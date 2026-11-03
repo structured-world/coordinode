@@ -3245,17 +3245,19 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
         n1.change_membership(vec![1, 2, 3])
             .await
             .expect("membership");
-        // Member 3 follows the leader's term: the vote it holds names it.
-        let mut given = None;
-        for _ in 0..100 {
-            let vote = n3.raft().metrics().borrow_watched().vote;
-            if vote.leader_id().term > 0 {
-                given = Some(vote);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let given = given.expect("member 3 took the leader's vote");
+        // Member 3 follows the leader's term: the vote it holds names it. It
+        // has applied entries too, so it has a position to restore: a vote
+        // arrives before the entries it then applies.
+        let given = n3
+            .raft()
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(
+                |m| m.vote.leader_id().term > 0 && m.last_applied.is_some(),
+                "member 3 takes the leader's vote and applies entries",
+            )
+            .await
+            .map(|m| m.vote)
+            .expect("member 3 took the leader's vote and applied entries");
 
         for node in [n3, n2, n1] {
             node.shutdown().await.expect("stop");
@@ -3277,14 +3279,18 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
         // once the engine runs. A campaign the member starts alone moves
         // past the restored vote, never back: from the default it would name
         // term 1 for itself, which is not at least the leader's term-1 vote.
-        let mut restored = n3.raft().metrics().borrow_watched().vote;
-        for _ in 0..100 {
-            if restored.leader_id().term > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            restored = n3.raft().metrics().borrow_watched().vote;
-        }
+        // The loaded vote and the applied position reach the metrics in
+        // separate reports, so both are awaited.
+        let (restored, last) = n3
+            .raft()
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(
+                |m| m.vote.leader_id().term > 0 && m.last_applied.is_some(),
+                "member 3 reports its restored vote and its applied entries",
+            )
+            .await
+            .map(|m| (m.vote, m.last_applied.expect("awaited")))
+            .expect("member 3 restored its vote and applied entries");
         assert!(
             restored >= given,
             "the vote went back from {given} to {restored}"
@@ -3294,11 +3300,6 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
         // node), with a log at least as long, is not granted: a member reset
         // to the engine's initial vote would grant it. It is sent as a
         // leadership transfer so a lease cannot be why it is refused.
-        let last = {
-            let rx = n3.raft().metrics();
-            let metrics = rx.borrow_watched();
-            metrics.last_applied.expect("member 3 applied entries")
-        };
         let mut ahead = last;
         ahead.index += 1_000;
         let delayed = openraft::raft::VoteRequest {
