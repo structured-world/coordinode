@@ -131,7 +131,9 @@ def main():
     if set(report["packages"]) != set(names) or report["source_commit"] != source:
         raise ValueError("qualification report does not describe this checkout and inventory")
     if args.mode == "preflight":
-        tag = subprocess.run(["git", "rev-parse", "--verify", f"refs/tags/v{report['version']}^{{commit}}"],
+        # An argv list with no shell, and the value starts with refs/tags/v,
+        # so the version from our own report cannot become a git option.
+        tag = subprocess.run(["git", "rev-parse", "--verify", f"refs/tags/v{report['version']}^{{commit}}"],  # NOSONAR
                              cwd=root, text=True, capture_output=True)
         if tag.returncode == 0 and tag.stdout.strip() != source:
             raise ValueError("version belongs to another source revision; prepare a new release PR")

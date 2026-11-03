@@ -59,7 +59,9 @@ def main():
                         help="release-plz release-pr --output json")
     args = parser.parse_args()
     root = args.checkout.resolve()
-    branch = release_branch(args.pr_json.read_text())
+    # The release workflow names this file; whoever runs the script chooses
+    # what it reads.
+    branch = release_branch(args.pr_json.read_text())  # NOSONAR
     if branch is None:
         print("no release PR: nothing to update")
         return

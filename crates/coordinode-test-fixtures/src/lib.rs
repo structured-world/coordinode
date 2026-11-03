@@ -445,7 +445,10 @@ fn reservation_dir() -> &'static std::path::Path {
 #[cfg(unix)]
 fn share_with_every_user(dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    match std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777)) {
+    // Sticky and world-writable on purpose, as `/tmp`: the directory holds
+    // only port reservations of test processes.
+    let shared = std::fs::Permissions::from_mode(0o1777); // NOSONAR
+    match std::fs::set_permissions(dir, shared) {
         Ok(()) => {}
         // Another user created it and shared it then; only they may change it.
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
