@@ -50,4 +50,6 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/structured-world/rust-stemmers"]
+# openraft comes from the structured-world fork until an openraft release
+# carries the fixes the workspace needs.
+allow-git = ["https://github.com/structured-world/openraft"]
