@@ -437,7 +437,7 @@ async fn log_store_purge() {
         make_entry(2, 1, "b"),
         make_entry(3, 1, "c"),
     ];
-    store.append(entries, IOFlushed::noop()).await.unwrap();
+    append_durable(&mut store, entries).await;
     // Every tree durably holds entries 0..=2.
     engine.reset_raft_coverage(3, &[]).unwrap();
 
@@ -461,7 +461,8 @@ async fn log_store_purge_stops_at_what_every_tree_holds() {
         make_entry(2, 1, "b"),
         make_entry(3, 1, "c"),
     ];
-    store.append(entries, IOFlushed::noop()).await.unwrap();
+    // openraft purges only applied entries, which are on disk by then.
+    append_durable(&mut store, entries).await;
     engine.reset_raft_coverage(2, &[]).unwrap();
 
     store.purge(log_id(1, 3)).await.unwrap();
@@ -488,7 +489,7 @@ async fn log_store_purge_keeps_what_the_latest_checkpoint_lacks() {
         make_entry(2, 1, "b"),
         make_entry(3, 1, "c"),
     ];
-    store.append(entries, IOFlushed::noop()).await.unwrap();
+    append_durable(&mut store, entries).await;
     engine.reset_raft_coverage(4, &[]).unwrap();
     engine.set_raft_log_keep_from(2);
 
@@ -525,7 +526,7 @@ async fn a_purge_below_what_is_already_purged_is_a_no_op() {
         make_entry(4, 1, "d"),
         make_entry(5, 1, "e"),
     ];
-    store.append(entries, IOFlushed::noop()).await.unwrap();
+    append_durable(&mut store, entries).await;
     engine.reset_raft_coverage(6, &[]).unwrap();
     store.purge(log_id(1, 3)).await.unwrap();
 
@@ -561,7 +562,7 @@ async fn log_store_purge_with_nothing_durable_keeps_everything() {
     let (_dir, engine) = test_engine();
     let mut store = LogStore::open(Arc::clone(&engine)).unwrap();
     let entries = vec![make_entry(1, 1, "a"), make_entry(2, 1, "b")];
-    store.append(entries, IOFlushed::noop()).await.unwrap();
+    append_durable(&mut store, entries).await;
     engine.reset_raft_coverage(0, &[]).unwrap();
 
     store.purge(log_id(1, 2)).await.unwrap();
@@ -1728,17 +1729,15 @@ async fn the_purge_point_survives_the_loss_of_the_raft_tree() {
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         let mut store = LogStore::open(Arc::clone(&engine)).expect("open log");
         store.save_vote(&Vote::new(1, 1)).await.expect("vote");
-        store
-            .append(
-                vec![
-                    make_entry(1, 1, "a"),
-                    make_entry(2, 1, "b"),
-                    make_entry(3, 1, "c"),
-                ],
-                IOFlushed::noop(),
-            )
-            .await
-            .expect("append");
+        append_durable(
+            &mut store,
+            vec![
+                make_entry(1, 1, "a"),
+                make_entry(2, 1, "b"),
+                make_entry(3, 1, "c"),
+            ],
+        )
+        .await;
         engine.reset_raft_coverage(3, &[]).expect("coverage");
         store.purge(log_id(1, 2)).await.expect("purge");
     }
@@ -2594,7 +2593,7 @@ async fn log_store_purge_persists_last_purged_log_id() {
         make_entry(2, 1, "b"),
         make_entry(3, 1, "c"),
     ];
-    store.append(entries, IOFlushed::noop()).await.unwrap();
+    append_durable(&mut store, entries).await;
     engine.reset_raft_coverage(3, &[]).unwrap();
 
     // Initially no purge
@@ -2637,7 +2636,7 @@ async fn log_store_purge_survives_reopen() {
             make_entry(2, 1, "b"),
             make_entry(3, 1, "c"),
         ];
-        store.append(entries, IOFlushed::noop()).await.unwrap();
+        append_durable(&mut store, entries).await;
         engine.reset_raft_coverage(3, &[]).unwrap();
         store.purge(log_id(1, 2)).await.unwrap();
     }
