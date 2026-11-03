@@ -1200,8 +1200,8 @@ impl CursorEngine for Gated {
 
 /// A session runs no more commands at once than its slots: while its one
 /// slot is held by a running statement, the next is refused before it runs as
-/// retryable, and a slot freed when the statement ends is taken by the one
-/// after.
+/// retryable, and the slot is back before the statement's answer reaches the
+/// client, so the one it sends after is not refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_command_past_the_sessions_slots_is_refused_before_it_runs() {
     let (gated, _abandoned) = Gated::new();
@@ -1234,6 +1234,8 @@ async fn a_command_past_the_sessions_slots_is_refused_before_it_runs() {
         ev_rx.recv().await,
         Some((1, SessionEvent::CursorEnd { .. }))
     ) {}
+    // A client sends its next command on the answer: the slot is back by then.
+    assert_eq!(slots.available(), 8, "the answered statement holds no slot");
     op_tx.send((3, statement("after", None))).await.unwrap();
     drop(op_tx);
     while ev_rx.recv().await.is_some() {}

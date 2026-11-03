@@ -283,16 +283,20 @@ impl Session {
                     cancel: self.cancels.register(request_id),
                 };
                 match transaction {
-                    None => self.spawn(out, Some(slot), |engine, _, out| async move {
-                        execute(&engine, statement, None, &out).await;
+                    None => self.spawn(out, Some(slot), |engine, _, out, slot| async move {
+                        let request_id = statement.request_id;
+                        let last = execute(&engine, statement, None, &out).await;
+                        drop(slot);
+                        answer(&out, request_id, last).await;
                     }),
                     Some(id) => {
                         // The transaction's first statement carries its begin.
                         let start = lanes.starts.remove(&id).map(|pending| pending.start);
                         let lane = lanes.step(id);
                         self.registry.attach(self.session_id, id);
-                        self.spawn(out, Some(slot), move |engine, _, out| async move {
+                        self.spawn(out, Some(slot), move |engine, _, out, slot| async move {
                             lane.after_previous().await;
+                            let request_id = statement.request_id;
                             let transaction = InTransaction {
                                 id,
                                 admission: lane.signal(),
@@ -308,10 +312,10 @@ impl Session {
                                     flag.cancel();
                                 })
                             };
-                            let delivered =
-                                execute(&engine, statement, Some(&transaction), &out).await;
+                            let last = execute(&engine, statement, Some(&transaction), &out).await;
                             watch.abort();
-                            if !delivered {
+                            drop(slot);
+                            if !answer(&out, request_id, last).await {
                                 abandon(engine, id).await;
                             }
                             lane.mine.release();
@@ -365,26 +369,31 @@ impl Session {
                 }
                 let lane = lanes.step(transaction);
                 let session_id = self.session_id;
-                self.spawn(out, Some(slot), move |engine, registry, out| async move {
-                    lane.after_previous().await;
-                    let admission = lane.signal();
-                    let committed = blocking(move || {
-                        engine.commit_transaction(
-                            transaction,
-                            operation.as_ref(),
-                            &expect,
-                            &admission,
-                        )
-                    })
-                    .await;
-                    lane.mine.release();
-                    registry.detach(session_id, &transaction);
-                    let event = match committed {
-                        Ok(receipt) => SessionEvent::Committed { receipt },
-                        Err(failure) => SessionEvent::Error(failure),
-                    };
-                    let _ = out.send((request_id, event)).await;
-                });
+                self.spawn(
+                    out,
+                    Some(slot),
+                    move |engine, registry, out, slot| async move {
+                        lane.after_previous().await;
+                        let admission = lane.signal();
+                        let committed = blocking(move || {
+                            engine.commit_transaction(
+                                transaction,
+                                operation.as_ref(),
+                                &expect,
+                                &admission,
+                            )
+                        })
+                        .await;
+                        lane.mine.release();
+                        registry.detach(session_id, &transaction);
+                        let event = match committed {
+                            Ok(receipt) => SessionEvent::Committed { receipt },
+                            Err(failure) => SessionEvent::Error(failure),
+                        };
+                        drop(slot);
+                        answer(&out, request_id, Some(event)).await;
+                    },
+                );
             }
 
             // Silent, as a rollback of a transaction already resolved is: the
@@ -400,7 +409,7 @@ impl Session {
                 let session_id = self.session_id;
                 // No slot: a rollback ends work and is never refused for want
                 // of room to do more.
-                self.spawn(out, None, move |engine, registry, _| async move {
+                self.spawn(out, None, move |engine, registry, _, _| async move {
                     lane.after_previous().await;
                     let admission = lane.signal();
                     let _ = blocking(move || engine.rollback_transaction(transaction, &admission))
@@ -454,7 +463,7 @@ impl Session {
             return;
         };
         let lane = lanes.step(transaction);
-        self.spawn(out, Some(slot), move |engine, _, out| async move {
+        self.spawn(out, Some(slot), move |engine, _, out, slot| async move {
             lane.after_previous().await;
             let PendingStart { start, request_id } = pending;
             // The start's wait runs on the runtime, holding no thread, and
@@ -486,17 +495,24 @@ impl Session {
                 Err(refused) => Err(refused.0),
             };
             lane.mine.release();
+            drop(slot);
             if let Err(failure) = begun {
                 send_error(&out, request_id, failure).await;
             }
         });
     }
 
-    /// Run `request` on its own task, counted as in flight for its lifetime
-    /// and holding `slot` until it ends.
+    /// Run `request` on its own task, counted as in flight for its lifetime.
+    /// It is handed `slot` and gives it back before its last answer: a client
+    /// that sends its next command on that answer finds the slot free.
     fn spawn<F, Fut>(&self, out: &mpsc::Sender<OutEvent>, slot: Option<CommandSlot>, request: F)
     where
-        F: FnOnce(Arc<dyn CursorEngine>, Arc<SessionRegistry>, mpsc::Sender<OutEvent>) -> Fut,
+        F: FnOnce(
+            Arc<dyn CursorEngine>,
+            Arc<SessionRegistry>,
+            mpsc::Sender<OutEvent>,
+            Option<CommandSlot>,
+        ) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let registry = Arc::clone(&self.registry);
@@ -506,10 +522,10 @@ impl Session {
             Arc::clone(&self.engine),
             Arc::clone(&self.registry),
             out.clone(),
+            slot,
         );
         tokio::spawn(async move {
             work.await;
-            drop(slot);
             registry.request_finished(session_id);
         });
     }
@@ -678,14 +694,15 @@ struct Statement {
 /// [`spawn_blocking`](tokio::task::spawn_blocking); the cursor (`Send`) moves in
 /// and back out per batch, keeping the stream's per-batch backpressure.
 ///
-/// Returns whether the whole answer, the error included, was handed to the
-/// stream.
+/// Returns the answer's last event, `CursorEnd` or `Error`, for the caller to
+/// send once the statement's slot is back; `None` when the stream went away
+/// before it.
 async fn execute(
     engine: &Arc<dyn CursorEngine>,
     statement: Statement,
     transaction: Option<&InTransaction>,
     out: &mpsc::Sender<OutEvent>,
-) -> bool {
+) -> Option<SessionEvent> {
     let Statement {
         request_id,
         query,
@@ -717,15 +734,12 @@ async fn execute(
                 })
                 .await
             }
-            Err(e) => return send_error(out, request_id, e.0).await,
+            Err(e) => return Some(SessionEvent::Error(e.0)),
         },
         (None, None) => {
-            return send_error(
-                out,
-                request_id,
-                Failure::internal("the engine took the statement and admitted nothing"),
-            )
-            .await;
+            return Some(SessionEvent::Error(Failure::internal(
+                "the engine took the statement and admitted nothing",
+            )));
         }
         (None, Some(call)) => {
             let engine = Arc::clone(engine);
@@ -747,8 +761,8 @@ async fn execute(
     };
     let (mut cursor, columns) = match opened {
         Ok(Ok(opened)) => opened,
-        Ok(Err(e)) => return send_error(out, request_id, e.0).await,
-        Err(join) => return send_error(out, request_id, lost_call(join)).await,
+        Ok(Err(e)) => return Some(SessionEvent::Error(e.0)),
+        Err(join) => return Some(SessionEvent::Error(lost_call(join))),
     };
 
     if out
@@ -756,19 +770,17 @@ async fn execute(
         .await
         .is_err()
     {
-        return false;
+        return None;
     }
 
     loop {
         // A cancelled statement stops paging: the rows already sent are not
         // a complete answer, and the error says so.
         if cancel.flag.is_cancelled() {
-            return send_error(
-                out,
-                request_id,
-                Failure::new(ErrorCode::Cancelled, "the statement was cancelled"),
-            )
-            .await;
+            return Some(SessionEvent::Error(Failure::new(
+                ErrorCode::Cancelled,
+                "the statement was cancelled",
+            )));
         }
         // Page on the blocking pool; hand the cursor in and take it back so the
         // next iteration (and `stats()` below) still own it.
@@ -782,7 +794,7 @@ async fn execute(
                 cursor = returned;
                 batch
             }
-            Err(join) => return send_error(out, request_id, lost_call(join)).await,
+            Err(join) => return Some(SessionEvent::Error(lost_call(join))),
         };
         match batch {
             // Empty batch = exhausted.
@@ -793,21 +805,25 @@ async fn execute(
                     .await
                     .is_err()
                 {
-                    return false;
+                    return None;
                 }
             }
-            Err(e) => return send_error(out, request_id, e.0).await,
+            Err(e) => return Some(SessionEvent::Error(e.0)),
         }
     }
 
-    out.send((
-        request_id,
-        SessionEvent::CursorEnd {
-            stats: cursor.stats(),
-        },
-    ))
-    .await
-    .is_ok()
+    Some(SessionEvent::CursorEnd {
+        stats: cursor.stats(),
+    })
+}
+
+/// Send `last`, a request's last event, if it has one. Returns whether the
+/// whole answer was handed to the stream.
+async fn answer(out: &mpsc::Sender<OutEvent>, request_id: u64, last: Option<SessionEvent>) -> bool {
+    match last {
+        Some(event) => out.send((request_id, event)).await.is_ok(),
+        None => false,
+    }
 }
 
 /// Abort `transaction`, whose statement's answer did not reach the client.
