@@ -79,14 +79,17 @@ pub(crate) async fn stamp(
     }
     wait_ready(raft).await?;
     let closed = engine.closure_frontier();
+    // A proposal below the bound is refused: the bound promised no commit
+    // there follows. One still sealed and held is the exception: only an
+    // entry carrying it can have closed past it, so it is in the log, and
+    // handing it over again settles to that same commit.
     if let Some(stale) = request
         .proposals
         .iter()
-        .map(|p| p.commit_ts.as_raw())
-        .find(|ts| *ts < closed)
+        .find(|p| p.commit_ts.as_raw() < closed && !engine.pending_commits().holds_sealed(p.id))
     {
         return Err(ProposalError::BelowClosedBound {
-            commit_ts: stale,
+            commit_ts: stale.commit_ts.as_raw(),
             closed_below: closed,
         });
     }

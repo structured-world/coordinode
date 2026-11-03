@@ -497,6 +497,50 @@ async fn a_sealed_commit_is_closed_by_its_own_entry() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A retry of a sealed commit whose earlier hand-over already closed the bound
+/// past it is handed over again, not refused: the bound passed it only
+/// through an entry carrying this very proposal, so the proposal is in the
+/// log and the retry settles to the same commit. Refusing it reported an
+/// unknown outcome for a write that had landed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_of_a_sealed_commit_past_its_own_bound_is_handed_over() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine =
+        Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open"));
+    let node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+        .await
+        .expect("open raft node");
+    let pipeline = node.pipeline();
+    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let proposal = RaftProposal {
+        id: ProposalIdGenerator::new().next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: b"node:1:sealed-retry".to_vec(),
+            value: b"v".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts),
+        bypass_rate_limiter: false,
+    };
+    held.seal(proposal.id);
+    pipeline.propose_async(&proposal).await.expect("commit");
+    assert!(engine.closure_frontier() > ts, "its own entry closed it");
+
+    let retry = pipeline.entry(&proposal, 1).await.map(|_| ());
+    assert!(retry.is_ok(), "the retry is handed over: {retry:?}");
+    drop(held);
+    node.shutdown().await.expect("shutdown");
+}
+
 /// An early answer proves where the entry is, not that it committed: the
 /// leader's copy written but not synced counts toward `w`, never toward the
 /// majority that commits it, so such an answer carries no committed index a

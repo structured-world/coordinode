@@ -635,6 +635,13 @@ impl PendingCommits {
         self.finished.notify_all();
     }
 
+    /// Whether a registration still standing is sealed into `proposal`. While
+    /// one is, a bound past its timestamp was handed out only by an entry
+    /// carrying `proposal`: every other entry stays below it.
+    pub fn holds_sealed(&self, proposal: ProposalId) -> bool {
+        self.inner.lock().sealed.values().any(|p| *p == proposal)
+    }
+
     /// Seal registration `id` into `proposal`, if it is still registered.
     fn seal(&self, id: u64, proposal: ProposalId) {
         let mut table = self.inner.lock();
