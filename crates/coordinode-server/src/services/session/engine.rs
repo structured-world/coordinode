@@ -31,8 +31,8 @@ use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::WriteStats;
 use coordinode_session::{
-    ConnectionSettings, CursorEngine, EngineError, InTransaction, QueryCursor, SessionStats,
-    StatementSource,
+    BeginReady, ConnectionSettings, CursorEngine, EngineError, InTransaction, PreparedStatement,
+    Preparing, QueryCursor, SessionStats, StatementCall, StatementSource,
 };
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
@@ -280,91 +280,80 @@ impl CursorEngine for DatabaseCursorEngine {
 
         let start = Instant::now();
         let requested = requested(settings, cancel, operation);
-        let admitted = match self.admit(query, &requested)? {
-            Admission::Run(admitted) => admitted,
-            Admission::Forward(leader_id) => {
-                let statement = Self::autonomous(query, params, &requested, source);
-                return self.routed(leader_id, statement, &AdmissionSignal::new(|| {}), cancel);
-            }
-        };
-        let fenced = SessionStats {
-            served_by_leader: admitted.served_by_leader,
-            read_as_of_ts: admitted.read_as_of_ts,
-            ..SessionStats::default()
-        };
+        let admission = self.admit(query, &requested)?;
+        self.run_admission(query, params, source, &requested, admission, cancel, start)
+    }
 
-        // Keyset path: an auto-commit read whose plan pages by a single
-        // NodeScan pins one snapshot and pages by key, so memory stays one
-        // page whatever the result size.
-        if self.database().read().keyset_pageable(query) {
-            let cursor = KeysetCursor::open(
-                Arc::clone(self.database()),
-                query.to_string(),
-                params,
-                admitted.read_concern.at_timestamp,
-                fenced,
-            )?;
-            // The cursor pins the latest complete snapshot, which a causal
-            // bound past it is not met by: refused like any read below its
-            // bound, never served from before it.
-            if let Some(bound) = admitted.read_concern.after_ts
-                && cursor.read_ts.is_none_or(|pinned| pinned < bound)
-            {
-                return Err(engine_error(DatabaseError::ReadNotReady {
-                    requested: bound,
-                    ready_through: cursor.read_ts,
-                }));
-            }
-            // Counted at its first page; later pages are served as the
-            // client asks for them.
-            crate::services::statement::observe_query(
-                crate::services::statement::QueryKind::Read,
-                start,
-            );
-            self.executor.record(query, source.as_ref(), start);
-            return Ok(Box::new(cursor));
+    fn prepare(&self, slot: &mut Option<StatementCall>) -> Option<Preparing> {
+        // Only a fence waits; standalone the statement runs as one.
+        if !self.executor.needs_fence() {
+            return None;
         }
-
-        // A write that reaches a follower is refused by consensus and goes to
-        // the leader, as on the unary path: nothing was applied here. Only a
-        // follower needs the parameters again for that, so only a follower
-        // keeps a copy; on the leader, a leadership lost mid-statement is
-        // answered with NOT_LEADER and the leader to retry at.
-        let retry =
-            (self.executor.needs_fence() && !admitted.served_by_leader).then(|| params.clone());
-        let result = match self
-            .executor
-            .execute(query, params, source.as_ref(), &admitted)
-        {
-            Ok(result) => result,
-            Err(e) => match (leader_hint(&e), retry) {
-                (Some(leader_id), Some(params)) => {
-                    let statement = Self::autonomous(query, params, &requested, source);
-                    return self.routed(leader_id, statement, &AdmissionSignal::new(|| {}), cancel);
-                }
-                _ => return Err(engine_error(e)),
-            },
+        let engine = Self::from_executor(self.executor.clone());
+        let Some(transaction) = slot.as_ref()?.transaction.as_ref() else {
+            let call = slot.take()?;
+            return Some(Box::pin(async move {
+                let start = Instant::now();
+                let requested = requested(&call.settings, &call.cancel, call.operation.as_ref());
+                let checked = engine
+                    .executor
+                    .check(&call.query, &requested)
+                    .map_err(engine_error)?;
+                let admission = engine
+                    .executor
+                    .fence(checked, false)
+                    .await
+                    .map_err(engine_error)?;
+                Ok(Box::new(Fenced {
+                    engine,
+                    call,
+                    requested,
+                    admission,
+                    start,
+                }) as Box<dyn PreparedStatement>)
+            }));
         };
-        self.executor.record(query, source.as_ref(), start);
-        let (columns, rows) = columns_and_values(&result.rows);
-        let written = write_stats(&result.write_stats);
-        Ok(Box::new(MaterializedCursor {
-            columns,
-            rows,
-            pos: 0,
-            stats: SessionStats {
-                // A write reports its own commit and entry, a read its view.
-                receipt: crate::services::causal::receipt(
-                    result.write_stats.commit_ts,
-                    result.write_stats.applied_index,
-                    result.write_stats.read_ts,
-                    admitted.history,
-                ),
-                execution_time_ms: start.elapsed().as_millis() as i64,
-                served_by_leader: fenced.served_by_leader,
-                read_as_of_ts: fenced.read_as_of_ts,
-                ..written
-            },
+        // A transaction's first statement on the member that leads it waits
+        // here for its start's causal bound, which its start then meets at
+        // once; any other runs as one.
+        let start = transaction
+            .start
+            .as_ref()
+            .map(|start| transaction_start(&start.settings, start.operation.as_ref()))
+            .filter(|start| start.after_ts.is_some())?;
+        if !matches!(self.transaction_leader(), Ok(None)) {
+            return None;
+        }
+        let call = slot.take()?;
+        Some(Box::pin(async move {
+            engine
+                .executor
+                .await_start_bound(start.after_ts, start.causal_wait, None, Some(&call.cancel))
+                .await
+                .map_err(engine_error)?;
+            Ok(Box::new(Waited { engine, call }) as Box<dyn PreparedStatement>)
+        }))
+    }
+
+    fn prepare_begin(
+        &self,
+        settings: &ConnectionSettings,
+        cancel: &coordinode_core::budget::CancelFlag,
+    ) -> Option<BeginReady> {
+        let start = transaction_start(settings, None);
+        // Nothing to wait for, or the leader the start runs at waits for it.
+        if start.after_ts.is_none()
+            || !self.executor.needs_fence()
+            || !matches!(self.transaction_leader(), Ok(None))
+        {
+            return None;
+        }
+        let (executor, cancel) = (self.executor.clone(), cancel.clone());
+        Some(Box::pin(async move {
+            executor
+                .await_start_bound(start.after_ts, start.causal_wait, None, Some(&cancel))
+                .await
+                .map_err(engine_error)
         }))
     }
 
@@ -440,6 +429,107 @@ impl CursorEngine for DatabaseCursorEngine {
 }
 
 impl DatabaseCursorEngine {
+    /// Run an autonomous statement as `admission` says: here, as admitted, or
+    /// at the leader it names.
+    #[allow(clippy::too_many_arguments)]
+    fn run_admission(
+        &self,
+        query: &str,
+        params: Option<HashMap<String, Value>>,
+        source: Option<SourceContext>,
+        requested: &Requested,
+        admission: Admission,
+        cancel: &coordinode_core::budget::CancelFlag,
+        start: Instant,
+    ) -> Result<Box<dyn QueryCursor>, EngineError> {
+        let admitted = match admission {
+            Admission::Run(admitted) => admitted,
+            Admission::Forward(leader_id) => {
+                let statement = Self::autonomous(query, params, requested, source);
+                return self.routed(leader_id, statement, &AdmissionSignal::new(|| {}), cancel);
+            }
+        };
+        let fenced = SessionStats {
+            served_by_leader: admitted.served_by_leader,
+            read_as_of_ts: admitted.read_as_of_ts,
+            ..SessionStats::default()
+        };
+
+        // Keyset path: an auto-commit read whose plan pages by a single
+        // NodeScan pins one snapshot and pages by key, so memory stays one
+        // page whatever the result size.
+        if self.database().read().keyset_pageable(query) {
+            let cursor = KeysetCursor::open(
+                Arc::clone(self.database()),
+                query.to_string(),
+                params,
+                admitted.read_concern.at_timestamp,
+                fenced,
+            )?;
+            // The cursor pins the latest complete snapshot, which a causal
+            // bound past it is not met by: refused like any read below its
+            // bound, never served from before it.
+            if let Some(bound) = admitted.read_concern.after_ts
+                && cursor.read_ts.is_none_or(|pinned| pinned < bound)
+            {
+                return Err(engine_error(DatabaseError::ReadNotReady {
+                    requested: bound,
+                    ready_through: cursor.read_ts,
+                }));
+            }
+            // Counted at its first page; later pages are served as the
+            // client asks for them.
+            crate::services::statement::observe_query(
+                crate::services::statement::QueryKind::Read,
+                start,
+            );
+            self.executor.record(query, source.as_ref(), start);
+            return Ok(Box::new(cursor));
+        }
+
+        // A write that reaches a follower is refused by consensus and goes to
+        // the leader, as on the unary path: nothing was applied here. Only a
+        // follower needs the parameters again for that, so only a follower
+        // keeps a copy; on the leader, a leadership lost mid-statement is
+        // answered with NOT_LEADER and the leader to retry at.
+        let retry =
+            (self.executor.needs_fence() && !admitted.served_by_leader).then(|| params.clone());
+        let result = match self
+            .executor
+            .execute(query, params, source.as_ref(), &admitted)
+        {
+            Ok(result) => result,
+            Err(e) => match (leader_hint(&e), retry) {
+                (Some(leader_id), Some(params)) => {
+                    let statement = Self::autonomous(query, params, requested, source);
+                    return self.routed(leader_id, statement, &AdmissionSignal::new(|| {}), cancel);
+                }
+                _ => return Err(engine_error(e)),
+            },
+        };
+        self.executor.record(query, source.as_ref(), start);
+        let (columns, rows) = columns_and_values(&result.rows);
+        let written = write_stats(&result.write_stats);
+        Ok(Box::new(MaterializedCursor {
+            columns,
+            rows,
+            pos: 0,
+            stats: SessionStats {
+                // A write reports its own commit and entry, a read its view.
+                receipt: crate::services::causal::receipt(
+                    result.write_stats.commit_ts,
+                    result.write_stats.applied_index,
+                    result.write_stats.read_ts,
+                    admitted.history,
+                ),
+                execution_time_ms: start.elapsed().as_millis() as i64,
+                served_by_leader: fenced.served_by_leader,
+                read_as_of_ts: fenced.read_as_of_ts,
+                ..written
+            },
+        }))
+    }
+
     /// Open `transaction` on this member, which leads, as `start` says; a
     /// wait for its causal bound ends with `cancel`.
     fn begin_here(
@@ -510,6 +600,61 @@ impl DatabaseCursorEngine {
                 },
             )
             .map_err(engine_error)
+    }
+}
+
+/// An autonomous statement whose read was fenced on the runtime: what is left
+/// runs as the fence decided.
+struct Fenced {
+    engine: DatabaseCursorEngine,
+    call: StatementCall,
+    requested: Requested,
+    admission: Admission,
+    start: Instant,
+}
+
+impl PreparedStatement for Fenced {
+    fn open(self: Box<Self>) -> Result<Box<dyn QueryCursor>, EngineError> {
+        let Self {
+            engine,
+            call,
+            requested,
+            admission,
+            start,
+        } = *self;
+        let params = (!call.params.is_empty()).then_some(call.params);
+        let source = call.source.as_deref().and_then(source_context);
+        engine.run_admission(
+            &call.query,
+            params,
+            source,
+            &requested,
+            admission,
+            &call.cancel,
+            start,
+        )
+    }
+}
+
+/// A transaction's first statement whose start's causal bound was met on the
+/// runtime: it opens the transaction and runs as any other.
+struct Waited {
+    engine: DatabaseCursorEngine,
+    call: StatementCall,
+}
+
+impl PreparedStatement for Waited {
+    fn open(self: Box<Self>) -> Result<Box<dyn QueryCursor>, EngineError> {
+        let Self { engine, call } = *self;
+        engine.open_cursor(
+            &call.query,
+            call.params,
+            call.transaction.as_ref(),
+            &call.settings,
+            call.source.as_deref(),
+            call.operation.as_ref(),
+            &call.cancel,
+        )
     }
 }
 

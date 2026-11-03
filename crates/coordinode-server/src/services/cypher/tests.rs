@@ -3713,6 +3713,103 @@ async fn a_replicated_lookup_through_a_wrong_entry_answers_within_the_request_li
     node.shutdown().await.expect("shutdown");
 }
 
+/// A session read waiting for its causal bound holds no thread while it
+/// waits: with a single blocking thread, a statement sent after it on the same
+/// session runs and answers while the read still waits; the read then ends
+/// with its cancel, never answered below its bound.
+#[test]
+fn a_waiting_causal_read_holds_no_thread() {
+    use coordinode_session::{
+        ConnectionSettings, ErrorCode, SessionEvent, SessionManager, SessionOp, SessionRegistry,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let (svc, node, _dir) = test_service_raft().await;
+        let manager = SessionManager::new(
+            Arc::new(session_engine(&svc)),
+            Arc::new(SessionRegistry::new()),
+        );
+        let (op_tx, op_rx) = tokio::sync::mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(8);
+        let session = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+        let execute = |query: &str, settings| SessionOp::Execute {
+            query: query.to_owned(),
+            params: std::collections::HashMap::new(),
+            transaction: None,
+            settings,
+            source: None,
+            operation: None,
+        };
+        // A minute's wait for a bound far past any commit made here.
+        let waiting = ConnectionSettings {
+            read_concern: Some(2), // MAJORITY
+            after_ts: Some(u64::MAX / 2),
+            causal_wait: Some(std::time::Duration::from_secs(60)),
+            ..ConnectionSettings::default()
+        };
+        op_tx
+            .send((1, execute("MATCH (n) RETURN count(n) AS c", waiting)))
+            .await
+            .expect("send");
+        // Let the read start its wait before the next statement needs the
+        // one blocking thread.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        op_tx
+            .send((2, execute("RETURN 1 AS one", ConnectionSettings::default())))
+            .await
+            .expect("send");
+
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match ev_rx.recv().await.expect("an event") {
+                    (2, SessionEvent::CursorEnd { .. }) => return,
+                    (1, event) => panic!("the waiting read answered early: {event:?}"),
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            answered.is_ok(),
+            "the second statement is held behind the waiting read"
+        );
+
+        op_tx
+            .send((
+                3,
+                SessionOp::Cancel {
+                    target_request_id: 1,
+                },
+            ))
+            .await
+            .expect("send");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                if let (1, event) = ev_rx.recv().await.expect("an event") {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the cancel ends the wait");
+        assert!(
+            matches!(&ended, SessionEvent::Error(f) if f.code == ErrorCode::Cancelled),
+            "{ended:?}"
+        );
+
+        drop(op_tx);
+        while ev_rx.recv().await.is_some() {}
+        session.await.expect("session task");
+        node.shutdown().await.expect("shutdown");
+    });
+}
+
 /// A member runs no more commands at once than its slots, whichever way they
 /// arrive: with its one slot held, a unary call and a statement on a session
 /// of the same member are both refused before anything of them runs, as a

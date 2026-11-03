@@ -40,6 +40,53 @@ pub struct TransactionStart {
     pub operation: Option<OperationDescriptor>,
 }
 
+/// One statement as the session hands it to the engine: what
+/// [`CursorEngine::open_cursor`] takes, owned, so the engine can admit it on
+/// the runtime and run it on the blocking pool afterwards.
+#[derive(Debug)]
+pub struct StatementCall {
+    /// The statement's text, in the engine's dialect.
+    pub query: String,
+    /// Its parameters, in the engine's value space.
+    pub params: HashMap<String, Value>,
+    /// The transaction it runs in; `None` for an autonomous statement.
+    pub transaction: Option<InTransaction>,
+    /// Its own settings over its session's.
+    pub settings: ConnectionSettings,
+    /// Where in the client's code it was issued.
+    pub source: Option<Box<StatementSource>>,
+    /// The client operation an autonomous statement carries out.
+    pub operation: Option<OperationDescriptor>,
+    /// Thrown when the client cancels it.
+    pub cancel: coordinode_core::budget::CancelFlag,
+}
+
+/// A statement [`CursorEngine::prepare`] admitted: what is left of it runs
+/// on the blocking pool.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an admitted statement the session can open",
+    label = "needs `PreparedStatement`",
+    note = "a `CursorEngine` returns one from `prepare`"
+)]
+pub trait PreparedStatement: Send {
+    /// Run the statement, or start paging it, and return its cursor.
+    /// Blocking: a write commits here.
+    ///
+    /// # Errors
+    ///
+    /// What the statement failed with.
+    fn open(self: Box<Self>) -> Result<Box<dyn QueryCursor>, EngineError>;
+}
+
+/// What [`CursorEngine::prepare`] returns when it admits a statement itself.
+pub type Preparing = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Box<dyn PreparedStatement>, EngineError>> + Send>,
+>;
+
+/// What [`CursorEngine::prepare_begin`] returns when it waits for a start.
+pub type BeginReady =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EngineError>> + Send>>;
+
 /// An error from the query engine, neutral over the engine implementation. It
 /// reaches the client as the request's failure, class and details intact.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +139,32 @@ pub trait CursorEngine: Send + Sync {
         operation: Option<&OperationDescriptor>,
         cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError>;
+
+    /// Admit the statement in `call` on the runtime before it runs: whatever
+    /// only waits for others (a read fence, a causal bound the statement
+    /// allows a wait for) waits here and holds no thread, and the statement's
+    /// command slot is all it holds meanwhile. An engine that admits it takes
+    /// it out of `call` and returns the admission, whose
+    /// [`PreparedStatement::open`] runs what is left on the blocking pool;
+    /// one that does not leaves `call` as it is, and the session runs it
+    /// through [`Self::open_cursor`] as a whole.
+    ///
+    /// The returned future fails with the admission's refusal.
+    fn prepare(&self, _call: &mut Option<StatementCall>) -> Option<Preparing> {
+        None
+    }
+
+    /// Wait on the runtime, holding no thread, for what a transaction's start
+    /// with `settings` waits for before [`Self::begin_transaction`] runs (its
+    /// causal bound), until `cancel` is thrown; `None` when nothing does.
+    /// The start's own wait is then met at once.
+    fn prepare_begin(
+        &self,
+        _settings: &ConnectionSettings,
+        _cancel: &coordinode_core::budget::CancelFlag,
+    ) -> Option<BeginReady> {
+        None
+    }
 
     /// The change to its session's settings `query` makes, when it is a
     /// dialect's session SET command; `None` for any other statement, and an

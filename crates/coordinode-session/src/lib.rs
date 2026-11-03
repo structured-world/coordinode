@@ -15,7 +15,10 @@ mod session;
 mod slots;
 mod types;
 
-pub use engine::{CursorEngine, EngineError, InTransaction, QueryCursor, TransactionStart};
+pub use engine::{
+    BeginReady, CursorEngine, EngineError, InTransaction, PreparedStatement, Preparing,
+    QueryCursor, StatementCall, TransactionStart,
+};
 pub use registry::SessionRegistry;
 pub use session::{InOp, OutEvent, Session, SessionManager};
 pub use slots::{CommandSlot, CommandSlots, SessionSlots, SlotCount};

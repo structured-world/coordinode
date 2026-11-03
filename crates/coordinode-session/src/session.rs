@@ -30,7 +30,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use coordinode_core::budget::CancelFlag;
 use coordinode_core::txn::operation::OperationDescriptor;
 
-use crate::engine::{CursorEngine, EngineError, InTransaction, TransactionStart};
+use crate::engine::{CursorEngine, EngineError, InTransaction, StatementCall, TransactionStart};
 use crate::registry::SessionRegistry;
 use crate::slots::{CommandSlot, CommandSlots, SessionSlots, SlotCount};
 use crate::types::{
@@ -457,10 +457,34 @@ impl Session {
         self.spawn(out, Some(slot), move |engine, _, out| async move {
             lane.after_previous().await;
             let PendingStart { start, request_id } = pending;
-            let begun = blocking(move || {
-                engine.begin_transaction(transaction, &start.settings, start.operation.as_ref())
-            })
-            .await;
+            // The start's wait runs on the runtime, holding no thread, and
+            // ends when the stream goes away: nobody waits for its answer.
+            let cancel = CancelFlag::new();
+            let watch = {
+                let (out, cancel) = (out.clone(), cancel.clone());
+                tokio::spawn(async move {
+                    out.closed().await;
+                    cancel.cancel();
+                })
+            };
+            let waited = match engine.prepare_begin(&start.settings, &cancel) {
+                Some(ready) => ready.await,
+                None => Ok(()),
+            };
+            watch.abort();
+            let begun = match waited {
+                Ok(()) => {
+                    blocking(move || {
+                        engine.begin_transaction(
+                            transaction,
+                            &start.settings,
+                            start.operation.as_ref(),
+                        )
+                    })
+                    .await
+                }
+                Err(refused) => Err(refused.0),
+            };
             lane.mine.release();
             if let Err(failure) = begun {
                 send_error(&out, request_id, failure).await;
@@ -671,24 +695,56 @@ async fn execute(
         operation,
         cancel,
     } = statement;
-    // Open on the blocking pool: a write statement commits through Raft here.
-    let engine = Arc::clone(engine);
-    let flag = cancel.flag.clone();
-    let transaction = transaction.cloned();
-    let opened = tokio::task::spawn_blocking(move || {
-        let cursor = engine.open_cursor(
-            &query,
-            params,
-            transaction.as_ref(),
-            &settings,
-            source.as_deref(),
-            operation.as_ref(),
-            &flag,
-        )?;
-        let columns = cursor.columns();
-        Ok::<_, EngineError>((cursor, columns))
-    })
-    .await;
+    let mut call = Some(StatementCall {
+        query,
+        params,
+        transaction: transaction.cloned(),
+        settings,
+        source,
+        operation,
+        cancel: cancel.flag.clone(),
+    });
+    // Admitted on the runtime first, where waiting holds no thread; then
+    // opened on the blocking pool, where a write commits through Raft.
+    let preparing = engine.prepare(&mut call);
+    let opened = match (preparing, call) {
+        (Some(preparing), _) => match preparing.await {
+            Ok(prepared) => {
+                tokio::task::spawn_blocking(move || {
+                    let cursor = prepared.open()?;
+                    let columns = cursor.columns();
+                    Ok::<_, EngineError>((cursor, columns))
+                })
+                .await
+            }
+            Err(e) => return send_error(out, request_id, e.0).await,
+        },
+        (None, None) => {
+            return send_error(
+                out,
+                request_id,
+                Failure::internal("the engine took the statement and admitted nothing"),
+            )
+            .await;
+        }
+        (None, Some(call)) => {
+            let engine = Arc::clone(engine);
+            tokio::task::spawn_blocking(move || {
+                let cursor = engine.open_cursor(
+                    &call.query,
+                    call.params,
+                    call.transaction.as_ref(),
+                    &call.settings,
+                    call.source.as_deref(),
+                    call.operation.as_ref(),
+                    &call.cancel,
+                )?;
+                let columns = cursor.columns();
+                Ok::<_, EngineError>((cursor, columns))
+            })
+            .await
+        }
+    };
     let (mut cursor, columns) = match opened {
         Ok(Ok(opened)) => opened,
         Ok(Err(e)) => return send_error(out, request_id, e.0).await,
