@@ -541,6 +541,136 @@ async fn a_retry_of_a_sealed_commit_past_its_own_bound_is_handed_over() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A sealed write whose first hand-over gets no answer in time lands once.
+/// The log's sync stalls past the first attempt's timeout, so the caller
+/// does not know whether that attempt landed; it does, and its own entry
+/// closes the bound past the write before the retry is stamped. The retry,
+/// through the pipeline's own loop, is handed over and answers success, and
+/// the write's effect applies once: the counter it increments reads one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sealed_write_retried_after_an_unknown_outcome_lands_once() {
+    use coordinode_storage::oplog::segment::SYNC_STALL_MS;
+    use std::sync::atomic::Ordering;
+    // Past the first attempt's timeout, short of the second's.
+    const STALL: Duration = Duration::from_millis(5_000);
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine =
+        Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open"));
+    let node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+        .await
+        .expect("open raft node");
+    let ids = ProposalIdGenerator::new();
+    // A first write makes the leader ready to stamp.
+    let (warm, warm_held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let warm_up = RaftProposal {
+        id: ids.next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: b"node:1:warm".to_vec(),
+            value: b"v".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(warm),
+        start_ts: Timestamp::from_raw(warm),
+        bypass_rate_limiter: false,
+    };
+    warm_held.seal(warm_up.id);
+    node.pipeline()
+        .propose_async(&warm_up)
+        .await
+        .expect("warm-up write");
+    drop(warm_held);
+    // The node's own startup writes settle first: a registration of theirs
+    // still in flight would hold this write's bound below it.
+    let settled = oracle.current().as_raw();
+    let mut quiet = false;
+    for _ in 0..300 {
+        if engine.closure_frontier() > settled {
+            quiet = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(quiet, "the node's own writes settle");
+
+    // Two permits: the first attempt takes one, the retry two, so the retry
+    // waits on the one the test holds.
+    let pipeline = Arc::new(
+        RaftProposalPipeline::with_max_pending(Arc::clone(node.raft()), 2)
+            .with_closure(Arc::clone(&engine)),
+    );
+    let gate = pipeline.rate_limiter.acquire(0).await.expect("permit");
+    let key = b"counter:once".to_vec();
+    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let proposal = RaftProposal {
+        id: ids.next(),
+        mutations: vec![Mutation::Merge {
+            partition: PartitionId::Counter,
+            key: key.clone(),
+            operand: coordinode_storage::engine::merge::encode_counter_delta(1),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts),
+        bypass_rate_limiter: false,
+    };
+    held.seal(proposal.id);
+
+    SYNC_STALL_MS.store(
+        u64::try_from(STALL.as_millis()).expect("small"),
+        Ordering::Relaxed,
+    );
+    let write = {
+        let pipeline = Arc::clone(&pipeline);
+        let proposal = proposal.clone();
+        tokio::spawn(async move { pipeline.propose_async(&proposal).await })
+    };
+    tokio::time::sleep(BASE_TIMEOUT + Duration::from_millis(300)).await;
+    SYNC_STALL_MS.store(0, Ordering::Relaxed);
+    assert!(
+        !write.is_finished(),
+        "the first attempt timed out and the retry waits for its permits"
+    );
+    let mut closed = false;
+    for _ in 0..300 {
+        if engine.closure_frontier() > ts {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        closed,
+        "the first attempt landed and its own entry closed it: frontier {} at {ts}, applied {}, counter {:?}",
+        engine.closure_frontier(),
+        node.applied_index(),
+        engine.get(Partition::Counter, &key).ok().flatten()
+    );
+    assert!(!write.is_finished(), "the retry has not been stamped yet");
+
+    drop(gate);
+    let outcome = write.await.expect("write task");
+    assert!(
+        outcome.is_ok(),
+        "the retry of a write that landed answers success: {outcome:?}"
+    );
+    let stored = engine
+        .get(Partition::Counter, &key)
+        .expect("read the counter")
+        .expect("the counter exists");
+    let count = i64::from_le_bytes(stored[..].try_into().expect("an i64"));
+    assert_eq!(count, 1, "the write's effect applied once");
+    drop(held);
+    node.shutdown().await.expect("shutdown");
+}
+
 /// An early answer proves where the entry is, not that it committed: the
 /// leader's copy written but not synced counts toward `w`, never toward the
 /// majority that commits it, so such an answer carries no committed index a
