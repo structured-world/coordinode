@@ -165,7 +165,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # release-plz updates these exact requirements with the coordinated version.
 coordinode-core = { path = "crates/coordinode-core", version = "=0.9.0" }
 coordinode-query = { path = "crates/coordinode-query", version = "=0.9.0" }
-coordinode-session = { path = "crates/coordinode-session" }
+coordinode-session = { path = "crates/coordinode-session", version = "=0.9.0" }
 coordinode-vector = { path = "crates/coordinode-vector", version = "=0.9.0" }
 coordinode-search = { path = "crates/coordinode-search", version = "=0.9.0" }
 coordinode-storage = { path = "crates/coordinode-storage", version = "=0.9.0" }
