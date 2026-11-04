@@ -372,24 +372,26 @@ fn waited_share(
 }
 
 /// A pause beyond the move's own counts as the host's when, for at least
-/// this share of it, the process of the member that led into it waited for
-/// CPU (its threads' run-queue delay, summed, with their block-I/O delay
-/// where the kernel keeps it) or some process of the test's own cgroup
-/// waited on I/O (a disk the group shares stalling). A stopped leader waits
-/// on neither, however loaded the host is meanwhile, and a group at rest
-/// waits far less.
+/// this share of it, some process of the test's own cgroup waited on I/O:
+/// the disk the group shares stalled. A leader stopped or held inside the
+/// group adds nothing to it, however loaded the host is meanwhile, and a
+/// group at rest waits on I/O a few thousandths of the time.
 ///
-/// The waits are whole processes', not the commit path's: a commit held
-/// inside the group (a lock) while a loaded host makes the leader's other
-/// threads wait, or while the group's disk stalls, is taken for the host's,
-/// and that attempt is retried. Such a defect fails the test only when it
-/// occurs, masked this way, in every attempt: if the three attempts were
-/// independent and each showed it with the same probability `p`, the test
-/// would catch it with probability `p` cubed. The attempts are not shown to
-/// be independent, so that figure holds only under that assumption; it is
-/// not a measured sensitivity. Nothing read from outside the process tells
-/// the two apart when the load coincides, and the test accepts this to stay
-/// green on a loaded host or a stalling disk.
+/// Waiting for CPU does not count. The leader's run-queue delay, summed over
+/// its threads, exceeds the whole pause even in the move's own pause on an
+/// idle host, so it tells nothing apart, and busy threads on every core of
+/// the host did not make the group pause at all.
+///
+/// The wait is the whole group's, not the commit path's: a commit held
+/// inside the group (a lock) while the group's disk stalls is taken for the
+/// host's, and that attempt is retried. Such a defect fails the test only
+/// when it occurs, masked this way, in every attempt: if the three attempts
+/// were independent and each showed it with the same probability `p`, the
+/// test would catch it with probability `p` cubed. The attempts are not
+/// shown to be independent, so that figure holds only under that
+/// assumption; it is not a measured sensitivity. Nothing read from outside
+/// the process tells the two apart when the stall coincides, and the test
+/// accepts this to stay green on a stalling disk.
 const HOST_STALLED: f64 = 0.25;
 
 /// A leadership as members report it: the leader's node id and the term.
@@ -418,11 +420,10 @@ impl std::fmt::Debug for PauseWaits {
 }
 
 impl PauseWaits {
-    /// Whether the host held the group back for [`HOST_STALLED`] of it.
+    /// Whether the group's disk held it back for [`HOST_STALLED`] of it.
+    /// The leader's waits are shown, not counted (see [`HOST_STALLED`]).
     fn host_stalled(&self) -> bool {
-        self.leader_waited
-            .is_some_and(|share| share >= HOST_STALLED)
-            || self.group_io.is_some_and(|share| share >= HOST_STALLED)
+        self.group_io.is_some_and(|share| share >= HOST_STALLED)
     }
 }
 
@@ -498,10 +499,42 @@ enum Stall {
     /// inside the group that coincides with a loaded host.
     #[cfg(target_os = "linux")]
     LeaderOnLoadedHost(Duration),
-    /// Busy threads contend every core of the host for this long; nothing
-    /// of the group is stopped.
+    /// Threads of the test write and sync files on the file system the
+    /// members' data is on for this long; nothing of the group is stopped.
     #[cfg(target_os = "linux")]
-    LoadedHost(Duration),
+    StalledDisk(Duration),
+}
+
+/// Keep the file system under `dir` busy with synced writes from `writers`
+/// threads while `during` runs.
+#[cfg(target_os = "linux")]
+async fn with_stalled_disk<T>(
+    dir: &std::path::Path,
+    writers: usize,
+    during: impl std::future::Future<Output = T>,
+) -> T {
+    use std::io::Write as _;
+    let busy = Arc::new(AtomicBool::new(true));
+    let threads: Vec<_> = (0..writers)
+        .map(|n| {
+            let (busy, path) = (Arc::clone(&busy), dir.join(format!("stall-{n}")));
+            std::thread::spawn(move || {
+                let chunk = vec![0x5a_u8; 8 << 20];
+                while busy.load(Ordering::Relaxed) {
+                    let mut file = std::fs::File::create(&path).expect("stall file");
+                    file.write_all(&chunk).expect("stall write");
+                    file.sync_data().expect("stall sync");
+                }
+                std::fs::remove_file(&path).ok();
+            })
+        })
+        .collect();
+    let out = during.await;
+    busy.store(false, Ordering::Relaxed);
+    for thread in threads {
+        thread.join().expect("stall writer");
+    }
+    out
 }
 
 /// Keep every core of the host busy with `per_core` threads per core while
@@ -715,8 +748,10 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
             with_loaded_host(2, member.freeze_for(pause)).await;
         }
         #[cfg(target_os = "linux")]
-        Stall::LoadedHost(pause) => {
-            with_loaded_host(16, tokio::time::sleep(pause)).await;
+        Stall::StalledDisk(pause) => {
+            // The members' data directories are made under the temporary
+            // directory, on the file system the writers fill.
+            with_stalled_disk(&std::env::temp_dir(), 4, tokio::time::sleep(pause)).await;
         }
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1042,14 +1077,14 @@ async fn a_stall_inside_the_group_on_a_loaded_host_is_not_retried_away() {
     );
 }
 
-/// Its positive control: busy threads load every core of the host for
-/// 3 s with nothing of the group stopped. The leader waits for CPU through
-/// the pause that causes, which is taken for the host's: the attempt would
-/// be retried.
+/// Its positive control: threads of the test fill the file system the
+/// members' data is on with synced writes for 3 s, nothing of the group
+/// stopped. The group's own processes wait on that disk through the pause
+/// it causes, which is taken for the host's: the attempt would be retried.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_loaded_host_is_told_from_a_stall_inside_the_group() {
-    let outcome = move_under_workload(false, Stall::LoadedHost(Duration::from_secs(3))).await;
+async fn a_stalled_disk_is_told_from_a_stall_inside_the_group() {
+    let outcome = move_under_workload(false, Stall::StalledDisk(Duration::from_secs(3))).await;
     assert!(matches!(outcome, Outcome::HostStalled(_)), "{outcome:?}");
 }
 
