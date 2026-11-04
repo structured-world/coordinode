@@ -249,8 +249,10 @@ struct Observed {
     waits: Vec<Waited>,
 }
 
-/// A member's report of who leads, first seen in this form at `at`; its
-/// previous answer came at `before`, so the change happened in between.
+/// A member's report of who leads, first seen in this form in the answer
+/// received at `at`; the previous answered request was sent at `before`, and
+/// the state it reported was read on the server no earlier, so the change
+/// happened between the two.
 #[derive(Debug, Clone)]
 struct Seen {
     port: u16,
@@ -330,9 +332,17 @@ fn waited_share(
 
 /// A pause beyond the move's own counts as the host's when the process of
 /// the member that led into it spent at least this share of it waiting for
-/// CPU or block I/O. A leader the group stalls itself (a lock, a stuck
-/// commit, a stopped process) waits on neither, however loaded the host is
-/// meanwhile, and a leader at rest waits far less.
+/// CPU or block I/O, summed over its threads. A stopped leader waits on
+/// neither, however loaded the host is meanwhile, and a leader at rest
+/// waits far less.
+///
+/// The waits are the whole process's, not its commit path's: a commit held
+/// inside the group (a lock) while a loaded host makes the leader's other
+/// threads wait is taken for the host's, and that attempt is retried. Such
+/// a defect fails the test only when it recurs in every attempt; one that
+/// shows up in a fraction `p` of attempts is caught with `p` cubed. Nothing
+/// read from outside the process tells the two apart when the load
+/// coincides, and the test accepts this to stay green on a loaded host.
 const HOST_STALLED: f64 = 0.25;
 
 /// A leadership as members report it: the leader's node id and the term.
@@ -532,8 +542,11 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
             let (stop, observed) = (Arc::clone(&stop), Arc::clone(&observed));
             tokio::spawn(async move {
                 let mut last: Option<(String, u64)> = None;
+                // When the previous answered request was sent: the state it
+                // reported may have been read on the server any time after.
                 let mut before = Instant::now();
                 while !stop.load(Ordering::Acquire) {
+                    let asked = Instant::now();
                     if let Some(now) = leadership_of(port).await {
                         let at = Instant::now();
                         if last.as_ref() != Some(&now) {
@@ -546,7 +559,7 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
                             });
                             last = Some(now);
                         }
-                        before = at;
+                        before = asked;
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
