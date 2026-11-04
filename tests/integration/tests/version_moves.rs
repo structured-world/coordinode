@@ -250,6 +250,49 @@ struct Observed {
     /// The test's own cgroup's I/O stall counter, sampled: when, and the
     /// microseconds some task of the group waited on I/O.
     group_io: Vec<(Instant, u64)>,
+    /// The host's CPU time, sampled: when, the time its CPUs were busy and
+    /// the time they existed (both in clock ticks, summed over CPUs).
+    host_cpu: Vec<(Instant, u64, u64)>,
+}
+
+/// The host's CPU time so far in clock ticks summed over its CPUs: busy (all
+/// but idle and I/O wait) and in total, from `/proc/stat`. `None` where the
+/// kernel keeps no such counter.
+#[cfg(target_os = "linux")]
+fn host_cpu_ticks() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    // "cpu  user nice system idle iowait irq softirq steal ...".
+    let ticks: Vec<u64> = stat
+        .lines()
+        .next()?
+        .strip_prefix("cpu ")?
+        .split_whitespace()
+        .map(|field| field.parse().ok())
+        .collect::<Option<_>>()?;
+    let total: u64 = ticks.iter().sum();
+    let idle = ticks.get(3)? + ticks.get(4)?;
+    Some((total.checked_sub(idle)?, total))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_cpu_ticks() -> Option<(u64, u64)> {
+    None
+}
+
+/// The share of the host's CPUs that were busy during `from..to` (from
+/// `started`), from the samples around it; `None` without samples covering
+/// it.
+fn host_busy_share(
+    samples: &[(Instant, u64, u64)],
+    started: Instant,
+    (from, to): (Duration, Duration),
+) -> Option<f64> {
+    let at = |sample: &(Instant, u64, u64)| sample.0.saturating_duration_since(started);
+    let before = samples.iter().rev().find(|s| at(s) <= from)?;
+    let after = samples.iter().find(|s| at(s) >= to)?;
+    let busy = after.1.checked_sub(before.1)? as f64;
+    let total = after.2.checked_sub(before.2)? as f64;
+    (total > 0.0).then(|| busy / total)
 }
 
 /// Microseconds some task of this process's cgroup (v2) has waited on I/O
@@ -304,33 +347,38 @@ struct Seen {
     term: u64,
 }
 
-/// What a member's process had waited, summed over its threads, at `at`:
-/// nanoseconds runnable but not running (scheduler run-queue delay), and
-/// nanoseconds blocked on block I/O (kept when the kernel's task delay
-/// accounting is on, else zero).
+/// What a member's process had used and waited, summed over its threads, at
+/// `at`: nanoseconds on a CPU, nanoseconds runnable but not running
+/// (scheduler run-queue delay), and nanoseconds blocked on block I/O (kept
+/// when the kernel's task delay accounting is on, else zero).
 #[derive(Debug, Clone, Copy)]
 struct Waited {
     port: u16,
     pid: u32,
     at: Instant,
+    ran_ns: u64,
     queued_ns: u64,
     blocked_ns: u64,
 }
 
-/// What process `pid` has waited so far, summed over its threads (see
-/// [`Waited`]); `None` where the kernel does not report it.
+/// What process `pid` has run and waited so far, summed over its threads, as
+/// (ran, queued, blocked) (see [`Waited`]); `None` where the kernel does not
+/// report it.
 #[cfg(target_os = "linux")]
-fn waited_of(pid: u32) -> Option<(u64, u64)> {
+fn waited_of(pid: u32) -> Option<(u64, u64, u64)> {
     // The kernel reports block-I/O delay in clock ticks of USER_HZ, which
     // Linux fixes at 100 for user space.
     const NS_PER_TICK: u64 = 10_000_000;
+    let mut ran = 0u64;
     let mut queued = 0u64;
     let mut blocked = 0u64;
     for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()? {
         let task = task.ok()?.path();
         // schedstat: time on the CPU, time waiting on a run queue, slices.
         let schedstat = std::fs::read_to_string(task.join("schedstat")).ok()?;
-        queued += schedstat.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        let mut fields = schedstat.split_whitespace();
+        ran += fields.next()?.parse::<u64>().ok()?;
+        queued += fields.next()?.parse::<u64>().ok()?;
         // stat field 42, delayacct_blkio_ticks; the fields after the
         // parenthesised name start at field 3.
         let stat = std::fs::read_to_string(task.join("stat")).ok()?;
@@ -338,12 +386,34 @@ fn waited_of(pid: u32) -> Option<(u64, u64)> {
         let ticks: u64 = after_name.split_whitespace().nth(42 - 3)?.parse().ok()?;
         blocked += ticks * NS_PER_TICK;
     }
-    Some((queued, blocked))
+    Some((ran, queued, blocked))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn waited_of(_pid: u32) -> Option<(u64, u64)> {
+fn waited_of(_pid: u32) -> Option<(u64, u64, u64)> {
     None
+}
+
+/// How many CPUs the process on `port` kept busy on average during
+/// `from..to` (from `started`), read from the samples of one process around
+/// it; `None` without such samples.
+fn cores_used(
+    samples: &[Waited],
+    port: u16,
+    started: Instant,
+    (from, to): (Duration, Duration),
+) -> Option<f64> {
+    let at = |sample: &Waited| sample.at.saturating_duration_since(started);
+    let before = samples
+        .iter()
+        .rev()
+        .find(|s| s.port == port && at(s) <= from)?;
+    let after = samples.iter().find(|s| s.port == port && at(s) >= to)?;
+    if before.pid != after.pid {
+        return None;
+    }
+    let wall = after.at.duration_since(before.at).as_nanos() as f64;
+    Some(after.ran_ns.checked_sub(before.ran_ns)? as f64 / wall)
 }
 
 /// The share of `from..to` (from `started`) that the process on `port`
@@ -409,14 +479,19 @@ struct PauseWaits {
     /// The share of the pause some process of the test's cgroup waited on
     /// I/O.
     group_io: Option<f64>,
+    /// The share of the host's CPUs busy during the pause.
+    host_busy: Option<f64>,
+    /// How many CPUs each member's process kept busy during it.
+    members_cores: Vec<(u16, Option<f64>)>,
 }
 
 impl std::fmt::Debug for PauseWaits {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "led by {:?}: leader waited {:?}, group I/O {:?}",
-            self.leader, self.leader_waited, self.group_io
+            "led by {:?}: leader waited {:?}, group I/O {:?}, host CPUs busy {:?}, \
+             cores used by member {:?}",
+            self.leader, self.leader_waited, self.group_io, self.host_busy, self.members_cores
         )
     }
 }
@@ -673,12 +748,20 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
                         .group_io
                         .push((Instant::now(), stalled));
                 }
+                if let Some((busy, total)) = host_cpu_ticks() {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .host_cpu
+                        .push((Instant::now(), busy, total));
+                }
                 for (port, pid) in now {
-                    if let Some((queued_ns, blocked_ns)) = waited_of(pid) {
+                    if let Some((ran_ns, queued_ns, blocked_ns)) = waited_of(pid) {
                         observed.lock().unwrap().waits.push(Waited {
                             port,
                             pid,
                             at: Instant::now(),
+                            ran_ns,
                             queued_ns,
                             blocked_ns,
                         });
@@ -914,6 +997,11 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
                 leader,
                 leader_waited,
                 group_io: group_io_share(&observed.group_io, started, *pause),
+                host_busy: host_busy_share(&observed.host_cpu, started, *pause),
+                members_cores: ports
+                    .iter()
+                    .map(|port| (*port, cores_used(&observed.waits, *port, started, *pause)))
+                    .collect(),
             }
         })
         .collect();
@@ -974,10 +1062,10 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
     );
 
     // And there only. A pause besides it counts as the host's only when, for
-    // at least `HOST_STALLED` of it, the leader's process waited for CPU or
-    // the test's own processes waited on I/O (see `HOST_STALLED`). A leader
-    // stopped or stuck inside the group waits on neither, whatever the rest
-    // of the host does, so such a pause is unexplained.
+    // at least `HOST_STALLED` of it, the test's own processes waited on I/O
+    // (see `HOST_STALLED`). A leader stopped or stuck inside the group does
+    // not make them wait, whatever the rest of the host does, so such a pause
+    // is unexplained. The CPU figures are shown, not counted.
     let extra: Vec<&PauseWaits> = pauses
         .iter()
         .zip(&waits)
