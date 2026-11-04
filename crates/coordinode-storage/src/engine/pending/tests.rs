@@ -348,6 +348,110 @@ fn a_task_waiting_for_a_timestamp_is_woken_by_the_commit_it_waits_for() {
     assert_eq!(pending.in_flight_at(100), None);
 }
 
+/// A wait's registration belongs to that wait: waits dropped while their
+/// commit is still in flight leave no waker behind, a wait polled again under
+/// another waker keeps only the latest one, and dropping one of two waits of
+/// the same task leaves the other woken when the commit finishes.
+#[test]
+fn a_waits_registration_ends_with_the_wait() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let count = || Arc::new(Count(AtomicUsize::new(0)));
+    let poll = |wait: &mut CompleteAt, by: &Arc<Count>| {
+        let waker = Waker::from(Arc::clone(by));
+        Pin::new(wait).poll(&mut Context::from_waker(&waker))
+    };
+
+    let pending = Arc::new(table());
+    let held = admit_at(&pending, 50, key(Partition::Node, b"a")).expect("admit");
+
+    let gone: Vec<_> = (0..8).map(|_| count()).collect();
+    for by in &gone {
+        let mut wait = pending.complete_at(100);
+        assert!(poll(&mut wait, by).is_pending());
+        drop(wait);
+    }
+    for by in &gone {
+        assert_eq!(
+            Arc::strong_count(by),
+            1,
+            "a wait dropped before its commit finished left its waker registered"
+        );
+    }
+
+    let (old, new) = (count(), count());
+    let mut moved = pending.complete_at(100);
+    assert!(poll(&mut moved, &old).is_pending());
+    assert!(poll(&mut moved, &new).is_pending());
+    assert_eq!(Arc::strong_count(&old), 1, "the replaced waker is let go");
+    assert_eq!(Arc::strong_count(&new), 2, "the latest waker is kept");
+
+    let shared = count();
+    let mut left = pending.complete_at(100);
+    let mut kept = pending.complete_at(100);
+    assert!(poll(&mut left, &shared).is_pending());
+    assert!(poll(&mut kept, &shared).is_pending());
+    drop(left);
+
+    drop(held);
+    assert!(
+        shared.0.load(Ordering::SeqCst) >= 1,
+        "the kept wait is woken"
+    );
+    assert!(new.0.load(Ordering::SeqCst) >= 1, "the moved wait is woken");
+    assert_eq!(old.0.load(Ordering::SeqCst), 0, "the replaced waker is not");
+    assert!(poll(&mut kept, &shared).is_ready());
+    assert!(poll(&mut moved, &new).is_ready());
+    drop((kept, moved));
+    assert_eq!(Arc::strong_count(&shared), 1);
+    assert_eq!(Arc::strong_count(&new), 1);
+}
+
+/// A wait dropped while its commit finishes on another thread leaves nothing
+/// behind, whichever of the two takes the table first.
+#[test]
+fn a_wait_dropped_as_its_commit_finishes_leaves_nothing_behind() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let pending = Arc::new(table());
+    for round in 0..200u64 {
+        let by = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&by));
+        let mut wait = pending.complete_at(1_000_000);
+        let (ts, admission) = pending
+            .admit_allocated(|| round + 1, Vec::new(), Vec::new())
+            .expect("admit");
+        assert_eq!(ts, round + 1);
+        assert!(
+            Pin::new(&mut wait)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(move || drop(admission));
+            drop(wait);
+        });
+        drop(waker);
+        assert_eq!(Arc::strong_count(&by), 1, "round {round} left a waker");
+        assert!(by.0.load(Ordering::SeqCst) <= 1, "woken at most once");
+    }
+}
+
 /// At the ceiling a commit is refused rather than admitted, and refused
 /// before its timestamp is taken: a number allocated and then thrown away is
 /// a hole in the clock that nobody closes.

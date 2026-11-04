@@ -134,8 +134,10 @@ struct Table {
     /// How many timestamps were withdrawn, for a waiter on the next one.
     withdrawals: u64,
     /// The tasks waiting without a thread for a commit to finish
-    /// ([`CompleteAt`]), woken with the threads that wait for one.
-    wakers: Vec<Waker>,
+    /// ([`CompleteAt`]), each under its wait's own number and only while that
+    /// wait lives: as many as the waits in progress. Woken with the threads
+    /// that wait for one.
+    wakers: HashMap<u64, Waker>,
 }
 
 /// The commits this leader has admitted but not yet applied.
@@ -250,6 +252,7 @@ impl PendingCommits {
         CompleteAt {
             pending: Arc::clone(self),
             ts,
+            registered: None,
         }
     }
 
@@ -269,13 +272,15 @@ impl PendingCommits {
 
     /// Wake every thread and task waiting for a commit to finish.
     fn wake_all(&self, mut table: parking_lot::MutexGuard<'_, Table>) {
+        // Taken out, not left: a wait still pending registers again when it
+        // is next polled.
         let wakers = std::mem::take(&mut table.wakers);
         drop(table);
         // Every waiter is woken rather than one: they are waiting on
         // different timestamps, and the one this commit unblocks is not
         // necessarily the one a single wake would reach.
         self.finished.notify_all();
-        for waker in wakers {
+        for waker in wakers.into_values() {
             waker.wake();
         }
     }
@@ -705,27 +710,51 @@ impl PendingCommits {
     }
 }
 
-/// [`PendingCommits::complete_at`]'s wait.
+/// [`PendingCommits::complete_at`]'s wait. Its waker is registered under its
+/// own number while it waits, and withdrawn when it is met or dropped.
 #[derive(Debug)]
 pub struct CompleteAt {
     pending: Arc<PendingCommits>,
     ts: u64,
+    /// The number this wait's waker is registered under, once it was.
+    registered: Option<u64>,
 }
 
 impl Future for CompleteAt {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let mut table = self.pending.inner.lock();
-        if PendingCommits::first_at(&table, self.ts).is_none() {
+        let this = self.get_mut();
+        let mut table = this.pending.inner.lock();
+        if PendingCommits::first_at(&table, this.ts).is_none() {
+            if let Some(id) = this.registered.take() {
+                table.wakers.remove(&id);
+            }
             return Poll::Ready(());
         }
         // Registered under the lock the finishing commit takes, so its wake
-        // cannot fall between this check and the registration.
-        if !table.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            table.wakers.push(cx.waker().clone());
+        // cannot fall between this check and the registration. A wake takes
+        // every registration out, so one may be gone: it is made again.
+        let id = *this.registered.get_or_insert_with(|| {
+            this.pending
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        });
+        match table.wakers.get_mut(&id) {
+            Some(waker) => waker.clone_from(cx.waker()),
+            None => {
+                table.wakers.insert(id, cx.waker().clone());
+            }
         }
         Poll::Pending
+    }
+}
+
+impl Drop for CompleteAt {
+    fn drop(&mut self) {
+        if let Some(id) = self.registered {
+            self.pending.inner.lock().wakers.remove(&id);
+        }
     }
 }
 
