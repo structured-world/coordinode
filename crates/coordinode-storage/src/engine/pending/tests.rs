@@ -305,6 +305,49 @@ fn a_named_timestamp_does_not_wait_for_commits_above_it() {
         .expect("nothing under this timestamp is in flight");
 }
 
+/// A task waits for a named timestamp without a thread: its wait is pending
+/// while a commit at or below it is in flight, takes no notice of one above,
+/// and the commit finishing wakes the task and completes the wait.
+#[test]
+fn a_task_waiting_for_a_timestamp_is_woken_by_the_commit_it_waits_for() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let pending = Arc::new(table());
+    let woken = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&woken));
+    let mut cx = Context::from_waker(&waker);
+
+    let above = admit_at(&pending, 200, key(Partition::Node, b"b")).expect("admit");
+    let mut clear = pending.complete_at(100);
+    assert!(
+        Pin::new(&mut clear).poll(&mut cx).is_ready(),
+        "a commit above the timestamp is not in its way"
+    );
+
+    let below = admit_at(&pending, 50, key(Partition::Node, b"a")).expect("admit");
+    let mut wait = pending.complete_at(100);
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    assert_eq!(pending.in_flight_at(100), Some(50));
+
+    drop(above);
+    drop(below);
+    assert!(
+        woken.0.load(Ordering::SeqCst) >= 1,
+        "the finishing commit woke the task"
+    );
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_ready());
+    assert_eq!(pending.in_flight_at(100), None);
+}
+
 /// At the ceiling a commit is refused rather than admitted, and refused
 /// before its timestamp is taken: a number allocated and then thrown away is
 /// a hole in the clock that nobody closes.

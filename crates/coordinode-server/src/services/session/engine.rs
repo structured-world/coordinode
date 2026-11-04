@@ -330,9 +330,17 @@ impl CursorEngine for DatabaseCursorEngine {
     }
 
     fn prepare(&self, slot: &mut Option<StatementCall>) -> Option<Preparing> {
-        // Only a fence waits; standalone the statement runs as one.
+        // Standalone only a causal bound the statement, or the start it
+        // carries, allows a wait for waits on others; any other runs as one.
         if !self.executor.needs_fence() {
-            return None;
+            let call = slot.as_ref()?;
+            let settings = match call.transaction.as_ref() {
+                Some(transaction) => &transaction.start.as_ref()?.settings,
+                None => &call.settings,
+            };
+            if settings.after_ts.is_none() || settings.causal_wait.is_none() {
+                return None;
+            }
         }
         let engine = Self::from_executor(self.executor.clone());
         // Another member leads the transaction: the statement runs there, its
@@ -432,10 +440,6 @@ impl CursorEngine for DatabaseCursorEngine {
         operation: Option<&OperationDescriptor>,
         cancel: &coordinode_core::budget::CancelFlag,
     ) -> Option<BeginReady> {
-        // Standalone, nothing waits on others.
-        if !self.executor.needs_fence() {
-            return None;
-        }
         let start = transaction_start(settings, operation);
         let (executor, cancel) = (self.executor.clone(), cancel.clone());
         match self.transaction_leader() {
@@ -451,15 +455,21 @@ impl CursorEngine for DatabaseCursorEngine {
                 .await?;
                 Ok(BeginStep::Begun)
             })),
-            // This member leads: the start's causal bound is waited for here,
-            // and the start then meets it at once.
-            Ok(None) if start.after_ts.is_some() => Some(Box::pin(async move {
-                executor
-                    .await_start_bound(start.after_ts, start.causal_wait, None, Some(&cancel))
-                    .await
-                    .map_err(engine_error)?;
-                Ok(BeginStep::Ready)
-            })),
+            // This member leads, or stands alone: the start's causal bound is
+            // waited for here, and the start then meets it at once. Standalone
+            // there is nothing to establish unless the start allows a wait.
+            Ok(None)
+                if start.after_ts.is_some()
+                    && (self.executor.needs_fence() || start.causal_wait.is_some()) =>
+            {
+                Some(Box::pin(async move {
+                    executor
+                        .await_start_bound(start.after_ts, start.causal_wait, None, Some(&cancel))
+                        .await
+                        .map_err(engine_error)?;
+                    Ok(BeginStep::Ready)
+                }))
+            }
             _ => None,
         }
     }

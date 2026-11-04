@@ -338,6 +338,19 @@ impl Admitter {
         already_forwarded: bool,
     ) -> Result<Admission, DatabaseError> {
         let Some(node) = self.node.as_ref() else {
+            // A causal bound a read allows a wait for is waited for here,
+            // holding no thread; the store then finds it met.
+            if let (Some(after_ts), Some(wait)) =
+                (checked.read_concern.after_ts, checked.read_concern.wait)
+            {
+                self.await_standalone_bound(
+                    after_ts,
+                    wait,
+                    checked.deadline,
+                    checked.cancel.as_ref(),
+                )
+                .await?;
+            }
             return Ok(Admission::Run(Box::new(self.admit_standalone(checked))));
         };
         // A write only the leader can take goes there before anything of it
@@ -421,8 +434,19 @@ impl Admitter {
         deadline: Option<Instant>,
         cancel: Option<&CancelFlag>,
     ) -> Result<(), DatabaseError> {
-        let (Some(node), Some(after_ts)) = (self.node.as_ref(), after_ts) else {
+        let Some(after_ts) = after_ts else {
             return Ok(());
+        };
+        let Some(node) = self.node.as_ref() else {
+            // Standalone, a start that allows a wait waits for its bound
+            // here, as a read does.
+            return match wait {
+                Some(wait) => {
+                    self.await_standalone_bound(after_ts, wait, deadline, cancel)
+                        .await
+                }
+                None => Ok(()),
+            };
         };
         let mut fence = node.read_fence();
         within_operation(wait, deadline, cancel, |wait| {
@@ -430,6 +454,28 @@ impl Admitter {
         })
         .await
         .map(|_| ())
+    }
+
+    /// Wait on a standalone store, holding no thread, until no commit at or
+    /// below `after_ts` is in flight: at most `wait`, cut at `deadline` and
+    /// given up once `cancel` is thrown, each ending with its own outcome.
+    async fn await_standalone_bound(
+        &self,
+        after_ts: u64,
+        wait: Duration,
+        deadline: Option<Instant>,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<(), DatabaseError> {
+        let met = self.database.read().causal_bound_met(after_ts);
+        let outcome =
+            within_deadline_and_cancel(deadline, cancel, tokio::time::timeout(wait, met)).await?;
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(_elapsed) => Err(DatabaseError::ReadNotReady {
+                requested: after_ts,
+                ready_through: self.database.read().causal_ready_through(after_ts),
+            }),
+        }
     }
 
     /// Check and fence in one step.

@@ -1859,6 +1859,10 @@ impl Database {
     /// [`DatabaseError::SettingsRefused`] for a position on a standalone store;
     /// [`DatabaseError::ReadNotReady`] after the wait;
     /// [`DatabaseError::Budget`] when the budget ends the wait.
+    ///
+    /// A caller on an async runtime waits first through
+    /// [`Self::causal_bound_met`], holding no thread; this check then finds
+    /// the bound met.
     fn prepare_causal_read(
         &self,
         causal: &CausalBound,
@@ -1903,6 +1907,23 @@ impl Database {
             }
         }
         Ok(Some(bound))
+    }
+
+    /// What a read bounded below by `after_ts` waits for on a standalone
+    /// store: no commit at or below it in flight. The wait holds no thread
+    /// and no lock of the database; the caller bounds it.
+    pub fn causal_bound_met(&self, after_ts: u64) -> impl Future<Output = ()> + Send + 'static {
+        self.engine.pending_commits().complete_at(after_ts)
+    }
+
+    /// How far a read bounded below by `after_ts` is complete here now: just
+    /// below the first commit at or below it still in flight; `None` when
+    /// none is, or when that commit is the first there is.
+    pub fn causal_ready_through(&self, after_ts: u64) -> Option<u64> {
+        self.engine
+            .pending_commits()
+            .in_flight_at(after_ts)
+            .and_then(|blocking| blocking.checked_sub(1))
     }
 
     /// The view of a read whose modalities must all resolve at one timestamp

@@ -3815,6 +3815,118 @@ fn a_waiting_causal_read_holds_no_thread() {
     });
 }
 
+/// On a standalone server a session read waiting for its causal bound, behind
+/// a commit still in flight, holds no thread: with a single blocking thread a
+/// statement of another session runs and answers meanwhile, and the read ends
+/// with its cancel, never answered below its bound.
+#[test]
+fn a_standalone_read_waiting_for_its_bound_holds_no_thread() {
+    use coordinode_session::{
+        ConnectionSettings, ErrorCode, SessionEvent, SessionManager, SessionOp, SessionRegistry,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let database = Arc::new(RwLock::new(
+        Database::open(dir.path()).expect("open database"),
+    ));
+    let pending = Arc::clone(database.read().engine().pending_commits());
+    // A commit in flight the read's bound covers, held until the test ends.
+    let in_flight = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros() as u64;
+    let (_, held) = pending
+        .admit_allocated(|| in_flight, Vec::new(), Vec::new())
+        .expect("admit the commit in flight");
+
+    runtime.block_on(async {
+        let executor = crate::services::statement::StatementExecutor::new(Arc::clone(&database));
+        let svc = CypherServiceImpl::from_executor(executor);
+        let manager = SessionManager::new(
+            Arc::new(session_engine(&svc)),
+            Arc::new(SessionRegistry::new()),
+        );
+        let (op_tx, op_rx) = tokio::sync::mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(8);
+        let session = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+        let execute = |query: &str, settings| SessionOp::Execute {
+            query: query.to_owned(),
+            params: std::collections::HashMap::new(),
+            transaction: None,
+            settings,
+            source: None,
+            operation: None,
+        };
+        let waiting = ConnectionSettings {
+            read_concern: Some(2), // MAJORITY
+            after_ts: Some(in_flight),
+            causal_wait: Some(std::time::Duration::from_secs(60)),
+            ..ConnectionSettings::default()
+        };
+        op_tx
+            .send((1, execute("MATCH (n) RETURN count(n) AS c", waiting)))
+            .await
+            .expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        op_tx
+            .send((2, execute("RETURN 1 AS one", ConnectionSettings::default())))
+            .await
+            .expect("send");
+
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match ev_rx.recv().await.expect("an event") {
+                    (2, SessionEvent::CursorEnd { .. }) => return,
+                    (1, event) => panic!("the waiting read answered early: {event:?}"),
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            answered.is_ok(),
+            "the second statement is held behind the waiting read"
+        );
+
+        op_tx
+            .send((
+                3,
+                SessionOp::Cancel {
+                    target_request_id: 1,
+                },
+            ))
+            .await
+            .expect("send");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                if let (1, event) = ev_rx.recv().await.expect("an event") {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the cancel ends the wait");
+        assert!(
+            matches!(&ended, SessionEvent::Error(f) if f.code == ErrorCode::Cancelled),
+            "{ended:?}"
+        );
+
+        drop(op_tx);
+        while ev_rx.recv().await.is_some() {}
+        session.await.expect("session task");
+    });
+    // A read still waiting on the blocking thread would hold the runtime's
+    // end for as long as its wait.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    drop(held);
+}
+
 /// A session read waiting for its causal bound stops when its client stops
 /// listening: the response stream closing, with no Cancel sent, ends the wait
 /// and gives its slot back long before the wait it asked for runs out.

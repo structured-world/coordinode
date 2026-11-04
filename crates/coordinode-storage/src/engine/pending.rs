@@ -27,7 +27,10 @@
 //! promise is the prepared-participant mechanism, with its own lifetime.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -130,6 +133,9 @@ struct Table {
     max_released: u64,
     /// How many timestamps were withdrawn, for a waiter on the next one.
     withdrawals: u64,
+    /// The tasks waiting without a thread for a commit to finish
+    /// ([`CompleteAt`]), woken with the threads that wait for one.
+    wakers: Vec<Waker>,
 }
 
 /// The commits this leader has admitted but not yet applied.
@@ -227,18 +233,50 @@ impl PendingCommits {
         let deadline = Instant::now() + timeout;
         let mut table = self.inner.lock();
         loop {
-            let Some(blocking) = table
-                .admitted
-                .values()
-                .map(|a| a.commit_ts)
-                .filter(|c| *c <= ts)
-                .min()
-            else {
+            let Some(blocking) = Self::first_at(&table, ts) else {
                 return Ok(());
             };
             if self.finished.wait_until(&mut table, deadline).timed_out() {
                 return Err(blocking);
             }
+        }
+    }
+
+    /// [`Self::await_complete_at`] for a task, holding no thread while it
+    /// waits: ready once no commit at or below `ts` is in flight. Woken by
+    /// the commits that finish, as the threads waiting for one are; its
+    /// caller bounds the wait.
+    pub fn complete_at(self: &Arc<Self>, ts: u64) -> CompleteAt {
+        CompleteAt {
+            pending: Arc::clone(self),
+            ts,
+        }
+    }
+
+    /// The first commit at or below `ts` still in flight, if any.
+    pub fn in_flight_at(&self, ts: u64) -> Option<u64> {
+        Self::first_at(&self.inner.lock(), ts)
+    }
+
+    fn first_at(table: &Table, ts: u64) -> Option<u64> {
+        table
+            .admitted
+            .values()
+            .map(|a| a.commit_ts)
+            .filter(|c| *c <= ts)
+            .min()
+    }
+
+    /// Wake every thread and task waiting for a commit to finish.
+    fn wake_all(&self, mut table: parking_lot::MutexGuard<'_, Table>) {
+        let wakers = std::mem::take(&mut table.wakers);
+        drop(table);
+        // Every waiter is woken rather than one: they are waiting on
+        // different timestamps, and the one this commit unblocks is not
+        // necessarily the one a single wake would reach.
+        self.finished.notify_all();
+        for waker in wakers {
+            waker.wake();
         }
     }
 
@@ -633,11 +671,7 @@ impl PendingCommits {
             table.max_released = table.max_released.max(admitted.commit_ts);
             table.withdrawals += 1;
         }
-        drop(table);
-        // Every waiter is woken rather than one: they are waiting on
-        // different timestamps, and the one this commit unblocks is not
-        // necessarily the one a single wake would reach.
-        self.finished.notify_all();
+        self.wake_all(table);
     }
 
     /// Whether a registration still standing is sealed into `proposal`. While
@@ -667,8 +701,31 @@ impl PendingCommits {
             table.max_released = table.max_released.max(commit_ts);
             table.withdrawals += 1;
         }
-        drop(table);
-        self.finished.notify_all();
+        self.wake_all(table);
+    }
+}
+
+/// [`PendingCommits::complete_at`]'s wait.
+#[derive(Debug)]
+pub struct CompleteAt {
+    pending: Arc<PendingCommits>,
+    ts: u64,
+}
+
+impl Future for CompleteAt {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut table = self.pending.inner.lock();
+        if PendingCommits::first_at(&table, self.ts).is_none() {
+            return Poll::Ready(());
+        }
+        // Registered under the lock the finishing commit takes, so its wake
+        // cannot fall between this check and the registration.
+        if !table.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+            table.wakers.push(cx.waker().clone());
+        }
+        Poll::Pending
     }
 }
 
