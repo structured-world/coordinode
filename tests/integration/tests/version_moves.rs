@@ -3,6 +3,15 @@
 //! write workload, no acknowledged write is lost, reads are served
 //! throughout, and the group pauses its writes exactly once.
 //!
+//! The three members run on one host, so a host that stalls stalls the
+//! whole group: its writes pause beyond the move's own pause, and its
+//! leader may lose its authority. Such an attempt must still be correct (no
+//! acknowledged write lost, every member caught up, one leader at the end).
+//! It is retried only when the host's own pressure counters show the stall
+//! during every extra pause; an extra pause the host does not account for is
+//! a failure at once. The test fails as well when no attempt of three shows
+//! the single pause.
+//!
 //! The server binary must be built with its `test-format-bump` feature (a
 //! workspace build with `--all-features`): `COORDINODE_TEST_ENGINE_FORMAT_BUMP`
 //! then raises the engine format version a process runs.
@@ -204,12 +213,83 @@ struct Observed {
     /// when it was seen, and the leader and term. They tell an election
     /// from a leader that stayed and did not write.
     leadership: Vec<(u16, Instant, String, u64)>,
+    /// The host's pressure counters, sampled: when, and the microseconds
+    /// some task has waited for CPU and for I/O since boot.
+    pressure: Vec<(Instant, u64, u64)>,
+}
+
+/// The host's pressure stall counters (Linux PSI): the microseconds some
+/// task has waited for CPU and for I/O since boot. `None` where the kernel
+/// keeps none, so no stall can be attributed to the host there.
+fn host_pressure() -> Option<(u64, u64)> {
+    let some = |path: &str| -> Option<u64> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .lines()
+            .find(|line| line.starts_with("some"))?
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("total="))?
+            .parse()
+            .ok()
+    };
+    Some((some("/proc/pressure/cpu")?, some("/proc/pressure/io")?))
+}
+
+/// The share of `from..to` (from `started`) during which some task on the
+/// host waited for CPU or for I/O, whichever is larger, read from the
+/// samples around it; `None` without samples covering it.
+fn pressure_share(
+    samples: &[(Instant, u64, u64)],
+    started: Instant,
+    (from, to): (Duration, Duration),
+) -> Option<f64> {
+    let at = |sample: &(Instant, u64, u64)| sample.0.saturating_duration_since(started);
+    let before = samples.iter().rev().find(|s| at(s) <= from)?;
+    let after = samples.iter().find(|s| at(s) >= to)?;
+    let wall = after.0.duration_since(before.0).as_micros() as f64;
+    let cpu = after.1.checked_sub(before.1)? as f64 / wall;
+    let io = after.2.checked_sub(before.2)? as f64 / wall;
+    Some(cpu.max(io))
+}
+
+/// A pause beyond the move's own counts as the host's when some task on the
+/// host waited for CPU or I/O at least this share of it. A process the
+/// group stalls itself (a lock, a stuck commit) waits on neither, and the
+/// group's own load at rest stays well below it.
+const HOST_STALLED: f64 = 0.25;
+
+/// How an attempt of the move went.
+#[derive(Debug)]
+enum Outcome {
+    /// Correct, and the writes paused once, on the completing update.
+    Single,
+    /// Correct, with more pauses, each while the host was stalled.
+    HostStalled(String),
+    /// Correct, with a pause the host does not account for.
+    Unexplained(String),
+}
+
+/// A stall the test causes during the quiet stretch after the first update,
+/// to check how attempts are classified. The stalls are caused only where
+/// the host keeps pressure counters to classify them by.
+#[derive(Clone, Copy)]
+enum Stall {
+    None,
+    /// The leader's process is not scheduled for this long; nothing else on
+    /// the host waits.
+    #[cfg(target_os = "linux")]
+    Leader(Duration),
+    /// No member is scheduled for this long while busy threads keep every
+    /// core of the host contended.
+    #[cfg(target_os = "linux")]
+    Host(Duration),
 }
 
 /// Move a group of three from format bump 0 to 1, member 3 first, member 2
 /// completing the majority (killed when `kill_completing`), member 1 last,
-/// under a continuous workload; check what the move promises.
-async fn move_under_workload(kill_completing: bool) {
+/// under a continuous workload, with `stall` caused after the first update;
+/// check what the move promises. Panics on any incorrect outcome.
+async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
     let ([m1, m2, m3], ports) = group_of_three().await;
     let base = engine_of(&m1);
 
@@ -311,6 +391,21 @@ async fn move_under_workload(kill_completing: bool) {
             }
         })
     };
+    let sampler = {
+        let (stop, observed) = (Arc::clone(&stop), Arc::clone(&observed));
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                if let Some((cpu, io)) = host_pressure() {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .pressure
+                        .push((Instant::now(), cpu, io));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Each member is down from the start of its update until it serves
@@ -327,6 +422,46 @@ async fn move_under_workload(kill_completing: bool) {
         base + 1,
         "the server honours the format bump"
     );
+    match stall {
+        Stall::None => {}
+        #[cfg(target_os = "linux")]
+        Stall::Leader(pause) => {
+            let leader = leadership_of(ports[0])
+                .await
+                .and_then(|(leader, _)| leader.parse::<u64>().ok())
+                .expect("the group has a leader");
+            let member = match leader {
+                1 => &m1,
+                2 => &m2,
+                _ => &m3,
+            };
+            member.freeze_for(pause).await;
+        }
+        #[cfg(target_os = "linux")]
+        Stall::Host(pause) => {
+            let busy = Arc::new(AtomicBool::new(true));
+            let cores = std::thread::available_parallelism().map_or(4, usize::from);
+            let spinners: Vec<_> = (0..2 * cores)
+                .map(|_| {
+                    let busy = Arc::clone(&busy);
+                    std::thread::spawn(move || {
+                        while busy.load(Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                    })
+                })
+                .collect();
+            tokio::join!(
+                m1.freeze_for(pause),
+                m2.freeze_for(pause),
+                m3.freeze_for(pause)
+            );
+            busy.store(false, Ordering::Relaxed);
+            for spinner in spinners {
+                spinner.join().expect("spinner");
+            }
+        }
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let completing = Instant::now();
@@ -348,6 +483,7 @@ async fn move_under_workload(kill_completing: bool) {
     writer.await.expect("writer");
     reader.await.expect("reader");
     watcher.await.expect("watcher");
+    sampler.await.expect("sampler");
     let mut observed = std::mem::take(&mut *observed.lock().unwrap());
     // Held attempts land out of order; the pause check reads acks in time.
     observed.acked.sort_by_key(|(_, at)| *at);
@@ -395,10 +531,10 @@ async fn move_under_workload(kill_completing: bool) {
         );
     }
 
-    // Exactly one write pause, while the completing member restarts. Away
-    // from it the workload acknowledges within a couple hundred
-    // milliseconds even across the other restarts, and the pause itself
-    // runs about a second, so half a second tells them apart.
+    // Write pauses: the move's own runs while the completing member
+    // restarts. Away from it the workload acknowledges within a couple
+    // hundred milliseconds even across the other restarts, and the pause
+    // itself runs about a second, so half a second tells them apart.
     const PAUSE: Duration = Duration::from_millis(500);
     // Every gap between consecutive acknowledgements as (from, to), from
     // the first update's start.
@@ -466,37 +602,146 @@ async fn move_under_workload(kill_completing: bool) {
             )
         })
         .collect();
+    // The host's pressure during each pause, and over the whole run.
+    let shares: Vec<Option<f64>> = pauses
+        .iter()
+        .map(|pause| pressure_share(&observed.pressure, started, *pause))
+        .collect();
+    let overall = observed.pressure.last().and_then(|last| {
+        pressure_share(
+            &observed.pressure,
+            started,
+            (Duration::ZERO, last.0.duration_since(started)),
+        )
+    });
     let seen = format!(
-        "write pauses {pauses:?}, largest gaps {largest:?}; restarts {windows:?} \
-         (ports {ports:?}); slow writes {slow:?}; leadership {leadership:?}"
+        "write pauses {pauses:?} at host pressure {shares:?} (whole run {overall:?}), \
+         largest gaps {largest:?}; restarts {windows:?} (ports {ports:?}); \
+         slow writes {slow:?}; leadership {leadership:?}"
     );
     eprintln!("{seen}");
-    assert_eq!(pauses.len(), 1, "one write pause: {seen}");
-    let (from, to) = pauses[0];
-    let (_, completing_from, completing_to) = down[1];
+
+    // Whatever else happened, the group ends with one leader every member
+    // sees. (Members are sampled every 100 ms, so this does not prove there
+    // never were two leaders; under openraft's advanced leader ids two
+    // leaders of one term with different node ids are allowed anyway, and
+    // safety of the acknowledged writes is what the checks above verify.)
+    let mut settled = HashMap::new();
+    for (port, _, leader, term) in &observed.leadership {
+        settled.insert(*port, (leader.as_str(), *term));
+    }
+    let views: BTreeSet<&(&str, u64)> = settled.values().collect();
     assert!(
-        from <= completing_to.duration_since(started)
-            && to >= completing_from.duration_since(started),
-        "the pause lies on the completing member's update: {seen}"
+        settled.len() == 3
+            && views.len() == 1
+            && views.iter().all(|(leader, _)| !leader.is_empty()),
+        "every member ends seeing the same leader: {settled:?}; {seen}"
     );
+
+    // The move pauses writes on the completing member's update, for about
+    // as long as that update.
+    let (_, completing_from, completing_to) = down[1];
+    let on_update: Vec<&(Duration, Duration)> = pauses
+        .iter()
+        .filter(|(from, to)| {
+            *from <= completing_to.duration_since(started)
+                && *to >= completing_from.duration_since(started)
+        })
+        .collect();
+    assert_eq!(
+        on_update.len(),
+        1,
+        "one pause on the completing member's update: {seen}"
+    );
+    let (from, to) = *on_update[0];
     assert!(
         to - from <= update_time + Duration::from_secs(20),
         "pause {:?} against an update of {update_time:?}",
         to - from
     );
+
+    // And there only. A pause elsewhere counts as the host's only when the
+    // host's pressure counters show it stalled throughout that pause; any
+    // other is unexplained, whatever followed it.
+    let extra: Vec<Option<f64>> = pauses
+        .iter()
+        .zip(&shares)
+        .filter(|(pause, _)| !on_update.contains(pause))
+        .map(|(_, share)| *share)
+        .collect();
+    if extra.is_empty() {
+        Outcome::Single
+    } else if extra
+        .iter()
+        .all(|share| share.is_some_and(|share| share >= HOST_STALLED))
+    {
+        Outcome::HostStalled(seen)
+    } else {
+        Outcome::Unexplained(seen)
+    }
+}
+
+/// Run [`move_under_workload`] until an attempt shows the single pause, at
+/// most three times. Every attempt must be correct; one the host stalled is
+/// reported and retried, one with an unexplained pause fails at once, and
+/// the test fails if no attempt shows the single pause.
+async fn move_until_single_pause(kill_completing: bool) {
+    const ATTEMPTS: usize = 3;
+    let mut stalled = Vec::new();
+    for attempt in 1..=ATTEMPTS {
+        match move_under_workload(kill_completing, Stall::None).await {
+            Outcome::Single => {
+                if !stalled.is_empty() {
+                    eprintln!(
+                        "single pause on attempt {attempt}; host stalls before: {stalled:#?}"
+                    );
+                }
+                return;
+            }
+            Outcome::HostStalled(seen) => {
+                eprintln!("attempt {attempt}: the host stalled the group: {seen}");
+                stalled.push(seen);
+            }
+            Outcome::Unexplained(seen) => {
+                panic!("attempt {attempt}: a write pause the host does not account for: {seen}")
+            }
+        }
+    }
+    panic!("the host stalled every attempt of {ATTEMPTS}: {stalled:#?}");
 }
 
 /// Three members updated one at a time under a continuous workload.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_engine_format_move_loses_no_acknowledged_write() {
-    move_under_workload(false).await;
+    move_until_single_pause(false).await;
 }
 
 /// The same with the completing member killed, so its directory carries an
 /// unapplied and partly uncommitted tail when it opens at the new format.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_move_with_the_completing_member_killed_loses_no_acknowledged_write() {
-    move_under_workload(true).await;
+    move_until_single_pause(true).await;
+}
+
+/// The classification's negative control: the leader's process stops for
+/// 800 ms while the host itself is idle. The writes pause, the move stays
+/// correct, and the pause is not taken for the host's, so it would fail the
+/// tests above at once rather than be retried away.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stall_inside_the_group_is_not_taken_for_the_host() {
+    let outcome = move_under_workload(false, Stall::Leader(Duration::from_millis(800))).await;
+    assert!(matches!(outcome, Outcome::Unexplained(_)), "{outcome:?}");
+}
+
+/// Its positive control: every member stops for 1.5 s while busy threads
+/// contend every core of the host. The move stays correct, and the pause is
+/// taken for the host's, so the tests above would retry the attempt.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_stall_is_told_from_one_inside_the_group() {
+    let outcome = move_under_workload(false, Stall::Host(Duration::from_millis(1500))).await;
+    assert!(matches!(outcome, Outcome::HostStalled(_)), "{outcome:?}");
 }
 
 /// Take the reachable members 1 and 2 of a group from format bump `from` to

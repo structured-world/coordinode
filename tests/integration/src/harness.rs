@@ -496,6 +496,16 @@ impl CoordinodeProcess {
         member_identity(self.port)
     }
 
+    /// Freeze the process for `pause` and let it go on, as a process the
+    /// operating system does not schedule: it holds its sockets and files
+    /// and runs nothing meanwhile.
+    #[cfg(unix)]
+    pub async fn freeze_for(&self, pause: Duration) {
+        signal(&self.child, "STOP");
+        tokio::time::sleep(pause).await;
+        signal(&self.child, "CONT");
+    }
+
     /// Replace this member's certificate and key in place with fresh ones for
     /// its own identity, valid until `not_after` when given, as a renewal
     /// does. The running process reads them on its next reload.
@@ -935,6 +945,16 @@ pub fn request_shutdown(child: &Child) -> std::io::Result<()> {
             Err(std::io::Error::last_os_error())
         }
     }
+}
+
+/// Send `child` the signal `name` through the system `kill` utility.
+#[cfg(unix)]
+fn signal(child: &Child, name: &str) {
+    let sent = Command::new("kill")
+        .args(["-s", name, &child.id().to_string()])
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(sent, "could not send {name} to the server");
 }
 
 /// Start the child in a process group of its own, so a shutdown request (and
