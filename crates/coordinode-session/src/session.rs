@@ -297,8 +297,23 @@ impl Session {
                         let lane = lanes.step(id);
                         self.registry.attach(self.session_id, id);
                         self.spawn(out, Some(slot), move |engine, _, out, slot| async move {
-                            lane.after_previous().await;
                             let request_id = statement.request_id;
+                            // A Cancel or the stream closing ends its wait for
+                            // its turn: it gives its slot back at once and is
+                            // answered, and its place passes on only once the
+                            // command before it has had its turn.
+                            let watch = CloseWatch::cancelling(&out, &statement.cancel.flag);
+                            if !lane.turn_unless(&statement.cancel.flag).await {
+                                drop((watch, statement, slot));
+                                let cancelled = Failure::new(
+                                    ErrorCode::Cancelled,
+                                    "the statement was cancelled",
+                                );
+                                send_error(&out, request_id, cancelled).await;
+                                lane.pass().await;
+                                return;
+                            }
+                            drop(watch);
                             let transaction = InTransaction {
                                 id,
                                 admission: lane.signal(),
@@ -479,12 +494,22 @@ impl Session {
         // received.
         let registered = self.cancels.register(pending.request_id);
         self.spawn(out, slot, move |engine, _, out, slot| async move {
-            lane.after_previous().await;
             let PendingStart { start, request_id } = pending;
             let cancel = registered.flag.clone();
-            // The whole start, its wait included, ends when the stream goes
-            // away: nobody waits for its answer.
+            // The whole start, its wait for its turn and for its bound
+            // included, ends when the stream goes away: nobody waits for its
+            // answer.
             let watch = CloseWatch::cancelling(&out, &cancel);
+            // Cancelled while it waits for its turn, it gives its slot back
+            // and opens nothing; its place passes on only once the command
+            // before it has had its turn.
+            if !lane.turn_unless(&cancel).await {
+                drop((watch, registered, slot));
+                let cancelled = Failure::new(ErrorCode::Cancelled, "the start was cancelled");
+                send_error(&out, request_id, cancelled).await;
+                lane.pass().await;
+                return;
+            }
             // What only waits for others waits on the runtime, holding no
             // thread; what is left opens on the blocking pool.
             let step = match engine.prepare_begin(
@@ -602,6 +627,23 @@ impl LanePosition {
         if let Some(previous) = &self.previous {
             previous.released().await;
         }
+    }
+
+    /// Wait for this command's turn unless `cancel` is thrown first: whether
+    /// it got its turn.
+    async fn turn_unless(&self, cancel: &CancelFlag) -> bool {
+        tokio::select! {
+            biased;
+            () = cancel.thrown() => false,
+            () = self.after_previous() => true,
+        }
+    }
+
+    /// Give up a turn this command will not take, keeping its place: the
+    /// commands after it still wait for the ones before it.
+    async fn pass(&self) {
+        self.after_previous().await;
+        self.mine.release();
     }
 
     /// The signal the owner tells when this command has its place.

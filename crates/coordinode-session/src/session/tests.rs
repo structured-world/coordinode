@@ -1255,6 +1255,143 @@ async fn a_command_past_the_sessions_slots_is_refused_before_it_runs() {
     assert_eq!(slots.available(), 8, "every slot came back");
 }
 
+/// Opens a test engine's gate when dropped, a failed assertion included, so
+/// the statement held at it lets the test's runtime end.
+struct OpensGate(Arc<Gated>);
+
+impl Drop for OpensGate {
+    fn drop(&mut self) {
+        self.0.gate.add_permits(16);
+    }
+}
+
+/// A transaction's three statements, the first held before it takes its place:
+/// returns the session's stream, the slots and the engine. The slots have room
+/// for all three.
+async fn three_in_one_transaction() -> (
+    mpsc::Sender<InOp>,
+    mpsc::Receiver<OutEvent>,
+    CommandSlots,
+    Arc<Gated>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (gated, _abandoned) = Gated::new();
+    let four = SlotCount::new(4).expect("slots");
+    let slots = CommandSlots::new(four, four);
+    let manager = SessionManager::new(
+        Arc::clone(&gated) as Arc<dyn CursorEngine>,
+        Arc::new(SessionRegistry::new()),
+    )
+    .with_command_slots(slots.clone());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, ev_rx) = mpsc::channel(64);
+    let run = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+    op_tx
+        .send((1, statement("held first", Some(txid(7)))))
+        .await
+        .unwrap();
+    op_tx
+        .send((2, statement("middle", Some(txid(7)))))
+        .await
+        .unwrap();
+    op_tx
+        .send((3, statement("third", Some(txid(7)))))
+        .await
+        .unwrap();
+    let taken = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while slots.available() != 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(taken.is_ok(), "the three statements took their slots");
+    (op_tx, ev_rx, slots, gated, run)
+}
+
+/// A statement waiting for its turn in its transaction ends with its cancel:
+/// it is answered cancelled and gives its slot back while the statement
+/// before it still waits, never runs, and keeps its place, so the one after
+/// it runs only once the first has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_statement_waiting_for_its_turn_ends_with_its_cancel() {
+    let (op_tx, mut ev_rx, slots, gated, run) = three_in_one_transaction().await;
+    let _opens = OpensGate(Arc::clone(&gated));
+
+    op_tx
+        .send((
+            4,
+            SessionOp::Cancel {
+                target_request_id: 2,
+            },
+        ))
+        .await
+        .unwrap();
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let (2, event) = ev_rx.recv().await.expect("an event") {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("the waiting statement is answered while the first still waits");
+    assert!(
+        matches!(&cancelled, SessionEvent::Error(f) if f.code == ErrorCode::Cancelled),
+        "{cancelled:?}"
+    );
+    assert_eq!(
+        slots.available(),
+        2,
+        "the cancelled statement's slot is back"
+    );
+    assert!(gated.order.lock().is_empty(), "nothing ran yet");
+
+    gated.gate.add_permits(1);
+    drop(op_tx);
+    while ev_rx.recv().await.is_some() {}
+    run.await.unwrap();
+    assert_eq!(
+        gated.order.lock().as_slice(),
+        ["held first", "third"],
+        "the cancelled statement never ran, and the third waited for the first"
+    );
+    assert_eq!(slots.available(), 4);
+}
+
+/// The stream going away ends the statements waiting for their turn in a
+/// transaction: their slots come back while the statement before them still
+/// waits, and none of them runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn statements_waiting_for_their_turn_end_when_the_stream_closes() {
+    let (op_tx, ev_rx, slots, gated, run) = three_in_one_transaction().await;
+    let _opens = OpensGate(Arc::clone(&gated));
+
+    drop(ev_rx);
+    let returned = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while slots.available() != 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        returned.is_ok(),
+        "the waiting statements still hold their slots: {} free",
+        slots.available()
+    );
+
+    gated.gate.add_permits(1);
+    drop(op_tx);
+    run.await.unwrap();
+    let all_back = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while slots.available() != 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(all_back.is_ok(), "every slot came back");
+    assert_eq!(gated.order.lock().as_slice(), ["held first"]);
+}
+
 /// A rollback only ends work: on a member whose every slot is held it still
 /// reaches the engine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
