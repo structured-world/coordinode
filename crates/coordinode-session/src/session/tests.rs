@@ -1453,10 +1453,39 @@ async fn cancelled_statements_waiting_for_their_turn_leave_nothing_behind() {
     assert_eq!(slots.available(), 2);
 }
 
+/// Wait up to five seconds for `done`; fail with `what` if it never holds.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    let met = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !done() {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    assert!(met.is_ok(), "{what}");
+}
+
+fn in_flight_of(registry: &SessionRegistry) -> u64 {
+    registry.sessions().first().map_or(0, |s| s.in_flight)
+}
+
+fn is_error(event: &SessionEvent, code: ErrorCode) -> bool {
+    matches!(event, SessionEvent::Error(f) if f.code == code)
+}
+
 /// A session whose client stops reading its answers: room for four answers,
-/// three slots, the transaction's first statement held. Twenty statements
-/// are sent and cancelled in turn without reading; whatever the session
-/// cannot take any more stays unsent.
+/// three slots, the transaction's first statement (request 1) held in the
+/// engine. Every step waits for the state it leads to, so what the test then
+/// sees is the session at rest, not work that has not started yet:
+///
+/// - statements 10, 12, 14, 16 each take a slot, are cancelled (by 11, 13,
+///   15, 17) and answer, until the four answers fill the output;
+/// - statements 18 and 20 take the two free slots and are cancelled (by 19,
+///   21): their answers have no room, so they keep their slots;
+/// - statement 22 finds no slot: it is refused, and the refusal has no room
+///   either.
+///
+/// So three commands are in flight (the held one and the two waiting for
+/// room), no slot is free and the output is full.
 async fn unread_session() -> (
     mpsc::Sender<InOp>,
     mpsc::Receiver<OutEvent>,
@@ -1477,120 +1506,195 @@ async fn unread_session() -> (
     let (op_tx, op_rx) = mpsc::channel(64);
     let (ev_tx, ev_rx) = mpsc::channel(4);
     let run = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
-    op_tx
-        .send((1, statement("held first", Some(txid(7)))))
-        .await
-        .unwrap();
-    for round in 0..20u64 {
-        let rid = 10 + round * 2;
-        let send = |op| {
-            let op_tx = op_tx.clone();
-            async move {
-                // A session that stopped reading its input takes no more.
-                let _ = tokio::time::timeout(std::time::Duration::from_millis(100), op_tx.send(op))
-                    .await;
-            }
-        };
-        send((rid, statement("cancelled", Some(txid(7))))).await;
-        send((
+    let cancel = |rid: u64| {
+        (
             rid + 1,
             SessionOp::Cancel {
                 target_request_id: rid,
             },
-        ))
+        )
+    };
+
+    op_tx
+        .send((1, statement("held first", Some(txid(7)))))
+        .await
+        .unwrap();
+    eventually("the first statement took its slot", || {
+        slots.available() == 2 && in_flight_of(&registry) == 1
+    })
+    .await;
+    for answered in 1..=4usize {
+        let rid = 8 + 2 * answered as u64;
+        op_tx
+            .send((rid, statement("cancelled", Some(txid(7)))))
+            .await
+            .unwrap();
+        eventually("the statement took a slot", || slots.available() == 1).await;
+        op_tx.send(cancel(rid)).await.unwrap();
+        eventually(
+            "the cancelled statement answered and gave its slot back",
+            || ev_rx.len() == answered && slots.available() == 2,
+        )
         .await;
-        // Paced as a client would: each cancel takes effect before the
-        // next command is sent.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    for (rid, free) in [(18u64, 1usize), (20, 0)] {
+        op_tx
+            .send((rid, statement("cancelled", Some(txid(7)))))
+            .await
+            .unwrap();
+        eventually(
+            "the statement took a slot: the one cancelled before it kept its own",
+            || slots.available() == free,
+        )
+        .await;
+        op_tx.send(cancel(rid)).await.unwrap();
+    }
+    op_tx
+        .send((22, statement("refused", Some(txid(7)))))
+        .await
+        .unwrap();
+    // Statement 22 taken off the input with no slot free is refused whatever
+    // happens next: nothing frees a slot while the output stays full.
+    eventually("the session took 22 and holds its three commands", || {
+        op_tx.capacity() == op_tx.max_capacity()
+            && in_flight_of(&registry) == 3
+            && slots.available() == 0
+            && ev_rx.len() == 4
+    })
+    .await;
     (op_tx, ev_rx, slots, gated, registry, run)
 }
 
-fn in_flight_of(registry: &SessionRegistry) -> u64 {
-    use coordinode_core::operations::OperationsView;
-    registry.sessions().first().map_or(0, |s| s.in_flight)
+/// The next event, within five seconds; `seen` describes what came before,
+/// for the failure.
+async fn next_event(ev_rx: &mut mpsc::Receiver<OutEvent>, seen: impl std::fmt::Debug) -> OutEvent {
+    tokio::time::timeout(std::time::Duration::from_secs(5), ev_rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("no further event after {seen:?}"))
+        .expect("the stream is open")
 }
 
 /// A client that stops reading its answers cannot make the session hold
 /// more than its slots: a cancelled command keeps its slot until its answer
-/// has room, so with three slots no more than three commands stay in flight
-/// however many the client sends and cancels. Once the client reads again
-/// every answer arrives, and a live statement sent then still runs after the
-/// held first one and only it.
+/// has room, so the session stops at three commands in flight. Read again,
+/// it answers every request it took exactly once (the cancelled ones
+/// cancelled, the one past its slots refused, a Cancel itself never), runs
+/// none of the cancelled ones, and runs a live statement sent meanwhile
+/// after the held first one; that statement's slot is free by the time its
+/// answer arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unread_session_holds_no_more_than_its_slots() {
     let (op_tx, mut ev_rx, slots, gated, registry, run) = unread_session().await;
     let _opens = OpensGate(Arc::clone(&gated));
-    assert!(
-        in_flight_of(&registry) <= 3,
-        "{} commands in flight on three slots",
-        in_flight_of(&registry)
-    );
 
-    // Reading again lets everything waiting for room answer.
-    let reader = tokio::spawn(async move {
-        let mut seen = Vec::new();
-        while let Some((id, event)) = ev_rx.recv().await {
-            let last = id == 100 && matches!(event, SessionEvent::CursorEnd { .. });
-            seen.push((id, event));
-            if last {
-                break;
-            }
-        }
-        (seen, ev_rx)
-    });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        op_tx.send((100, statement("last", Some(txid(7))))),
-    )
-    .await
-    .expect("the session reads its input again")
-    .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The held statement still holds the transaction: every answer that
+    // arrives now comes from a command that waited for room, not its turn.
+    let mut finals: HashMap<u64, SessionEvent> = HashMap::new();
+    while finals.len() < 7 {
+        let (rid, event) = next_event(&mut ev_rx, (&finals, slots.available())).await;
+        assert!(
+            finals.insert(rid, event).is_none(),
+            "request {rid} answered twice"
+        );
+    }
+    for rid in [10, 12, 14, 16, 18, 20] {
+        assert!(
+            finals
+                .get(&rid)
+                .is_some_and(|e| is_error(e, ErrorCode::Cancelled)),
+            "request {rid}: {finals:?}"
+        );
+    }
+    assert!(
+        finals
+            .get(&22)
+            .is_some_and(|e| is_error(e, ErrorCode::ResourceExhausted)),
+        "request 22: {finals:?}"
+    );
+    eventually("the answered commands gave their slots back", || {
+        slots.available() == 2 && in_flight_of(&registry) == 1
+    })
+    .await;
+    op_tx
+        .send((100, statement("last", Some(txid(7)))))
+        .await
+        .unwrap();
+    eventually("the live statement took a slot behind the held one", || {
+        slots.available() == 1 && in_flight_of(&registry) == 2
+    })
+    .await;
     assert!(
         gated.order.lock().is_empty(),
         "nothing ran before the first"
     );
+
+    // The live statements run in their transaction's order; once the first
+    // is admitted the second may run alongside it, so their answers may
+    // interleave, each in its own order.
     gated.gate.add_permits(1);
-    let (_, mut ev_rx) = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
-        .await
-        .expect("the live statement is answered")
-        .unwrap();
+    let mut live: HashMap<u64, Vec<&str>> = HashMap::new();
+    let mut unanswered = 2usize;
+    while unanswered > 0 {
+        let (rid, event) = next_event(&mut ev_rx, (&live, slots.available())).await;
+        let kind = match event {
+            SessionEvent::CursorOpen { .. } => "open",
+            SessionEvent::CursorEnd { .. } => "end",
+            other => panic!("request {rid}: {other:?}"),
+        };
+        live.entry(rid).or_default().push(kind);
+        if kind == "end" {
+            unanswered -= 1;
+            // A client sends its next command on an answer: the answered
+            // statement's slot is back by then.
+            assert!(
+                3 - slots.available() <= unanswered,
+                "request {rid} answered while still holding its slot"
+            );
+        }
+    }
+    assert_eq!(
+        live,
+        HashMap::from([(1, vec!["open", "end"]), (100, vec!["open", "end"])]),
+        "each live statement answers in order, and nothing else does"
+    );
     drop(op_tx);
-    while ev_rx.recv().await.is_some() {}
+    assert!(ev_rx.recv().await.is_none(), "no other answer");
     run.await.unwrap();
     assert_eq!(gated.order.lock().as_slice(), ["held first", "last"]);
-    assert_eq!(slots.available(), 3);
 }
 
-/// A client that stops reading and then goes away leaves nothing behind:
-/// every command still waiting for room for its answer ends and gives its
-/// slot back.
+/// A client that stops reading and then drops its answers' stream, with its
+/// input still open, leaves nothing behind: the commands waiting for room
+/// for their answers end at once, leaving only the statement the engine
+/// still holds, and once that one returns no command is in flight. The
+/// session is open throughout, so this is the commands ending, not their
+/// session's record going away.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unread_session_that_closes_leaves_nothing_behind() {
     let (op_tx, ev_rx, slots, gated, registry, run) = unread_session().await;
     let _opens = OpensGate(Arc::clone(&gated));
-    assert!(
-        in_flight_of(&registry) <= 3,
-        "{} commands in flight on three slots",
-        in_flight_of(&registry)
-    );
 
     drop(ev_rx);
+    eventually("only the statement held in the engine is in flight", || {
+        in_flight_of(&registry) == 1 && slots.available() == 2
+    })
+    .await;
+    assert_eq!(registry.sessions().len(), 1, "the session is still open");
+    assert!(gated.order.lock().is_empty(), "nothing else ran");
+
     gated.gate.add_permits(1);
+    eventually("no command is in flight", || {
+        in_flight_of(&registry) == 0 && slots.available() == 3
+    })
+    .await;
+    assert_eq!(registry.sessions().len(), 1, "the session is still open");
+    assert_eq!(gated.order.lock().as_slice(), ["held first"]);
+
     drop(op_tx);
     tokio::time::timeout(std::time::Duration::from_secs(5), run)
         .await
         .expect("the session ends")
         .unwrap();
-    let freed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while slots.available() != 3 {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await;
-    assert!(freed.is_ok(), "{} slots still held", 3 - slots.available());
 }
 
 /// A step given up in a transaction's lane passes its place to the one before
