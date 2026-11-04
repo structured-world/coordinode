@@ -638,35 +638,57 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
         "every member ends seeing the same leader: {settled:?}; {seen}"
     );
 
-    // The move pauses writes on the completing member's update, for about
-    // as long as that update.
+    // The move's own pause is the one the leadership changes hands in: the
+    // old-format leader gives way once a majority runs the new format, on
+    // the completing member's update. Members are sampled every 100 ms, so a
+    // new term is first seen up to a sampling round after the writes resume.
+    // An election before that update (a stalled host can cause one) is not
+    // the move's.
     let (_, completing_from, completing_to) = down[1];
-    let on_update: Vec<&(Duration, Duration)> = pauses
+    let completing_from = completing_from.duration_since(started);
+    let term_before = observed
+        .leadership
         .iter()
-        .filter(|(from, to)| {
-            *from <= completing_to.duration_since(started)
-                && *to >= completing_from.duration_since(started)
-        })
+        .filter(|(_, at, _, _)| at.duration_since(started) <= completing_from)
+        .map(|(_, _, _, term)| *term)
+        .max()
+        .expect("the members were observed before the update");
+    let handed_over = observed
+        .leadership
+        .iter()
+        .filter(|(_, _, _, term)| *term > term_before)
+        .map(|(_, at, _, _)| at.duration_since(started))
+        .min()
+        .unwrap_or_else(|| panic!("the leadership never changed hands: {seen}"));
+    let round = Duration::from_millis(300);
+    let own: Vec<&(Duration, Duration)> = pauses
+        .iter()
+        .filter(|(from, to)| *from <= handed_over && handed_over <= *to + round)
         .collect();
     assert_eq!(
-        on_update.len(),
+        own.len(),
         1,
-        "one pause on the completing member's update: {seen}"
+        "one pause holds the hand-over at {handed_over:?}: {seen}"
     );
-    let (from, to) = *on_update[0];
+    let (from, to) = *own[0];
+    assert!(
+        from <= completing_to.duration_since(started) && to >= completing_from,
+        "the hand-over pause lies on the completing member's update: {seen}"
+    );
     assert!(
         to - from <= update_time + Duration::from_secs(20),
         "pause {:?} against an update of {update_time:?}",
         to - from
     );
 
-    // And there only. A pause elsewhere counts as the host's only when the
-    // host's pressure counters show it stalled throughout that pause; any
-    // other is unexplained, whatever followed it.
+    // And there only. A pause besides it counts as the host's only when the
+    // host's pressure counters show some task waiting for CPU or I/O at
+    // least `HOST_STALLED` of that pause; any other is unexplained, whatever
+    // followed it.
     let extra: Vec<Option<f64>> = pauses
         .iter()
         .zip(&shares)
-        .filter(|(pause, _)| !on_update.contains(pause))
+        .filter(|(pause, _)| !own.contains(pause))
         .map(|(_, share)| *share)
         .collect();
     if extra.is_empty() {
