@@ -250,49 +250,81 @@ struct Observed {
     /// The test's own cgroup's I/O stall counter, sampled: when, and the
     /// microseconds some task of the group waited on I/O.
     group_io: Vec<(Instant, u64)>,
-    /// The host's CPU time, sampled: when, the time its CPUs were busy and
-    /// the time they existed (both in clock ticks, summed over CPUs).
-    host_cpu: Vec<(Instant, u64, u64)>,
+    /// The host's and the test's own CPU time, sampled together.
+    cpu: Vec<CpuTime>,
 }
 
-/// The host's CPU time so far in clock ticks summed over its CPUs: busy (all
-/// but idle and I/O wait) and in total, from `/proc/stat`. `None` where the
-/// kernel keeps no such counter.
+/// CPU time so far, in microseconds summed over the host's CPUs: the time
+/// the host's CPUs were busy and the time they existed, and the time spent
+/// by the processes of the test's own cgroup (the test and every member, a
+/// member shutting down included).
+#[derive(Debug, Clone, Copy)]
+struct CpuTime {
+    at: Instant,
+    host_busy_us: u64,
+    host_total_us: u64,
+    group_us: u64,
+}
+
+/// The CPU time read now (see [`CpuTime`]); `None` where the kernel keeps
+/// no such counters.
 #[cfg(target_os = "linux")]
-fn host_cpu_ticks() -> Option<(u64, u64)> {
+fn cpu_time() -> Option<CpuTime> {
+    // `/proc/stat` counts in clock ticks of USER_HZ, which Linux fixes at
+    // 100 for user space.
+    const US_PER_TICK: u64 = 10_000;
     let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    // "cpu  user nice system idle iowait irq softirq steal ...".
+    // "cpu  user nice system idle iowait irq softirq steal guest guest_nice";
+    // guest time is already counted in user, so the sum stops at steal.
     let ticks: Vec<u64> = stat
         .lines()
         .next()?
         .strip_prefix("cpu ")?
         .split_whitespace()
+        .take(8)
         .map(|field| field.parse().ok())
         .collect::<Option<_>>()?;
     let total: u64 = ticks.iter().sum();
     let idle = ticks.get(3)? + ticks.get(4)?;
-    Some((total.checked_sub(idle)?, total))
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let group_us = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/cpu.stat"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(CpuTime {
+        at: Instant::now(),
+        host_busy_us: total.checked_sub(idle)? * US_PER_TICK,
+        host_total_us: total * US_PER_TICK,
+        group_us,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn host_cpu_ticks() -> Option<(u64, u64)> {
+fn cpu_time() -> Option<CpuTime> {
     None
 }
 
-/// The share of the host's CPUs that were busy during `from..to` (from
-/// `started`), from the samples around it; `None` without samples covering
-/// it.
-fn host_busy_share(
-    samples: &[(Instant, u64, u64)],
+/// During `from..to` (from `started`), the share of the host's CPUs that
+/// were busy, and the share busy with processes outside the test's cgroup;
+/// `None` without samples covering it.
+fn cpu_shares(
+    samples: &[CpuTime],
     started: Instant,
     (from, to): (Duration, Duration),
-) -> Option<f64> {
-    let at = |sample: &(Instant, u64, u64)| sample.0.saturating_duration_since(started);
+) -> Option<(f64, f64)> {
+    let at = |sample: &CpuTime| sample.at.saturating_duration_since(started);
     let before = samples.iter().rev().find(|s| at(s) <= from)?;
     let after = samples.iter().find(|s| at(s) >= to)?;
-    let busy = after.1.checked_sub(before.1)? as f64;
-    let total = after.2.checked_sub(before.2)? as f64;
-    (total > 0.0).then(|| busy / total)
+    let busy = after.host_busy_us.checked_sub(before.host_busy_us)? as f64;
+    let total = after.host_total_us.checked_sub(before.host_total_us)? as f64;
+    let own = after.group_us.checked_sub(before.group_us)? as f64;
+    // The two counters are read a moment apart, so the group's time can
+    // exceed the host's busy time it is part of by that moment.
+    (total > 0.0).then(|| (busy / total, (busy - own).max(0.0) / total))
 }
 
 /// Microseconds some task of this process's cgroup (v2) has waited on I/O
@@ -449,10 +481,10 @@ fn waited_share(
 /// pause with its leader stopped on a loaded host at most 0.017, and pauses
 /// of commits slowed by the disk 0.15 to 0.33.
 ///
-/// Waiting for CPU does not count. The leader's run-queue delay, summed over
-/// its threads, exceeds the whole pause even in the move's own pause on an
-/// idle host, so it tells nothing apart, and busy threads on every core of
-/// the host did not make the group pause at all.
+/// The leader's own waiting for CPU does not count: its run-queue delay,
+/// summed over its threads, exceeds the whole pause even in the move's own
+/// pause on an idle host, so it tells nothing apart. What the host's other
+/// work takes does (see [`FOREIGN_CPU`]).
 ///
 /// The wait is the whole group's, not the commit path's: a commit held
 /// inside the group (a lock) while the group's disk stalls is taken for the
@@ -463,8 +495,21 @@ fn waited_share(
 /// shown to be independent, so that figure holds only under that
 /// assumption; it is not a measured sensitivity. Nothing read from outside
 /// the process tells the two apart when the stall coincides, and the test
-/// accepts this to stay green on a stalling disk.
+/// accepts this to stay green on a stalling disk. The same holds for
+/// [`FOREIGN_CPU`] on a host busy with other work.
 const HOST_STALLED: f64 = 0.1;
+
+/// A pause beyond the move's own also counts as the host's when processes
+/// outside the test's cgroup kept at least this share of the host's CPUs
+/// busy during it: other work on a shared host starved the group. The
+/// group's own processes are excluded, a member shutting down and the
+/// test's own busy threads included, so a stall made inside the group is
+/// not taken for the host's however busy the group keeps the CPUs.
+/// Measured on a CI host: pauses under other work 0.96 to 0.99 of the
+/// host's CPUs busy with the group's processes using under two of twelve,
+/// and at most 0.4 of the CPUs busy in all, the group included, when
+/// nothing else ran.
+const FOREIGN_CPU: f64 = 0.5;
 
 /// A leadership as members report it: the leader's node id and the term.
 type Identity = (String, u64);
@@ -479,8 +524,9 @@ struct PauseWaits {
     /// The share of the pause some process of the test's cgroup waited on
     /// I/O.
     group_io: Option<f64>,
-    /// The share of the host's CPUs busy during the pause.
-    host_busy: Option<f64>,
+    /// The share of the host's CPUs busy during the pause, and the share
+    /// busy with processes outside the test's cgroup.
+    host_cpu: Option<(f64, f64)>,
     /// How many CPUs each member's process kept busy during it.
     members_cores: Vec<(u16, Option<f64>)>,
 }
@@ -489,18 +535,22 @@ impl std::fmt::Debug for PauseWaits {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "led by {:?}: leader waited {:?}, group I/O {:?}, host CPUs busy {:?}, \
-             cores used by member {:?}",
-            self.leader, self.leader_waited, self.group_io, self.host_busy, self.members_cores
+            "led by {:?}: leader waited {:?}, group I/O {:?}, host CPUs busy (all, outside \
+             the group) {:?}, cores used by member {:?}",
+            self.leader, self.leader_waited, self.group_io, self.host_cpu, self.members_cores
         )
     }
 }
 
 impl PauseWaits {
-    /// Whether the group's disk held it back for [`HOST_STALLED`] of it.
-    /// The leader's waits are shown, not counted (see [`HOST_STALLED`]).
+    /// Whether the group's disk held it back for [`HOST_STALLED`] of it, or
+    /// other work kept [`FOREIGN_CPU`] of the host's CPUs busy. The leader's
+    /// waits and the members' CPU use are shown, not counted.
     fn host_stalled(&self) -> bool {
         self.group_io.is_some_and(|share| share >= HOST_STALLED)
+            || self
+                .host_cpu
+                .is_some_and(|(_, foreign)| foreign >= FOREIGN_CPU)
     }
 }
 
@@ -748,12 +798,8 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
                         .group_io
                         .push((Instant::now(), stalled));
                 }
-                if let Some((busy, total)) = host_cpu_ticks() {
-                    observed
-                        .lock()
-                        .unwrap()
-                        .host_cpu
-                        .push((Instant::now(), busy, total));
+                if let Some(cpu) = cpu_time() {
+                    observed.lock().unwrap().cpu.push(cpu);
                 }
                 for (port, pid) in now {
                     if let Some((ran_ns, queued_ns, blocked_ns)) = waited_of(pid) {
@@ -997,7 +1043,7 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
                 leader,
                 leader_waited,
                 group_io: group_io_share(&observed.group_io, started, *pause),
-                host_busy: host_busy_share(&observed.host_cpu, started, *pause),
+                host_cpu: cpu_shares(&observed.cpu, started, *pause),
                 members_cores: ports
                     .iter()
                     .map(|port| (*port, cores_used(&observed.waits, *port, started, *pause)))
@@ -1062,10 +1108,10 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
     );
 
     // And there only. A pause besides it counts as the host's only when, for
-    // at least `HOST_STALLED` of it, the test's own processes waited on I/O
-    // (see `HOST_STALLED`). A leader stopped or stuck inside the group does
-    // not make them wait, whatever the rest of the host does, so such a pause
-    // is unexplained. The CPU figures are shown, not counted.
+    // at least `HOST_STALLED` of it, the test's own processes waited on I/O,
+    // or work outside the test kept `FOREIGN_CPU` of the host's CPUs busy. A
+    // leader stopped or stuck inside the group causes neither, whatever the
+    // group itself does, so such a pause is unexplained.
     let extra: Vec<&PauseWaits> = pauses
         .iter()
         .zip(&waits)
@@ -1135,10 +1181,10 @@ async fn a_move_with_the_completing_member_killed_loses_no_acknowledged_write() 
 
 /// The classification's negative control: in the first attempt only, the
 /// leader's process stops for 800 ms while busy threads load every core of
-/// the host at the same time; the attempts after it are healthy. The pause
-/// inside the group is not taken for the host's although the host is loaded
-/// meanwhile, so the test fails at once instead of passing on a later
-/// attempt.
+/// the host at the same time; the attempts after it are healthy. The busy
+/// threads are the test's own, so the host's CPUs are busy with the group's
+/// work, not other work: the pause inside the group is not taken for the
+/// host's, and the test fails at once instead of passing on a later attempt.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stall_inside_the_group_on_a_loaded_host_is_not_retried_away() {
@@ -1161,6 +1207,47 @@ async fn a_stall_inside_the_group_on_a_loaded_host_is_not_retried_away() {
 async fn a_stalled_disk_is_told_from_a_stall_inside_the_group() {
     let outcome = move_under_workload(false, Stall::StalledDisk(Duration::from_secs(3))).await;
     assert!(matches!(outcome, Outcome::HostStalled(_)), "{outcome:?}");
+}
+
+/// The CPU check's controls: a host whose CPUs the group itself keeps busy
+/// did not stall the group; one other work keeps busy did, and the group's
+/// share is taken out of the host's busy time before comparing.
+#[test]
+fn only_other_work_on_the_host_counts_as_its_stall() {
+    let t0 = Instant::now();
+    let sample = |ms: u64, busy_us: u64, group_us: u64| CpuTime {
+        at: t0 + Duration::from_millis(ms),
+        host_busy_us: busy_us,
+        host_total_us: ms * 12_000,
+        group_us,
+    };
+    let pause = (Duration::from_millis(1_000), Duration::from_millis(2_000));
+    let waits = |samples: &[CpuTime]| PauseWaits {
+        leader: None,
+        leader_waited: None,
+        group_io: Some(0.0),
+        host_cpu: cpu_shares(samples, t0, pause),
+        members_cores: Vec::new(),
+    };
+
+    // Every CPU busy for the whole second, all of it the group's.
+    let own = [sample(1_000, 0, 0), sample(2_000, 12_000_000, 12_000_000)];
+    assert_eq!(cpu_shares(&own, t0, pause), Some((1.0, 0.0)));
+    assert!(!waits(&own).host_stalled());
+
+    // Every CPU busy, the group using two of the twelve.
+    let other = [sample(1_000, 0, 0), sample(2_000, 12_000_000, 2_000_000)];
+    let (busy, foreign) = cpu_shares(&other, t0, pause).unwrap();
+    assert_eq!(busy, 1.0);
+    assert!((foreign - 10.0 / 12.0).abs() < 1e-9);
+    assert!(waits(&other).host_stalled());
+
+    // A third of the CPUs busy with other work stays below the bound.
+    let some = [sample(1_000, 0, 0), sample(2_000, 6_000_000, 2_000_000)];
+    assert!(!waits(&some).host_stalled());
+
+    // No sample after the pause: nothing to say.
+    assert_eq!(cpu_shares(&own[..1], t0, pause), None);
 }
 
 /// The loss check's negative control: of the two acknowledged attempts at
