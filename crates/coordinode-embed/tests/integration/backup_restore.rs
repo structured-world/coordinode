@@ -818,6 +818,28 @@ fn restored_data_breaking_a_constraint_is_reported() {
     );
 }
 
+/// Every file under `root` with its length, largest first: what an endpoint
+/// at its limit spent its room on.
+fn files_under(root: &std::path::Path) -> Vec<(u64, std::path::PathBuf)> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => dirs.push(path),
+                Ok(meta) => found.push((
+                    meta.len(),
+                    path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
+                )),
+                Err(_) => {}
+            }
+        }
+    }
+    found.sort_by(|a, b| b.cmp(a));
+    found
+}
+
 /// A physical backup of a database opened from its own storage
 /// configuration opens with `Database::open` on the backup directory alone,
 /// with its unique index, text index and vector index answering for the
@@ -887,7 +909,12 @@ fn a_physical_backup_opens_as_a_database_of_its_own() {
     let held = pads(&mut db);
     let backups = tempfile::tempdir().unwrap();
     let target = backups.path().join("backup");
-    db.physical_backup(&target).unwrap();
+    if let Err(refused) = db.physical_backup(&target) {
+        panic!(
+            "the backup at the limit was refused: {refused:?}; the endpoint holds {:#?}",
+            files_under(dir.path())
+        );
+    }
     // What the backup released (flushed memtables, retired journal) may take
     // a few more writes before the limit refuses again.
     let mut refused = false;
