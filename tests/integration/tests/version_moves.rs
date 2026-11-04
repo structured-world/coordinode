@@ -339,10 +339,14 @@ fn waited_share(
 /// The waits are the whole process's, not its commit path's: a commit held
 /// inside the group (a lock) while a loaded host makes the leader's other
 /// threads wait is taken for the host's, and that attempt is retried. Such
-/// a defect fails the test only when it recurs in every attempt; one that
-/// shows up in a fraction `p` of attempts is caught with `p` cubed. Nothing
-/// read from outside the process tells the two apart when the load
-/// coincides, and the test accepts this to stay green on a loaded host.
+/// a defect fails the test only when it occurs, masked this way, in every
+/// attempt: if the three attempts were independent and each showed it with
+/// the same probability `p`, the test would catch it with probability `p`
+/// cubed. The attempts are not shown to be independent, so that figure
+/// holds only under that assumption; it is not a measured sensitivity.
+/// Nothing read from outside
+/// the process tells the two apart when the load coincides, and the test
+/// accepts this to stay green on a loaded host.
 const HOST_STALLED: f64 = 0.25;
 
 /// A leadership as members report it: the leader's node id and the term.
