@@ -1453,6 +1453,146 @@ async fn cancelled_statements_waiting_for_their_turn_leave_nothing_behind() {
     assert_eq!(slots.available(), 2);
 }
 
+/// A session whose client stops reading its answers: room for four answers,
+/// three slots, the transaction's first statement held. Twenty statements
+/// are sent and cancelled in turn without reading; whatever the session
+/// cannot take any more stays unsent.
+async fn unread_session() -> (
+    mpsc::Sender<InOp>,
+    mpsc::Receiver<OutEvent>,
+    CommandSlots,
+    Arc<Gated>,
+    Arc<SessionRegistry>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (gated, _abandoned) = Gated::new();
+    let three = SlotCount::new(3).expect("slots");
+    let slots = CommandSlots::new(three, three);
+    let registry = Arc::new(SessionRegistry::new());
+    let manager = SessionManager::new(
+        Arc::clone(&gated) as Arc<dyn CursorEngine>,
+        Arc::clone(&registry),
+    )
+    .with_command_slots(slots.clone());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, ev_rx) = mpsc::channel(4);
+    let run = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+    op_tx
+        .send((1, statement("held first", Some(txid(7)))))
+        .await
+        .unwrap();
+    for round in 0..20u64 {
+        let rid = 10 + round * 2;
+        let send = |op| {
+            let op_tx = op_tx.clone();
+            async move {
+                // A session that stopped reading its input takes no more.
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(100), op_tx.send(op))
+                    .await;
+            }
+        };
+        send((rid, statement("cancelled", Some(txid(7))))).await;
+        send((
+            rid + 1,
+            SessionOp::Cancel {
+                target_request_id: rid,
+            },
+        ))
+        .await;
+        // Paced as a client would: each cancel takes effect before the
+        // next command is sent.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    (op_tx, ev_rx, slots, gated, registry, run)
+}
+
+fn in_flight_of(registry: &SessionRegistry) -> u64 {
+    use coordinode_core::operations::OperationsView;
+    registry.sessions().first().map_or(0, |s| s.in_flight)
+}
+
+/// A client that stops reading its answers cannot make the session hold
+/// more than its slots: a cancelled command keeps its slot until its answer
+/// has room, so with three slots no more than three commands stay in flight
+/// however many the client sends and cancels. Once the client reads again
+/// every answer arrives, and a live statement sent then still runs after the
+/// held first one and only it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unread_session_holds_no_more_than_its_slots() {
+    let (op_tx, mut ev_rx, slots, gated, registry, run) = unread_session().await;
+    let _opens = OpensGate(Arc::clone(&gated));
+    assert!(
+        in_flight_of(&registry) <= 3,
+        "{} commands in flight on three slots",
+        in_flight_of(&registry)
+    );
+
+    // Reading again lets everything waiting for room answer.
+    let reader = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some((id, event)) = ev_rx.recv().await {
+            let last = id == 100 && matches!(event, SessionEvent::CursorEnd { .. });
+            seen.push((id, event));
+            if last {
+                break;
+            }
+        }
+        (seen, ev_rx)
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        op_tx.send((100, statement("last", Some(txid(7))))),
+    )
+    .await
+    .expect("the session reads its input again")
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        gated.order.lock().is_empty(),
+        "nothing ran before the first"
+    );
+    gated.gate.add_permits(1);
+    let (_, mut ev_rx) = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+        .await
+        .expect("the live statement is answered")
+        .unwrap();
+    drop(op_tx);
+    while ev_rx.recv().await.is_some() {}
+    run.await.unwrap();
+    assert_eq!(gated.order.lock().as_slice(), ["held first", "last"]);
+    assert_eq!(slots.available(), 3);
+}
+
+/// A client that stops reading and then goes away leaves nothing behind:
+/// every command still waiting for room for its answer ends and gives its
+/// slot back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unread_session_that_closes_leaves_nothing_behind() {
+    let (op_tx, ev_rx, slots, gated, registry, run) = unread_session().await;
+    let _opens = OpensGate(Arc::clone(&gated));
+    assert!(
+        in_flight_of(&registry) <= 3,
+        "{} commands in flight on three slots",
+        in_flight_of(&registry)
+    );
+
+    drop(ev_rx);
+    gated.gate.add_permits(1);
+    drop(op_tx);
+    tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("the session ends")
+        .unwrap();
+    let freed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while slots.available() != 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(freed.is_ok(), "{} slots still held", 3 - slots.available());
+}
+
 /// A step given up in a transaction's lane passes its place to the one before
 /// it: the step after waits for that one, is not let through before it, and a
 /// step appended later lines up behind it too, not behind the one given up;

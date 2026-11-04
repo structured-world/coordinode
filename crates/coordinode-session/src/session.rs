@@ -287,8 +287,7 @@ impl Session {
                     None => self.spawn(out, Some(slot), |engine, _, out, slot| async move {
                         let request_id = statement.request_id;
                         let last = execute(&engine, statement, None, &out).await;
-                        drop(slot);
-                        answer(&out, request_id, last).await;
+                        finish(&out, slot, request_id, last).await;
                     }),
                     Some(id) => {
                         // The transaction's first statement carries its begin.
@@ -303,13 +302,14 @@ impl Session {
                             // after it wait for that one, and is answered.
                             let watch = CloseWatch::cancelling(&out, &statement.cancel.flag);
                             if !lane.turn_unless(&statement.cancel.flag).await {
-                                drop((watch, statement, slot));
+                                drop((watch, statement));
                                 lane.pass();
                                 let cancelled = Failure::new(
                                     ErrorCode::Cancelled,
                                     "the statement was cancelled",
                                 );
-                                send_error(&out, request_id, cancelled).await;
+                                let last = Some(SessionEvent::Error(cancelled));
+                                finish(&out, slot, request_id, last).await;
                                 return;
                             }
                             drop(watch);
@@ -319,8 +319,7 @@ impl Session {
                                 start,
                             };
                             let last = execute(&engine, statement, Some(&transaction), &out).await;
-                            drop(slot);
-                            if !answer(&out, request_id, last).await {
+                            if !finish(&out, slot, request_id, last).await {
                                 abandon(engine, id).await;
                             }
                             lane.mine.release();
@@ -350,9 +349,9 @@ impl Session {
                 // request as a start naming an open ID, as when the first
                 // had run.
                 if let Some(earlier) = lanes.starts.insert(transaction, pending) {
-                    self.open_alone(transaction, earlier, lanes, out);
+                    self.open_alone(transaction, earlier, lanes, out).await;
                     if let Some(this) = lanes.starts.remove(&transaction) {
-                        self.open_alone(transaction, this, lanes, out);
+                        self.open_alone(transaction, this, lanes, out).await;
                     }
                 }
             }
@@ -397,8 +396,7 @@ impl Session {
                             Ok(receipt) => SessionEvent::Committed { receipt },
                             Err(failure) => SessionEvent::Error(failure),
                         };
-                        drop(slot);
-                        answer(&out, request_id, Some(event)).await;
+                        finish(&out, slot, request_id, Some(event)).await;
                     },
                 );
             }
@@ -456,8 +454,8 @@ impl Session {
 
     /// Open `transaction` with `pending` as a command of its own, in a slot of
     /// its own. Refused for want of one, it opens nothing, and the begin's
-    /// request says why.
-    fn open_alone(
+    /// request says why, from the session's task like any other refusal.
+    async fn open_alone(
         &self,
         transaction: TransactionId,
         pending: PendingStart,
@@ -467,10 +465,7 @@ impl Session {
         // A start waits for its causal bound like a read: it runs in a slot.
         let Some(slot) = self.slots.take() else {
             self.registry.detach(self.session_id, &transaction);
-            let (out, failure) = (out.clone(), self.engine.busy());
-            tokio::spawn(async move {
-                send_error(&out, pending.request_id, failure).await;
-            });
+            send_error(out, pending.request_id, self.engine.busy()).await;
             return;
         };
         self.open(transaction, pending, Some(slot), lanes, out);
@@ -502,10 +497,10 @@ impl Session {
             // Cancelled while it waits for its turn, it gives its slot back,
             // passes its place to the command before it and opens nothing.
             if !lane.turn_unless(&cancel).await {
-                drop((watch, registered, slot));
+                drop((watch, registered));
                 lane.pass();
                 let cancelled = Failure::new(ErrorCode::Cancelled, "the start was cancelled");
-                send_error(&out, request_id, cancelled).await;
+                finish(&out, slot, request_id, Some(SessionEvent::Error(cancelled))).await;
                 return;
             }
             // What only waits for others waits on the runtime, holding no
@@ -537,16 +532,14 @@ impl Session {
             drop(watch);
             drop(registered);
             lane.mine.release();
-            drop(slot);
-            if let Err(failure) = begun {
-                send_error(&out, request_id, failure).await;
-            }
+            finish(&out, slot, request_id, begun.err().map(SessionEvent::Error)).await;
         });
     }
 
     /// Run `request` on its own task, counted as in flight for its lifetime.
-    /// It is handed `slot` and gives it back before its last answer: a client
-    /// that sends its next command on that answer finds the slot free.
+    /// It is handed `slot` and gives it back once its last answer has room,
+    /// before handing it over: a client that sends its next command on that
+    /// answer finds the slot free.
     fn spawn<F, Fut>(&self, out: &mpsc::Sender<OutEvent>, slot: Option<CommandSlot>, request: F)
     where
         F: FnOnce(
@@ -968,13 +961,26 @@ async fn execute(
     })
 }
 
-/// Send `last`, a request's last event, if it has one. Returns whether the
-/// whole answer was handed to the stream.
-async fn answer(out: &mpsc::Sender<OutEvent>, request_id: u64, last: Option<SessionEvent>) -> bool {
-    match last {
-        Some(event) => out.send((request_id, event)).await.is_ok(),
-        None => false,
-    }
+/// End a request: wait for room for `last`, its last event, while still
+/// holding `slot`, then give the slot back and hand the event over at once.
+/// A client that stops reading thus stops the session at its slots: no
+/// command that gave its slot back is left waiting to send. Returns whether
+/// the whole answer was handed to the stream.
+async fn finish(
+    out: &mpsc::Sender<OutEvent>,
+    slot: Option<CommandSlot>,
+    request_id: u64,
+    last: Option<SessionEvent>,
+) -> bool {
+    let Some(event) = last else {
+        return false;
+    };
+    let Ok(room) = out.reserve().await else {
+        return false;
+    };
+    drop(slot);
+    room.send((request_id, event));
+    true
 }
 
 /// Abort `transaction`, whose statement's answer did not reach the client.
