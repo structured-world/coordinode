@@ -1274,13 +1274,15 @@ async fn three_in_one_transaction() -> (
     CommandSlots,
     Arc<Gated>,
     tokio::task::JoinHandle<()>,
+    Arc<SessionRegistry>,
 ) {
     let (gated, _abandoned) = Gated::new();
     let four = SlotCount::new(4).expect("slots");
     let slots = CommandSlots::new(four, four);
+    let registry = Arc::new(SessionRegistry::new());
     let manager = SessionManager::new(
         Arc::clone(&gated) as Arc<dyn CursorEngine>,
-        Arc::new(SessionRegistry::new()),
+        Arc::clone(&registry),
     )
     .with_command_slots(slots.clone());
     let (op_tx, op_rx) = mpsc::channel(64);
@@ -1305,7 +1307,7 @@ async fn three_in_one_transaction() -> (
     })
     .await;
     assert!(taken.is_ok(), "the three statements took their slots");
-    (op_tx, ev_rx, slots, gated, run)
+    (op_tx, ev_rx, slots, gated, run, registry)
 }
 
 /// A statement waiting for its turn in its transaction ends with its cancel:
@@ -1314,7 +1316,7 @@ async fn three_in_one_transaction() -> (
 /// it runs only once the first has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_statement_waiting_for_its_turn_ends_with_its_cancel() {
-    let (op_tx, mut ev_rx, slots, gated, run) = three_in_one_transaction().await;
+    let (op_tx, mut ev_rx, slots, gated, run, _registry) = three_in_one_transaction().await;
     let _opens = OpensGate(Arc::clone(&gated));
 
     op_tx
@@ -1358,12 +1360,176 @@ async fn a_statement_waiting_for_its_turn_ends_with_its_cancel() {
     assert_eq!(slots.available(), 4);
 }
 
+/// A statement cancelled while it waits for its turn is done: nothing of it
+/// stays behind waiting for the statement before it. With the first held,
+/// twenty statements sent and cancelled one after another leave only the
+/// first in flight, and a live statement sent last still runs after the
+/// first and only it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_statements_waiting_for_their_turn_leave_nothing_behind() {
+    use coordinode_core::operations::OperationsView;
+
+    let (gated, _abandoned) = Gated::new();
+    let _opens = OpensGate(Arc::clone(&gated));
+    let two = SlotCount::new(2).expect("slots");
+    let slots = CommandSlots::new(two, two);
+    let registry = Arc::new(SessionRegistry::new());
+    let manager = SessionManager::new(
+        Arc::clone(&gated) as Arc<dyn CursorEngine>,
+        Arc::clone(&registry),
+    )
+    .with_command_slots(slots.clone());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    let run = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+    let in_flight = || registry.sessions().first().map_or(0, |s| s.in_flight);
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let met = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(met.is_ok(), "{what}");
+    }
+
+    op_tx
+        .send((1, statement("held first", Some(txid(7)))))
+        .await
+        .unwrap();
+    until("the first took its slot", || slots.available() == 1).await;
+    for round in 0..20u64 {
+        let rid = 10 + round * 2;
+        op_tx
+            .send((rid, statement("cancelled", Some(txid(7)))))
+            .await
+            .unwrap();
+        until("the statement took the other slot", || {
+            slots.available() == 0
+        })
+        .await;
+        op_tx
+            .send((
+                rid + 1,
+                SessionOp::Cancel {
+                    target_request_id: rid,
+                },
+            ))
+            .await
+            .unwrap();
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let (id, event) = ev_rx.recv().await.expect("an event")
+                    && id == rid
+                {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the waiting statement is answered");
+        assert!(
+            matches!(&answered, SessionEvent::Error(f) if f.code == ErrorCode::Cancelled),
+            "{answered:?}"
+        );
+        until("its slot came back", || slots.available() == 1).await;
+    }
+    until("only the held statement is in flight", || in_flight() == 1).await;
+
+    op_tx
+        .send((100, statement("last", Some(txid(7)))))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        gated.order.lock().is_empty(),
+        "nothing ran before the first"
+    );
+    gated.gate.add_permits(1);
+    drop(op_tx);
+    while ev_rx.recv().await.is_some() {}
+    run.await.unwrap();
+    assert_eq!(gated.order.lock().as_slice(), ["held first", "last"]);
+    assert_eq!(slots.available(), 2);
+}
+
+/// A step given up in a transaction's lane passes its place to the one before
+/// it: the step after waits for that one, is not let through before it, and a
+/// step appended later lines up behind it too, not behind the one given up;
+/// whichever of the pass and the release comes first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_given_up_passes_its_place_to_the_one_before_it() {
+    let within = std::time::Duration::from_secs(5);
+
+    // In order: the middle gives up while the first still holds its place.
+    let mut lanes = Lanes::default();
+    let first = lanes.step(txid(1));
+    let middle = lanes.step(txid(1));
+    let third = lanes.step(txid(1));
+    let third_step = Arc::clone(&third.mine);
+    let waiting = tokio::spawn(async move { third.after_previous().await });
+    middle.pass();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!waiting.is_finished(), "the third went before the first");
+    let fourth = lanes.step(txid(1));
+    assert!(
+        fourth
+            .mine
+            .before()
+            .is_some_and(|before| Arc::ptr_eq(&before, &third_step)),
+        "a step appended later lines up behind the third"
+    );
+    first.mine.release();
+    tokio::time::timeout(within, waiting)
+        .await
+        .expect("the third goes once the first has")
+        .unwrap();
+    third_step.release();
+    tokio::time::timeout(within, fourth.after_previous())
+        .await
+        .expect("the fourth goes once the third has");
+
+    // A step given up last is skipped when appending: the next one lines up
+    // behind the step before it.
+    let mut lanes = Lanes::default();
+    let held = lanes.step(txid(2));
+    let gone = lanes.step(txid(2));
+    gone.pass();
+    let next = lanes.step(txid(2));
+    assert!(
+        next.mine
+            .before()
+            .is_some_and(|before| Arc::ptr_eq(&before, &held.mine)),
+        "a step given up holds nobody back"
+    );
+
+    // Racing: the middle gives up as the first is released, either first.
+    for round in 0..200u32 {
+        let mut lanes = Lanes::default();
+        let first = lanes.step(txid(3));
+        let middle = lanes.step(txid(3));
+        let third = lanes.step(txid(3));
+        let waiting = tokio::spawn(async move { third.after_previous().await });
+        let (a, b) = (Arc::clone(&first.mine), Arc::clone(&middle.mine));
+        let releases = tokio::spawn(async move { a.release() });
+        let passes = tokio::spawn(async move { b.pass() });
+        releases.await.unwrap();
+        passes.await.unwrap();
+        tokio::time::timeout(within, waiting)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the third never went"))
+            .unwrap();
+    }
+}
+
 /// The stream going away ends the statements waiting for their turn in a
 /// transaction: their slots come back while the statement before them still
 /// waits, and none of them runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn statements_waiting_for_their_turn_end_when_the_stream_closes() {
-    let (op_tx, ev_rx, slots, gated, run) = three_in_one_transaction().await;
+    use coordinode_core::operations::OperationsView;
+
+    let (op_tx, ev_rx, slots, gated, run, registry) = three_in_one_transaction().await;
     let _opens = OpensGate(Arc::clone(&gated));
 
     drop(ev_rx);
@@ -1378,6 +1544,15 @@ async fn statements_waiting_for_their_turn_end_when_the_stream_closes() {
         "the waiting statements still hold their slots: {} free",
         slots.available()
     );
+    // Nothing of them stays behind waiting for the first.
+    let in_flight = || registry.sessions().first().map_or(0, |s| s.in_flight);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while in_flight() != 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "{} still in flight", in_flight());
 
     gated.gate.add_permits(1);
     drop(op_tx);

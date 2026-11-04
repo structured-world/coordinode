@@ -20,7 +20,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::command::{AdmissionSignal, TransactionId};
@@ -299,18 +298,18 @@ impl Session {
                         self.spawn(out, Some(slot), move |engine, _, out, slot| async move {
                             let request_id = statement.request_id;
                             // A Cancel or the stream closing ends its wait for
-                            // its turn: it gives its slot back at once and is
-                            // answered, and its place passes on only once the
-                            // command before it has had its turn.
+                            // its turn: it gives its slot back at once, passes
+                            // its place to the command before it, so the ones
+                            // after it wait for that one, and is answered.
                             let watch = CloseWatch::cancelling(&out, &statement.cancel.flag);
                             if !lane.turn_unless(&statement.cancel.flag).await {
                                 drop((watch, statement, slot));
+                                lane.pass();
                                 let cancelled = Failure::new(
                                     ErrorCode::Cancelled,
                                     "the statement was cancelled",
                                 );
                                 send_error(&out, request_id, cancelled).await;
-                                lane.pass().await;
                                 return;
                             }
                             drop(watch);
@@ -500,14 +499,13 @@ impl Session {
             // included, ends when the stream goes away: nobody waits for its
             // answer.
             let watch = CloseWatch::cancelling(&out, &cancel);
-            // Cancelled while it waits for its turn, it gives its slot back
-            // and opens nothing; its place passes on only once the command
-            // before it has had its turn.
+            // Cancelled while it waits for its turn, it gives its slot back,
+            // passes its place to the command before it and opens nothing.
             if !lane.turn_unless(&cancel).await {
                 drop((watch, registered, slot));
+                lane.pass();
                 let cancelled = Failure::new(ErrorCode::Cancelled, "the start was cancelled");
                 send_error(&out, request_id, cancelled).await;
-                lane.pass().await;
                 return;
             }
             // What only waits for others waits on the runtime, holding no
@@ -599,11 +597,13 @@ impl Lanes {
     /// The step of the next command for transaction `id`, after the one sent
     /// before.
     fn step(&mut self, id: TransactionId) -> LanePosition {
-        // Steps already passed hold nobody back.
-        self.steps.retain(|_, step| !step.is_released());
-        let mine = Arc::new(LaneStep::default());
-        let previous = self.steps.insert(id, Arc::clone(&mine));
-        LanePosition { previous, mine }
+        // Steps nobody holds any more hold nobody back.
+        self.steps.retain(|_, step| step.holder().is_some());
+        // After the step holding the place last, past any given up since.
+        let before = self.steps.get(&id).and_then(LaneStep::holder);
+        let mine = Arc::new(LaneStep::after(before));
+        self.steps.insert(id, Arc::clone(&mine));
+        LanePosition { mine }
     }
 }
 
@@ -617,15 +617,14 @@ struct PendingStart {
 
 /// Where a command stands in its stream's order for one transaction.
 struct LanePosition {
-    previous: Option<Arc<LaneStep>>,
     mine: Arc<LaneStep>,
 }
 
 impl LanePosition {
     /// Wait until the command sent before has its place at the owner.
     async fn after_previous(&self) {
-        if let Some(previous) = &self.previous {
-            previous.released().await;
+        if let Some(before) = self.mine.before() {
+            before.released().await;
         }
     }
 
@@ -639,11 +638,10 @@ impl LanePosition {
         }
     }
 
-    /// Give up a turn this command will not take, keeping its place: the
-    /// commands after it still wait for the ones before it.
-    async fn pass(&self) {
-        self.after_previous().await;
-        self.mine.release();
+    /// Give up a turn this command will not take: the commands after it
+    /// wait for the ones before it instead, and nothing of this one waits.
+    fn pass(&self) {
+        self.mine.pass();
     }
 
     /// The signal the owner tells when this command has its place.
@@ -654,33 +652,103 @@ impl LanePosition {
 }
 
 /// One command's place in its lane: released once the owner has placed it,
-/// or once it has answered, whichever comes first.
-#[derive(Default)]
+/// or once it has answered, whichever comes first. A command that gives its
+/// turn up passes its place to the one before it, so whoever waits for it
+/// waits for that one instead, and nothing of it is left waiting.
 struct LaneStep {
-    released: AtomicBool,
+    place: Mutex<Place>,
     notify: Notify,
 }
 
+/// Where a [`LaneStep`] stands.
+enum Place {
+    /// Holding its place, after `before`, the step sent before it that was
+    /// still holding one then.
+    Held { before: Option<Arc<LaneStep>> },
+    /// Done with: nobody after it waits for it.
+    Released,
+    /// Given up: waiting for it is waiting for `before`.
+    Passed { before: Option<Arc<LaneStep>> },
+}
+
 impl LaneStep {
+    fn after(before: Option<Arc<LaneStep>>) -> Self {
+        Self {
+            place: Mutex::new(Place::Held { before }),
+            notify: Notify::new(),
+        }
+    }
+
     fn release(&self) {
-        if !self.released.swap(true, AtomicOrdering::AcqRel) {
+        let mut place = self.place.lock();
+        // A step given up stays given up: it passed its place on already.
+        if matches!(*place, Place::Held { .. }) {
+            *place = Place::Released;
+            drop(place);
             self.notify.notify_waiters();
         }
     }
 
-    fn is_released(&self) -> bool {
-        self.released.load(AtomicOrdering::Acquire)
+    /// Give this step's place up to the one before it.
+    fn pass(&self) {
+        let mut place = self.place.lock();
+        if let Place::Held { before } = &mut *place {
+            *place = Place::Passed {
+                before: before.take(),
+            };
+            drop(place);
+            self.notify.notify_waiters();
+        }
     }
 
-    async fn released(&self) {
+    /// The step before this one, while it holds its place.
+    fn before(&self) -> Option<Arc<LaneStep>> {
+        match &*self.place.lock() {
+            Place::Held { before } => before.clone(),
+            Place::Released | Place::Passed { .. } => None,
+        }
+    }
+
+    /// The step a command sent after this one waits for: this one, or the
+    /// one it passed its place to; `None` when nobody holds one.
+    fn holder(self: &Arc<Self>) -> Option<Arc<LaneStep>> {
+        let mut at = Arc::clone(self);
         loop {
-            // Registered before the check, so a release between the two is
-            // not missed.
-            let notified = self.notify.notified();
-            if self.is_released() {
-                return;
+            let next = match &*at.place.lock() {
+                Place::Held { .. } => return Some(Arc::clone(&at)),
+                Place::Released | Place::Passed { before: None } => return None,
+                Place::Passed {
+                    before: Some(before),
+                } => Arc::clone(before),
+            };
+            at = next;
+        }
+    }
+
+    /// Wait until nobody holds this step's place any more: it is released,
+    /// or it was given up and the one it passed its place to is.
+    async fn released(self: &Arc<Self>) {
+        let mut at = Arc::clone(self);
+        loop {
+            let next = {
+                // Registered before the check, so a release or a pass
+                // between the two is not missed.
+                let notified = at.notify.notified();
+                let next = match &*at.place.lock() {
+                    Place::Released | Place::Passed { before: None } => return,
+                    Place::Passed {
+                        before: Some(before),
+                    } => Some(Arc::clone(before)),
+                    Place::Held { .. } => None,
+                };
+                if next.is_none() {
+                    notified.await;
+                }
+                next
+            };
+            if let Some(before) = next {
+                at = before;
             }
-            notified.await;
         }
     }
 }
