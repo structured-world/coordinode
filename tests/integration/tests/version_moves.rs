@@ -785,6 +785,7 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
     pids.lock().unwrap().insert(ports[0], m1.pid());
     tokio::time::sleep(Duration::from_secs(3)).await;
 
+    let stopped = Instant::now();
     stop.store(true, Ordering::Release);
     writer.await.expect("writer");
     reader.await.expect("reader");
@@ -848,9 +849,14 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
     // itself runs about a second, so half a second tells them apart.
     const PAUSE: Duration = Duration::from_millis(500);
     // Every gap between consecutive acknowledgements as (from, to), from
-    // the first update's start.
-    let gaps: Vec<(Duration, Duration)> = observed
+    // the first update's start, while the workload ran: once it stops it
+    // sends nothing, and attempts still held land at their own pace.
+    let while_running: Vec<&(Attempt, Instant)> = observed
         .acked
+        .iter()
+        .filter(|(_, at)| *at <= stopped)
+        .collect();
+    let gaps: Vec<(Duration, Duration)> = while_running
         .windows(2)
         .map(|w| {
             (
