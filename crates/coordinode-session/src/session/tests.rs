@@ -1485,16 +1485,19 @@ fn is_error(event: &SessionEvent, code: ErrorCode) -> bool {
 ///   either.
 ///
 /// So three commands are in flight (the held one and the two waiting for
-/// room), no slot is free and the output is full.
+/// room), no slot is free and the output is full. The returned guard opens
+/// the engine's gate when dropped, so a failure here does not leave the
+/// held statement blocking the runtime's end.
 async fn unread_session() -> (
     mpsc::Sender<InOp>,
     mpsc::Receiver<OutEvent>,
     CommandSlots,
-    Arc<Gated>,
+    OpensGate,
     Arc<SessionRegistry>,
     tokio::task::JoinHandle<()>,
 ) {
     let (gated, _abandoned) = Gated::new();
+    let opens = OpensGate(Arc::clone(&gated));
     let three = SlotCount::new(3).expect("slots");
     let slots = CommandSlots::new(three, three);
     let registry = Arc::new(SessionRegistry::new());
@@ -1562,7 +1565,7 @@ async fn unread_session() -> (
             && ev_rx.len() == 4
     })
     .await;
-    (op_tx, ev_rx, slots, gated, registry, run)
+    (op_tx, ev_rx, slots, opens, registry, run)
 }
 
 /// The next event, within five seconds; `seen` describes what came before,
@@ -1584,8 +1587,8 @@ async fn next_event(ev_rx: &mut mpsc::Receiver<OutEvent>, seen: impl std::fmt::D
 /// answer arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unread_session_holds_no_more_than_its_slots() {
-    let (op_tx, mut ev_rx, slots, gated, registry, run) = unread_session().await;
-    let _opens = OpensGate(Arc::clone(&gated));
+    let (op_tx, mut ev_rx, slots, opens, registry, run) = unread_session().await;
+    let gated = Arc::clone(&opens.0);
 
     // The held statement still holds the transaction: every answer that
     // arrives now comes from a command that waited for room, not its turn.
@@ -1671,8 +1674,8 @@ async fn an_unread_session_holds_no_more_than_its_slots() {
 /// session's record going away.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unread_session_that_closes_leaves_nothing_behind() {
-    let (op_tx, ev_rx, slots, gated, registry, run) = unread_session().await;
-    let _opens = OpensGate(Arc::clone(&gated));
+    let (op_tx, ev_rx, slots, opens, registry, run) = unread_session().await;
+    let gated = Arc::clone(&opens.0);
 
     drop(ev_rx);
     eventually("only the statement held in the engine is in flight", || {
