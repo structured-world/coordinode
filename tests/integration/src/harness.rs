@@ -496,6 +496,11 @@ impl CoordinodeProcess {
         member_identity(self.port)
     }
 
+    /// The server's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Freeze the process for `pause` and let it go on, as a process the
     /// operating system does not schedule: it holds its sockets and files
     /// and runs nothing meanwhile.
