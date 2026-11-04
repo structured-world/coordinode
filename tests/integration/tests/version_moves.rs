@@ -239,7 +239,7 @@ struct Observed {
     /// Every local read a member refused: the member, when the request
     /// began and when it was refused, and why.
     refused_reads: Vec<(u16, Instant, Instant, String)>,
-    /// Write attempts that took long: the member, when, how long, and
+    /// Write attempts that took long or were refused: the member, when, how long, and
     /// how it ended. They tell a member that answered slowly from a group
     /// that did not write.
     slow_writes: Vec<(u16, Instant, Duration, Result<(), String>)>,
@@ -519,7 +519,17 @@ async fn with_stalled_disk<T>(
         .map(|n| {
             let (busy, path) = (Arc::clone(&busy), dir.join(format!("stall-{n}")));
             std::thread::spawn(move || {
-                let chunk = vec![0x5a_u8; 8 << 20];
+                // Incompressible, so a compressing file system writes it
+                // all.
+                let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ n as u64;
+                let chunk: Vec<u8> = (0..(8 << 20) / 8)
+                    .flat_map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state.to_le_bytes()
+                    })
+                    .collect();
                 while busy.load(Ordering::Relaxed) {
                     let mut file = std::fs::File::create(&path).expect("stall file");
                     file.write_all(&chunk).expect("stall write");
@@ -600,7 +610,9 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
                         let ok = written.is_ok();
                         {
                             let mut observed = observed.lock().unwrap();
-                            if took > Duration::from_millis(250) {
+                            // A refusal is kept however fast it came: a
+                            // pause of quick refusals says why as well.
+                            if took > Duration::from_millis(250) || !ok {
                                 observed.slow_writes.push((port, at, took, written));
                             }
                             if ok {
@@ -865,30 +877,36 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
             )
         })
         .collect();
-    // Attempts at a member that is down time out by the hundred; only
-    // those overlapping a pause say anything about it, a few per pause so
-    // every pause is accounted for.
+    // Attempts at a member that is down are refused by the hundred; only
+    // those overlapping a pause say anything about it. Per pause, each
+    // member's distinct outcomes, with how many and the first and longest.
     let slow: Vec<String> = pauses
         .iter()
-        .flat_map(|(from, to)| {
-            observed
-                .slow_writes
-                .iter()
-                .filter(move |(_, at, took, _)| {
-                    let begin = at.duration_since(started);
-                    begin < *to && begin + *took > *from
-                })
-                .take(6)
-        })
-        .map(|(port, at, took, written)| {
-            format!(
-                "{port} at {:?} took {took:?} {}",
-                at.duration_since(started),
-                match written {
-                    Ok(()) => "acked",
-                    Err(why) => why.as_str(),
+        .map(|(from, to)| {
+            let mut outcomes: std::collections::BTreeMap<(u16, &str), (usize, Duration, Duration)> =
+                std::collections::BTreeMap::new();
+            for (port, at, took, written) in &observed.slow_writes {
+                let begin = at.duration_since(started);
+                if begin < *to && begin + *took > *from {
+                    let outcome = match written {
+                        Ok(()) => "acked",
+                        Err(why) => why.as_str(),
+                    };
+                    let entry =
+                        outcomes
+                            .entry((*port, outcome))
+                            .or_insert((0, begin, Duration::ZERO));
+                    entry.0 += 1;
+                    entry.2 = entry.2.max(*took);
                 }
-            )
+            }
+            let outcomes: Vec<String> = outcomes
+                .into_iter()
+                .map(|((port, outcome), (count, first, longest))| {
+                    format!("{port} {count}x from {first:?} (longest {longest:?}): {outcome}")
+                })
+                .collect();
+            format!("pause {from:?}..{to:?}: {outcomes:?}")
         })
         .collect();
     let leadership: Vec<String> = observed
