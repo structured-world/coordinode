@@ -247,6 +247,47 @@ struct Observed {
     leadership: Vec<Seen>,
     /// The members' processes' waits, sampled.
     waits: Vec<Waited>,
+    /// The test's own cgroup's I/O stall counter, sampled: when, and the
+    /// microseconds some task of the group waited on I/O.
+    group_io: Vec<(Instant, u64)>,
+}
+
+/// Microseconds some task of this process's cgroup (v2) has waited on I/O
+/// (its `io.pressure`, "some"). The members run as this process's children,
+/// in its cgroup, so this is the I/O the test's own processes waited on,
+/// not the host's. `None` where the kernel keeps no such counter.
+#[cfg(target_os = "linux")]
+fn group_io_stalled_us() -> Option<u64> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+    std::fs::read_to_string(format!("/sys/fs/cgroup{path}/io.pressure"))
+        .ok()?
+        .lines()
+        .find(|line| line.starts_with("some"))?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("total="))?
+        .parse()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn group_io_stalled_us() -> Option<u64> {
+    None
+}
+
+/// The share of `from..to` (from `started`) during which some task of the
+/// test's cgroup waited on I/O, from the samples around it; `None` without
+/// samples covering it.
+fn group_io_share(
+    samples: &[(Instant, u64)],
+    started: Instant,
+    (from, to): (Duration, Duration),
+) -> Option<f64> {
+    let at = |sample: &(Instant, u64)| sample.0.saturating_duration_since(started);
+    let before = samples.iter().rev().find(|s| at(s) <= from)?;
+    let after = samples.iter().find(|s| at(s) >= to)?;
+    let wall = after.0.duration_since(before.0).as_micros() as f64;
+    Some(after.1.checked_sub(before.1)? as f64 / wall)
 }
 
 /// A member's report of who leads, first seen in this form in the answer
@@ -330,27 +371,60 @@ fn waited_share(
     Some(waited / wall)
 }
 
-/// A pause beyond the move's own counts as the host's when the process of
-/// the member that led into it spent at least this share of it waiting for
-/// CPU or block I/O, summed over its threads. A stopped leader waits on
-/// neither, however loaded the host is meanwhile, and a leader at rest
+/// A pause beyond the move's own counts as the host's when, for at least
+/// this share of it, the process of the member that led into it waited for
+/// CPU (its threads' run-queue delay, summed, with their block-I/O delay
+/// where the kernel keeps it) or some process of the test's own cgroup
+/// waited on I/O (a disk the group shares stalling). A stopped leader waits
+/// on neither, however loaded the host is meanwhile, and a group at rest
 /// waits far less.
 ///
-/// The waits are the whole process's, not its commit path's: a commit held
+/// The waits are whole processes', not the commit path's: a commit held
 /// inside the group (a lock) while a loaded host makes the leader's other
-/// threads wait is taken for the host's, and that attempt is retried. Such
-/// a defect fails the test only when it occurs, masked this way, in every
-/// attempt: if the three attempts were independent and each showed it with
-/// the same probability `p`, the test would catch it with probability `p`
-/// cubed. The attempts are not shown to be independent, so that figure
-/// holds only under that assumption; it is not a measured sensitivity.
-/// Nothing read from outside
-/// the process tells the two apart when the load coincides, and the test
-/// accepts this to stay green on a loaded host.
+/// threads wait, or while the group's disk stalls, is taken for the host's,
+/// and that attempt is retried. Such a defect fails the test only when it
+/// occurs, masked this way, in every attempt: if the three attempts were
+/// independent and each showed it with the same probability `p`, the test
+/// would catch it with probability `p` cubed. The attempts are not shown to
+/// be independent, so that figure holds only under that assumption; it is
+/// not a measured sensitivity. Nothing read from outside the process tells
+/// the two apart when the load coincides, and the test accepts this to stay
+/// green on a loaded host or a stalling disk.
 const HOST_STALLED: f64 = 0.25;
 
 /// A leadership as members report it: the leader's node id and the term.
 type Identity = (String, u64);
+
+/// What was waited during one write pause.
+struct PauseWaits {
+    /// Who led into the pause.
+    leader: Option<Identity>,
+    /// The share of the pause the leader's process waited for CPU (or
+    /// block I/O, where the kernel keeps it).
+    leader_waited: Option<f64>,
+    /// The share of the pause some process of the test's cgroup waited on
+    /// I/O.
+    group_io: Option<f64>,
+}
+
+impl std::fmt::Debug for PauseWaits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "led by {:?}: leader waited {:?}, group I/O {:?}",
+            self.leader, self.leader_waited, self.group_io
+        )
+    }
+}
+
+impl PauseWaits {
+    /// Whether the host held the group back for [`HOST_STALLED`] of it.
+    fn host_stalled(&self) -> bool {
+        self.leader_waited
+            .is_some_and(|share| share >= HOST_STALLED)
+            || self.group_io.is_some_and(|share| share >= HOST_STALLED)
+    }
+}
 
 /// Who led as of `at` (from `started`): the last leadership any member
 /// reported by then, when it names one.
@@ -586,6 +660,13 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
                     .iter()
                     .map(|(p, pid)| (*p, *pid))
                     .collect();
+                if let Some(stalled) = group_io_stalled_us() {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .group_io
+                        .push((Instant::now(), stalled));
+                }
                 for (port, pid) in now {
                     if let Some((queued_ns, blocked_ns)) = waited_of(pid) {
                         observed.lock().unwrap().waits.push(Waited {
@@ -796,23 +877,28 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
             .and_then(|n| n.checked_sub(1))
             .and_then(|i| ports.get(i).copied())
     };
-    // For each pause, the member that led into it and the share of the
-    // pause its process waited for CPU or block I/O.
-    let waits: Vec<(Option<Identity>, Option<f64>)> = pauses
+    // For each pause, the member that led into it, the share of the pause
+    // its process waited for CPU (or block I/O), and the share the test's
+    // own processes waited on I/O.
+    let waits: Vec<PauseWaits> = pauses
         .iter()
         .map(|pause| {
             let leader = leader_as_of(&observed.leadership, started, pause.0);
-            let share = leader
+            let leader_waited = leader
                 .as_ref()
                 .and_then(|(node, _)| port_of(node))
                 .and_then(|port| waited_share(&observed.waits, port, started, *pause));
-            (leader, share)
+            PauseWaits {
+                leader,
+                leader_waited,
+                group_io: group_io_share(&observed.group_io, started, *pause),
+            }
         })
         .collect();
     let seen = format!(
-        "write pauses {pauses:?}, each with its leader and the share of it that leader's \
-         process waited {waits:?}, largest gaps {largest:?}; restarts {windows:?} \
-         (ports {ports:?}); slow writes {slow:?}; leadership {leadership:?}"
+        "write pauses {pauses:?}, each with its leader and what was waited in it {waits:?}, \
+         largest gaps {largest:?}; restarts {windows:?} (ports {ports:?}); \
+         slow writes {slow:?}; leadership {leadership:?}"
     );
     eprintln!("{seen}");
 
@@ -865,23 +951,20 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
         to - from
     );
 
-    // And there only. A pause besides it counts as the host's only when the
-    // process of the member that led into it waited for CPU or block I/O at
-    // least `HOST_STALLED` of the pause: the host held the leader back. A
-    // leader stopped or stuck inside the group waits on neither, whatever
-    // the rest of the host does, so such a pause is unexplained.
-    let extra: Vec<Option<f64>> = pauses
+    // And there only. A pause besides it counts as the host's only when, for
+    // at least `HOST_STALLED` of it, the leader's process waited for CPU or
+    // the test's own processes waited on I/O (see `HOST_STALLED`). A leader
+    // stopped or stuck inside the group waits on neither, whatever the rest
+    // of the host does, so such a pause is unexplained.
+    let extra: Vec<&PauseWaits> = pauses
         .iter()
         .zip(&waits)
         .filter(|(pause, _)| !own.contains(pause))
-        .map(|(_, (_, share))| *share)
+        .map(|(_, waited)| waited)
         .collect();
     if extra.is_empty() {
         Outcome::Single
-    } else if extra
-        .iter()
-        .all(|share| share.is_some_and(|share| share >= HOST_STALLED))
-    {
+    } else if extra.iter().all(|waited| waited.host_stalled()) {
         Outcome::HostStalled(seen)
     } else {
         Outcome::Unexplained(seen)
