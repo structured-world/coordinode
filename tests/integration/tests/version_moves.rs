@@ -50,15 +50,31 @@ fn engine_of(member: &CoordinodeProcess) -> u64 {
         .expect("the report names the engine format")
 }
 
-async fn cypher_client(port: u16) -> Option<CypherServiceClient<tonic::transport::Channel>> {
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://[::1]:{port}"))
+async fn channel(port: u16, timeout: Duration) -> Option<tonic::transport::Channel> {
+    tonic::transport::Endpoint::from_shared(format!("http://[::1]:{port}"))
         .expect("endpoint")
         .connect_timeout(Duration::from_millis(500))
-        .timeout(Duration::from_secs(5))
+        .timeout(timeout)
         .connect()
         .await
-        .ok()?;
-    Some(CypherServiceClient::new(channel))
+        .ok()
+}
+
+async fn cypher_client(port: u16) -> Option<CypherServiceClient<tonic::transport::Channel>> {
+    Some(CypherServiceClient::new(
+        channel(port, Duration::from_secs(5)).await?,
+    ))
+}
+
+/// The leader and term the member at `port` reports, if it answers.
+async fn leadership_of(port: u16) -> Option<(String, u64)> {
+    let mut client = ClusterServiceClient::new(channel(port, Duration::from_millis(300)).await?);
+    let status = client
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await
+        .ok()?
+        .into_inner();
+    Some((status.leader_id, status.raft_term))
 }
 
 /// Create node `seq` of `:Move` on the member at `port`, acknowledged at
@@ -184,6 +200,10 @@ struct Observed {
     /// how it ended. They tell a member that answered slowly from a group
     /// that did not write.
     slow_writes: Vec<(u16, Instant, Duration, Result<(), String>)>,
+    /// Each change of the leader and term a member reports: the member,
+    /// when it was seen, and the leader and term. They tell an election
+    /// from a leader that stayed and did not write.
+    leadership: Vec<(u16, Instant, String, u64)>,
 }
 
 /// Move a group of three from format bump 0 to 1, member 3 first, member 2
@@ -269,6 +289,28 @@ async fn move_under_workload(kill_completing: bool) {
             }
         })
     };
+    let watcher = {
+        let (stop, observed) = (Arc::clone(&stop), Arc::clone(&observed));
+        tokio::spawn(async move {
+            let mut last: HashMap<u16, (String, u64)> = HashMap::new();
+            while !stop.load(Ordering::Acquire) {
+                for port in ports {
+                    if let Some(seen) = leadership_of(port).await
+                        && last.get(&port) != Some(&seen)
+                    {
+                        observed.lock().unwrap().leadership.push((
+                            port,
+                            Instant::now(),
+                            seen.0.clone(),
+                            seen.1,
+                        ));
+                        last.insert(port, seen);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Each member is down from the start of its update until it serves
@@ -305,6 +347,7 @@ async fn move_under_workload(kill_completing: bool) {
     stop.store(true, Ordering::Release);
     writer.await.expect("writer");
     reader.await.expect("reader");
+    watcher.await.expect("watcher");
     let mut observed = std::mem::take(&mut *observed.lock().unwrap());
     // Held attempts land out of order; the pause check reads acks in time.
     observed.acked.sort_by_key(|(_, at)| *at);
@@ -413,9 +456,19 @@ async fn move_under_workload(kill_completing: bool) {
             )
         })
         .collect();
+    let leadership: Vec<String> = observed
+        .leadership
+        .iter()
+        .map(|(port, at, leader, term)| {
+            format!(
+                "{port} at {:?} sees leader {leader:?} term {term}",
+                at.duration_since(started)
+            )
+        })
+        .collect();
     let seen = format!(
         "write pauses {pauses:?}, largest gaps {largest:?}; restarts {windows:?} \
-         (ports {ports:?}); slow writes {slow:?}"
+         (ports {ports:?}); slow writes {slow:?}; leadership {leadership:?}"
     );
     eprintln!("{seen}");
     assert_eq!(pauses.len(), 1, "one write pause: {seen}");
