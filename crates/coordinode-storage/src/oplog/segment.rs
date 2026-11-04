@@ -602,6 +602,47 @@ impl SyncHandle {
 #[cfg(any(test, feature = "test-faults"))]
 pub static SYNC_STALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Bytes every segment sync of this process first writes and syncs to a
+/// scratch file next to the system's temporary directory, as a disk the
+/// process shares with other writers makes it wait on real I/O; zero writes
+/// nothing. Unlike [`SYNC_STALL_MS`], the wait is block I/O the kernel
+/// accounts as such.
+#[cfg(any(test, feature = "test-faults"))]
+pub static SYNC_STALL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write `bytes` incompressible bytes to this process's scratch file and
+/// sync them, so the caller waits on the disk.
+#[cfg(any(test, feature = "test-faults"))]
+fn stall_on_disk(bytes: u64) -> std::io::Result<()> {
+    const CHUNK: usize = 1 << 20;
+    // One file per call: syncs of several segments may stall at once.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("coordinode-sync-stall-{}-{n}", std::process::id()));
+    let mut scratch = std::fs::File::create(&path)?;
+    // Incompressible, so a compressing file system writes all of it.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ u64::from(std::process::id());
+    let chunk: Vec<u8> = (0..CHUNK / 8)
+        .flat_map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()
+        })
+        .collect();
+    let mut left = bytes;
+    while left > 0 {
+        let n = left.min(CHUNK as u64);
+        // Bounded by CHUNK.
+        scratch.write_all(&chunk[..n as usize])?;
+        left -= n;
+    }
+    scratch.sync_data()?;
+    drop(scratch);
+    std::fs::remove_file(&path)
+}
+
 /// Make everything written to `file` durable under `sync`.
 fn sync_file(file: &std::fs::File, sync: SyncMethod) -> std::io::Result<()> {
     #[cfg(any(test, feature = "test-faults"))]
@@ -609,6 +650,10 @@ fn sync_file(file: &std::fs::File, sync: SyncMethod) -> std::io::Result<()> {
         let stall = SYNC_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
         if stall > 0 {
             std::thread::sleep(std::time::Duration::from_millis(stall));
+        }
+        let bytes = SYNC_STALL_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        if bytes > 0 {
+            stall_on_disk(bytes)?;
         }
     }
     match sync {

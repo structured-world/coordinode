@@ -374,8 +374,10 @@ fn waited_share(
 /// A pause beyond the move's own counts as the host's when, for at least
 /// this share of it, some process of the test's own cgroup waited on I/O:
 /// the disk the group shares stalled. A leader stopped or held inside the
-/// group adds nothing to it, however loaded the host is meanwhile, and a
-/// group at rest waits on I/O a few thousandths of the time.
+/// group adds nothing to it, however loaded the host is meanwhile. Measured
+/// on a CI host: a group at rest waits on I/O 0.005 to 0.03 of the time, a
+/// pause with its leader stopped on a loaded host at most 0.017, and pauses
+/// of commits slowed by the disk 0.15 to 0.33.
 ///
 /// Waiting for CPU does not count. The leader's run-queue delay, summed over
 /// its threads, exceeds the whole pause even in the move's own pause on an
@@ -392,7 +394,7 @@ fn waited_share(
 /// assumption; it is not a measured sensitivity. Nothing read from outside
 /// the process tells the two apart when the stall coincides, and the test
 /// accepts this to stay green on a stalling disk.
-const HOST_STALLED: f64 = 0.25;
+const HOST_STALLED: f64 = 0.1;
 
 /// A leadership as members report it: the leader's node id and the term.
 type Identity = (String, u64);
@@ -499,52 +501,11 @@ enum Stall {
     /// inside the group that coincides with a loaded host.
     #[cfg(target_os = "linux")]
     LeaderOnLoadedHost(Duration),
-    /// Threads of the test write and sync files on the file system the
-    /// members' data is on for this long; nothing of the group is stopped.
+    /// The disk under every member's Raft log stalls for this long: each of
+    /// its syncs first writes and syncs 64 MiB (the server's test fault), so
+    /// the members wait on real block I/O; nothing of the group is stopped.
     #[cfg(target_os = "linux")]
     StalledDisk(Duration),
-}
-
-/// Keep the file system under `dir` busy with synced writes from `writers`
-/// threads while `during` runs.
-#[cfg(target_os = "linux")]
-async fn with_stalled_disk<T>(
-    dir: &std::path::Path,
-    writers: usize,
-    during: impl std::future::Future<Output = T>,
-) -> T {
-    use std::io::Write as _;
-    let busy = Arc::new(AtomicBool::new(true));
-    let threads: Vec<_> = (0..writers)
-        .map(|n| {
-            let (busy, path) = (Arc::clone(&busy), dir.join(format!("stall-{n}")));
-            std::thread::spawn(move || {
-                // Incompressible, so a compressing file system writes it
-                // all.
-                let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ n as u64;
-                let chunk: Vec<u8> = (0..(8 << 20) / 8)
-                    .flat_map(|_| {
-                        state ^= state << 13;
-                        state ^= state >> 7;
-                        state ^= state << 17;
-                        state.to_le_bytes()
-                    })
-                    .collect();
-                while busy.load(Ordering::Relaxed) {
-                    let mut file = std::fs::File::create(&path).expect("stall file");
-                    file.write_all(&chunk).expect("stall write");
-                    file.sync_data().expect("stall sync");
-                }
-                std::fs::remove_file(&path).ok();
-            })
-        })
-        .collect();
-    let out = during.await;
-    busy.store(false, Ordering::Relaxed);
-    for thread in threads {
-        thread.join().expect("stall writer");
-    }
-    out
 }
 
 /// Keep every core of the host busy with `per_core` threads per core while
@@ -761,9 +722,11 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
         }
         #[cfg(target_os = "linux")]
         Stall::StalledDisk(pause) => {
-            // The members' data directories are made under the temporary
-            // directory, on the file system the writers fill.
-            with_stalled_disk(&std::env::temp_dir(), 4, tokio::time::sleep(pause)).await;
+            tokio::join!(
+                m1.stall_disk_for(pause),
+                m2.stall_disk_for(pause),
+                m3.stall_disk_for(pause)
+            );
         }
     }
     tokio::time::sleep(Duration::from_secs(2)).await;

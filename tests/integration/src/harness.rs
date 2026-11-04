@@ -501,6 +501,16 @@ impl CoordinodeProcess {
         self.child.id()
     }
 
+    /// Stall the disk under the server's Raft log for `pause`: each of its
+    /// syncs meanwhile first writes and syncs 64 MiB, so the process waits
+    /// on real block I/O. Needs a server built with `test-faults`.
+    #[cfg(unix)]
+    pub async fn stall_disk_for(&self, pause: Duration) {
+        signal(&self.child, "USR2");
+        tokio::time::sleep(pause).await;
+        signal(&self.child, "USR2");
+    }
+
     /// Freeze the process for `pause` and let it go on, as a process the
     /// operating system does not schedule: it holds its sockets and files
     /// and runs nothing meanwhile.

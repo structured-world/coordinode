@@ -32,7 +32,8 @@ io-uring = ["coordinode-storage/io-uring"]
 # the server side by side. Never enabled in a release build.
 test-format-bump = ["coordinode-storage/test-format-bump"]
 # Test builds only: SIGUSR1 makes the node's Raft log refuse writes, as a full
-# disk does. Never enabled in a release build.
+# disk does, and SIGUSR2 toggles a stalling disk under its syncs. Never
+# enabled in a release build.
 test-faults = ["coordinode-raft/test-faults"]
 
 [dependencies]

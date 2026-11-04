@@ -1154,6 +1154,22 @@ pub(crate) async fn serve(
                 tracing::warn!("test fault: Raft log writes now fail");
             }
         });
+        // SIGUSR2 starts, and the next one stops, a stalling disk under the
+        // Raft log: each of its syncs first writes and syncs 64 MiB, so the
+        // node waits on real block I/O as a disk shared with other writers
+        // makes it.
+        let mut stall =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+                .map_err(|e| format!("failed to install SIGUSR2 handler: {e}"))?;
+        tokio::spawn(async move {
+            use coordinode_storage::oplog::segment::SYNC_STALL_BYTES;
+            use std::sync::atomic::Ordering;
+            while stall.recv().await.is_some() {
+                let stalled = SYNC_STALL_BYTES.load(Ordering::Relaxed) == 0;
+                SYNC_STALL_BYTES.store(if stalled { 64 << 20 } else { 0 }, Ordering::Relaxed);
+                tracing::warn!(stalled, "test fault: Raft log syncs stall on the disk");
+            }
+        });
     }
     let ops_readiness = readiness.clone();
     // Reading the node's files again, on `POST /reload` and on SIGHUP: a
