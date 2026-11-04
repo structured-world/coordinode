@@ -30,7 +30,9 @@ use tokio::sync::{Notify, mpsc, watch};
 use coordinode_core::budget::CancelFlag;
 use coordinode_core::txn::operation::OperationDescriptor;
 
-use crate::engine::{CursorEngine, EngineError, InTransaction, StatementCall, TransactionStart};
+use crate::engine::{
+    BeginStep, CursorEngine, EngineError, InTransaction, StatementCall, TransactionStart,
+};
 use crate::registry::SessionRegistry;
 use crate::slots::{CommandSlot, CommandSlots, SessionSlots, SlotCount};
 use crate::types::{
@@ -473,37 +475,44 @@ impl Session {
         out: &mpsc::Sender<OutEvent>,
     ) {
         let lane = lanes.step(transaction);
+        // A Cancel naming the begin reaches its start, from the moment it is
+        // received.
+        let registered = self.cancels.register(pending.request_id);
         self.spawn(out, slot, move |engine, _, out, slot| async move {
             lane.after_previous().await;
             let PendingStart { start, request_id } = pending;
-            // The start's wait runs on the runtime, holding no thread, and
-            // ends when the stream goes away: nobody waits for its answer.
-            let cancel = CancelFlag::new();
-            let watch = {
-                let (out, cancel) = (out.clone(), cancel.clone());
-                tokio::spawn(async move {
-                    out.closed().await;
-                    cancel.cancel();
-                })
-            };
-            let waited = match engine.prepare_begin(&start.settings, &cancel) {
+            let cancel = registered.flag.clone();
+            // The whole start, its wait included, ends when the stream goes
+            // away: nobody waits for its answer.
+            let watch = CloseWatch::cancelling(&out, &cancel);
+            // What only waits for others waits on the runtime, holding no
+            // thread; what is left opens on the blocking pool.
+            let step = match engine.prepare_begin(
+                transaction,
+                &start.settings,
+                start.operation.as_ref(),
+                &cancel,
+            ) {
                 Some(ready) => ready.await,
-                None => Ok(()),
+                None => Ok(BeginStep::Ready),
             };
-            watch.abort();
-            let begun = match waited {
-                Ok(()) => {
+            let begun = match step {
+                Ok(BeginStep::Begun) => Ok(()),
+                Ok(BeginStep::Ready) => {
                     blocking(move || {
                         engine.begin_transaction(
                             transaction,
                             &start.settings,
                             start.operation.as_ref(),
+                            &cancel,
                         )
                     })
                     .await
                 }
                 Err(refused) => Err(refused.0),
             };
+            drop(watch);
+            drop(registered);
             lane.mine.release();
             drop(slot);
             if let Err(failure) = begun {

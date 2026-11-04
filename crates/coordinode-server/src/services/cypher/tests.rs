@@ -165,7 +165,12 @@ fn in_txn(
 fn begin_as(svc: &CypherServiceImpl, tx: coordinode_embed::TransactionId) -> Result<(), Status> {
     use coordinode_session::CursorEngine;
     session_engine(svc)
-        .begin_transaction(tx, &coordinode_session::ConnectionSettings::default(), None)
+        .begin_transaction(
+            tx,
+            &coordinode_session::ConnectionSettings::default(),
+            None,
+            &coordinode_core::budget::CancelFlag::new(),
+        )
         .map_err(|e| crate::services::session::status(e.0))
 }
 

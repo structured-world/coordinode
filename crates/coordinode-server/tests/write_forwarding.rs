@@ -9,127 +9,20 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::sync::Arc;
+// Each test binary uses part of the shared members.
+#[allow(dead_code)]
+#[path = "support/members.rs"]
+mod members;
+
 use std::time::Duration;
 
-use coordinode_core::txn::timestamp::TimestampOracle;
-use coordinode_embed::Database;
-use coordinode_embed::replication::routing::{CommandRoutingHandler, MAX_ROUTED_MESSAGE};
-use coordinode_raft::cluster::RaftNode;
-use coordinode_raft::proposal::RaftProposalPipeline;
-use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
 use coordinode_server::proto::{operation, query};
-use coordinode_server::services::cypher::CypherServiceImpl;
-use coordinode_server::services::operation::OperationServiceImpl;
-use coordinode_server::services::routing::ServerCommandExecutor;
-use coordinode_server::services::statement::StatementExecutor;
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_storage::engine::core::StorageEngine;
-use parking_lot::RwLock;
 
-use coordinode_test_fixtures::{TestPki, alloc_port, serve_member_port};
-
-/// The CA the nodes are issued their identities by.
-static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
-
-struct Node {
-    db: Arc<RwLock<Database>>,
-    raft: Arc<RaftNode>,
-    _dir: tempfile::TempDir,
-}
-
-/// Open a node and serve both its Raft and its Cypher API on ONE port, the way
-/// a deployed node does. That is what makes forwarding meaningful: the address
-/// a peer is told to reach in the membership is the same address a client
-/// reaches, so a node can pass a client's request to the leader by the address
-/// it already knows. A node joins the group of `founder`, which listens on
-/// the port given with it; without one it founds a group.
-async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> Node {
-    let dir = tempfile::tempdir().unwrap();
-    let oracle = Arc::new(TimestampOracle::new());
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
-    let connections = PKI.connections(node_id);
-
-    let (raft, raft_handler) = match founder {
-        None => RaftNode::open_cluster_embedded(
-            node_id,
-            Arc::clone(&engine),
-            format!("127.0.0.1:{port}"),
-            connections,
-        )
-        .await
-        .unwrap(),
-        // A joining node learns its own advertised address from the leader's
-        // add_node call, so it takes none here.
-        Some((founder, founder_port)) => {
-            let enrollment = founder
-                .raft
-                .enrollment(format!("127.0.0.1:{founder_port}"))
-                .unwrap();
-            RaftNode::open_joining_embedded(node_id, Arc::clone(&engine), connections, enrollment)
-                .await
-                .unwrap()
-        }
-    };
-    let raft = Arc::new(raft);
-
-    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
-        Arc::new(RaftProposalPipeline::new(Arc::clone(raft.raft())));
-    let db = Arc::new(RwLock::new(
-        Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap(),
-    ));
-
-    let executor = StatementExecutor::new(Arc::clone(&db)).with_raft_node(Arc::clone(&raft));
-    let cypher = CypherServiceImpl::from_executor(executor.clone());
-    let operations = OperationServiceImpl::new(executor.clone());
-    // What a follower passes its clients' statements to the leader through.
-    let routing = CommandRoutingHandler::new(Arc::new(ServerCommandExecutor::new(executor)))
-        .into_service(MAX_ROUTED_MESSAGE);
-
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let context = Arc::clone(raft.connections().unwrap().context());
-    serve_member_port(
-        addr,
-        &context,
-        tonic::service::Routes::new(RaftServiceServer::new(raft_handler))
-            .add_service(query::cypher_service_server::CypherServiceServer::new(
-                cypher,
-            ))
-            .add_service(
-                operation::operation_service_server::OperationServiceServer::new(operations),
-            )
-            .add_service(routing),
-    )
-    .await;
-
-    Node {
-        db,
-        raft,
-        _dir: dir,
-    }
-}
+use members::leader_and_follower;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_sent_to_a_follower_is_carried_to_the_leader() {
-    let (p1, p2) = (alloc_port(), alloc_port());
-
-    let n1 = open_node(1, p1, None).await;
-    let _n2 = open_node(2, p2, Some((&n1, p1))).await;
-
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    n1.raft
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
-    n1.raft.change_membership(vec![1, 2]).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let ((n1, _p1), (_n2, p2)) = leader_and_follower().await;
 
     // The client talks to the FOLLOWER and never learns there is a leader.
     let mut client = query::cypher_service_client::CypherServiceClient::connect(format!(
@@ -181,16 +74,7 @@ async fn a_write_sent_to_a_follower_is_carried_to_the_leader() {
 async fn operation_identity_works_through_a_follower() {
     use tonic_types::StatusExt;
 
-    let (p1, p2) = (alloc_port(), alloc_port());
-    let n1 = open_node(1, p1, None).await;
-    let _n2 = open_node(2, p2, Some((&n1, p1))).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    n1.raft
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
-    n1.raft.change_membership(vec![1, 2]).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let ((n1, p1), (_n2, p2)) = leader_and_follower().await;
 
     let follower = format!("http://127.0.0.1:{p2}");
     let mut operations =

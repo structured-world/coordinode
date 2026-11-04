@@ -160,7 +160,14 @@ fn a_cancelled_statement_answers_with_a_cancellation() {
     assert_eq!(refused.0.code, coordinode_session::ErrorCode::Cancelled);
 
     let id = coordinode_embed::db::draw_transaction_id();
-    engine.begin_transaction(id, &unset(), None).expect("begin");
+    engine
+        .begin_transaction(
+            id,
+            &unset(),
+            None,
+            &coordinode_core::budget::CancelFlag::new(),
+        )
+        .expect("begin");
     let transaction = coordinode_session::InTransaction {
         id,
         admission: AdmissionSignal::new(|| {}),

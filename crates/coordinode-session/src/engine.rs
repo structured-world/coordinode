@@ -83,9 +83,19 @@ pub type Preparing = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Box<dyn PreparedStatement>, EngineError>> + Send>,
 >;
 
-/// What [`CursorEngine::prepare_begin`] returns when it waits for a start.
+/// What [`CursorEngine::prepare_begin`] returns when it takes a start on.
 pub type BeginReady =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EngineError>> + Send>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<BeginStep, EngineError>> + Send>>;
+
+/// Where a start [`CursorEngine::prepare_begin`] took on stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginStep {
+    /// What it waited for is met: [`CursorEngine::begin_transaction`] opens
+    /// the transaction next.
+    Ready,
+    /// The transaction is open: nothing is left of the start.
+    Begun,
+}
 
 /// An error from the query engine, neutral over the engine implementation. It
 /// reaches the client as the request's failure, class and details intact.
@@ -154,13 +164,17 @@ pub trait CursorEngine: Send + Sync {
         None
     }
 
-    /// Wait on the runtime, holding no thread, for what a transaction's start
-    /// with `settings` waits for before [`Self::begin_transaction`] runs (its
-    /// causal bound), until `cancel` is thrown; `None` when nothing does.
-    /// The start's own wait is then met at once.
+    /// Take the start of `transaction` with `settings` and `operation` on the
+    /// runtime, holding no thread, until `cancel` is thrown: whatever of it
+    /// only waits for others (its causal bound, or the whole start where
+    /// another member opens it) waits here. `None` when nothing of it does;
+    /// the session then opens it through [`Self::begin_transaction`], as it
+    /// does after [`BeginStep::Ready`].
     fn prepare_begin(
         &self,
+        _transaction: TransactionId,
         _settings: &ConnectionSettings,
+        _operation: Option<&OperationDescriptor>,
         _cancel: &coordinode_core::budget::CancelFlag,
     ) -> Option<BeginReady> {
         None
@@ -184,12 +198,14 @@ pub trait CursorEngine: Send + Sync {
     /// calls carrying this ID run inside it, reading its pinned snapshot and
     /// buffering writes until `commit_transaction`. A transaction normally
     /// opens with its first statement ([`InTransaction::start`]); this is
-    /// for one whose first command is not a statement.
+    /// for one whose first command is not a statement. `cancel` is the
+    /// start's: thrown, the start stops at its next check.
     fn begin_transaction(
         &self,
         transaction: TransactionId,
         settings: &ConnectionSettings,
         operation: Option<&OperationDescriptor>,
+        cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<(), EngineError>;
 
     /// Commit an interactive transaction once every command that reached it

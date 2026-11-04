@@ -187,6 +187,7 @@ async fn a_repeated_commit_answers_with_the_outcome() {
             txn,
             &coordinode_session::ConnectionSettings::default(),
             None,
+            &coordinode_core::budget::CancelFlag::new(),
         )
         .unwrap();
     s.session

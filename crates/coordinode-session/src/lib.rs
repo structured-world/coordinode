@@ -16,7 +16,7 @@ mod slots;
 mod types;
 
 pub use engine::{
-    BeginReady, CursorEngine, EngineError, InTransaction, PreparedStatement, Preparing,
+    BeginReady, BeginStep, CursorEngine, EngineError, InTransaction, PreparedStatement, Preparing,
     QueryCursor, StatementCall, TransactionStart,
 };
 pub use registry::SessionRegistry;

@@ -31,8 +31,8 @@ use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::WriteStats;
 use coordinode_session::{
-    BeginReady, ConnectionSettings, CursorEngine, EngineError, InTransaction, PreparedStatement,
-    Preparing, QueryCursor, SessionStats, StatementCall, StatementSource,
+    BeginReady, BeginStep, ConnectionSettings, CursorEngine, EngineError, InTransaction,
+    PreparedStatement, Preparing, QueryCursor, SessionStats, StatementCall, StatementSource,
 };
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
@@ -117,6 +117,31 @@ impl DatabaseCursorEngine {
         }))
     }
 
+    /// Start `statement` at `member` on the runtime: until the member answers
+    /// (after whatever it waits for there) this one holds no thread, and a
+    /// Cancel thrown meanwhile drops the call. The rows are paged as
+    /// [`Self::routed`]'s are.
+    async fn routed_async(
+        &self,
+        member: u64,
+        statement: RoutedStatement,
+        admitted: &AdmissionSignal,
+        cancel: coordinode_core::budget::CancelFlag,
+    ) -> Result<Box<dyn PreparedStatement>, EngineError> {
+        let led = statement.transaction.is_none();
+        let rows = unless_cancelled(
+            &cancel,
+            self.executor.route_rows(member, statement, admitted),
+        )
+        .await?;
+        Ok(Box::new(Opened(Box::new(RoutedCursor {
+            rows,
+            cancel,
+            led,
+            history: self.executor.history(),
+        }))))
+    }
+
     /// Wait on the blocking pool for `call`, a command routed to another
     /// member, unless the statement's Cancel is thrown first.
     fn block_on_routed<T>(
@@ -127,15 +152,7 @@ impl DatabaseCursorEngine {
         let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
             EngineError::internal(format!("no runtime to reach another member on: {e}"))
         })?;
-        runtime.block_on(async {
-            tokio::select! {
-                biased;
-                () = cancel.thrown() => Err(engine_error(DatabaseError::Budget(
-                    coordinode_core::budget::BudgetStop::Cancelled,
-                ))),
-                answered = call => answered.map_err(engine_error),
-            }
-        })
+        runtime.block_on(unless_cancelled(cancel, call))
     }
 
     /// The member every command of a transaction runs at, when it is not this
@@ -165,6 +182,52 @@ impl DatabaseCursorEngine {
             source,
             start: None,
         }
+    }
+}
+
+/// Wait for `call`, a command routed to another member, unless `cancel` is
+/// thrown first.
+async fn unless_cancelled<T>(
+    cancel: &coordinode_core::budget::CancelFlag,
+    call: impl std::future::Future<Output = Result<T, DatabaseError>>,
+) -> Result<T, EngineError> {
+    tokio::select! {
+        biased;
+        () = cancel.thrown() => Err(engine_error(DatabaseError::Budget(
+            coordinode_core::budget::BudgetStop::Cancelled,
+        ))),
+        answered = call => answered.map_err(engine_error),
+    }
+}
+
+/// A statement of `transaction` as routed to the leader that holds it: the
+/// session's vector settings go with it, its concerns are the transaction's.
+fn transaction_statement(
+    query: &str,
+    params: Option<HashMap<String, Value>>,
+    settings: &ConnectionSettings,
+    source: Option<SourceContext>,
+    transaction: &InTransaction,
+) -> RoutedStatement {
+    RoutedStatement {
+        actor: ActingContext::Trusted,
+        query: query.to_string(),
+        params: params.unwrap_or_default(),
+        settings: RoutedSettings {
+            vector_consistency: settings.vector_consistency,
+            vector_build_wait: settings.vector_build_wait,
+            query_memory_limit: settings.query_memory_limit,
+            ..RoutedSettings::default()
+        },
+        transaction: Some(transaction.id),
+        operation: None,
+        deadline: None,
+        source,
+        // The transaction's first statement opens it, in the same step.
+        start: transaction
+            .start
+            .as_ref()
+            .map(|start| transaction_start(&start.settings, start.operation.as_ref())),
     }
 }
 
@@ -227,33 +290,15 @@ impl CursorEngine for DatabaseCursorEngine {
         // fence and no commit of its own here. Its session's vector settings
         // still apply.
         if let Some(transaction) = transaction {
-            // The transaction's first statement opens it, in the same step.
-            let start = transaction
-                .start
-                .as_ref()
-                .map(|start| transaction_start(&start.settings, start.operation.as_ref()));
             // Another member leads: the statement runs there, and has its
             // place once the leader says so.
             if let Some(leader) = self.transaction_leader()? {
-                let statement = RoutedStatement {
-                    actor: ActingContext::Trusted,
-                    query: query.to_string(),
-                    params: params.unwrap_or_default(),
-                    settings: RoutedSettings {
-                        vector_consistency: settings.vector_consistency,
-                        vector_build_wait: settings.vector_build_wait,
-                        query_memory_limit: settings.query_memory_limit,
-                        ..RoutedSettings::default()
-                    },
-                    transaction: Some(transaction.id),
-                    operation: None,
-                    deadline: None,
-                    source,
-                    start,
-                };
+                let statement = transaction_statement(query, params, settings, source, transaction);
                 return self.routed(leader, statement, &transaction.admission, cancel);
             }
-            if let Some(start) = start {
+            // The transaction's first statement opens it, in the same step.
+            if let Some(start) = transaction.start.as_ref() {
+                let start = transaction_start(&start.settings, start.operation.as_ref());
                 self.begin_here(transaction.id, start, Some(cancel))?;
             }
             let options = StatementOptions {
@@ -290,6 +335,34 @@ impl CursorEngine for DatabaseCursorEngine {
             return None;
         }
         let engine = Self::from_executor(self.executor.clone());
+        // Another member leads the transaction: the statement runs there, its
+        // start's wait included, and this member only waits for its answer.
+        if slot.as_ref()?.transaction.is_some()
+            && let Ok(Some(leader)) = self.transaction_leader()
+        {
+            let call = slot.take()?;
+            return Some(Box::pin(async move {
+                let StatementCall {
+                    query,
+                    params,
+                    transaction,
+                    settings,
+                    source,
+                    cancel,
+                    ..
+                } = call;
+                let transaction = transaction.ok_or_else(|| {
+                    EngineError::internal("a transaction's statement lost its transaction")
+                })?;
+                let params = (!params.is_empty()).then_some(params);
+                let source = source.as_deref().and_then(source_context);
+                let statement =
+                    transaction_statement(&query, params, &settings, source, &transaction);
+                engine
+                    .routed_async(leader, statement, &transaction.admission, cancel)
+                    .await
+            }));
+        }
         let Some(transaction) = slot.as_ref()?.transaction.as_ref() else {
             let call = slot.take()?;
             return Some(Box::pin(async move {
@@ -304,6 +377,23 @@ impl CursorEngine for DatabaseCursorEngine {
                     .fence(checked, false)
                     .await
                     .map_err(engine_error)?;
+                // Named for the leader: it runs there, and this member only
+                // waits for its answer, holding no thread.
+                if let Admission::Forward(leader) = admission {
+                    let StatementCall {
+                        query,
+                        params,
+                        source,
+                        cancel,
+                        ..
+                    } = call;
+                    let params = (!params.is_empty()).then_some(params);
+                    let source = source.as_deref().and_then(source_context);
+                    let statement = Self::autonomous(&query, params, &requested, source);
+                    return engine
+                        .routed_async(leader, statement, &AdmissionSignal::new(|| {}), cancel)
+                        .await;
+                }
                 Ok(Box::new(Fenced {
                     engine,
                     call,
@@ -337,24 +427,41 @@ impl CursorEngine for DatabaseCursorEngine {
 
     fn prepare_begin(
         &self,
+        transaction: TransactionId,
         settings: &ConnectionSettings,
+        operation: Option<&OperationDescriptor>,
         cancel: &coordinode_core::budget::CancelFlag,
     ) -> Option<BeginReady> {
-        let start = transaction_start(settings, None);
-        // Nothing to wait for, or the leader the start runs at waits for it.
-        if start.after_ts.is_none()
-            || !self.executor.needs_fence()
-            || !matches!(self.transaction_leader(), Ok(None))
-        {
+        // Standalone, nothing waits on others.
+        if !self.executor.needs_fence() {
             return None;
         }
+        let start = transaction_start(settings, operation);
         let (executor, cancel) = (self.executor.clone(), cancel.clone());
-        Some(Box::pin(async move {
-            executor
-                .await_start_bound(start.after_ts, start.causal_wait, None, Some(&cancel))
-                .await
-                .map_err(engine_error)
-        }))
+        match self.transaction_leader() {
+            // A transaction is held by the leader: the whole start runs
+            // there, its wait included, and this member only waits for its
+            // answer.
+            Ok(Some(leader)) => Some(Box::pin(async move {
+                let router = executor.router(leader).map_err(engine_error)?;
+                unless_cancelled(
+                    &cancel,
+                    router.begin(RoutedBegin::new(transaction, ActingContext::Trusted, start)),
+                )
+                .await?;
+                Ok(BeginStep::Begun)
+            })),
+            // This member leads: the start's causal bound is waited for here,
+            // and the start then meets it at once.
+            Ok(None) if start.after_ts.is_some() => Some(Box::pin(async move {
+                executor
+                    .await_start_bound(start.after_ts, start.causal_wait, None, Some(&cancel))
+                    .await
+                    .map_err(engine_error)?;
+                Ok(BeginStep::Ready)
+            })),
+            _ => None,
+        }
     }
 
     fn begin_transaction(
@@ -362,6 +469,7 @@ impl CursorEngine for DatabaseCursorEngine {
         transaction: TransactionId,
         settings: &ConnectionSettings,
         operation: Option<&OperationDescriptor>,
+        cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<(), EngineError> {
         let start = transaction_start(settings, operation);
         // A transaction is held by the leader: on another member it opens
@@ -369,11 +477,11 @@ impl CursorEngine for DatabaseCursorEngine {
         if let Some(leader) = self.transaction_leader()? {
             let router = self.executor.router(leader).map_err(engine_error)?;
             return self.block_on_routed(
-                &coordinode_core::budget::CancelFlag::new(),
+                cancel,
                 router.begin(RoutedBegin::new(transaction, ActingContext::Trusted, start)),
             );
         }
-        self.begin_here(transaction, start, None)
+        self.begin_here(transaction, start, Some(cancel))
     }
 
     fn commit_transaction(
@@ -601,6 +709,15 @@ impl DatabaseCursorEngine {
                 },
             )
             .map_err(engine_error)
+    }
+}
+
+/// A statement already started where it runs: its cursor is all that is left.
+struct Opened(Box<dyn QueryCursor>);
+
+impl PreparedStatement for Opened {
+    fn open(self: Box<Self>) -> Result<Box<dyn QueryCursor>, EngineError> {
+        Ok(self.0)
     }
 }
 

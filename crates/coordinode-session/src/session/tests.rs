@@ -112,6 +112,7 @@ impl CursorEngine for MockEngine {
         _transaction: TransactionId,
         _settings: &ConnectionSettings,
         _operation: Option<&OperationDescriptor>,
+        _cancel: &CancelFlag,
     ) -> Result<(), EngineError> {
         Ok(())
     }
@@ -269,6 +270,7 @@ impl CursorEngine for RecordingEngine {
         transaction: TransactionId,
         settings: &ConnectionSettings,
         operation: Option<&OperationDescriptor>,
+        _cancel: &CancelFlag,
     ) -> Result<(), EngineError> {
         self.calls.lock().push(Call::Begin(
             transaction,
@@ -395,6 +397,7 @@ async fn a_statement_failing_after_its_first_rows_ends_with_the_error() {
             _transaction: TransactionId,
             _settings: &ConnectionSettings,
             _operation: Option<&OperationDescriptor>,
+            _cancel: &coordinode_core::budget::CancelFlag,
         ) -> Result<(), EngineError> {
             Ok(())
         }
@@ -747,6 +750,7 @@ impl CursorEngine for UntilCancelled {
         _transaction: TransactionId,
         _settings: &ConnectionSettings,
         _operation: Option<&OperationDescriptor>,
+        _cancel: &CancelFlag,
     ) -> Result<(), EngineError> {
         Ok(())
     }
@@ -1004,6 +1008,7 @@ async fn a_refused_begin_is_answered() {
             _transaction: TransactionId,
             _settings: &ConnectionSettings,
             _operation: Option<&OperationDescriptor>,
+            _cancel: &coordinode_core::budget::CancelFlag,
         ) -> Result<(), EngineError> {
             Err(EngineError(Failure::new(
                 ErrorCode::AlreadyExists,
@@ -1160,6 +1165,7 @@ impl CursorEngine for Gated {
         _transaction: TransactionId,
         _settings: &ConnectionSettings,
         _operation: Option<&OperationDescriptor>,
+        _cancel: &CancelFlag,
     ) -> Result<(), EngineError> {
         Ok(())
     }
