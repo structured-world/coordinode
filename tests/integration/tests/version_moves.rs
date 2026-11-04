@@ -62,11 +62,11 @@ async fn cypher_client(port: u16) -> Option<CypherServiceClient<tonic::transport
 }
 
 /// Create node `seq` of `:Move` on the member at `port`, acknowledged at
-/// majority with the journal.
-async fn write_seq(port: u16, seq: i64) -> bool {
-    let Some(mut client) = cypher_client(port).await else {
-        return false;
-    };
+/// majority with the journal; why not when it is refused.
+async fn write_seq(port: u16, seq: i64) -> Result<(), String> {
+    let mut client = cypher_client(port)
+        .await
+        .ok_or_else(|| "no connection".to_string())?;
     let mut parameters = HashMap::new();
     parameters.insert(
         "seq".to_string(),
@@ -88,7 +88,8 @@ async fn write_seq(port: u16, seq: i64) -> bool {
             ..Default::default()
         })
         .await
-        .is_ok()
+        .map(drop)
+        .map_err(|status| format!("{:?}: {}", status.code(), status.message()))
 }
 
 /// The `:Move` sequence numbers the member at `port` holds, read locally
@@ -180,9 +181,9 @@ struct Observed {
     acked: Vec<(i64, Instant)>,
     refused_reads: Vec<(u16, Instant, Instant, String)>,
     /// Write attempts that took long: the member, when, how long, and
-    /// whether it was acknowledged. They tell a member that answered slowly
-    /// from a group that did not write.
-    slow_writes: Vec<(u16, Instant, Duration, bool)>,
+    /// how it ended. They tell a member that answered slowly from a group
+    /// that did not write.
+    slow_writes: Vec<(u16, Instant, Duration, Result<(), String>)>,
 }
 
 /// Move a group of three from format bump 0 to 1, member 3 first, member 2
@@ -218,12 +219,13 @@ async fn move_under_workload(kill_completing: bool) {
                     let (observed, done_tx) = (Arc::clone(&observed), done_tx.clone());
                     stragglers.push(tokio::spawn(async move {
                         let at = Instant::now();
-                        let ok = write_seq(port, seq).await;
+                        let written = write_seq(port, seq).await;
                         let took = at.elapsed();
+                        let ok = written.is_ok();
                         {
                             let mut observed = observed.lock().unwrap();
                             if took > Duration::from_millis(250) {
-                                observed.slow_writes.push((port, at, took, ok));
+                                observed.slow_writes.push((port, at, took, written));
                             }
                             if ok {
                                 observed.acked.push((seq, Instant::now()));
@@ -386,22 +388,28 @@ async fn move_under_workload(kill_completing: bool) {
         })
         .collect();
     // Attempts at a member that is down time out by the hundred; only
-    // those overlapping a pause say anything about it.
-    let slow: Vec<String> = observed
-        .slow_writes
+    // those overlapping a pause say anything about it, a few per pause so
+    // every pause is accounted for.
+    let slow: Vec<String> = pauses
         .iter()
-        .filter(|(_, at, took, _)| {
-            let begin = at.duration_since(started);
-            pauses
+        .flat_map(|(from, to)| {
+            observed
+                .slow_writes
                 .iter()
-                .any(|(from, to)| begin < *to && begin + *took > *from)
+                .filter(move |(_, at, took, _)| {
+                    let begin = at.duration_since(started);
+                    begin < *to && begin + *took > *from
+                })
+                .take(6)
         })
-        .take(20)
-        .map(|(port, at, took, ok)| {
+        .map(|(port, at, took, written)| {
             format!(
                 "{port} at {:?} took {took:?} {}",
                 at.duration_since(started),
-                if *ok { "acked" } else { "failed" }
+                match written {
+                    Ok(()) => "acked",
+                    Err(why) => why.as_str(),
+                }
             )
         })
         .collect();
@@ -460,7 +468,7 @@ async fn write_on_leader(ports: &[u16], seq: i64) {
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         for port in ports {
-            if write_seq(*port, seq).await {
+            if write_seq(*port, seq).await.is_ok() {
                 return;
             }
         }
@@ -623,7 +631,7 @@ async fn a_directory_two_formats_behind_goes_through_the_intermediate_one() {
     let m1 = CoordinodeProcess::start_cluster_member_with_env(1, p1, &[p2], &at("0")).await;
     m1.wait_for_leader(Duration::from_secs(20)).await;
     let base = engine_of(&m1);
-    assert!(write_seq(p1, 1).await, "the single member writes");
+    write_seq(p1, 1).await.expect("the single member writes");
     let dir = m1.stop_keeping_data().await;
 
     let (status, printed) =
@@ -647,8 +655,7 @@ async fn a_directory_two_formats_behind_goes_through_the_intermediate_one() {
         BTreeSet::from([1]),
         "the data came through both migrations"
     );
-    assert!(
-        write_seq(p1, 2).await,
-        "and the member writes at the new format"
-    );
+    write_seq(p1, 2)
+        .await
+        .expect("and the member writes at the new format");
 }
