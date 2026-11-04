@@ -139,10 +139,23 @@ pub fn deployment_candidate() -> DeploymentId {
 /// As [`bound_deployment`]; [`StorageError::HistoryDomainMissing`] for an
 /// unbound store holding history.
 pub fn founding_candidate(engine: &StorageEngine) -> StorageResult<DeploymentId> {
-    if let Some(bound) = bound_deployment(engine)? {
+    founding_candidate_from(|| holds_history(engine), || bound_deployment(engine))
+}
+
+/// [`founding_candidate`] over the store's two reads, made in the order this
+/// function chooses: history first. A binding lands before the history it
+/// binds, so history seen by the first read has its binding visible to the
+/// second; read the other way round, another founder landing both between
+/// the reads would look like history whose binding was lost.
+fn founding_candidate_from(
+    holds_history: impl FnOnce() -> StorageResult<bool>,
+    bound: impl FnOnce() -> StorageResult<Option<DeploymentId>>,
+) -> StorageResult<DeploymentId> {
+    let holds = holds_history()?;
+    if let Some(bound) = bound()? {
         return Ok(bound);
     }
-    if holds_history(engine)? {
+    if holds {
         return Err(StorageError::HistoryDomainMissing);
     }
     Ok(deployment_candidate())

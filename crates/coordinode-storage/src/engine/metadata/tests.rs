@@ -611,3 +611,38 @@ fn a_retired_label_is_rebound_only_above_its_retirement() {
     assert_eq!(again.state, BindingState::Implicit);
     assert!(again.id > first.id, "a new identity, never the retired one");
 }
+
+/// Another founder lands its binding and then its history between this
+/// store's two reads. Whichever read comes first, the store must not take
+/// that history for one whose binding was lost: it reads the founder's
+/// binding back, or proposes a candidate the ordered decision will drop.
+#[test]
+fn a_founder_landing_between_the_reads_is_not_a_lost_binding() {
+    use std::cell::Cell;
+
+    let founded = DeploymentId([7; 16]);
+    // Reads made so far; the other founder lands after the first one.
+    let reads = Cell::new(0u32);
+    let landed = || {
+        let before = reads.get();
+        reads.set(before + 1);
+        before > 0
+    };
+    let candidate = founding_candidate_from(|| Ok(landed()), || Ok(landed().then_some(founded)));
+    assert!(
+        candidate.is_ok(),
+        "the founder's history taken for an unbound store's: {candidate:?}"
+    );
+    assert_eq!(reads.get(), 2);
+
+    // History with no binding at all stays refused.
+    assert!(matches!(
+        founding_candidate_from(|| Ok(true), || Ok(None)),
+        Err(StorageError::HistoryDomainMissing)
+    ));
+    // A bound store reads its binding back.
+    assert_eq!(
+        founding_candidate_from(|| Ok(true), || Ok(Some(founded))).unwrap(),
+        founded
+    );
+}
