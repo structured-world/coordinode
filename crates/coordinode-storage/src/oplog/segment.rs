@@ -648,10 +648,14 @@ fn sync_file(file: &std::fs::File, sync: SyncMethod) -> std::io::Result<()> {
     #[cfg(any(test, feature = "test-faults"))]
     {
         let stall = SYNC_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes = SYNC_STALL_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        if stall > 0 || bytes > 0 {
+            // Counted, so a test sees the stall reach a sync and stop.
+            metrics::counter!("coordinode_test_stalled_syncs_total").increment(1);
+        }
         if stall > 0 {
             std::thread::sleep(std::time::Duration::from_millis(stall));
         }
-        let bytes = SYNC_STALL_BYTES.load(std::sync::atomic::Ordering::Relaxed);
         if bytes > 0 {
             stall_on_disk(bytes)?;
         }

@@ -60,8 +60,20 @@ async fn leadership_of(port: u16) -> Option<(String, u64)> {
     Some((status.leader_id, status.raft_term))
 }
 
-/// Create `:Stalled {seq}` through the member at `port`, acknowledged at
-/// majority with the journal; why not when it is refused.
+/// One write attempt: its number and the member it was sent through. A
+/// number refused or unanswered by one member is sent through the next, and
+/// the first attempt may still have committed, so each attempt is its own
+/// node, told apart by `via`, and every acknowledged one is checked itself.
+type Attempt = (i64, u16);
+
+/// The acknowledged attempts `held` lacks. Another attempt at the same
+/// number, acknowledged or not, does not stand in for one.
+fn lost_attempts(acked: &BTreeSet<Attempt>, held: &BTreeSet<Attempt>) -> Vec<Attempt> {
+    acked.difference(held).copied().collect()
+}
+
+/// Create `:Stalled {seq, via}` through the member at `port`, acknowledged
+/// at majority with the journal; why not when it is refused.
 async fn write_seq(port: u16, seq: i64) -> Result<(), String> {
     let mut client = CypherServiceClient::new(
         channel(port, Duration::from_secs(10))
@@ -75,9 +87,15 @@ async fn write_seq(port: u16, seq: i64) -> Result<(), String> {
             value: Some(Pv::IntValue(seq)),
         },
     );
+    parameters.insert(
+        "via".to_string(),
+        PropertyValue {
+            value: Some(Pv::IntValue(i64::from(port))),
+        },
+    );
     client
         .execute_cypher(ExecuteCypherRequest {
-            query: "CREATE (:Stalled {seq: $seq})".to_string(),
+            query: "CREATE (:Stalled {seq: $seq, via: $via})".to_string(),
             parameters,
             write_concern: Some(WriteConcern {
                 w: Some(W::Mode(WriteConcernMode::Majority as i32)),
@@ -91,8 +109,8 @@ async fn write_seq(port: u16, seq: i64) -> Result<(), String> {
         .map_err(|status| format!("{:?}: {}", status.code(), status.message()))
 }
 
-/// The `:Stalled` numbers the member at `port` holds, read from itself.
-async fn held(port: u16) -> Result<BTreeSet<i64>, String> {
+/// The `:Stalled` attempts the member at `port` holds, read from itself.
+async fn held(port: u16) -> Result<BTreeSet<Attempt>, String> {
     let mut client = CypherServiceClient::new(
         channel(port, Duration::from_secs(5))
             .await
@@ -100,7 +118,7 @@ async fn held(port: u16) -> Result<BTreeSet<i64>, String> {
     );
     let rows = client
         .execute_cypher(ExecuteCypherRequest {
-            query: "MATCH (n:Stalled) RETURN n.seq AS seq".to_string(),
+            query: "MATCH (n:Stalled) RETURN n.seq AS seq, n.via AS via".to_string(),
             read_preference: 5, // NEAREST: answered where the request lands
             read_concern: Some(ReadConcern {
                 level: 1, // LOCAL
@@ -114,9 +132,11 @@ async fn held(port: u16) -> Result<BTreeSet<i64>, String> {
         .rows;
     Ok(rows
         .iter()
-        .map(|row| match &row.values[0].value {
-            Some(Pv::IntValue(seq)) => *seq,
-            other => panic!("unexpected seq {other:?}"),
+        .map(|row| match (&row.values[0].value, &row.values[1].value) {
+            (Some(Pv::IntValue(seq)), Some(Pv::IntValue(via))) => {
+                (*seq, u16::try_from(*via).expect("a via is a port"))
+            }
+            other => panic!("unexpected attempt {other:?}"),
         })
         .collect())
 }
@@ -166,8 +186,8 @@ async fn group_of_three() -> ([CoordinodeProcess; 3], [u16; 3]) {
 
 /// Write numbers one after another for `run`, each through `first` and,
 /// when that member refuses it, through the others: every acknowledged
-/// number with when it was acknowledged.
-async fn write_for(ports: [u16; 3], first: u16, run: Duration) -> Vec<(i64, Instant)> {
+/// attempt with when it was acknowledged.
+async fn write_for(ports: [u16; 3], first: u16, run: Duration) -> Vec<(Attempt, Instant)> {
     let until = Instant::now() + run;
     let order: Vec<u16> = std::iter::once(first)
         .chain(ports.into_iter().filter(|p| *p != first))
@@ -178,7 +198,7 @@ async fn write_for(ports: [u16; 3], first: u16, run: Duration) -> Vec<(i64, Inst
         seq += 1;
         for port in &order {
             if write_seq(*port, seq).await.is_ok() {
-                acked.push((seq, Instant::now()));
+                acked.push(((seq, *port), Instant::now()));
                 break;
             }
         }
@@ -186,18 +206,64 @@ async fn write_for(ports: [u16; 3], first: u16, run: Duration) -> Vec<(i64, Inst
     acked
 }
 
-/// Every member holds every acknowledged number and reports the same leader,
-/// within the time a member needs to catch up.
-async fn every_member_holds(ports: [u16; 3], acked: &BTreeSet<i64>) {
+/// The member's count of its log syncs held by a stalled disk.
+fn stalled_syncs(member: &CoordinodeProcess) -> f64 {
+    member
+        .metric("coordinode_test_stalled_syncs_total")
+        .unwrap_or(0.0)
+}
+
+/// Whether a stall reached the member's syncs and let go of them, from its
+/// count before the stall, once the stall was released, and a while after:
+/// held syncs while it lasted, none since.
+fn stall_engaged(before: f64, released: f64, later: f64) -> Result<(), String> {
+    if released <= before {
+        return Err(format!(
+            "no sync was held: {before} before, {released} at release"
+        ));
+    }
+    if later != released {
+        return Err(format!(
+            "syncs still held after release: {released} at release, {later} later"
+        ));
+    }
+    Ok(())
+}
+
+/// Stall `member`'s own disk for [`STALL`] while writes run, and require
+/// that the stall held its syncs and released them; the count of a member
+/// left alone over the same span must show no stall, or the check could not
+/// tell a stall from none.
+async fn stall_and_check(member: &CoordinodeProcess, untouched: &CoordinodeProcess) {
+    let (before, untouched_before) = (stalled_syncs(member), stalled_syncs(untouched));
+    member.stall_disk_for(STALL).await;
+    // The release is a signal the member handles on its own time; a sync
+    // begun before it lands is still held and counted.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (released, untouched_released) = (stalled_syncs(member), stalled_syncs(untouched));
+    // Writes go on meanwhile, so a sync still held would count.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (later, untouched_later) = (stalled_syncs(member), stalled_syncs(untouched));
+    stall_engaged(before, released, later).unwrap_or_else(|why| panic!("{why}"));
+    assert!(
+        stall_engaged(untouched_before, untouched_released, untouched_later).is_err(),
+        "a member left alone counts held syncs: {untouched_before}, {untouched_released}, \
+         {untouched_later}"
+    );
+}
+
+/// Every member holds every acknowledged attempt and reports the same
+/// leader, within the time a member needs to catch up.
+async fn every_member_holds(ports: [u16; 3], acked: &BTreeSet<Attempt>) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let mut missing = Vec::new();
         for port in ports {
             match held(port).await {
-                Ok(seqs) => {
-                    let lacks: Vec<i64> = acked.difference(&seqs).copied().collect();
+                Ok(attempts) => {
+                    let lacks = lost_attempts(acked, &attempts);
                     if !lacks.is_empty() {
-                        missing.push(format!("{port} lacks {} of them", lacks.len()));
+                        missing.push(format!("{port} lacks {lacks:?}"));
                     }
                 }
                 Err(why) => missing.push(format!("{port}: {why}")),
@@ -232,11 +298,12 @@ async fn a_followers_slow_disk_does_not_hold_the_group_back() {
     let leadership = leadership_of(ports[0]).await.expect("the leader answers");
     assert_eq!(leadership.0, "1", "member 1 leads");
 
-    let writer = tokio::spawn(write_for(ports, ports[0], STALL + Duration::from_secs(4)));
+    let writer = tokio::spawn(write_for(ports, ports[0], STALL + Duration::from_secs(5)));
     tokio::time::sleep(Duration::from_secs(2)).await;
     let stalled_from = Instant::now();
-    members[1].stall_disk_for(STALL).await;
-    let stalled_to = Instant::now();
+    stall_and_check(&members[1], &members[2]).await;
+    // The stall itself, without the check's wait after it.
+    let stalled_to = stalled_from + STALL;
     let acked = writer.await.expect("writer");
 
     // Waiting on the stalled follower would commit at most one write per
@@ -254,7 +321,7 @@ async fn a_followers_slow_disk_does_not_hold_the_group_back() {
         Some(leadership),
         "the leader keeps leading in its term"
     );
-    let acked: BTreeSet<i64> = acked.into_iter().map(|(seq, _)| seq).collect();
+    let acked: BTreeSet<Attempt> = acked.into_iter().map(|(attempt, _)| attempt).collect();
     every_member_holds(ports, &acked).await;
 }
 
@@ -272,8 +339,9 @@ async fn a_leaders_slow_disk_loses_no_acknowledged_write() {
 
     let writer = tokio::spawn(write_for(ports, ports[0], STALL + Duration::from_secs(8)));
     tokio::time::sleep(Duration::from_secs(2)).await;
-    members[0].stall_disk_for(STALL).await;
-    let released = Instant::now();
+    let stalled_from = Instant::now();
+    stall_and_check(&members[0], &members[2]).await;
+    let released = stalled_from + STALL;
     let acked = writer.await.expect("writer");
 
     let after = acked
@@ -285,6 +353,27 @@ async fn a_leaders_slow_disk_loses_no_acknowledged_write() {
         "no write committed in the last {:?} after the leader's disk answered",
         Duration::from_secs(6)
     );
-    let acked: BTreeSet<i64> = acked.into_iter().map(|(seq, _)| seq).collect();
+    let acked: BTreeSet<Attempt> = acked.into_iter().map(|(attempt, _)| attempt).collect();
     every_member_holds(ports, &acked).await;
+}
+
+/// The loss check's negative control: a number first sent through one
+/// member without an answer (it may have committed) and then acknowledged
+/// through another is held only when the acknowledged attempt is; the
+/// unanswered one does not cover it.
+#[test]
+fn an_unanswered_attempt_does_not_cover_the_acknowledged_one() {
+    let acked = BTreeSet::from([(1, 2002), (2, 2001)]);
+    let held = BTreeSet::from([(1, 2001), (2, 2001)]);
+    assert_eq!(lost_attempts(&acked, &held), [(1, 2002)]);
+    assert!(lost_attempts(&acked, &acked).is_empty());
+}
+
+/// The stall check's controls: held syncs while the stall lasted and none
+/// since pass; none held, or more held after release, fail.
+#[test]
+fn a_stall_counts_only_when_it_held_syncs_and_let_go() {
+    assert!(stall_engaged(0.0, 3.0, 3.0).is_ok());
+    assert!(stall_engaged(0.0, 0.0, 0.0).is_err(), "no sync held");
+    assert!(stall_engaged(0.0, 3.0, 5.0).is_err(), "held after release");
 }

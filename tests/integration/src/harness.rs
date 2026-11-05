@@ -365,6 +365,32 @@ impl CoordinodeProcess {
         serde_json::from_str(body).unwrap_or_else(|e| panic!("version report {body:?}: {e}"))
     }
 
+    /// The value of the unlabelled metric `name` in the member's
+    /// `GET /metrics` scrape, `None` while nothing has recorded it.
+    pub fn metric(&self, name: &str) -> Option<f64> {
+        use std::io::{Read, Write};
+
+        let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, self.ops_port));
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .expect("connect to the ops port");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read the response");
+        response.lines().find_map(|line| {
+            let (metric, value) = line.split_once(' ')?;
+            (metric == name)
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+    }
+
     /// Crash the running process with SIGKILL then re-spawn against the same
     /// data directory.
     ///
