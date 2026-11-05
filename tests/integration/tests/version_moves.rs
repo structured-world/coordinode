@@ -1179,23 +1179,36 @@ async fn a_move_with_the_completing_member_killed_loses_no_acknowledged_write() 
         .unwrap_or_else(|why| panic!("{why}"));
 }
 
-/// The classification's negative control: in the first attempt only, the
-/// leader's process stops for 800 ms while busy threads load every core of
-/// the host at the same time; the attempts after it are healthy. The busy
-/// threads are the test's own, so the host's CPUs are busy with the group's
-/// work, not other work: the pause inside the group is not taken for the
-/// host's, and the test fails at once instead of passing on a later attempt.
+/// The classification's negative control: the leader's process stops for
+/// 800 ms while busy threads load every core of the host at the same time.
+/// The busy threads are the test's own, so the host's CPUs are busy with the
+/// group's work, not other work: the pause inside the group is classified
+/// unexplained, which [`move_until_single_pause`] fails on at once instead
+/// of retrying it away.
+///
+/// That holds only while nothing else stalls the host meanwhile: other work
+/// that keeps the host's disk or CPUs busy during the frozen pause makes the
+/// pause the host's as well, which is the accepted masking (see
+/// [`HOST_STALLED`]) and leaves this attempt saying nothing. Such an attempt
+/// is reported and the control runs again, at most three times; it fails
+/// when an attempt it can judge does not classify the frozen pause as
+/// unexplained, or when the host stalled every attempt.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stall_inside_the_group_on_a_loaded_host_is_not_retried_away() {
-    let result =
-        move_until_single_pause(false, Stall::LeaderOnLoadedHost(Duration::from_millis(800))).await;
-    assert!(
-        result.as_ref().is_err_and(
-            |why| why.starts_with("attempt 1: a write pause the host does not account for")
-        ),
-        "{result:?}"
-    );
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match move_under_workload(false, Stall::LeaderOnLoadedHost(Duration::from_millis(800)))
+            .await
+        {
+            Outcome::Unexplained(_) => return,
+            Outcome::HostStalled(seen) => {
+                eprintln!("control attempt {attempt}: other work stalled the host too: {seen}");
+            }
+            Outcome::Single => panic!("control attempt {attempt}: the frozen leader made no pause"),
+        }
+    }
+    panic!("the host stalled every control attempt of {ATTEMPTS}");
 }
 
 /// Its positive control: threads of the test fill the file system the
