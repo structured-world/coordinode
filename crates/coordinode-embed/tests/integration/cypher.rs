@@ -487,3 +487,64 @@ fn param_binding_in_set() {
         Some(&Value::String("light".to_string()))
     );
 }
+
+/// A node grouped by an aggregation keeps its properties: after
+/// `WITH a, min(2) AS priority` the group key is the node itself, and
+/// `a.asset` reads that node's property rather than NULL.
+#[test]
+fn a_grouped_node_keeps_its_properties() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE (:OmRow {parent: 'assets', asset: 'a1', incarnation: 3, revision: 7})",
+    )
+    .expect("seed");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:OmRow {parent:'assets'}) WITH a, min(2) AS priority \
+             RETURN {asset: a.asset, incarnation: a.incarnation, revision: a.revision, \
+             priority: priority} AS p LIMIT 1",
+        )
+        .expect("grouped projection");
+    assert_eq!(rows.len(), 1);
+    let p = match rows[0].get("p") {
+        Some(Value::Map(p)) => Some(p),
+        _ => None,
+    }
+    .expect("p is a map");
+    assert_eq!(p.get("asset"), Some(&Value::String("a1".into())));
+    assert_eq!(p.get("incarnation"), Some(&Value::Int(3)));
+    assert_eq!(p.get("revision"), Some(&Value::Int(7)));
+    assert_eq!(p.get("priority"), Some(&Value::Int(2)));
+
+    // An alias of the grouped node reads the same properties.
+    let rows = db
+        .execute_cypher("MATCH (a:OmRow) WITH a AS row, count(*) AS n RETURN row.asset AS asset, n")
+        .expect("aliased group");
+    assert_eq!(rows[0].get("asset"), Some(&Value::String("a1".into())));
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(1)));
+}
+
+/// Grouping by a node groups by the node, not by its properties: two nodes
+/// with equal properties are two groups, each keeping its own identity.
+#[test]
+fn nodes_with_equal_properties_stay_separate_groups() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:Twin {name: 'same'}), (:Twin {name: 'same'})")
+        .expect("seed");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (t:Twin) WITH t, count(*) AS n \
+             RETURN id(t) AS id, t.name AS name, n ORDER BY id",
+        )
+        .expect("grouped by node");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_ne!(rows[0].get("id"), rows[1].get("id"));
+    for row in &rows {
+        assert_eq!(row.get("name"), Some(&Value::String("same".into())));
+        assert_eq!(row.get("n"), Some(&Value::Int(1)));
+    }
+}

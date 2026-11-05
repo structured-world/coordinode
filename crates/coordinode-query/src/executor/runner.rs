@@ -13894,6 +13894,21 @@ fn execute_aggregate(
             let val = key.get(i).cloned().unwrap_or(Value::Null);
             let col = expr_display_name_neutral(expr);
             out.insert(col, val);
+            // A bare variable groups by the entity's identity, and its
+            // property and auxiliary columns (`a.prop`, `a.__labels__`) go
+            // with it, as a projection passes them through: without them
+            // `WITH a, min(x) ... RETURN a.prop` reads NULL. Every row of
+            // the group carries the same entity, so its first row is taken.
+            if let crate::plan::expr::Expr::Variable(var_name) = expr
+                && let Some(first) = group_rows.first()
+            {
+                let prefix = format!("{var_name}.");
+                for (column, value) in first.iter() {
+                    if column.starts_with(&prefix) {
+                        out.insert(column.clone(), value.clone());
+                    }
+                }
+            }
         }
 
         // Compute aggregates. Each collects its group's argument values
