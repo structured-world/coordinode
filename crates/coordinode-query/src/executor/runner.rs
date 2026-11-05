@@ -13923,8 +13923,10 @@ fn execute_aggregate(
 
     for (key, group_rows) in &groups {
         let mut out = Row::new();
-        // What was charged for the carried entity columns before they were
-        // copied.
+        // The entity columns carried with the group, kept apart until the
+        // keys and aggregates are in, and what was charged for them before
+        // they were copied.
+        let mut carried = Row::new();
         let mut charged = 0u64;
 
         // Add group-by values
@@ -13945,7 +13947,7 @@ fn execute_aggregate(
                     .any(|earlier| carried_variable(earlier) == Some(var_name))
                 && let Some(first) = group_rows.first()
             {
-                charged += carry_entity_columns(&mut out, first, var_name, budget)?;
+                charged += carry_entity_columns(&mut carried, first, var_name, budget)?;
             }
         }
 
@@ -13960,32 +13962,29 @@ fn execute_aggregate(
             out.insert(col, val);
         }
 
-        // The carried columns as the row holds them, measured on the row
-        // itself: a part of it, so the rest never goes below zero. Their
-        // charge, taken from the source before copying, bounds them: the
-        // measure counts the capacity of every string, vector and list a
-        // value owns, and a clone allocates exactly the length, which a
-        // source's capacity is never below. The rest of the row is charged
-        // as usual.
-        let in_row: u64 = out
-            .iter()
-            .filter(|(column, _)| {
-                group_by.iter().filter_map(carried_variable).any(|var| {
-                    column
-                        .strip_prefix(var)
-                        .is_some_and(|rest| rest.starts_with('.'))
-                })
-            })
-            .map(|(column, value)| {
-                coordinode_core::graph::types::map_entry_bytes(column) + value.held_bytes()
-            })
-            .sum();
+        // The carried columns go into the row where no key or aggregate took
+        // their name: an aggregate aliased `a.extra` stays the aggregate's.
+        // What moves is measured as it moves, a part of the row, so the rest
+        // never goes below zero. Their charge, taken from the source before
+        // copying, bounds them: the measure counts the capacity of every
+        // string, vector and list a value owns, and a clone allocates
+        // exactly the length, which a source's capacity is never below. A
+        // carried column a key or aggregate displaced stays charged until
+        // the query ends. The rest of the row is charged as usual.
+        let mut moved = 0u64;
+        for (column, value) in carried {
+            if let std::collections::btree_map::Entry::Vacant(slot) = out.entry(column) {
+                moved +=
+                    coordinode_core::graph::types::map_entry_bytes(slot.key()) + value.held_bytes();
+                slot.insert(value);
+            }
+        }
         debug_assert!(
-            in_row <= charged,
-            "a copy measured {in_row} bytes against its source's {charged}"
+            moved <= charged,
+            "a copy measured {moved} bytes against its source's {charged}"
         );
         budget
-            .reserve(crate::executor::row::row_held_bytes(&out) - in_row)?
+            .reserve(crate::executor::row::row_held_bytes(&out) - moved)?
             .keep_until_query_ends();
         results.push(out);
     }

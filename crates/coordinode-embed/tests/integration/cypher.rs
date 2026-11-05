@@ -526,6 +526,33 @@ fn a_grouped_node_keeps_its_properties() {
     assert_eq!(rows[0].get("n"), Some(&Value::Int(1)));
 }
 
+/// An aggregate whose alias looks like a grouped variable's column
+/// (`` `a.extra` ``) is the aggregate's, not something carried with `a`: it
+/// answers the aggregate, and the row is charged for it as for any other
+/// aggregate, while `a`'s own columns are carried as usual.
+#[test]
+fn an_aggregate_alias_like_a_carried_column_is_the_aggregates() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    let rows = db
+        .execute_cypher("UNWIND [1] AS a WITH a, count(*) AS `a.extra` RETURN a, `a.extra` AS n")
+        .expect("aggregate alias");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("a"), Some(&Value::Int(1)));
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(1)));
+
+    db.execute_cypher("CREATE (:OmRow {asset: 'a1', extra: 'kept'})")
+        .expect("seed");
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:OmRow) WITH a, count(*) AS `a.extra` \
+             RETURN a.asset AS asset, `a.extra` AS n",
+        )
+        .expect("aggregate alias over a node");
+    assert_eq!(rows[0].get("asset"), Some(&Value::String("a1".into())));
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(1)));
+}
+
 /// A node grouped under two aliases is carried into the group's row once:
 /// both aliases read its properties, and the row's memory is charged once.
 #[test]
