@@ -130,18 +130,7 @@ RETURN n.age
 AS OF TIMESTAMP '2024-06-01T12:00:00Z'
 ```
 
-**gRPC `ReadConcern.at_timestamp`** for programmatic pinning. Set `level = SNAPSHOT` and `at_timestamp = <HLC microseconds since Unix epoch>` on `ExecuteCypherRequest.read_concern`. The query then reads as of that exact HLC timestamp:
-
-```python
-client.execute_cypher(
-    query="MATCH (a:Account {id: $id}) RETURN a.balance",
-    parameters={"id": account_id},
-    read_concern=ReadConcern(
-        level=ReadConcernLevel.SNAPSHOT,
-        at_timestamp=1_700_000_000_000_000,  # microseconds since epoch
-    ),
-)
-```
+**gRPC `ReadConcern.at_timestamp`** for programmatic pinning. Set `level = SNAPSHOT` and `at_timestamp = <HLC microseconds since Unix epoch>` on `ExecuteCypherRequest.read_concern`. The query then reads as of that exact HLC timestamp.
 
 Constraints:
 
