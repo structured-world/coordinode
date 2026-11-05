@@ -6886,3 +6886,41 @@ fn the_first_unaccounted_operator_is_found_beside_and_inside() {
         Some("Extension")
     );
 }
+
+/// A grouped entity's columns are charged before they are copied into the
+/// group's row: a budget they do not fit refuses them and the row gets none,
+/// so a large entity is never copied past the statement's memory. Copying
+/// first and charging the row afterwards would leave the copy in the row.
+#[test]
+fn a_grouped_entity_is_charged_before_its_columns_are_copied() {
+    use coordinode_core::budget::QueryBudget;
+    let mut from = Row::new();
+    from.insert("a".into(), Value::Int(7));
+    from.insert("a.blob".into(), Value::String("b".repeat(1 << 20)));
+    from.insert("a.name".into(), Value::String("n".into()));
+    from.insert("other.blob".into(), Value::String("o".repeat(1 << 20)));
+
+    let small = QueryBudget::new(64 << 10);
+    let mut out = Row::new();
+    let refused = carry_entity_columns(&mut out, &from, "a", &small);
+    assert!(
+        matches!(refused, Err(ExecutionError::Budget(_))),
+        "{refused:?}"
+    );
+    assert!(
+        out.is_empty(),
+        "copied before the refusal: {:?}",
+        out.keys()
+    );
+    assert!(small.memory_peak() <= small.memory_limit());
+
+    let ample = QueryBudget::new(16 << 20);
+    let mut out = Row::new();
+    let charged = carry_entity_columns(&mut out, &from, "a", &ample).expect("fits");
+    // Only `a`'s own columns, not the key itself or another entity's.
+    let mut keys: Vec<&String> = out.keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["a.blob", "a.name"]);
+    assert_eq!(ample.memory_used(), charged);
+    assert!(charged > 1 << 20);
+}

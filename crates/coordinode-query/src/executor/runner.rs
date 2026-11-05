@@ -13834,6 +13834,33 @@ fn eval_scalar_expr(
     }
 }
 
+/// Copy the property and auxiliary columns of entity `var` (`var.prop`,
+/// `var.__labels__`) from `from` into `out`, charged to `budget` for the
+/// result's life before any is copied. Returns the bytes charged; a refusal
+/// leaves `out` as it was.
+fn carry_entity_columns(
+    out: &mut Row,
+    from: &Row,
+    var: &str,
+    budget: &coordinode_core::budget::QueryBudget,
+) -> Result<u64, ExecutionError> {
+    let prefix = format!("{var}.");
+    let columns = || {
+        from.iter()
+            .filter(|(column, _)| column.starts_with(&prefix))
+    };
+    let bytes: u64 = columns()
+        .map(|(column, value)| {
+            coordinode_core::graph::types::map_entry_bytes(column) + value.held_bytes()
+        })
+        .sum();
+    budget.reserve(bytes)?.keep_until_query_ends();
+    for (column, value) in columns() {
+        out.insert(column.clone(), value.clone());
+    }
+    Ok(bytes)
+}
+
 /// Execute aggregation: group rows and compute aggregate functions.
 fn execute_aggregate(
     rows: &[Row],
@@ -13888,6 +13915,9 @@ fn execute_aggregate(
 
     for (key, group_rows) in &groups {
         let mut out = Row::new();
+        // What the entity columns carried below take, charged for the
+        // result's life before they are copied.
+        let mut carried = 0u64;
 
         // Add group-by values
         for (i, expr) in group_by.iter().enumerate() {
@@ -13902,12 +13932,7 @@ fn execute_aggregate(
             if let crate::plan::expr::Expr::Variable(var_name) = expr
                 && let Some(first) = group_rows.first()
             {
-                let prefix = format!("{var_name}.");
-                for (column, value) in first.iter() {
-                    if column.starts_with(&prefix) {
-                        out.insert(column.clone(), value.clone());
-                    }
-                }
+                carried += carry_entity_columns(&mut out, first, var_name, budget)?;
             }
         }
 
@@ -13922,8 +13947,9 @@ fn execute_aggregate(
             out.insert(col, val);
         }
 
+        // The carried columns are part of the row and charged already.
         budget
-            .reserve(crate::executor::row::row_held_bytes(&out))?
+            .reserve(crate::executor::row::row_held_bytes(&out) - carried)?
             .keep_until_query_ends();
         results.push(out);
     }
