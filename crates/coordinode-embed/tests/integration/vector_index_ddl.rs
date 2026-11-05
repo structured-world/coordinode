@@ -254,16 +254,43 @@ fn a_transaction_ranks_its_own_uncommitted_vectors() {
             .expect("search inside"),
     );
     assert_eq!(inside, "new");
-    assert_eq!(
-        first(db.execute_cypher(query).expect("search outside")),
-        "near"
-    );
+    let outside = first(db.execute_cypher(query).expect("search outside"));
+    if outside != "near" {
+        panic!(
+            "the search outside the open transaction ranked {outside:?} first, not \"near\"; {}",
+            ranking_evidence(&mut db)
+        );
+    }
 
     db.rollback_transaction(tx).expect("rollback");
-    assert_eq!(
-        first(db.execute_cypher(query).expect("search after")),
-        "near"
+    let after = first(db.execute_cypher(query).expect("search after"));
+    if after != "near" {
+        panic!(
+            "the search after rollback ranked {after:?} first, not \"near\"; {}",
+            ranking_evidence(&mut db)
+        );
+    }
+}
+
+/// What tells apart why a search outside a transaction ranked as it did:
+/// the top three it returns with their distances (the candidate set), the
+/// vectors the committed store holds read by a plain scan (the committed
+/// state), its plan, and the commits the vector worker has not folded yet.
+fn ranking_evidence(db: &mut Database) -> String {
+    let top = db.execute_cypher(
+        "MATCH (n:Embed) WITH n, vector_distance(n.vec, [1.0, 0.0, 0.0]) AS d \
+         ORDER BY d LIMIT 3 RETURN n.name AS name, d",
     );
+    let stored = db.execute_cypher("MATCH (n:Embed) RETURN n.name AS name, n.vec AS vec");
+    let plan = db.explain_cypher(
+        "MATCH (n:Embed) WITH n, vector_distance(n.vec, [1.0, 0.0, 0.0]) AS d \
+         ORDER BY d LIMIT 1 RETURN n.name AS name",
+    );
+    let unfolded = !db.vector_index_registry().delta(1).is_empty();
+    format!(
+        "top three {top:?}; committed vectors {stored:?}; commits not yet folded {unfolded}; \
+         plan {plan:?}"
+    )
 }
 
 /// A transaction ranks at the snapshot it began on, though the index has
