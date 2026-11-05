@@ -6887,6 +6887,54 @@ fn the_first_unaccounted_operator_is_found_beside_and_inside() {
     );
 }
 
+/// The bound the carried columns are charged by before copying: a clone of
+/// any value measures no more than its source, whose strings, vectors and
+/// lists may hold capacity past their length that a clone does not.
+#[test]
+fn a_cloned_value_never_measures_more_than_its_source() {
+    let mut string = String::with_capacity(4096);
+    string.push_str("short");
+    let mut vector = Vec::with_capacity(512);
+    vector.extend([1.0f32, 2.0]);
+    let mut blob = Vec::with_capacity(1024);
+    blob.extend([1u8, 2, 3]);
+    let mut items = Vec::with_capacity(64);
+    items.push(Value::String(string.clone()));
+    items.push(Value::Int(1));
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(
+        String::with_capacity(256) + "k",
+        Value::Array(items.clone()),
+    );
+    let mut rows = Vec::with_capacity(16);
+    rows.push(vector.clone());
+    let values = [
+        Value::String(string),
+        Value::Vector(vector),
+        Value::Blob(blob.clone()),
+        Value::Binary(blob),
+        Value::Array(items),
+        Value::Map(map),
+        Value::MultiVector(rows),
+        Value::Document(rmpv::Value::Array(vec![rmpv::Value::from("d"); 3])),
+    ];
+    for value in values {
+        let copy = value.clone();
+        assert!(
+            copy.held_bytes() <= value.held_bytes(),
+            "{value:?}: copy {} against source {}",
+            copy.held_bytes(),
+            value.held_bytes()
+        );
+    }
+    let mut key = String::with_capacity(128);
+    key.push_str("a.blob");
+    assert!(
+        coordinode_core::graph::types::map_entry_bytes(&key.clone())
+            <= coordinode_core::graph::types::map_entry_bytes(&key)
+    );
+}
+
 /// A grouped entity's columns are charged before they are copied into the
 /// group's row: a budget they do not fit refuses them and the row gets none,
 /// so a large entity is never copied past the statement's memory. Copying

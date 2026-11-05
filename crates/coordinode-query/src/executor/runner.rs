@@ -13834,6 +13834,14 @@ fn eval_scalar_expr(
     }
 }
 
+/// The variable a group key names bare, whose entity's columns go with it.
+fn carried_variable(expr: &crate::plan::expr::Expr) -> Option<&str> {
+    match expr {
+        crate::plan::expr::Expr::Variable(name) => Some(name),
+        _ => None,
+    }
+}
+
 /// Copy the property and auxiliary columns of entity `var` (`var.prop`,
 /// `var.__labels__`) from `from` into `out`, charged to `budget` for the
 /// result's life before any is copied. Returns the bytes charged; a refusal
@@ -13915,10 +13923,8 @@ fn execute_aggregate(
 
     for (key, group_rows) in &groups {
         let mut out = Row::new();
-        // The entities whose columns are carried below, each once however
-        // many group keys name it, and what was charged for them before
-        // they were copied.
-        let mut carried_vars: Vec<&str> = Vec::new();
+        // What was charged for the carried entity columns before they were
+        // copied.
         let mut charged = 0u64;
 
         // Add group-by values
@@ -13931,12 +13937,15 @@ fn execute_aggregate(
             // with it, as a projection passes them through: without them
             // `WITH a, min(x) ... RETURN a.prop` reads NULL. Every row of
             // the group carries the same entity, so its first row is taken.
-            if let crate::plan::expr::Expr::Variable(var_name) = expr
-                && !carried_vars.contains(&var_name.as_str())
+            // An entity named by several keys (`WITH a AS x, a AS y`) is
+            // carried at the first of them only.
+            if let Some(var_name) = carried_variable(expr)
+                && !group_by[..i]
+                    .iter()
+                    .any(|earlier| carried_variable(earlier) == Some(var_name))
                 && let Some(first) = group_rows.first()
             {
                 charged += carry_entity_columns(&mut out, first, var_name, budget)?;
-                carried_vars.push(var_name);
             }
         }
 
@@ -13952,13 +13961,16 @@ fn execute_aggregate(
         }
 
         // The carried columns as the row holds them, measured on the row
-        // itself: a part of it, so the rest never goes below zero. What they
-        // take past their charge (the copies measured larger than the
-        // source) is charged now; the rest of the row is charged as usual.
+        // itself: a part of it, so the rest never goes below zero. Their
+        // charge, taken from the source before copying, bounds them: the
+        // measure counts the capacity of every string, vector and list a
+        // value owns, and a clone allocates exactly the length, which a
+        // source's capacity is never below. The rest of the row is charged
+        // as usual.
         let in_row: u64 = out
             .iter()
             .filter(|(column, _)| {
-                carried_vars.iter().any(|var| {
+                group_by.iter().filter_map(carried_variable).any(|var| {
                     column
                         .strip_prefix(var)
                         .is_some_and(|rest| rest.starts_with('.'))
@@ -13968,9 +13980,10 @@ fn execute_aggregate(
                 coordinode_core::graph::types::map_entry_bytes(column) + value.held_bytes()
             })
             .sum();
-        if in_row > charged {
-            budget.reserve(in_row - charged)?.keep_until_query_ends();
-        }
+        debug_assert!(
+            in_row <= charged,
+            "a copy measured {in_row} bytes against its source's {charged}"
+        );
         budget
             .reserve(crate::executor::row::row_held_bytes(&out) - in_row)?
             .keep_until_query_ends();
