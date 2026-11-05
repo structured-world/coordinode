@@ -615,6 +615,78 @@ enum Outcome {
     Unexplained(String),
 }
 
+impl Outcome {
+    /// What the attempt saw, for a report; empty for the single pause.
+    fn seen(&self) -> &str {
+        match self {
+            Self::Single => "",
+            Self::HostStalled(seen) | Self::Unexplained(seen) => seen,
+        }
+    }
+}
+
+/// What one attempt showed: how it went, and, when it injected a stall, how
+/// the write pauses over the stall's span were classified.
+struct Attempted {
+    outcome: Outcome,
+    injected: Option<Injected>,
+}
+
+/// How the write pauses over an injected stall's span were classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Injected {
+    /// No write pause overlapped the stall.
+    NoPause,
+    /// Every pause overlapping it was the host's.
+    HostStalled,
+    /// A pause overlapping it is one the host does not account for.
+    Unexplained,
+}
+
+/// How the pauses overlapping `span` (from the first update's start) were
+/// classified, from every pause and whether the host stalled it. A pause
+/// elsewhere in the attempt says nothing of the injected stall.
+fn judge_injection(
+    pauses: &[(Duration, Duration)],
+    host_stalled: &[bool],
+    (from, to): (Duration, Duration),
+) -> Injected {
+    let over: Vec<bool> = pauses
+        .iter()
+        .zip(host_stalled)
+        .filter(|((start, end), _)| *start <= to && *end >= from)
+        .map(|(_, stalled)| *stalled)
+        .collect();
+    if over.is_empty() {
+        Injected::NoPause
+    } else if over.iter().all(|stalled| *stalled) {
+        Injected::HostStalled
+    } else {
+        Injected::Unexplained
+    }
+}
+
+/// What the attempt loop does after an attempt's outcome.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// The single pause: the move is shown.
+    Done,
+    /// The host stalled the group: another attempt.
+    Retry,
+    /// A pause the host does not account for: a failure at once.
+    Fail,
+}
+
+/// The attempt loop's rule: an unexplained pause fails at once, never
+/// retried away; a host stall is retried.
+fn after_attempt(outcome: &Outcome) -> Step {
+    match outcome {
+        Outcome::Single => Step::Done,
+        Outcome::HostStalled(_) => Step::Retry,
+        Outcome::Unexplained(_) => Step::Fail,
+    }
+}
+
 /// A stall the test causes during the quiet stretch after the first update,
 /// to check how attempts are classified. The stalls are caused only where
 /// the kernel reports the waits to classify them by.
@@ -661,7 +733,7 @@ async fn with_loaded_host<T>(per_core: usize, during: impl std::future::Future<O
 /// completing the majority (killed when `kill_completing`), member 1 last,
 /// under a continuous workload, with `stall` caused after the first update;
 /// check what the move promises. Panics on any incorrect outcome.
-async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
+async fn move_under_workload(kill_completing: bool, stall: Stall) -> Attempted {
     let ([m1, m2, m3], ports) = group_of_three().await;
     let base = engine_of(&m1);
 
@@ -834,6 +906,9 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
         base + 1,
         "the server honours the format bump"
     );
+    // The span the injected stall ran over, from the first update's start.
+    let injected_from = started.elapsed();
+    let injected = !matches!(stall, Stall::None);
     match stall {
         Stall::None => {}
         #[cfg(target_os = "linux")]
@@ -858,6 +933,7 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
             );
         }
     }
+    let injected_span = injected.then(|| (injected_from, started.elapsed()));
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let completing = Instant::now();
@@ -1118,12 +1194,17 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Outcome {
         .filter(|(pause, _)| !own.contains(pause))
         .map(|(_, waited)| waited)
         .collect();
-    if extra.is_empty() {
+    let outcome = if extra.is_empty() {
         Outcome::Single
     } else if extra.iter().all(|waited| waited.host_stalled()) {
         Outcome::HostStalled(seen)
     } else {
         Outcome::Unexplained(seen)
+    };
+    let stalled: Vec<bool> = waits.iter().map(PauseWaits::host_stalled).collect();
+    Attempted {
+        outcome,
+        injected: injected_span.map(|span| judge_injection(&pauses, &stalled, span)),
     }
 }
 
@@ -1137,8 +1218,15 @@ async fn move_until_single_pause(kill_completing: bool, first: Stall) -> Result<
     let mut stalled = Vec::new();
     for attempt in 1..=ATTEMPTS {
         let stall = if attempt == 1 { first } else { Stall::None };
-        match move_under_workload(kill_completing, stall).await {
-            Outcome::Single => {
+        let Attempted { outcome, injected } = move_under_workload(kill_completing, stall).await;
+        // The rule alone decides; the outcome only says what is reported,
+        // with the verdict on an injected stall's span when there was one.
+        let seen = match injected {
+            Some(injected) => format!("{} (injected stall: {injected:?})", outcome.seen()),
+            None => outcome.seen().to_string(),
+        };
+        match after_attempt(&outcome) {
+            Step::Done => {
                 if !stalled.is_empty() {
                     eprintln!(
                         "single pause on attempt {attempt}; host stalls before: {stalled:#?}"
@@ -1146,11 +1234,11 @@ async fn move_until_single_pause(kill_completing: bool, first: Stall) -> Result<
                 }
                 return Ok(());
             }
-            Outcome::HostStalled(seen) => {
+            Step::Retry => {
                 eprintln!("attempt {attempt}: the host stalled the group: {seen}");
                 stalled.push(seen);
             }
-            Outcome::Unexplained(seen) => {
+            Step::Fail => {
                 return Err(format!(
                     "attempt {attempt}: a write pause the host does not account for: {seen}"
                 ));
@@ -1182,44 +1270,95 @@ async fn a_move_with_the_completing_member_killed_loses_no_acknowledged_write() 
 /// The classification's negative control: the leader's process stops for
 /// 800 ms while busy threads load every core of the host at the same time.
 /// The busy threads are the test's own, so the host's CPUs are busy with the
-/// group's work, not other work: the pause inside the group is classified
-/// unexplained, which [`move_until_single_pause`] fails on at once instead
-/// of retrying it away.
+/// group's work, not other work: the pause over the frozen span is
+/// classified unexplained, the outcome [`after_attempt`] fails on at once
+/// (`the_attempt_rule_fails_at_once_on_an_unexplained_pause`).
 ///
-/// That holds only while nothing else stalls the host meanwhile: other work
-/// that keeps the host's disk or CPUs busy during the frozen pause makes the
-/// pause the host's as well, which is the accepted masking (see
-/// [`HOST_STALLED`]) and leaves this attempt saying nothing. Such an attempt
-/// is reported and the control runs again, at most three times; it fails
-/// when an attempt it can judge does not classify the frozen pause as
-/// unexplained, or when the host stalled every attempt.
+/// The frozen span's own pauses are judged, not the attempt's: an
+/// unexplained pause elsewhere says nothing of the injected one. That holds
+/// only while nothing else stalls the host over the span: other work that
+/// keeps its disk or CPUs busy then makes the pause the host's as well, the
+/// accepted masking (see [`HOST_STALLED`]), and the attempt says nothing.
+/// Such an attempt is reported and the control runs again, at most three
+/// times; it fails when the frozen span made no pause, or when the host
+/// stalled every attempt's span.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stall_inside_the_group_on_a_loaded_host_is_not_retried_away() {
     const ATTEMPTS: usize = 3;
     for attempt in 1..=ATTEMPTS {
-        match move_under_workload(false, Stall::LeaderOnLoadedHost(Duration::from_millis(800)))
-            .await
-        {
-            Outcome::Unexplained(_) => return,
-            Outcome::HostStalled(seen) => {
-                eprintln!("control attempt {attempt}: other work stalled the host too: {seen}");
-            }
-            Outcome::Single => panic!("control attempt {attempt}: the frozen leader made no pause"),
+        let attempted =
+            move_under_workload(false, Stall::LeaderOnLoadedHost(Duration::from_millis(800))).await;
+        match attempted.injected.expect("the control injects a stall") {
+            Injected::Unexplained => return,
+            Injected::HostStalled => eprintln!(
+                "control attempt {attempt}: other work stalled the host over the frozen span: {:?}",
+                attempted.outcome
+            ),
+            Injected::NoPause => panic!(
+                "control attempt {attempt}: the frozen leader made no pause: {:?}",
+                attempted.outcome
+            ),
         }
     }
-    panic!("the host stalled every control attempt of {ATTEMPTS}");
+    panic!("the host stalled the frozen span of every control attempt of {ATTEMPTS}");
 }
 
 /// Its positive control: threads of the test fill the file system the
 /// members' data is on with synced writes for 3 s, nothing of the group
 /// stopped. The group's own processes wait on that disk through the pause
-/// it causes, which is taken for the host's: the attempt would be retried.
+/// it causes over the stall's span, which is taken for the host's: the
+/// attempt would be retried.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stalled_disk_is_told_from_a_stall_inside_the_group() {
-    let outcome = move_under_workload(false, Stall::StalledDisk(Duration::from_secs(3))).await;
-    assert!(matches!(outcome, Outcome::HostStalled(_)), "{outcome:?}");
+    let attempted = move_under_workload(false, Stall::StalledDisk(Duration::from_secs(3))).await;
+    assert_eq!(
+        attempted.injected,
+        Some(Injected::HostStalled),
+        "{:?}",
+        attempted.outcome
+    );
+}
+
+/// The attempt rule's control: an unexplained pause fails at once and is
+/// never retried away, a host stall is retried, the single pause is done.
+/// Retrying an unexplained pause would let the healthy attempt after it pass.
+#[test]
+fn the_attempt_rule_fails_at_once_on_an_unexplained_pause() {
+    assert_eq!(
+        after_attempt(&Outcome::Unexplained(String::new())),
+        Step::Fail
+    );
+    assert_eq!(
+        after_attempt(&Outcome::HostStalled(String::new())),
+        Step::Retry
+    );
+    assert_eq!(after_attempt(&Outcome::Single), Step::Done);
+}
+
+/// The injection judge's controls: the pauses over the injected span decide,
+/// whatever else the attempt holds. An injected pause taken for the host's
+/// beside an unexplained one elsewhere is the host's, not unexplained.
+#[test]
+fn only_the_pauses_over_the_injected_span_judge_it() {
+    let s = Duration::from_secs;
+    let pauses = [(s(2), s(3)), (s(11), s(12))];
+    // The injected pause, at 2..3 s, the host's; another, unexplained.
+    assert_eq!(
+        judge_injection(&pauses, &[true, false], (s(2), s(3))),
+        Injected::HostStalled
+    );
+    // The injected pause unexplained, the other the host's.
+    assert_eq!(
+        judge_injection(&pauses, &[false, true], (s(2), s(3))),
+        Injected::Unexplained
+    );
+    // No pause over the span.
+    assert_eq!(
+        judge_injection(&pauses, &[false, false], (s(5), s(6))),
+        Injected::NoPause
+    );
 }
 
 /// The CPU check's controls: a host whose CPUs the group itself keeps busy
