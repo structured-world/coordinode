@@ -13915,9 +13915,11 @@ fn execute_aggregate(
 
     for (key, group_rows) in &groups {
         let mut out = Row::new();
-        // What the entity columns carried below take, charged for the
-        // result's life before they are copied.
-        let mut carried = 0u64;
+        // The entities whose columns are carried below, each once however
+        // many group keys name it, and what was charged for them before
+        // they were copied.
+        let mut carried_vars: Vec<&str> = Vec::new();
+        let mut charged = 0u64;
 
         // Add group-by values
         for (i, expr) in group_by.iter().enumerate() {
@@ -13930,9 +13932,11 @@ fn execute_aggregate(
             // `WITH a, min(x) ... RETURN a.prop` reads NULL. Every row of
             // the group carries the same entity, so its first row is taken.
             if let crate::plan::expr::Expr::Variable(var_name) = expr
+                && !carried_vars.contains(&var_name.as_str())
                 && let Some(first) = group_rows.first()
             {
-                carried += carry_entity_columns(&mut out, first, var_name, budget)?;
+                charged += carry_entity_columns(&mut out, first, var_name, budget)?;
+                carried_vars.push(var_name);
             }
         }
 
@@ -13947,9 +13951,28 @@ fn execute_aggregate(
             out.insert(col, val);
         }
 
-        // The carried columns are part of the row and charged already.
+        // The carried columns as the row holds them, measured on the row
+        // itself: a part of it, so the rest never goes below zero. What they
+        // take past their charge (the copies measured larger than the
+        // source) is charged now; the rest of the row is charged as usual.
+        let in_row: u64 = out
+            .iter()
+            .filter(|(column, _)| {
+                carried_vars.iter().any(|var| {
+                    column
+                        .strip_prefix(var)
+                        .is_some_and(|rest| rest.starts_with('.'))
+                })
+            })
+            .map(|(column, value)| {
+                coordinode_core::graph::types::map_entry_bytes(column) + value.held_bytes()
+            })
+            .sum();
+        if in_row > charged {
+            budget.reserve(in_row - charged)?.keep_until_query_ends();
+        }
         budget
-            .reserve(crate::executor::row::row_held_bytes(&out) - carried)?
+            .reserve(crate::executor::row::row_held_bytes(&out) - in_row)?
             .keep_until_query_ends();
         results.push(out);
     }

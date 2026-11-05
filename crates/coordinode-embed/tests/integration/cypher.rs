@@ -526,6 +526,30 @@ fn a_grouped_node_keeps_its_properties() {
     assert_eq!(rows[0].get("n"), Some(&Value::Int(1)));
 }
 
+/// A node grouped under two aliases is carried into the group's row once:
+/// both aliases read its properties, and the row's memory is charged once.
+#[test]
+fn a_node_grouped_under_two_aliases_is_carried_once() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    let blob = "b".repeat(64 << 10);
+    db.execute_cypher(&format!("CREATE (:OmRow {{asset: 'a1', blob: '{blob}'}})"))
+        .expect("seed");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:OmRow) WITH a AS x, a AS y, count(*) AS n \
+             RETURN x.asset AS xa, y.asset AS ya, size(x.blob) AS xs, size(y.blob) AS ys, n",
+        )
+        .expect("grouped twice");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("xa"), Some(&Value::String("a1".into())));
+    assert_eq!(rows[0].get("ya"), Some(&Value::String("a1".into())));
+    assert_eq!(rows[0].get("xs"), Some(&Value::Int(64 << 10)));
+    assert_eq!(rows[0].get("ys"), Some(&Value::Int(64 << 10)));
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(1)));
+}
+
 /// Grouping by a node groups by the node, not by its properties: two nodes
 /// with equal properties are two groups, each keeping its own identity.
 #[test]
