@@ -230,6 +230,12 @@ fn stall_engaged(before: f64, released: f64, later: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a member held no sync at all over a span, from its count before,
+/// at the release and a while after: the three are equal.
+fn no_stall(before: f64, released: f64, later: f64) -> bool {
+    before == released && released == later
+}
+
 /// Stall `member`'s own disk for [`STALL`] while writes run, and require
 /// that the stall held its syncs and released them; the count of a member
 /// left alone over the same span must show no stall, or the check could not
@@ -246,7 +252,7 @@ async fn stall_and_check(member: &CoordinodeProcess, untouched: &CoordinodeProce
     let (later, untouched_later) = (stalled_syncs(member), stalled_syncs(untouched));
     stall_engaged(before, released, later).unwrap_or_else(|why| panic!("{why}"));
     assert!(
-        stall_engaged(untouched_before, untouched_released, untouched_later).is_err(),
+        no_stall(untouched_before, untouched_released, untouched_later),
         "a member left alone counts held syncs: {untouched_before}, {untouched_released}, \
          {untouched_later}"
     );
@@ -376,4 +382,16 @@ fn a_stall_counts_only_when_it_held_syncs_and_let_go() {
     assert!(stall_engaged(0.0, 3.0, 3.0).is_ok());
     assert!(stall_engaged(0.0, 0.0, 0.0).is_err(), "no sync held");
     assert!(stall_engaged(0.0, 3.0, 5.0).is_err(), "held after release");
+}
+
+/// The untouched member's control: only three equal counts show it held no
+/// sync. Syncs held during the span, or after it (which the stall check
+/// rejects too, and so could be mistaken for no stall), are a stall there.
+#[test]
+fn a_member_left_alone_counts_no_held_sync() {
+    assert!(no_stall(0.0, 0.0, 0.0));
+    assert!(no_stall(4.0, 4.0, 4.0));
+    assert!(!no_stall(0.0, 3.0, 3.0), "held during the span");
+    assert!(!no_stall(0.0, 3.0, 5.0), "held during and after");
+    assert!(!no_stall(0.0, 0.0, 2.0), "held after the release");
 }
