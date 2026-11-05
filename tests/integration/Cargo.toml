@@ -39,10 +39,17 @@ path = "tests/version_moves.rs"
 name = "session_subscriptions"
 path = "tests/session_subscriptions.rs"
 
+[[test]]
+name = "disk_stall"
+path = "tests/disk_stall.rs"
+
 [features]
 # The version-move tests run a server binary built with its own
 # `test-format-bump` feature (a workspace build with --all-features).
 test-format-bump = []
+# The disk-stall tests run a server binary built with its own `test-faults`
+# feature (a workspace build with --all-features).
+test-faults = []
 
 [dependencies]
 tonic = { version = "0.14", features = ["transport"] }

@@ -503,7 +503,9 @@ impl CoordinodeProcess {
 
     /// Stall the disk under the server's Raft log for `pause`: each of its
     /// syncs meanwhile first writes and syncs 64 MiB, so the process waits
-    /// on real block I/O. Needs a server built with `test-faults`.
+    /// on real block I/O; or, for a process started with
+    /// `COORDINODE_TEST_DISK_STALL_OWN_MS`, holds each of its own syncs that
+    /// long. Needs a server built with `test-faults`.
     #[cfg(unix)]
     pub async fn stall_disk_for(&self, pause: Duration) {
         signal(&self.child, "USR2");

@@ -1155,19 +1155,33 @@ pub(crate) async fn serve(
             }
         });
         // SIGUSR2 starts, and the next one stops, a stalling disk under the
-        // Raft log: each of its syncs first writes and syncs 64 MiB, so the
-        // node waits on real block I/O as a disk shared with other writers
-        // makes it.
+        // Raft log. By default each of its syncs first writes and syncs
+        // 64 MiB, so the node waits on real block I/O as a disk shared with
+        // other writers makes it, and slows every process on that disk. A
+        // process started with COORDINODE_TEST_DISK_STALL_OWN_MS instead
+        // holds each of its own syncs that long, as its own slow disk does,
+        // and leaves the disk to the others.
+        let own_ms: Option<u64> = std::env::var("COORDINODE_TEST_DISK_STALL_OWN_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok());
         let mut stall =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
                 .map_err(|e| format!("failed to install SIGUSR2 handler: {e}"))?;
         tokio::spawn(async move {
-            use coordinode_storage::oplog::segment::SYNC_STALL_BYTES;
+            use coordinode_storage::oplog::segment::{SYNC_STALL_BYTES, SYNC_STALL_MS};
             use std::sync::atomic::Ordering;
+            let (switch, on) = match own_ms {
+                Some(ms) => (&SYNC_STALL_MS, ms),
+                None => (&SYNC_STALL_BYTES, 64 << 20),
+            };
             while stall.recv().await.is_some() {
-                let stalled = SYNC_STALL_BYTES.load(Ordering::Relaxed) == 0;
-                SYNC_STALL_BYTES.store(if stalled { 64 << 20 } else { 0 }, Ordering::Relaxed);
-                tracing::warn!(stalled, "test fault: Raft log syncs stall on the disk");
+                let stalled = switch.load(Ordering::Relaxed) == 0;
+                switch.store(if stalled { on } else { 0 }, Ordering::Relaxed);
+                tracing::warn!(
+                    stalled,
+                    own = own_ms.is_some(),
+                    "test fault: Raft log syncs stall"
+                );
             }
         });
     }
