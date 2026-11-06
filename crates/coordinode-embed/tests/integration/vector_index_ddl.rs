@@ -285,13 +285,63 @@ fn a_rebuild_is_not_undone_by_the_build_it_replaces() {
     );
 }
 
-/// The same with the CREATE build held before it hands the index over,
-/// while writes are left to it: the label's first node must not be left to
-/// a build whose carriers do not take it.
+/// A type comes to imply the indexed label while the index's CREATE build is
+/// held before it hands the index over: the type's stored nodes the change
+/// adds to the index must be in it once the build ended, not left to a
+/// build that judges them by the carriers it began with.
 #[test]
-fn a_first_node_is_not_left_to_a_build_that_never_takes_it() {
-    a_first_node_stays_indexed_past_a_build_held_at(
-        &coordinode_query::index::vector_build::BEFORE_HAND_OVER,
+fn a_change_followed_during_a_build_keeps_its_gained_nodes() {
+    use coordinode_query::index::vector_build::BEFORE_HAND_OVER;
+    let (mut db, _dir) = open_db();
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "ALTER LABEL Thing SET SCHEMA FLEXIBLE",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "ALTER LABEL Task SET SCHEMA FLEXIBLE",
+        "CREATE (:Thing {title: 'thing', emb: [0.0, 1.0]})",
+        "CREATE (:Task {title: 'task', emb: [1.0, 0.0]})",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    let (reached_tx, reached) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    *BEFORE_HAND_OVER.lock() = Some(Box::new(move |token| {
+        reached_tx.send(()).expect("test waits");
+        while !token.is_cancelled()
+            && matches!(
+                released.recv_timeout(std::time::Duration::from_millis(10)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            )
+        {}
+    }));
+    db.execute_cypher(r#"CREATE VECTOR INDEX thing_emb ON :Thing(emb) OPTIONS {metric: "l2"}"#)
+        .expect("create index");
+    reached
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the CREATE build reaches its hand-over");
+    db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+        .expect("Task comes to imply Thing");
+    drop(release);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !db.vector_index_registry().running_builds().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the CREATE build never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    await_folded(&db);
+    let rows = db
+        .execute_cypher("MATCH (n:Task {title: 'task'}) RETURN id(n) AS id")
+        .expect("task id");
+    let task = match rows[0].get("id") {
+        Some(Value::Int(id)) => coordinode_core::graph::node::NodeId::from_raw(*id as u64),
+        other => panic!("no task id: {other:?}"),
+    };
+    assert!(
+        db.vector_index_registry().holds("Thing", "emb", task),
+        "the task the change added to :Thing is not in its index"
     );
 }
 
