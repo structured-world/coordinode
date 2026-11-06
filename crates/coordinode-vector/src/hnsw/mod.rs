@@ -423,6 +423,10 @@ pub struct HnswIndex {
     /// Tests: batch waves run blind, every insert planned before any links.
     #[cfg(test)]
     blind_waves: std::sync::atomic::AtomicBool,
+    /// Tests: who removed which id, a backtrace per removal, for
+    /// [`Self::graph_dump`].
+    #[cfg(feature = "graph-dump")]
+    removals: parking_lot::Mutex<Vec<String>>,
     /// Optional persistent vector tier backing (truth tier
     /// f32 + quantized rerank tier). `None` for in-memory-only indexes
     /// (tests, ad-hoc analytics); `Some` when the caller has wired up
@@ -918,6 +922,8 @@ impl HnswIndex {
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
             #[cfg(test)]
             blind_waves: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "graph-dump")]
+            removals: parking_lot::Mutex::new(Vec::new()),
             vector_tier: None,
             rabitq_block: std::sync::OnceLock::new(),
             data_level0: std::sync::OnceLock::new(),
@@ -1687,6 +1693,10 @@ impl HnswIndex {
             }
             out.push('\n');
         }
+        for removal in self.removals.lock().iter() {
+            out.push_str(removal);
+            out.push('\n');
+        }
         out
     }
 
@@ -1979,6 +1989,11 @@ impl HnswIndex {
         let Some(idx) = self.id_to_idx.remove(id) else {
             return false;
         };
+        #[cfg(feature = "graph-dump")]
+        self.removals.lock().push(format!(
+            "removed id {id} (slot {idx}) at\n{}",
+            std::backtrace::Backtrace::force_capture()
+        ));
         // No longer a result before the count says it is gone: a reader
         // that sees the count drop finds no more results than it says.
         self.nodes().set_state(idx, data_level0::NodeState::Retired);
