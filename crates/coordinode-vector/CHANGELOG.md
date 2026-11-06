@@ -2,6 +2,41 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-06
+
+### Added
+
+- *(vector)* follow a change of what a type implies
+- *(vector)* exact scores and domain errors end to end
+- *(vector)* score vectors exactly in binary64 with one reduction
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+
+### Fixed
+
+- *(vector)* draw each HNSW level once and finite
+- *(vector)* keep every HNSW node reachable when lists fill
+- *(vector)* keep cosine exact for every finite vector
+
+### Performance
+
+- *(vector)* reduce four AVX2 blocks vertically
+- *(vector)* score exactly only candidates that can rank
+- *(vector)* no per-evaluation clear of the reduction stack
+- *(vector)* SSE2 exact kernels and cached sums of squares
+
+### Testing
+
+- *(vector)* keep the graph dump, drop the per-removal backtraces
+- *(vector)* record who removed an id in the graph dump
+- *(vector)* dump the graph when the outside search misses near
+- *(vector)* choose the exact kernel set for a bench run
+- *(vector)* measure the production exhaustive scan, not the unused flat index
+- *(vector)* qualify exact vector evaluation before and after
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
