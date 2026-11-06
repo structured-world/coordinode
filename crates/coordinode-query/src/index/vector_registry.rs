@@ -47,6 +47,20 @@ fn before_start(token: &BuildToken) {
     }
 }
 
+/// The step a test runs in a cancel once it chose the build to stop and
+/// released the table, before it waits for that build.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static BEFORE_CANCEL_WAIT: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn before_cancel_wait() {
+    let hook = BEFORE_CANCEL_WAIT.lock().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// What a search goes by beside its query: the loader reranking from disk,
 /// and which members it may return (all of them without one).
 type SearchWith<'a> = (
@@ -249,6 +263,16 @@ struct BuildEntry {
     property: String,
 }
 
+impl BuildEntry {
+    /// Stop this entry's owner, the table locked by the caller: an absorb,
+    /// checking the flag under the same lock, then never moves the entry
+    /// past the stop.
+    fn stop(&self) -> Arc<BuildOwner> {
+        self.owner.stop.store(true, Ordering::Relaxed);
+        Arc::clone(&self.owner)
+    }
+}
+
 /// One build, over one or more generations: the flag that stops it and the
 /// signal that it let its indexes go.
 struct BuildOwner {
@@ -307,9 +331,9 @@ impl BuildClaim {
     /// cancelled: its index belongs to whoever cancelled it.
     pub fn absorb(&mut self, mut other: BuildClaim) -> bool {
         let mut builds = self.builds.lock().unwrap_or_else(|e| e.into_inner());
-        // A cancel that stopped `other` first keeps its indexes; one that
-        // stops it after this check waits for `other` to be dropped below,
-        // then finds them under this claim when it looks again.
+        // A cancel or a takeover stops an owner under this lock: one that
+        // came first keeps `other`'s indexes, one that comes after finds
+        // them under this claim and stops it.
         if other.owner.stop.load(Ordering::Relaxed) {
             return false;
         }
@@ -591,13 +615,11 @@ impl VectorIndexRegistry {
             return None;
         }
         let hnsw = self.new_graph(&def, tier)?;
-        let claim = self.claim_entries(&[&def], None, |previous| {
-            // A build of this generation outliving its unregistered index
-            // fills the graph that went with it, not the one registered
-            // here: stopped, it is not waited for under the definitions
-            // lock, which the build it waits for may need.
-            previous.stop.store(true, Ordering::Relaxed);
-        });
+        // A build of this generation outliving its unregistered index fills
+        // the graph that went with it, not the one registered here: stopped,
+        // it is not waited for under the definitions lock, which the build it
+        // waits for may need.
+        let claim = self.claim_entries(&[&def], None, |_| {});
         let health = HealthSignal::new_ready();
         health.report_rebuild_progress(0.0, 0);
         self.forget_selection(&key);
@@ -619,13 +641,13 @@ impl VectorIndexRegistry {
     /// writes them while the claim is held.
     pub fn claim_build(&self, defs: &[&IndexDefinition], within: &BuildToken) -> BuildClaim {
         self.claim_entries(defs, Some(Arc::clone(&within.own)), |previous| {
-            previous.stop.store(true, Ordering::Relaxed);
             previous.wait_released();
         })
     }
 
-    /// Enter one owner for `defs`' generations, handing each one owned
-    /// already to `take_over` first, with the table unlocked.
+    /// Enter one owner for `defs`' generations. A generation owned already
+    /// has its owner stopped under the table's lock, then handed to
+    /// `take_over` with the table unlocked.
     fn claim_entries(
         &self,
         defs: &[&IndexDefinition],
@@ -643,7 +665,7 @@ impl VectorIndexRegistry {
                 let previous = {
                     let mut builds = self.builds.lock().unwrap_or_else(|e| e.into_inner());
                     match builds.get(&def.generation) {
-                        Some(entry) => Arc::clone(&entry.owner),
+                        Some(entry) => entry.stop(),
                         None => {
                             builds.insert(
                                 def.generation,
@@ -1099,11 +1121,12 @@ impl VectorIndexRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&generation)
-            .map(|entry| Arc::clone(&entry.owner));
+            .map(BuildEntry::stop);
         let Some(owner) = owner else {
             return false;
         };
-        owner.stop.store(true, Ordering::Relaxed);
+        #[cfg(any(test, feature = "test-hooks"))]
+        before_cancel_wait();
         // Its claim removes the entry as it lets the index go.
         owner.wait_released();
         true
@@ -1117,11 +1140,8 @@ impl VectorIndexRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|entry| Arc::clone(&entry.owner))
+            .map(BuildEntry::stop)
             .collect();
-        for owner in &owners {
-            owner.stop.store(true, Ordering::Relaxed);
-        }
         for owner in owners {
             owner.wait_released();
         }

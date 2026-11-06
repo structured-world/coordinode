@@ -219,6 +219,40 @@ fn a_second_cancel_waits_for_the_build_the_first_is_joining() {
     });
 }
 
+/// A cancel and a claim taking the cancelled build's index over race: the
+/// cancel chose the claim's build, and before it stops it, the index moves
+/// into another claim. The cancel must stop the build that owns the index
+/// when it returns, or refuse the move; it never returns while another
+/// build goes on filling the index it cancelled.
+#[test]
+fn a_cancel_racing_an_absorb_stops_the_build_that_took_the_index() {
+    let reg = VectorIndexRegistry::new();
+    let taken = hnsw(10, "doc_embedding", "Doc", "embedding");
+    let taker = hnsw(11, "img_pixels", "Img", "pixels");
+    let claim = reg.register_for_build(taken.clone(), None).expect("claim");
+    let mut absorber = reg.register_for_build(taker, None).expect("claim");
+    let (reached_tx, reached) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    *BEFORE_CANCEL_WAIT.lock() = Some(Box::new(move || {
+        reached_tx.send(()).expect("the test waits");
+        // Until the test lets it go: nothing is sent, the drop ends it.
+        while released.recv().is_ok() {}
+    }));
+    std::thread::scope(|scope| {
+        let cancel = scope.spawn(|| reg.cancel_build(taken.generation));
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the cancel chooses the build to stop");
+        let moved = absorber.absorb(claim);
+        drop(release);
+        assert!(cancel.join().expect("cancel"), "a build owned the index");
+        assert!(
+            !moved || absorber.token().is_cancelled(),
+            "the cancel returned while the claim that took the index over still builds it"
+        );
+    });
+}
+
 #[test]
 fn health_tracks_state_and_freshness_watermark() {
     let reg = VectorIndexRegistry::new();
