@@ -952,8 +952,9 @@ Room is reserved before anything grows, under one account per endpoint:
   records (schema, consensus vote, commit and log bounds) may use the whole
   limit; client writes stop at the limit less the reserve, so they always find
   room. Compactions take only the room admitted writes and the memtables'
-  flushes leave: a compaction that would need more stops, keeps its inputs and
-  runs again later.
+  flushes leave, the manifest versions flushes installed and have still to
+  write included: a compaction that would need more stops, keeps its inputs
+  and runs again later.
 - **Replicated groups.** The consensus log is counted like the journal. A leader
   admits a write before it proposes it; a follower reserves the room of the
   entries it receives until it has applied them, and refuses entries that do not
