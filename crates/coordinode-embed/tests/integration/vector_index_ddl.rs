@@ -272,6 +272,62 @@ fn a_transaction_ranks_its_own_uncommitted_vectors() {
     }
 }
 
+/// An index created over a label no node carries yet is built under no
+/// carriers; the label's first node makes the worker rebuild it under the
+/// carriers now in force. The build its CREATE started, held here between
+/// handing the index over and folding what its tap delivered, must not fold
+/// that node out of the graph the rebuild put it in: a search would then
+/// miss a committed node.
+#[test]
+fn a_rebuild_is_not_undone_by_the_build_it_replaces() {
+    use coordinode_query::index::vector_build::BEFORE_TAKE;
+    let (reached_tx, reached) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    *BEFORE_TAKE.lock() = Some(Box::new(move |token| {
+        reached_tx.send(()).expect("test waits");
+        // Until the test lets it go (drops `release`), or a newer build
+        // cancels it.
+        while !token.is_cancelled()
+            && matches!(
+                released.recv_timeout(std::time::Duration::from_millis(10)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            )
+        {}
+    }));
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(r#"CREATE VECTOR INDEX l2_idx ON :Embed(vec) OPTIONS {metric: "l2"}"#)
+        .expect("create l2 index");
+    reached
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the CREATE build reaches its take");
+    db.execute_cypher("CREATE (:Embed {name: 'near', vec: [1.0, 0.0, 0.0]})")
+        .expect("create near");
+    let near = embed_id(&mut db, "near");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !db.vector_index_registry().holds("Embed", "vec", near) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the rebuild never put near in the graph"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // A build still held now goes on to fold.
+    drop(release);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !db.vector_index_registry().running_builds().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the CREATE build never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        db.vector_index_registry().holds("Embed", "vec", near),
+        "the replaced build folded near out of the graph; {}",
+        ranking_evidence(&mut db)
+    );
+}
+
 /// What tells apart why a search outside a transaction ranked as it did:
 /// the top three it returns with their distances (the candidate set), the
 /// vectors the committed store holds read by a plain scan (the committed

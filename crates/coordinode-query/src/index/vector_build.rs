@@ -33,6 +33,24 @@ const PROGRESS_INTERVAL: u64 = 1000;
 /// partition is being replaced faster than it can be read.
 const RESCANS: usize = 16;
 
+/// A step a test runs in a build once it has handed its indexes over and
+/// before it takes the writes its tap delivered, given the build's token:
+/// the window a newer build of the same index can start in.
+#[cfg(any(test, feature = "test-hooks"))]
+pub type BeforeTakeHook = Box<dyn FnOnce(&BuildToken) + Send>;
+
+/// The step [`BeforeTakeHook`] names, taken by the next build to get there.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static BEFORE_TAKE: parking_lot::Mutex<Option<BeforeTakeHook>> = parking_lot::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn before_take(token: &BuildToken) {
+    let hook = BEFORE_TAKE.lock().take();
+    if let Some(hook) = hook {
+        hook(token);
+    }
+}
+
 /// Why a scan did not complete.
 enum ScanFailure {
     /// The history under the scan's snapshot was released: a scan from a
@@ -145,6 +163,14 @@ impl VectorBuild<'_> {
                 return Ok(BuildOutcome::Cancelled);
             }
             self.hand_over();
+            #[cfg(any(test, feature = "test-hooks"))]
+            before_take(self.token);
+            // A cancelled build writes nothing further: whoever cancelled it
+            // owns the indexes from here, and a fold judged by this build's
+            // carriers would undo what a newer build writes.
+            if self.token.is_cancelled() {
+                return Ok(BuildOutcome::Cancelled);
+            }
             // Every write at or below this cut landed before the take below:
             // in the scan or in the tap. It is the freshness the indexes have
             // once that take is folded.
@@ -163,7 +189,9 @@ impl VectorBuild<'_> {
                 Tapped::Keys(keys) => {
                     if !keys.is_empty() {
                         tracing::debug!(keys = keys.len(), "vector build: folding tapped writes");
-                        self.fold(&keys)?;
+                        if !self.fold(&keys)? {
+                            return Ok(BuildOutcome::Cancelled);
+                        }
                     }
                     drop(tap);
                     // This take came after the handover, so it held every
@@ -317,12 +345,16 @@ impl VectorBuild<'_> {
     /// not is removed from the graph, which repairs the links around it and
     /// later reuses its slot.
     ///
+    /// Returns `false` when the build was cancelled before a chunk: checked
+    /// under the graphs' write locks, so no chunk lands after a newer build
+    /// has taken the indexes over.
+    ///
     /// The read and the insert happen under the graphs' write locks. A writer
     /// that inserts its own vector after its record landed is ordered by the
     /// same lock; one that inserted before (an interactive statement, ahead
     /// of its commit) is delivered again by the tap when the commit lands,
     /// and that later fold reads the committed record.
-    fn fold(&self, keys: &[Vec<u8>]) -> Result<(), String> {
+    fn fold(&self, keys: &[Vec<u8>]) -> Result<bool, String> {
         // Other shards' rows and the per-version keys of temporal nodes
         // decode to nothing these indexes hold.
         let ids: Vec<NodeId> = keys
@@ -338,6 +370,9 @@ impl VectorBuild<'_> {
                 .map(|t| t.hnsw.write())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| "vector index lock poisoned".to_string())?;
+            if self.token.is_cancelled() {
+                return Ok(false);
+            }
             let read_txn = coordinode_storage::engine::transaction::Transaction::new(
                 self.engine,
                 None,
@@ -366,7 +401,7 @@ impl VectorBuild<'_> {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
