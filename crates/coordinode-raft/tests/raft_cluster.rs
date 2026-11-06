@@ -8479,6 +8479,12 @@ async fn a_stalled_log_sync_keeps_the_leader() {
     use std::sync::atomic::Ordering;
     // Past the longest election timeout either timing profile runs with.
     const STALL_MS: u64 = 4_000;
+    // A failure shows why a member left the term: an openraft core that
+    // stopped logs the error that ended it.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=warn,coordinode_raft=warn")
+        .with_test_writer()
+        .try_init();
 
     let result = tokio::time::timeout(Duration::from_secs(120), async {
         let dirs: Vec<_> = (0..3)
@@ -8500,8 +8506,33 @@ async fn a_stalled_log_sync_keeps_the_leader() {
                 .map(|m| (m.id, m.node.current_term()));
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // Each member's whole state when the term moved: whether its core
+        // runs (and the error that stopped it), its vote, role and log.
+        let states: Vec<String> = members
+            .iter()
+            .map(|m| {
+                use openraft::async_runtime::watch::WatchReceiver;
+                let metrics = m.node.raft().metrics().borrow_watched().clone();
+                format!(
+                    "member {}: running {:?}, state {:?}, term {}, vote {}, last log {:?}, \
+                     applied {:?}, leader {:?}, membership {}",
+                    m.id,
+                    metrics.running_state,
+                    metrics.state,
+                    metrics.current_term,
+                    metrics.vote,
+                    metrics.last_log_index,
+                    metrics.last_applied,
+                    metrics.current_leader,
+                    metrics.membership_config.membership()
+                )
+            })
+            .collect();
         SYNC_STALL_MS.store(0, Ordering::Relaxed);
-        assert_eq!(changed, None, "an election ran while the log syncs stalled");
+        assert_eq!(
+            changed, None,
+            "an election ran while the log syncs stalled (term {term}); {states:#?}"
+        );
         assert!(
             members[leader].node.is_leader().await,
             "the leader keeps leading"
