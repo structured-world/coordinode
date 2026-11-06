@@ -834,28 +834,30 @@ fn one_build_fills_every_index_of_the_shard() {
     assert_eq!(interner.intern("embedding"), fx.field);
     let pixels = interner.intern("pixels");
     assert!(
-        fx.registry.register_for_build(
-            crate::index::IndexDescriptor::hnsw(
-                "img",
-                "Img",
-                "pixels",
-                VectorIndexConfig {
-                    dimensions: 3,
-                    metric: coordinode_core::graph::types::VectorMetric::Cosine,
-                    m: 16,
-                    ef_construction: 200,
-                    quantization: coordinode_vector::hnsw::QuantizationCodec::None,
-                    offload_vectors: false,
-                    ef_search: None,
-                    rerank_candidates: None,
-                },
+        fx.registry
+            .register_for_build(
+                crate::index::IndexDescriptor::hnsw(
+                    "img",
+                    "Img",
+                    "pixels",
+                    VectorIndexConfig {
+                        dimensions: 3,
+                        metric: coordinode_core::graph::types::VectorMetric::Cosine,
+                        m: 16,
+                        ef_construction: 200,
+                        quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+                        offload_vectors: false,
+                        ef_search: None,
+                        rerank_candidates: None,
+                    },
+                )
+                .bind(
+                    crate::index::IndexId::from_raw(2),
+                    crate::index::GenerationId::from_raw(2),
+                ),
+                None,
             )
-            .bind(
-                crate::index::IndexId::from_raw(2),
-                crate::index::GenerationId::from_raw(2),
-            ),
-            None,
-        )
+            .is_some()
     );
     fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
     let img = fx.label("Img");

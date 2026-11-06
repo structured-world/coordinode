@@ -1370,13 +1370,13 @@ impl Database {
             let tier = registry.tier_handle(label_id, property_id);
             // Registered already, by the statement that created it on this
             // member: that statement's build fills it.
-            if registry.register_for_build(def.clone(), tier) {
-                resolved.push((def, property_id));
+            if let Some(claim) = registry.register_for_build(def.clone(), tier) {
+                resolved.push((def, property_id, claim));
             }
         }
 
         let mut members = Vec::with_capacity(resolved.len());
-        for (def, field_id) in resolved {
+        for (def, field_id, claim) in resolved {
             let (Some(hnsw), Some(health)) = (
                 registry.get(&def.label, def.property()),
                 registry.health_handle(&def.label, def.property()),
@@ -1394,16 +1394,36 @@ impl Database {
                         continue;
                     }
                 };
-            members.push((def, field_id, hnsw, health, carriers));
+            members.push((def, field_id, hnsw, health, carriers, claim));
         }
 
         // Each graph is filled with the members of its label's carriers now,
         // the interpretation it answers with.
-        for (def, _, _, _, carriers) in &members {
+        for (def, _, _, _, carriers, _) in &members {
             registry.record_built(&def.label, def.property(), carriers.clone());
         }
         match mode {
             PopulateMode::Blocking => {
+                // One build fills them all, under one claim: an index another
+                // owner took over since its registration is that owner's.
+                let mut claim: Option<coordinode_query::index::BuildClaim> = None;
+                let mut owned = Vec::with_capacity(members.len());
+                for (def, field_id, hnsw, health, carriers, own) in members {
+                    let taken = match claim.as_mut() {
+                        None => {
+                            claim = Some(own);
+                            true
+                        }
+                        Some(claim) => claim.absorb(own),
+                    };
+                    if taken {
+                        owned.push((def, field_id, hnsw, health, carriers));
+                    }
+                }
+                let members = owned;
+                let Some(claim) = claim else {
+                    return;
+                };
                 let targets: Vec<coordinode_query::index::BuildTarget<'_>> = members
                     .iter()
                     .map(|(_, field_id, hnsw, health, carriers)| {
@@ -1415,7 +1435,6 @@ impl Database {
                         }
                     })
                     .collect();
-                let token = registry.new_build_token();
                 // On its own thread: the build may pause the Raft applies,
                 // which blocks, and the caller can be on the async runtime.
                 let outcome = std::thread::scope(|scope| {
@@ -1423,7 +1442,7 @@ impl Database {
                         .spawn(|| {
                             coordinode_query::index::VectorBuild {
                                 engine,
-                                token: &token,
+                                token: claim.token(),
                                 shard_id,
                                 targets: &targets,
                             }
@@ -1450,11 +1469,14 @@ impl Database {
                         }
                     }
                 }
+                // Let go only once the outcome is published: an owner
+                // waiting to take an index over writes after it.
+                drop(claim);
             }
             PopulateMode::Background => {
-                for (def, field_id, hnsw, health, carriers) in members {
+                for (def, field_id, hnsw, health, carriers, claim) in members {
                     Self::spawn_replica_build(
-                        registry, engine, shard_id, def, field_id, hnsw, health, carriers,
+                        registry, engine, shard_id, claim, def, field_id, hnsw, health, carriers,
                     );
                 }
             }
@@ -1462,13 +1484,14 @@ impl Database {
     }
 
     /// Build `def` on a replica in the background, the way a `CREATE VECTOR
-    /// INDEX` does on the member that ran it: the registry owns the thread,
-    /// so dropping the index cancels and joins it.
+    /// INDEX` does on the member that ran it: `claim` owns the index, so
+    /// dropping it or a rebuild taking it over stops the build and waits.
     #[allow(clippy::too_many_arguments)]
     fn spawn_replica_build(
         registry: &coordinode_query::index::VectorIndexRegistry,
         engine: &Arc<StorageEngine>,
         shard_id: u16,
+        claim: coordinode_query::index::BuildClaim,
         def: &coordinode_query::index::IndexDefinition,
         field_id: u32,
         hnsw: Arc<std::sync::RwLock<coordinode_vector::hnsw::HnswIndex>>,
@@ -1481,7 +1504,7 @@ impl Database {
         // so, and a blocked reader would wait on it until its timeout.
         let unbuilt = Arc::clone(&health);
         let spawned =
-            registry.spawn_build(def, format!("vec-replica-{name}"), move |build_token| {
+            registry.spawn_build(claim, format!("vec-replica-{name}"), move |build_token| {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     coordinode_query::index::VectorBuild {
                         engine: engine.as_ref(),

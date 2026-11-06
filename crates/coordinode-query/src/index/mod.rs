@@ -99,4 +99,4 @@ pub use registry::{
 };
 pub use text_registry::TextIndexRegistry;
 pub use vector_build::{BuildOutcome, BuildTarget, VectorBuild};
-pub use vector_registry::{BuildToken, VectorIndexRegistry};
+pub use vector_registry::{BuildClaim, BuildToken, VectorIndexRegistry};

@@ -130,7 +130,7 @@ fn building_vector_index() -> (
         crate::index::GenerationId::from_raw(1),
     );
     let registry = crate::index::VectorIndexRegistry::new();
-    assert!(registry.register_for_build(def, None));
+    assert!(registry.register_for_build(def, None).is_some());
     (dir, oracle, engine, registry)
 }
 

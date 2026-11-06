@@ -26,7 +26,8 @@ use coordinode_modality::{LocalNodeStore, NodeStore as _};
 use coordinode_query::index::membership::LabelCarriers;
 use coordinode_query::index::selection::Held;
 use coordinode_query::index::{
-    BuildTarget, BuildToken, IndexCoverage, VectorBuild, VectorIndexRegistry,
+    BuildOutcome, BuildTarget, BuildToken, IndexCoverage, IndexDefinition, VectorBuild,
+    VectorIndexRegistry,
 };
 use coordinode_search::tantivy::Scope;
 use coordinode_storage::engine::applied::{
@@ -336,8 +337,22 @@ impl Worker {
 
     /// Rebuild every index from the store, since what changed is not known;
     /// the event the rebuilt indexes cover, or `None` when the rebuild
-    /// failed.
+    /// failed or the worker is stopping.
     fn rebuild(&self) -> Option<u64> {
+        loop {
+            match self.rebuild_once() {
+                Rebuilt::Covered(covered) => return Some(covered),
+                Rebuilt::Failed => return None,
+                // An owner took one of the indexes over (its DROP, a
+                // cancel): the others are incomplete, so the rebuild runs
+                // again over the indexes there are now.
+                Rebuilt::TakenOver if !self.stop.is_cancelled() => {}
+                Rebuilt::TakenOver => return None,
+            }
+        }
+    }
+
+    fn rebuild_once(&self) -> Rebuilt {
         // Every event numbered up to here is in the store the build reads.
         let covered = self.position.delivered();
         let definitions = self.registry.all_definitions();
@@ -345,7 +360,7 @@ impl Worker {
             Ok(view) => view,
             Err(e) => {
                 tracing::error!(error = %e, "vector index worker cannot read the field dictionary");
-                return None;
+                return Rebuilt::Failed;
             }
         };
         let mut members = Vec::with_capacity(definitions.len());
@@ -364,22 +379,24 @@ impl Worker {
                 Ok(carriers) => carriers,
                 Err(e) => {
                     tracing::error!(index = %def, error = %e, "vector index worker cannot read the carriers of its label");
-                    return None;
+                    return Rebuilt::Failed;
                 }
             };
             members.push((def, hnsw, health, field_id, carriers));
         }
         drop(interner);
         if members.is_empty() {
-            return Some(covered);
+            return Rebuilt::Covered(covered);
         }
+        // A build owning an index (the one its CREATE registered, started or
+        // not) fills it under the carriers it read when it began: its last
+        // fold would take out the members this rebuild inserts under the ones
+        // in force now. It is stopped, and waited for, before anything here
+        // writes the index, and one not yet started never starts; the index
+        // is this rebuild's until it ends, so a DROP stops it in turn.
+        let defs: Vec<&IndexDefinition> = members.iter().map(|(def, ..)| *def).collect();
+        let claim = self.registry.claim_build(&defs, &self.stop);
         for (def, _, health, _, carriers) in &members {
-            // A build still running on the index (the one its CREATE started)
-            // fills it under the carriers it read when it began: its last fold
-            // would take out the members this rebuild inserts under the ones
-            // in force now. It stops, and is waited for, before anything here
-            // writes the index.
-            self.registry.cancel_build(def.generation);
             // Incomplete until the build hands it over again.
             health.report_rebuild_progress(0.0, 0);
             // Filled with these carriers' members alone from here.
@@ -405,25 +422,36 @@ impl Worker {
         );
         let outcome = VectorBuild {
             engine: &self.engine,
-            token: &self.stop,
+            token: claim.token(),
             shard_id: self.shard_id,
             targets: &targets,
         }
         .run();
         match outcome {
+            Ok(BuildOutcome::Cancelled) => Rebuilt::TakenOver,
             Ok(outcome) => {
                 tracing::info!(?outcome, "vector index worker rebuild done");
-                Some(covered)
+                Rebuilt::Covered(covered)
             }
             Err(reason) => {
                 tracing::warn!(%reason, "vector index worker rebuild failed");
                 for (_, _, health, _, _) in &members {
                     health.mark_offline(reason.clone());
                 }
-                None
+                Rebuilt::Failed
             }
         }
     }
+}
+
+/// How one attempt at rebuilding the indexes ended.
+enum Rebuilt {
+    /// Every index holds the store up to this event.
+    Covered(u64),
+    /// The store could not be read, or an index could not take a vector.
+    Failed,
+    /// Stopped: the worker is stopping, or an index was taken over.
+    TakenOver,
 }
 
 /// The interpretations of its label a fold judges a node's membership in an
@@ -520,8 +548,8 @@ impl Worker {
             };
             let base_holds = held.base.as_ref() == Some(&in_force);
             let unchanged = base_holds && candidate == in_force && held.candidate.is_none();
-            // A build still filling the index judges its members by the
-            // carriers it began with, and writes left to it are folded by
+            // A build owning the index, running or registered to start,
+            // judges its members by the carriers it began with, and writes left to it are folded by
             // those: following a change beside it would leave the members
             // only the change carries to a build that never takes them, or
             // have its last fold take them out. The rebuild stops it first

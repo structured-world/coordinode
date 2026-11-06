@@ -345,6 +345,109 @@ fn a_change_followed_during_a_build_keeps_its_gained_nodes() {
     );
 }
 
+/// The label's first node arrives after the CREATE registered its index for
+/// a build under no carriers and before that build started: the worker
+/// rebuilds the index under the carriers in force. The CREATE build, let go
+/// afterwards, must not start under the carriers it read and fold that node
+/// out when a write to it reaches its tap; the node stays indexed, found,
+/// and the index ready.
+#[test]
+fn a_build_not_yet_started_does_not_undo_the_rebuild_that_took_it_over() {
+    use coordinode_query::index::vector_build::BEFORE_TAKE;
+    use coordinode_query::index::vector_registry::BEFORE_START;
+    let held = |reached_tx: std::sync::mpsc::Sender<()>,
+                released: std::sync::mpsc::Receiver<()>| {
+        Box::new(move |token: &coordinode_query::index::BuildToken| {
+            reached_tx.send(()).expect("test waits");
+            // Until the test lets it go (drops its sender), or the build is
+            // cancelled.
+            while !token.is_cancelled()
+                && matches!(
+                    released.recv_timeout(std::time::Duration::from_millis(10)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                )
+            {}
+        })
+    };
+    let (start_reached_tx, start_reached) = std::sync::mpsc::channel::<()>();
+    let (start_release, start_released) = std::sync::mpsc::channel::<()>();
+    *BEFORE_START.lock() = Some(held(start_reached_tx, start_released));
+    let (db, _dir) = open_db();
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    let run = |query: &str| {
+        db.execute_cypher_shared(query, None, None, None, None)
+            .unwrap_or_else(|e| panic!("{query}: {e}"))
+    };
+    std::thread::scope(|scope| {
+        let create = scope.spawn(|| {
+            run(r#"CREATE VECTOR INDEX l2_idx ON :Embed(vec) OPTIONS {metric: "l2"}"#);
+        });
+        start_reached
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the CREATE reaches the start of its build");
+        run("CREATE (:Embed {name: 'near', vec: [1.0, 0.0, 0.0]})");
+        let rows = run("MATCH (n:Embed {name: 'near'}) RETURN id(n) AS id");
+        let near = match rows.rows[0].get("id") {
+            Some(Value::Int(id)) => coordinode_core::graph::node::NodeId::from_raw(*id as u64),
+            other => panic!("no id for near: {other:?}"),
+        };
+        wait("the rebuild never put near in the graph", &|| {
+            db.vector_index_registry().holds("Embed", "vec", near)
+        });
+        // The CREATE build, if it starts now, is held before it folds its
+        // tap, and a write to near is put through that tap.
+        let (take_reached_tx, take_reached) = std::sync::mpsc::channel::<()>();
+        let (take_release, take_released) = std::sync::mpsc::channel::<()>();
+        *BEFORE_TAKE.lock() = Some(held(take_reached_tx, take_released));
+        drop(start_release);
+        create.join().expect("the CREATE answers");
+        loop {
+            if take_reached.try_recv().is_ok() {
+                run("MATCH (n:Embed {name: 'near'}) SET n.vec = [1.0, 0.0, 0.1]");
+                await_folded(&db);
+                break;
+            }
+            if db.vector_index_registry().running_builds().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(take_release);
+        wait("the CREATE build never ended", &|| {
+            db.vector_index_registry().running_builds().is_empty()
+        });
+        *BEFORE_TAKE.lock() = None;
+        await_folded(&db);
+        assert!(
+            db.vector_index_registry().holds("Embed", "vec", near),
+            "a build started after the rebuild took its index over folded near out"
+        );
+        let found = run(
+            "MATCH (n:Embed) WITH n, vector_distance(n.vec, [1.0, 0.0, 0.0]) AS d \
+             ORDER BY d LIMIT 1 RETURN n.name AS name",
+        );
+        assert_eq!(
+            found.rows[0].get("name"),
+            Some(&Value::String("near".to_string())),
+            "the search does not find near"
+        );
+        assert!(
+            matches!(
+                db.vector_index_registry().health_snapshot("Embed", "vec"),
+                Some(coordinode_vector::health::IndexHealthState::Ready { .. })
+            ),
+            "the index is not ready: {:?}",
+            db.vector_index_registry().health_snapshot("Embed", "vec")
+        );
+    });
+}
+
 /// Create an index over an empty label with its CREATE build held at
 /// `hook`, give the label its first node, wait for the index to hold it,
 /// then let the build go on and require the node still indexed once the

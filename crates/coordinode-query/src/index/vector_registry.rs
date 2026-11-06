@@ -32,6 +32,21 @@ pub use selection::Reader;
 /// Key for vector index lookup: (label, property).
 type VectorIndexKey = (String, String);
 
+/// The step a test runs in the thread starting a build, given the build's
+/// token: after the index was registered for the build and its carriers
+/// recorded, before the build starts.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static BEFORE_START: parking_lot::Mutex<Option<super::vector_build::BeforeTakeHook>> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn before_start(token: &BuildToken) {
+    let hook = BEFORE_START.lock().take();
+    if let Some(hook) = hook {
+        hook(token);
+    }
+}
+
 /// What a search goes by beside its query: the loader reranking from disk,
 /// and which members it may return (all of them without one).
 type SearchWith<'a> = (
@@ -193,15 +208,17 @@ pub struct VectorIndexRegistry {
     /// caller (executor, Database) so we never re-enter the same
     /// `parking_lot` RwLock from inside an active write transaction.
     tier_backend: Option<Arc<dyn VectorTierStorage>>,
-    /// Backfills running right now, keyed by the generation each fills.
+    /// The build that owns each generation's index right now, from the moment
+    /// the index is registered for it until the build ends.
     ///
     /// A build is a task the index owns, not a detached thread: DROP, a
-    /// replacing CREATE, and database shutdown all cancel and join it here
-    /// before touching the index. Without that ownership the build outlives
-    /// the index it belongs to and keeps writing under whatever comes next.
-    /// Keyed by generation, a build of a dropped index can never be taken
-    /// for one of an index created later under the same name.
-    builds: Mutex<HashMap<GenerationId, BuildHandle>>,
+    /// replacing CREATE or rebuild, and database shutdown all stop it here
+    /// and wait for it before touching the index. Without that ownership the
+    /// build outlives the index it belongs to and keeps writing under
+    /// whatever comes next. Keyed by generation, a build of a dropped index
+    /// can never be taken for one of an index created later under the same
+    /// name.
+    builds: Arc<Mutex<HashMap<GenerationId, BuildEntry>>>,
     /// Retired-memory budget each graph gets (see
     /// [`Self::set_retired_bytes_budget`]).
     retired_bytes_budget: AtomicUsize,
@@ -218,19 +235,116 @@ pub struct VectorIndexRegistry {
     held_changes: crate::index::selection::HeldChanges,
 }
 
-/// A running backfill: the flag that stops it and the thread to join.
+/// The build owning one generation's index.
 ///
 /// Carries what it is building rather than looking it up: a build outlives the
 /// registry entry for its index by exactly the window this type exists to
 /// close, and a progress surface that went silent in that window would report
 /// "no builds running" while one still holds the index.
-struct BuildHandle {
-    stop: Arc<AtomicBool>,
-    thread: std::thread::JoinHandle<()>,
+struct BuildEntry {
+    owner: Arc<BuildOwner>,
     /// How the index is named in progress reports.
     index: String,
     label: String,
     property: String,
+}
+
+/// One build, over one or more generations: the flag that stops it and the
+/// signal that it let its indexes go.
+struct BuildOwner {
+    stop: Arc<AtomicBool>,
+    released: Mutex<bool>,
+    on_release: std::sync::Condvar,
+}
+
+impl BuildOwner {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            released: Mutex::new(false),
+            on_release: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Wait until the build has let its indexes go: it writes nothing to them
+    /// afterwards.
+    fn wait_released(&self) {
+        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        while !*released {
+            released = self
+                .on_release
+                .wait(released)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// A build's ownership of the indexes it fills, from their registration until
+/// it is dropped.
+///
+/// Whoever registers an index for a build holds the claim, through the start
+/// of the build to its end. A newer owner (a rebuild, a DROP, shutdown) stops
+/// the claim's build and waits for the claim to be dropped before writing:
+/// a build cancelled before it started never starts, and one cancelled while
+/// it runs writes nothing more once its claim is gone.
+#[must_use = "dropping the claim lets the index go: only its holder may build it"]
+pub struct BuildClaim {
+    builds: Arc<Mutex<HashMap<GenerationId, BuildEntry>>>,
+    owner: Arc<BuildOwner>,
+    token: BuildToken,
+    generations: Vec<GenerationId>,
+}
+
+impl BuildClaim {
+    /// The token the claimed build runs under: cancelled once a newer owner
+    /// takes any of its indexes over.
+    pub fn token(&self) -> &BuildToken {
+        &self.token
+    }
+
+    /// Take `other`'s indexes into this claim, so one build fills them all
+    /// under one token. False, and nothing taken, when `other` was already
+    /// cancelled: its index belongs to whoever cancelled it.
+    pub fn absorb(&mut self, mut other: BuildClaim) -> bool {
+        let mut builds = self.builds.lock().unwrap_or_else(|e| e.into_inner());
+        // A cancel that stopped `other` first keeps its indexes; one that
+        // stops it after this check waits for `other` to be dropped below,
+        // then finds them under this claim when it looks again.
+        if other.owner.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        for generation in other.generations.drain(..) {
+            if let Some(entry) = builds.get_mut(&generation)
+                && Arc::ptr_eq(&entry.owner, &other.owner)
+            {
+                entry.owner = Arc::clone(&self.owner);
+                self.generations.push(generation);
+            }
+        }
+        true
+    }
+}
+
+impl Drop for BuildClaim {
+    fn drop(&mut self) {
+        {
+            let mut builds = self.builds.lock().unwrap_or_else(|e| e.into_inner());
+            for generation in &self.generations {
+                if builds
+                    .get(generation)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.owner, &self.owner))
+                {
+                    builds.remove(generation);
+                }
+            }
+        }
+        *self
+            .owner
+            .released
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+        self.owner.on_release.notify_all();
+    }
 }
 
 /// Handed to a backfill so it can tell whether it should still be running.
@@ -240,19 +354,28 @@ struct BuildHandle {
 /// its progress — so the index it was building is free to be dropped or
 /// replaced the moment the cancel returns.
 #[derive(Clone)]
-pub struct BuildToken(Arc<AtomicBool>);
+pub struct BuildToken {
+    own: Arc<AtomicBool>,
+    /// The token of whoever runs the build on its own thread (a worker
+    /// rebuilding its indexes), which stops the build too.
+    within: Option<Arc<AtomicBool>>,
+}
 
 impl BuildToken {
     /// True once someone has asked this build to stop.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.own.load(Ordering::Relaxed)
+            || self
+                .within
+                .as_ref()
+                .is_some_and(|within| within.load(Ordering::Relaxed))
     }
 
     /// Ask the build to stop. The registry does this for the builds it owns;
     /// whoever runs a build of its own (a worker rebuilding its indexes)
     /// stops it with this.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.own.store(true, Ordering::Relaxed);
     }
 }
 
@@ -265,7 +388,7 @@ impl VectorIndexRegistry {
             definitions: RwLock::new(HashMap::new()),
             health: RwLock::new(HashMap::new()),
             tier_backend: None,
-            builds: Mutex::new(HashMap::new()),
+            builds: Arc::new(Mutex::new(HashMap::new())),
             retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
             coverage: RwLock::new(None),
             selections: RwLock::new(HashMap::new()),
@@ -291,7 +414,7 @@ impl VectorIndexRegistry {
             definitions: RwLock::new(HashMap::new()),
             health: RwLock::new(HashMap::new()),
             tier_backend: Some(backend),
-            builds: Mutex::new(HashMap::new()),
+            builds: Arc::new(Mutex::new(HashMap::new())),
             retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
             coverage: RwLock::new(None),
             selections: RwLock::new(HashMap::new()),
@@ -446,12 +569,17 @@ impl VectorIndexRegistry {
     /// published already rebuilding, so neither a reader nor a writer ever
     /// takes the empty graph for a finished one.
     ///
-    /// Returns whether it registered. A generation already registered keeps
-    /// its graph, its health signal and the build filling them, and the
-    /// caller starts no build of its own: the statement that created the
-    /// index and this member's catalog follower both register it.
-    #[must_use = "only the registration that returns true may start the build"]
-    pub fn register_for_build(&self, def: IndexDefinition, tier: Option<VectorTierHandle>) -> bool {
+    /// Returns the claim on the index's build when it registered: the index
+    /// is that build's from here, though the build has not started, and a
+    /// newer owner stops it through the claim. A generation already
+    /// registered keeps its graph, its health signal and the build filling
+    /// them, and the caller starts no build of its own: the statement that
+    /// created the index and this member's catalog follower both register it.
+    pub fn register_for_build(
+        &self,
+        def: IndexDefinition,
+        tier: Option<VectorTierHandle>,
+    ) -> Option<BuildClaim> {
         let key = (def.label.clone(), def.property().to_string());
         // Held from the check to the insert, so two registrations of one
         // generation cannot both pass the check.
@@ -460,11 +588,16 @@ impl VectorIndexRegistry {
             .get(&key)
             .is_some_and(|registered| registered.generation == def.generation)
         {
-            return false;
+            return None;
         }
-        let Some(hnsw) = self.new_graph(&def, tier) else {
-            return false;
-        };
+        let hnsw = self.new_graph(&def, tier)?;
+        let claim = self.claim_entries(&[&def], None, |previous| {
+            // A build of this generation outliving its unregistered index
+            // fills the graph that went with it, not the one registered
+            // here: stopped, it is not waited for under the definitions
+            // lock, which the build it waits for may need.
+            previous.stop.store(true, Ordering::Relaxed);
+        });
         let health = HealthSignal::new_ready();
         health.report_rebuild_progress(0.0, 0);
         self.forget_selection(&key);
@@ -477,7 +610,73 @@ impl VectorIndexRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), health);
         definitions.insert(key, def);
-        true
+        Some(claim)
+    }
+
+    /// Take the indexes of `defs` over for a build run by the caller on its
+    /// own thread, under `within`, which stops it too: every build owning one
+    /// of them is stopped and waited for first, so nothing but this build
+    /// writes them while the claim is held.
+    pub fn claim_build(&self, defs: &[&IndexDefinition], within: &BuildToken) -> BuildClaim {
+        self.claim_entries(defs, Some(Arc::clone(&within.own)), |previous| {
+            previous.stop.store(true, Ordering::Relaxed);
+            previous.wait_released();
+        })
+    }
+
+    /// Enter one owner for `defs`' generations, handing each one owned
+    /// already to `take_over` first, with the table unlocked.
+    fn claim_entries(
+        &self,
+        defs: &[&IndexDefinition],
+        within: Option<Arc<AtomicBool>>,
+        take_over: impl Fn(&BuildOwner),
+    ) -> BuildClaim {
+        let owner = BuildOwner::new();
+        let token = BuildToken {
+            own: Arc::clone(&owner.stop),
+            within,
+        };
+        let mut generations = Vec::with_capacity(defs.len());
+        for def in defs {
+            loop {
+                let previous = {
+                    let mut builds = self.builds.lock().unwrap_or_else(|e| e.into_inner());
+                    match builds.get(&def.generation) {
+                        Some(entry) => Arc::clone(&entry.owner),
+                        None => {
+                            builds.insert(
+                                def.generation,
+                                BuildEntry {
+                                    owner: Arc::clone(&owner),
+                                    index: def.to_string(),
+                                    label: def.label.clone(),
+                                    property: def.property().to_string(),
+                                },
+                            );
+                            break;
+                        }
+                    }
+                };
+                take_over(&previous);
+                let mut builds = self.builds.lock().unwrap_or_else(|e| e.into_inner());
+                // Taken over without waiting: the previous owner's claim
+                // leaves this entry alone when it is dropped.
+                if builds
+                    .get(&def.generation)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.owner, &previous))
+                {
+                    builds.remove(&def.generation);
+                }
+            }
+            generations.push(def.generation);
+        }
+        BuildClaim {
+            builds: Arc::clone(&self.builds),
+            owner,
+            token,
+            generations,
+        }
     }
 
     fn insert_index(
@@ -836,147 +1035,100 @@ impl VectorIndexRegistry {
             .is_some_and(|h| h.build_owns_writes())
     }
 
-    /// Mint a cancellation token for a build that is about to start.
-    ///
-    /// The caller spawns the build with this token, then hands the thread to
-    /// [`Self::register_build`]; the pair is what makes the build cancellable.
+    /// Mint a cancellation token for a build run by its caller that owns no
+    /// index of the registry: a worker's stop, a test's build.
     pub fn new_build_token(&self) -> BuildToken {
-        BuildToken(Arc::new(AtomicBool::new(false)))
+        BuildToken {
+            own: Arc::new(AtomicBool::new(false)),
+            within: None,
+        }
     }
 
-    /// Adopt a running backfill of `def`'s generation so the index owns it.
+    /// Start the build `claim` owns on a thread named `thread`. `build` runs
+    /// with the claim's token, and the claim is let go once it returns.
     ///
-    /// A build already registered for that generation is cancelled and
-    /// joined first: two builds of one generation would race each other's
-    /// inserts into the same graph, and only the survivor's progress would
-    /// mean anything.
-    pub fn register_build(
-        &self,
-        def: &IndexDefinition,
-        token: &BuildToken,
-        thread: std::thread::JoinHandle<()>,
-    ) {
-        self.cancel_build(def.generation);
-        self.reap_finished_builds();
-        let handle = BuildHandle {
-            stop: Arc::clone(&token.0),
-            thread,
-            index: def.to_string(),
-            label: def.label.clone(),
-            property: def.property().to_string(),
-        };
-        self.builds
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(def.generation, handle);
-    }
-
-    /// Start a backfill of `def`'s generation on a thread named `thread`,
-    /// owned by the index: `build` runs only once the build is registered,
-    /// so a newer build of the index or its drop can always stop it before
-    /// writing to it, never racing a build that has not been registered yet.
+    /// A claim a newer owner cancelled before this start runs no build: the
+    /// index is that owner's, and a build starting now would fill it under
+    /// what it was given at registration.
     ///
     /// # Errors
     ///
-    /// The thread could not be spawned; nothing was registered.
+    /// The thread could not be spawned; the claim is let go.
     pub fn spawn_build(
         &self,
-        def: &IndexDefinition,
+        claim: BuildClaim,
         thread: String,
         build: impl FnOnce(BuildToken) + Send + 'static,
     ) -> std::io::Result<()> {
-        let token = self.new_build_token();
-        let build_token = token.clone();
-        let (start, registered) = std::sync::mpsc::channel::<()>();
-        let handle = std::thread::Builder::new().name(thread).spawn(move || {
-            // The sender goes only after the registration below, which
-            // cannot fail: a closed channel means the registering thread
-            // panicked, and nobody owns this build then.
-            if registered.recv().is_ok() {
-                build(build_token);
+        #[cfg(any(test, feature = "test-hooks"))]
+        before_start(claim.token());
+        std::thread::Builder::new().name(thread).spawn(move || {
+            let token = claim.token().clone();
+            if token.is_cancelled() {
+                // What the build holds (the engine among it) goes before
+                // the claim, whose release tells a waiting owner it is gone.
+                drop(build);
+            } else {
+                build(token);
             }
+            drop(claim);
         })?;
-        self.register_build(def, &token, handle);
-        if start.send(()).is_err() {
-            // The thread is gone before it was let start: it panicked
-            // before receiving, and its join reports nothing to act on.
-            tracing::warn!(index = %def, "a vector index build ended before it started");
-        }
         Ok(())
     }
 
-    /// Whether a backfill of `generation` is running: registered and not yet
-    /// finished.
+    /// Whether a build owns `generation`'s index: registered for it, or
+    /// running, and not yet ended.
     pub fn is_building(&self, generation: GenerationId) -> bool {
-        self.reap_finished_builds();
         self.builds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&generation)
     }
 
-    /// Stop the backfill of `generation` and wait for it to finish.
+    /// Stop the build owning `generation`'s index and wait for it to let the
+    /// index go.
     ///
-    /// Returns whether a build was running. On return the build has stopped
+    /// Returns whether a build owned it. On return the build has stopped
     /// touching the index AND its persisted definition, which is what lets a
     /// caller drop or replace the index immediately afterwards without racing
-    /// a write it cannot see.
+    /// a write it cannot see. A cancel arriving while another one waits for
+    /// the same build waits for it too.
     pub fn cancel_build(&self, generation: GenerationId) -> bool {
-        let handle = self
+        let owner = self
             .builds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&generation);
-        let Some(handle) = handle else {
+            .get(&generation)
+            .map(|entry| Arc::clone(&entry.owner));
+        let Some(owner) = owner else {
             return false;
         };
-        handle.stop.store(true, Ordering::Relaxed);
-        // A panicked build is still a stopped build: the join error carries no
-        // obligation here, the thread is gone either way.
-        let _ = handle.thread.join();
+        owner.stop.store(true, Ordering::Relaxed);
+        // Its claim removes the entry as it lets the index go.
+        owner.wait_released();
         true
     }
 
-    /// Stop and join every running backfill. Used on shutdown, where a build
+    /// Stop every build and wait for each. Used on shutdown, where a build
     /// left running would keep writing into an engine that is closing.
     pub fn cancel_all_builds(&self) {
-        let handles: Vec<BuildHandle> = self
+        let owners: Vec<Arc<BuildOwner>> = self
             .builds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .drain()
-            .map(|(_, h)| h)
+            .values()
+            .map(|entry| Arc::clone(&entry.owner))
             .collect();
-        for handle in handles {
-            handle.stop.store(true, Ordering::Relaxed);
-            let _ = handle.thread.join();
+        for owner in &owners {
+            owner.stop.store(true, Ordering::Relaxed);
+        }
+        for owner in owners {
+            owner.wait_released();
         }
     }
 
-    /// Drop the bookkeeping for builds that have finished on their own.
-    ///
-    /// A build that runs to completion has nobody to cancel it, so its handle
-    /// would otherwise sit in the table forever, holding a joinable thread and
-    /// making every progress query report a build that ended. Reaping is lazy
-    /// (done on the paths that read or write the table) because there is no
-    /// one to notify us, and joining a finished thread returns at once.
-    fn reap_finished_builds(&self) {
-        let mut builds = self.builds.lock().unwrap_or_else(|e| e.into_inner());
-        let finished: Vec<GenerationId> = builds
-            .iter()
-            .filter(|(_, h)| h.thread.is_finished())
-            .map(|(generation, _)| *generation)
-            .collect();
-        for generation in finished {
-            if let Some(handle) = builds.remove(&generation) {
-                let _ = handle.thread.join();
-            }
-        }
-    }
-
-    /// Names of the indexes whose backfills are running right now.
+    /// Names of the indexes whose builds own them right now.
     pub fn running_builds(&self) -> Vec<String> {
-        self.reap_finished_builds();
         self.builds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -993,7 +1145,6 @@ impl VectorIndexRegistry {
     /// cluster-wide picture. The progress comes from the same atomic signal
     /// the search path reads, so asking costs no lock on the build.
     pub fn build_progress(&self) -> Vec<(String, String, String, Option<IndexHealthState>)> {
-        self.reap_finished_builds();
         let running: Vec<(String, String, String)> = self
             .builds
             .lock()

@@ -150,11 +150,12 @@ fn registering_a_generation_for_its_build_twice_keeps_the_first() {
     let reg = VectorIndexRegistry::new();
     let def = hnsw(7, "doc_embedding", "Doc", "embedding");
 
-    assert!(reg.register_for_build(def.clone(), None));
+    let claim = reg.register_for_build(def.clone(), None);
+    assert!(claim.is_some());
     let graph = reg.get("Doc", "embedding").expect("graph");
     let health = reg.health_handle("Doc", "embedding").expect("health");
 
-    assert!(!reg.register_for_build(def, None));
+    assert!(reg.register_for_build(def, None).is_none());
     assert!(Arc::ptr_eq(
         &graph,
         &reg.get("Doc", "embedding").expect("graph")
@@ -165,11 +166,51 @@ fn registering_a_generation_for_its_build_twice_keeps_the_first() {
     ));
 
     // A new generation of the index is a new graph.
-    assert!(reg.register_for_build(hnsw(8, "doc_embedding", "Doc", "embedding"), None));
+    assert!(
+        reg.register_for_build(hnsw(8, "doc_embedding", "Doc", "embedding"), None)
+            .is_some()
+    );
     assert!(!Arc::ptr_eq(
         &graph,
         &reg.get("Doc", "embedding").expect("graph")
     ));
+}
+
+/// A cancel arriving while another cancel of the same build is still waiting
+/// for it returns only once the build has stopped: a DROP racing the takeover
+/// of a rebuild must not go on while the build can still write.
+#[test]
+fn a_second_cancel_waits_for_the_build_the_first_is_joining() {
+    let reg = VectorIndexRegistry::new();
+    let def = hnsw(9, "doc_embedding", "Doc", "embedding");
+    let claim = reg.register_for_build(def.clone(), None).expect("claim");
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (seen_tx, seen) = std::sync::mpsc::channel::<()>();
+    let flag = Arc::clone(&stopped);
+    reg.spawn_build(claim, "test-build".to_string(), move |token| {
+        while !token.is_cancelled() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        seen_tx.send(()).expect("the test waits");
+        // Still winding down, as a fold chunk under way finishes.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    })
+    .expect("spawn the build");
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| reg.cancel_build(def.generation));
+        seen.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the build sees the first cancel");
+        assert!(
+            reg.cancel_build(def.generation),
+            "the second cancel found no build while the first was waiting for it"
+        );
+        assert!(
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "the second cancel returned while the build was still running"
+        );
+        assert!(first.join().expect("first cancel"));
+    });
 }
 
 #[test]

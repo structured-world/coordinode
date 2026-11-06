@@ -22698,9 +22698,11 @@ fn execute_create_vector_index(
     // Register the empty HNSW graph in memory with its tier handle,
     // keyed by the ids bound above. This member's catalog follower may have
     // registered the generation first, from the definition published above:
-    // its build fills the graph then, and this statement starts none.
+    // its build fills the graph then, and this statement starts none. The
+    // claim makes the index this statement's build's from here: a rebuild
+    // taking it over before the build starts stops the build from starting.
     let tier = registry.tier_handle(label_id, property_id);
-    let registered = registry.register_for_build(def.clone(), tier);
+    let claim = registry.register_for_build(def.clone(), tier);
 
     let shard_id = ctx.shard_id;
 
@@ -22712,7 +22714,7 @@ fn execute_create_vector_index(
         ))
     })?;
 
-    if registered {
+    if let Some(claim) = claim {
         // The build runs on its own thread, owned by the registry, and the
         // statement returns once it has started. Its readiness is this member's
         // own: the graph's health signal carries it, and every member builds
@@ -22737,7 +22739,7 @@ fn execute_create_vector_index(
         registry.record_built(label, property, carriers.clone());
 
         registry
-            .spawn_build(&def, format!("vec-backfill-{name}"), move |build_token| {
+            .spawn_build(claim, format!("vec-backfill-{name}"), move |build_token| {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::index::VectorBuild {
                         engine: engine.as_ref(),
