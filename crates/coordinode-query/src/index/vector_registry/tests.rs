@@ -185,9 +185,11 @@ fn a_second_cancel_waits_for_the_build_the_first_is_joining() {
     let def = hnsw(9, "doc_embedding", "Doc", "embedding");
     let claim = reg.register_for_build(def.clone(), None).expect("claim");
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (started_tx, started) = std::sync::mpsc::channel::<()>();
     let (seen_tx, seen) = std::sync::mpsc::channel::<()>();
     let flag = Arc::clone(&stopped);
     reg.spawn_build(claim, "test-build".to_string(), move |token| {
+        started_tx.send(()).expect("the test waits");
         while !token.is_cancelled() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -197,6 +199,10 @@ fn a_second_cancel_waits_for_the_build_the_first_is_joining() {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     })
     .expect("spawn the build");
+    // Cancelled before it started, the build would never run at all.
+    started
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the build starts");
     std::thread::scope(|scope| {
         let first = scope.spawn(|| reg.cancel_build(def.generation));
         seen.recv_timeout(std::time::Duration::from_secs(10))
