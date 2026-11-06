@@ -51,6 +51,20 @@ fn before_take(token: &BuildToken) {
     }
 }
 
+/// The step a test runs in a build once it has scanned and before it hands
+/// its indexes over, while writes are still left to it.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static BEFORE_HAND_OVER: parking_lot::Mutex<Option<BeforeTakeHook>> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn before_hand_over(token: &BuildToken) {
+    let hook = BEFORE_HAND_OVER.lock().take();
+    if let Some(hook) = hook {
+        hook(token);
+    }
+}
+
 /// Why a scan did not complete.
 enum ScanFailure {
     /// The history under the scan's snapshot was released: a scan from a
@@ -159,6 +173,8 @@ impl VectorBuild<'_> {
         let mut outcome = self.scan_from(&tap, at)?;
         tracing::debug!(?outcome, "vector build: scanned");
         loop {
+            #[cfg(any(test, feature = "test-hooks"))]
+            before_hand_over(self.token);
             if outcome == BuildOutcome::Cancelled || self.token.is_cancelled() {
                 return Ok(BuildOutcome::Cancelled);
             }

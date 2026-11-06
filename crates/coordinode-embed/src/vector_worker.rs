@@ -519,6 +519,18 @@ impl Worker {
                 continue;
             };
             let base_holds = held.base.as_ref() == Some(&in_force);
+            let unchanged = base_holds && candidate == in_force && held.candidate.is_none();
+            // A build still filling the index judges its members by the
+            // carriers it began with, and writes left to it are folded by
+            // those: following a change beside it would leave the members
+            // only the change carries to a build that never takes them, or
+            // have its last fold take them out. The rebuild stops it first
+            // and fills the index under the carriers in force; the change is
+            // followed after it.
+            if !unchanged && self.registry.is_building(def.generation) {
+                rebuild = true;
+                continue;
+            }
             if candidate != in_force {
                 // A change is certified: the index keeps both.
                 if !base_holds {

@@ -1475,16 +1475,13 @@ impl Database {
         health: Arc<coordinode_vector::health::HealthSignal>,
         carriers: Option<coordinode_query::index::membership::LabelCarriers>,
     ) {
-        let token = registry.new_build_token();
-        let build_token = token.clone();
         let engine = Arc::clone(engine);
         let name = def.to_string();
         // The index was registered rebuilding; without a build it would stay
         // so, and a blocked reader would wait on it until its timeout.
         let unbuilt = Arc::clone(&health);
-        let spawned = std::thread::Builder::new()
-            .name(format!("vec-replica-{name}"))
-            .spawn(move || {
+        let spawned =
+            registry.spawn_build(def, format!("vec-replica-{name}"), move |build_token| {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     coordinode_query::index::VectorBuild {
                         engine: engine.as_ref(),
@@ -1514,9 +1511,7 @@ impl Database {
                 }
             });
         match spawned {
-            Ok(thread) => {
-                registry.register_build(def, &token, thread);
-            }
+            Ok(()) => {}
             Err(e) => {
                 tracing::warn!(index = %def, error = %e, "could not spawn the replica build");
                 unbuilt.mark_offline(format!("could not start the build: {e}"));

@@ -280,10 +280,31 @@ fn a_transaction_ranks_its_own_uncommitted_vectors() {
 /// miss a committed node.
 #[test]
 fn a_rebuild_is_not_undone_by_the_build_it_replaces() {
-    use coordinode_query::index::vector_build::BEFORE_TAKE;
+    a_first_node_stays_indexed_past_a_build_held_at(
+        &coordinode_query::index::vector_build::BEFORE_TAKE,
+    );
+}
+
+/// The same with the CREATE build held before it hands the index over,
+/// while writes are left to it: the label's first node must not be left to
+/// a build whose carriers do not take it.
+#[test]
+fn a_first_node_is_not_left_to_a_build_that_never_takes_it() {
+    a_first_node_stays_indexed_past_a_build_held_at(
+        &coordinode_query::index::vector_build::BEFORE_HAND_OVER,
+    );
+}
+
+/// Create an index over an empty label with its CREATE build held at
+/// `hook`, give the label its first node, wait for the index to hold it,
+/// then let the build go on and require the node still indexed once the
+/// build ended.
+fn a_first_node_stays_indexed_past_a_build_held_at(
+    hook: &parking_lot::Mutex<Option<coordinode_query::index::vector_build::BeforeTakeHook>>,
+) {
     let (reached_tx, reached) = std::sync::mpsc::channel::<()>();
     let (release, released) = std::sync::mpsc::channel::<()>();
-    *BEFORE_TAKE.lock() = Some(Box::new(move |token| {
+    *hook.lock() = Some(Box::new(move |token| {
         reached_tx.send(()).expect("test waits");
         // Until the test lets it go (drops `release`), or a newer build
         // cancels it.
@@ -299,7 +320,7 @@ fn a_rebuild_is_not_undone_by_the_build_it_replaces() {
         .expect("create l2 index");
     reached
         .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("the CREATE build reaches its take");
+        .expect("the CREATE build reaches the held step");
     db.execute_cypher("CREATE (:Embed {name: 'near', vec: [1.0, 0.0, 0.0]})")
         .expect("create near");
     let near = embed_id(&mut db, "near");

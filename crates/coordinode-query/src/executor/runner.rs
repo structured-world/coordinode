@@ -22721,8 +22721,6 @@ fn execute_create_vector_index(
         // open.
         let engine = Arc::clone(engine_arc);
         let name_owned = name.to_string();
-        let token = registry.new_build_token();
-        let build_token = token.clone();
         // The build publishes through the index's health signal, not
         // the registry: the signal is atomic and `Arc`-shared, so the
         // thread needs neither a borrow of the registry nor a lock on
@@ -22738,9 +22736,8 @@ fn execute_create_vector_index(
         // interpretation it answers with.
         registry.record_built(label, property, carriers.clone());
 
-        let thread = std::thread::Builder::new()
-            .name(format!("vec-backfill-{name}"))
-            .spawn(move || {
+        registry
+            .spawn_build(&def, format!("vec-backfill-{name}"), move |build_token| {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::index::VectorBuild {
                         engine: engine.as_ref(),
@@ -22786,7 +22783,6 @@ fn execute_create_vector_index(
                 unbuilt.mark_offline(format!("could not start the build: {e}"));
                 ExecutionError::Unsupported(format!("spawn backfill thread: {e}"))
             })?;
-        registry.register_build(&def, &token, thread);
     }
 
     // The build has only started: nothing is indexed yet, and the state

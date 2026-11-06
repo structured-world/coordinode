@@ -871,6 +871,50 @@ impl VectorIndexRegistry {
             .insert(def.generation, handle);
     }
 
+    /// Start a backfill of `def`'s generation on a thread named `thread`,
+    /// owned by the index: `build` runs only once the build is registered,
+    /// so a newer build of the index or its drop can always stop it before
+    /// writing to it, never racing a build that has not been registered yet.
+    ///
+    /// # Errors
+    ///
+    /// The thread could not be spawned; nothing was registered.
+    pub fn spawn_build(
+        &self,
+        def: &IndexDefinition,
+        thread: String,
+        build: impl FnOnce(BuildToken) + Send + 'static,
+    ) -> std::io::Result<()> {
+        let token = self.new_build_token();
+        let build_token = token.clone();
+        let (start, registered) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::Builder::new().name(thread).spawn(move || {
+            // The sender goes only after the registration below, which
+            // cannot fail: a closed channel means the registering thread
+            // panicked, and nobody owns this build then.
+            if registered.recv().is_ok() {
+                build(build_token);
+            }
+        })?;
+        self.register_build(def, &token, handle);
+        if start.send(()).is_err() {
+            // The thread is gone before it was let start: it panicked
+            // before receiving, and its join reports nothing to act on.
+            tracing::warn!(index = %def, "a vector index build ended before it started");
+        }
+        Ok(())
+    }
+
+    /// Whether a backfill of `generation` is running: registered and not yet
+    /// finished.
+    pub fn is_building(&self, generation: GenerationId) -> bool {
+        self.reap_finished_builds();
+        self.builds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&generation)
+    }
+
     /// Stop the backfill of `generation` and wait for it to finish.
     ///
     /// Returns whether a build was running. On return the build has stopped
