@@ -374,6 +374,12 @@ impl Worker {
             return Some(covered);
         }
         for (def, _, health, _, carriers) in &members {
+            // A build still running on the index (the one its CREATE started)
+            // fills it under the carriers it read when it began: its last fold
+            // would take out the members this rebuild inserts under the ones
+            // in force now. It stops, and is waited for, before anything here
+            // writes the index.
+            self.registry.cancel_build(def.generation);
             // Incomplete until the build hands it over again.
             health.report_rebuild_progress(0.0, 0);
             // Filled with these carriers' members alone from here.
