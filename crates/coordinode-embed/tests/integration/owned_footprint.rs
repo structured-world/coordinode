@@ -544,7 +544,7 @@ fn a_compaction_leaves_room_for_the_versions_deferred_flushes_owe() {
     // still owed then is the versions they left to a barrier.
     footprints.squeeze();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while footprint.debt() % PERSIST_ALLOWANCE != 0 {
+    while !footprint.debt().is_multiple_of(PERSIST_ALLOWANCE) {
         assert!(
             std::time::Instant::now() < deadline,
             "the background flushes never ran: owed {}",
