@@ -808,11 +808,17 @@ impl StorageEngine {
         // What the memtables will write when they are flushed is owed to the
         // footprint from the moment it is in them.
         if !footprints.is_empty() {
+            footprints.set_flushes_deferred(
+                config.tree_flush_durability() == lsm_tree::config::FlushDurability::Deferred,
+            );
             let unflushed = Arc::clone(&write_buffer);
+            let unpersisted = footprints.unpersisted_debt();
             footprints.set_debt(move || {
-                // Each memtable is a flush of its own, with its own fixed cost.
+                // Each memtable is a flush of its own, with its own fixed cost;
+                // a deferred flush done owes the version it is still to write.
                 let waiting = unflushed.unflushed();
                 crate::engine::footprint::flush_debt(waiting.bytes, waiting.memtables)
+                    + unpersisted.bytes()
             });
         }
         // One maintenance budget for every tree's compaction and the scrub:
@@ -5241,6 +5247,8 @@ impl StorageEngine {
         if let Some(local) = &self.local_journal {
             local.sync()?;
         }
+        // Owed before the flush: its memtable stops owing when it installs.
+        self.footprints.flushing(tree.id());
         if tree.flush(&lock, 0)?.is_some() {
             // A new table may need compacting.
             self.compaction_wake.notify();
@@ -5250,6 +5258,7 @@ impl StorageEngine {
         // hold or promises a write. A tree whose flushes are synced has
         // nothing pending.
         tree.persist_flushes()?;
+        self.footprints.persisted(tree.id());
         Ok(())
     }
 

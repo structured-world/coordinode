@@ -99,6 +99,14 @@ pub fn flush_debt(unflushed: u64, flushes: u64) -> u64 {
     tables + ahead
 }
 
+/// Room a tree whose flushes installed their tables in memory only
+/// ([`lsm_tree::config::FlushDurability::Deferred`]) owes until a barrier
+/// writes its version to the manifest: the version edit, or the snapshot a
+/// rotation writes beside the one it replaces, with what the file system
+/// allocates ahead of it. The bound [`FLUSH_ALLOWANCE`] holds for the
+/// version a flush installs; deferred, it outlives the memtable that owed it.
+pub const PERSIST_ALLOWANCE: u64 = FLUSH_ALLOWANCE;
+
 /// The most the flush debt grows when an empty memtable takes its first
 /// write and becomes one more flush: [`FLUSH_ALLOWANCE`] in its table and as
 /// much again, with [`MIN_AHEAD`] twice, in the allocation ahead the sum of
@@ -1045,6 +1053,30 @@ pub struct Footprints {
     /// Room held for consensus log entries this member took until they are
     /// applied.
     unapplied: Arc<parking_lot::Mutex<Unapplied>>,
+    /// See [`Footprints::flushing`].
+    unpersisted: Arc<Unpersisted>,
+}
+
+/// The trees whose flushes installed their tables in memory only, by tree
+/// id, each owing [`PERSIST_ALLOWANCE`] until a barrier writes its version.
+#[derive(Debug, Default)]
+struct Unpersisted {
+    /// Whether the trees' flushes are deferred at all; with synced flushes a
+    /// flush writes its version before its memtable stops owing.
+    deferred: AtomicBool,
+    trees: parking_lot::Mutex<rustc_hash::FxHashSet<u64>>,
+}
+
+/// See [`Footprints::unpersisted_debt`].
+#[derive(Clone)]
+pub(crate) struct UnpersistedDebt(Arc<Unpersisted>);
+
+impl UnpersistedDebt {
+    /// The bytes owed now.
+    pub(crate) fn bytes(&self) -> u64 {
+        // A tree count times a fixed allowance: far below u64::MAX.
+        self.0.trees.lock().len() as u64 * PERSIST_ALLOWANCE
+    }
 }
 
 /// See [`Footprints::hold_until_applied`].
@@ -1087,7 +1119,46 @@ impl Footprints {
             endpoints: Arc::new(capped),
             squeeze: Arc::default(),
             unapplied: Arc::default(),
+            unpersisted: Arc::default(),
         })
+    }
+
+    /// Whether the partition trees' flushes install their tables in memory
+    /// only, written to the manifest at the next barrier.
+    pub(crate) fn set_flushes_deferred(&self, deferred: bool) {
+        self.unpersisted.deferred.store(deferred, Ordering::Release);
+    }
+
+    /// A flush of the partition tree `tree` is about to run. Deferred, it
+    /// installs its tables in memory and its memtable stops owing, while the
+    /// version it installed is still to be written: the tree owes
+    /// [`PERSIST_ALLOWANCE`] from now until [`Self::persisted`]. Called
+    /// before the flush, so no moment is left where neither owes the room.
+    pub(crate) fn flushing(&self, tree: u64) {
+        if self.endpoints.is_empty() || !self.unpersisted.deferred.load(Ordering::Acquire) {
+            return;
+        }
+        self.unpersisted.trees.lock().insert(tree);
+    }
+
+    /// A barrier wrote the version of tree `tree` to the manifest: what its
+    /// flushes owed for it comes back.
+    pub(crate) fn persisted(&self, tree: u64) {
+        if self.endpoints.is_empty() {
+            return;
+        }
+        if self.unpersisted.trees.lock().remove(&tree) {
+            for footprint in self.endpoints.iter() {
+                footprint.follow_pending();
+            }
+        }
+    }
+
+    /// What the trees owe for the versions their flushes installed in memory
+    /// only, readable without the footprints: the debt each footprint holds
+    /// reads it, and holding the footprints there would keep them alive.
+    pub(crate) fn unpersisted_debt(&self) -> UnpersistedDebt {
+        UnpersistedDebt(Arc::clone(&self.unpersisted))
     }
 
     /// Keep `room` until the consensus log is applied through `index`: what

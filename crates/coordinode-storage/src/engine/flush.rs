@@ -254,9 +254,12 @@ impl FlushManager {
             let flushed = Arc::clone(&wake);
             let compaction = Arc::clone(&compaction_wake);
             let journal = journal.clone();
+            let owed = footprints.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("coord-flush-worker-{i}"))
-                .spawn(move || flush_worker_loop(rx, &flushed, &compaction, journal.as_deref()))
+                .spawn(move || {
+                    flush_worker_loop(rx, &flushed, &compaction, journal.as_deref(), &owed);
+                })
                 .map_err(|e| StorageError::InvalidConfig(format!("flush worker spawn: {e}")))?;
             workers.push(handle);
         }
@@ -496,6 +499,7 @@ fn flush_worker_loop(
     flushed: &Wake,
     compaction: &Wake,
     journal: Option<&Mutex<EmbeddedOplog>>,
+    footprints: &crate::engine::footprint::Footprints,
 ) {
     while let Ok(FlushRequest {
         tree,
@@ -511,7 +515,15 @@ fn flush_worker_loop(
             // Every entry a sealed memtable holds was journaled before it was
             // applied, so a sync now covers them all.
             match journal.map_or(Ok(()), sync_journal) {
-                Ok(()) => tree.flush(&flush_lock, gc_watermark),
+                Ok(()) => {
+                    // A partition tree's flush is deferred: its version is
+                    // owed from before the flush until a barrier writes it.
+                    // A table's flush is synced and writes it itself.
+                    if matches!(source, FlushSource::Partition(_)) {
+                        footprints.flushing(tree.id());
+                    }
+                    tree.flush(&flush_lock, gc_watermark)
+                }
                 Err(e) => Err(lsm_tree::Error::Io(lsm_tree::io::Error::other(
                     e.to_string(),
                 ))),

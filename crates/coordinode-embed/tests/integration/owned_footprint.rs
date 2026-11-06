@@ -526,6 +526,54 @@ fn a_restore_past_the_cap_is_refused_without_passing_it() {
 /// store held back may take the new room for a moment first, its output
 /// charged with what the file system may allocate ahead of it until it is
 /// closed, and gives it back when it ends.
+/// A barrier writes the versions the background flushes installed in memory
+/// only, after their memtables stopped owing. A compaction that takes all
+/// the room the account shows free must leave that write its room: the
+/// barrier behind a backup or a journal release is refused otherwise.
+#[test]
+fn a_compaction_leaves_room_for_the_versions_deferred_flushes_owe() {
+    use coordinode_storage::engine::footprint::{MaintenanceScope, PERSIST_ALLOWANCE};
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open_with_config(capped(dir.path())).unwrap();
+    for key in 0..8 {
+        db.execute_cypher(&create(key)).unwrap();
+    }
+    let footprints = db.engine().footprints();
+    let footprint = footprints.iter().next().expect("the capped endpoint");
+    // The background flushes run and their memtables stop owing; what is
+    // still owed then is the versions they left to a barrier.
+    footprints.squeeze();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while footprint.debt() % PERSIST_ALLOWANCE != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background flushes never ran: owed {}",
+            footprint.debt()
+        );
+        footprints.squeeze();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // A compaction in progress growing its output into every byte it may
+    // take, held while the barrier runs.
+    let scratch = dir.path().join("compaction-output");
+    let output = footprints
+        .file(&scratch)
+        .expect("a charge under the endpoint");
+    {
+        let _compaction = MaintenanceScope::enter();
+        // Background work may move the room between the read and the growth.
+        let grown = (0..100).any(|_| {
+            let room = footprint.room();
+            output.grow_to(output.bytes() + room - room % 4096).is_ok()
+        });
+        assert!(grown, "a compaction takes the room it is shown");
+    }
+    let persisted = db.engine().persist();
+    footprints.removed(&scratch);
+    drop(output);
+    persisted.expect("the barrier writes the versions deferred flushes owe");
+}
+
 fn admitted_once_room_settles(db: &mut Database, statement: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
