@@ -1659,6 +1659,37 @@ impl HnswIndex {
         self.id_to_idx.get(id)
     }
 
+    /// The whole graph as text, for a test to print when a search misses a
+    /// node: the entry point, the live count, then every slot with its id,
+    /// state, the slot the id maps to now, its vector and its list on every
+    /// layer.
+    #[cfg(feature = "graph-dump")]
+    pub fn graph_dump(&self) -> String {
+        let mut out = format!(
+            "entry {:?}, live {}, slots {}\n",
+            self.entry_point.for_search(),
+            self.len(),
+            self.node_len()
+        );
+        let Some(store) = self.data_level0.get() else {
+            return out;
+        };
+        for idx in 0..self.node_len() {
+            let id = self.node_id(idx);
+            out.push_str(&format!(
+                "slot {idx}: id {id} {:?} mapped {:?} vector {:?}",
+                store.state(idx),
+                self.id_to_idx.get(id),
+                self.read_node_f32(idx)
+            ));
+            for level in 0..self.node_levels(idx) {
+                out.push_str(&format!(" L{level} {:?}", self.layer_snapshot(idx, level)));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     /// Copy the RaBitQ code (packed bytes) and scalar header of node `idx`
     /// into the code block, so the slot holds the node's current code or
     /// nothing. When the code cannot go in (no code, a width or length that

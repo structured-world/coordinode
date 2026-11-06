@@ -78,6 +78,8 @@ chrono = { workspace = true }
 coordinode-search = { workspace = true, features = ["test-hooks"] }
 # A certification paused after its proof, for the races of its tests.
 coordinode-query = { workspace = true, features = ["test-hooks"] }
+# A vector test prints the graph when a search misses a node.
+coordinode-vector = { workspace = true, features = ["graph-dump"] }
 # The oplog placement test opens the consensus log store on an embedded
 # directory.
 coordinode-raft = { workspace = true }

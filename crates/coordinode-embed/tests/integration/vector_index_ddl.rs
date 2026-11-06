@@ -287,9 +287,23 @@ fn ranking_evidence(db: &mut Database) -> String {
          ORDER BY d LIMIT 1 RETURN n.name AS name",
     );
     let unfolded = !db.vector_index_registry().delta(1).is_empty();
+    // The graph itself and what it answers directly for the probe, so one
+    // failure shows whether `near` is unlinked, retired, unmapped or missed.
+    let graph = db
+        .vector_index_registry()
+        .get("Embed", "vec")
+        .and_then(|handle| {
+            handle.read().ok().map(|graph| {
+                format!(
+                    "direct search {:?}\n{}",
+                    graph.search(&[1.0, 0.0, 0.0], 2),
+                    graph.graph_dump()
+                )
+            })
+        });
     format!(
         "top three {top:?}; committed vectors {stored:?}; commits not yet folded {unfolded}; \
-         plan {plan:?}"
+         plan {plan:?}; graph {graph:?}"
     )
 }
 

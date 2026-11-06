@@ -34,6 +34,10 @@ dist-counters = []
 # avx2, neon) when the CPU has it, so one host measures each set. Never
 # enable in production builds.
 kernel-select = []
+# Test builds only: `HnswIndex::graph_dump`, every slot with its id, state
+# and lists, for a test to print when a search misses a node. Never enable
+# in production builds.
+graph-dump = []
 
 [dev-dependencies]
 criterion = { workspace = true }
