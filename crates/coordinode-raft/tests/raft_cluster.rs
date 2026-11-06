@@ -7564,6 +7564,23 @@ async fn clocked_group(dirs: &[tempfile::TempDir]) -> Vec<Clocked> {
         .change_membership(members.iter().map(|m| m.id).collect::<Vec<_>>())
         .await
         .expect("membership");
+    // The change commits on a quorum, and a learner counts as caught up while
+    // its lag is under openraft's threshold, so a member can be in the group
+    // before it has accepted anything from the leader: a joining member
+    // refuses the leader until it has learnt the membership from the member
+    // it enrolled with. A test starting now would see that member at term 0.
+    let term = members[0].node.current_term();
+    let size = members.len();
+    await_condition(
+        Duration::from_secs(30),
+        "every member follows the founder's term with the whole membership",
+        || {
+            members
+                .iter()
+                .all(|m| m.node.current_term() == term && m.node.voter_ids().len() == size)
+        },
+    )
+    .await;
     members
 }
 
