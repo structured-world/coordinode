@@ -2,6 +2,17 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-06
+
+### Added
+
+- *(wire)* probe idle client and peer connections with keepalive
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+
 ## v0.9.0 - 2026-10-24
 
 ### Testing

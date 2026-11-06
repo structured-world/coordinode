@@ -2,6 +2,29 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-06
+
+### Added
+
+- *(index)* answer a text search with its view's interpretation
+- *(search)* keep both interpretations of a change in one text index
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+- *(search)* state what settling a scope costs
+
+### Fixed
+
+- *(search)* never score what a text search leaves out
+- *(search)* refuse text reads of an unknown commit, type not-ready
+- *(search)* refuse reads of a lagging text reader, own write refusal
+- *(search)* keep a landed text commit when the reader lags
+- *(search)* commit the scope epoch with the documents
+- *(index)* bind text settling to one revision and one catalog state
+- *(index)* bind a text read to the interpretation its index holds
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
