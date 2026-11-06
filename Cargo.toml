@@ -227,16 +227,18 @@ strip = true
 panic = "abort"
 opt-level = 3
 
-# openraft 0.10.0-alpha.37, the latest release, carries two defects fixed
+# openraft 0.10.0-alpha.37, the latest release, carries three defects fixed
 # upstream since: a replication stream descheduled across two elections can
 # send an old term's entries with a later term's commit, and a follower then
-# applies an entry the cluster overwrote (openraft #2245); and a heartbeat is
+# applies an entry the cluster overwrote (openraft #2245); a heartbeat is
 # answered only after every log entry accepted before it is flushed, so a slow
-# disk on the followers costs the leader its lease. The structured-world fork
-# carries both fixes on top of alpha.37 until an openraft release includes
+# disk on the followers costs the leader its lease; and a caller dropped while
+# it joins the core leaves the core state half-joined, so the next caller
+# panics with the state lock held and poisons it. The structured-world fork
+# carries the fixes on top of alpha.37 until an openraft release includes
 # them; the whole workspace comes from the same revision.
 [patch.crates-io]
-openraft = { git = "https://github.com/structured-world/openraft", rev = "6b09498c25cc023b759a941beeb30f53e6ade525" }
-openraft-macros = { git = "https://github.com/structured-world/openraft", rev = "6b09498c25cc023b759a941beeb30f53e6ade525" }
-openraft-rt = { git = "https://github.com/structured-world/openraft", rev = "6b09498c25cc023b759a941beeb30f53e6ade525" }
-openraft-rt-tokio = { git = "https://github.com/structured-world/openraft", rev = "6b09498c25cc023b759a941beeb30f53e6ade525" }
+openraft = { git = "https://github.com/structured-world/openraft", rev = "458643adbe93f0abce70675da8d683beae9515a8" }
+openraft-macros = { git = "https://github.com/structured-world/openraft", rev = "458643adbe93f0abce70675da8d683beae9515a8" }
+openraft-rt = { git = "https://github.com/structured-world/openraft", rev = "458643adbe93f0abce70675da8d683beae9515a8" }
+openraft-rt-tokio = { git = "https://github.com/structured-world/openraft", rev = "458643adbe93f0abce70675da8d683beae9515a8" }
