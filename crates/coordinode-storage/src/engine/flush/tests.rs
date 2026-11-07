@@ -347,7 +347,12 @@ fn a_memtable_sealed_while_the_queue_was_full_is_flushed_later() {
     // Size trigger at 1 byte, backlog limit above one sealed memtable, no
     // age trigger: once sealed, an idle partition is due by nothing else.
     let (mgr, _wake) = start(&trees, &gc_watermark, 1, 4, 1, 0);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // One worker flushes the ten trees one after another, each a table
+    // write with its syncs: on a host whose disk other work saturates that
+    // has taken over 5 s. A request lost for good never flushes at all, so a
+    // generous bound still tells the two apart.
+    const PATIENCE: Duration = Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + PATIENCE;
     while trees.values().any(|tree| tree.active_memtable().size() > 0) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -358,7 +363,7 @@ fn a_memtable_sealed_while_the_queue_was_full_is_flushed_later() {
     std::thread::sleep(Duration::from_millis(100));
     drop(held);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + PATIENCE;
     loop {
         let left: Vec<&str> = trees
             .iter()
