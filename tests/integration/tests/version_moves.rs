@@ -1208,13 +1208,19 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Attempted {
     }
 }
 
+/// Attempts a move or a control may take while other work on the host stalls
+/// the group. A shared runner under load has stalled three in a row; an
+/// attempt's verdict is unchanged, only how long the host may keep spoiling
+/// them.
+const HOST_STALL_ATTEMPTS: usize = 6;
+
 /// Run [`move_under_workload`] until an attempt shows the single pause, at
-/// most three times, with `first` caused in the first attempt only. Every
-/// attempt must be correct; one the host stalled is reported and retried,
-/// one with an unexplained pause fails at once, and no attempt with the
-/// single pause fails as well.
+/// most [`HOST_STALL_ATTEMPTS`] times, with `first` caused in the first
+/// attempt only. Every attempt must be correct; one the host stalled is
+/// reported and retried, one with an unexplained pause fails at once, and no
+/// attempt with the single pause fails as well.
 async fn move_until_single_pause(kill_completing: bool, first: Stall) -> Result<(), String> {
-    const ATTEMPTS: usize = 3;
+    const ATTEMPTS: usize = HOST_STALL_ATTEMPTS;
     let mut stalled = Vec::new();
     for attempt in 1..=ATTEMPTS {
         let stall = if attempt == 1 { first } else { Stall::None };
@@ -1279,13 +1285,13 @@ async fn a_move_with_the_completing_member_killed_loses_no_acknowledged_write() 
 /// only while nothing else stalls the host over the span: other work that
 /// keeps its disk or CPUs busy then makes the pause the host's as well, the
 /// accepted masking (see [`HOST_STALLED`]), and the attempt says nothing.
-/// Such an attempt is reported and the control runs again, at most three
-/// times; it fails when the frozen span made no pause, or when the host
-/// stalled every attempt's span.
+/// Such an attempt is reported and the control runs again, at most
+/// [`HOST_STALL_ATTEMPTS`] times; it fails when the frozen span made no
+/// pause, or when the host stalled every attempt's span.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stall_inside_the_group_on_a_loaded_host_is_not_retried_away() {
-    const ATTEMPTS: usize = 3;
+    const ATTEMPTS: usize = HOST_STALL_ATTEMPTS;
     for attempt in 1..=ATTEMPTS {
         let attempted =
             move_under_workload(false, Stall::LeaderOnLoadedHost(Duration::from_millis(800))).await;

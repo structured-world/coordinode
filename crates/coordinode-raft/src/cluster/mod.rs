@@ -593,10 +593,12 @@ fn enrolled_deployment(engine: &StorageEngine) -> Result<Option<DeploymentId>, R
 const SNAPSHOT_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How long a leadership transfer waits for the target to lead, in ms. An
-/// election the target was told to start takes one round to the voters; a
-/// transfer still pending after this is failing (target down, partitioned,
-/// or beaten), not slow.
-pub const LEADERSHIP_TRANSFER_TIMEOUT_MS: u64 = 5_000;
+/// election the target was told to start takes one round to the voters, but
+/// on a host whose CPUs or disk are saturated by other work that round (and
+/// the log sync the new leader commits behind) has taken over 5 s; a transfer
+/// still pending after this is failing (target down, partitioned, or
+/// beaten), not slow.
+pub const LEADERSHIP_TRANSFER_TIMEOUT_MS: u64 = 15_000;
 
 /// Raft node orchestrator.
 ///
