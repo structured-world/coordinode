@@ -23,15 +23,22 @@ pub struct LogRetentionSource {
     /// Where the log's segments start, published by the log itself: every
     /// change stream asks on each wake, so it must not list the directories.
     floor: RetainedFloor,
-    /// One past the last log entry a consumer can be given.
-    head: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Which log it is, and so where its head is and how it is purged.
+    log: Log,
     /// When each log entry was written: the bound checks ask the age of the
     /// same acknowledged positions every sweep, and reading the segment that
     /// holds one would cost its size on every ask.
     timeline: OplogTimeline,
-    /// Whether the log is the store's own journal, whose purges keep what
-    /// the registry's floor and a registration's hold need.
-    own_journal: bool,
+}
+
+/// The log a [`LogRetentionSource`] answers for.
+enum Log {
+    /// A group's consensus log, purged as the group decides; its head (one
+    /// past the last entry a consumer can be given) is what this reports.
+    Group(Arc<dyn Fn() -> u64 + Send + Sync>),
+    /// The store's own journal, whose purges keep what the registry's floor
+    /// and a registration's hold need.
+    OwnJournal,
 }
 
 impl LogRetentionSource {
@@ -49,8 +56,7 @@ impl LogRetentionSource {
             timeline: OplogTimeline::new(log_dirs.clone()),
             log_dirs,
             floor,
-            head,
-            own_journal: false,
+            log: Log::Group(head),
         }
     }
 
@@ -68,21 +74,31 @@ impl LogRetentionSource {
         let Some((dir, floor)) = engine.journal_location()? else {
             return Ok(None);
         };
-        let journal = Arc::clone(&engine);
-        let head = Arc::new(move || match journal.journal_next_index() {
-            Ok(Some(next)) => next,
-            // The journal was there at construction and is never removed.
-            Ok(None) => 0,
-            Err(e) => {
-                // A poisoned journal takes no more writes: nothing past its
-                // start can be claimed, and a hold there is refused.
-                tracing::error!(error = %e, "registry: journal head unreadable");
-                0
-            }
-        });
-        let mut source = Self::new(engine, vec![dir], floor, head);
-        source.own_journal = true;
-        Ok(Some(source))
+        Ok(Some(Self {
+            engine,
+            timeline: OplogTimeline::new(vec![dir.clone()]),
+            log_dirs: vec![dir],
+            floor,
+            log: Log::OwnJournal,
+        }))
+    }
+
+    /// One past the last log entry a consumer can be given.
+    fn log_head(&self) -> u64 {
+        match &self.log {
+            Log::Group(head) => head(),
+            Log::OwnJournal => match self.engine.journal_next_index() {
+                Ok(Some(next)) => next,
+                // The journal was there at construction and is never removed.
+                Ok(None) => 0,
+                Err(e) => {
+                    // A poisoned journal takes no more writes: nothing past
+                    // its start can be claimed, and a hold there is refused.
+                    tracing::error!(error = %e, "registry: journal head unreadable");
+                    0
+                }
+            },
+        }
     }
 }
 
@@ -91,7 +107,7 @@ impl RetentionSource for LogRetentionSource {
         if kind.is_seqno_space() {
             self.engine.snapshot()
         } else {
-            (self.head)()
+            self.log_head()
         }
     }
 
@@ -152,7 +168,7 @@ impl RetentionSource for LogRetentionSource {
     }
 
     fn hold_log_from(&self, position: u64) -> Result<Option<JournalHold>, u64> {
-        if !self.own_journal {
+        if matches!(self.log, Log::Group(_)) {
             let first = self.first_retained(ConsumerKind::OplogEvents);
             return if position < first {
                 Err(first)

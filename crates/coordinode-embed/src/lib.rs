@@ -68,6 +68,16 @@ pub use db::{
 };
 pub use repair::RepairReport;
 
+/// What a change-stream consumer registers with
+/// ([`Database::register_consumer`]) and what the registry reports of it.
+pub mod consumer {
+    pub use coordinode_replicate::{
+        ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot,
+        InitialSeqno, RegisteredHandle, RegistrationState, RegistryError, TerminalReason,
+        TopologyScope, ValidatedRetentionBounds,
+    };
+}
+
 /// Every Rust snippet of the embedded guide, compiled as a doctest against
 /// this crate so the guide cannot advertise code that does not build. The
 /// replicated snippets need the feature; the documentation suite runs with

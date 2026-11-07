@@ -1045,6 +1045,19 @@ fn a_journal_purge_racing_a_registration_never_passes_its_position() {
         "the published floor did not keep the journal"
     );
     assert_eq!(reg.check_retention(&h).expect("covered"), at);
+
+    // Acknowledged, the journal below the new position is no longer kept for
+    // the consumer once the floor is republished.
+    let head = source.head(ConsumerKind::OplogEvents);
+    reg.checkpoint(&h, head).expect("acknowledge");
+    reg.core.sweep_evictions().expect("sweep");
+    engine
+        .oplog_purge_expired(4_000_000_000, u64::MAX)
+        .expect("purge");
+    assert!(
+        source.first_retained(ConsumerKind::OplogEvents) > at,
+        "the journal the consumer acknowledged was still kept"
+    );
 }
 
 /// A seqno-space registration below what the engine has already collected is

@@ -178,7 +178,9 @@ coordinode-server = { path = "crates/coordinode-server" }
 coordinode-s3 = { path = "crates/coordinode-s3" }
 coordinode-embed = { path = "crates/coordinode-embed", version = "=0.9.0" }
 coordinode-swarm = { path = "crates/coordinode-swarm", version = "=0.9.0" }
-coordinode-replicate = { path = "crates/coordinode-replicate", version = "=0.9.0" }
+# Without its features: a store outside a replicated group takes only the
+# consumer registry; members and the server ask for segment transfer.
+coordinode-replicate = { path = "crates/coordinode-replicate", version = "=0.9.0", default-features = false }
 coordinode-client = { path = "crates/coordinode-client" }
 coordinode-test-fixtures = { path = "crates/coordinode-test-fixtures" }
 coordinode-bench = { path = "crates/coordinode-bench" }

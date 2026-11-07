@@ -1319,7 +1319,7 @@ fn engine_shared_multiple_arcs() {
     let arc1 = db.engine_shared();
     let arc2 = db.engine_shared();
 
-    // Both point to the same allocation (Arc strong count = 12:
+    // Both point to the same allocation (Arc strong count = 14:
     // one in Database, one in OwnedLocalProposalPipeline (drain),
     // one in TtlReaperHandle (background thread), one in the
     // LsmVectorTier backing VectorIndexRegistry (f32 truth tier),
@@ -1328,9 +1328,10 @@ fn engine_shared_multiple_arcs() {
     // one in the vector index worker and one in the text index worker
     // (each reads committed records), one in the index build executor's
     // environment (its threads write the builds), one in the orphan blob
-    // collector's store, two here).
-    assert_eq!(Arc::strong_count(&arc1), 12);
-    assert_eq!(Arc::strong_count(&arc2), 12);
+    // collector's store, one in the consumer registry and one in the history
+    // source it reads, two here).
+    assert_eq!(Arc::strong_count(&arc1), 14);
+    assert_eq!(Arc::strong_count(&arc2), 14);
 
     // Write through arc1, read through arc2
     arc1.put(

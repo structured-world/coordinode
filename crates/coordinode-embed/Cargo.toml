@@ -20,7 +20,7 @@ io-uring = ["coordinode-storage/io-uring"]
 replication = [
     "dep:coordinode-raft",
     "dep:coordinode-wire",
-    "dep:coordinode-replicate",
+    "coordinode-replicate/transfer",
     "dep:coordinode-session",
     "dep:tokio",
     "dep:tokio-stream",
@@ -37,7 +37,8 @@ coordinode-query = { workspace = true }
 coordinode-raft = { workspace = true, optional = true }
 # The inter-node channel: node identity, the listener, segment transfer.
 coordinode-wire = { workspace = true, optional = true }
-coordinode-replicate = { workspace = true, optional = true }
+# The consumer registry always; segment transfer with `replication`.
+coordinode-replicate = { workspace = true }
 # The slots routed commands run in, shared with the member's own clients.
 coordinode-session = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }

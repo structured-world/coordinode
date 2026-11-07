@@ -574,6 +574,13 @@ pub enum DatabaseError {
     #[error("storage error: {0}")]
     Storage(#[source] StorageFailure),
 
+    /// A change-stream consumer's registration was refused or has ended: its
+    /// handle is stale or terminated, its starting position is no longer
+    /// held, its retention policy cannot be admitted, or the store is under
+    /// pressure. The variant says which and what to do.
+    #[error("consumer registry: {0}")]
+    Consumer(#[from] coordinode_replicate::RegistryError),
+
     /// A failure inside the database a caller cannot act on beyond reporting
     /// it.
     #[error("{0}")]

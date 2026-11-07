@@ -124,6 +124,7 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::OperationSettled { .. } => "OperationSettled",
         E::ForeignOperation { .. } => "ForeignOperation",
         E::Storage(_) => "Storage",
+        E::Consumer(_) => "Consumer",
         E::Other(_) => "Other",
         E::PeerUnreachable { .. } => "PeerUnreachable",
         E::PeerOutcomeUnknown { .. } => "PeerOutcomeUnknown",
@@ -658,6 +659,10 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             deployment: descriptor.as_bytes().to_vec(),
         }),
         E::Storage(failure) => Kind::Storage(text(failure.message().to_owned())),
+        // Consumer registrations are made at the store that keeps the
+        // history, never routed as a statement: no routed command answers
+        // with one, so it travels as text rather than as a case of its own.
+        E::Consumer(e) => Kind::Other(text(e.to_string())),
         E::Other(message) => Kind::Other(text(message)),
         // An ingress's own account of a member it reached; an executing
         // member routes nothing on, so these reach the wire only as text.

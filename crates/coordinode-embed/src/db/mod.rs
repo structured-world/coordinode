@@ -451,6 +451,10 @@ pub struct Database {
     blob_collector: Arc<coordinode_storage::blob::gc::BlobCollector>,
     /// Its background worker, stopped on drop.
     _blob_collector_worker: coordinode_storage::blob::gc::CollectorWorker,
+    /// Change-stream consumers registered with this database and the
+    /// history kept for them; `None` for a store without a journal of its
+    /// own.
+    consumers: Option<consumers::Consumers>,
 }
 
 /// A query whose parse + analyze + logical-plan-build succeeded, kept
@@ -1166,6 +1170,10 @@ impl Database {
         );
         let blob_collector_worker = blob_collector.spawn();
 
+        // Registrations recorded in an earlier run hold their history again
+        // from here, before anything this open starts purges the journal.
+        let consumers = consumers::Consumers::open(&engine, &pipeline)?;
+
         let db = Self {
             engine,
             fields,
@@ -1218,6 +1226,7 @@ impl Database {
             group_members,
             blob_collector,
             _blob_collector_worker: blob_collector_worker,
+            consumers,
         };
         // A store that owns its log takes up its unfinished index builds now;
         // a cluster member does it once it leads, since the builds are
@@ -4135,6 +4144,7 @@ mod after_commit;
 mod blob;
 mod catalog;
 mod client_ops;
+mod consumers;
 mod error;
 mod fields;
 mod id_lease;

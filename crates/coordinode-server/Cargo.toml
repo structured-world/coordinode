@@ -41,7 +41,7 @@ coordinode-cluster = { workspace = true }
 coordinode-core = { workspace = true }
 # The member assembly: store, consensus node, database and background work.
 coordinode-embed = { workspace = true, features = ["replication"] }
-coordinode-replicate = { workspace = true }
+coordinode-replicate = { workspace = true, features = ["transfer"] }
 coordinode-query = { workspace = true }
 coordinode-session = { workspace = true }
 coordinode-vector = { workspace = true, optional = true }
