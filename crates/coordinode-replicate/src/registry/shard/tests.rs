@@ -738,6 +738,56 @@ fn an_acknowledgement_after_an_expiry_is_refused() {
     assert_eq!(reg.shard_floor(), u64::MAX);
 }
 
+/// An ended registration records where its source's history started when it
+/// ended, in its own space: the log's first entry for a log consumer, the
+/// engine's collection watermark for an MVCC one. A late handle learns it
+/// with the reason and checkpoint, so it can tell a policy ending over
+/// history still there from history already gone.
+#[test]
+fn an_ended_registration_records_where_its_history_started() {
+    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
+    source.set_first(40);
+    source.set_head(90);
+    let log = reg
+        .register(ConsumerRegistration {
+            kind: ConsumerKind::OplogEvents,
+            ..registration("log", 60, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("register log");
+    let mvcc = reg
+        .register(registration("mvcc", 7, bounded(1_000, 1 << 30, None)))
+        .expect("register mvcc");
+    source.set_first(55);
+    reg.unregister(log.clone()).expect("cancel");
+    assert!(matches!(
+        reg.checkpoint(&log, 70).unwrap_err(),
+        RegistryError::Terminated {
+            reason: TerminalReason::Cancelled,
+            checkpoint: 60,
+            retained_from: 55,
+            ..
+        }
+    ));
+
+    source.produced(7, 0);
+    clock.set(5_000);
+    assert_eq!(reg.core.sweep_evictions().expect("sweep").evicted, 1);
+    let collected = reg.core.engine.gc_watermark();
+    let refused = reg.checkpoint(&mvcc, 20).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            RegistryError::Terminated {
+                reason: TerminalReason::ProgressLagExceeded,
+                checkpoint: 7,
+                retained_from,
+                ..
+            } if retained_from <= collected
+        ),
+        "the MVCC boundary is the engine's watermark ({collected}): {refused:?}"
+    );
+}
+
 /// A registry reopened over the same store (a restart, a new leader) finds
 /// live registrations holding their floors and ended ones still refusing
 /// their handles: nothing is resurrected.

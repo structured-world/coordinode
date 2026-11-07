@@ -253,6 +253,11 @@ pub enum RegistrationState {
         reason: TerminalReason,
         /// When the ending was decided.
         at_ms: u64,
+        /// The first position the source still held in the consumer's space
+        /// when it ended. With the last checkpoint it tells a policy ending
+        /// over history still there (checkpoint at or above it) from one over
+        /// history already gone, and where a resync can start.
+        retained_from: u64,
     },
 }
 
@@ -311,10 +316,11 @@ pub enum RegistryError {
     },
 
     /// The handle's incarnation has ended: its protection is gone, and
-    /// nothing done through the handle takes effect. The reason and the last
-    /// accepted checkpoint come with it.
+    /// nothing done through the handle takes effect. The reason, the last
+    /// accepted checkpoint and where the source's history started when it
+    /// ended come with it.
     #[error(
-        "consumer {consumer_id:?} incarnation {incarnation} ended ({reason:?}) at checkpoint {checkpoint}"
+        "consumer {consumer_id:?} incarnation {incarnation} ended ({reason:?}) at checkpoint {checkpoint}, the source holding history from {retained_from}"
     )]
     Terminated {
         /// The consumer id.
@@ -325,6 +331,8 @@ pub enum RegistryError {
         reason: TerminalReason,
         /// The last checkpoint it had acknowledged.
         checkpoint: u64,
+        /// The first position the source still held when it ended.
+        retained_from: u64,
     },
 
     /// The handle names an incarnation other than the one registered now:

@@ -241,6 +241,7 @@ fn registry_status(e: RegistryError) -> Status {
             incarnation,
             reason,
             checkpoint,
+            retained_from,
             ..
         } => status_with_reason(
             Code::FailedPrecondition,
@@ -250,6 +251,7 @@ fn registry_status(e: RegistryError) -> Status {
                 ("incarnation", incarnation.to_string()),
                 ("reason", format!("{reason:?}")),
                 ("checkpoint", checkpoint.to_string()),
+                ("retainedFrom", retained_from.to_string()),
             ],
         ),
         RegistryError::StaleIncarnation {

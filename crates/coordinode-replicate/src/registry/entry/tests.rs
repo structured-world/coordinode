@@ -117,6 +117,7 @@ fn entry_roundtrips_through_msgpack() {
     e.state = RegistrationState::Terminated {
         reason: TerminalReason::RetainedBytesExceeded,
         at_ms: 77,
+        retained_from: 12,
     };
     let decoded = RegistryEntry::decode(&e.encode().expect("encode")).expect("decode");
     assert_eq!(e, decoded);
@@ -220,6 +221,7 @@ fn an_ended_registration_is_not_judged() {
     e.state = RegistrationState::Terminated {
         reason: TerminalReason::Cancelled,
         at_ms: 0,
+        retained_from: 0,
     };
     let over_everything = Fixed {
         head: u64::MAX,

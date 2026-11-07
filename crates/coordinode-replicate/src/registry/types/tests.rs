@@ -103,10 +103,14 @@ fn a_terminated_error_names_its_reason_and_checkpoint() {
         incarnation: 4,
         reason: TerminalReason::ProgressLagExceeded,
         checkpoint: 99,
+        retained_from: 57,
     };
     let msg = format!("{e}");
     assert!(
-        msg.contains("ProgressLagExceeded") && msg.contains("99") && msg.contains('4'),
+        msg.contains("ProgressLagExceeded")
+            && msg.contains("99")
+            && msg.contains('4')
+            && msg.contains("57"),
         "msg: {msg}"
     );
 }

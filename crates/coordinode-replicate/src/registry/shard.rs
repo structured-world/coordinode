@@ -501,15 +501,48 @@ impl RegistryCore {
                 current: entry.incarnation,
             });
         }
-        if let RegistrationState::Terminated { reason, .. } = entry.state {
+        if let RegistrationState::Terminated {
+            reason,
+            retained_from,
+            ..
+        } = entry.state
+        {
             return Err(RegistryError::Terminated {
                 consumer_id: entry.consumer_id,
                 incarnation: entry.incarnation,
                 reason,
                 checkpoint: entry.checkpoint_seqno,
+                retained_from,
             });
         }
         Ok(entry)
+    }
+
+    /// The first position held in `kind`'s space: the engine's collection
+    /// watermark for MVCC history, which the engine alone decides, and the
+    /// source's first retained entry for a log.
+    fn retained_from(&self, kind: ConsumerKind) -> u64 {
+        if kind.is_seqno_space() {
+            self.engine.gc_watermark()
+        } else {
+            self.source.first_retained(kind)
+        }
+    }
+
+    /// `entry` ended for `reason` at `now`, recording where its history
+    /// started then.
+    fn terminated(
+        &self,
+        mut entry: RegistryEntry,
+        reason: TerminalReason,
+        now: u64,
+    ) -> RegistryEntry {
+        entry.state = RegistrationState::Terminated {
+            reason,
+            at_ms: now,
+            retained_from: self.retained_from(entry.kind),
+        };
+        entry
     }
 
     /// Re-scan the keyspace, refresh the two space-split floors over live
@@ -750,8 +783,10 @@ impl RegistryCore {
                 match current.termination(now, self.source.as_ref()) {
                     Some(reason) => {
                         let checkpoint = current.checkpoint_seqno;
-                        current.state = RegistrationState::Terminated { reason, at_ms: now };
-                        Ok(Step::Write(current, Some((reason, checkpoint))))
+                        Ok(Step::Write(
+                            self.terminated(current, reason, now),
+                            Some((reason, checkpoint)),
+                        ))
                     }
                     None => Ok(Step::Keep(None)),
                 }
@@ -920,11 +955,7 @@ impl ShardConsumerRegistry {
     pub fn check_retention(&self, handle: &RegisteredHandle) -> Result<u64, RegistryError> {
         let entry = self.core.read_entry(handle.consumer_id())?.map(|(e, _)| e);
         let entry = RegistryCore::live_for(entry, handle)?;
-        let floor = if entry.kind.is_seqno_space() {
-            self.core.engine.gc_watermark()
-        } else {
-            self.core.source.first_retained(entry.kind)
-        };
+        let floor = self.core.retained_from(entry.kind);
         if entry.checkpoint_seqno < floor {
             return Err(RegistryError::RetentionLost {
                 checkpoint: entry.checkpoint_seqno,
@@ -1262,12 +1293,11 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
     fn unregister(&self, handle: RegisteredHandle) -> Result<(), RegistryError> {
         let now = self.core.clock.now_ms();
         self.core.transition(handle.consumer_id(), |current| {
-            let mut entry = RegistryCore::live_for(current, &handle)?;
-            entry.state = RegistrationState::Terminated {
-                reason: TerminalReason::Cancelled,
-                at_ms: now,
-            };
-            Ok(Step::Write(entry, ()))
+            let entry = RegistryCore::live_for(current, &handle)?;
+            Ok(Step::Write(
+                self.core.terminated(entry, TerminalReason::Cancelled, now),
+                (),
+            ))
         })
     }
 
