@@ -36,6 +36,7 @@ mod integration {
     mod index_profiles;
     mod index_repair;
     mod interactive_txn;
+    mod kill_fuzz;
     mod label_count;
     mod label_kinds;
     mod label_lookup;
