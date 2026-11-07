@@ -284,6 +284,69 @@ pub struct ConsumerSnapshot {
     pub checkpoint_seqno: u64,
     /// Wall-clock millis of the last heartbeat the leader committed.
     pub last_heartbeat_ts_ms: u64,
+    /// Age, in ms, of the oldest work a live registration has not
+    /// acknowledged: 0 when it has none outstanding, however long ago it last
+    /// acknowledged. `None` when ended or when the source cannot tell.
+    pub progress_lag_ms: Option<u64>,
+    /// Bytes of source history a live registration's checkpoint requires.
+    /// Registrations sharing history each count it; the space's total counts
+    /// it once ([`RetentionSummary::retained_bytes`]). `None` when ended or
+    /// when the source cannot account it.
+    pub retained_bytes: Option<u64>,
+    /// Whether this live registration's checkpoint is the lowest in its
+    /// space, so it is what holds the source's history back.
+    pub holds_floor: bool,
+}
+
+/// The two position spaces history is kept in, each with its own floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionSpace {
+    /// Log positions: the consumers reading the log.
+    Log,
+    /// MVCC positions: the consumers reading state or pinning snapshots.
+    Mvcc,
+}
+
+impl RetentionSpace {
+    /// The space `kind`'s checkpoints are positions of.
+    pub fn of(kind: ConsumerKind) -> Self {
+        if kind.is_seqno_space() {
+            Self::Mvcc
+        } else {
+            Self::Log
+        }
+    }
+
+    /// The space's name as a metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Mvcc => "mvcc",
+        }
+    }
+}
+
+/// What the live registrations of one space hold of the source, and who
+/// holds it ([`ShardConsumerRegistry::retention_summary`](super::ShardConsumerRegistry::retention_summary)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionSummary {
+    /// The space.
+    pub space: RetentionSpace,
+    /// The lowest checkpoint of a live registration; `None` with none, when
+    /// the registrations hold nothing in this space.
+    pub floor: Option<u64>,
+    /// Bytes of source history kept from the floor, shared segments counted
+    /// once. Releasing one registration may reclaim none of it: another
+    /// registration, a live reader or recovery can still need it. `None`
+    /// with no floor or when the source cannot account it.
+    pub retained_bytes: Option<u64>,
+    /// The registrations at the floor: the ones whose progress or
+    /// cancellation would let it rise.
+    pub held_by: Vec<String>,
+    /// Whether a new registration in this space is admitted now; `false`
+    /// while the store is under write pressure, the reason a registration is
+    /// refused with `Backpressure`.
+    pub admits_new: bool,
 }
 
 /// Errors from the [`SeqnoConsumerRegistry`](super::SeqnoConsumerRegistry).

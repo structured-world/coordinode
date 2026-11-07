@@ -73,8 +73,8 @@ pub use repair::RepairReport;
 pub mod consumer {
     pub use coordinode_replicate::{
         ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot,
-        InitialSeqno, RegisteredHandle, RegistrationState, RegistryError, TerminalReason,
-        TopologyScope, ValidatedRetentionBounds,
+        InitialSeqno, RegisteredHandle, RegistrationState, RegistryError, RetentionSpace,
+        RetentionSummary, TerminalReason, TopologyScope, ValidatedRetentionBounds,
     };
 }
 

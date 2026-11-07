@@ -255,6 +255,39 @@ fn an_mvcc_consumer_holds_collection_at_its_position() {
     assert_eq!(db.consumer_position(&h).expect("held"), at);
 }
 
+/// The database reports, per space, the lowest live position and the
+/// registration holding it.
+#[test]
+fn the_database_reports_who_holds_its_history() {
+    use coordinode_replicate::RetentionSpace;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    let h = db
+        .register_consumer(log_consumer(
+            "holder",
+            InitialSeqno::FromNow,
+            ConsumerRetentionPolicy::Strict,
+        ))
+        .expect("register");
+    let from = db.consumer_position(&h).expect("position");
+    write(&mut db, 3, "x");
+    let summary = db.consumer_retention().expect("retention");
+    let journal = summary
+        .iter()
+        .find(|v| v.space == RetentionSpace::Log)
+        .expect("a journal view");
+    assert_eq!(journal.floor, Some(from));
+    assert_eq!(journal.held_by, vec!["holder".to_string()]);
+    assert!(journal.retained_bytes.is_some_and(|b| b > 0));
+    assert!(journal.admits_new);
+    let mvcc = summary
+        .iter()
+        .find(|v| v.space == RetentionSpace::Mvcc)
+        .expect("an MVCC view");
+    assert_eq!(mvcc.floor, None, "no MVCC consumer holds anything");
+}
+
 /// A database that keeps no journal of its own holds no history for
 /// consumers and says so, rather than registering protection it cannot give.
 #[test]

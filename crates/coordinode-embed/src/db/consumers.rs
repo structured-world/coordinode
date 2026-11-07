@@ -16,7 +16,8 @@ use std::sync::Arc;
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_replicate::{
     BackgroundConfig, ConsumerRegistration, ConsumerSnapshot, LogRetentionSource, RegisteredHandle,
-    RegistryBackground, SeqnoConsumerRegistry, ShardConsumerRegistry, SystemClock,
+    RegistryBackground, RetentionSummary, SeqnoConsumerRegistry, ShardConsumerRegistry,
+    SystemClock,
 };
 use coordinode_storage::engine::core::StorageEngine;
 
@@ -177,6 +178,19 @@ impl Database {
     /// own.
     pub fn consumers_list(&self) -> Result<Vec<ConsumerSnapshot>, DatabaseError> {
         Ok(self.consumers()?.list_consumers())
+    }
+
+    /// What the registrations hold of the store's history in each space
+    /// (journal and MVCC): the lowest position, the bytes from it counted
+    /// once however many registrations share them, the registrations at that
+    /// position, and whether a new registration is admitted now.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::Unsupported`] on a database without a journal of its
+    /// own; [`DatabaseError::Consumer`] when the records cannot be read.
+    pub fn consumer_retention(&self) -> Result<Vec<RetentionSummary>, DatabaseError> {
+        Ok(self.consumers()?.retention_summary()?)
     }
 }
 

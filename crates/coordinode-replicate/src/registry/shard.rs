@@ -49,7 +49,8 @@ use super::entry::{
 use super::source::RetentionSource;
 use super::types::{
     ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot, InitialSeqno,
-    RegisteredHandle, RegistrationState, RegistryError, TerminalReason, TopologyScope,
+    RegisteredHandle, RegistrationState, RegistryError, RetentionSpace, RetentionSummary,
+    TerminalReason, TopologyScope,
 };
 use super::watch::{RegistrationWatch, Watches};
 use coordinode_storage::engine::applied::AppliedEvent;
@@ -1318,9 +1319,12 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                 return Vec::new();
             }
         };
+        let floors = Floors::of(&entries);
         entries
             .into_iter()
             .map(|e| {
+                let mut progress_lag_ms = None;
+                let mut retained_bytes = None;
                 if e.is_live() {
                     let head = source.head(e.kind);
                     let behind = e.checkpoint_seqno < head;
@@ -1334,21 +1338,30 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                     .set(head.saturating_sub(e.checkpoint_seqno) as f64);
                     // Age of the oldest unacknowledged work; a consumer with
                     // none outstanding is not lagging, however long ago it
-                    // last acknowledged.
-                    let lag_age_ms = behind
-                        .then(|| source.produced_at_ms(e.kind, e.checkpoint_seqno))
-                        .flatten()
-                        .map_or(0, |at| now.saturating_sub(at));
+                    // last acknowledged. A source that does not account the
+                    // space cannot tell.
+                    progress_lag_ms = if !behind {
+                        Some(0)
+                    } else {
+                        match source.produced_at_ms(e.kind, e.checkpoint_seqno) {
+                            Some(at) => Some(now.saturating_sub(at)),
+                            None => source.accounts(e.kind).then_some(0),
+                        }
+                    };
                     metrics::gauge!("registry_consumer_lag_age_seconds", "consumer_id" => e.consumer_id.clone())
-                        .set(lag_age_ms as f64 / 1_000.0);
+                        .set(progress_lag_ms.unwrap_or(0) as f64 / 1_000.0);
                     metrics::gauge!("registry_consumer_heartbeat_age_seconds", "consumer_id" => e.consumer_id.clone())
                         .set(now.saturating_sub(e.last_heartbeat_ts_ms) as f64 / 1_000.0);
-                    if let Some(bytes) = source.retained_bytes_from(e.kind, e.checkpoint_seqno) {
+                    retained_bytes = source.retained_bytes_from(e.kind, e.checkpoint_seqno);
+                    if let Some(bytes) = retained_bytes {
                         metrics::gauge!("registry_consumer_retained_bytes", "consumer_id" => e.consumer_id.clone())
                             .set(bytes as f64);
                     }
                 }
                 ConsumerSnapshot {
+                    holds_floor: floors.held_by(&e),
+                    progress_lag_ms,
+                    retained_bytes,
                     consumer_id: e.consumer_id,
                     incarnation: e.incarnation,
                     kind: e.kind,
@@ -1361,6 +1374,82 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                 }
             })
             .collect()
+    }
+}
+
+/// The lowest live checkpoint of each space.
+#[derive(Debug, Clone, Copy, Default)]
+struct Floors {
+    log: Option<u64>,
+    mvcc: Option<u64>,
+}
+
+impl Floors {
+    fn of(entries: &[RegistryEntry]) -> Self {
+        let mut floors = Self::default();
+        for e in entries.iter().filter(|e| e.is_live()) {
+            let floor = floors.slot(RetentionSpace::of(e.kind));
+            *floor = Some(floor.map_or(e.checkpoint_seqno, |f| f.min(e.checkpoint_seqno)));
+        }
+        floors
+    }
+
+    fn slot(&mut self, space: RetentionSpace) -> &mut Option<u64> {
+        match space {
+            RetentionSpace::Log => &mut self.log,
+            RetentionSpace::Mvcc => &mut self.mvcc,
+        }
+    }
+
+    fn get(&self, space: RetentionSpace) -> Option<u64> {
+        match space {
+            RetentionSpace::Log => self.log,
+            RetentionSpace::Mvcc => self.mvcc,
+        }
+    }
+
+    /// Whether `e` is live and at the floor of its space.
+    fn held_by(&self, e: &RegistryEntry) -> bool {
+        e.is_live() && self.get(RetentionSpace::of(e.kind)) == Some(e.checkpoint_seqno)
+    }
+}
+
+impl ShardConsumerRegistry {
+    /// What the live registrations hold of the source in each space, the
+    /// bytes counted once, and which registrations hold it: one entry per
+    /// space, log first.
+    ///
+    /// # Errors
+    ///
+    /// The registry's records could not be read.
+    pub fn retention_summary(&self) -> Result<Vec<RetentionSummary>, RegistryError> {
+        let entries = self.core.scan_entries()?;
+        let floors = Floors::of(&entries);
+        let source = self.core.source.as_ref();
+        let summary = [
+            (RetentionSpace::Log, ConsumerKind::OplogEvents),
+            (RetentionSpace::Mvcc, ConsumerKind::LsmStateDelta),
+        ]
+        .into_iter()
+        .map(|(space, kind)| {
+            let floor = floors.get(space);
+            let retained_bytes = floor.and_then(|at| source.retained_bytes_from(kind, at));
+            metrics::gauge!("registry_retained_bytes", "space" => space.label())
+                .set(retained_bytes.unwrap_or(0) as f64);
+            RetentionSummary {
+                space,
+                floor,
+                retained_bytes,
+                held_by: entries
+                    .iter()
+                    .filter(|e| RetentionSpace::of(e.kind) == space && floors.held_by(e))
+                    .map(|e| e.consumer_id.clone())
+                    .collect(),
+                admits_new: source.admits(kind),
+            }
+        })
+        .collect();
+        Ok(summary)
     }
 }
 

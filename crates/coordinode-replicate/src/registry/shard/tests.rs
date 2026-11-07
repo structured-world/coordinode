@@ -738,6 +738,84 @@ fn an_acknowledgement_after_an_expiry_is_refused() {
     assert_eq!(reg.shard_floor(), u64::MAX);
 }
 
+/// The retention summary counts a space's shared history once, names the
+/// registrations at its floor (the ones whose progress or cancellation lets
+/// it rise), and says when new retention is refused for pressure; each
+/// registration's own view says whether it holds the floor and how long its
+/// work has waited.
+#[test]
+fn the_summary_counts_shared_history_once_and_names_who_holds_it() {
+    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
+    let log = |id: &str, at| ConsumerRegistration {
+        kind: ConsumerKind::OplogEvents,
+        ..registration(id, at, ConsumerRetentionPolicy::Strict)
+    };
+    source.set_head(30);
+    source.set_bytes(1_000);
+    source.produced(10, 1_000);
+    source.produced(20, 4_000);
+    let slow = reg.register(log("slow", 10)).expect("register slow");
+    reg.register(log("fast", 20)).expect("register fast");
+    reg.register(registration("state", 5, ConsumerRetentionPolicy::Strict))
+        .expect("register state");
+    clock.set(6_000);
+
+    let summary = reg.retention_summary().expect("summary");
+    let space = |s: RetentionSpace| {
+        summary
+            .iter()
+            .find(|v| v.space == s)
+            .cloned()
+            .expect("a view per space")
+    };
+    let log_view = space(RetentionSpace::Log);
+    assert_eq!(log_view.floor, Some(10));
+    assert_eq!(
+        log_view.retained_bytes,
+        Some(1_000),
+        "shared history is counted once, not once per registration"
+    );
+    assert_eq!(log_view.held_by, vec!["slow".to_string()]);
+    assert!(log_view.admits_new);
+    assert_eq!(
+        space(RetentionSpace::Mvcc).held_by,
+        vec!["state".to_string()]
+    );
+
+    let listed = reg.list_consumers();
+    let view = |id: &str| {
+        listed
+            .iter()
+            .find(|c| c.consumer_id == id)
+            .cloned()
+            .expect("listed")
+    };
+    assert!(view("slow").holds_floor && !view("fast").holds_floor);
+    assert_eq!(view("slow").progress_lag_ms, Some(5_000));
+    assert_eq!(view("fast").progress_lag_ms, Some(2_000));
+    assert_eq!(view("fast").retained_bytes, Some(1_000));
+
+    // Cancelling the holder moves the floor and the holder to the next one.
+    reg.unregister(slow).expect("cancel");
+    let log_view = reg
+        .retention_summary()
+        .expect("summary")
+        .into_iter()
+        .find(|v| v.space == RetentionSpace::Log)
+        .expect("log view");
+    assert_eq!(log_view.floor, Some(20));
+    assert_eq!(log_view.held_by, vec!["fast".to_string()]);
+
+    source.set_pressured(true);
+    assert!(
+        reg.retention_summary()
+            .expect("summary")
+            .iter()
+            .all(|v| !v.admits_new),
+        "write pressure is reported as the reason new retention is refused"
+    );
+}
+
 /// An ended registration records where its source's history started when it
 /// ended, in its own space: the log's first entry for a log consumer, the
 /// engine's collection watermark for an MVCC one. A late handle learns it

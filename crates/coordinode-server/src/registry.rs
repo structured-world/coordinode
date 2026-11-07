@@ -80,6 +80,10 @@ pub(crate) fn build_consumer_registry(
 pub(crate) fn sample_consumer_gauges(registry: &ShardConsumerRegistry) {
     // The listing sets the gauges; the snapshot it returns is not needed.
     let _listed = registry.list_consumers();
+    // So does the summary, with the bytes each space keeps counted once.
+    if let Err(e) = registry.retention_summary() {
+        tracing::warn!(error = %e, "registry: retention summary failed");
+    }
 }
 
 #[cfg(test)]

@@ -323,7 +323,14 @@ After a restart the consumer takes its registration up again with
 handle with the reason and last acknowledged position
 (`RegistryError::Terminated`), and registering the same id again starts a new
 incarnation. `cancel_consumer` ends one; `consumers_list` shows every
-registration with its policy, state and position.
+registration with its policy, state, position, how long its oldest
+unacknowledged work has waited, the bytes it needs and whether it is the one
+holding the history back. `consumer_retention` sums it up per space (journal,
+MVCC): the lowest position, the bytes kept from it counted once however many
+consumers share them, which registrations hold it, and whether a new
+registration is admitted now (it is refused as `Backpressure` while the store
+is under write pressure). Releasing one consumer can free nothing when
+another, a live reader or recovery still needs the same history.
 
 The registry runs on a thread of the database and stops when it is dropped;
 no async runtime is needed. A database kept in memory, and a member of a
