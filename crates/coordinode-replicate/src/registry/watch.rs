@@ -8,18 +8,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
+#[cfg(feature = "async")]
 use tokio::sync::Notify;
 
 /// A counter bumped as writes apply, and the readers waiting for it to move.
 #[derive(Debug, Default)]
 struct Generation {
     value: AtomicU64,
+    #[cfg(feature = "async")]
     moved: Notify,
 }
 
 impl Generation {
     fn bump(&self) {
         self.value.fetch_add(1, Ordering::Release);
+        #[cfg(feature = "async")]
         self.moved.notify_waiters();
     }
 
@@ -61,6 +64,7 @@ impl Watches {
     pub(crate) fn set_relayed(&self, relayed: bool) {
         self.relayed.store(relayed, Ordering::Release);
         // A reader waiting for the relay to start looks again.
+        #[cfg(feature = "async")]
         self.all.moved.notify_waiters();
     }
 
@@ -119,6 +123,7 @@ impl RegistrationWatch {
     /// does not learn of the end of its registration only at its next one.
     /// Without the relay it waits for the relay to start: such a reader
     /// rechecks at every wake-up anyway.
+    #[cfg(feature = "async")]
     pub async fn wait(&self) {
         loop {
             let record = self.generation.moved.notified();

@@ -4,6 +4,7 @@
 /// path with a `\\?\` prefix (e.g. `\\?\D:\a\...`). protoc does not understand
 /// this prefix and fails with "Invalid file name pattern". Strip it so protoc
 /// receives a plain absolute Windows path (`D:\a\...`).
+#[cfg(feature = "transfer")]
 fn canonicalize_for_protoc(path: &std::path::Path) -> std::path::PathBuf {
     match path.canonicalize() {
         Ok(p) => {
@@ -20,6 +21,11 @@ fn canonicalize_for_protoc(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    compile_transfer_protos()
+}
+
+#[cfg(feature = "transfer")]
+fn compile_transfer_protos() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
     // Proto files live in the `proto/` submodule at the workspace root.
     // From this crate (crates/coordinode-replicate/) that's ../../proto.
@@ -47,5 +53,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .codec_path("coordinode_wire::ZstdCodec")
         .compile_protos(&[transfer_proto], &[proto_root_str])?;
 
+    Ok(())
+}
+
+/// Only segment transfer has generated stubs: without it there is nothing to
+/// compile and no protoc is needed.
+#[cfg(not(feature = "transfer"))]
+fn compile_transfer_protos() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }

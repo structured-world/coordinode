@@ -9,32 +9,53 @@ repository.workspace = true
 readme.workspace = true
 documentation = "https://docs.rs/coordinode-replicate"
 
+[features]
+default = ["transfer"]
+# Segment transfer between members over gRPC: repair, migration, resync. A
+# database that is not a member of a replicated group keeps only the consumer
+# registry, which needs none of it.
+transfer = [
+    "async",
+    "dep:coordinode-wire",
+    "dep:coordinode-query",
+    "dep:coordinode-swarm",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:prost",
+    "dep:futures-util",
+    "dep:tonic-prost-build",
+]
+# Awaiting a change to a registration from async code. Without it the
+# registry carries no async runtime dependency.
+async = ["dep:tokio"]
+
 [dependencies]
 coordinode-core = { workspace = true }
 # Shared inter-node transport codec (pure-Rust zstd); wired into the
 # SegmentTransferService stubs via codec_path.
-coordinode-wire = { workspace = true }
-coordinode-query = { workspace = true }
+coordinode-wire = { workspace = true, optional = true }
+coordinode-query = { workspace = true, optional = true }
 coordinode-storage = { workspace = true }
-coordinode-swarm = { workspace = true }
+coordinode-swarm = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 rmp-serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, optional = true }
 metrics = { workspace = true }
 # Inter-node segment-transfer gRPC (SegmentTransferService): the transport that
 # carries swarm pieces between nodes for replication repair, migration, resync.
-tonic = { workspace = true }
-tonic-prost = "0.14"
-prost = { workspace = true }
-futures-util = { workspace = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { version = "0.14", optional = true }
+prost = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 
 [build-dependencies]
-tonic-prost-build = "0.14"
+tonic-prost-build = { version = "0.14", optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true }
 tempfile = { workspace = true }
 coordinode-raft = { workspace = true }
 # Node credentials for the in-process SegmentTransferService round trips.

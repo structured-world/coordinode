@@ -18,16 +18,22 @@
 //! - [`SegmentInstaller`] and the segment-transfer service: the inter-node
 //!   bulk transfer behind repair, migration and resync.
 //!
-//! The embedded database consumes this crate when it is a member of a
-//! replicated group, so this crate does not depend on it.
+//! The embedded database consumes the registry always and the transfer when
+//! it is a member of a replicated group, so this crate does not depend on it.
 //!
-//! Tier: `std-only`: wraps tokio-backed transfer and a Raft proposal
-//! pipeline; not a no-std target.
+//! Features: `transfer` (default) adds segment transfer and its gRPC stubs;
+//! `async` adds awaiting a registration's change. Without them the registry
+//! needs no async runtime.
+//!
+//! Tier: `std-only`: wraps a proposal pipeline, threads and, with
+//! `transfer`, tokio-backed transfer; not a no-std target.
 
 #![forbid(unsafe_code)]
 
 pub mod registry;
+#[cfg(feature = "transfer")]
 pub mod segment_store;
+#[cfg(feature = "transfer")]
 pub mod transfer;
 
 pub use registry::{
@@ -36,7 +42,9 @@ pub use registry::{
     RegistryBackground, RegistryError, RetentionSource, SeqnoConsumerRegistry,
     ShardConsumerRegistry, SystemClock, TerminalReason, TopologyScope, ValidatedRetentionBounds,
 };
+#[cfg(feature = "transfer")]
 pub use segment_store::{RepairError, SegmentInstaller};
+#[cfg(feature = "transfer")]
 pub use transfer::PeerLinks;
 
 // Re-exported so server-side callers can name the causal token type
@@ -46,4 +54,5 @@ pub use coordinode_core::txn::proposal::ProposalOutcome;
 // Re-exported so server-side callers (e.g. the background-scrub repair trigger)
 // can name the wire piece encoding without depending on coordinode-swarm
 // directly.
+#[cfg(feature = "transfer")]
 pub use coordinode_swarm::PieceEncoding;
