@@ -36,6 +36,7 @@ use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_storage::engine::applied::AppliedStop;
 use coordinode_storage::engine::coordinator::SnapshotPin;
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::oplog_journal::JournalHold;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
 use parking_lot::{Condvar, Mutex};
@@ -118,6 +119,17 @@ enum Step<T> {
     Write(RegistryEntry, T),
     /// Nothing to write; answer `T`.
     Keep(T),
+}
+
+/// What holds a new registration's starting position until its floor is
+/// published. Dropping it releases the position to the floor; nothing reads
+/// what it holds.
+enum Held {
+    /// An MVCC snapshot pinned in the engine.
+    Snapshot { _pin: SnapshotPin },
+    /// A log position held against purge, or nothing when the log's purge is
+    /// bounded by other means.
+    Log { _hold: Option<JournalHold> },
 }
 
 /// What the background service has been asked to do since it last looked.
@@ -203,24 +215,36 @@ impl RegistryCore {
     /// lock that publishes the watermark, and the pin returned must outlive
     /// the floor the registration then publishes. Checking first and
     /// protecting later lets collection pass the position in between.
-    fn resolve_initial(
-        &self,
-        reg: &ConsumerRegistration,
-    ) -> Result<(u64, Option<SnapshotPin>), RegistryError> {
+    fn resolve_initial(&self, reg: &ConsumerRegistration) -> Result<(u64, Held), RegistryError> {
         if reg.kind.is_seqno_space() {
-            return self.pin_initial(reg).map(|(at, pin)| (at, Some(pin)));
+            return self
+                .pin_initial(reg)
+                .map(|(at, pin)| (at, Held::Snapshot { _pin: pin }));
         }
-        let first = self.source.first_retained(reg.kind);
-        let at = match reg.initial_seqno {
-            InitialSeqno::FromNow => Ok(self.source.head(reg.kind)),
-            InitialSeqno::FromEarliestRetained => Ok(first),
-            InitialSeqno::At(at) if at < first => Err(RegistryError::RetentionLost {
-                checkpoint: at,
-                floor: first,
-            }),
-            InitialSeqno::At(at) => Ok(at),
-        }?;
-        Ok((at, None))
+        // The log may be purged between reading where it starts and holding
+        // that position: the hold is refused then, and the next read is past
+        // the purge.
+        for _ in 0..TRANSITION_ATTEMPTS {
+            let at = match reg.initial_seqno {
+                InitialSeqno::FromNow => self.source.head(reg.kind),
+                InitialSeqno::FromEarliestRetained => self.source.first_retained(reg.kind),
+                InitialSeqno::At(at) => at,
+            };
+            match self.source.hold_log_from(at) {
+                Ok(hold) => return Ok((at, Held::Log { _hold: hold })),
+                Err(first) if matches!(reg.initial_seqno, InitialSeqno::At(_)) => {
+                    return Err(RegistryError::RetentionLost {
+                        checkpoint: at,
+                        floor: first,
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+        Err(RegistryError::Replication(format!(
+            "the log of {:?} kept being purged under {TRANSITION_ATTEMPTS} attempts",
+            reg.consumer_id
+        )))
     }
 
     /// The MVCC starting position of `reg`, pinned in the engine.
@@ -519,6 +543,9 @@ impl RegistryCore {
         self.floor.store(seqno_floor, Ordering::Release);
         self.oplog_index_floor.store(oplog_floor, Ordering::Release);
         self.source.release_log_below(oplog_floor);
+        // The store's own journal, when it keeps one, is the log its log
+        // consumers read; a store whose log is a consensus log ignores it.
+        self.engine.set_consumer_journal_floor(oplog_floor);
         for (kind, count) in ConsumerKind::ALL.iter().zip(counts) {
             metrics::gauge!("registry_consumer_count", "kind" => kind.label()).set(count as f64);
         }

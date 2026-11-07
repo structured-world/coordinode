@@ -463,6 +463,11 @@ impl OplogManager {
         self.floor.clone()
     }
 
+    /// The directory this manager keeps its segments in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Publish where the segments start now. Sealed segments all lie below
     /// the active one, which `append` enforces.
     fn publish_floor(&self) {

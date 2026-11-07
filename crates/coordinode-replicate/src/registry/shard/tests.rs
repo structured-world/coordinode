@@ -952,6 +952,101 @@ fn collection_racing_a_registration_never_passes_its_position() {
     assert_eq!(reg.check_retention(&h).expect("covered"), 100);
 }
 
+/// A journal purge running while a log registration commits never passes
+/// the position being registered, over a store's own journal: the position is
+/// held from the check on, under the lock the purge takes. Before, the purge
+/// removed it in between, and the consumer was registered over entries the
+/// journal no longer had.
+#[test]
+fn a_journal_purge_racing_a_registration_never_passes_its_position() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_storage::engine::oplog_journal::OplogJournalConfig;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_embedded_with_journal(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            Arc::clone(&oracle),
+            OplogJournalConfig {
+                retention_secs: 1,
+                max_segment_entries: 2,
+                ..OplogJournalConfig::default()
+            },
+        )
+        .expect("open embedded"),
+    );
+    for i in 0..6u64 {
+        engine
+            .commit_journaled(
+                &[Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: format!("node:r:{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                }],
+                oracle.next().as_raw(),
+            )
+            .expect("commit");
+    }
+    let source: Arc<dyn RetentionSource> = Arc::new(
+        crate::registry::LogRetentionSource::over_own_journal(Arc::clone(&engine))
+            .expect("inspect")
+            .expect("a journal"),
+    );
+    let reg = ShardConsumerRegistry::new(
+        Arc::clone(&engine),
+        Arc::new(
+            coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
+        ),
+        Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
+        Arc::new(ManualClock::new(0)),
+        Arc::clone(&source),
+    );
+    let at = source.first_retained(ConsumerKind::OplogEvents);
+    let after_purge = Arc::new(AtomicU64::new(0));
+    *reg.core.before_commit.lock() = Some(Box::new({
+        let (engine, source, after_purge) = (
+            Arc::clone(&engine),
+            Arc::clone(&source),
+            Arc::clone(&after_purge),
+        );
+        move || {
+            engine
+                .oplog_purge_expired(4_000_000_000, u64::MAX)
+                .expect("purge");
+            after_purge.store(
+                source.first_retained(ConsumerKind::OplogEvents),
+                Ordering::Release,
+            );
+        }
+    }));
+    let h = reg
+        .register(ConsumerRegistration {
+            kind: ConsumerKind::OplogEvents,
+            ..registration("tail", at, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("the position was in the journal when registered");
+    let start = after_purge.load(Ordering::Acquire);
+    assert!(
+        start <= at,
+        "a purge removed the journal from {at} up to {start} while it was being registered"
+    );
+    engine
+        .oplog_purge_expired(4_000_000_000, u64::MAX)
+        .expect("purge");
+    assert!(
+        source.first_retained(ConsumerKind::OplogEvents) <= at,
+        "the published floor did not keep the journal"
+    );
+    assert_eq!(reg.check_retention(&h).expect("covered"), at);
+}
+
 /// A seqno-space registration below what the engine has already collected is
 /// refused, whatever the source says: the engine's watermark decides what MVCC
 /// history is held.

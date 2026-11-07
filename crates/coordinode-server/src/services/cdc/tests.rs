@@ -27,7 +27,8 @@ use crate::proto::replication::cdc::{
     CdcFilters as ProtoCdcFilters, ConsumerRetention, ResumeToken as ProtoResumeToken,
     StrictRetention, SubscribeRequest, consumer_retention,
 };
-use crate::registry::{NodeRetentionSource, RegistryTuning, build_consumer_registry};
+use crate::registry::{RegistryTuning, build_consumer_registry};
+use coordinode_replicate::LogRetentionSource;
 
 /// Open a fresh single-endpoint engine in a temp directory.
 fn open_engine() -> (Arc<StorageEngine>, tempfile::TempDir) {
@@ -63,7 +64,7 @@ fn fixture(
     let (engine, engine_dir) = open_engine();
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(OwnedLocalProposalPipeline::new(&engine));
-    let source = Arc::new(NodeRetentionSource::new(
+    let source = Arc::new(LogRetentionSource::new(
         Arc::clone(&engine),
         dirs.clone(),
         floor,
@@ -989,7 +990,7 @@ async fn stream_follows_a_raft_node() {
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(node.pipeline());
     let applied_node = Arc::clone(&node);
-    let source = Arc::new(NodeRetentionSource::new(
+    let source = Arc::new(LogRetentionSource::new(
         Arc::clone(&engine),
         coordinode_raft::storage::raft_oplog_dirs(&engine, 0)
             .expect("dirs")

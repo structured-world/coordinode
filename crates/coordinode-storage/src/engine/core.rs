@@ -326,6 +326,12 @@ pub struct StorageEngine {
     /// replays from; reclamation keeps it. `u64::MAX` when no checkpoint
     /// needs any.
     journal_keep_from: AtomicU64,
+    /// The lowest journal index a registered consumer still needs, published
+    /// by its registry; `u64::MAX` when none needs any.
+    consumer_journal_floor: AtomicU64,
+    /// Journal indices held while a consumer registering at them publishes
+    /// the floor that keeps them.
+    journal_holds: crate::engine::oplog_journal::JournalHolds,
 }
 
 /// History entries a replacement import writes between two admissions
@@ -1573,6 +1579,8 @@ impl StorageEngine {
             footprints,
             footprint_reclaim: parking_lot::Mutex::new(()),
             journal_keep_from: AtomicU64::new(u64::MAX),
+            consumer_journal_floor: AtomicU64::new(u64::MAX),
+            journal_holds: Default::default(),
         };
         engine.drain_local_journal()?;
         // A repair that lost nothing owes only the tail the journal or the
@@ -3624,10 +3632,105 @@ impl StorageEngine {
                 let mut guard = oplog
                     .lock()
                     .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
-                guard.purge_expired(now_secs, keep_from_index, &is_durable)
+                // Read under the journal lock a hold is taken under.
+                let keep = keep_from_index.min(self.consumer_journal_needs());
+                guard.purge_expired(now_secs, keep, &is_durable)
             }
             _ => Ok(0),
         }
+    }
+
+    /// The lowest journal index a consumer needs kept: its registry's
+    /// published floor, or an index held while a registration publishes it.
+    /// Read with the journal locked, the lock [`Self::hold_journal_from`]
+    /// takes its hold under.
+    fn consumer_journal_needs(&self) -> u64 {
+        let held = self
+            .journal_holds
+            .lock()
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(u64::MAX);
+        held.min(
+            self.consumer_journal_floor
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Keep the journal from `index` on for the consumers registered to read
+    /// it; `u64::MAX` when none needs any. Expiry and reclamation under a
+    /// footprint limit never remove it: a store at its limit then refuses new
+    /// writes rather than drop history a consumer was promised.
+    pub fn set_consumer_journal_floor(&self, index: u64) {
+        self.consumer_journal_floor
+            .store(index, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Hold the journal from `index` on until the hold drops, if the journal
+    /// still holds `index`; `Ok(None)` when it no longer does. The check and
+    /// the hold are made under the lock every purge takes, so a purge either
+    /// ran before (and the index is gone) or keeps it.
+    ///
+    /// # Errors
+    ///
+    /// The engine keeps no journal of its own, or its lock is poisoned.
+    pub fn hold_journal_from(
+        &self,
+        index: u64,
+    ) -> StorageResult<Option<crate::engine::oplog_journal::JournalHold>> {
+        let oplog = self
+            .oplog
+            .as_ref()
+            .ok_or_else(|| StorageError::InvalidConfig("the store keeps no journal".into()))?;
+        let journal = oplog
+            .lock()
+            .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+        if index < journal.first_index() {
+            return Ok(None);
+        }
+        Ok(Some(crate::engine::oplog_journal::JournalHold::take(
+            &self.journal_holds,
+            index,
+        )))
+    }
+
+    /// What a reader of this store's own journal needs to know of it: the
+    /// directory of its segments and where they start, kept current. `None`
+    /// when the store keeps no journal.
+    ///
+    /// # Errors
+    ///
+    /// The journal lock is poisoned.
+    pub fn journal_location(
+        &self,
+    ) -> StorageResult<Option<(std::path::PathBuf, crate::oplog::RetainedFloor)>> {
+        let Some(oplog) = &self.oplog else {
+            return Ok(None);
+        };
+        let journal = oplog
+            .lock()
+            .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+        Ok(Some((
+            journal.dir().to_path_buf(),
+            journal.retained_floor(),
+        )))
+    }
+
+    /// The index the journal's next entry receives: one past the newest a
+    /// reader of it can be given. `None` when the store keeps no journal.
+    ///
+    /// # Errors
+    ///
+    /// The journal lock is poisoned.
+    pub fn journal_next_index(&self) -> StorageResult<Option<u64>> {
+        let Some(oplog) = &self.oplog else {
+            return Ok(None);
+        };
+        let journal = oplog
+            .lock()
+            .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+        Ok(Some(journal.next_index()))
     }
 
     /// Keep the journal from `index` on for a rebuild from the latest local
@@ -3665,13 +3768,17 @@ impl StorageEngine {
         };
         // Every entry below `covered` is in a table of every tree.
         let covered = self.persist_coverage_base()?;
-        let below = covered.min(
-            self.journal_keep_from
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
         let mut log = oplog
             .lock()
             .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+        // What consumers need is read under the journal lock a hold is taken
+        // under.
+        let below = covered
+            .min(
+                self.journal_keep_from
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .min(self.consumer_journal_needs());
         // A segment is removed only once sealed: the active one is sealed when
         // all it holds is covered, and the next entry starts a new one.
         if log.next_index() <= below {

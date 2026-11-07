@@ -38,8 +38,8 @@ pub mod transfer;
 
 pub use registry::{
     BackgroundConfig, Clock, ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy,
-    ConsumerSnapshot, InitialSeqno, RegisteredHandle, RegistrationState, RegistrationWatch,
-    RegistryBackground, RegistryError, RetentionSource, SeqnoConsumerRegistry,
+    ConsumerSnapshot, InitialSeqno, LogRetentionSource, RegisteredHandle, RegistrationState,
+    RegistrationWatch, RegistryBackground, RegistryError, RetentionSource, SeqnoConsumerRegistry,
     ShardConsumerRegistry, SystemClock, TerminalReason, TopologyScope, ValidatedRetentionBounds,
 };
 #[cfg(feature = "transfer")]

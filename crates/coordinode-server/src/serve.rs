@@ -903,7 +903,7 @@ pub(crate) async fn serve(
     // defaults (1 s heartbeat window, 1 s between sweeps).
     let retention_source: Arc<dyn coordinode_replicate::RetentionSource> = {
         let applied_node = Arc::clone(&raft_node);
-        Arc::new(registry::NodeRetentionSource::new(
+        Arc::new(coordinode_replicate::LogRetentionSource::new(
             Arc::clone(&engine),
             coordinode_raft::storage::raft_oplog_dirs(&engine, 0)
                 .map_err(|e| format!("oplog directories: {e}"))?

@@ -48,7 +48,7 @@ use crate::engine::coverage;
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp, ShardId};
-use crate::oplog::manager::OplogManager;
+use crate::oplog::manager::{OplogManager, RetainedFloor};
 use crate::placement::partition_from_wire_tag;
 
 /// Tuning for the embedded oplog journal.
@@ -143,6 +143,48 @@ struct Unsynced {
     index: u64,
     commit_ts: u64,
     bytes: u64,
+}
+
+/// Journal indices held against purge, each with how many holds it has.
+pub(crate) type JournalHolds = Arc<parking_lot::Mutex<std::collections::BTreeMap<u64, usize>>>;
+
+/// Keeps the journal from one index on until dropped, whatever purges or
+/// reclamation run meanwhile. Taken by
+/// [`StorageEngine::hold_journal_from`](crate::engine::core::StorageEngine::hold_journal_from)
+/// while a consumer registering at that index publishes the floor that keeps
+/// it from then on.
+#[derive(Debug)]
+pub struct JournalHold {
+    holds: JournalHolds,
+    index: u64,
+}
+
+impl JournalHold {
+    /// Hold `index` in `holds`.
+    pub(crate) fn take(holds: &JournalHolds, index: u64) -> Self {
+        *holds.lock().entry(index).or_insert(0) += 1;
+        Self {
+            holds: Arc::clone(holds),
+            index,
+        }
+    }
+
+    /// The index held.
+    pub fn index(&self) -> u64 {
+        self.index
+    }
+}
+
+impl Drop for JournalHold {
+    fn drop(&mut self) {
+        let mut holds = self.holds.lock();
+        if let Some(count) = holds.get_mut(&self.index) {
+            *count -= 1;
+            if *count == 0 {
+                holds.remove(&self.index);
+            }
+        }
+    }
 }
 
 /// Retained, oracle-coupled oplog journal owned by a standalone engine.
@@ -356,6 +398,25 @@ impl EmbeddedOplog {
     /// The index the next appended entry receives.
     pub(crate) fn next_index(&self) -> u64 {
         self.next_index
+    }
+
+    /// The first index the journal still holds: its oldest segment's first
+    /// entry, or the next index when no segment holds anything.
+    pub(crate) fn first_index(&self) -> u64 {
+        self.manager
+            .retained_floor()
+            .get()
+            .unwrap_or(self.next_index)
+    }
+
+    /// Where the journal's segments start, kept current as they change.
+    pub(crate) fn retained_floor(&self) -> RetainedFloor {
+        self.manager.retained_floor()
+    }
+
+    /// The directory holding the journal's segments.
+    pub(crate) fn dir(&self) -> &Path {
+        self.manager.dir()
     }
 
     /// Never hand out an index below `floor`: an index the partition trees

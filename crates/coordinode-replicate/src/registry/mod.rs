@@ -15,11 +15,13 @@
 //! BOUNDED registration once its bound is crossed.
 
 mod entry;
+mod log_source;
 mod shard;
 mod source;
 mod types;
 mod watch;
 
+pub use log_source::LogRetentionSource;
 pub use shard::{BackgroundConfig, Clock, RegistryBackground, ShardConsumerRegistry, SystemClock};
 pub use source::RetentionSource;
 pub use types::{

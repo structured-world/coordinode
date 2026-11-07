@@ -1340,6 +1340,139 @@ fn oplog_purge_collects_durable_expired_segments() {
     );
 }
 
+/// A store whose journal rotates every two entries and expires at once, with
+/// six durable entries written: every sealed segment is collectable unless
+/// something keeps it.
+fn journal_with_six_collectable_entries() -> (StorageEngine, TempDir) {
+    use crate::engine::oplog_journal::OplogJournalConfig;
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::TimestampOracle;
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(TimestampOracle::new());
+    let journal = OplogJournalConfig {
+        retention_secs: 1,
+        max_segment_entries: 2,
+        ..OplogJournalConfig::default()
+    };
+    let engine = StorageEngine::open_embedded_with_journal(&config, oracle.clone(), journal)
+        .expect("open_embedded_with_journal");
+    for i in 0..6u64 {
+        engine
+            .commit_journaled(
+                &[Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: format!("node:kept:{i}").into_bytes(),
+                    value: b"applied".to_vec(),
+                }],
+                oracle.next().as_raw(),
+            )
+            .expect("commit_journaled");
+    }
+    (engine, dir)
+}
+
+/// The lowest index the journal still holds.
+fn first_journal_index(engine: &StorageEngine) -> u64 {
+    engine
+        .oplog_read_since(0)
+        .expect("read")
+        .expect("journal")
+        .first()
+        .map_or(u64::MAX, |e| e.index)
+}
+
+/// Neither expiry nor footprint reclamation removes journal entries a
+/// consumer's published floor needs, and lowering nothing else, both remove
+/// what lies below it.
+#[test]
+fn journal_purges_keep_what_a_consumer_floor_needs() {
+    let (engine, _dir) = journal_with_six_collectable_entries();
+    engine.set_consumer_journal_floor(2);
+    engine
+        .oplog_purge_expired(4_000_000_000, u64::MAX)
+        .expect("purge");
+    assert!(
+        first_journal_index(&engine) <= 2,
+        "expiry removed entries the consumer floor keeps"
+    );
+    engine.reclaim_footprint();
+    assert!(
+        first_journal_index(&engine) <= 2,
+        "reclamation removed entries the consumer floor keeps"
+    );
+
+    engine.set_consumer_journal_floor(u64::MAX);
+    engine
+        .oplog_purge_expired(4_000_000_000, u64::MAX)
+        .expect("purge");
+    assert!(
+        first_journal_index(&engine) > 2,
+        "with the floor released the expired entries go"
+    );
+}
+
+/// A hold keeps the journal from its index on while it lives, and a hold is
+/// refused below what the journal still holds: a purge either ran before the
+/// hold was asked for, or it keeps what the hold names.
+#[test]
+fn a_journal_hold_keeps_its_index_and_is_refused_below_the_journal() {
+    let (engine, _dir) = journal_with_six_collectable_entries();
+    let hold = engine
+        .hold_journal_from(1)
+        .expect("hold")
+        .expect("index 1 is still held");
+    assert_eq!(hold.index(), 1);
+    engine
+        .oplog_purge_expired(4_000_000_000, u64::MAX)
+        .expect("purge");
+    engine.reclaim_footprint();
+    assert!(first_journal_index(&engine) <= 1, "a purge passed a hold");
+
+    drop(hold);
+    engine
+        .oplog_purge_expired(4_000_000_000, u64::MAX)
+        .expect("purge");
+    let first = first_journal_index(&engine);
+    assert!(first > 1, "the dropped hold still kept the journal");
+    assert!(
+        engine.hold_journal_from(0).expect("hold").is_none(),
+        "a hold below what the journal holds was granted"
+    );
+    assert!(
+        engine.hold_journal_from(first).expect("hold").is_some(),
+        "a hold at the journal's first entry was refused"
+    );
+}
+
+/// A store keeping no journal of its own refuses a journal hold rather than
+/// pretend to keep anything.
+#[test]
+fn a_store_without_a_journal_refuses_a_journal_hold() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]))
+    .expect("open");
+    assert!(matches!(
+        engine.hold_journal_from(0),
+        Err(StorageError::InvalidConfig(_))
+    ));
+    assert!(engine.journal_location().expect("location").is_none());
+    assert!(engine.journal_next_index().expect("next").is_none());
+}
+
 /// End-to-end power-loss recovery under the crash-simulator filesystem: the
 /// trees roll back to their last-fsynced content, and reopening the engine
 /// replays the journal so every acknowledged write survives. This exercises

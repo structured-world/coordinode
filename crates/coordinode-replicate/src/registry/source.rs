@@ -5,6 +5,8 @@
 //! counts Raft indexes in segment files, the MVCC store counts commit
 //! timestamps in trees. The node that owns the source answers for it.
 
+use coordinode_storage::engine::oplog_journal::JournalHold;
+
 use super::types::ConsumerKind;
 
 /// The source behind one consumer position space on a shard.
@@ -46,4 +48,21 @@ pub trait RetentionSource: Send + Sync {
     /// asked of [`Self::produced_at_ms`] again, so a source may drop what it
     /// keeps to answer for it. A source that keeps nothing ignores it.
     fn release_log_below(&self, _position: u64) {}
+
+    /// Keep the log from `position` on while a registration starting there
+    /// commits and publishes the floor that keeps it from then on.
+    ///
+    /// `Err(first)` when the log no longer holds `position`, `first` being
+    /// where it starts now. A log whose purge consults the registry's floor
+    /// returns a hold taken under the lock its purge takes; one whose purge
+    /// is bounded by other means answers from [`Self::first_retained`] and
+    /// holds nothing.
+    fn hold_log_from(&self, position: u64) -> Result<Option<JournalHold>, u64> {
+        let first = self.first_retained(ConsumerKind::OplogEvents);
+        if position < first {
+            Err(first)
+        } else {
+            Ok(None)
+        }
+    }
 }
