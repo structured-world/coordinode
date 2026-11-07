@@ -272,6 +272,64 @@ backups written elsewhere, a store received from a replicated group) are in
 The engine cannot hold unrelated processes to a size: a host that needs a
 system-wide cap also sets a file-system quota.
 
+## Change-stream consumers
+
+A consumer that reads the database's history (an outbox relay, a projection,
+a backup reading state deltas) registers so that history is kept for it. Each
+registration chooses its retention policy; there is no default:
+
+- **`Strict`** keeps what the consumer has not acknowledged until the
+  consumer is cancelled. Missing heartbeats do not end it. At a hard limit the
+  store refuses new writes rather than drop that history.
+- **`Bounded`** declares a finite progress lag (age of the oldest
+  unacknowledged work, in ms), a finite number of retained bytes, and
+  optionally a liveness timeout. Crossing one ends the registration with that
+  reason, and its history is no longer kept for it. Heartbeats prove liveness
+  only: they never reset the lag.
+
+A log consumer (`ConsumerKind::OplogEvents`) has its position kept in the
+journal; a state or snapshot consumer (`LsmStateDelta`, `MvccSnapshotPin`) in
+the MVCC history. The position is held from the registration on, across
+restarts, and a registration at a position already gone is refused with
+`RetentionLost`:
+
+```rust,no_run
+use coordinode_embed::Database;
+use coordinode_embed::consumer::{
+    ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, InitialSeqno, TopologyScope,
+};
+
+# fn main() -> Result<(), coordinode_embed::DatabaseError> {
+let db = Database::open("/var/lib/myapp/graph")?;
+let outbox = db.register_consumer(ConsumerRegistration {
+    consumer_id: "outbox-relay".into(),
+    kind: ConsumerKind::OplogEvents,
+    scope: TopologyScope::Shard(0),
+    initial_seqno: InitialSeqno::FromNow,
+    retention: ConsumerRetentionPolicy::Strict,
+})?;
+// Before reading: where the consumer stands, refused if that history is gone.
+let from = db.consumer_position(&outbox)?;
+// ...deliver what follows `from`, then acknowledge up to where it was handed
+// over; what lies below is no longer kept for this consumer.
+db.acknowledge_consumer(&outbox, from)?;
+# Ok(())
+# }
+```
+
+After a restart the consumer takes its registration up again with
+`resume_consumer(id, incarnation)`; the incarnation is in its handle
+(`RegisteredHandle::incarnation`). An ended registration keeps refusing its
+handle with the reason and last acknowledged position
+(`RegistryError::Terminated`), and registering the same id again starts a new
+incarnation. `cancel_consumer` ends one; `consumers_list` shows every
+registration with its policy, state and position.
+
+The registry runs on a thread of the database and stops when it is dropped;
+no async runtime is needed. A database kept in memory, and a member of a
+replicated group (whose history is the group's log, not a journal of its
+own), refuse registrations as `Unsupported`.
+
 ## Blobs
 
 Large binary objects are stored by id beside the graph. Each upload is its own

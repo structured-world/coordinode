@@ -744,8 +744,10 @@ kept in memory has no journal, and its flushes stay synced.
 
 Segments rotate at whichever size limit is reached first. In the journal of
 an embedded database, `retention_secs` is a floor, not a promise to delete: a
-segment is kept while a checkpoint still needs it or any table still lacks one
-of its entries. The Raft log of a server (standalone or cluster member) drops
+segment is kept while a checkpoint still needs it, any table still lacks one
+of its entries, or a registered consumer has not acknowledged it (see
+[Change-stream consumers](./embedded#change-stream-consumers)); reclamation
+under a hard limit keeps those too, and refuses new writes instead. The Raft log of a server (standalone or cluster member) drops
 entries once they are in a snapshot and every table holds them;
 `retention_secs` does not extend it, and a change stream does not hold it. A
 change stream resuming at an entry the log has dropped is refused with
