@@ -738,6 +738,33 @@ fn an_acknowledgement_after_an_expiry_is_refused() {
     assert_eq!(reg.shard_floor(), u64::MAX);
 }
 
+/// Ending a registration releases only its own protection: a read already
+/// admitted at that position keeps the history it pinned until it finishes,
+/// and only then can collection pass it.
+#[test]
+fn a_read_in_progress_keeps_its_history_when_the_consumer_ends() {
+    let (reg, _clock, _source, _pipeline, _dir) = hooked_registry();
+    let engine = Arc::clone(&reg.core.engine);
+    let h = reg
+        .register(registration("reader", 100, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    let reading = engine
+        .pin_snapshot_at(100)
+        .expect("the read is admitted at the consumer's position");
+    reg.unregister(h).expect("cancel");
+    engine.set_retention_window(Duration::from_millis(1));
+    assert!(
+        engine.gc_watermark() <= 100,
+        "ending the registration released the history a read still uses"
+    );
+    drop(reading);
+    engine.set_retention_window(Duration::from_millis(1));
+    assert!(
+        engine.gc_watermark() > 100,
+        "with the read finished and the consumer gone nothing holds it"
+    );
+}
+
 /// The retention summary counts a space's shared history once, names the
 /// registrations at its floor (the ones whose progress or cancellation lets
 /// it rise), and says when new retention is refused for pressure; each

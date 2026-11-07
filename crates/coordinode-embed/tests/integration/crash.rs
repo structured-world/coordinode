@@ -156,6 +156,143 @@ fn an_indexed_node_is_found_after_replay_behind_a_create() {
     );
 }
 
+/// Set by the parent of the consumer kill tests; the child does nothing
+/// without it. `CONSUMER_CHILD_CANCEL` set makes the child cancel first.
+const CONSUMER_CHILD_DIR: &str = "COORDINODE_CRASH_CONSUMER_CHILD_DIR";
+const CONSUMER_CHILD_CANCEL: &str = "COORDINODE_CRASH_CONSUMER_CHILD_CANCEL";
+
+/// A STRICT log consumer starting at the journal's head.
+fn strict_log_consumer(id: &str) -> coordinode_embed::consumer::ConsumerRegistration {
+    use coordinode_embed::consumer::{
+        ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, InitialSeqno, TopologyScope,
+    };
+    ConsumerRegistration {
+        consumer_id: id.to_string(),
+        kind: ConsumerKind::OplogEvents,
+        scope: TopologyScope::Shard(0),
+        initial_seqno: InitialSeqno::FromNow,
+        retention: ConsumerRetentionPolicy::Strict,
+    }
+}
+
+/// Child half of the consumer kill tests: a registration (cancelled when
+/// asked), writes after it, then death without destructors. It prints the
+/// registration's position for the parent.
+#[test]
+fn crash_child_registers_a_consumer_then_aborts() {
+    let Some(dir) = std::env::var_os(CONSUMER_CHILD_DIR) else {
+        return;
+    };
+    let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
+    let h = db
+        .register_consumer(strict_log_consumer("relay"))
+        .expect("register in child");
+    let from = db.consumer_position(&h).expect("position in child");
+    println!("consumer-position {from}");
+    if std::env::var_os(CONSUMER_CHILD_CANCEL).is_some() {
+        db.cancel_consumer(h).expect("cancel in child");
+    }
+    for i in 0..5 {
+        db.execute_cypher(&format!("CREATE (:Relayed {{i: {i}}})"))
+            .expect("write in child");
+    }
+    super::helpers::die_killed();
+}
+
+/// Run the consumer child on `dir`, cancelling first when `cancel`, and
+/// return the position it registered at.
+fn run_consumer_child(dir: &std::path::Path, cancel: bool) -> u64 {
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args([
+            "--exact",
+            "integration::crash::crash_child_registers_a_consumer_then_aborts",
+            "--nocapture",
+        ])
+        .env(CONSUMER_CHILD_DIR, dir);
+    if cancel {
+        child.env(CONSUMER_CHILD_CANCEL, "1");
+    }
+    let out = child.output().expect("run the child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            out.status.signal(),
+            Some(super::helpers::CHILD_KILL_SIGNAL),
+            "the child must be killed after its writes, got {:?}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("consumer-position "))
+        .expect("the child printed its position")
+        .trim()
+        .parse()
+        .expect("a position")
+}
+
+/// Persist and reclaim what the journal no longer owes anyone.
+fn reclaim(db: &Database) {
+    db.persist().expect("persist");
+    db.engine().reclaim_footprint();
+}
+
+/// The first index the journal still holds.
+fn journal_start(db: &Database) -> u64 {
+    db.engine()
+        .oplog_read_since(0)
+        .expect("read")
+        .expect("journal")
+        .first()
+        .map_or(u64::MAX, |e| e.index)
+}
+
+/// A registration made before a kill holds the journal after it: the
+/// reopened database keeps its position through reclamation, and the
+/// consumer takes it up again with its incarnation.
+#[test]
+fn a_consumer_registration_holds_the_journal_across_a_kill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let from = run_consumer_child(dir.path(), false);
+    let db = Database::open(dir.path()).expect("reopen after the kill");
+    reclaim(&db);
+    assert!(
+        journal_start(&db) <= from,
+        "the journal from {from} the consumer had not acknowledged was reclaimed"
+    );
+    let h = db.resume_consumer("relay", 1).expect("resume");
+    assert_eq!(db.consumer_position(&h).expect("position"), from);
+}
+
+/// A cancellation made before a kill stays made: the handle is refused with
+/// its reason after the reopen, and the journal it held is no longer kept
+/// for it.
+#[test]
+fn a_consumer_cancelled_before_a_kill_stays_cancelled() {
+    use coordinode_embed::consumer::{RegistryError, TerminalReason};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let from = run_consumer_child(dir.path(), true);
+    let db = Database::open(dir.path()).expect("reopen after the kill");
+    assert!(matches!(
+        db.resume_consumer("relay", 1),
+        Err(coordinode_embed::DatabaseError::Consumer(
+            RegistryError::Terminated {
+                reason: TerminalReason::Cancelled,
+                ..
+            }
+        ))
+    ));
+    reclaim(&db);
+    assert!(
+        journal_start(&db) > from,
+        "the cancelled consumer still kept the journal"
+    );
+}
+
 // ── Close/Reopen persistence ────────────────────────────────────────
 
 /// A directory a live database holds is not opened a second time: the second

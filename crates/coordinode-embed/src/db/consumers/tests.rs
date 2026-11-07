@@ -255,6 +255,76 @@ fn an_mvcc_consumer_holds_collection_at_its_position() {
     assert_eq!(db.consumer_position(&h).expect("held"), at);
 }
 
+/// A physical backup carries the registrations with their incarnations and
+/// positions: the database opened from it keeps the same history for them
+/// and takes them up again, and an ended one stays ended there.
+#[test]
+fn a_backup_carries_the_registrations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = tempfile::tempdir().expect("backup dir");
+    let backup = target.path().join("copy");
+    let (from, incarnation) = {
+        let mut db = Database::open(dir.path()).expect("open");
+        let h = db
+            .register_consumer(log_consumer(
+                "kept",
+                InitialSeqno::FromNow,
+                ConsumerRetentionPolicy::Strict,
+            ))
+            .expect("register kept");
+        let gone = db
+            .register_consumer(log_consumer(
+                "gone",
+                InitialSeqno::FromNow,
+                ConsumerRetentionPolicy::Strict,
+            ))
+            .expect("register gone");
+        db.cancel_consumer(gone).expect("cancel gone");
+        write(&mut db, 3, "x");
+        db.physical_backup(&backup).expect("backup");
+        (db.consumer_position(&h).expect("position"), h.incarnation())
+    };
+    let restored = Database::open(&backup).expect("open the backup");
+    let h = restored
+        .resume_consumer("kept", incarnation)
+        .expect("resume in the backup");
+    assert_eq!(restored.consumer_position(&h).expect("position"), from);
+    reclaim_journal(&restored);
+    assert!(
+        journal_start(&restored) <= from,
+        "the backup did not keep the registration's history"
+    );
+    assert!(matches!(
+        restored.resume_consumer("gone", 1),
+        Err(DatabaseError::Consumer(RegistryError::Terminated { .. }))
+    ));
+}
+
+/// Releasing a consumer releases only what it held: the journal a rebuild
+/// from the latest checkpoint replays is still kept, whatever consumers do.
+#[test]
+fn a_cancelled_consumer_does_not_release_what_recovery_needs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    write(&mut db, 2, "base");
+    let ckpt = db.checkpoint(1).expect("checkpoint");
+    let replay_from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("replay floor");
+    let h = db
+        .register_consumer(log_consumer(
+            "c",
+            InitialSeqno::FromNow,
+            ConsumerRetentionPolicy::Strict,
+        ))
+        .expect("register");
+    write(&mut db, 4, "tail");
+    db.cancel_consumer(h).expect("cancel");
+    reclaim_journal(&db);
+    assert!(
+        journal_start(&db) <= replay_from,
+        "the journal a checkpoint rebuild replays from {replay_from} went with the consumer"
+    );
+}
+
 /// The database reports, per space, the lowest live position and the
 /// registration holding it.
 #[test]
