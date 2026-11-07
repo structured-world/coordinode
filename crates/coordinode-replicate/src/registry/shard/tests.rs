@@ -104,6 +104,7 @@ async fn fixture(clock: Arc<dyn Clock>) -> Fixture {
     let engine = Arc::new(
         StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open engine"),
     );
+    keep_all_history(&engine);
     let node = Arc::new(
         RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(oracle))
             .await
@@ -138,6 +139,13 @@ fn registry_over(
         clock,
         source,
     )
+}
+
+/// Keep every MVCC version: with a window longer than the clock has run, the
+/// engine has collected nothing, so a registration at any small seqno starts
+/// over history still held, as the tests' fixed positions need.
+fn keep_all_history(engine: &StorageEngine) {
+    engine.set_retention_window(Duration::from_secs(100 * 365 * 24 * 3_600));
 }
 
 fn bounded(lag_ms: u64, bytes: u64, liveness_ms: Option<u64>) -> ConsumerRetentionPolicy {
@@ -569,16 +577,18 @@ async fn bounded_is_refused_where_the_source_cannot_measure_it() {
     f.node.shutdown().await.expect("shutdown");
 }
 
-/// A registration starting below what the source holds is refused: its
+/// A log registration starting below what the source holds is refused: its
 /// protection would start over history already gone.
 #[tokio::test(flavor = "multi_thread")]
 async fn registering_below_the_retained_source_is_refused() {
     let f = fixture(Arc::new(ManualClock::new(0))).await;
     f.source.set_first(100);
+    let log = |id: &str, at| ConsumerRegistration {
+        kind: ConsumerKind::OplogEvents,
+        ..registration(id, at, ConsumerRetentionPolicy::Strict)
+    };
     assert!(matches!(
-        f.reg
-            .register(registration("late", 99, ConsumerRetentionPolicy::Strict))
-            .unwrap_err(),
+        f.reg.register(log("late", 99)).unwrap_err(),
         RegistryError::RetentionLost {
             checkpoint: 99,
             floor: 100
@@ -588,7 +598,7 @@ async fn registering_below_the_retained_source_is_refused() {
         .reg
         .register(ConsumerRegistration {
             initial_seqno: InitialSeqno::FromEarliestRetained,
-            ..registration("earliest", 0, ConsumerRetentionPolicy::Strict)
+            ..log("earliest", 0)
         })
         .expect("from the earliest retained");
     assert_eq!(f.reg.check_retention(&h).expect("held"), 100);
@@ -760,18 +770,24 @@ async fn floors_are_split_by_consumer_space() {
         .expect("register oplog consumer");
     assert_eq!(f.reg.oplog_retention_floor(), 42);
     assert_eq!(f.reg.shard_floor(), u64::MAX);
-    assert_ne!(f.engine.gc_watermark(), 42);
+    // A short window lets collection run: only an MVCC consumer holds it.
+    f.engine.set_retention_window(Duration::from_millis(1));
+    let collected = f.engine.gc_watermark();
+    assert!(
+        collected > 42,
+        "the oplog consumer held MVCC collection back"
+    );
 
     let seqno_h = f
         .reg
         .register(registration(
             "backup",
-            1_000,
+            collected,
             ConsumerRetentionPolicy::Strict,
         ))
         .expect("register seqno consumer");
-    assert_eq!(f.reg.shard_floor(), 1_000);
-    assert_eq!(f.engine.gc_watermark(), 1_000);
+    assert_eq!(f.reg.shard_floor(), collected);
+    assert_eq!(f.engine.gc_watermark(), collected);
     assert_eq!(f.reg.oplog_retention_floor(), 42);
 
     f.reg.unregister(oplog_h).expect("cancel");
@@ -790,6 +806,8 @@ async fn consumer_floor_drives_engine_gc_watermark() {
         .reg
         .register(registration("cdc", 100, ConsumerRetentionPolicy::Strict))
         .expect("register");
+    // A short window lets collection run: the consumer alone holds it.
+    f.engine.set_retention_window(Duration::from_millis(1));
     assert_eq!(f.engine.gc_watermark(), 100);
     f.reg.checkpoint(&h, 500).expect("advance");
     assert_eq!(f.engine.gc_watermark(), 500);
@@ -814,6 +832,9 @@ async fn check_retention_surfaces_retention_lost() {
         .register(registration("cdc", 100, ConsumerRetentionPolicy::Strict))
         .expect("register");
     assert_eq!(f.reg.check_retention(&h).expect("protected"), 100);
+    // An operator-forced floor above the checkpoint, with a window that no
+    // longer holds the history either.
+    f.engine.set_retention_window(Duration::from_millis(1));
     f.engine.set_consumer_retention_floor(1_000);
     let lost = f.reg.check_retention(&h);
     assert!(
@@ -831,41 +852,160 @@ async fn check_retention_surfaces_retention_lost() {
 #[tokio::test(flavor = "multi_thread")]
 async fn engine_window_governs_when_no_consumer_is_registered() {
     let f = fixture(Arc::new(ManualClock::new(0))).await;
-    f.engine.set_retention_window(Duration::from_millis(1));
     let h = f
         .reg
         .register(registration("probe", 0, ConsumerRetentionPolicy::Strict))
         .expect("register");
-    assert_eq!(f.engine.gc_watermark(), 0);
+    f.engine.set_retention_window(Duration::from_millis(1));
+    assert_eq!(f.engine.gc_watermark(), 0, "the consumer holds collection");
     f.reg.unregister(h).expect("cancel");
     assert_eq!(f.engine.gc_watermark(), f.engine.snapshot() - 1_000);
     f.node.shutdown().await.expect("shutdown");
 }
 
 /// `FromNow` starts at the source head, `FromEarliestRetained` at the first
-/// retained position.
+/// retained position: the log's for a log consumer, the engine's collection
+/// watermark for an MVCC one.
 #[tokio::test(flavor = "multi_thread")]
 async fn initial_positions_resolve_against_the_source() {
     let f = fixture(Arc::new(ManualClock::new(0))).await;
     f.source.set_first(11);
     f.source.set_head(77);
+    let log = |id: &str, initial_seqno| ConsumerRegistration {
+        kind: ConsumerKind::OplogEvents,
+        initial_seqno,
+        ..registration(id, 0, ConsumerRetentionPolicy::Strict)
+    };
     let earliest = f
         .reg
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::FromEarliestRetained,
-            ..registration("all", 0, ConsumerRetentionPolicy::Strict)
-        })
+        .register(log("all", InitialSeqno::FromEarliestRetained))
         .expect("register");
     let now = f
         .reg
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::FromNow,
-            ..registration("new-only", 0, ConsumerRetentionPolicy::Strict)
-        })
+        .register(log("new-only", InitialSeqno::FromNow))
         .expect("register");
     assert_eq!(f.reg.check_retention(&earliest).expect("held"), 11);
     assert_eq!(f.reg.check_retention(&now).expect("held"), 77);
+
+    f.engine.set_retention_window(Duration::from_millis(1));
+    let collected = f.engine.gc_watermark();
+    let mvcc = f
+        .reg
+        .register(ConsumerRegistration {
+            initial_seqno: InitialSeqno::FromEarliestRetained,
+            ..registration("mvcc", 0, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("register");
+    assert!(
+        f.reg.check_retention(&mvcc).expect("held") >= collected,
+        "an MVCC consumer starts at what the engine still holds"
+    );
     f.node.shutdown().await.expect("shutdown");
+}
+
+/// Collection catching up while a registration commits never passes the
+/// position being registered: the position is held from the moment it is
+/// found still collected-free, not from when the registry next publishes its
+/// floor. Before, the watermark ran past it in that window and was pulled
+/// back afterwards, over versions a compaction could already have dropped.
+#[test]
+fn collection_racing_a_registration_never_passes_its_position() {
+    let (reg, _clock, _source, _pipeline, _dir) = hooked_registry();
+    let engine = Arc::clone(&reg.core.engine);
+    let passed_to = Arc::new(AtomicU64::new(0));
+    *reg.core.before_commit.lock() = Some(Box::new({
+        let (engine, passed_to) = (Arc::clone(&engine), Arc::clone(&passed_to));
+        move || {
+            engine.set_retention_window(Duration::from_millis(1));
+            passed_to.store(engine.gc_watermark(), Ordering::Release);
+        }
+    }));
+    let h = reg
+        .register(registration("racing", 100, ConsumerRetentionPolicy::Strict))
+        .expect("the position was free of collection when registered");
+    let reached = passed_to.load(Ordering::Acquire);
+    assert!(
+        reached <= 100,
+        "collection reached {reached} while the registration of 100 was committing"
+    );
+    assert_eq!(reg.check_retention(&h).expect("covered"), 100);
+}
+
+/// A seqno-space registration below what the engine has already collected is
+/// refused, whatever the source says: the engine's watermark decides what MVCC
+/// history is held.
+#[test]
+fn registering_below_collected_history_is_refused() {
+    let (reg, _clock, _source, _pipeline, _dir) = hooked_registry();
+    reg.core
+        .engine
+        .set_retention_window(Duration::from_millis(1));
+    let collected = reg.core.engine.gc_watermark();
+    assert!(collected > 100, "the window let nothing be collected");
+    let refused = reg.register(registration("late", 100, ConsumerRetentionPolicy::Strict));
+    assert!(
+        matches!(
+            refused,
+            Err(RegistryError::RetentionLost { checkpoint: 100, floor }) if floor >= collected
+        ),
+        "got {refused:?}"
+    );
+    assert_eq!(
+        reg.shard_floor(),
+        u64::MAX,
+        "a refused registration holds nothing"
+    );
+}
+
+/// Floors published out of order would let a scan taken before a registration
+/// overwrite the floor that registration published: the floor rises past the
+/// registered position and collection may take what it holds. A floor is
+/// scanned and published as one step, so the later scan always wins.
+#[test]
+fn a_stale_floor_scan_never_overwrites_a_newer_registration() {
+    let (reg, _clock, _source, _pipeline, _dir) = hooked_registry();
+    let (scanned_tx, scanned_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    *reg.core.after_floor_scan.lock() = Some(Box::new(move || {
+        scanned_tx.send(()).expect("report the scan");
+        resume_rx.recv().expect("resume the publication");
+    }));
+    let stale = std::thread::spawn({
+        let reg = reg.clone();
+        move || reg.core.recompute_floor().expect("stale recompute")
+    });
+    scanned_rx.recv().expect("the stale scan ran");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let registering = std::thread::spawn({
+        let reg = reg.clone();
+        move || {
+            let h = reg.register(registration("new", 100, ConsumerRetentionPolicy::Strict));
+            done_tx.send(()).expect("report the registration");
+            h
+        }
+    });
+    // A registration that publishes its floor while the stale scan is held
+    // finishes first; one that waits for it does not.
+    let _finished_first = done_rx.recv_timeout(Duration::from_secs(2));
+    resume_tx.send(()).expect("resume");
+    stale.join().expect("stale thread");
+    registering
+        .join()
+        .expect("registering thread")
+        .expect("register");
+    assert_eq!(
+        reg.shard_floor(),
+        100,
+        "a scan taken before the registration published the floor last"
+    );
+    reg.core
+        .engine
+        .set_retention_window(Duration::from_millis(1));
+    assert_eq!(
+        reg.core.engine.gc_watermark(),
+        100,
+        "collection is held at the registered position"
+    );
 }
 
 /// With the background service, heartbeats buffer and flush in one
@@ -1226,6 +1366,7 @@ fn hooked_registry() -> (
         )
         .expect("open engine"),
     );
+    keep_all_history(&engine);
     let pipeline = Arc::new(HookPipeline {
         inner: coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
         hook: Mutex::new(None),

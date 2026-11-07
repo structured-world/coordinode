@@ -34,6 +34,7 @@ use std::time::Duration;
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_storage::engine::applied::AppliedStop;
+use coordinode_storage::engine::coordinator::SnapshotPin;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
@@ -134,6 +135,10 @@ struct RegistryCore {
     /// Cached `min(checkpoint)` over live **oplog-index-space** registrations;
     /// `u64::MAX` when none.
     oplog_index_floor: Arc<AtomicU64>,
+    /// Held across a floor scan and its publication: a scan taken before a
+    /// registration committed must not publish after the scan that sees it,
+    /// or the floor rises past what that registration holds.
+    floor_publication: Mutex<()>,
     /// Whether `dc` / `rack` scopes are accepted (EE multi-DC topologies).
     allow_topology_scopes: bool,
     /// `true` once a background service is running: `heartbeat` then buffers
@@ -151,6 +156,9 @@ struct RegistryCore {
     /// writer does in that window.
     #[cfg(test)]
     before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once between a floor scan and its publication.
+    #[cfg(test)]
+    after_floor_scan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl RegistryCore {
@@ -163,11 +171,23 @@ impl RegistryCore {
         }
     }
 
-    /// Where a new registration's checkpoint starts, refused when the source
-    /// no longer holds that position.
-    fn resolve_initial(&self, reg: &ConsumerRegistration) -> Result<u64, RegistryError> {
+    /// Where a new registration's checkpoint starts, refused when that
+    /// position is no longer held.
+    ///
+    /// MVCC history is held by the engine, which decides what it has
+    /// collected: the position is pinned there as it is checked, under the
+    /// lock that publishes the watermark, and the pin returned must outlive
+    /// the floor the registration then publishes. Checking first and
+    /// protecting later lets collection pass the position in between.
+    fn resolve_initial(
+        &self,
+        reg: &ConsumerRegistration,
+    ) -> Result<(u64, Option<SnapshotPin>), RegistryError> {
+        if reg.kind.is_seqno_space() {
+            return self.pin_initial(reg).map(|(at, pin)| (at, Some(pin)));
+        }
         let first = self.source.first_retained(reg.kind);
-        match reg.initial_seqno {
+        let at = match reg.initial_seqno {
             InitialSeqno::FromNow => Ok(self.source.head(reg.kind)),
             InitialSeqno::FromEarliestRetained => Ok(first),
             InitialSeqno::At(at) if at < first => Err(RegistryError::RetentionLost {
@@ -175,6 +195,43 @@ impl RegistryCore {
                 floor: first,
             }),
             InitialSeqno::At(at) => Ok(at),
+        }?;
+        Ok((at, None))
+    }
+
+    /// The MVCC starting position of `reg`, pinned in the engine.
+    fn pin_initial(&self, reg: &ConsumerRegistration) -> Result<(u64, SnapshotPin), RegistryError> {
+        let lost = |checkpoint| RegistryError::RetentionLost {
+            checkpoint,
+            floor: self.engine.gc_watermark(),
+        };
+        match reg.initial_seqno {
+            InitialSeqno::At(at) => self
+                .engine
+                .pin_snapshot_at(at)
+                .map(|pin| (at, pin))
+                .ok_or_else(|| lost(at)),
+            InitialSeqno::FromNow => {
+                let at = self.source.head(reg.kind);
+                self.engine
+                    .pin_snapshot_at(at)
+                    .map(|pin| (at, pin))
+                    .ok_or_else(|| lost(at))
+            }
+            InitialSeqno::FromEarliestRetained => {
+                // The watermark only moves forward: a pin refused at the value
+                // just read means it moved, and the next read is past it.
+                for _ in 0..TRANSITION_ATTEMPTS {
+                    let at = self.engine.gc_watermark();
+                    if let Some(pin) = self.engine.pin_snapshot_at(at) {
+                        return Ok((at, pin));
+                    }
+                }
+                Err(RegistryError::Replication(format!(
+                    "the collected history of {:?} kept moving under {TRANSITION_ATTEMPTS} attempts",
+                    reg.consumer_id
+                )))
+            }
         }
     }
 
@@ -411,6 +468,7 @@ impl RegistryCore {
     /// registrations, and publish the engine GC watermark. Returns the
     /// seqno-space floor.
     fn recompute_floor(&self) -> Result<u64, RegistryError> {
+        let _publishing = self.floor_publication.lock();
         let mut seqno_floor = u64::MAX;
         let mut oplog_floor = u64::MAX;
         let mut counts = [0u64; ConsumerKind::ALL.len()];
@@ -425,6 +483,13 @@ impl RegistryCore {
                 seqno_floor = seqno_floor.min(entry.checkpoint_seqno);
             } else {
                 oplog_floor = oplog_floor.min(entry.checkpoint_seqno);
+            }
+        }
+        #[cfg(test)]
+        {
+            let hook = self.after_floor_scan.lock().take();
+            if let Some(hook) = hook {
+                hook();
             }
         }
         self.floor.store(seqno_floor, Ordering::Release);
@@ -728,6 +793,7 @@ impl ShardConsumerRegistry {
             source,
             floor: Arc::new(AtomicU64::new(u64::MAX)),
             oplog_index_floor: Arc::new(AtomicU64::new(u64::MAX)),
+            floor_publication: Mutex::new(()),
             allow_topology_scopes: false,
             batching_on: AtomicBool::new(false),
             pending_hb: Mutex::new(HashMap::new()),
@@ -735,6 +801,8 @@ impl ShardConsumerRegistry {
             watches: Arc::new(Watches::default()),
             #[cfg(test)]
             before_commit: Mutex::new(None),
+            #[cfg(test)]
+            after_floor_scan: Mutex::new(None),
         });
         // Recover the floors and publish the engine watermark from any
         // registrations persisted in a prior life. A failure here leaves the
@@ -1023,7 +1091,10 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
         if !self.core.source.admits(reg.kind) {
             return Err(RegistryError::Backpressure);
         }
-        let checkpoint = self.core.resolve_initial(&reg)?;
+        // Dropped once the registration has published its floor (the
+        // transition does that before returning): until then the pin is what
+        // holds the history the new checkpoint needs.
+        let (checkpoint, _held) = self.core.resolve_initial(&reg)?;
         let now = self.core.clock.now_ms();
         let incarnation = self.core.transition(&reg.consumer_id, |current| {
             let incarnation = match current {
