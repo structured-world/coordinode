@@ -267,14 +267,24 @@ fn a_snapshot_installed_is_rebuilt_from_the_store() {
     fx.engine.reset_raft_coverage(6, &[]).unwrap();
 
     let indexed = fx.await_indexed(5);
-    worker.shutdown();
-    assert_eq!(indexed, 5, "the snapshot's nodes are indexed");
-    assert!(
+    // The rebuild inserts the nodes before it hands the index back as
+    // ready: stopping the worker as soon as the fifth is in can cancel it
+    // in between.
+    let ready = || {
         fx.registry
             .health_snapshot("Item", "embedding")
-            .is_some_and(|h| h.is_ready()),
-        "the rebuilt index is ready again"
-    );
+            .is_some_and(|h| h.is_ready())
+    };
+    for _ in 0..100 {
+        if ready() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let ready = ready();
+    worker.shutdown();
+    assert_eq!(indexed, 5, "the snapshot's nodes are indexed");
+    assert!(ready, "the rebuilt index is ready again");
 }
 
 /// Entries keep applying for the whole length of an index build and after

@@ -3231,6 +3231,13 @@ fn concurrent_removals_reinserts_and_searches_stay_consistent() {
                             assert!(index.remove(i), "id {i} round {round}");
                             index.insert_shared(i, &scattered_vector(i + round * IDS, 8));
                         }
+                        // The epoch's collection is lazy and on a host
+                        // starved of CPU may not have run in the whole
+                        // loop, leaving every slot unreused and nothing
+                        // below proven: it is driven here, while the
+                        // searches still run, so the next rounds reuse
+                        // slots under them.
+                        drain_epoch();
                     }
                 })
             })
