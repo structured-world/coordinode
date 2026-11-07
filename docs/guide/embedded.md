@@ -327,10 +327,14 @@ registration with its policy, state, position, how long its oldest
 unacknowledged work has waited, the bytes it needs and whether it is the one
 holding the history back. `consumer_retention` sums it up per space (journal,
 MVCC): the lowest position, the bytes kept from it counted once however many
-consumers share them, which registrations hold it, and whether a new
-registration is admitted now (it is refused as `Backpressure` while the store
-is under write pressure). Releasing one consumer can free nothing when
-another, a live reader or recovery still needs the same history.
+consumers share them, which registrations hold it, and why a new
+registration would be refused now. A registration is new history to keep, so
+it is refused as `Backpressure` with its reason while compaction is behind
+(`WritePressure`), the volume is below its free-space reserve (`FreeSpace`),
+or an endpoint's hard limit has no room left for client writes, only the
+reserve recovery needs (`Footprint`); retry once it eases. Releasing one
+consumer can free nothing when another, a live reader or recovery still needs
+the same history.
 
 The registry runs on a thread of the database and stops when it is dropped;
 no async runtime is needed. A database kept in memory, and a member of a

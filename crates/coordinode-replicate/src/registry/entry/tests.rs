@@ -25,8 +25,8 @@ impl RetentionSource for Fixed {
     fn retained_bytes_from(&self, _: ConsumerKind, _: u64) -> Option<u64> {
         self.bytes
     }
-    fn admits(&self, _: ConsumerKind) -> bool {
-        true
+    fn admits(&self, _: ConsumerKind) -> Result<(), crate::registry::RetentionPressure> {
+        Ok(())
     }
 }
 

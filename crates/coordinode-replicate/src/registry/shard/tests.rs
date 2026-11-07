@@ -1,5 +1,5 @@
 use super::*;
-use crate::registry::types::{ConsumerKind, ValidatedRetentionBounds};
+use crate::registry::types::{ConsumerKind, RetentionPressure, ValidatedRetentionBounds};
 use coordinode_core::txn::proposal::RaftProposal;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proposal::RaftProposalPipeline;
@@ -75,8 +75,12 @@ impl RetentionSource for FakeSource {
     fn retained_bytes_from(&self, _: ConsumerKind, _: u64) -> Option<u64> {
         Some(self.bytes.load(Ordering::Acquire))
     }
-    fn admits(&self, _: ConsumerKind) -> bool {
-        !self.pressured.load(Ordering::Acquire)
+    fn admits(&self, _: ConsumerKind) -> Result<(), RetentionPressure> {
+        if self.pressured.load(Ordering::Acquire) {
+            Err(RetentionPressure::WritePressure)
+        } else {
+            Ok(())
+        }
     }
     fn release_log_below(&self, position: u64) {
         self.released.store(position, Ordering::Release);
@@ -803,7 +807,7 @@ fn the_summary_counts_shared_history_once_and_names_who_holds_it() {
         "shared history is counted once, not once per registration"
     );
     assert_eq!(log_view.held_by, vec!["slow".to_string()]);
-    assert!(log_view.admits_new);
+    assert_eq!(log_view.refused, None);
     assert_eq!(
         space(RetentionSpace::Mvcc).held_by,
         vec!["state".to_string()]
@@ -838,7 +842,7 @@ fn the_summary_counts_shared_history_once_and_names_who_holds_it() {
         reg.retention_summary()
             .expect("summary")
             .iter()
-            .all(|v| !v.admits_new),
+            .all(|v| v.refused == Some(RetentionPressure::WritePressure)),
         "write pressure is reported as the reason new retention is refused"
     );
 }
@@ -1722,7 +1726,12 @@ fn a_registration_under_pressure_is_refused_and_admitted_ones_continue() {
     source.set_pressured(true);
     let refused = reg.register(registration("late", 10, ConsumerRetentionPolicy::Strict));
     assert!(
-        matches!(refused, Err(RegistryError::Backpressure)),
+        matches!(
+            refused,
+            Err(RegistryError::Backpressure(
+                RetentionPressure::WritePressure
+            ))
+        ),
         "got {refused:?}"
     );
     assert!(

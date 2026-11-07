@@ -298,6 +298,29 @@ pub struct ConsumerSnapshot {
     pub holds_floor: bool,
 }
 
+/// Why a store takes on no new retention now: a new registration is refused
+/// for it, retryably, and the space's summary reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum RetentionPressure {
+    /// Compaction is behind on reclaiming what the store already holds.
+    #[error("compaction is behind on reclaiming what the store holds")]
+    WritePressure,
+    /// The volume is below its free-space reserve.
+    #[error("the volume is below its free-space reserve")]
+    FreeSpace,
+    /// An endpoint's hard limit has no room left for client writes: what is
+    /// left is the reserve recovery work needs, which new retention would
+    /// eat into.
+    #[error("endpoint {endpoint_id:?} has no room left under its hard limit")]
+    Footprint {
+        /// The endpoint without room.
+        endpoint_id: String,
+    },
+    /// The store could not tell; the message says why.
+    #[error("the store's room could not be read: {0}")]
+    Unknown(String),
+}
+
 /// The two position spaces history is kept in, each with its own floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetentionSpace {
@@ -343,10 +366,9 @@ pub struct RetentionSummary {
     /// The registrations at the floor: the ones whose progress or
     /// cancellation would let it rise.
     pub held_by: Vec<String>,
-    /// Whether a new registration in this space is admitted now; `false`
-    /// while the store is under write pressure, the reason a registration is
-    /// refused with `Backpressure`.
-    pub admits_new: bool,
+    /// Why a new registration in this space is refused now (as
+    /// `Backpressure`), or `None` when one is admitted.
+    pub refused: Option<RetentionPressure>,
 }
 
 /// Errors from the [`SeqnoConsumerRegistry`](super::SeqnoConsumerRegistry).
@@ -424,11 +446,11 @@ pub enum RegistryError {
     #[error("retention lost: checkpoint {checkpoint} is below shard floor {floor}")]
     RetentionLost { checkpoint: u64, floor: u64 },
 
-    /// The shard is under write pressure: a new registration would add
-    /// retention to storage that is already behind on reclaiming it. Nothing
-    /// was registered; retry once the pressure eases.
-    #[error("the shard is under write pressure; registration not admitted")]
-    Backpressure,
+    /// The store takes on no new retention now, for the reason given: a new
+    /// registration would keep history the store has no room to keep beside
+    /// what it already owes. Nothing was registered; retry once it eases.
+    #[error("registration not admitted: {0}")]
+    Backpressure(RetentionPressure),
 
     /// This member cannot decide the transition: it is not the leader of the
     /// shard's ordering group. Nothing changed; the leader can.

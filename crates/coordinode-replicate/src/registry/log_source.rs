@@ -10,8 +10,10 @@ use coordinode_storage::oplog::OplogTimeline;
 use coordinode_storage::oplog::RetainedFloor;
 use coordinode_storage::oplog::tailer::bytes_needed_from;
 
+use coordinode_storage::error::StorageError;
+
 use super::source::RetentionSource;
-use super::types::ConsumerKind;
+use super::types::{ConsumerKind, RetentionPressure};
 
 /// The history a store holds for its consumers: a log (a group's consensus
 /// log, or the store's own journal) for log consumers, the MVCC store for the
@@ -161,10 +163,24 @@ impl RetentionSource for LogRetentionSource {
         }
     }
 
-    fn admits(&self, _kind: ConsumerKind) -> bool {
+    fn admits(&self, _kind: ConsumerKind) -> Result<(), RetentionPressure> {
         // The log and the MVCC store share the engine's endpoints, so one
-        // verdict covers both: Stop means compaction is behind on reclaiming.
-        !matches!(self.engine.write_pressure(), WritePressure::Stop)
+        // verdict covers both. A consumer's history is kept through
+        // reclamation, so new retention is taken on only while compaction
+        // keeps up, the volume is above its free-space reserve, and every
+        // capped endpoint has room for client writes: what is left past that
+        // is the reserve recovery work needs.
+        if matches!(self.engine.write_pressure(), WritePressure::Stop) {
+            return Err(RetentionPressure::WritePressure);
+        }
+        match self.engine.space().admit() {
+            Ok(()) => Ok(()),
+            Err(StorageError::OutOfSpace { .. }) => Err(RetentionPressure::FreeSpace),
+            Err(StorageError::CapacityExhausted { endpoint_id, .. }) => {
+                Err(RetentionPressure::Footprint { endpoint_id })
+            }
+            Err(other) => Err(RetentionPressure::Unknown(other.to_string())),
+        }
     }
 
     fn hold_log_from(&self, position: u64) -> Result<Option<JournalHold>, u64> {

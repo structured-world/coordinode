@@ -325,6 +325,70 @@ fn a_cancelled_consumer_does_not_release_what_recovery_needs() {
     );
 }
 
+/// A store whose hard limit has no room left for client writes (only the
+/// reserve recovery needs) takes on no new retention: the registration is
+/// refused as backpressure naming the endpoint, the summary reports why, and
+/// once the room is back the same registration is admitted.
+#[test]
+fn a_registration_is_refused_where_the_limit_has_no_room() {
+    use coordinode_replicate::{RetentionPressure, RetentionSpace};
+
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+
+    const LIMIT: u64 = 64 << 20;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open_with_config(StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(LIMIT),
+    ]))
+    .expect("open with a limit");
+    // All but a page of the limit is the recovery reserve.
+    db.set_hard_limit("default", LIMIT, Some(LIMIT - 4096))
+        .expect("limit");
+    let refused = db.register_consumer(log_consumer(
+        "squeezed",
+        InitialSeqno::FromNow,
+        ConsumerRetentionPolicy::Strict,
+    ));
+    assert!(
+        matches!(
+            &refused,
+            Err(DatabaseError::Consumer(RegistryError::Backpressure(
+                RetentionPressure::Footprint { endpoint_id }
+            ))) if endpoint_id == "default"
+        ),
+        "got {refused:?}"
+    );
+    let journal = db
+        .consumer_retention()
+        .expect("retention")
+        .into_iter()
+        .find(|v| v.space == RetentionSpace::Log)
+        .expect("journal view");
+    assert!(matches!(
+        journal.refused,
+        Some(RetentionPressure::Footprint { .. })
+    ));
+    assert!(db.consumers_list().expect("list").is_empty());
+
+    db.set_hard_limit("default", LIMIT, None)
+        .expect("room back");
+    db.register_consumer(log_consumer(
+        "squeezed",
+        InitialSeqno::FromNow,
+        ConsumerRetentionPolicy::Strict,
+    ))
+    .expect("admitted once there is room");
+}
+
 /// The database reports, per space, the lowest live position and the
 /// registration holding it.
 #[test]
@@ -350,7 +414,7 @@ fn the_database_reports_who_holds_its_history() {
     assert_eq!(journal.floor, Some(from));
     assert_eq!(journal.held_by, vec!["holder".to_string()]);
     assert!(journal.retained_bytes.is_some_and(|b| b > 0));
-    assert!(journal.admits_new);
+    assert_eq!(journal.refused, None);
     let mvcc = summary
         .iter()
         .find(|v| v.space == RetentionSpace::Mvcc)

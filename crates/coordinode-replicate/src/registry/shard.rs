@@ -1203,12 +1203,13 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                 reg.kind
             )));
         }
-        // A registration is new retention; it is admitted only while storage
-        // keeps up with reclaiming what it holds. Transitions that release or
-        // record retention are never held back.
-        if !self.core.source.admits(reg.kind) {
-            return Err(RegistryError::Backpressure);
-        }
+        // A registration is new retention; it is admitted only while the
+        // store has room to keep it beside what it already owes. Transitions
+        // that release or record retention are never held back.
+        self.core
+            .source
+            .admits(reg.kind)
+            .map_err(RegistryError::Backpressure)?;
         // Dropped once the registration has published its floor (the
         // transition does that before returning): until then the pin is what
         // holds the history the new checkpoint needs.
@@ -1445,7 +1446,7 @@ impl ShardConsumerRegistry {
                     .filter(|e| RetentionSpace::of(e.kind) == space && floors.held_by(e))
                     .map(|e| e.consumer_id.clone())
                     .collect(),
-                admits_new: source.admits(kind),
+                refused: source.admits(kind).err(),
             }
         })
         .collect();

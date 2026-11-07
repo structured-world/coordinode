@@ -7,7 +7,7 @@
 
 use coordinode_storage::engine::oplog_journal::JournalHold;
 
-use super::types::ConsumerKind;
+use super::types::{ConsumerKind, RetentionPressure};
 
 /// The source behind one consumer position space on a shard.
 #[diagnostic::on_unimplemented(
@@ -39,9 +39,13 @@ pub trait RetentionSource: Send + Sync {
     fn retained_bytes_from(&self, kind: ConsumerKind, position: u64) -> Option<u64>;
 
     /// Whether the source can take on retention for a new `kind` consumer
-    /// now. `false` while its storage is behind on reclaiming what it already
-    /// holds: the registration is refused as retryable backpressure.
-    fn admits(&self, kind: ConsumerKind) -> bool;
+    /// now, or why not: the registration is then refused as retryable
+    /// backpressure with that reason.
+    ///
+    /// # Errors
+    ///
+    /// The pressure that keeps it from taking on more.
+    fn admits(&self, kind: ConsumerKind) -> Result<(), RetentionPressure>;
 
     /// The lowest checkpoint among live consumers in the log position space
     /// is now `position` (`u64::MAX` with none): nothing below it will be

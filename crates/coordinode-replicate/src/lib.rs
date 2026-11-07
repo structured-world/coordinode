@@ -39,9 +39,9 @@ pub mod transfer;
 pub use registry::{
     BackgroundConfig, Clock, ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy,
     ConsumerSnapshot, InitialSeqno, LogRetentionSource, RegisteredHandle, RegistrationState,
-    RegistrationWatch, RegistryBackground, RegistryError, RetentionSource, RetentionSpace,
-    RetentionSummary, SeqnoConsumerRegistry, ShardConsumerRegistry, SystemClock, TerminalReason,
-    TopologyScope, ValidatedRetentionBounds,
+    RegistrationWatch, RegistryBackground, RegistryError, RetentionPressure, RetentionSource,
+    RetentionSpace, RetentionSummary, SeqnoConsumerRegistry, ShardConsumerRegistry, SystemClock,
+    TerminalReason, TopologyScope, ValidatedRetentionBounds,
 };
 #[cfg(feature = "transfer")]
 pub use segment_store::{RepairError, SegmentInstaller};

@@ -961,19 +961,44 @@ async fn a_parked_stream_learns_of_its_end_without_waiting_for_a_heartbeat() {
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
 }
 
-/// A registration refused under write pressure reaches the client as
-/// retryable RESOURCE_EXHAUSTED with WRITE_BACKPRESSURE and a retry delay,
-/// the same answer a write gets in that state.
+/// A registration refused under pressure reaches the client as retryable
+/// RESOURCE_EXHAUSTED with WRITE_BACKPRESSURE and a retry delay, the same
+/// answer a write gets in that state, naming the pressure (and the endpoint
+/// whose limit has no room).
 #[test]
 fn a_registration_refused_under_pressure_is_retryable_backpressure() {
-    let status = super::registry_status(coordinode_replicate::RegistryError::Backpressure);
+    use coordinode_replicate::{RegistryError, RetentionPressure};
+
+    let status = super::registry_status(RegistryError::Backpressure(
+        RetentionPressure::WritePressure,
+    ));
     assert_eq!(status.code(), Code::ResourceExhausted);
     let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo");
+    assert_eq!(info.reason, "WRITE_BACKPRESSURE");
     assert_eq!(
-        details.error_info().expect("ErrorInfo").reason,
-        "WRITE_BACKPRESSURE"
+        info.metadata.get("pressure").map(String::as_str),
+        Some("writePressure")
     );
     assert!(details.retry_info().is_some(), "a retry delay is advised");
+
+    let status =
+        super::registry_status(RegistryError::Backpressure(RetentionPressure::Footprint {
+            endpoint_id: "hot".into(),
+        }));
+    let info = status
+        .get_error_details()
+        .error_info()
+        .cloned()
+        .expect("ErrorInfo");
+    assert_eq!(
+        info.metadata.get("pressure").map(String::as_str),
+        Some("footprint")
+    );
+    assert_eq!(
+        info.metadata.get("endpointId").map(String::as_str),
+        Some("hot")
+    );
 }
 
 /// The service the server builds for a Raft node streams what the node

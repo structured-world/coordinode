@@ -31,8 +31,8 @@ use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::storage::raft_oplog_dirs;
 use coordinode_replicate::{
     ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, InitialSeqno, RegisteredHandle,
-    RegistrationWatch, RegistryError, SeqnoConsumerRegistry, ShardConsumerRegistry, TopologyScope,
-    ValidatedRetentionBounds,
+    RegistrationWatch, RegistryError, RetentionPressure, SeqnoConsumerRegistry,
+    ShardConsumerRegistry, TopologyScope, ValidatedRetentionBounds,
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::error::StorageError;
@@ -274,12 +274,24 @@ fn registry_status(e: RegistryError) -> Status {
                 ("first_retained_index", floor.to_string()),
             ],
         ),
-        RegistryError::Backpressure => status_with_reason(
-            Code::ResourceExhausted,
-            message,
-            Reason::WriteBackpressure,
-            None,
-        ),
+        RegistryError::Backpressure(pressure) => {
+            let cause = match &pressure {
+                RetentionPressure::WritePressure => "writePressure",
+                RetentionPressure::FreeSpace => "freeSpace",
+                RetentionPressure::Footprint { .. } => "footprint",
+                RetentionPressure::Unknown(_) => "unknown",
+            };
+            let mut metadata = vec![("pressure", cause.to_string())];
+            if let RetentionPressure::Footprint { endpoint_id } = pressure {
+                metadata.push(("endpointId", endpoint_id));
+            }
+            status_with_reason(
+                Code::ResourceExhausted,
+                message,
+                Reason::WriteBackpressure,
+                metadata,
+            )
+        }
         RegistryError::NotLeader { leader_id } => status_with_reason(
             Code::Unavailable,
             message,
