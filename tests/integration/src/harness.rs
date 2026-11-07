@@ -46,6 +46,9 @@ pub struct CoordinodeProcess {
     member_settings: String,
     /// Environment variables set on the process.
     env: Vec<(String, String)>,
+    /// The command line this process was started with, so a start that is not
+    /// ready in time can be run again the same way to diagnose it.
+    launch: Launch,
 }
 
 impl CoordinodeProcess {
@@ -85,7 +88,7 @@ impl CoordinodeProcess {
         let path = config.as_ref().map(|f| f.path().to_path_buf());
         let mut proc = Self::spawn_on_free_port(data_dir, |port, ops_port, rest_port, data| {
             (
-                spawn_binary(port, ops_port, rest_port, data, path.as_deref()),
+                standalone_launch(port, ops_port, rest_port, data, path.as_deref()),
                 None,
             )
         })
@@ -103,15 +106,16 @@ impl CoordinodeProcess {
     /// instead of a timeout or a test that talks to someone else's server.
     async fn spawn_on_free_port(
         data_dir: tempfile::TempDir,
-        spawn: impl Fn(u16, u16, u16, PathBuf) -> (Child, Option<tempfile::TempDir>),
+        launch: impl Fn(u16, u16, u16, PathBuf) -> (Launch, Option<tempfile::TempDir>),
     ) -> Self {
         const ATTEMPTS: u32 = 5;
         let mut last_exit = None;
         for _ in 0..ATTEMPTS {
             let (port, ops_port, rest_port) = (free_port(), free_port(), free_port());
-            let (child, identity) = spawn(port, ops_port, rest_port, data_dir.path().to_path_buf());
+            let (launch, identity) =
+                launch(port, ops_port, rest_port, data_dir.path().to_path_buf());
             let mut proc = Self {
-                child,
+                child: launch.spawn(),
                 port,
                 ops_port,
                 rest_port,
@@ -121,8 +125,9 @@ impl CoordinodeProcess {
                 deployment: None,
                 member_settings: String::new(),
                 env: Vec::new(),
+                launch,
             };
-            match proc.wait_until_ready(Duration::from_secs(15)).await {
+            match proc.ready_or_diagnose(Duration::from_secs(15)).await {
                 Ok(()) => {
                     proc.data_dir = Some(data_dir);
                     return proc;
@@ -232,7 +237,7 @@ impl CoordinodeProcess {
         } else {
             None
         };
-        let (child, identity) = spawn_cluster_binary(
+        let (launch, identity) = member_launch(
             Member {
                 node_id,
                 port,
@@ -247,7 +252,7 @@ impl CoordinodeProcess {
             &env,
         );
         let mut proc = Self {
-            child,
+            child: launch.spawn(),
             port,
             ops_port,
             rest_port,
@@ -257,10 +262,11 @@ impl CoordinodeProcess {
             deployment,
             member_settings: settings.to_owned(),
             env,
+            launch,
         };
         // The port is fixed by the caller (peers already name it), so a
         // process that lost it cannot move to another one.
-        if let Err(status) = proc.wait_until_ready(Duration::from_secs(15)).await {
+        if let Err(status) = proc.ready_or_diagnose(Duration::from_secs(15)).await {
             panic!("cluster member {node_id} exited during startup on port {port}: {status}");
         }
         proc
@@ -301,7 +307,7 @@ impl CoordinodeProcess {
         let mut last = None;
         for _ in 0..20 {
             let (ops_port, rest_port) = (free_port(), free_port());
-            let (child, identity) = spawn_cluster_binary(
+            let (launch, identity) = member_launch(
                 Member {
                     node_id,
                     port,
@@ -316,7 +322,7 @@ impl CoordinodeProcess {
                 &env,
             );
             let mut proc = Self {
-                child,
+                child: launch.spawn(),
                 port,
                 ops_port,
                 rest_port,
@@ -326,8 +332,9 @@ impl CoordinodeProcess {
                 deployment: deployment.clone(),
                 member_settings: settings.clone(),
                 env: env.clone(),
+                launch,
             };
-            match proc.wait_until_ready(Duration::from_secs(30)).await {
+            match proc.ready_or_diagnose(Duration::from_secs(30)).await {
                 Ok(()) => {
                     proc.data_dir = Some(data_dir);
                     return proc;
@@ -483,7 +490,7 @@ impl CoordinodeProcess {
         };
         let settings = std::mem::take(&mut self.member_settings);
         let mut proc = Self::spawn_on_free_port(data_dir, |port, ops_port, rest_port, data| {
-            let (child, identity) = spawn_cluster_binary(
+            let (launch, identity) = member_launch(
                 Member {
                     node_id,
                     port,
@@ -497,7 +504,7 @@ impl CoordinodeProcess {
                 data,
                 &env,
             );
-            (child, Some(identity))
+            (launch, Some(identity))
         })
         .await;
         proc.env = env;
@@ -704,25 +711,104 @@ impl CoordinodeProcess {
     /// starting. `/ready` turns 200 once it serves: storage, consensus and
     /// the query engine are open. A server that lost a port to another holder
     /// exits at its bind, which the exit check catches first.
-    async fn wait_until_ready(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<(), std::process::ExitStatus> {
-        let deadline = Instant::now() + timeout;
+    async fn wait_until_ready(&mut self, timeout: Duration) -> Result<(), StartFailure> {
+        let started = Instant::now();
+        let deadline = started + timeout;
         loop {
             if let Ok(Some(status)) = self.child.try_wait() {
-                return Err(status);
+                return Err(StartFailure::Exited(status));
             }
-            if answers_ready(self.ops_port) {
+            let probe = probe_ready(self.ops_port);
+            if probe == ReadyProbe::Status(200) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                panic!(
-                    "coordinode on port {} was not ready within {:?}",
-                    self.port, timeout
-                );
+                return Err(StartFailure::NotReady(NotReady {
+                    pid: self.child.id(),
+                    waited: started.elapsed(),
+                    last: probe,
+                }));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// [`wait_until_ready`](Self::wait_until_ready), with a start that is not
+    /// ready in time diagnosed (see [`diagnose`](Self::diagnose)) and the test
+    /// failed with both attempts reported; the exit status of a process that
+    /// ended during startup.
+    async fn ready_or_diagnose(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), std::process::ExitStatus> {
+        match self.wait_until_ready(timeout).await {
+            Ok(()) => Ok(()),
+            Err(StartFailure::Exited(status)) => Err(status),
+            Err(StartFailure::NotReady(first)) => {
+                let report = self.diagnose(first, DIAGNOSTIC_START_TIMEOUT).await;
+                panic!("{report}");
+            }
+        }
+    }
+
+    /// After `first`, a start of this process that was not ready in time:
+    /// stop it, run the same command line once more on the same ports and
+    /// data directory with the start's phases traced, wait up to `within`,
+    /// and stop that one too. The first attempt stands whatever the second
+    /// does: the report keeps both.
+    async fn diagnose(&mut self, first: NotReady, within: Duration) -> StartReport {
+        // Only this process: its ports and files are what the second start
+        // needs, and nothing else is touched.
+        force_reap(&mut self.child);
+        eprintln!(
+            "--- coordinode on port {} (pid {}) was not ready within {:?}; its output is above. \
+             A diagnostic start of the same command follows. ---",
+            self.port, first.pid, first.waited
+        );
+        let trace = tempfile::NamedTempFile::new().expect("diagnostic trace file");
+        let sink = || {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(trace.path())
+                .expect("open the diagnostic trace file")
+        };
+        let filter = format!(
+            "{},{STARTUP_TRACE}",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into())
+        );
+        let mut launch = self.launch.clone();
+        launch.set_env("RUST_LOG", &filter);
+        self.child = launch
+            .command()
+            .stdout(sink())
+            .stderr(sink())
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn the diagnostic start: {e}"));
+        let started = Instant::now();
+        let outcome = match self.wait_until_ready(within).await {
+            Ok(()) => DiagnosticOutcome::Ready(started.elapsed()),
+            Err(StartFailure::Exited(status)) => {
+                DiagnosticOutcome::Exited(status, started.elapsed())
+            }
+            Err(StartFailure::NotReady(again)) => DiagnosticOutcome::NotReady(again),
+        };
+        // Stopped gracefully when it can be: the server's log is written
+        // through a queue that a kill would cut short.
+        send_sigterm(&self.child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !has_exited(&mut self.child) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        force_reap(&mut self.child);
+        let output = std::fs::read_to_string(trace.path())
+            .unwrap_or_else(|e| format!("[the diagnostic trace could not be read: {e}]"));
+        StartReport {
+            port: self.port,
+            first,
+            filter,
+            within,
+            outcome,
+            output,
         }
     }
 
@@ -1078,14 +1164,127 @@ pub fn binary_path() -> PathBuf {
     );
 }
 
-/// Whether the ops endpoint on `[::1]:port` answers `GET /ready` with 200.
-fn answers_ready(port: u16) -> bool {
+/// How long the one diagnostic start of a process that was not ready in time
+/// may take: long enough to see where a slow start spends its time.
+const DIAGNOSTIC_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The log filter a diagnostic start adds: the server's start phases.
+const STARTUP_TRACE: &str = "coordinode::startup=debug";
+
+/// Why a start did not become ready.
+enum StartFailure {
+    /// The process ended during startup.
+    Exited(std::process::ExitStatus),
+    /// The process kept running and was not ready in time.
+    NotReady(NotReady),
+}
+
+/// A start that was not ready in time.
+#[derive(Debug, Clone, Copy)]
+struct NotReady {
+    pid: u32,
+    waited: Duration,
+    /// The last answer `/ready` gave before the wait ended.
+    last: ReadyProbe,
+}
+
+/// What `GET /ready` on the ops port got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadyProbe {
+    /// No connection: the ports were not bound yet.
+    Refused,
+    /// Connected, no answer: the ports are bound (they are bound before the
+    /// store opens) and the ops server is not serving yet, so the start is
+    /// still opening the store, consensus or the database.
+    NoAnswer,
+    /// The ops server answered with this status: 503 while the services are
+    /// still being set up, 200 once the node serves.
+    Status(u16),
+}
+
+impl std::fmt::Display for ReadyProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused => f.write_str("connection refused: the ports were not bound yet"),
+            Self::NoAnswer => f.write_str(
+                "no answer: the ports were bound and the ops server was not serving yet \
+                 (opening the store, consensus or the database)",
+            ),
+            Self::Status(503) => {
+                f.write_str("503: store and consensus open, services not serving yet")
+            }
+            Self::Status(code) => write!(f, "status {code}"),
+        }
+    }
+}
+
+/// How the diagnostic start ended.
+enum DiagnosticOutcome {
+    Ready(Duration),
+    Exited(std::process::ExitStatus, Duration),
+    NotReady(NotReady),
+}
+
+/// A start that was not ready in time and the diagnostic start that followed.
+struct StartReport {
+    port: u16,
+    first: NotReady,
+    /// The log filter the diagnostic start ran with.
+    filter: String,
+    within: Duration,
+    outcome: DiagnosticOutcome,
+    /// What the diagnostic start printed.
+    output: String,
+}
+
+impl std::fmt::Display for StartReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            port,
+            first,
+            filter,
+            within,
+            outcome,
+            output,
+        } = self;
+        writeln!(
+            f,
+            "coordinode on port {port} was not ready within {:?} (pid {}); last /ready: {}.",
+            first.waited, first.pid, first.last
+        )?;
+        write!(
+            f,
+            "Diagnostic start (the same command, ports and data directory, RUST_LOG={filter}, \
+             limit {within:?}): "
+        )?;
+        match outcome {
+            DiagnosticOutcome::Ready(after) => writeln!(f, "ready after {after:?}.")?,
+            DiagnosticOutcome::Exited(status, after) => {
+                writeln!(f, "exited with {status} after {after:?}.")?;
+            }
+            DiagnosticOutcome::NotReady(again) => writeln!(
+                f,
+                "not ready within {:?} either (pid {}); last /ready: {}.",
+                again.waited, again.pid, again.last
+            )?,
+        }
+        writeln!(
+            f,
+            "The first attempt's output is in this test's output above; \
+             the diagnostic start printed:"
+        )?;
+        f.write_str(output)
+    }
+}
+
+/// What the ops endpoint on `[::1]:port` answers `GET /ready`.
+fn probe_ready(port: u16) -> ReadyProbe {
     use std::io::{Read, Write};
 
     let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
     let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
     else {
-        return false;
+        return ReadyProbe::Refused;
     };
     if stream
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -1094,58 +1293,100 @@ fn answers_ready(port: u16) -> bool {
             .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .is_err()
     {
-        return false;
+        return ReadyProbe::NoAnswer;
     }
+    // "HTTP/1.1 200": the code is the status line's last three bytes.
     let mut status_line = [0u8; 12];
-    stream.read_exact(&mut status_line).is_ok() && status_line.ends_with(b" 200")
+    if stream.read_exact(&mut status_line).is_err() {
+        return ReadyProbe::NoAnswer;
+    }
+    std::str::from_utf8(&status_line[9..])
+        .ok()
+        .and_then(|code| code.parse().ok())
+        .map_or(ReadyProbe::NoAnswer, ReadyProbe::Status)
 }
 
-/// Spawn `coordinode serve [--config FILE] --addr [::1]:PORT --ops-addr
+/// A `coordinode` command line: program, arguments and the variables set on
+/// it, kept so the same start can be run again.
+#[derive(Clone)]
+struct Launch {
+    program: PathBuf,
+    args: Vec<std::ffi::OsString>,
+    env: Vec<(String, String)>,
+}
+
+impl Launch {
+    /// `coordinode` with `args`, logging at `RUST_LOG` (errors only unless
+    /// the test run sets it).
+    fn new(args: Vec<std::ffi::OsString>) -> Self {
+        Self {
+            program: binary_path(),
+            args,
+            env: vec![(
+                "RUST_LOG".to_string(),
+                std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into()),
+            )],
+        }
+    }
+
+    /// Set `key` to `value`, replacing an earlier value.
+    fn set_env(&mut self, key: &str, value: &str) {
+        self.env.retain(|(k, _)| k != key);
+        self.env.push((key.to_string(), value.to_string()));
+    }
+
+    /// The command, in a process group of its own.
+    ///
+    /// The group keeps a Ctrl-C / SIGINT delivered to the test runner's group
+    /// from reaching the server mid-flush; the harness owns the child's
+    /// lifetime by PID. It does NOT hide the child from nextest's leak
+    /// detection, which follows the inherited stdout/stderr pipes: only
+    /// reaping the child before the test exits prevents a LEAKY verdict,
+    /// which the Drop impl guarantees.
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args)
+            .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        own_process_group(&mut cmd);
+        cmd
+    }
+
+    /// Start it, its output going to the test's.
+    fn spawn(&self) -> Child {
+        self.command()
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", self.program.display()))
+    }
+}
+
+/// `coordinode serve [--config FILE] --addr [::1]:PORT --ops-addr
 /// [::1]:OPS_PORT --rest-addr [::1]:REST_PORT --data DATA_DIR`.
 ///
 /// Every port is chosen by the harness, so a test can ask `/ready` and reach
 /// the REST surface; concurrent test servers would otherwise fight over the
 /// defaults (:7084, :7081), and a taken port fails the start.
-fn spawn_binary(
+fn standalone_launch(
     port: u16,
     ops_port: u16,
     rest_port: u16,
     data_dir: PathBuf,
     config: Option<&std::path::Path>,
-) -> Child {
-    let bin = binary_path();
-    let mut cmd = Command::new(&bin);
-    cmd.arg("serve");
+) -> Launch {
+    let mut args: Vec<std::ffi::OsString> = vec!["serve".into()];
     if let Some(config) = config {
-        cmd.arg("--config").arg(config);
+        args.extend(["--config".into(), config.into()]);
     }
-    cmd.arg("--addr")
-        .arg(format!("[::1]:{port}"))
-        .arg("--ops-addr")
-        .arg(format!("[::1]:{ops_port}"))
-        .arg("--rest-addr")
-        .arg(format!("[::1]:{rest_port}"))
-        .arg("--data")
-        .arg(&data_dir)
-        // Suppress server logs from test output; set RUST_LOG=debug for debugging.
-        .env(
-            "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into()),
-        );
-
-    // Place the child in its own process group (Unix only), so a Ctrl-C /
-    // SIGINT delivered to the test runner's group is not fanned out to the
-    // server mid-flush; the harness owns the child's lifetime through
-    // `terminate_and_reap` (kill by PID, group-independent).
-    //
-    // Note this does NOT hide the child from nextest's leak detection, which
-    // is based on the inherited stdout/stderr pipes, not on process groups:
-    // the only thing that prevents a LEAKY verdict is actually reaping the
-    // child before the test exits, which the Drop impl guarantees.
-    own_process_group(&mut cmd);
-
-    cmd.spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e))
+    args.extend([
+        "--addr".into(),
+        format!("[::1]:{port}").into(),
+        "--ops-addr".into(),
+        format!("[::1]:{ops_port}").into(),
+        "--rest-addr".into(),
+        format!("[::1]:{rest_port}").into(),
+        "--data".into(),
+        data_dir.into(),
+    ]);
+    Launch::new(args)
 }
 
 /// A member's address in the form the operator guide gives for
@@ -1261,49 +1502,42 @@ fn write_member_identity(member: &Member<'_>) -> tempfile::TempDir {
     dir
 }
 
-/// Spawn `member` with explicit `--node-id`, `--advertise-addr`, and
-/// `--peers`, and its identity written for it. See
+/// `member` with explicit `--node-id`, `--advertise-addr`, and `--peers`,
+/// `env` set, and its identity written for it. See
 /// [`CoordinodeProcess::start_cluster_member`].
-fn spawn_cluster_binary(
+fn member_launch(
     member: Member<'_>,
     ops_port: u16,
     rest_port: u16,
     data_dir: PathBuf,
     env: &[(String, String)],
-) -> (Child, tempfile::TempDir) {
+) -> (Launch, tempfile::TempDir) {
     let (node_id, port) = (member.node_id, member.port);
     let peers: Vec<String> = member.peer_ports.iter().map(|&p| member_addr(p)).collect();
     let identity = write_member_identity(&member);
-    let bin = binary_path();
-    let mut cmd = Command::new(&bin);
-    cmd.arg("serve")
-        .arg("--config")
-        .arg(identity.path().join(MEMBER_CONFIG))
-        .arg("--node-id")
-        .arg(node_id.to_string())
-        .arg("--addr")
-        .arg(format!("[::1]:{port}"))
-        .arg("--advertise-addr")
-        .arg(member_addr(port))
-        .arg("--peers")
-        .arg(peers.join(","))
-        .arg("--ops-addr")
-        .arg(format!("[::1]:{ops_port}"))
-        .arg("--rest-addr")
-        .arg(format!("[::1]:{rest_port}"))
-        .arg("--data")
-        .arg(&data_dir)
-        .env(
-            "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into()),
-        );
-    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-    own_process_group(&mut cmd);
-
-    let child = cmd
-        .spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e));
-    (child, identity)
+    let mut launch = Launch::new(vec![
+        "serve".into(),
+        "--config".into(),
+        identity.path().join(MEMBER_CONFIG).into(),
+        "--node-id".into(),
+        node_id.to_string().into(),
+        "--addr".into(),
+        format!("[::1]:{port}").into(),
+        "--advertise-addr".into(),
+        member_addr(port).into(),
+        "--peers".into(),
+        peers.join(",").into(),
+        "--ops-addr".into(),
+        format!("[::1]:{ops_port}").into(),
+        "--rest-addr".into(),
+        format!("[::1]:{rest_port}").into(),
+        "--data".into(),
+        data_dir.into(),
+    ]);
+    for (key, value) in env {
+        launch.set_env(key, value);
+    }
+    (launch, identity)
 }
 
 /// A free port on `[::1]`, where the spawned server listens.

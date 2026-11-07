@@ -396,6 +396,20 @@ pub(crate) async fn serve(
         "coordinode v{} starting on {addr}",
         env!("CARGO_PKG_VERSION")
     );
+    // The start's phases at debug level under one target, so a slow start can
+    // be told apart (bind, store, consensus, serving) by enabling just these.
+    tracing::debug!(target: "coordinode::startup", "listeners bound");
+    // Test builds only: COORDINODE_TEST_STARTUP_DELAY_MS holds the start
+    // between binding and opening the store, so a test drives a slow or hung
+    // start through the process.
+    #[cfg(feature = "test-faults")]
+    if let Some(ms) = std::env::var("COORDINODE_TEST_STARTUP_DELAY_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        tracing::warn!(ms, "test fault: the start is held before the store opens");
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
 
     coordinode_vector::metrics::log_simd_capabilities();
 
@@ -1647,6 +1661,7 @@ pub(crate) async fn serve(
 
     // The listener is bound and every service registered: connections that
     // arrive now are accepted as soon as the server below starts polling.
+    tracing::debug!(target: "coordinode::startup", "serving");
     readiness.set(true);
     match shared_port {
         Some((context, accept)) => {

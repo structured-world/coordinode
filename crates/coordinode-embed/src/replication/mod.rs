@@ -189,12 +189,16 @@ impl Member {
         // A store the non-replicated build wrote keeps its history in a
         // journal where the consensus log is about to live: its entries are
         // brought into the store first, the cut the group starts from.
+        // The open's phases at debug level under the start's target, so a
+        // slow start says where it waits (store, consensus, leadership).
+        tracing::debug!(target: "coordinode::startup", "store opening");
         StorageEngine::retire_embedded_journal(storage)?;
         let oracle = Arc::new(TimestampOracle::new());
         let engine = Arc::new(StorageEngine::open_with_oracle(
             storage,
             Arc::clone(&oracle),
         )?);
+        tracing::debug!(target: "coordinode::startup", "store open; consensus opening");
         let MemberOptions {
             node_id,
             peering,
@@ -253,13 +257,16 @@ impl Member {
             }
         };
         let node = Arc::new(node);
+        tracing::debug!(target: "coordinode::startup", "consensus open; database opening");
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(node.pipeline());
         let database =
             Database::from_engine(storage.data_dir(), Arc::clone(&engine), oracle, pipeline)?;
+        tracing::debug!(target: "coordinode::startup", "database open; awaiting leadership");
         // Before the database serves anything: a member that does not lead
         // opens no transaction, and one that leads opens them in its term.
         let (leader, term) = node.next_leadership_change((None, u64::MAX)).await;
+        tracing::debug!(target: "coordinode::startup", ?leader, term, "leadership known");
         database.set_execution_tenure(node.node_id(), leader, term);
         // The idle reaper sleeps while no transaction is open; a begin wakes
         // it.
