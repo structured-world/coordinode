@@ -1,5 +1,7 @@
 use super::*;
-use crate::registry::types::{ConsumerKind, RetentionPressure, ValidatedRetentionBounds};
+use crate::registry::types::{
+    ConsumerKind, PriorIncarnation, RetentionPressure, ValidatedRetentionBounds,
+};
 use coordinode_core::txn::proposal::RaftProposal;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proposal::RaftProposalPipeline;
@@ -844,6 +846,64 @@ fn the_summary_counts_shared_history_once_and_names_who_holds_it() {
             .iter()
             .all(|v| v.refused == Some(RetentionPressure::WritePressure)),
         "write pressure is reported as the reason new retention is refused"
+    );
+}
+
+/// A consumer registering again after its registration ended (a resync)
+/// records what it followed: the ended incarnation, why it ended, what it
+/// had acknowledged and where the history started then. From where the new
+/// one starts it is plain what no incarnation was given; a resync that
+/// starts at the last acknowledgement missed nothing.
+#[test]
+fn a_resync_records_what_it_followed_and_what_was_missed() {
+    let (reg, _clock, source, _pipeline, _dir) = hooked_registry();
+    let log = |id: &str, initial_seqno| ConsumerRegistration {
+        kind: ConsumerKind::OplogEvents,
+        initial_seqno,
+        ..registration(id, 0, ConsumerRetentionPolicy::Strict)
+    };
+    source.set_first(10);
+    source.set_head(50);
+    let first = reg
+        .register(log("sink", InitialSeqno::At(20)))
+        .expect("register");
+    reg.checkpoint(&first, 30).expect("acknowledge");
+    source.set_first(40);
+    reg.unregister(first).expect("cancel");
+
+    // The history from 30 is gone: the consumer resyncs from what is held.
+    reg.register(log("sink", InitialSeqno::FromEarliestRetained))
+        .expect("resync");
+    let view = reg
+        .list_consumers()
+        .into_iter()
+        .find(|c| c.consumer_id == "sink")
+        .expect("listed");
+    let follows = view.follows.expect("it follows the ended incarnation");
+    assert_eq!(
+        follows,
+        PriorIncarnation {
+            incarnation: 1,
+            reason: TerminalReason::Cancelled,
+            acknowledged: 30,
+            retained_from: 40,
+        }
+    );
+    assert_eq!(view.started_at, 40);
+    assert_eq!(follows.missed(view.started_at), Some(30..40));
+    assert_eq!(follows.missed(30), None, "a resync from 30 misses nothing");
+
+    let fresh = reg
+        .register(log("new", InitialSeqno::FromNow))
+        .expect("register new");
+    assert!(
+        reg.list_consumers()
+            .into_iter()
+            .find(|c| c.consumer_id == fresh.consumer_id())
+            .expect("listed")
+            .follows
+            .is_none(),
+        "a first registration follows nothing"
     );
 }
 

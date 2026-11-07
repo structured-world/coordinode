@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use super::source::RetentionSource;
 use super::types::{
-    ConsumerKind, ConsumerRetentionPolicy, RegistrationState, TerminalReason, TopologyScope,
+    ConsumerKind, ConsumerRetentionPolicy, PriorIncarnation, RegistrationState, TerminalReason,
+    TopologyScope,
 };
 
 /// Key prefix for every registry record within `Partition::Registry`.
@@ -35,12 +36,35 @@ pub(crate) struct RegistryEntry {
     pub state: RegistrationState,
     pub checkpoint_seqno: u64,
     pub last_heartbeat_ts_ms: u64,
+    /// Where this incarnation's checkpoint started.
+    pub started_at: u64,
+    /// The ended incarnation of the same id this one followed. Boxed: only a
+    /// resync carries one, and every transition moves the record by value.
+    pub follows: Option<Box<PriorIncarnation>>,
 }
 
 impl RegistryEntry {
     /// Whether this registration still holds its protection.
     pub(crate) fn is_live(&self) -> bool {
         matches!(self.state, RegistrationState::Live)
+    }
+
+    /// What a registration of the same id following this ended one takes
+    /// over from; `None` while this one is live.
+    pub(crate) fn as_prior(&self) -> Option<PriorIncarnation> {
+        match self.state {
+            RegistrationState::Live => None,
+            RegistrationState::Terminated {
+                reason,
+                retained_from,
+                ..
+            } => Some(PriorIncarnation {
+                incarnation: self.incarnation,
+                reason,
+                acknowledged: self.checkpoint_seqno,
+                retained_from,
+            }),
+        }
     }
 
     /// The reason a live BOUNDED registration must end at `now_ms`, or `None`

@@ -321,8 +321,14 @@ After a restart the consumer takes its registration up again with
 `resume_consumer(id, incarnation)`; the incarnation is in its handle
 (`RegisteredHandle::incarnation`). An ended registration keeps refusing its
 handle with the reason and last acknowledged position
-(`RegistryError::Terminated`), and registering the same id again starts a new
-incarnation. `cancel_consumer` ends one; `consumers_list` shows every
+(`RegistryError::Terminated`, with where the history started when it ended),
+and registering the same id again starts a new incarnation: a resync. Its
+listing shows what it followed (`follows`: the ended incarnation, why it
+ended, what it had acknowledged) and where it started (`started_at`);
+`follows.missed(started_at)` is the range of positions no incarnation was
+given, `None` when the resync started at the last acknowledgement. A resync
+never starts anywhere on its own: the consumer chooses `At`, `FromNow` or
+`FromEarliestRetained`. `cancel_consumer` ends one; `consumers_list` shows every
 registration with its policy, state, position, how long its oldest
 unacknowledged work has waited, the bytes it needs and whether it is the one
 holding the history back. `consumer_retention` sums it up per space (journal,

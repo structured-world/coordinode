@@ -41,6 +41,13 @@ fn entry(retention: ConsumerRetentionPolicy) -> RegistryEntry {
         state: RegistrationState::Live,
         checkpoint_seqno: 512,
         last_heartbeat_ts_ms: 1_000,
+        started_at: 500,
+        follows: Some(Box::new(crate::registry::PriorIncarnation {
+            incarnation: 2,
+            reason: TerminalReason::LivenessExpired,
+            acknowledged: 480,
+            retained_from: 400,
+        })),
     }
 }
 

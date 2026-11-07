@@ -261,6 +261,30 @@ pub enum RegistrationState {
     },
 }
 
+/// The ended incarnation a registration of the same id followed: what a
+/// consumer that registered again (a resync) took over from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriorIncarnation {
+    /// The ended incarnation.
+    pub incarnation: u64,
+    /// Why it ended.
+    pub reason: TerminalReason,
+    /// The last checkpoint it had acknowledged.
+    pub acknowledged: u64,
+    /// The first position the source held when it ended.
+    pub retained_from: u64,
+}
+
+impl PriorIncarnation {
+    /// The positions no incarnation of the consumer was given when the one
+    /// following this starts at `starts_at`: `[acknowledged, starts_at)`, or
+    /// `None` when it starts at or below the last acknowledgement and missed
+    /// nothing.
+    pub fn missed(&self, starts_at: u64) -> Option<core::ops::Range<u64>> {
+        (starts_at > self.acknowledged).then_some(self.acknowledged..starts_at)
+    }
+}
+
 /// A point-in-time view of one registration, for ops / debugging
 /// ([`list_consumers`](super::SeqnoConsumerRegistry::list_consumers)).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +320,12 @@ pub struct ConsumerSnapshot {
     /// Whether this live registration's checkpoint is the lowest in its
     /// space, so it is what holds the source's history back.
     pub holds_floor: bool,
+    /// The ended incarnation this one followed, when the consumer
+    /// registered again after an end: its resync, with what it missed
+    /// ([`PriorIncarnation::missed`] from [`Self::started_at`]).
+    pub follows: Option<PriorIncarnation>,
+    /// Where this incarnation's checkpoint started.
+    pub started_at: u64,
 }
 
 /// Why a store takes on no new retention now: a new registration is refused

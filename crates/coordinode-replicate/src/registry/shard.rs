@@ -1216,20 +1216,23 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
         let (checkpoint, _held) = self.core.resolve_initial(&reg)?;
         let now = self.core.clock.now_ms();
         let incarnation = self.core.transition(&reg.consumer_id, |current| {
-            let incarnation = match current {
+            let (incarnation, follows) = match current {
                 Some(existing) if existing.is_live() => {
                     return Err(RegistryError::AlreadyRegistered {
                         consumer_id: existing.consumer_id,
                         incarnation: existing.incarnation,
                     });
                 }
-                Some(ended) => ended.incarnation.checked_add(1).ok_or_else(|| {
-                    RegistryError::Replication(format!(
-                        "consumer {:?} has used every incarnation",
-                        reg.consumer_id
-                    ))
-                })?,
-                None => 1,
+                Some(ended) => (
+                    ended.incarnation.checked_add(1).ok_or_else(|| {
+                        RegistryError::Replication(format!(
+                            "consumer {:?} has used every incarnation",
+                            reg.consumer_id
+                        ))
+                    })?,
+                    ended.as_prior().map(Box::new),
+                ),
+                None => (1, None),
             };
             let entry = RegistryEntry {
                 consumer_id: reg.consumer_id.clone(),
@@ -1241,6 +1244,8 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                 state: RegistrationState::Live,
                 checkpoint_seqno: checkpoint,
                 last_heartbeat_ts_ms: now,
+                started_at: checkpoint,
+                follows,
             };
             Ok(Step::Write(entry, incarnation))
         })?;
@@ -1372,6 +1377,8 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                     state: e.state,
                     checkpoint_seqno: e.checkpoint_seqno,
                     last_heartbeat_ts_ms: e.last_heartbeat_ts_ms,
+                    follows: e.follows.map(|prior| *prior),
+                    started_at: e.started_at,
                 }
             })
             .collect()
