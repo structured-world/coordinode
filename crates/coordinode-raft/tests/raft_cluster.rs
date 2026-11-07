@@ -17,7 +17,8 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::{
-    Enrollment, GroupId, NodeOptions, PeerConnections, RaftNode, RaftNodeError,
+    Enrollment, GroupId, LEADERSHIP_TRANSFER_TIMEOUT_MS, NodeOptions, PeerConnections, RaftNode,
+    RaftNodeError,
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
@@ -4917,10 +4918,14 @@ async fn cluster_graceful_leader_transfer() {
 }
 
 /// A transfer to a member that is down cannot complete, and says so: the
-/// caller gets `TransferTimeout` instead of a success that leaves it
-/// forwarding work to a node that never took over.
+/// caller gets an error instead of a success that leaves it forwarding work
+/// to a node that never took over. While the leader hands over it sends no
+/// heartbeats, so the live member elects itself; the transfer then ends
+/// with who leads instead, not after the whole transfer timeout. A member
+/// shutting down right after its peer did hands over to that peer and must
+/// not sit out the timeout for it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_transfer_to_a_stopped_member_reports_the_timeout() {
+async fn a_transfer_to_a_stopped_member_ends_when_another_leads() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let [p1, p2, p3] = coordinode_test_fixtures::alloc_ports();
         let dirs = [
@@ -4983,13 +4988,23 @@ async fn a_transfer_to_a_stopped_member_reports_the_timeout() {
             .expect("membership");
 
         n3.shutdown().await.expect("stop n3");
+        let started = std::time::Instant::now();
         let outcome = n1.transfer_leadership_to(3).await;
+        let took = started.elapsed();
         assert!(
             matches!(
                 outcome,
-                Err(RaftNodeError::TransferTimeout { target: 3, .. })
+                Err(RaftNodeError::TransferSuperseded {
+                    target: 3,
+                    leader: 2
+                })
             ),
-            "a transfer to a stopped member must time out, got {outcome:?}"
+            "a transfer to a stopped member must end with the member that \
+             took over, got {outcome:?}"
+        );
+        assert!(
+            took < Duration::from_millis(LEADERSHIP_TRANSFER_TIMEOUT_MS),
+            "the transfer must end once another member leads, took {took:?}"
         );
 
         n1.shutdown().await.expect("s1");
@@ -4999,7 +5014,7 @@ async fn a_transfer_to_a_stopped_member_reports_the_timeout() {
 
     assert!(
         result.is_ok(),
-        "TIMED OUT — a_transfer_to_a_stopped_member_reports_the_timeout"
+        "TIMED OUT: a_transfer_to_a_stopped_member_ends_when_another_leads"
     );
 }
 

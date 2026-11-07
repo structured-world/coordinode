@@ -530,7 +530,8 @@ impl ClusterServiceImpl {
             .transfer_leadership_to(peer_id)
             .await
             .map_err(|e| match e {
-                coordinode_raft::cluster::RaftNodeError::TransferTimeout { .. } => {
+                coordinode_raft::cluster::RaftNodeError::TransferTimeout { .. }
+                | coordinode_raft::cluster::RaftNodeError::TransferSuperseded { .. } => {
                     Status::unavailable(format!("leadership transfer failed: {e}"))
                 }
                 e => Status::internal(format!("leadership transfer failed: {e}")),

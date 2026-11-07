@@ -600,6 +600,13 @@ const SNAPSHOT_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(
 /// beaten), not slow.
 pub const LEADERSHIP_TRANSFER_TIMEOUT_MS: u64 = 15_000;
 
+/// How long a shutting-down leader waits for its transfer, in ms: the
+/// failover a graceful shutdown is for. A transfer still pending then gains
+/// nothing over stopping, after which the peers elect once they miss the
+/// heartbeats, and a last member whose peers are gone would otherwise wait
+/// out the whole transfer timeout to stop.
+const SHUTDOWN_TRANSFER_TIMEOUT_MS: u64 = 5_000;
+
 /// Raft node orchestrator.
 ///
 /// Manages the lifecycle of an openraft instance, providing:
@@ -2524,11 +2531,23 @@ impl RaftNode {
     /// election without waiting for `election_timeout` (300-600ms).
     ///
     /// Returns `Ok(())` once `target_id` leads and has committed in its term
-    /// (so it serves reads and writes), and [`RaftNodeError::TransferTimeout`]
-    /// when that has not happened within [`LEADERSHIP_TRANSFER_TIMEOUT_MS`].
+    /// (so it serves reads and writes), [`RaftNodeError::TransferSuperseded`]
+    /// once another member does instead, and
+    /// [`RaftNodeError::TransferTimeout`] when neither has happened within
+    /// [`LEADERSHIP_TRANSFER_TIMEOUT_MS`].
     ///
     /// No-op if this node is not the leader.
     pub async fn transfer_leadership_to(&self, target_id: u64) -> Result<(), RaftNodeError> {
+        self.transfer_leadership_within(target_id, LEADERSHIP_TRANSFER_TIMEOUT_MS)
+            .await
+    }
+
+    /// [`Self::transfer_leadership_to`], waiting at most `timeout_ms`.
+    async fn transfer_leadership_within(
+        &self,
+        target_id: u64,
+        timeout_ms: u64,
+    ) -> Result<(), RaftNodeError> {
         // The node's own account, not a quorum-confirmed lease: a leader cut
         // off from its peers still holds leadership to hand over, and asking
         // them would wait on peers that may be gone.
@@ -2546,44 +2565,67 @@ impl RaftNode {
             "initiating leadership transfer"
         );
 
+        let handed_over_in = {
+            use openraft::async_runtime::watch::WatchReceiver;
+            self.raft.metrics().borrow_watched().current_term
+        };
         self.raft
             .trigger()
             .transfer_leader(target_id)
             .await
             .map_err(|e| RaftNodeError::Shutdown(format!("transfer_leader: {e}")))?;
 
-        // Done when the target leads AND this node has applied an entry of
-        // the target's term: that entry is applied only once committed, so
-        // the new leader has committed in its term and serves reads and
-        // writes, rather than merely having won the vote.
+        // Done when a member leads AND this node has applied an entry of its
+        // term: that entry is applied only once committed, so the new leader
+        // has committed in its term and serves reads and writes, rather than
+        // merely having won the vote. The member is the target, or another
+        // one the group elected in a later term: a leader handing over sends
+        // no heartbeats, so with the target down the others elect themselves,
+        // and the transfer can no longer complete.
+        let node_id = self.node_id;
         match self
             .raft
-            .wait(Some(std::time::Duration::from_millis(
-                LEADERSHIP_TRANSFER_TIMEOUT_MS,
-            )))
+            .wait(Some(std::time::Duration::from_millis(timeout_ms)))
             .metrics(
                 |m| {
-                    m.current_leader == Some(target_id)
-                        && m.last_applied
-                            .as_ref()
-                            .map(|l| l.committed_leader_id().term)
-                            == Some(m.current_term)
+                    m.current_leader.is_some_and(|leader| {
+                        leader == target_id
+                            || (leader != node_id && m.current_term > handed_over_in)
+                    }) && m
+                        .last_applied
+                        .as_ref()
+                        .map(|l| l.committed_leader_id().term)
+                        == Some(m.current_term)
                 },
                 "leadership transfer",
             )
             .await
         {
-            Ok(_) => {
-                tracing::info!(
-                    node_id = self.node_id,
-                    target_id,
-                    "leadership transfer successful"
-                );
-                Ok(())
-            }
+            Ok(m) => match m.current_leader {
+                Some(leader) if leader != target_id => {
+                    tracing::info!(
+                        node_id = self.node_id,
+                        target_id,
+                        leader,
+                        "leadership transfer superseded: another member leads"
+                    );
+                    Err(RaftNodeError::TransferSuperseded {
+                        target: target_id,
+                        leader,
+                    })
+                }
+                _ => {
+                    tracing::info!(
+                        node_id = self.node_id,
+                        target_id,
+                        "leadership transfer successful"
+                    );
+                    Ok(())
+                }
+            },
             Err(openraft::metrics::WaitError::Timeout(..)) => Err(RaftNodeError::TransferTimeout {
                 target: target_id,
-                timeout_ms: LEADERSHIP_TRANSFER_TIMEOUT_MS,
+                timeout_ms,
             }),
             Err(e) => Err(RaftNodeError::Shutdown(format!("transfer_leader: {e}"))),
         }
@@ -2666,8 +2708,13 @@ impl RaftNode {
         );
         if leads {
             if let Some(target_id) = self.find_transfer_target() {
-                if let Err(e) = self.transfer_leadership_to(target_id).await {
-                    tracing::warn!(target_id, "leadership transfer failed: {e}");
+                match self
+                    .transfer_leadership_within(target_id, SHUTDOWN_TRANSFER_TIMEOUT_MS)
+                    .await
+                {
+                    // Leadership left this node either way.
+                    Ok(()) | Err(RaftNodeError::TransferSuperseded { .. }) => {}
+                    Err(e) => tracing::warn!(target_id, "leadership transfer failed: {e}"),
                 }
             } else {
                 tracing::debug!("no peer available for leadership transfer");
@@ -3732,6 +3779,12 @@ pub enum RaftNodeError {
     /// leader in time (it is down, partitioned, or lost the election).
     #[error("leadership did not move to node {target} within {timeout_ms} ms")]
     TransferTimeout { target: u64, timeout_ms: u64 },
+
+    /// Leadership was handed to `target`, but the group elected `leader`
+    /// instead (`target` is down or could not win); the transfer is over and
+    /// this node no longer leads.
+    #[error("leadership did not move to node {target}: node {leader} leads instead")]
+    TransferSuperseded { target: u64, leader: u64 },
 
     /// A node was asked to join a group while holding data of its own.
     ///
