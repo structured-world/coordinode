@@ -70,7 +70,8 @@ fn fixture(
         Arc::clone(&applied),
     ));
     let decisions = coordinode_storage::engine::operations::unit_decisions(Arc::clone(&engine));
-    let (registry, bg) = build_consumer_registry(engine, pipeline, source, tuning);
+    let (registry, bg) =
+        build_consumer_registry(engine, pipeline, source, tuning).expect("registry");
     let service =
         ChangeEventServiceImpl::new(0, dirs, registry.clone(), applied, signal, decisions);
     Fixture {
@@ -1001,7 +1002,8 @@ async fn stream_follows_a_raft_node() {
         pipeline,
         source,
         RegistryTuning::default(),
-    );
+    )
+    .expect("registry");
     let service = ChangeEventServiceImpl::for_raft_node(&engine, Arc::clone(&node), registry)
         .expect("service");
     let mut stream = service

@@ -920,7 +920,8 @@ pub(crate) async fn serve(
             heartbeat_window_ms: registry_heartbeat_ms,
             eviction_interval_ms: registry_eviction_ms,
         },
-    );
+    )
+    .map_err(|e| format!("consumer registry: {e}"))?;
 
     // Vector index observability: per-index serving state + freshness lag as
     // Prometheus gauges. The lag needs the engine's current committed HLC,

@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_replicate::{
-    BackgroundConfig, ConsumerKind, RegistryBackground, RetentionSource, SeqnoConsumerRegistry,
-    ShardConsumerRegistry, SystemClock,
+    BackgroundConfig, ConsumerKind, RegistryBackground, RegistryError, RetentionSource,
+    SeqnoConsumerRegistry, ShardConsumerRegistry, SystemClock,
 };
 use coordinode_storage::engine::core::{StorageEngine, WritePressure};
 use coordinode_storage::oplog::OplogTimeline;
@@ -146,12 +146,16 @@ pub(crate) struct RegistryTuning {
 /// so producers like the change-stream service register through it) and its
 /// [`RegistryBackground`] handle, which must be held for the process lifetime:
 /// dropping it shuts the background service down (with a final heartbeat flush).
+///
+/// # Errors
+///
+/// The background service's thread could not be started.
 pub(crate) fn build_consumer_registry(
     engine: Arc<StorageEngine>,
     pipeline: Arc<dyn ProposalPipeline>,
     source: Arc<dyn RetentionSource>,
     tuning: RegistryTuning,
-) -> (ShardConsumerRegistry, RegistryBackground) {
+) -> Result<(ShardConsumerRegistry, RegistryBackground), RegistryError> {
     let registry = ShardConsumerRegistry::new(
         engine,
         pipeline,
@@ -170,8 +174,8 @@ pub(crate) fn build_consumer_registry(
     }
     // start_background borrows &self, so the registry stays owned and is returned
     // for producers to register through (the bg task holds its own Arc to core).
-    let background = registry.start_background(bg_cfg);
-    (registry, background)
+    let background = registry.start_background(bg_cfg)?;
+    Ok((registry, background))
 }
 
 /// Set the per-consumer gauges (lag in positions, age of the work owed,

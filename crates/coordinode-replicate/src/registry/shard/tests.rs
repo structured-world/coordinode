@@ -141,6 +141,27 @@ fn registry_over(
     )
 }
 
+/// Start the registry's background service with these cadences.
+fn start_service(
+    reg: &ShardConsumerRegistry,
+    heartbeat_window_ms: u64,
+    eviction_interval_ms: u64,
+) -> RegistryBackground {
+    reg.start_background(BackgroundConfig {
+        heartbeat_window_ms,
+        eviction_interval_ms,
+    })
+    .expect("start the registry service")
+}
+
+/// Stop the service where blocking is allowed: its final flush commits
+/// through the log, which this runtime serves.
+async fn stop_service(bg: RegistryBackground) {
+    tokio::task::spawn_blocking(move || bg.stop())
+        .await
+        .expect("stop the registry service");
+}
+
 /// Keep every MVCC version: with a window longer than the clock has run, the
 /// engine has collected nothing, so a registration at any small seqno starts
 /// over history still held, as the tests' fixed positions need.
@@ -1022,10 +1043,7 @@ async fn batched_heartbeats_flush_and_refresh_liveness() {
             bounded(u64::MAX, u64::MAX, Some(10_000)),
         ))
         .expect("register");
-    let bg = f.reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 30,
-        eviction_interval_ms: 100_000,
-    });
+    let bg = start_service(&f.reg, 30, 100_000);
     clock.set(4_000);
     for _ in 0..5 {
         f.reg.heartbeat(&h).expect("buffer heartbeat");
@@ -1045,7 +1063,7 @@ async fn batched_heartbeats_flush_and_refresh_liveness() {
         Some(4_000),
         "the coalesced flush wrote the buffered time"
     );
-    bg.shutdown().await;
+    stop_service(bg).await;
     f.node.shutdown().await.expect("shutdown");
 }
 
@@ -1068,10 +1086,7 @@ async fn the_background_sweep_ends_a_silent_bounded_consumer() {
             ConsumerRetentionPolicy::Strict,
         ))
         .expect("register survivor");
-    let bg = f.reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 100_000,
-        eviction_interval_ms: 30,
-    });
+    let bg = start_service(&f.reg, 100_000, 30);
     // The terminal record commits first and the floor moves after it (the
     // floor never moves ahead of the record), so a reader can see the ended
     // consumer before the new floor: wait for both.
@@ -1086,7 +1101,7 @@ async fn the_background_sweep_ends_a_silent_bounded_consumer() {
         Some(TerminalReason::LivenessExpired)
     );
     assert_eq!(f.reg.shard_floor(), 500);
-    bg.shutdown().await;
+    stop_service(bg).await;
     f.node.shutdown().await.expect("shutdown");
 }
 
@@ -1096,10 +1111,7 @@ async fn the_background_sweep_ends_a_silent_bounded_consumer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watch_hears_of_its_own_record_only() {
     let f = fixture(Arc::new(ManualClock::new(1_000))).await;
-    let bg = f.reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 100_000,
-        eviction_interval_ms: 100_000,
-    });
+    let bg = start_service(&f.reg, 100_000, 100_000);
     let mine = f
         .reg
         .register(registration("mine", 10, ConsumerRetentionPolicy::Strict))
@@ -1145,7 +1157,7 @@ async fn a_watch_hears_of_its_own_record_only() {
         !watch.changed(),
         "another record's write does not concern it"
     );
-    bg.shutdown().await;
+    stop_service(bg).await;
     assert!(watch.changed(), "without the relay every call is a change");
     f.node.shutdown().await.expect("shutdown");
 }
@@ -1156,10 +1168,7 @@ async fn a_watch_hears_of_its_own_record_only() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lowering_registration_publishes_the_floor_before_returning() {
     let f = fixture(Arc::new(ManualClock::new(1_000))).await;
-    let bg = f.reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 100_000,
-        eviction_interval_ms: 100_000,
-    });
+    let bg = start_service(&f.reg, 100_000, 100_000);
     f.reg
         .register(registration("late", 250, ConsumerRetentionPolicy::Strict))
         .expect("register late");
@@ -1168,7 +1177,7 @@ async fn a_lowering_registration_publishes_the_floor_before_returning() {
         .register(registration("early", 100, ConsumerRetentionPolicy::Strict))
         .expect("register early");
     assert_eq!(f.reg.shard_floor(), 100, "lowered before the call returned");
-    bg.shutdown().await;
+    stop_service(bg).await;
     f.node.shutdown().await.expect("shutdown");
 }
 
@@ -1177,10 +1186,7 @@ async fn a_lowering_registration_publishes_the_floor_before_returning() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_acknowledgement_raises_the_floor_through_the_sweep() {
     let f = fixture(Arc::new(ManualClock::new(1_000))).await;
-    let bg = f.reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 100_000,
-        eviction_interval_ms: 30,
-    });
+    let bg = start_service(&f.reg, 100_000, 30);
     let early = f
         .reg
         .register(registration("early", 100, ConsumerRetentionPolicy::Strict))
@@ -1194,7 +1200,7 @@ async fn an_acknowledgement_raises_the_floor_through_the_sweep() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(f.reg.shard_floor(), 250);
-    bg.shutdown().await;
+    stop_service(bg).await;
     f.node.shutdown().await.expect("shutdown");
 }
 
@@ -1234,10 +1240,7 @@ async fn the_source_learns_the_lowest_acknowledged_log_position() {
 async fn a_registration_applied_from_elsewhere_moves_the_floor() {
     let clock = Arc::new(ManualClock::new(1_000));
     let f = fixture(clock.clone()).await;
-    let bg = f.reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 100_000,
-        eviction_interval_ms: 30,
-    });
+    let bg = start_service(&f.reg, 100_000, 30);
     let elsewhere = registry_over(&f.engine, &f.node, clock, Arc::clone(&f.source), 3);
     elsewhere
         .register(registration("remote", 77, ConsumerRetentionPolicy::Strict))
@@ -1247,7 +1250,7 @@ async fn a_registration_applied_from_elsewhere_moves_the_floor() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(f.reg.shard_floor(), 77);
-    bg.shutdown().await;
+    stop_service(bg).await;
     f.node.shutdown().await.expect("shutdown");
 }
 

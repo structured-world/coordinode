@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::write_concern::WriteConcern;
@@ -38,7 +38,7 @@ use coordinode_storage::engine::coordinator::SnapshotPin;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use super::SeqnoConsumerRegistry;
 use super::entry::{
@@ -120,6 +120,29 @@ enum Step<T> {
     Keep(T),
 }
 
+/// What the background service has been asked to do since it last looked.
+#[derive(Debug, Default)]
+struct WakeReasons {
+    heartbeat_buffered: bool,
+    registry_changed: bool,
+    stop: bool,
+}
+
+/// Wakes the background service's thread. A reason stays set until the
+/// service takes it, so one raised while the service is busy is not lost.
+#[derive(Debug, Default)]
+struct Wake {
+    reasons: Mutex<WakeReasons>,
+    raised: Condvar,
+}
+
+impl Wake {
+    fn raise(&self, set: impl FnOnce(&mut WakeReasons)) {
+        set(&mut self.reasons.lock());
+        self.raised.notify_one();
+    }
+}
+
 /// Shared registry state, held by the facade and the background tasks.
 struct RegistryCore {
     engine: Arc<StorageEngine>,
@@ -148,8 +171,9 @@ struct RegistryCore {
     /// and the incarnation that sent them: a heartbeat of an ended
     /// incarnation must not keep its successor alive.
     pending_hb: Mutex<HashMap<(String, u64), u64>>,
-    /// Notified when a heartbeat is buffered, opening a flush window.
-    hb_buffered: tokio::sync::Notify,
+    /// What wakes the background service: a heartbeat buffered, a registry
+    /// write applied, a stop.
+    wake: Wake,
     /// Readers' notices of writes to the records they watch.
     watches: Arc<Watches>,
     /// Runs once between a transition's read and its commit: what another
@@ -797,7 +821,7 @@ impl ShardConsumerRegistry {
             allow_topology_scopes: false,
             batching_on: AtomicBool::new(false),
             pending_hb: Mutex::new(HashMap::new()),
-            hb_buffered: tokio::sync::Notify::new(),
+            wake: Wake::default(),
             watches: Arc::new(Watches::default()),
             #[cfg(test)]
             before_commit: Mutex::new(None),
@@ -896,45 +920,28 @@ impl ShardConsumerRegistry {
 
     /// Start the background service: coalesced heartbeat flush and the
     /// bound sweep. Switches `heartbeat` to buffered mode. Returns a handle
-    /// whose [`shutdown`](RegistryBackground::shutdown) does a final flush.
-    pub fn start_background(&self, cfg: BackgroundConfig) -> RegistryBackground {
+    /// whose [`stop`](RegistryBackground::stop) does a final flush.
+    ///
+    /// The service is one thread of its own, not a task on an async runtime:
+    /// its work waits on commits, and an embedded database without a runtime
+    /// runs it too.
+    ///
+    /// # Errors
+    ///
+    /// The OS refused a thread for the service.
+    pub fn start_background(
+        &self,
+        cfg: BackgroundConfig,
+    ) -> Result<RegistryBackground, RegistryError> {
         self.core.batching_on.store(true, Ordering::Release);
-        let core = Arc::clone(&self.core);
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let stop = Arc::clone(&shutdown);
-        // Registry writes wait on a commit, an fsync at least: they run on
-        // the blocking pool, or the runtime thread they would hold is the one
-        // the consumers' streams heartbeat from.
-        let blocking =
-            |core: &Arc<RegistryCore>,
-             work: fn(&RegistryCore) -> Result<Option<Sweep>, RegistryError>| {
-                let core = Arc::clone(core);
-                async move {
-                    tokio::task::spawn_blocking(move || work(&core))
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(RegistryError::Replication(format!("registry task: {e}")))
-                        })
-                }
-            };
-        let flush = |core: &RegistryCore| core.flush_pending_heartbeats().map(|()| None);
-        let sweep = |core: &RegistryCore| {
-            core.sweep_evictions().map(|sweep| {
-                if sweep.evicted > 0 {
-                    tracing::debug!(evicted = sweep.evicted, "registry bound sweep");
-                }
-                Some(sweep)
-            })
-        };
 
         // A registration another member wrote changes the floor this member
         // publishes, so a write applied to the registry keyspace asks for a
         // sweep, and tells the readers watching that record. The feed is a
         // blocking subscription; one parked thread relays it.
-        let changed = Arc::new(tokio::sync::Notify::new());
         let applied = self.core.engine.subscribe_applied(Partition::Registry, 16);
         let applied_stop = applied.stopper();
-        let relay = Arc::clone(&changed);
+        let relay = Arc::clone(&self.core);
         let watches = Arc::clone(&self.core.watches);
         let relay_watches = Arc::clone(&watches);
         let relay_thread = std::thread::Builder::new()
@@ -945,7 +952,7 @@ impl ShardConsumerRegistry {
                         AppliedEvent::Keys { keys, .. } => relay_watches.applied(&keys),
                         AppliedEvent::Replaced => relay_watches.applied_unknown(),
                     }
-                    relay.notify_one();
+                    relay.wake.raise(|r| r.registry_changed = true);
                 }
             })
             .map_err(|e| tracing::error!(error = %e, "registry apply relay did not start"))
@@ -954,84 +961,128 @@ impl ShardConsumerRegistry {
         // unrelayed.
         watches.set_relayed(relay_thread.is_some());
 
-        let window = Duration::from_millis(cfg.heartbeat_window_ms);
-        let gap = Duration::from_millis(cfg.eviction_interval_ms);
-        let handle = tokio::spawn(async move {
-            let mut flush_at: Option<tokio::time::Instant> = None;
-            // The first sweep publishes the floor the stored registrations hold.
-            let mut sweep_at: Option<tokio::time::Instant> = Some(tokio::time::Instant::now());
-            let mut last_sweep: Option<tokio::time::Instant> = None;
-            loop {
-                tokio::select! {
-                    _ = stop.notified() => break,
-                    _ = core.hb_buffered.notified(), if flush_at.is_none() => {
-                        flush_at = Some(tokio::time::Instant::now() + window);
-                    }
-                    _ = changed.notified() => {
-                        let soonest = last_sweep.map_or_else(tokio::time::Instant::now, |at| at + gap);
-                        sweep_at = Some(sweep_at.map_or(soonest, |due| due.min(soonest)));
-                    }
-                    _ = sleep_until(flush_at), if flush_at.is_some() => {
-                        flush_at = None;
-                        if let Err(e) = blocking(&core, flush).await {
-                            tracing::warn!(error = %e, "registry heartbeat flush failed");
-                            // The heartbeats stay buffered: try again a window on.
-                            flush_at = Some(tokio::time::Instant::now() + window);
-                        }
-                    }
-                    _ = sleep_until(sweep_at), if sweep_at.is_some() => {
-                        let swept_at = tokio::time::Instant::now();
-                        last_sweep = Some(swept_at);
-                        sweep_at = match blocking(&core, sweep).await {
-                            Ok(Some(sweep)) => {
-                                let deadline = sweep.next_deadline_ms.map(|at_ms| {
-                                    let wait = at_ms.saturating_sub(core.clock.now_ms());
-                                    swept_at + Duration::from_millis(wait).max(gap)
-                                });
-                                let periodic = sweep.behind.then_some(swept_at + gap);
-                                match (deadline, periodic) {
-                                    (Some(a), Some(b)) => Some(a.min(b)),
-                                    (a, b) => a.or(b),
-                                }
-                            }
-                            Ok(None) => None,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "registry bound sweep failed");
-                                Some(swept_at + gap)
-                            }
-                        };
-                    }
-                }
+        let core = Arc::clone(&self.core);
+        let service = std::thread::Builder::new()
+            .name("registry-service".to_string())
+            .spawn(move || core.serve(cfg));
+        let service = match service {
+            Ok(service) => service,
+            Err(e) => {
+                watches.set_relayed(false);
+                applied_stop.stop();
+                self.core.batching_on.store(false, Ordering::Release);
+                return Err(RegistryError::Replication(format!(
+                    "registry service thread did not start: {e}"
+                )));
             }
-            // Final flush so no buffered heartbeat is lost on graceful stop.
-            if let Err(e) = blocking(&core, flush).await {
-                tracing::warn!(error = %e, "registry final heartbeat flush failed");
-            }
-        });
-        RegistryBackground {
-            shutdown,
-            handle: Some(handle),
+        };
+        Ok(RegistryBackground {
+            core: Arc::clone(&self.core),
+            service: Some(service),
             applied_stop,
             relay_thread,
             watches,
             config: cfg,
+        })
+    }
+}
+
+impl RegistryCore {
+    /// The background service's loop: flush heartbeats a window after the
+    /// first one buffered, sweep when a bound can be crossed or the registry
+    /// changed, until stopped; then a final flush.
+    fn serve(&self, cfg: BackgroundConfig) {
+        let window = Duration::from_millis(cfg.heartbeat_window_ms);
+        let gap = Duration::from_millis(cfg.eviction_interval_ms);
+        let mut flush_at: Option<Instant> = None;
+        // The first sweep publishes the floor the stored registrations hold.
+        let mut sweep_at: Option<Instant> = Some(Instant::now());
+        let mut last_sweep: Option<Instant> = None;
+        loop {
+            let (heartbeat, changed, stop) = {
+                let mut reasons = self.wake.reasons.lock();
+                loop {
+                    // A buffered heartbeat opens a window only when none is
+                    // open: the window already open flushes it.
+                    let opens = reasons.heartbeat_buffered && flush_at.is_none();
+                    if reasons.stop || reasons.registry_changed || opens {
+                        break;
+                    }
+                    let due = match (flush_at, sweep_at) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    match due {
+                        Some(due) if due <= Instant::now() => break,
+                        Some(due) => {
+                            self.wake.raised.wait_until(&mut reasons, due);
+                        }
+                        None => self.wake.raised.wait(&mut reasons),
+                    }
+                }
+                let heartbeat = flush_at.is_none() && reasons.heartbeat_buffered;
+                if heartbeat {
+                    reasons.heartbeat_buffered = false;
+                }
+                let changed = std::mem::take(&mut reasons.registry_changed);
+                (heartbeat, changed, reasons.stop)
+            };
+            if stop {
+                break;
+            }
+            let now = Instant::now();
+            if heartbeat {
+                flush_at = Some(now + window);
+            }
+            if changed {
+                let soonest = last_sweep.map_or(now, |at| at + gap);
+                sweep_at = Some(sweep_at.map_or(soonest, |due| due.min(soonest)));
+            }
+            if flush_at.is_some_and(|at| at <= now) {
+                flush_at = None;
+                if let Err(e) = self.flush_pending_heartbeats() {
+                    tracing::warn!(error = %e, "registry heartbeat flush failed");
+                    // The heartbeats stay buffered: try again a window on.
+                    flush_at = Some(Instant::now() + window);
+                }
+            }
+            if sweep_at.is_some_and(|at| at <= now) {
+                last_sweep = Some(now);
+                sweep_at = match self.sweep_evictions() {
+                    Ok(sweep) => {
+                        if sweep.evicted > 0 {
+                            tracing::debug!(evicted = sweep.evicted, "registry bound sweep");
+                        }
+                        let deadline = sweep.next_deadline_ms.map(|at_ms| {
+                            let wait = at_ms.saturating_sub(self.clock.now_ms());
+                            now + Duration::from_millis(wait).max(gap)
+                        });
+                        let periodic = sweep.behind.then_some(now + gap);
+                        match (deadline, periodic) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "registry bound sweep failed");
+                        Some(now + gap)
+                    }
+                };
+            }
+        }
+        // Final flush so no buffered heartbeat is lost on a stop.
+        if let Err(e) = self.flush_pending_heartbeats() {
+            tracing::warn!(error = %e, "registry final heartbeat flush failed");
         }
     }
 }
 
-/// Sleep until `at`; never return when there is no `at`.
-async fn sleep_until(at: Option<tokio::time::Instant>) {
-    match at {
-        Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Handle to the running background service. Drop detaches the task; prefer
-/// [`shutdown`](Self::shutdown) for a clean final flush.
+/// Handle to the running background service. Dropping it stops the service,
+/// which finishes with a final flush on its own; [`stop`](Self::stop) also
+/// waits for that.
 pub struct RegistryBackground {
-    shutdown: Arc<tokio::sync::Notify>,
-    handle: Option<tokio::task::JoinHandle<()>>,
+    core: Arc<RegistryCore>,
+    service: Option<std::thread::JoinHandle<()>>,
     /// Ends the thread relaying registry applies.
     applied_stop: AppliedStop,
     relay_thread: Option<std::thread::JoinHandle<()>>,
@@ -1046,27 +1097,35 @@ impl RegistryBackground {
         self.config
     }
 
-    /// Stop the service after a final heartbeat flush, awaiting the task.
-    pub async fn shutdown(mut self) {
-        self.shutdown.notify_one();
+    /// Stop the service and wait for its final heartbeat flush. Blocks on
+    /// that flush's commit: an async caller runs it where blocking is allowed.
+    pub fn stop(mut self) {
+        self.signal_stop();
+        for thread in [self.relay_thread.take(), self.service.take()]
+            .into_iter()
+            .flatten()
+        {
+            if thread.join().is_err() {
+                tracing::error!("a registry service thread panicked");
+            }
+        }
+    }
+
+    fn signal_stop(&self) {
+        // Heartbeats from now on are written at once: nothing will flush a
+        // buffer once the service is gone.
+        self.core.batching_on.store(false, Ordering::Release);
         self.watches.set_relayed(false);
         self.applied_stop.stop();
-        let relay = self.relay_thread.take();
-        if let Some(relay) = relay {
-            // The stop has ended its wait; the join is immediate.
-            let _ = tokio::task::spawn_blocking(move || relay.join()).await;
-        }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
-        }
+        self.core.wake.raise(|r| r.stop = true);
     }
 }
 
 impl Drop for RegistryBackground {
     fn drop(&mut self) {
-        self.watches.set_relayed(false);
-        // A parked relay thread would outlive the service otherwise.
-        self.applied_stop.stop();
+        // The threads end on their own: the relay at the stop of its feed,
+        // the service after its final flush.
+        self.signal_stop();
     }
 }
 
@@ -1154,7 +1213,7 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                 .entry((handle.consumer_id().to_string(), handle.incarnation()))
                 .and_modify(|t| *t = (*t).max(now))
                 .or_insert(now);
-            self.core.hb_buffered.notify_one();
+            self.core.wake.raise(|r| r.heartbeat_buffered = true);
             return Ok(());
         }
         // Unbatched: refuse a handle that no longer addresses a live

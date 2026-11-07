@@ -95,7 +95,8 @@ async fn registry_leaves_the_engine_window_in_force() {
         pipeline,
         empty_source(&engine),
         RegistryTuning::default(),
-    );
+    )
+    .expect("registry");
 
     let snap = engine.snapshot();
     let expected = snap.saturating_sub(window_secs * US_PER_SEC);
@@ -119,7 +120,8 @@ async fn short_window_keeps_higher_floor_than_default() {
         pipeline_for(&engine_short),
         empty_source(&engine_short),
         RegistryTuning::default(),
-    );
+    )
+    .expect("registry");
     let floor_short = engine_short.gc_watermark();
 
     let (engine_default, _d2) = open_engine(None); // 7-day default
@@ -128,7 +130,8 @@ async fn short_window_keeps_higher_floor_than_default() {
         pipeline_for(&engine_default),
         empty_source(&engine_default),
         RegistryTuning::default(),
-    );
+    )
+    .expect("registry");
     let floor_default = engine_default.gc_watermark();
 
     assert!(
@@ -151,7 +154,8 @@ async fn cadence_overrides_reach_the_background_service() {
             heartbeat_window_ms: Some(250),
             eviction_interval_ms: Some(5_000),
         },
-    );
+    )
+    .expect("registry");
     assert_eq!(bg.config().heartbeat_window_ms, 250);
     assert_eq!(bg.config().eviction_interval_ms, 5_000);
 }
