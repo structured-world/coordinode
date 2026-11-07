@@ -169,6 +169,11 @@ harness = false
 name = "volatile_writes"
 harness = false
 
+# What consumer retention costs writes, transitions, listings and opens.
+[[bench]]
+name = "consumers"
+harness = false
+
 [[bench]]
 name = "schema_package"
 harness = false
