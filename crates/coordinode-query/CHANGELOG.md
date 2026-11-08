@@ -2,6 +2,124 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-08
+
+### Added
+
+- *(replication)* typed causal bounds and receipts
+- *(storage)* hold a temporal unique value per instant of valid time
+- *(query)* answer AS OF past the retention from temporal history
+- *(modality)* read temporal node versions as known at a system time
+- *(index)* bound the bytes of implication placement and folding
+- *(index)* key unique entries by their owner
+- *(vector)* follow a change of what a type implies
+- *(query)* refuse a RETYPE NODE that would move a node's shard
+- *(index)* configure the pages of an implication change
+- *(index)* keep label counts exact across an implication change
+- *(index)* answer a text search with its view's interpretation
+- *(schema)* change what a type implies through a schema package
+- *(index)* fold what a concluded implication change kept apart
+- *(index)* keep a B-tree index's moved carriers apart under ALTER IMPLIES
+- *(schema)* give labels a catalog identity records store
+- *(query)* change a node's type with RETYPE NODE
+- *(schema)* declare type, implied and auxiliary labels
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(storage)* judge, repair and drop columnar tables as partitions
+- *(vector)* exact scores and domain errors end to end
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+- *(query)* drop the type-keyed index reason from relabel
+
+### Fixed
+
+- *(query)* stop a build's owner under the table lock
+- *(query)* a vector index is its build's from registration
+- *(embed)* rebuild an index a build is filling instead of following a change
+- *(query)* a cancelled vector build folds nothing further
+- *(query)* tell carried columns from an aggregate named like one
+- *(query)* bound a grouped entity's copy by its charge, unallocated
+- *(query)* carry an entity grouped under two aliases once
+- *(query)* charge a grouped entity's columns before copying them
+- *(query)* keep a grouped node's properties through aggregation
+- *(raft)* let an entry close the commits it carries
+- *(query)* read only views every commit below is applied at
+- *(index)* hold index builds and catalog changes to a memory bound
+- *(search)* never score what a text search leaves out
+- *(storage)* report a write of unknown outcome as such
+- *(query)* charge every tuple expansion of index checks and conflicts
+- *(query)* count deleted implied labels and allow redundant implications
+- *(query)* refuse readers of an index still following a change
+- *(query)* activate an implication change once search follows it
+- *(query)* reserve a vector index read's memory before allocating it
+- *(index)* charge catalog changes to the statement and check skipped fields
+- *(index)* walk the catalog by head when publishing or concluding parts
+- *(index)* bound held memory in claim restating and the report queue
+- *(index)* reserve room only for claims not held yet
+- *(index)* keep a claim's charge only on what is kept
+- *(index)* charge unique claims and checks for as long as they live
+- *(index)* bound the fan-out everywhere and type every index refusal
+- *(index)* refuse keys past the store's limit, bound entry fan-out
+- *(index)* charge implication placement memory before taking it
+- *(index)* claim a unique value across the parts of a change
+- *(index)* fold what a cancelled implication change kept apart
+- *(index)* read a reconciliation page at one snapshot in every mode
+- *(index)* place every changed label and conclude the record read
+- *(search)* refuse text reads of an unknown commit, type not-ready
+- *(search)* refuse reads of a lagging text reader, own write refusal
+- *(index)* bind text interpretations to their installation
+- *(index)* bind text settling to one revision and one catalog state
+- *(index)* write text documents under the interpretation held
+- *(index)* judge a label's carriers by the view's own catalog
+- *(index)* bind a text read to the interpretation its index holds
+- *(index)* refuse a change until the previous one is folded
+- *(index)* reap expired members kept in selection parts
+- *(schema)* bind a label's first use through the ordered log
+- *(query)* defer only the retyped nodes' index entries in RETYPE
+- *(query)* plan subqueries with the index access paths
+- *(query)* keep rows without a vector in a vector ordering
+- *(query)* order by variables the projection drops
+- *(query)* subqueries see the outer row; one index search per top-k
+- *(query)* keep each edge's orientation in undirected hops
+- *(query)* three-valued AND/OR, simple CASE, correlated keys
+- *(query)* charge exact dedup memory before allocating it
+
+### Performance
+
+- *(storage)* keep a transaction's writes in key order
+- *(index)* refresh the integrity view without reading the evidence
+- *(index)* record a batch of reports without copying it
+- *(index)* keep no per-node or per-page scratch in reconciliation
+- *(query)* build only the node properties a statement reads
+- *(query)* read a property column without allocating
+- *(query)* read a node's schemas once per write
+- *(query)* look the keys of a correlated index join up in batches
+- *(query)* look a correlated index key up once per distinct key
+- index partition trees by discriminant, share index definitions
+- *(query)* hashed exact DISTINCT, grouping and UNION
+
+### Refactored
+
+- *(index)* open a reconciliation page by holding what it carries
+- *(schema)* store canonical labels and judge RETYPE by its result
+
+### Testing
+
+- *(query)* cancel a build only once it runs in the double-cancel test
+- *(embed)* a stale certification executor changes nothing
+- *(index)* measure the report queue's memory apart from its accounting
+- *(index)* stop a fold at an exact step
+- *(query)* tell a woken snapshot read from a timed-out one by margin
+- *(query)* measure the distributed top-k merge
+
+### Wip
+
+- reconcile the label lookup through the implication change
+- keep only a label change's difference apart in the lookup
+- ALTER NODE TYPE SET IMPLIES with per-label lookup generations
+
 ## v0.8.0 - 2026-10-23
 
 ### Added

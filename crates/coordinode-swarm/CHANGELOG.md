@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-08
+
+### Added
+
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
