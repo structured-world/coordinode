@@ -197,6 +197,55 @@ impl GrantedBytes {
     pub(crate) fn load(engine: &StorageEngine) -> Result<Self, io::Error> {
         Ok(load_stored(engine, Partition::Schema, KEY_GRANTED_BYTES)?.unwrap_or_default())
     }
+
+    /// The total once entry `index` (`request`) is counted, or `None` when
+    /// it changes nothing: it carries no client bytes (its proposals all
+    /// bypass the rate limit, or it has none), or an entry at or after it is
+    /// counted already. Every proposal of the request counts, as members pay
+    /// for each, a repeated one included.
+    fn after(self, request: &Request, index: u64) -> Option<Self> {
+        let client: u64 = request
+            .proposals
+            .iter()
+            .filter(|proposal| !proposal.bypass_rate_limiter)
+            .map(crate::cluster::grants::proposal_room)
+            .sum();
+        (client > 0 && index > self.through).then_some(Self {
+            through: index,
+            // Bounded by the bytes the group ever applied.
+            total: self.total + client,
+        })
+    }
+
+    /// Write this total as position `sub` of entry `index`, with its
+    /// coverage marker, into every partition `held` says lacks it.
+    ///
+    /// No commit timestamp: the store gives the record its next version,
+    /// later than every version this member applied before it, so the
+    /// latest version is the latest total whatever order the entries'
+    /// commit timestamps came in. A record no read waits for raises no
+    /// applied commit ceiling.
+    fn record(
+        self,
+        engine: &StorageEngine,
+        index: u64,
+        sub: u32,
+        held: impl Fn(Partition) -> bool,
+    ) -> Result<(), StorageError> {
+        let value = rmp_serde::to_vec(&self).map_err(|e| StorageError::Io(e.to_string()))?;
+        engine.apply_raft_proposal(
+            &[Mutation::Put {
+                partition: coordinode_core::txn::proposal::PartitionId::Schema,
+                key: KEY_GRANTED_BYTES.to_vec(),
+                value,
+            }],
+            0,
+            index,
+            sub,
+            held,
+        )?;
+        Ok(())
+    }
 }
 
 /// An existing member whose promise (its vote) neither copy can prove: the
@@ -574,6 +623,14 @@ pub fn clear_catch_up(engine: &StorageEngine) -> Result<(), io::Error> {
     }
 }
 
+/// Whether `proposal` is a unit bound to a client operation, decided by its
+/// binding whenever it applies: the binding is durable and marks a refused
+/// unit for raw readers of the log, so neither the apply nor a rebuild's
+/// replay drops a retransmission of it as a repeated proposal.
+fn decided_by_binding(proposal: &RaftProposal) -> bool {
+    matches!(proposal.mutations.last(), Some(Mutation::Operation(_)))
+}
+
 /// Rebuild `partition` from the checkpoint at `checkpoint_dir` and this
 /// node's Raft log `log`, with the applies paused: the checkpoint's rows,
 /// then every proposal of the log the checkpoint's tree lacks, up to where
@@ -617,6 +674,20 @@ pub fn rebuild_partition_from_checkpoint(
                 )));
             }
             let repair = engine.begin_partition_rebuild(partition, &rows)?;
+            // The checkpoint's Schema rows carried its closure ledger and the
+            // group's granted bytes; each entry replayed after it writes its
+            // records of both as its apply did, or the rebuilt tree would
+            // answer with the checkpoint's.
+            let mut closure = if partition == Partition::Schema {
+                Some(engine.closure_replay()?)
+            } else {
+                None
+            };
+            let mut granted = if partition == Partition::Schema {
+                Some(GrantedBytes::load(engine).map_err(|e| StorageError::Io(e.to_string()))?)
+            } else {
+                None
+            };
             let mut seen: HashMap<u64, usize> = HashMap::new();
             for oplog_entry in entries {
                 let index = oplog_entry.index;
@@ -625,13 +696,24 @@ pub fn rebuild_partition_from_checkpoint(
                 let openraft::entry::EntryPayload::Normal(request) = &entry.payload else {
                     continue;
                 };
+                let mut commits = Vec::with_capacity(request.proposals.len());
                 for (sub, proposal) in request.proposals.iter().enumerate() {
                     let sub = u32::try_from(sub).map_err(|_| {
                         StorageError::Io(format!("entry {index} carries over 2^32 proposals"))
                     })?;
-                    let size = proposal.size_estimate();
-                    let repeated = seen.insert(proposal.id.as_raw(), size) == Some(size);
-                    if repeated || held.holds(index, sub) {
+                    // A repeated proposal is skipped as its apply skipped it:
+                    // one bound to an operation is decided by its binding.
+                    let repeated = !decided_by_binding(proposal) && {
+                        let size = proposal.size_estimate();
+                        seen.insert(proposal.id.as_raw(), size) == Some(size)
+                    };
+                    if repeated {
+                        continue;
+                    }
+                    // A proposal the checkpoint holds still counts toward the
+                    // entry's ceiling; the ledger skips what it accounted for.
+                    commits.push((index, proposal.commit_ts.as_raw()));
+                    if held.holds(index, sub) {
                         continue;
                     }
                     engine.apply_raft_proposal(
@@ -640,6 +722,33 @@ pub fn rebuild_partition_from_checkpoint(
                         index,
                         sub,
                         |p| p != partition,
+                    )?;
+                }
+                // The granted-bytes record right after the proposals, the
+                // closure record after it, as the apply writes them. An entry
+                // the checkpoint counted already is past its total's through.
+                let granted_sub = u32::try_from(request.proposals.len()).map_err(|_| {
+                    StorageError::Io(format!("entry {index} carries over 2^32 proposals"))
+                })?;
+                if let Some(granted) = &mut granted
+                    && let Some(total) = granted.after(request, index)
+                {
+                    if !held.holds(index, granted_sub) {
+                        total.record(engine, index, granted_sub, |p| p != Partition::Schema)?;
+                    }
+                    *granted = total;
+                }
+                if let Some(closure) = &mut closure {
+                    let sub = granted_sub.checked_add(1).ok_or_else(|| {
+                        StorageError::Io(format!("entry {index} carries over 2^32 proposals"))
+                    })?;
+                    engine.replay_closure_record(
+                        closure,
+                        &commits,
+                        request.closed_below,
+                        index,
+                        sub,
+                        held.holds(index, sub),
                     )?;
                 }
             }
@@ -1859,6 +1968,11 @@ pub struct CoordinodeStateMachine {
     /// The group's applied client bytes, as recorded at the last entry
     /// carrying any.
     granted_bytes: GrantedBytes,
+    /// Run with an entry's index once its proposals applied and before its
+    /// granted-bytes and closure records: what a capture taken between them
+    /// holds.
+    #[cfg(test)]
+    after_proposals: Option<Box<dyn FnMut(u64) + Send + Sync>>,
     /// Where the applies stand, held while applying; registered with the
     /// engine as its Raft apply fence.
     gate: Arc<RaftApplyGate>,
@@ -2129,6 +2243,8 @@ impl CoordinodeStateMachine {
             skip_until,
             folded,
             granted_bytes,
+            #[cfg(test)]
+            after_proposals: None,
             gate,
             _hold: engine_work.start(),
             engine_work,
@@ -2300,10 +2416,7 @@ impl CoordinodeStateMachine {
     ) -> Result<Response, io::Error> {
         let proposal_key = proposal.id.as_raw();
         let proposal_size = proposal.size_estimate();
-        // A unit bound to a client operation is decided by its binding, which
-        // is durable and marks a refused unit for raw readers of the log; the
-        // process-local filter below would drop a retransmission unmarked.
-        let bound = matches!(proposal.mutations.last(), Some(Mutation::Operation(_)));
+        let bound = decided_by_binding(proposal);
 
         // Dedup check: same key + same size = already applied
         if !bound {
@@ -2439,19 +2552,8 @@ impl CoordinodeStateMachine {
         sub: u32,
         applies: &RaftApplyState,
     ) -> Result<(), io::Error> {
-        let client: u64 = request
-            .proposals
-            .iter()
-            .filter(|proposal| !proposal.bypass_rate_limiter)
-            .map(crate::cluster::grants::proposal_room)
-            .sum();
-        if client == 0 || index <= self.granted_bytes.through {
+        let Some(total) = self.granted_bytes.after(request, index) else {
             return Ok(());
-        }
-        let total = GrantedBytes {
-            through: index,
-            // Bounded by the bytes the group ever applied.
-            total: self.granted_bytes.total + client,
         };
         let replay = self
             .replay_skip
@@ -2459,24 +2561,8 @@ impl CoordinodeStateMachine {
             .filter(|_| index < self.skip_until);
         let held =
             |part| applies.skips(part, index) || replay.is_some_and(|c| c.holds(part, index, sub));
-        let value = rmp_serde::to_vec(&total).map_err(|e| io::Error::other(e.to_string()))?;
-        // No commit timestamp: the store gives the record its next version,
-        // later than every version this member applied before it, so the
-        // latest version is the latest total whatever order the entries'
-        // commit timestamps came in. A record no read waits for raises no
-        // applied commit ceiling.
-        self.engine
-            .apply_raft_proposal(
-                &[Mutation::Put {
-                    partition: coordinode_core::txn::proposal::PartitionId::Schema,
-                    key: KEY_GRANTED_BYTES.to_vec(),
-                    value,
-                }],
-                0,
-                index,
-                sub,
-                held,
-            )
+        total
+            .record(&self.engine, index, sub, held)
             .map_err(|e| io::Error::other(format!("record the granted bytes: {e}")))?;
         self.granted_bytes = total;
         Ok(())
@@ -2667,6 +2753,10 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                     let sub = u32::try_from(request.proposals.len()).map_err(|_| {
                         io::Error::other(format!("entry {index} carries over 2^32 proposals"))
                     })?;
+                    #[cfg(test)]
+                    if let Some(hook) = &mut self.after_proposals {
+                        hook(index);
+                    }
                     // Before the closure record: whatever the total's write
                     // leaves for the closure to account is the entry's own,
                     // settled by its record, never a later entry's.

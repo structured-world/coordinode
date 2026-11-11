@@ -34,9 +34,21 @@ pub(crate) const CACHED_BREAKPOINTS: usize = 256;
 /// The most breakpoints one entry retires.
 pub(crate) const RETIRE_BATCH: usize = 64;
 
+/// The head record's key, in the Schema tree's engine-reserved namespace:
+/// protocol metadata of the engine, not an application row. Application
+/// scans, change enumeration and range deletion never reach it.
+pub(crate) const HEAD_KEY: &[u8] = b"\x00clh";
+
 /// The key prefix of the breakpoint records, beside the head record in the
-/// Schema partition; the index follows big-endian, so keys sort by position.
-pub(crate) const BREAKPOINT_PREFIX: &[u8] = b"closure:bp:";
+/// reserved namespace; the index follows big-endian, so keys sort by
+/// position.
+pub(crate) const BREAKPOINT_PREFIX: &[u8] = b"\x00clb";
+
+/// Where an earlier layout kept the head and the breakpoints, among the
+/// application's Schema rows. A store holding either is of a layout this
+/// build does not read: it is refused, never read as having no ledger.
+pub(crate) const REFUSED_HEAD_KEY: &[u8] = b"closure:below";
+pub(crate) const REFUSED_BREAKPOINT_PREFIX: &[u8] = b"closure:bp:";
 
 /// The head record's leading byte.
 const FORMAT: u8 = 2;
@@ -206,6 +218,14 @@ impl ClosureLedger {
         let mut last_index = self.last_index;
         let mut ceiling = self.applied_ceiling;
         for &(at, commit_ts) in commits {
+            // Entry 0 is the group's initial membership: the prefix through
+            // it is empty, its ceiling 0 (the anchor's), and a commit there
+            // would have no position the ledger could answer it at.
+            if at == 0 {
+                return Err(StorageError::Io(
+                    "a commit at log position 0, which holds the group's initial membership".into(),
+                ));
+            }
             if at < last_index {
                 continue;
             }
@@ -306,12 +326,18 @@ impl ClosureLedger {
     }
 
     /// The commit timestamp a read must reach to hold every commit of the
-    /// log through `index`, a position this member applied.
+    /// log through `index`, a position this member applied. Position 0 holds
+    /// the group's initial membership and no commit ([`Self::plan`] refuses
+    /// one there), so its prefix is empty and its ceiling 0, however far
+    /// retirement moved the anchor past it.
     ///
     /// # Errors
     ///
     /// The breakpoint records could not be read.
     pub(crate) fn ceiling_through(&self, index: u64, held: &dyn Breakpoints) -> StorageResult<u64> {
+        if index == 0 {
+            return Ok(0);
+        }
         if index <= self.anchor_through {
             return Ok(self.anchor_ceiling);
         }

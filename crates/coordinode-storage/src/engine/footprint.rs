@@ -1054,10 +1054,9 @@ fn breakpoint_removal() -> u64 {
 /// holds: it reads no tree.
 #[must_use]
 pub fn closure_debt(held: u64) -> u64 {
-    use crate::engine::closure_ledger::HEAD_LEN;
-    use crate::engine::core::CLOSURE_KEY;
+    use crate::engine::closure_ledger::{HEAD_KEY, HEAD_LEN};
     // One removal per record held: bounded by the records, no overflow.
-    footprint_of((CLOSURE_KEY.len() + HEAD_LEN) as u64, 1) + held * breakpoint_removal()
+    footprint_of((HEAD_KEY.len() + HEAD_LEN) as u64, 1) + held * breakpoint_removal()
 }
 
 /// What [`flush_debt`] can grow by when a memtable starts beside those

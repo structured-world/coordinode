@@ -447,19 +447,26 @@ impl StorageEngine {
     }
 
     /// The replicated rows of `partition` in this engine: every key but the
-    /// node-local ones ([`is_node_local`]) and the coverage records.
+    /// node-local ones ([`is_node_local`]), and, of the reserved records,
+    /// only the Schema tree's closure ledger, read at the same cut: the
+    /// position authority a copy of the same history carries. Coverage,
+    /// installation and accounting records keep their own rules.
     ///
     /// # Errors
     ///
     /// A read failure.
     pub fn replicated_rows(&self, partition: Partition) -> StorageResult<Rows> {
         let snapshot = self.snapshot();
-        Ok(self
+        let mut rows: Rows = self
             .snapshot_prefix_scan(&snapshot, partition, &[])?
             .into_iter()
             .filter(|(key, _)| !is_node_local(partition, key))
             .map(|(key, value)| (key, value.to_vec()))
-            .collect())
+            .collect();
+        if partition == Partition::Schema {
+            rows.extend(self.closure_rows_at(snapshot)?);
+        }
+        Ok(rows)
     }
 
     /// The replicated rows of `partition` in the checkpoint at
@@ -608,14 +615,12 @@ impl StorageEngine {
                 self.flush_memtables(tree)?;
             }
         }
-        // The index's inventory is taken while its repair still holds it.
+        // The index's inventory is taken, and the Schema tree's ledger
+        // installed, while its repair still holds it.
         for repair in repairs {
             let partition = repair.partition();
             self.finish_rebuild_with(repair, || {
-                if partition == Partition::Idx {
-                    self.index_transfer_installed(index_inventory)?;
-                }
-                Ok(())
+                self.establish_replaced(partition, index_inventory)
             })?;
         }
         Ok(())
@@ -643,13 +648,9 @@ impl StorageEngine {
         coverage::write_fold(tree, Domain::Raft, 0, next, payload, self.next_seqno());
         // A partition copy carries no inventory: every index copy in it is
         // unknown until checked here, under the repair, so no next repair's
-        // transfer is taken for this one's.
-        self.finish_rebuild_with(repair, || {
-            if partition == Partition::Idx {
-                self.index_transfer_installed(None)?;
-            }
-            Ok(())
-        })?;
+        // transfer is taken for this one's. The Schema tree's ledger is
+        // installed under the repair too.
+        self.finish_rebuild_with(repair, || self.establish_replaced(partition, None))?;
         // The partition was replaced wholesale, from a peer's copy or a
         // checkpoint: followers of the applies read it afresh.
         self.applied_feed.replaced(Some(partition));
@@ -734,12 +735,8 @@ impl StorageEngine {
         let Some(fence) = self.raft_fence() else {
             if whole {
                 let repair = self.begin_partition_rebuild(partition, &copy.rows)?;
-                return self.finish_rebuild_with(repair, || {
-                    if partition == Partition::Idx {
-                        self.index_transfer_installed(None)?;
-                    }
-                    Ok(())
-                });
+                return self
+                    .finish_rebuild_with(repair, || self.establish_replaced(partition, None));
             }
             for (key, value) in &copy.rows {
                 self.put(partition, key, value)?;

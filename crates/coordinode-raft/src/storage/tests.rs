@@ -1102,6 +1102,390 @@ async fn a_rebuild_the_log_cannot_complete_changes_nothing() {
     assert!(engine.pending_rebuilds().unwrap().is_empty());
 }
 
+/// The Schema tree rebuilt from a checkpoint holds the closure records of
+/// the entries the rebuild replays from the log, not only the checkpoint's:
+/// after the rebuild and a restart every position answers its own commit
+/// ceiling. Replaying only the proposals left the replayed positions
+/// answered with the checkpoint's last ceiling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_rebuilt_from_a_checkpoint_keeps_the_replayed_ceilings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open_dir(dir.path());
+    let mut log = LogStore::open(Arc::clone(&engine)).unwrap();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
+    // A group's history starts with its initial membership at entry 0, as
+    // openraft initializes it; the data entries follow from 1. The rebuild
+    // reads the log from the checkpoint's base, 0.
+    use openraft::entry::RaftEntry;
+    let membership = openraft::Membership::new(
+        vec![std::collections::BTreeSet::from([1])],
+        std::collections::BTreeMap::from([(1, MemberNode::new("http://node-1".into(), None))]),
+    )
+    .expect("a uniform configuration");
+    let initial = Entry::new_membership(log_id(1, 0), membership);
+    let first: Vec<Entry> = std::iter::once(initial)
+        .chain((1..=3).map(|i| two_tree_merge_entry(i, 1000 * i)))
+        .collect();
+    append_durable(&mut log, first.clone()).await;
+    apply_entries(&mut sm, first).await;
+    let ckpt_root = tempfile::tempdir().unwrap();
+    let ckpt = ckpt_root.path().join("c");
+    engine.create_checkpoint(&ckpt).unwrap();
+    let later: Vec<Entry> = (4..=6).map(|i| two_tree_merge_entry(i, 1000 * i)).collect();
+    append_durable(&mut log, later.clone()).await;
+    apply_entries(&mut sm, later).await;
+    // The empty prefix through the membership commits nothing.
+    let ceilings: Vec<u64> = (0..=6)
+        .map(|i| engine.commit_ceiling_through(i).expect("ceiling"))
+        .collect();
+    assert_eq!(ceilings, [0, 1000, 2000, 3000, 4000, 5000, 6000]);
+
+    rebuild_schema(&engine, log.oplog_handle(), &ckpt).await;
+    for (i, ceiling) in (0..=6).zip(&ceilings) {
+        assert_eq!(
+            engine.commit_ceiling_through(i).expect("ceiling"),
+            *ceiling,
+            "position {i} after the rebuild"
+        );
+    }
+
+    // Every owner of the store closes; the reopened store reads the ledger
+    // from the rebuilt tree alone.
+    drop(sm);
+    drop(log);
+    engine.persist().expect("persist");
+    drop(engine);
+    let engine = open_dir(dir.path());
+    let _log = LogStore::open(Arc::clone(&engine)).unwrap();
+    let _sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("reopen");
+    for (i, ceiling) in (0..=6).zip(&ceilings) {
+        assert_eq!(
+            engine.commit_ceiling_through(i).expect("ceiling"),
+            *ceiling,
+            "position {i} after the store reopened"
+        );
+    }
+}
+
+/// A proposal bound to a client operation: a counter increment bound to
+/// operation 1 of incarnation 1 with intent `intent`, or (intent 0) that
+/// incarnation's enrollment.
+fn bound_entry(index: u64, id: u64, commit_ts: u64, intent: u8) -> Entry {
+    use coordinode_core::txn::operation::{
+        DEFAULT_ADMISSION_WINDOW, INTENT_DIGEST_LEN, ISSUER_ID_LEN, IntentDigest, IssuerId,
+        OperationBinding, OperationCommand, OperationId,
+    };
+    use openraft::entry::RaftEntry;
+    let issuer = IssuerId([0x5a; ISSUER_ID_LEN]);
+    let mutations = if intent == 0 {
+        vec![Mutation::Operation(OperationCommand::Enroll {
+            issuer,
+            incarnation: 1,
+            window: DEFAULT_ADMISSION_WINDOW,
+        })]
+    } else {
+        vec![
+            Mutation::Merge {
+                partition: PartitionId::Counter,
+                key: b"counter:bound".to_vec(),
+                operand: coordinode_storage::engine::merge::encode_counter_delta(1),
+            },
+            Mutation::Operation(OperationCommand::Bind(OperationBinding {
+                op: OperationId {
+                    issuer,
+                    incarnation: 1,
+                    sequence: 1,
+                },
+                intent: IntentDigest([intent; INTENT_DIGEST_LEN]),
+                attempt: 100,
+            })),
+        ]
+    };
+    let proposal = RaftProposal {
+        id: coordinode_core::txn::proposal::ProposalId::from_raw(id),
+        mutations,
+        commit_ts: Timestamp::from_raw(commit_ts),
+        start_ts: Timestamp::from_raw(commit_ts - 1),
+        bypass_rate_limiter: false,
+    };
+    Entry::new_normal(log_id(1, index), Request::single(proposal))
+}
+
+/// The application rows of the Schema tree a rebuild compares: every key
+/// but this member's own (`raft:`, `meta:`).
+fn schema_rows(engine: &StorageEngine) -> Vec<(Vec<u8>, Vec<u8>)> {
+    engine
+        .prefix_scan(Partition::Schema, &[])
+        .expect("scan")
+        .map(|guard| {
+            let (key, value) = guard.into_inner().expect("row");
+            (key.to_vec(), value.to_vec())
+        })
+        .filter(|(key, _)| !key.starts_with(b"raft:") && !key.starts_with(b"meta:"))
+        .collect()
+}
+
+/// A retransmitted proposal bound to a client operation (same id, same
+/// size, a later commit) is decided again by its binding when a rebuild
+/// replays it, as its apply decided it: the rebuilt Schema tree holds the
+/// same records, the durable mark of the refused retransmission included,
+/// and every position keeps its ceiling, the retransmission's commit too,
+/// after the rebuild and after a restart. The rebuild's filter of repeated
+/// proposals dropped it unmarked and left its commit out of the ledger.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_decides_a_retransmitted_bound_proposal_as_its_apply_did() {
+    use openraft::entry::RaftEntry;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open_dir(dir.path());
+    let mut log = LogStore::open(Arc::clone(&engine)).unwrap();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
+    let membership = openraft::Membership::new(
+        vec![std::collections::BTreeSet::from([1])],
+        std::collections::BTreeMap::from([(1, MemberNode::new("http://node-1".into(), None))]),
+    )
+    .expect("a uniform configuration");
+    let first = vec![
+        Entry::new_membership(log_id(1, 0), membership),
+        bound_entry(1, 900, 1_000, 0),
+        bound_entry(2, 901, 2_000, 7),
+    ];
+    append_durable(&mut log, first.clone()).await;
+    apply_entries(&mut sm, first).await;
+    let ckpt_root = tempfile::tempdir().unwrap();
+    let ckpt = ckpt_root.path().join("c");
+    engine.create_checkpoint(&ckpt).unwrap();
+    // Another intent for the same operation, same id and size: the binding
+    // refuses it and marks the unit.
+    let later = vec![
+        bound_entry(3, 901, 3_000, 8),
+        two_tree_merge_entry(4, 4_000),
+    ];
+    append_durable(&mut log, later.clone()).await;
+    apply_entries(&mut sm, later).await;
+    let refused = coordinode_core::txn::operation::LogPosition { index: 3, sub: 0 };
+    let marked = |engine: &StorageEngine| {
+        coordinode_storage::engine::operations::unit_skipped(engine, refused).expect("mark")
+    };
+    let ceilings_of = |engine: &StorageEngine, through: u64| -> Vec<u64> {
+        (0..=through)
+            .map(|i| engine.commit_ceiling_through(i).expect("ceiling"))
+            .collect()
+    };
+    assert!(
+        marked(&engine),
+        "the apply marked the refused retransmission"
+    );
+    let rows = schema_rows(&engine);
+    assert_eq!(ceilings_of(&engine, 4), [0, 1_000, 2_000, 3_000, 4_000]);
+
+    rebuild_schema(&engine, log.oplog_handle(), &ckpt).await;
+    assert_eq!(schema_rows(&engine), rows, "the rebuilt Schema rows");
+    assert!(marked(&engine), "the rebuild kept the mark");
+    assert_eq!(
+        ceilings_of(&engine, 4),
+        [0, 1_000, 2_000, 3_000, 4_000],
+        "after the rebuild"
+    );
+
+    // The state machine that ran across the rebuild goes on.
+    let five = two_tree_merge_entry(5, 5_000);
+    append_durable(&mut log, vec![five.clone()]).await;
+    apply_entries(&mut sm, vec![five]).await;
+    let ceilings = [0, 1_000, 2_000, 3_000, 4_000, 5_000];
+    assert_eq!(ceilings_of(&engine, 5), ceilings, "after the next entry");
+    let rows = schema_rows(&engine);
+
+    // Every owner of the store closes; the directory opens again.
+    drop(sm);
+    drop(log);
+    engine.persist().expect("persist");
+    drop(engine);
+    let engine = open_dir(dir.path());
+    let _log = LogStore::open(Arc::clone(&engine)).unwrap();
+    let _sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("reopen");
+    assert_eq!(
+        schema_rows(&engine),
+        rows,
+        "the Schema rows after the store reopened"
+    );
+    assert!(marked(&engine), "the mark after the store reopened");
+    assert_eq!(
+        ceilings_of(&engine, 5),
+        ceilings,
+        "after the store reopened"
+    );
+}
+
+/// One client or rate-limit-bypassing write at `commit_ts`, to the Node and
+/// Schema trees: the Schema tree records the proposal's position too.
+fn granted_entry(index: u64, commit_ts: u64, bypass: bool) -> Entry {
+    use openraft::entry::RaftEntry;
+    let proposal = RaftProposal {
+        id: coordinode_core::txn::proposal::ProposalId::from_raw(10_000 + index),
+        mutations: vec![
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key: format!("node:1:g{index}").into_bytes(),
+                value: vec![7u8; 100 + index as usize],
+            },
+            Mutation::Put {
+                partition: PartitionId::Schema,
+                key: format!("test:g{index}").into_bytes(),
+                value: vec![1u8; 8],
+            },
+        ],
+        commit_ts: Timestamp::from_raw(commit_ts),
+        start_ts: Timestamp::from_raw(commit_ts - 1),
+        bypass_rate_limiter: bypass,
+    };
+    Entry::new_normal(log_id(1, index), Request::single(proposal))
+}
+
+/// The client bytes members pay for `entry`.
+fn entry_room(entry: &Entry) -> u64 {
+    match &entry.payload {
+        openraft::entry::EntryPayload::Normal(request) => request
+            .proposals
+            .iter()
+            .filter(|p| !p.bypass_rate_limiter)
+            .map(crate::cluster::grants::proposal_room)
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// The store at `dir`, opened as [`test_engine`] opens it.
+fn open_dir(dir: &std::path::Path) -> Arc<StorageEngine> {
+    Arc::new(
+        StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]))
+        .expect("open"),
+    )
+}
+
+/// Rebuild the Schema tree of `engine` from the checkpoint at `ckpt` and the
+/// log `oplog`.
+async fn rebuild_schema(engine: &Arc<StorageEngine>, oplog: RaftLogHandle, ckpt: &std::path::Path) {
+    let engine = Arc::clone(engine);
+    let ckpt = ckpt.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        rebuild_partition_from_checkpoint(&engine, &oplog, &ckpt, Partition::Schema)
+    })
+    .await
+    .expect("rebuild task")
+    .expect("rebuild");
+}
+
+/// The Schema tree rebuilt from a checkpoint holds the group's applied
+/// client bytes of the entries the rebuild replays, counted as their apply
+/// counted them: client entries only, closing and bypassing ones adding
+/// nothing, whatever order their commit timestamps came in. The checkpoint
+/// is taken inside entry 4, after its proposal and before its granted-bytes
+/// record, so it holds the one position and lacks the other. The total is
+/// the applied one after the rebuild and after rebuilding again; the state
+/// machine that ran across the rebuild adds the next entry's bytes once;
+/// after every owner of the store closed and the directory reopened, the
+/// reopened member reads the same total and adds the entry after once.
+/// Replaying only the proposals left the member with the checkpoint's
+/// total.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_rebuilt_from_a_checkpoint_keeps_the_granted_bytes() {
+    use openraft::entry::RaftEntry;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open_dir(dir.path());
+    let mut log = LogStore::open(Arc::clone(&engine)).unwrap();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
+    let ckpt_root = tempfile::tempdir().unwrap();
+    let ckpt = ckpt_root.path().join("c");
+    {
+        let (engine, ckpt) = (Arc::clone(&engine), ckpt.clone());
+        sm.after_proposals = Some(Box::new(move |index| {
+            if index == 4 {
+                engine.create_checkpoint(&ckpt).expect("checkpoint");
+            }
+        }));
+    }
+    let membership = openraft::Membership::new(
+        vec![std::collections::BTreeSet::from([1])],
+        std::collections::BTreeMap::from([(1, MemberNode::new("http://node-1".into(), None))]),
+    )
+    .expect("a uniform configuration");
+    let entries = vec![
+        Entry::new_membership(log_id(1, 0), membership),
+        granted_entry(1, 5_000, false),
+        granted_entry(2, 4_000, true),
+        granted_entry(3, 6_000, false),
+        granted_entry(4, 3_000, false),
+        Entry::new_normal(log_id(1, 5), Request::closing(2_000)),
+        granted_entry(6, 9_000, true),
+        granted_entry(7, 2_500, false),
+    ];
+    append_durable(&mut log, entries.clone()).await;
+    apply_entries(&mut sm, entries).await;
+    sm.after_proposals = None;
+    let total = GrantedBytes::load(&engine).expect("total");
+    assert_eq!(total.through, 7);
+    assert_eq!(total, sm.granted_bytes);
+
+    // The checkpoint holds entry 4's proposal and not its granted bytes.
+    let (_, held) =
+        StorageEngine::checkpoint_raft_partition(&ckpt, Partition::Schema).expect("checkpoint");
+    assert!(held.holds(4, 0), "the checkpoint holds the proposal");
+    assert!(!held.holds(4, 1), "the checkpoint lacks the granted bytes");
+
+    rebuild_schema(&engine, log.oplog_handle(), &ckpt).await;
+    assert_eq!(
+        GrantedBytes::load(&engine).expect("total"),
+        total,
+        "after the rebuild"
+    );
+
+    // The state machine that ran across the rebuild goes on.
+    let eight = granted_entry(8, 1_000, false);
+    let room8 = entry_room(&eight);
+    assert!(room8 > 0, "entry 8 is a client write");
+    append_durable(&mut log, vec![eight.clone()]).await;
+    apply_entries(&mut sm, vec![eight]).await;
+    let total8 = GrantedBytes {
+        through: 8,
+        total: total.total + room8,
+    };
+    assert_eq!(GrantedBytes::load(&engine).expect("total"), total8);
+    assert_eq!(sm.granted_bytes, total8);
+    rebuild_schema(&engine, log.oplog_handle(), &ckpt).await;
+    assert_eq!(
+        GrantedBytes::load(&engine).expect("total"),
+        total8,
+        "after rebuilding again"
+    );
+
+    // Every owner of the store closes; the directory opens again.
+    drop(sm);
+    drop(log);
+    engine.persist().expect("persist");
+    drop(engine);
+    let engine = open_dir(dir.path());
+    let mut log = LogStore::open(Arc::clone(&engine)).unwrap();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("reopen");
+    assert_eq!(sm.granted_bytes, total8, "after the store reopened");
+    let nine = granted_entry(9, 1_500, false);
+    let room9 = entry_room(&nine);
+    append_durable(&mut log, vec![nine.clone()]).await;
+    apply_entries(&mut sm, vec![nine]).await;
+    assert_eq!(
+        GrantedBytes::load(&engine).expect("total"),
+        GrantedBytes {
+            through: 9,
+            total: total8.total + room9,
+        }
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partition_installed_ahead_is_left_alone_until_the_applies_pass_it() {
     // A peer's copy of Counter standing at entry 6 replaces the local one

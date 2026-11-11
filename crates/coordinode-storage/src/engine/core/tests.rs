@@ -2103,14 +2103,18 @@ fn every_position_keeps_its_ceiling_past_the_cache_and_a_restart() {
     }
 }
 
-/// The breakpoint records the store holds, counted in the store.
+/// The breakpoint records the store holds, counted in the Schema tree's
+/// reserved namespace.
 fn stored_breakpoints(engine: &StorageEngine) -> u64 {
+    use lsm_tree::AbstractTree;
     engine
-        .prefix_scan(
-            Partition::Schema,
+        .tree(Partition::Schema)
+        .expect("schema tree")
+        .prefix(
             crate::engine::closure_ledger::BREAKPOINT_PREFIX,
+            lsm_tree::SeqNo::MAX,
+            None,
         )
-        .expect("scan")
         .count() as u64
 }
 

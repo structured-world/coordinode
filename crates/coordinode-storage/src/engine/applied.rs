@@ -426,10 +426,14 @@ impl AppliedFeed {
             let mut replaced = false;
             for mutation in mutations {
                 match mutation {
+                    // An engine-reserved key is the engine's own bookkeeping
+                    // (the closure ledger): no consumer reads it.
                     Mutation::Put { partition, key, .. }
                     | Mutation::Delete { partition, key }
                     | Mutation::Merge { partition, key, .. } => {
-                        if Partition::from(*partition) == subscriber.partition {
+                        if Partition::from(*partition) == subscriber.partition
+                            && !crate::engine::coverage::is_reserved(key)
+                        {
                             keys.push(key.clone());
                         }
                     }

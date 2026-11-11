@@ -72,6 +72,41 @@ impl Log {
     }
 }
 
+/// The prefix through position 0, the group's initial membership, is empty:
+/// its ceiling is 0 before and after commits apply, and a commit claimed at
+/// position 0 is refused rather than lost under the anchor.
+#[test]
+fn the_prefix_through_position_zero_is_empty() {
+    let mut log = Log::default();
+    assert_eq!(log.ceiling(0), 0);
+    log.entry(1, &[10], 0, 0);
+    log.entry(2, &[20], 11, 0);
+    assert_eq!(log.ceiling(0), 0);
+    assert_eq!(log.ceiling(1), 10);
+    assert!(
+        log.ledger.plan(&[(0, 5)], 0, 3, 0, &log.held).is_err(),
+        "a commit at position 0 was planned"
+    );
+}
+
+/// Retiring breakpoints moves the anchor past position 0 without giving it
+/// a ceiling: the prefix through position 0 stays empty, read live and from
+/// a reopened ledger, while the retired positions keep the anchor's.
+#[test]
+fn position_zero_stays_empty_once_breakpoints_retire() {
+    let mut log = Log::default();
+    log.entry(1, &[10], 0, 0);
+    log.entry(2, &[20], 0, 0);
+    log.entry(3, &[], 21, 21);
+    assert!(log.held.0.is_empty(), "the breakpoints retired");
+    assert_eq!(log.ceiling(0), 0);
+    assert_eq!(log.ceiling(1), 20);
+    assert_eq!(log.ceiling(2), 20);
+    let reopened = log.reopened();
+    assert_eq!(reopened.ceiling_through(0, &log.held).expect("ceiling"), 0);
+    assert_eq!(reopened.ceiling_through(2, &log.held).expect("ceiling"), 20);
+}
+
 /// An open position reads the ceiling of its own prefix, not of the log
 /// after it: a read there waits on no later commit.
 #[test]

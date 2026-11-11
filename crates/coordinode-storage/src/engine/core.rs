@@ -170,15 +170,15 @@ pub struct StorageEngine {
     pending_commits: Arc<crate::engine::pending::PendingCommits>,
     /// The closed bound of the Raft log applied here: every commit timestamp
     /// below it is in an entry applied on this node. `0` while no entry
-    /// carrying one has applied. Mirrors [`CLOSURE_KEY`].
+    /// carrying one has applied. Mirrors the ledger's head record.
     closure_frontier: AtomicU64,
     /// The highest commit timestamp of the Raft log applied here; `0` before
     /// any. Every such commit is in the log, so a closed bound reaches it
     /// once the leader covers it. Mirrors the ledger in `closure`.
     raft_applied_ts: AtomicU64,
     /// The closed bound and the commit ceilings of the Raft log applied
-    /// here, as its [`CLOSURE_KEY`] record and breakpoint records hold them;
-    /// see [`Self::commit_ceiling_through`].
+    /// here, as its head and breakpoint records hold them in the Schema
+    /// tree's reserved namespace; see [`Self::commit_ceiling_through`].
     // no-std: spin::Mutex; held for one update or one search.
     closure: parking_lot::Mutex<ClosureState>,
     /// The ledger's breakpoint records, read by the footprint's debt: each
@@ -962,10 +962,13 @@ impl StorageEngine {
             if let Some(first_servable) = schema_tree.retention_floor().checked_add(1) {
                 seqno.fetch_max(first_servable);
             }
+            // A store of the layout that kept the ledger among the Schema
+            // rows is refused before anything here writes to it.
+            refuse_earlier_closure_layout(&schema_tree, seqno.get())?;
             // The cleanup a stored closure ledger owes is owed from the open
             // on, before any other tree opens or maintenance runs.
             let head = schema_tree
-                .get(CLOSURE_KEY, seqno.get())
+                .get(crate::engine::closure_ledger::HEAD_KEY, seqno.get())
                 .map_err(|e| StorageError::Io(format!("schema get closed bound: {e}")))?;
             if let Some(head) = head {
                 closure_held.store(
@@ -3760,6 +3763,23 @@ impl StorageEngine {
         self.leave_repair(partition);
         drop(repair);
         Ok(())
+    }
+
+    /// What a partition replaced from a copy establishes before its repair
+    /// ends ([`Self::finish_rebuild_with`]'s last step): the index tree's
+    /// transferred copies qualified against `index_inventory`, and the
+    /// Schema tree's closure ledger installed for readers, its cleanup owed.
+    /// A failure leaves the partition owed its repair.
+    pub(crate) fn establish_replaced(
+        &self,
+        partition: Partition,
+        index_inventory: Option<&[u8]>,
+    ) -> StorageResult<()> {
+        match partition {
+            Partition::Idx => self.index_transfer_installed(index_inventory),
+            Partition::Schema => self.reload_closure_frontier(),
+            _ => Ok(()),
+        }
     }
 
     /// Refuse a repair taken on another store.
@@ -6658,8 +6678,6 @@ impl StorageEngine {
         index: u64,
         replaying: bool,
     ) -> StorageResult<Option<(Vec<coordinode_core::txn::proposal::Mutation>, u64)>> {
-        use coordinode_core::txn::proposal::{Mutation, PartitionId};
-
         let retained = if replaying {
             0
         } else {
@@ -6670,34 +6688,53 @@ impl StorageEngine {
         let plan = state
             .ledger
             .plan(&pending, below, index, retained, &StoredBreakpoints(self))?;
-        let head = state.ledger.encode_after(&plan);
-        let writes = if head == state.ledger.encode() && plan.writes_no_breakpoint() {
-            None
-        } else {
-            let mut mutations = vec![Mutation::Put {
-                partition: PartitionId::Schema,
-                key: CLOSURE_KEY.to_vec(),
-                value: head,
-            }];
-            mutations.extend(plan.added().iter().map(|b| Mutation::Put {
-                partition: PartitionId::Schema,
-                key: b.key(),
-                value: b.value().to_vec(),
-            }));
-            mutations.extend(plan.retired().iter().map(|b| Mutation::Delete {
-                partition: PartitionId::Schema,
-                key: b.key(),
-            }));
-            let ceiling = plan
-                .added()
-                .last()
-                .map_or(state.ledger.applied_ceiling(), |b| b.ceiling);
-            let bound = below.max(state.ledger.below());
-            let at = bound.checked_sub(1).map_or(ceiling, |b| b.max(ceiling));
-            Some((mutations, at))
-        };
+        let writes = closure_writes(&state.ledger, &plan, below);
         state.prepared = Some(plan);
         Ok(writes)
+    }
+
+    /// The ledger the Schema tree holds now, for a rebuild that replays the
+    /// closure records of the entries its source cut lacks
+    /// ([`Self::replay_closure_record`]). Read with the applies paused, after
+    /// the source's rows are installed.
+    ///
+    /// # Errors
+    ///
+    /// The head or the breakpoint records cannot be read, or the tree holds
+    /// the ledger where an earlier layout kept it.
+    pub fn closure_replay(&self) -> StorageResult<ClosureReplay> {
+        Ok(ClosureReplay(self.stored_closure_ledger()?))
+    }
+
+    /// Write the closure records entry `index` makes, as the apply of the
+    /// entry made them, into the Schema tree a rebuild is filling: `commits`
+    /// are the `(index, commit_ts)` of its proposals, `below` the bound it
+    /// carries (`0` for none), `sub` its closure record's position in the
+    /// entry. Records the rebuild's source already holds (`held`) are not
+    /// written again, and the replay retires nothing, as a restart's replay
+    /// does. Call with the applies paused.
+    ///
+    /// # Errors
+    ///
+    /// The breakpoint records cannot be read or the records cannot be
+    /// written.
+    pub fn replay_closure_record(
+        &self,
+        replay: &mut ClosureReplay,
+        commits: &[(u64, u64)],
+        below: u64,
+        index: u64,
+        sub: u32,
+        held: bool,
+    ) -> StorageResult<()> {
+        let plan = replay
+            .0
+            .plan(commits, below, index, 0, &StoredBreakpoints(self))?;
+        if !held && let Some((records, at)) = closure_writes(&replay.0, &plan, below) {
+            self.apply_raft_proposal(&records, at, index, sub, |p| p != Partition::Schema)?;
+        }
+        replay.0.install(&plan);
+        Ok(())
     }
 
     /// Account for entry `index` once the writes [`Self::closure_record`]
@@ -6816,21 +6853,7 @@ impl StorageEngine {
     ///
     /// The record cannot be read or is malformed.
     pub fn reload_closure_frontier(&self) -> StorageResult<()> {
-        use crate::engine::closure_ledger::{BREAKPOINT_PREFIX, Breakpoint, ClosureLedger};
-        let ledger = match self.get(Partition::Schema, CLOSURE_KEY)? {
-            // The newest breakpoints only, read from the top: never the
-            // whole window.
-            Some(bytes) => ClosureLedger::decode(
-                &bytes,
-                self.prefix_scan_rev(Partition::Schema, BREAKPOINT_PREFIX)?
-                    .map(|guard| {
-                        let (key, value) = guard.into_inner()?;
-                        Breakpoint::decode(&key, &value)
-                    }),
-                &StoredBreakpoints(self),
-            )?,
-            None => ClosureLedger::default(),
-        };
+        let ledger = self.stored_closure_ledger()?;
         self.closure_frontier
             .store(ledger.below(), std::sync::atomic::Ordering::Release);
         self.raft_applied_ts.store(
@@ -6844,6 +6867,50 @@ impl StorageEngine {
             ..ClosureState::default()
         };
         Ok(())
+    }
+
+    /// The ledger the Schema tree holds: its head with the newest
+    /// breakpoints, read from the top (never the whole window), and the
+    /// first one after its anchor; empty when the tree holds no head.
+    fn stored_closure_ledger(&self) -> StorageResult<crate::engine::closure_ledger::ClosureLedger> {
+        use crate::engine::closure_ledger::{
+            BREAKPOINT_PREFIX, Breakpoint, ClosureLedger, HEAD_KEY,
+        };
+        use lsm_tree::{AbstractTree, Guard as _};
+        let tree = self.tree(Partition::Schema)?;
+        refuse_earlier_closure_layout(tree, lsm_tree::SeqNo::MAX)?;
+        let Some(bytes) = tree.get(HEAD_KEY, lsm_tree::SeqNo::MAX)? else {
+            return Ok(ClosureLedger::default());
+        };
+        ClosureLedger::decode(
+            &bytes,
+            tree.prefix(BREAKPOINT_PREFIX, lsm_tree::SeqNo::MAX, None)
+                .rev()
+                .map(|guard| {
+                    let (key, value) = guard.into_inner()?;
+                    Breakpoint::decode(&key, &value)
+                }),
+            &StoredBreakpoints(self),
+        )
+    }
+
+    /// The ledger's records as the Schema tree holds them at `seqno`: what a
+    /// copy of the partition carries beside its rows, from the same cut. Only
+    /// these of the reserved records: coverage, installation and accounting
+    /// records keep their own rules.
+    pub(crate) fn closure_rows_at(&self, seqno: lsm_tree::SeqNo) -> StorageResult<Rows> {
+        use crate::engine::closure_ledger::{BREAKPOINT_PREFIX, HEAD_KEY};
+        use lsm_tree::{AbstractTree, Guard as _};
+        let tree = self.tree(Partition::Schema)?;
+        let mut rows = Vec::new();
+        if let Some(head) = tree.get(HEAD_KEY, seqno)? {
+            rows.push((HEAD_KEY.to_vec(), head.to_vec()));
+        }
+        for guard in tree.prefix(BREAKPOINT_PREFIX, seqno, None) {
+            let (key, value) = guard.into_inner()?;
+            rows.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(rows)
     }
 
     /// Open a tap on `partition` and return it with a snapshot: every write
@@ -8045,12 +8112,76 @@ fn new_maintenance_budget(
 /// rebuild is in progress, named after the partition.
 const REBUILD_INTENT_DIR: &str = "rebuild";
 
-/// Schema record of the Raft log's closed bound and the anchor of its
-/// prefixes' commit ceilings as applied here, written by the apply of each
-/// entry that changes them beside the breakpoint records; see
-/// [`StorageEngine::closure_record`]. A snapshot carries both, and a restart
-/// finds them with the entries its tree holds.
-pub const CLOSURE_KEY: &[u8] = b"closure:below";
+/// The ledger a rebuild replays closure records against: the one its source
+/// cut installed, advanced entry by entry; see
+/// [`StorageEngine::replay_closure_record`].
+pub struct ClosureReplay(crate::engine::closure_ledger::ClosureLedger);
+
+/// Refuse a Schema tree holding the closure ledger where an earlier layout
+/// kept it, among the application's rows: this build reads the ledger only
+/// from the reserved namespace and would take that store for one without a
+/// ledger, every prefix closed.
+fn refuse_earlier_closure_layout(
+    tree: &lsm_tree::AnyTree,
+    seqno: lsm_tree::SeqNo,
+) -> StorageResult<()> {
+    use crate::engine::closure_ledger::{REFUSED_BREAKPOINT_PREFIX, REFUSED_HEAD_KEY};
+    use lsm_tree::AbstractTree;
+    let earlier = tree.get(REFUSED_HEAD_KEY, seqno)?.is_some()
+        || tree
+            .prefix(REFUSED_BREAKPOINT_PREFIX, seqno, None)
+            .next()
+            .is_some();
+    if earlier {
+        return Err(StorageError::InvalidConfig(
+            "this store keeps the Raft closure ledger among its Schema rows, a layout this \
+             release does not read; it was written by an earlier build"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The Schema writes `plan` makes against `ledger`, with the timestamp to
+/// write them at, or `None` when it changes nothing: the head as the plan
+/// leaves it, a record per breakpoint it adds and the removal of each it
+/// retires, all in the reserved namespace. The timestamp is the larger of the
+/// commit ceiling and the bound less one: no earlier than the entry's own
+/// writes, and below every commit the bound leaves open.
+fn closure_writes(
+    ledger: &crate::engine::closure_ledger::ClosureLedger,
+    plan: &crate::engine::closure_ledger::ClosurePlan,
+    below: u64,
+) -> Option<(Vec<coordinode_core::txn::proposal::Mutation>, u64)> {
+    use crate::engine::closure_ledger::HEAD_KEY;
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    let head = ledger.encode_after(plan);
+    if head == ledger.encode() && plan.writes_no_breakpoint() {
+        return None;
+    }
+    let mut mutations = Vec::with_capacity(1 + plan.added().len() + plan.retired().len());
+    mutations.push(Mutation::Put {
+        partition: PartitionId::Schema,
+        key: HEAD_KEY.to_vec(),
+        value: head,
+    });
+    mutations.extend(plan.added().iter().map(|b| Mutation::Put {
+        partition: PartitionId::Schema,
+        key: b.key(),
+        value: b.value().to_vec(),
+    }));
+    mutations.extend(plan.retired().iter().map(|b| Mutation::Delete {
+        partition: PartitionId::Schema,
+        key: b.key(),
+    }));
+    let ceiling = plan
+        .added()
+        .last()
+        .map_or(ledger.applied_ceiling(), |b| b.ceiling);
+    let bound = below.max(ledger.below());
+    let at = bound.checked_sub(1).map_or(ceiling, |b| b.max(ceiling));
+    Some((mutations, at))
+}
 
 /// This member's client grant record in the Raft partition: the horizon its
 /// reports reached and the count of its openings, two big-endian u64s.
@@ -8072,7 +8203,9 @@ struct ClosureState {
     prepared: Option<crate::engine::closure_ledger::ClosurePlan>,
 }
 
-/// The breakpoint records in the Schema tree.
+/// The breakpoint records in the Schema tree's reserved namespace, read by
+/// bounded seeks of the tree itself: the application's scans never reach
+/// that namespace.
 struct StoredBreakpoints<'a>(&'a StorageEngine);
 
 impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
@@ -8082,13 +8215,18 @@ impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
         through: u64,
     ) -> StorageResult<Option<crate::engine::closure_ledger::Breakpoint>> {
         use crate::engine::closure_ledger::{Breakpoint, breakpoint_key};
+        use lsm_tree::{AbstractTree, Guard as _};
+        if from > through {
+            return Ok(None);
+        }
         self.0
-            .range_scan_rev(
-                Partition::Schema,
-                &breakpoint_key(from),
-                &breakpoint_key(through),
-            )?
-            .next()
+            .tree(Partition::Schema)?
+            .range(
+                breakpoint_key(from)..=breakpoint_key(through),
+                lsm_tree::SeqNo::MAX,
+                None,
+            )
+            .next_back()
             .map(|guard| {
                 let (key, value) = guard.into_inner()?;
                 Breakpoint::decode(&key, &value)
@@ -8102,15 +8240,17 @@ impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
         limit: usize,
     ) -> StorageResult<Vec<crate::engine::closure_ledger::Breakpoint>> {
         use crate::engine::closure_ledger::{Breakpoint, breakpoint_key};
+        use lsm_tree::{AbstractTree, Guard as _};
         let Some(from) = after.checked_add(1) else {
             return Ok(Vec::new());
         };
         self.0
-            .range_scan(
-                Partition::Schema,
-                &breakpoint_key(from),
-                &breakpoint_key(u64::MAX),
-            )?
+            .tree(Partition::Schema)?
+            .range(
+                breakpoint_key(from)..=breakpoint_key(u64::MAX),
+                lsm_tree::SeqNo::MAX,
+                None,
+            )
             .take(limit)
             .map(|guard| {
                 let (key, value) = guard.into_inner()?;
@@ -8388,6 +8528,10 @@ mod material_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod material_fold_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod closure_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
