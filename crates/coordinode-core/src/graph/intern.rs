@@ -471,37 +471,96 @@ impl FieldInterner {
     /// Truncated or trailing bytes, a name that is not UTF-8, id 0, or a
     /// name or id bound twice.
     pub fn from_bytes(data: &[u8]) -> Result<Self, DictionaryError> {
-        let malformed = |what: &str| DictionaryError::Malformed(what.to_owned());
-        let (count, mut rest) = data
-            .split_first_chunk::<4>()
-            .ok_or_else(|| malformed("no binding count"))?;
-        let count = u32::from_le_bytes(*count) as usize;
-        // Each binding takes at least 6 bytes, so a count the data cannot hold
-        // is refused before anything is allocated for it.
-        if count > rest.len() / 6 {
-            return Err(malformed("binding count exceeds the data"));
-        }
-        let mut bindings = Vec::with_capacity(count);
-        for _ in 0..count {
-            let (id, after) = rest
-                .split_first_chunk::<4>()
-                .ok_or_else(|| malformed("truncated binding id"))?;
-            let (len, after) = after
-                .split_first_chunk::<2>()
-                .ok_or_else(|| malformed("truncated name length"))?;
-            let len = usize::from(u16::from_le_bytes(*len));
-            if after.len() < len {
-                return Err(malformed("truncated name"));
-            }
-            let (name, after) = after.split_at(len);
-            let name = std::str::from_utf8(name).map_err(|_| malformed("name is not UTF-8"))?;
-            bindings.push((name.to_owned(), u32::from_le_bytes(*id)));
-            rest = after;
-        }
-        if !rest.is_empty() {
-            return Err(malformed("bytes past the last binding"));
+        let encoded = EncodedBindings::new(data)?;
+        let mut bindings = Vec::with_capacity(encoded.len());
+        for binding in encoded {
+            let (name, id) = binding?;
+            bindings.push((name.to_owned(), id));
         }
         Self::from_bindings(bindings)
+    }
+}
+
+/// The bindings of a dictionary [`FieldInterner::to_bytes`] wrote, read in
+/// place in id order, nothing allocated: what compares a serialized
+/// dictionary with another without building either.
+#[derive(Debug)]
+pub struct EncodedBindings<'a> {
+    rest: &'a [u8],
+    left: usize,
+}
+
+impl<'a> EncodedBindings<'a> {
+    /// The bindings `data` holds.
+    ///
+    /// # Errors
+    ///
+    /// No binding count, or a count the data cannot hold.
+    pub fn new(data: &'a [u8]) -> Result<Self, DictionaryError> {
+        let (count, rest) = data
+            .split_first_chunk::<4>()
+            .ok_or_else(|| DictionaryError::Malformed("no binding count".into()))?;
+        let left = u32::from_le_bytes(*count) as usize;
+        // Each binding takes at least 6 bytes, so a count the data cannot hold
+        // is refused before anything is allocated for it.
+        if left > rest.len() / 6 {
+            return Err(DictionaryError::Malformed(
+                "binding count exceeds the data".into(),
+            ));
+        }
+        Ok(Self { rest, left })
+    }
+
+    /// How many bindings are left to read.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.left
+    }
+
+    /// Whether every binding was read.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.left == 0
+    }
+}
+
+impl<'a> Iterator for EncodedBindings<'a> {
+    type Item = Result<(&'a str, u32), DictionaryError>;
+
+    /// The next binding; after the last, an error if bytes follow it.
+    fn next(&mut self) -> Option<Self::Item> {
+        let malformed = |what: &str| Some(Err(DictionaryError::Malformed(what.to_owned())));
+        if self.left == 0 {
+            if self.rest.is_empty() {
+                return None;
+            }
+            self.rest = &[];
+            return malformed("bytes past the last binding");
+        }
+        self.left -= 1;
+        let parsed = self.rest.split_first_chunk::<4>().and_then(|(id, after)| {
+            let (len, after) = after.split_first_chunk::<2>()?;
+            let len = usize::from(u16::from_le_bytes(*len));
+            (after.len() >= len).then(|| {
+                let (name, after) = after.split_at(len);
+                (u32::from_le_bytes(*id), name, after)
+            })
+        });
+        let Some((id, name, after)) = parsed else {
+            // Nothing past a malformed binding is read.
+            self.left = 0;
+            self.rest = &[];
+            return malformed("truncated binding");
+        };
+        self.rest = after;
+        match std::str::from_utf8(name) {
+            Ok(name) => Some(Ok((name, id))),
+            Err(_) => {
+                self.left = 0;
+                self.rest = &[];
+                malformed("name is not UTF-8")
+            }
+        }
     }
 }
 

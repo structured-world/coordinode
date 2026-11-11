@@ -1170,6 +1170,58 @@ type and every version of a temporal node under its own discriminator or
   reported as an error, and that index is marked failed, so lookups stop using
   it, until the data is fixed and the index is created again.
 
+### Restoring a snapshot backup
+
+A `snapshot` backup is the whole database at one moment: every record, the
+field dictionary and the deployment its history belongs to are read from the
+same cut, so writes landing while the backup runs are either all in it or not
+at all. `coordinode restore --format snapshot` installs it as a new store.
+
+A member of a replicated group applies its group's commits in log order,
+which is not always timestamp order, so a backup of a member's store holds
+the commits its log has closed: those every later commit is known to follow.
+A write the leader had not yet closed when the member stopped (the leader
+closes an idle write within moments) is left out. The backup is refused when
+the store cannot show that every partition holds every log entry its closed
+bound accounts for, as after a power cut that kept one tree's records and
+lost another's: start the member once so it replays its log, stop it, and
+back up again. A member's store with `STORAGE COLUMNAR` tables is refused, as
+is one whose state at the closed cut was already collected.
+
+- **The target must be empty.** Every configured directory must be absent or
+  empty. A directory that holds a store, a group member's included, is refused
+  before anything is opened, and is left byte for byte as it was. To replace a
+  store, move it aside first.
+- **The whole input is checked before the target is touched.** A truncated or
+  corrupted file, an unknown format, or a backup whose frame names another
+  deployment or another field dictionary than its image is refused, and the
+  target directory is not created.
+- **The restore owns the target while it runs.** Every directory is held from
+  the check that finds it empty to the end of the restore, as an open store
+  holds its own; a second restore or a server started on it meanwhile is
+  refused with "in use by another open store or a restore". Two endpoints
+  naming the same directory are refused, and so is a configuration whose
+  first endpoint is volatile, since it keeps the catalog and the restore's
+  claim nowhere durable.
+- **A restore cut short is finished by running it again.** The restore marks
+  every target directory with the image it installs and the full set of
+  directories before writing anything, and removes the marks only once
+  everything installed is durable. Until then the store does not open (the
+  error names the unfinished restore), and a restore of a different backup, or
+  into another set of directories, is refused. Rerun the same restore to finish
+  it, or empty the directories to start over. A rerun starts the install over
+  rather than adding to what the cut-short one wrote.
+- **The restore stays within the memory limit.** It reads the backup twice
+  from one open file, first to check it, then to install it in batches, and
+  holds at once no more than `query_memory_limit_mb` (256 MiB by default):
+  an image of any size restores, and a single record larger than the limit is
+  refused before it is read and before the target is touched. If the file
+  changes between the two passes, the restore fails without serving anything;
+  run it again with the intended file.
+- **Only the data and its stable records travel.** Operation outcomes, the
+  history and its deployment are restored; a group member's own consensus
+  state (its log position, membership, election state) is not.
+
 ## Growing and shrinking a cluster
 
 A single machine that already holds data becomes a replicated cluster in

@@ -108,6 +108,13 @@ struct Counted<'a> {
     bytes: u64,
 }
 
+/// Bytes a tree batch's tally holds per unit it counts.
+pub(crate) const COUNTED_SLOT: u64 = core::mem::size_of::<Counted<'static>>() as u64;
+
+/// Bytes of a unit record beyond the key it carries: its key and the kind,
+/// length and key-length fields of its value ([`unit_value`]).
+pub(crate) const UNIT_RECORD_FIXED: u64 = UNIT_KEY_LEN as u64 + 1 + 8 + 4;
+
 /// Sums the units of one tree's batch and puts their records.
 #[derive(Debug, Default)]
 pub(crate) struct Tally<'a> {

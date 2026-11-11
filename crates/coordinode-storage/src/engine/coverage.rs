@@ -86,7 +86,7 @@ impl Domain {
     }
 }
 
-const MARKER_LEN: usize = 16;
+pub(crate) const MARKER_LEN: usize = 16;
 
 /// The coverage marker one apply writes into every tree it touches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

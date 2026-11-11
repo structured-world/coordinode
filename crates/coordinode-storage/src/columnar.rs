@@ -74,11 +74,15 @@ pub fn enable_columnar(tree: &AnyTree) -> StorageResult<()> {
 /// Returns [`StorageError::Engine`] if the batch shape is invalid, the keys are
 /// not strictly increasing, the tree is not columnar, or a block write fails.
 pub fn write_columnar_rows(tree: &AnyTree, rows: &[ColumnarRow<'_>]) -> StorageResult<()> {
-    let entries: Vec<InternalValue> = rows
-        .iter()
-        .map(|r| InternalValue::from_components(r.key, r.value, 0, ValueType::Value))
-        .collect();
-    let batch = entries_to_column_batch(&entries)?;
+    // The entries are only the transpose's input: gone before the write
+    // holds its own copies of the batch.
+    let batch = {
+        let entries: Vec<InternalValue> = rows
+            .iter()
+            .map(|r| InternalValue::from_components(r.key, r.value, 0, ValueType::Value))
+            .collect();
+        entries_to_column_batch(&entries)?
+    };
     let mut ingestion = tree.ingestion()?;
     ingestion.write_columnar_batch(&batch)?;
     ingestion.finish()?;

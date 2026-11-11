@@ -362,6 +362,12 @@ pub struct StorageEngine {
     /// Journal indices held while a consumer registering at them publishes
     /// the floor that keeps them.
     journal_holds: crate::engine::oplog_journal::JournalHolds,
+    /// Whether the store holds a consensus group's history (its log is bound
+    /// to a group, or its trees hold entries of one), as found at open.
+    group_history: bool,
+    /// The holds on the data directories. Last, so they are released only
+    /// once every tree above is closed.
+    _directory_locks: crate::format::DirectoryLocks,
 }
 
 /// History entries a replacement import writes between two admissions
@@ -746,6 +752,41 @@ impl StorageEngine {
         Ok(true)
     }
 
+    /// Open the directories `claim` holds for the restore that claimed them,
+    /// as [`Self::open_with_oracle`] does: the claim's holds pass to the
+    /// engine, and the unfinished restore it is for does not refuse the
+    /// open. The restore installs its image through this engine and ends
+    /// with [`crate::format::finish_restore`] before dropping it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_with_oracle`];
+    /// [`StorageError::RestoreTarget`] when `config` names other
+    /// directories than the claim covers.
+    pub fn open_restoring(
+        config: &StorageConfig,
+        oracle: std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+        claim: crate::format::RestoreClaim,
+    ) -> StorageResult<Self> {
+        let gc_watermark = Arc::new(AtomicU64::new(0));
+        let seqno: lsm_tree::SharedSequenceNumberGenerator =
+            Arc::new(OracleSeqnoGenerator(Arc::clone(&oracle)));
+        // No batch of a restore needs to be durable on its own: its claim
+        // keeps a cut-short install unserved and the rerun starts it over,
+        // and the restore persists once before it ends the claim. Full
+        // memtables still flush in the background.
+        let mut config = config.clone();
+        config.flush_policy = FlushPolicy::Manual;
+        Self::finish_open_with(
+            &config,
+            seqno,
+            gc_watermark,
+            Some(oracle),
+            None,
+            Some(claim),
+        )
+    }
+
     fn finish_open(
         config: &StorageConfig,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
@@ -753,9 +794,27 @@ impl StorageEngine {
         oracle: Option<std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
         journal_config: Option<OplogJournalConfig>,
     ) -> StorageResult<Self> {
-        // Before anything reads the directory: a directory of another engine
-        // format is migrated or refused here, never opened as it is.
-        let format = crate::format::prepare(config)?;
+        Self::finish_open_with(config, seqno, gc_watermark, oracle, journal_config, None)
+    }
+
+    fn finish_open_with(
+        config: &StorageConfig,
+        seqno: lsm_tree::SharedSequenceNumberGenerator,
+        gc_watermark: Arc<AtomicU64>,
+        oracle: Option<std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+        journal_config: Option<OplogJournalConfig>,
+        claim: Option<crate::format::RestoreClaim>,
+    ) -> StorageResult<Self> {
+        // Before anything reads the directory: the directories are taken,
+        // and one of another engine format is migrated or refused here,
+        // never opened as it is.
+        let crate::format::Prepared {
+            format,
+            locks: directory_locks,
+        } = match claim {
+            Some(claim) => crate::format::prepare_restoring(config, claim)?,
+            None => crate::format::prepare(config)?,
+        };
 
         // Built here rather than inside the coordinator: the capacity scanner
         // is spawned below, before the coordinator exists, and its cascade
@@ -1620,6 +1679,12 @@ impl StorageEngine {
             &config.data_dir().join(raft_coverage::PARTITION_CAPTURE_DIR),
         )?;
 
+        // Durable evidence, not a running state machine: a member's store
+        // opened offline holds its group's history all the same.
+        let group_history = match config.select_oplog_endpoint(0) {
+            Ok(endpoint) => group_history_evidence(&endpoint.path, &trees)?.is_some(),
+            Err(_) => false,
+        };
         let coordinator = LocalMultiModalCoordinator::new(
             trees,
             Arc::clone(&seqno),
@@ -1708,6 +1773,8 @@ impl StorageEngine {
             consumer_journal_floor: AtomicU64::new(if protections_pending { 0 } else { u64::MAX }),
             protections_pending: std::sync::atomic::AtomicBool::new(protections_pending),
             journal_holds: Default::default(),
+            group_history,
+            _directory_locks: directory_locks,
         };
         engine.drain_local_journal()?;
         // A repair that lost nothing owes only the tail the journal or the
@@ -2522,6 +2589,77 @@ impl StorageEngine {
                         .into(),
                 ))
             }
+        }
+    }
+
+    /// Drop every `STORAGE COLUMNAR` table: the start of installing a
+    /// whole-store image table by table ([`Self::reset_columnar_table`],
+    /// [`Self::append_columnar_rows`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if a tree cannot be dropped.
+    pub fn clear_columnar_tables(&self) -> StorageResult<()> {
+        #[cfg(feature = "columnar")]
+        for table_id in self.columnar_tables.table_ids() {
+            self.columnar_tables.drop_table(&table_id)?;
+        }
+        Ok(())
+    }
+
+    /// Create `table_id` empty, dropping a table of that name: a table of a
+    /// whole-store image, its rows following through
+    /// [`Self::append_columnar_rows`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the tree cannot be dropped or
+    /// created, and [`StorageError::InvalidConfig`] in a build without
+    /// columnar support.
+    pub fn reset_columnar_table(&self, table_id: &str) -> StorageResult<()> {
+        #[cfg(feature = "columnar")]
+        {
+            self.columnar_tables.drop_table(table_id)?;
+            self.open_columnar_table(table_id).map(drop)
+        }
+        #[cfg(not(feature = "columnar"))]
+        {
+            Err(StorageError::InvalidConfig(format!(
+                "the image carries STORAGE COLUMNAR table {table_id}; this build has no \
+                 columnar support"
+            )))
+        }
+    }
+
+    /// Write `rows` (sorted by key, each above the last written) into
+    /// `table_id`, which [`Self::reset_columnar_table`] created.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the tree cannot be opened or
+    /// written, and [`StorageError::InvalidConfig`] in a build without
+    /// columnar support.
+    pub fn append_columnar_rows(
+        &self,
+        table_id: &str,
+        rows: &[(Vec<u8>, Vec<u8>)],
+    ) -> StorageResult<()> {
+        #[cfg(feature = "columnar")]
+        {
+            let (tree, _) = self.open_columnar_table(table_id)?;
+            let rows: Vec<crate::columnar::ColumnarRow<'_>> = rows
+                .iter()
+                .map(|(key, value)| crate::columnar::ColumnarRow { key, value })
+                .collect();
+            crate::columnar::write_columnar_rows(&tree, &rows)
+        }
+        #[cfg(not(feature = "columnar"))]
+        {
+            let _ = rows;
+            Err(StorageError::InvalidConfig(format!(
+                "the image carries STORAGE COLUMNAR table {table_id}; this build has no \
+                 columnar support"
+            )))
         }
     }
 
@@ -4444,6 +4582,90 @@ impl StorageEngine {
         self.pin_new_snapshot(|| self.snapshot())
     }
 
+    /// The cut an offline capture of the whole store reads every partition
+    /// at (strictly below it), pinned for as long as the capture reads.
+    ///
+    /// A store outside any group learns of every commit before it lands, so
+    /// its latest complete snapshot is such a cut. A store holding a group's
+    /// history applied commits in log order, which need not be timestamp
+    /// order: its cut is the log's closed bound as its Schema tree records
+    /// it, below which every commit is in an entry applied before. That
+    /// bound only holds where every partition physically holds every entry
+    /// it accounts for, which the trees' coverage bases must show; a power
+    /// cut that kept the bound and lost an entry behind it in another tree
+    /// is refused, not captured as if the bound held. Every included tree,
+    /// the consumer registry among them although it keeps no history of its
+    /// own, must still serve the cut under the pin, or the capture is
+    /// refused rather than read a later state.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::CaptureRefused`] when no cut qualifies; a read of the
+    /// closed bound or of a coverage record fails.
+    pub fn pin_capture_cut(&self) -> StorageResult<(lsm_tree::SeqNo, Option<SnapshotPin>)> {
+        use lsm_tree::AbstractTree as _;
+        let refuse = |reason: String| StorageError::CaptureRefused { reason };
+        let included = || {
+            Partition::all()
+                .iter()
+                .copied()
+                .filter(|&p| p != Partition::Raft)
+        };
+        let (cut, pin) = if self.group_history {
+            let ledger = self.stored_closure_ledger()?;
+            let coverage = self.raft_coverage()?;
+            for part in included() {
+                match coverage.base_of(part) {
+                    Some(next) if next > ledger.last_index() => {}
+                    held => {
+                        return Err(refuse(format!(
+                            "its closed bound accounts for its group's log through entry {}, \
+                             but its {} tree is shown to hold that log only below {}; open \
+                             it as a member until its trees hold the entries, then capture",
+                            ledger.last_index(),
+                            part.name(),
+                            held.unwrap_or(0)
+                        )));
+                    }
+                }
+            }
+            #[cfg(feature = "columnar")]
+            if !self.columnar_tables.table_ids().is_empty() {
+                return Err(refuse(
+                    "its STORAGE COLUMNAR tables record no position in its group's log, so \
+                     no closed cut of them can be shown complete"
+                        .into(),
+                ));
+            }
+            let cut = self.snapshot().min(ledger.below());
+            if cut == 0 {
+                return Err(refuse(
+                    "no commit of its group's log is known closed".into(),
+                ));
+            }
+            let pin = self.pin_readable_snapshot_at(cut).map_err(|horizon| {
+                refuse(format!(
+                    "its closed cut {cut} is below the oldest state it still serves, {horizon}"
+                ))
+            })?;
+            (cut, Some(pin))
+        } else {
+            self.pin_latest_snapshot()
+        };
+        // Under the pin, no collection raises a floor past the cut any more.
+        for part in included() {
+            let floor = self.tree(part)?.oldest_retained_seqno();
+            if cut <= floor {
+                return Err(refuse(format!(
+                    "its {} tree no longer holds its state at the cut {cut} (collected \
+                     through {floor})",
+                    part.name()
+                )));
+            }
+        }
+        Ok((cut, pin))
+    }
+
     /// [`Self::pin_latest_snapshot`] for a read that must not see a write a
     /// crash can still take back: the latest complete snapshot, lowered to
     /// [`Self::durable_view`].
@@ -5668,6 +5890,23 @@ impl StorageEngine {
         if wrote {
             self.coordinator.flush_trigger().wrote_unmeasured();
         }
+    }
+
+    /// The most bytes one scan of `part` opened now holds besides the records
+    /// it hands out, when none of its records is longer than
+    /// `longest_record` key and value bytes. A caller charging its memory
+    /// reserves it before it opens the scan and keeps it until the scan is
+    /// dropped; the tree's runs are read now, so it is taken again for each
+    /// scan.
+    ///
+    /// # Errors
+    ///
+    /// The partition's tree is not open.
+    pub fn scan_hold_bytes(&self, part: Partition, longest_record: u64) -> StorageResult<u64> {
+        Ok(crate::engine::material::fold::scan_holds(
+            self.tree(part)?,
+            longest_record,
+        ))
     }
 
     /// Physically reset a partition to empty: install a fresh empty version and

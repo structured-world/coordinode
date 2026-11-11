@@ -190,6 +190,46 @@ pub enum StorageError {
         runs: u32,
     },
 
+    /// A restore into the data directory began and has not finished: the
+    /// image there may be partial, so nothing opens it but the restore of
+    /// the same image, run again. Opening it changes nothing.
+    #[error(
+        "data directory {path} holds an unfinished restore of image {image:#018x}; run that \
+         restore again to finish it"
+    )]
+    RestoreIncomplete {
+        /// The directory refused.
+        path: String,
+        /// The checksum of the image being restored.
+        image: u64,
+    },
+
+    /// No cut of the store can be shown complete for a whole-store capture;
+    /// nothing is captured.
+    #[error("the store cannot be captured: {reason}")]
+    CaptureRefused {
+        /// Why no cut qualifies.
+        reason: String,
+    },
+
+    /// Another open engine or a restore holds the data directory.
+    #[error("data directory {path} is in use by another open store or a restore")]
+    StoreInUse {
+        /// The directory held.
+        path: String,
+    },
+
+    /// A restore was refused its target, which was left as it was: a
+    /// directory already holding a store, or an unfinished restore of
+    /// another image.
+    #[error("cannot restore into {path}: {reason}")]
+    RestoreTarget {
+        /// The directory refused.
+        path: String,
+        /// What it holds.
+        reason: String,
+    },
+
     /// A catalog record (an index definition, an index build) does not
     /// decode in this build. Nothing is served without it: skipping it would
     /// serve the database without that index and the uniqueness it enforces.

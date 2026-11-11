@@ -111,6 +111,14 @@ impl StorageEngine {
         )
     }
 
+    /// The most bytes [`Self::begin_index_transfer`] holds at once beside
+    /// what the memtables keep: what a caller charging its memory reserves
+    /// for it.
+    #[must_use]
+    pub fn begin_index_transfer_bytes() -> u64 {
+        crate::engine::batch::local_record_bytes(INDEX_TRANSFER_KEY.len() as u64, 0)
+    }
+
     /// Whether an index transfer was begun and its inventory not taken.
     ///
     /// # Errors

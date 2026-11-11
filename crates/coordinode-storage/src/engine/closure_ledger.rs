@@ -188,6 +188,11 @@ impl ClosureLedger {
         self.below
     }
 
+    /// The last entry the ledger accounts for.
+    pub(crate) fn last_index(&self) -> u64 {
+        self.last_index
+    }
+
     /// The commit ceiling of the whole log applied here.
     pub(crate) fn applied_ceiling(&self) -> u64 {
         self.applied_ceiling

@@ -765,6 +765,19 @@ pub struct RaftNode {
     deployment: tokio::sync::watch::Receiver<Option<DeploymentId>>,
     /// Writes this node's own metadata commands.
     commands: Commands,
+    /// The last log id the state machine applied; read at shutdown once the
+    /// applies have stopped.
+    applied: crate::storage::AppliedLogId,
+    /// Test builds only: run by `shutdown()` before the consensus stops.
+    #[cfg(feature = "test-faults")]
+    before_stop: std::sync::Mutex<Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    /// Test builds only: how long `shutdown()` waits for consensus work to
+    /// let go of the engine, in ms; `0` for the production wait.
+    #[cfg(feature = "test-faults")]
+    work_drain_ms: core::sync::atomic::AtomicU64,
+    /// Test builds only: where the state machine's applies stop.
+    #[cfg(feature = "test-faults")]
+    apply_pause: crate::storage::ApplyPause,
 }
 
 /// Default for [`RaftNode::join_readiness_lag`]: close enough that the
@@ -954,6 +967,9 @@ impl RaftNode {
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
+        let applied = state_machine.applied();
+        #[cfg(feature = "test-faults")]
+        let apply_pause = state_machine.apply_pause();
 
         let network = StubNetworkFactory;
 
@@ -1061,6 +1077,13 @@ impl RaftNode {
             grants,
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
+            applied,
+            #[cfg(feature = "test-faults")]
+            before_stop: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-faults")]
+            work_drain_ms: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-faults")]
+            apply_pause,
             // No peers to call.
             closing: tokio::sync::watch::Sender::new(false),
             _snapshot_trigger: Some(snap_handle),
@@ -1277,6 +1300,9 @@ impl RaftNode {
             book: Arc::clone(&book),
             grants: Arc::clone(&grants),
         };
+        let applied = state_machine.applied();
+        #[cfg(feature = "test-faults")]
+        let apply_pause = state_machine.apply_pause();
 
         let raft: RaftInstance =
             openraft::Raft::new(node_id, config, network, log_store, state_machine)
@@ -1438,6 +1464,13 @@ impl RaftNode {
             grants,
             grpc_shutdown: std::sync::Mutex::new(grpc_shutdown),
             grpc_task: std::sync::Mutex::new(grpc_task),
+            applied,
+            #[cfg(feature = "test-faults")]
+            before_stop: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-faults")]
+            work_drain_ms: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-faults")]
+            apply_pause,
             closing,
             _snapshot_trigger: Some(snap_handle),
             version,
@@ -2914,13 +2947,93 @@ impl RaftNode {
             .any(|id| id != self.node_id)
     }
 
+    /// Test builds only: have [`Self::shutdown`] run `step` before the
+    /// consensus stops, so a test applies entries while the node is going
+    /// down.
+    #[cfg(feature = "test-faults")]
+    pub fn before_consensus_stop(&self, step: impl Future<Output = ()> + Send + 'static) {
+        if let Ok(mut slot) = self.before_stop.lock() {
+            *slot = Some(Box::pin(step));
+        }
+    }
+
+    /// Test builds only: hold the node's consensus work open, as an apply or
+    /// a snapshot build still running would, until the guard drops.
+    #[cfg(feature = "test-faults")]
+    #[must_use]
+    pub fn hold_consensus_work(&self) -> crate::storage::EngineWorkGuard {
+        self.engine_work.start()
+    }
+
+    /// Test builds only: have [`Self::shutdown`] wait `drain` for consensus
+    /// work to let go of the engine instead of the production wait.
+    #[cfg(feature = "test-faults")]
+    pub fn set_work_drain(&self, drain: std::time::Duration) {
+        self.work_drain_ms.store(
+            u64::try_from(drain.as_millis()).unwrap_or(u64::MAX),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Test builds only: stop the apply of entry `index` once its proposals
+    /// landed in the trees, before it counts as applied. The receiver fires
+    /// when the apply stopped there; sending on or dropping the sender lets
+    /// it go on.
+    #[cfg(feature = "test-faults")]
+    pub fn pause_apply_at(
+        &self,
+        index: u64,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.apply_pause.at(index)
+    }
+
+    /// Test builds only: wait until no consensus work holds the engine any
+    /// more, with no deadline of its own.
+    #[cfg(feature = "test-faults")]
+    pub async fn consensus_work_released(&self) {
+        self.engine_work.idle().await;
+    }
+
+    /// How long shutdown waits for consensus work to let go of the engine.
+    fn work_drain(&self) -> std::time::Duration {
+        #[cfg(feature = "test-faults")]
+        {
+            let ms = self
+                .work_drain_ms
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if ms > 0 {
+                return std::time::Duration::from_millis(ms);
+            }
+        }
+        SNAPSHOT_WORK_DRAIN
+    }
+
     /// Stop the node. A member of a group with other voters shuts down
     /// gracefully, handing leadership over if it leads; a node alone just
     /// stops.
+    ///
+    /// When the consensus work lets go of the engine in time, the trees'
+    /// bases record every applied entry and the directory is free once the
+    /// caller drops its own handles. When it does not, the bases are left
+    /// as they were, and the work may still write and keeps the directory
+    /// locked until it ends.
     pub async fn shutdown(&self) -> Result<(), RaftNodeError> {
         self.version_watch.stop().await;
         self.catch_up_watch.stop().await;
         let has_peers = self.has_voter_peers();
+        #[cfg(feature = "test-faults")]
+        let step = self
+            .before_stop
+            .lock()
+            .ok()
+            .and_then(|mut step| step.take());
+        #[cfg(feature = "test-faults")]
+        if let Some(step) = step {
+            step.await;
+        }
 
         let result = if has_peers {
             self.graceful_shutdown().await
@@ -2961,23 +3074,58 @@ impl RaftNode {
         // What openraft spawned can outlive its core and hold the engine: a
         // replication task still in a call to a peer keeps its log reader, a
         // snapshot capture or build runs on to its end. The directory stays
-        // locked until the last of them lets go. Wait for it: a caller that
-        // reopens the directory after this returns must find it free.
-        if !self.engine_work.wait_idle(SNAPSHOT_WORK_DRAIN).await {
+        // locked until the last of them lets go. Wait for it, so that after
+        // a stop that drains a caller finds the directory free. Work still
+        // running at the deadline keeps it locked and may still write after
+        // this returns.
+        let drain = self.work_drain();
+        let drained = self.engine_work.wait_idle(drain).await;
+        if !drained {
             tracing::warn!(
                 node_id = self.node_id,
-                ?SNAPSHOT_WORK_DRAIN,
-                "consensus work still holds the engine after shutdown"
+                ?drain,
+                "consensus work still holds the engine after shutdown; \
+                 the applied prefix is not recorded as final"
             );
         }
 
-        // Flush active memtables to SST so a later reopen sees all writes.
-        //
-        // openraft's internal tasks hold Arc<LogStore> and Arc<StateMachine>,
-        // both of which hold Arc<StorageEngine>. After raft.shutdown() the tasks
-        // have stopped writing, but tokio may not drop the task futures (and their
-        // Arc refs) before the caller opens the same directory again. Calling
-        // persist() here guarantees durability before shutdown() returns.
+        // Once the consensus work has drained, no apply can follow: the state
+        // machine's last applied entry, read now, is the end of what every
+        // tree holds. Fold it into the trees' bases, as a snapshot build does,
+        // so the store records on disk the whole prefix it holds. A store
+        // copied offline is qualified by those bases; markers alone cannot
+        // tell an entry a tree never took from one a crash lost. A tree
+        // already past it (a snapshot installed meanwhile) keeps its base.
+        // Work still running could change the trees after the read, so then
+        // nothing is folded: the bases stay where the last snapshot left
+        // them, and an offline copy is refused until a stop that drains.
+        let applied = if drained {
+            self.applied.lock().ok().and_then(|applied| *applied)
+        } else {
+            None
+        };
+        if let Some(log_id) = applied {
+            let next = log_id.index + 1;
+            match (rmp_serde::to_vec(&log_id), self.engine.raft_coverage()) {
+                (Ok(payload), Ok(coverage)) => {
+                    self.engine.fold_raft_coverage(0, next, &payload, |part| {
+                        coverage.base_of(part).is_some_and(|base| base >= next)
+                    })
+                }
+                (payload, coverage) => tracing::warn!(
+                    payload = ?payload.err(),
+                    coverage = ?coverage.err(),
+                    "the applied entries were not folded at shutdown"
+                ),
+            }
+        }
+
+        // Flush active memtables to SST, so the writes made so far are durable
+        // before shutdown() returns. After a stop that drains, that is every
+        // write the consensus made. Work still running at the deadline may
+        // write after this flush; those writes carry their coverage markers
+        // above the unmoved bases, so a reopen re-delivers their entries from
+        // the log rather than trusting them.
         if let Err(e) = self.engine.persist() {
             tracing::warn!(error = %e, "engine persist on shutdown failed (best-effort)");
         }

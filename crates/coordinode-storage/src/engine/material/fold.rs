@@ -396,6 +396,18 @@ const fn range_page_cost(start: usize, end: usize, from: usize) -> u64 {
     (first + stop + start + end + tomb + moves + resume + MARK) as u64
 }
 
+/// What one scan of `tree` holds besides the records it hands out, when no
+/// record in it is longer than `longest_record` key and value bytes: the
+/// read's own state and memtable iterators, and in each run (its memtables
+/// counted as one more) the table reads it opens, each standing in a data
+/// block that holds at most one record past the block size.
+pub(crate) fn scan_holds(tree: &AnyTree, longest_record: u64) -> u64 {
+    let run_read = (RUN_READ - RANGE_RECORD_MAX) as u64 + longest_record;
+    // Runs are bounded by the tree's levels and its first level's runs, a
+    // record by the engine's key and value limits: far below u64::MAX.
+    READS_FIXED as u64 + (READS_PER_RUN * (runs(tree) + 1)) as u64 * run_read
+}
+
 /// The least memory with which a fold of a tree of `runs` runs always goes
 /// on: its reads, and a range page between the longest bounds with its
 /// longest key, or the longest point unit.

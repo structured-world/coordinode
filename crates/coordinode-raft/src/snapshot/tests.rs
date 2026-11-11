@@ -14,6 +14,20 @@ fn open_engine(dir: &std::path::Path) -> StorageEngine {
     StorageEngine::open(&config).expect("open engine")
 }
 
+/// A target opened as an offline restore opens it: no batch is synced on its
+/// own, the restore persists once at its end.
+fn open_restore_target(dir: &std::path::Path) -> StorageEngine {
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    config.flush_policy = coordinode_storage::engine::config::FlushPolicy::Manual;
+    StorageEngine::open(&config).expect("open engine")
+}
+
 /// `engine`'s full snapshot, in memory.
 fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
     let mut buf = io::Cursor::new(Vec::new());
@@ -38,6 +52,379 @@ fn with_history(engine: &StorageEngine, id: u8) {
 
 fn domain_of(engine: &StorageEngine) -> Option<coordinode_core::group::DeploymentId> {
     coordinode_storage::engine::metadata::bound_deployment(engine).unwrap()
+}
+
+/// Every section of a snapshot describes the one cut it was asked for:
+/// writes landing while the partitions stream out (a row of a partition not
+/// yet written, the domain binding read last) stay out of it, so an image is
+/// never half before and half after a commit.
+#[test]
+fn a_snapshot_is_one_cut_whatever_lands_while_it_streams() {
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    engine.put(Partition::Node, b"node:early", b"v").unwrap();
+    engine.put(Partition::EdgeProp, b"ep:early", b"v").unwrap();
+    let (at, _pin) = engine.pin_latest_snapshot();
+
+    let mut buf = io::Cursor::new(Vec::new());
+    let mut landed = false;
+    write_snapshot(&engine, at, None, &mut buf, |partition| {
+        if partition == Partition::Node && !landed {
+            landed = true;
+            engine
+                .put(Partition::EdgeProp, b"ep:late", b"v")
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            engine
+                .put(
+                    Partition::Schema,
+                    coordinode_core::group::DEPLOYMENT_KEY,
+                    &[7; 16],
+                )
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(landed, "the Node partition is written first");
+
+    let parsed = parse_verified_slice(&buf.into_inner()).unwrap();
+    let keys = |wanted: Partition| -> Vec<Vec<u8>> {
+        parsed
+            .partitions
+            .iter()
+            .filter(|(partition, _)| *partition == wanted)
+            .flat_map(|(_, entries)| entries.iter().map(|(key, _)| key.clone()))
+            .collect()
+    };
+    assert_eq!(keys(Partition::EdgeProp), vec![b"ep:early".to_vec()]);
+    assert!(
+        !keys(Partition::Schema)
+            .iter()
+            .any(|key| key.as_slice() == coordinode_core::group::DEPLOYMENT_KEY),
+        "a binding written after the cut is not in the image"
+    );
+    assert_eq!(parsed.domain, None, "the store was unbound at the cut");
+}
+
+/// An install whose second pass reads other bytes than the checked image
+/// fails, and what it wrote is staging the next attempt starts over from:
+/// retrying the checked image leaves none of the other input's records,
+/// also after a reopen.
+#[test]
+fn a_retried_install_keeps_nothing_of_a_changed_input() {
+    let source_dir = tempdir().unwrap();
+    let source = open_engine(source_dir.path());
+    source.put(Partition::Node, b"node:a", b"v").unwrap();
+    let image = build_full_snapshot(&source).unwrap();
+    // No longer than the checked record: written before the change shows.
+    source.put(Partition::Node, b"node:b", b"v").unwrap();
+    let changed = build_full_snapshot(&source).unwrap();
+    drop(source);
+
+    let target_dir = tempdir().unwrap();
+    let budget = QueryBudget::new(1 << 20);
+    let check = check_image(&mut io::Cursor::new(&image), &budget).unwrap();
+    {
+        let target = open_engine(target_dir.path());
+        let failed = install_image(&target, &mut io::Cursor::new(&changed), &check, &budget)
+            .expect_err("a changed input");
+        assert!(failed.to_string().contains("changed"), "{failed}");
+        assert!(
+            target.get(Partition::Node, b"node:b").unwrap().is_some(),
+            "the changed pass wrote its records"
+        );
+        install_image(&target, &mut io::Cursor::new(&image), &check, &budget).unwrap();
+        target.persist().unwrap();
+    }
+    let target = open_engine(target_dir.path());
+    assert!(target.get(Partition::Node, b"node:a").unwrap().is_some());
+    assert!(
+        target.get(Partition::Node, b"node:b").unwrap().is_none(),
+        "the retry left a record of the changed input"
+    );
+}
+
+/// A record the second pass reads longer than any the check saw is not of
+/// the checked image: refused before it is written, so what a later
+/// attempt clears reads no record longer than its image's.
+#[test]
+fn a_changed_input_with_a_longer_record_writes_none_of_it() {
+    let source_dir = tempdir().unwrap();
+    let source = open_engine(source_dir.path());
+    source.put(Partition::Node, b"node:a", b"v").unwrap();
+    let image = build_full_snapshot(&source).unwrap();
+    source
+        .put(Partition::Node, b"node:long", &vec![b'l'; 64 << 10])
+        .unwrap();
+    let changed = build_full_snapshot(&source).unwrap();
+    drop(source);
+
+    let budget = QueryBudget::new(4 << 20);
+    let check = check_image(&mut io::Cursor::new(&image), &budget).unwrap();
+    let target_dir = tempdir().unwrap();
+    let target = open_engine(target_dir.path());
+    let failed = install_image(&target, &mut io::Cursor::new(&changed), &check, &budget)
+        .expect_err("a changed input");
+    assert!(failed.to_string().contains("longer"), "{failed}");
+    assert!(
+        target.get(Partition::Node, b"node:long").unwrap().is_none(),
+        "the longer record was written"
+    );
+}
+
+/// Checking an image whose field dictionary is many short names holds, by
+/// the allocator's count, no more than the memory limit at once: what the
+/// check builds to verify the dictionary is reserved like the records.
+#[test]
+fn checking_a_large_dictionary_holds_no_more_than_the_limit() {
+    use coordinode_test_fixtures::alloc_peak::peak_of;
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    for chunk in 0..20 {
+        let names: Vec<String> = (0..1_000)
+            .map(|i| format!("f{:05}", chunk * 1_000 + i))
+            .collect();
+        engine
+            .apply_proposal_at(
+                &command(coordinode_core::txn::proposal::MetadataCommand::RegisterFields { names }),
+                0,
+            )
+            .unwrap();
+    }
+    let data = build_full_snapshot(&engine).unwrap();
+    let limit: u64 = 6 << 20;
+    let budget = QueryBudget::new(limit);
+    let (checked, peak) = peak_of(|| {
+        check_image(&mut io::Cursor::new(&data), &budget)
+            .map(drop)
+            .map_err(|e| e.to_string())
+    });
+    if let Err(e) = checked {
+        assert!(e.contains("memory limit"), "{e}");
+    }
+    assert!(
+        peak as u64 <= limit,
+        "held {peak} bytes under a {limit}-byte limit"
+    );
+    // With room for it, the check passes, and still holds within its limit.
+    let roomy: u64 = 32 << 20;
+    let budget = QueryBudget::new(roomy);
+    let (checked, peak) = peak_of(|| {
+        check_image(&mut io::Cursor::new(&data), &budget)
+            .map(|check| check.field_bindings().len())
+            .map_err(|e| e.to_string())
+    });
+    assert_eq!(checked, Ok(20_000));
+    assert!(
+        peak as u64 <= roomy,
+        "held {peak} bytes under a {roomy}-byte limit"
+    );
+}
+
+/// Installing columnar rows holds, by the allocator's count, no more than
+/// the memory limit at once: the copies the table write makes of a batch
+/// are reserved, and a written batch gives its memory back.
+#[test]
+fn installing_columnar_rows_holds_no_more_than_the_limit() {
+    use coordinode_test_fixtures::alloc_peak::peak_of;
+    let limit: u64 = 1 << 20;
+    let row = vec![b'r'; (limit / 8) as usize];
+    let dir = tempdir().unwrap();
+    let sender = open_engine(dir.path());
+    let keys: Vec<Vec<u8>> = (0..12u8).map(|i| vec![b'k', i]).collect();
+    sender
+        .replace_columnar_tables(vec![(
+            "Wide".to_owned(),
+            keys.iter().map(|k| (k.clone(), row.clone())).collect(),
+        )])
+        .unwrap();
+    let image = build_full_snapshot(&sender).unwrap();
+    drop(sender);
+
+    let budget = QueryBudget::new(limit);
+    let check = check_image(&mut io::Cursor::new(&image), &budget).unwrap();
+    let target_dir = tempdir().unwrap();
+    let target = open_engine(target_dir.path());
+    let (installed, peak) = peak_of(|| {
+        install_image(&target, &mut io::Cursor::new(&image), &check, &budget)
+            .map_err(|e| e.to_string())
+    });
+    installed.unwrap();
+    // The table's tree the engine opens and keeps is the engine's memory,
+    // not the restore's: measured alone, and allowed for.
+    let engine_tree = {
+        let probe_dir = tempdir().unwrap();
+        let probe = open_engine(probe_dir.path());
+        peak_of(|| probe.reset_columnar_table("Probe").unwrap()).1 as u64
+    };
+    assert!(
+        peak as u64 <= limit + engine_tree,
+        "held {peak} bytes under a {limit}-byte limit (the engine's tree takes {engine_tree})"
+    );
+    assert_eq!(target.columnar_tables_at(u64::MAX).unwrap()[0].1.len(), 12);
+}
+
+/// A record whose install cannot fit the memory limit (the batch and the
+/// tree's write each hold a copy of it) is refused by the check, before any
+/// target is touched.
+#[test]
+fn a_record_whose_install_does_not_fit_is_refused_by_the_check() {
+    let limit: u64 = 1 << 20;
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    engine
+        .put(
+            Partition::Node,
+            b"node:wide",
+            &vec![b'w'; (limit * 6 / 10) as usize],
+        )
+        .unwrap();
+    let image = build_full_snapshot(&engine).unwrap();
+    let budget = QueryBudget::new(limit);
+    let refused = check_image(&mut io::Cursor::new(&image), &budget)
+        .expect_err("a record past half the limit");
+    assert!(refused.to_string().contains("memory limit"), "{refused}");
+}
+
+/// A record whose commit holds more than the memory limit at once (a long
+/// key is copied into the tree batch and once more into its unit record,
+/// beside the buffer encoding unit records) is refused by the check, though
+/// twice its bytes would fit.
+#[test]
+fn a_long_key_whose_commit_does_not_fit_is_refused_by_the_check() {
+    let limit: u64 = 160 << 10;
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    let mut key = b"node:".to_vec();
+    key.resize(60 << 10, b'k');
+    engine.put(Partition::Node, &key, b"v").unwrap();
+    let image = build_full_snapshot(&engine).unwrap();
+    let budget = QueryBudget::new(limit);
+    let refused = check_image(&mut io::Cursor::new(&image), &budget)
+        .expect_err("a record whose commit holds more than the limit");
+    assert!(refused.to_string().contains("memory limit"), "{refused}");
+}
+
+/// Installing holds, by the allocator's count, at no instant more than it
+/// has reserved at that instant, besides what the store keeps (its
+/// memtables), which is left out allocation by allocation rather than
+/// subtracted as an end total: for a long key, for many short records,
+/// over an earlier attempt's records, which the install deletes first, and
+/// for batches large enough to be written by the rayon pool, whose threads
+/// are counted too.
+#[test]
+fn installing_holds_no_more_than_it_reserves_and_the_store_keeps() {
+    use coordinode_test_fixtures::alloc_peak::held_against;
+    let image_of = |fill: &dyn Fn(&StorageEngine)| {
+        let dir = tempdir().unwrap();
+        let engine = open_engine(dir.path());
+        fill(&engine);
+        build_full_snapshot(&engine).unwrap()
+    };
+    let long_key = image_of(&|engine| {
+        let mut key = b"node:".to_vec();
+        key.resize(60 << 10, b'k');
+        engine.put(Partition::Node, &key, b"v").unwrap();
+    });
+    let short = image_of(&|engine| {
+        for i in 0..20_000u32 {
+            engine
+                .put(
+                    Partition::Node,
+                    format!("node:{i:08}").as_bytes(),
+                    b"0123456789abcdef",
+                )
+                .unwrap();
+        }
+    });
+    // Two partitions in one stream: a batch at their boundary carries over a
+    // thousand mutations of both, which the store writes on the rayon pool.
+    let two_partitions = image_of(&|engine| {
+        for i in 0..6_000u32 {
+            for partition in [Partition::Node, Partition::Adj] {
+                engine
+                    .put(
+                        partition,
+                        format!("{}:{i:08}", partition.name()).as_bytes(),
+                        b"0123456789abcdef",
+                    )
+                    .unwrap();
+            }
+        }
+    });
+    for (name, image, limit, again) in [
+        ("long key", &long_key, 1u64 << 20, false),
+        ("short records", &short, 2 << 20, false),
+        ("over an earlier attempt", &short, 2 << 20, true),
+        (
+            "two partitions on the rayon pool",
+            &two_partitions,
+            16 << 20,
+            false,
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let target = open_restore_target(dir.path());
+        if again {
+            let budget = QueryBudget::new(limit);
+            let check = check_image(&mut io::Cursor::new(image), &budget).unwrap();
+            install_image(&target, &mut io::Cursor::new(image), &check, &budget).unwrap();
+        }
+        let check_budget = QueryBudget::new(limit);
+        let check = check_image(&mut io::Cursor::new(image), &check_budget).unwrap();
+        let budget = std::sync::Arc::new(QueryBudget::new(limit));
+        let read = std::sync::Arc::clone(&budget);
+        let (installed, held) =
+            held_against(std::sync::Arc::new(move || read.memory_used()), || {
+                install_image(&target, &mut io::Cursor::new(image), &check, &budget)
+                    .map_err(|e| e.to_string())
+            });
+        installed.unwrap();
+        let reserved = budget.memory_peak();
+        assert!(
+            reserved <= limit,
+            "{name}: reserved {reserved} past {limit}"
+        );
+        assert_eq!(
+            held.over, None,
+            "{name}: held more than was reserved at that instant: {held:?}"
+        );
+    }
+}
+
+/// An image many times the memory limit installs whole, holding no more
+/// than the limit at once.
+#[test]
+fn an_image_larger_than_the_budget_installs_within_it() {
+    let source_dir = tempdir().unwrap();
+    let source = open_engine(source_dir.path());
+    let pad = vec![b'x'; 1000];
+    for i in 0..4000u32 {
+        source
+            .put(Partition::Node, format!("node:{i:06}").as_bytes(), &pad)
+            .unwrap();
+    }
+    let image = build_full_snapshot(&source).unwrap();
+    let limit = 256 << 10;
+    assert!(image.len() as u64 > 8 * limit);
+
+    let budget = QueryBudget::new(limit);
+    let check = check_image(&mut io::Cursor::new(&image), &budget).unwrap();
+    let target_dir = tempdir().unwrap();
+    let target = open_engine(target_dir.path());
+    install_image(&target, &mut io::Cursor::new(&image), &check, &budget).unwrap();
+    assert!(
+        budget.memory_peak() <= limit,
+        "peak {}",
+        budget.memory_peak()
+    );
+    assert_eq!(
+        target
+            .prefix_scan(Partition::Node, b"node:")
+            .unwrap()
+            .count(),
+        4000
+    );
 }
 
 /// A snapshot names the domain of its history. A receiver bound to another
@@ -122,7 +509,10 @@ fn a_replaced_database_takes_the_images_domain() {
             &[2; 16],
         )
         .unwrap();
-    replace_database_from_reader(&target, &mut io::Cursor::new(&data)).expect("replace");
+    let budget = QueryBudget::new(1 << 20);
+    let check = check_image(&mut io::Cursor::new(&data), &budget).expect("a valid image");
+    assert_eq!(check.domain(), Some(DeploymentId([1; 16])));
+    install_image(&target, &mut io::Cursor::new(&data), &check, &budget).expect("replace");
     assert_eq!(domain_of(&target), Some(DeploymentId([1; 16])));
     assert!(
         target
@@ -137,8 +527,8 @@ fn a_replaced_database_takes_the_images_domain() {
         .put(Partition::NodeHistory, b"nhist:history", b"state")
         .unwrap();
     let data = build_full_snapshot(&unbound_source).unwrap();
-    let refused = replace_database_from_reader(&target, &mut io::Cursor::new(&data))
-        .expect_err("history without a domain");
+    let refused =
+        check_image(&mut io::Cursor::new(&data), &budget).expect_err("history without a domain");
     assert!(refused.to_string().contains("names no domain"), "{refused}");
     assert_eq!(domain_of(&target), Some(DeploymentId([1; 16])));
 }

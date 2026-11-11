@@ -55,6 +55,7 @@ use serde::{Deserialize, Serialize};
 
 use std::path::PathBuf;
 
+use coordinode_core::budget::{MemoryCharge, QueryBudget};
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::{ColumnarTable, StorageEngine};
 use coordinode_storage::engine::partition::Partition;
@@ -171,7 +172,8 @@ fn snapshot_partitions() -> impl Iterator<Item = Partition> {
 /// `Partition::Raft`, which openraft manages), every `STORAGE COLUMNAR`
 /// table and `index_inventory`, the sender's inventory of the index copies
 /// the snapshot carries (`None`: the receiver takes them all as unknown), to
-/// `out`, from its current position, and return the bytes written.
+/// `out`, from its current position, and return the bytes written. Every
+/// section is read at one pinned cut, the latest complete snapshot.
 ///
 /// Entries stream to `out` as they are scanned, so memory does not grow with
 /// the store: each partition's entry count is written as a placeholder and
@@ -190,6 +192,39 @@ pub fn write_full_snapshot<F>(
 where
     F: IoRead + Write + Seek,
 {
+    let (at, _pin) = engine.pin_latest_snapshot();
+    write_full_snapshot_at(engine, at, index_inventory, out)
+}
+
+/// [`write_full_snapshot`] of the store as it stood at `at`, a seqno the
+/// caller pinned, so whatever else it reads at `at` describes the same cut.
+///
+/// # Errors
+///
+/// As [`write_full_snapshot`]; `at` is no longer retained.
+pub fn write_full_snapshot_at<F>(
+    engine: &StorageEngine,
+    at: u64,
+    index_inventory: Option<&[u8]>,
+    out: &mut F,
+) -> io::Result<u64>
+where
+    F: IoRead + Write + Seek,
+{
+    write_snapshot(engine, at, index_inventory, out, |_| Ok(()))
+}
+
+/// [`write_full_snapshot_at`], calling `written` once each partition is out.
+fn write_snapshot<F>(
+    engine: &StorageEngine,
+    at: u64,
+    index_inventory: Option<&[u8]>,
+    out: &mut F,
+    mut written: impl FnMut(Partition) -> io::Result<()>,
+) -> io::Result<u64>
+where
+    F: IoRead + Write + Seek,
+{
     let start = out.stream_position()?;
     let partitions: Vec<Partition> = snapshot_partitions().collect();
     let partition_count = u8::try_from(partitions.len())
@@ -204,7 +239,7 @@ where
         let count_at = w.stream_position()?;
         w.write_all(&[0; 4])?;
         let iter = engine
-            .prefix_scan(part, &[])
+            .snapshot_prefix_iter(&at, part, &[])
             .map_err(|e| io::Error::other(format!("snapshot scan {}: {e}", part.name())))?;
         let mut entries = 0usize;
         for guard in iter {
@@ -228,10 +263,11 @@ where
             "snapshot: serialized partition"
         );
         counts.push((count_at, entries));
+        written(part)?;
     }
 
     let tables = engine
-        .columnar_tables_at(engine.snapshot())
+        .columnar_tables_at(at)
         .map_err(|e| io::Error::other(format!("snapshot columnar tables: {e}")))?;
     put_tables(&mut w, &tables)?;
     match index_inventory {
@@ -241,10 +277,10 @@ where
         }
         None => w.write_all(&[0])?,
     }
-    // The domain the history above belongs to, read after the history was:
-    // a store binds its domain before any of its history is visible, so a
-    // history the scan found has its domain bound by now.
-    let domain = coordinode_storage::engine::metadata::bound_deployment(engine)
+    // The domain the history above belongs to, at the same cut: a store
+    // binds its domain before any of its history is visible, so a history
+    // the cut holds has its domain bound in it too.
+    let domain = coordinode_storage::engine::metadata::bound_deployment_at(engine, at)
         .map_err(|e| io::Error::other(format!("snapshot history domain: {e}")))?;
     match domain {
         Some(domain) => {
@@ -369,7 +405,7 @@ fn parse_verified_slice(data: &[u8]) -> io::Result<ParsedSnapshot> {
 /// Parse a snapshot from a stream, hashing it as it goes, and verify the
 /// checksum that follows before returning: nothing is applied from a stream
 /// whose checksum fails.
-fn parse_verified_stream(reader: &mut impl IoRead) -> io::Result<ParsedSnapshot> {
+fn parse_verified_stream(reader: &mut impl IoRead) -> io::Result<(ParsedSnapshot, u64)> {
     let mut hashing = HashingReader {
         inner: &mut *reader,
         hash: FNV_OFFSET,
@@ -384,7 +420,7 @@ fn parse_verified_stream(reader: &mut impl IoRead) -> io::Result<ParsedSnapshot>
             "snapshot checksum mismatch: expected {expected:#x}, got {actual:#x}"
         )));
     }
-    Ok(parsed)
+    Ok((parsed, actual))
 }
 
 fn parse_body(reader: &mut impl IoRead) -> io::Result<ParsedSnapshot> {
@@ -826,34 +862,626 @@ pub fn install_full_snapshot_from_reader(
     install_from_reader(engine, reader, Install::SameDomain)
 }
 
-/// Replace the whole database with the snapshot `reader` holds: its data and
-/// the domain its history and operations belong to, bound in the same batch
-/// as the data, whatever domain the receiver held. For an explicit offline
-/// restore, which also fences the operations the replaced database admitted;
-/// a member catching up with its group installs with
-/// [`install_full_snapshot_from_reader`], which keeps its domain.
-///
-/// # Errors
-///
-/// As [`install_full_snapshot_from_reader`]; history the snapshot names no
-/// domain for is refused before anything is written.
-pub fn replace_database_from_reader(
-    engine: &StorageEngine,
-    reader: &mut impl IoRead,
-) -> io::Result<()> {
-    install_from_reader(engine, reader, Install::ReplaceDatabase)
-}
-
 fn install_from_reader(
     engine: &StorageEngine,
     reader: &mut impl IoRead,
     install: Install,
 ) -> io::Result<()> {
+    let (parsed, _) = read_whole(reader)?;
+    apply_full(engine, parsed, install)
+}
+
+/// The snapshot `reader` holds, checksum verified, and that checksum; the
+/// reader must end right after it.
+fn read_whole(reader: &mut impl IoRead) -> io::Result<(ParsedSnapshot, u64)> {
     let parsed = parse_verified_stream(reader)?;
     if reader.read(&mut [0u8; 1])? != 0 {
         return Err(io::Error::other("snapshot has bytes past its checksum"));
     }
-    apply_full(engine, parsed, install)
+    Ok(parsed)
+}
+
+/// What one pass over a serialized image hands its consumer, in stream
+/// order. Each record is read into memory only once its bytes are reserved
+/// from the pass's budget, and its charge goes with it.
+trait ImageVisit<'b> {
+    /// An entry of `partition` a receiver installs.
+    fn entry(
+        &mut self,
+        partition: Partition,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        charge: MemoryCharge<'b>,
+    ) -> io::Result<()>;
+    /// The columnar table `name` starts; its rows follow.
+    fn table(&mut self, name: &str) -> io::Result<()>;
+    /// A row of the table last started.
+    fn row(&mut self, key: Vec<u8>, value: Vec<u8>, charge: MemoryCharge<'b>) -> io::Result<()>;
+    /// The sender's index inventory.
+    fn inventory(&mut self, bytes: Vec<u8>, charge: MemoryCharge<'b>) -> io::Result<()>;
+}
+
+/// What the end of a pass establishes.
+struct Walked {
+    checksum: u64,
+    domain: Option<coordinode_core::group::DeploymentId>,
+}
+
+/// A budget refusal, as the error of a pass.
+fn memory_refused(stop: coordinode_core::budget::BudgetStop) -> io::Error {
+    io::Error::other(format!("the image does not fit the memory limit: {stop}"))
+}
+
+/// A length-prefixed byte string, its bytes reserved under `charge` before
+/// they are read.
+fn read_charged(reader: &mut impl IoRead, charge: &mut MemoryCharge<'_>) -> io::Result<Vec<u8>> {
+    let len = read_u32(reader)?;
+    charge.grow(u64::from(len)).map_err(memory_refused)?;
+    let mut bytes = vec![0u8; len as usize];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Bytes a held entry costs beyond its key and value: the two vectors, the
+/// slot of the container holding them, which may double as it grows, and
+/// the allocator's rounding of two small allocations.
+const ENTRY_OVERHEAD: u64 = 4 * core::mem::size_of::<Vec<u8>>() as u64 + 32;
+
+/// Copies of a columnar row's bytes an install holds at once: the rows, the
+/// table write's entries, its column batch, the block it encodes and the
+/// block writer's buffers (measured at 4.8 copies for a batch of two).
+const ROW_COPIES: u64 = 6;
+
+/// Bytes verifying a field dictionary holds per binding beyond its names:
+/// a name-to-id entry, an id-to-name entry and the interner built from
+/// them, each a container slot, a hash table slot and a small allocation.
+const DICTIONARY_BINDING_OVERHEAD: u64 = 320;
+
+/// Grow `charge` to cover `copies` copies of the `data` bytes it holds one of.
+fn reserve_copies(charge: &mut MemoryCharge<'_>, data: u64, copies: u64) -> io::Result<()> {
+    charge.grow(data * (copies - 1)).map_err(memory_refused)
+}
+
+/// Grow `charge` to at least `bytes`.
+fn reserve_up_to(charge: &mut MemoryCharge<'_>, bytes: u64) -> io::Result<()> {
+    match bytes.checked_sub(charge.bytes()) {
+        Some(more) if more > 0 => charge.grow(more).map_err(memory_refused),
+        _ => Ok(()),
+    }
+}
+
+/// What staging a put of `key` and `value` into a store's write batch holds
+/// at once until the commit hands it to the memtables, the batch's own
+/// buffers for a key this long included: what the store's write path says
+/// it copies.
+fn staged_put(key: &[u8], value: &[u8]) -> u64 {
+    coordinode_storage::engine::batch::staged_put_bytes(key.len() as u64, value.len() as u64)
+        + coordinode_storage::engine::batch::staged_batch_bytes(key.len() as u64)
+}
+
+/// A key and its value, both reserved from `budget` before they are read.
+fn read_entry<'b>(
+    reader: &mut impl IoRead,
+    budget: &'b QueryBudget,
+) -> io::Result<(Vec<u8>, Vec<u8>, MemoryCharge<'b>)> {
+    let mut charge = budget.reserve(ENTRY_OVERHEAD).map_err(memory_refused)?;
+    let key = read_charged(reader, &mut charge)?;
+    let value = read_charged(reader, &mut charge)?;
+    Ok((key, value, charge))
+}
+
+/// One pass over the image `reader` holds, handing every record to `visit`
+/// and checking the trailing checksum, past which the reader must end.
+fn walk<'b>(
+    reader: &mut impl IoRead,
+    budget: &'b QueryBudget,
+    visit: &mut impl ImageVisit<'b>,
+) -> io::Result<Walked> {
+    let mut hashing = HashingReader {
+        inner: &mut *reader,
+        hash: FNV_OFFSET,
+    };
+    let r = &mut hashing;
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(io::Error::other("invalid snapshot magic"));
+    }
+    let mut head = [0u8; 2];
+    r.read_exact(&mut head)?;
+    let [version, partitions] = head;
+    if version == 0 || version > FORMAT_VERSION {
+        return Err(io::Error::other(format!(
+            "unsupported snapshot version: {version}"
+        )));
+    }
+    for _ in 0..partitions {
+        let mut tag = [0u8; 1];
+        r.read_exact(&mut tag)?;
+        let partition = tag_to_partition(tag[0])
+            .ok_or_else(|| io::Error::other(format!("unknown partition tag: {}", tag[0])))?;
+        for _ in 0..read_u32(r)? {
+            let (key, value, charge) = read_entry(r, budget)?;
+            if installable(partition, &key) {
+                visit.entry(partition, key, value, charge)?;
+            }
+        }
+    }
+    if version >= TABLES_SINCE {
+        for _ in 0..read_u32(r)? {
+            let mut charge = budget.empty_charge();
+            let name = String::from_utf8(read_charged(r, &mut charge)?)
+                .map_err(|_| io::Error::other("snapshot table name is not UTF-8"))?;
+            visit.table(&name)?;
+            for _ in 0..read_u32(r)? {
+                let (key, value, charge) = read_entry(r, budget)?;
+                visit.row(key, value, charge)?;
+            }
+        }
+    }
+    let mut domain = None;
+    if version >= INVENTORY_SINCE {
+        let mut present = [0u8; 1];
+        r.read_exact(&mut present)?;
+        match present[0] {
+            0 => {}
+            1 => {
+                let mut charge = budget.empty_charge();
+                let bytes = read_charged(r, &mut charge)?;
+                visit.inventory(bytes, charge)?;
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "snapshot index inventory flag {other}"
+                )));
+            }
+        }
+        r.read_exact(&mut present)?;
+        match present[0] {
+            0 => {}
+            1 => {
+                let mut id = [0u8; 16];
+                r.read_exact(&mut id)?;
+                domain = Some(coordinode_core::group::DeploymentId(id));
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "snapshot history domain flag {other}"
+                )));
+            }
+        }
+    }
+    let checksum = hashing.hash;
+    let mut trailer = [0u8; 8];
+    reader.read_exact(&mut trailer)?;
+    let expected = u64::from_le_bytes(trailer);
+    if expected != checksum {
+        return Err(io::Error::other(format!(
+            "snapshot checksum mismatch: expected {expected:#x}, got {checksum:#x}"
+        )));
+    }
+    if reader.read(&mut [0u8; 1])? != 0 {
+        return Err(io::Error::other("snapshot has bytes past its checksum"));
+    }
+    Ok(Walked { checksum, domain })
+}
+
+/// A whole-database image as its first pass over the input found it:
+/// checksum, version, field dictionary and a domain for any history all
+/// checked, nothing of it held but its dictionary, charged for as long as
+/// this lives. An explicit offline restore checks its input this way before
+/// it touches the target, then installs the same input with
+/// [`install_image`].
+#[derive(Debug)]
+pub struct ImageCheck<'b> {
+    checksum: u64,
+    /// The key and value bytes of the image's longest record.
+    longest_record: u64,
+    domain: Option<coordinode_core::group::DeploymentId>,
+    bindings: Vec<(String, u32)>,
+    _held: MemoryCharge<'b>,
+}
+
+impl ImageCheck<'_> {
+    /// The image's checksum: what tells this image from another one.
+    #[must_use]
+    pub fn checksum(&self) -> u64 {
+        self.checksum
+    }
+
+    /// The deployment the image's history and operations belong to.
+    #[must_use]
+    pub fn domain(&self) -> Option<coordinode_core::group::DeploymentId> {
+        self.domain
+    }
+
+    /// The field bindings the image's Schema records hold, in id order.
+    #[must_use]
+    pub fn field_bindings(&self) -> &[(String, u32)] {
+        &self.bindings
+    }
+}
+
+/// Read the image `reader` holds through and check it, holding at once no
+/// more than `budget` allows: the reader must end with it.
+///
+/// # Errors
+///
+/// The input is truncated, corrupt or of an unsupported version; a record
+/// or the dictionary does not fit `budget`; the field dictionary is
+/// inconsistent; history names no domain.
+pub fn check_image<'b>(
+    reader: &mut impl IoRead,
+    budget: &'b QueryBudget,
+) -> io::Result<ImageCheck<'b>> {
+    use coordinode_core::graph::intern::{FIELD_ID_KEY_PREFIX, FIELD_NAME_KEY_PREFIX};
+
+    struct Checking<'b> {
+        dictionary: Vec<(Vec<u8>, Vec<u8>)>,
+        held: MemoryCharge<'b>,
+        /// Bytes of the dictionary records' keys and values.
+        names: u64,
+        history: bool,
+        longest_record: u64,
+    }
+    impl<'b> ImageVisit<'b> for Checking<'b> {
+        fn entry(
+            &mut self,
+            partition: Partition,
+            key: Vec<u8>,
+            value: Vec<u8>,
+            mut charge: MemoryCharge<'b>,
+        ) -> io::Result<()> {
+            self.history |= partition == Partition::NodeHistory;
+            // What its install will hold of it must fit too: refused here,
+            // before any target is touched.
+            let data = (key.len() + value.len()) as u64;
+            self.longest_record = self.longest_record.max(data);
+            let read = charge.bytes();
+            reserve_up_to(&mut charge, staged_put(&key, &value))?;
+            let staged = charge.bytes();
+            charge.shrink(staged - read);
+            if partition == Partition::Schema
+                && (key.starts_with(FIELD_ID_KEY_PREFIX) || key.starts_with(FIELD_NAME_KEY_PREFIX))
+            {
+                self.names += data;
+                let bytes = charge.bytes();
+                charge
+                    .transfer(bytes, &mut self.held)
+                    .map_err(|e| io::Error::other(format!("dictionary charge: {e:?}")))?;
+                self.dictionary.push((key, value));
+            }
+            Ok(())
+        }
+        fn table(&mut self, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn row(
+            &mut self,
+            key: Vec<u8>,
+            value: Vec<u8>,
+            mut charge: MemoryCharge<'b>,
+        ) -> io::Result<()> {
+            reserve_copies(&mut charge, (key.len() + value.len()) as u64, ROW_COPIES)
+        }
+        fn inventory(&mut self, _: Vec<u8>, _: MemoryCharge<'b>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut checking = Checking {
+        dictionary: Vec::new(),
+        held: budget.empty_charge(),
+        names: 0,
+        history: false,
+        longest_record: 0,
+    };
+    let walked = walk(reader, budget, &mut checking)?;
+    let records = checking.dictionary.len() as u64;
+    {
+        // What verifying builds: a copy of every name thrice over, with
+        // its table slots, held only while it checks.
+        let _verifying = budget
+            .reserve(records * DICTIONARY_BINDING_OVERHEAD + 3 * checking.names)
+            .map_err(memory_refused)?;
+        verify_field_dictionary(&checking.dictionary)?;
+    }
+    if walked.domain.is_none() && checking.history {
+        return Err(io::Error::other(
+            "the snapshot carries history but names no domain for it",
+        ));
+    }
+    // Half the records are id records, one binding each, named once.
+    let bound = records / 2;
+    let held = budget
+        .reserve(bound * core::mem::size_of::<(String, u32)>() as u64 + checking.names)
+        .map_err(memory_refused)?;
+    let mut bindings = Vec::with_capacity(bound as usize);
+    for (key, value) in &checking.dictionary {
+        if key.starts_with(FIELD_ID_KEY_PREFIX)
+            && let (Ok(name), Some(id)) = (
+                std::str::from_utf8(value),
+                coordinode_core::graph::intern::decode_field_id_key(key),
+            )
+        {
+            bindings.push((name.to_owned(), id));
+        }
+    }
+    bindings.sort_unstable_by_key(|(_, id)| *id);
+    // The records go; the bindings stay, charged as long as the check.
+    drop(checking.dictionary);
+    drop(checking.held);
+    // The domain record the install writes is one of the records it holds.
+    let longest_record = walked.domain.map_or(checking.longest_record, |domain| {
+        checking
+            .longest_record
+            .max((coordinode_core::group::DEPLOYMENT_KEY.len() + domain.as_bytes().len()) as u64)
+    });
+    Ok(ImageCheck {
+        checksum: walked.checksum,
+        longest_record,
+        domain: walked.domain,
+        bindings,
+        _held: held,
+    })
+}
+
+/// Install the image `reader` holds, which [`check_image`] checked as
+/// `check`, as the whole of `engine`'s data: what an earlier attempt left
+/// is removed first, the image's domain is bound, and its records stream in
+/// as batches of at most a quarter of `budget`. Ends with the input read
+/// again being the image checked; when it is not, what was installed is
+/// unpublished staging, removed by the next attempt.
+///
+/// For an explicit offline restore into a store it owns and does not serve
+/// until the restore is finished; a member catching up with its group
+/// installs with [`install_full_snapshot_from_reader`].
+///
+/// # Errors
+///
+/// The input differs from the image checked, a record does not fit
+/// `budget`, or a storage write fails.
+pub fn install_image(
+    engine: &StorageEngine,
+    reader: &mut impl IoRead,
+    check: &ImageCheck<'_>,
+    budget: &QueryBudget,
+) -> io::Result<()> {
+    let storage = |what: &str, e: coordinode_storage::error::StorageError| {
+        io::Error::other(format!("{what}: {e}"))
+    };
+    let chunk = (budget.memory_limit() / 4).max(1);
+    engine.with_metadata_exclusive(|| {
+        // An earlier attempt was of this image (the claim binds its checksum)
+        // and wrote none of its records longer than the checked ones (see
+        // `Installing::entry`): what it left reads no longer records.
+        clear_installable(engine, budget, chunk, check.longest_record)?;
+        engine
+            .clear_columnar_tables()
+            .map_err(|e| storage("remove the columnar tables", e))?;
+        {
+            let _record = budget
+                .reserve(StorageEngine::begin_index_transfer_bytes())
+                .map_err(memory_refused)?;
+            engine
+                .begin_index_transfer()
+                .map_err(|e| storage("snapshot index copies", e))?;
+        }
+        let mut installing = Installing {
+            engine,
+            batch: WriteBatch::new(engine),
+            batch_charge: budget.empty_charge(),
+            rows: Vec::new(),
+            table: None,
+            inventory: None,
+            chunk,
+            longest_record: check.longest_record,
+        };
+        if let Some(domain) = check.domain {
+            installing.batch.put(
+                Partition::Schema,
+                coordinode_core::group::DEPLOYMENT_KEY.to_vec(),
+                domain.as_bytes().to_vec(),
+            );
+        }
+        let walked = walk(reader, budget, &mut installing)?;
+        installing.flush_batch()?;
+        installing.flush_rows()?;
+        if walked.checksum != check.checksum {
+            return Err(io::Error::other(format!(
+                "the input changed between its check and its install (checksum {:#x}, then \
+                 {:#x}); nothing installed is served, and the next attempt starts over",
+                check.checksum, walked.checksum
+            )));
+        }
+        engine
+            .index_transfer_installed(
+                installing
+                    .inventory
+                    .as_ref()
+                    .map(|(bytes, _)| bytes.as_slice()),
+            )
+            .map_err(|e| storage("snapshot index copies", e))?;
+        engine.note_field_dictionary_change();
+        Ok(())
+    })
+}
+
+/// Remove every installable entry of every snapshot partition, in batches
+/// of at most `chunk` reserved bytes of keys. No record left in them is
+/// longer than `longest_record` key and value bytes.
+fn clear_installable(
+    engine: &StorageEngine,
+    budget: &QueryBudget,
+    chunk: u64,
+    longest_record: u64,
+) -> io::Result<()> {
+    let storage = |what: &str, e: coordinode_storage::error::StorageError| {
+        io::Error::other(format!("{what}: {e}"))
+    };
+    for partition in snapshot_partitions() {
+        loop {
+            // What the scan holds while it is open, besides the keys taken.
+            let _scan = budget
+                .reserve(
+                    engine
+                        .scan_hold_bytes(partition, longest_record)
+                        .map_err(|e| storage("scan the target", e))?,
+                )
+                .map_err(memory_refused)?;
+            let mut charge = budget.empty_charge();
+            let mut keys = Vec::new();
+            for guard in engine
+                .prefix_scan(partition, &[])
+                .map_err(|e| storage("scan the target", e))?
+            {
+                let key = guard
+                    .key()
+                    .map_err(|e| io::Error::other(format!("scan the target: {e}")))?;
+                if !installable(partition, &key) {
+                    continue;
+                }
+                charge
+                    .grow(
+                        coordinode_storage::engine::batch::staged_delete_bytes(key.len() as u64)
+                            + coordinode_storage::engine::batch::staged_batch_bytes(
+                                key.len() as u64
+                            ),
+                    )
+                    .map_err(memory_refused)?;
+                keys.push(key.to_vec());
+                if charge.bytes() >= chunk {
+                    break;
+                }
+            }
+            if keys.is_empty() {
+                break;
+            }
+            let mut batch = WriteBatch::new(engine);
+            for key in keys {
+                batch.delete(partition, key);
+            }
+            batch.commit().map_err(|e| storage("clear the target", e))?;
+        }
+    }
+    Ok(())
+}
+
+/// The second pass: records gathered into bounded batches and written.
+struct Installing<'e, 'b> {
+    engine: &'e StorageEngine,
+    batch: WriteBatch<'e>,
+    batch_charge: MemoryCharge<'b>,
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The table the rows belong to, its name charged while held.
+    table: Option<(String, MemoryCharge<'b>)>,
+    inventory: Option<(Vec<u8>, MemoryCharge<'b>)>,
+    chunk: u64,
+    /// The key and value bytes of the checked image's longest record.
+    longest_record: u64,
+}
+
+impl Installing<'_, '_> {
+    fn flush_batch(&mut self) -> io::Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::replace(&mut self.batch, WriteBatch::new(self.engine));
+        batch
+            .commit()
+            .map_err(|e| io::Error::other(format!("install the image: {e}")))?;
+        let held = self.batch_charge.bytes();
+        self.batch_charge.shrink(held);
+        Ok(())
+    }
+
+    fn flush_rows(&mut self) -> io::Result<()> {
+        let Some(table) = &self.table else {
+            return Ok(());
+        };
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        self.engine
+            .append_columnar_rows(&table.0, &self.rows)
+            .map_err(|e| io::Error::other(format!("install columnar table {}: {e}", table.0)))?;
+        // Its capacity goes too, not only its rows: what the charge stops
+        // paying for is no longer held.
+        self.rows = Vec::new();
+        let held = self.batch_charge.bytes();
+        self.batch_charge.shrink(held);
+        Ok(())
+    }
+}
+
+impl<'b> ImageVisit<'b> for Installing<'_, 'b> {
+    fn entry(
+        &mut self,
+        partition: Partition,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        mut charge: MemoryCharge<'b>,
+    ) -> io::Result<()> {
+        // A record longer than any checked one is not of the checked image;
+        // refused before it is written, so the staging a later attempt
+        // clears holds no record longer than its image's.
+        if (key.len() + value.len()) as u64 > self.longest_record {
+            return Err(io::Error::other(
+                "the input changed between its check and its install (a record longer than \
+                 any checked); nothing installed is served, and the next attempt starts over",
+            ));
+        }
+        // What the store's write path holds of it until its commit hands it
+        // to the memtables; the batch buffers for its key are reserved with
+        // each record, an upper bound of the one the batch holds.
+        reserve_up_to(&mut charge, staged_put(&key, &value))?;
+        let bytes = charge.bytes();
+        charge
+            .transfer(bytes, &mut self.batch_charge)
+            .map_err(|e| io::Error::other(format!("batch charge: {e:?}")))?;
+        self.batch.put(partition, key, value);
+        if self.batch_charge.bytes() >= self.chunk {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    fn table(&mut self, name: &str) -> io::Result<()> {
+        self.flush_batch()?;
+        self.flush_rows()?;
+        self.engine
+            .reset_columnar_table(name)
+            .map_err(|e| io::Error::other(format!("install columnar table {name}: {e}")))?;
+        let mut charge = self.batch_charge.empty_like();
+        charge.grow(name.len() as u64).map_err(memory_refused)?;
+        self.table = Some((name.to_owned(), charge));
+        Ok(())
+    }
+
+    fn row(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        mut charge: MemoryCharge<'b>,
+    ) -> io::Result<()> {
+        reserve_copies(&mut charge, (key.len() + value.len()) as u64, ROW_COPIES)?;
+        let bytes = charge.bytes();
+        charge
+            .transfer(bytes, &mut self.batch_charge)
+            .map_err(|e| io::Error::other(format!("batch charge: {e:?}")))?;
+        self.rows.push((key, value));
+        if self.batch_charge.bytes() >= self.chunk {
+            self.flush_rows()?;
+        }
+        Ok(())
+    }
+
+    fn inventory(&mut self, bytes: Vec<u8>, charge: MemoryCharge<'b>) -> io::Result<()> {
+        self.flush_rows()?;
+        // Kept, and charged, to the end of the pass.
+        self.inventory = Some((bytes, charge));
+        Ok(())
+    }
 }
 
 /// Install `received`, a Raft snapshot standing at log position `next`

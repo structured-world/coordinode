@@ -1928,8 +1928,9 @@ pub struct CoordinodeStateMachine {
     /// - snapshot_at(commit_ts) sees the whole entry, snapshot_at(commit_ts - 1) none of it
     /// - a follower promoted to leader never allocates a timestamp it already applied
     oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
-    /// Last applied log id, cached in memory for fast access.
-    last_applied: Mutex<Option<openraft::type_config::alias::LogIdOf<TypeConfig>>>,
+    /// Last applied log id, cached in memory for fast access; shared with
+    /// the node, which reads it once the applies have stopped.
+    last_applied: AppliedLogId,
     /// Last applied membership, cached in memory.
     last_membership: Mutex<StoredMembership>,
     /// Dedup map: proposal_id → (size, last_seen). Entries older than
@@ -1973,6 +1974,10 @@ pub struct CoordinodeStateMachine {
     /// holds.
     #[cfg(test)]
     after_proposals: Option<Box<dyn FnMut(u64) + Send + Sync>>,
+    /// Test builds only: where an entry's apply stops once its proposals
+    /// landed.
+    #[cfg(feature = "test-faults")]
+    apply_pause: ApplyPause,
     /// Where the applies stand, held while applying; registered with the
     /// engine as its Raft apply fence.
     gate: Arc<RaftApplyGate>,
@@ -2025,16 +2030,70 @@ impl EngineWork {
     /// Wait until no work holds the engine, for at most `timeout`. `false`
     /// when some was still running at the deadline.
     pub async fn wait_idle(&self, timeout: std::time::Duration) -> bool {
-        let wait = async {
-            loop {
-                let notified = self.0.idle.notified();
-                if self.0.running.load(core::sync::atomic::Ordering::SeqCst) == 0 {
-                    return;
-                }
-                notified.await;
+        tokio::time::timeout(timeout, self.idle()).await.is_ok()
+    }
+
+    /// Wait until no work holds the engine.
+    pub async fn idle(&self) {
+        loop {
+            let notified = self.0.idle.notified();
+            if self.0.running.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+                return;
             }
-        };
-        tokio::time::timeout(timeout, wait).await.is_ok()
+            notified.await;
+        }
+    }
+}
+
+/// Test builds only: stops the apply of one entry once its proposals have
+/// landed in the trees and before the entry counts as applied, until the
+/// test releases it.
+#[cfg(feature = "test-faults")]
+#[derive(Clone, Default)]
+pub struct ApplyPause(Arc<Mutex<Option<PausedEntry>>>);
+
+#[cfg(feature = "test-faults")]
+struct PausedEntry {
+    index: u64,
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(feature = "test-faults")]
+impl ApplyPause {
+    /// Stop the apply of entry `index`. The first receiver fires once the
+    /// apply stopped there; dropping or sending on the returned sender lets
+    /// it go on.
+    pub fn at(
+        &self,
+        index: u64,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release) = tokio::sync::oneshot::channel();
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(PausedEntry {
+                index,
+                reached,
+                release,
+            });
+        }
+        (reached_rx, release_tx)
+    }
+
+    async fn stop_at(&self, index: u64) {
+        let paused = self
+            .0
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take_if(|paused| paused.index == index));
+        if let Some(paused) = paused {
+            // A test that stopped waiting still releases on drop.
+            let _ = paused.reached.send(());
+            let _ = paused.release.await;
+        }
     }
 }
 
@@ -2128,7 +2187,25 @@ const RAFT_FOLD_EVERY: u64 = 4096;
 #[cfg(test)]
 const RAFT_FOLD_EVERY: u64 = 5;
 
+/// The last log id a state machine applied, shared with the node running it.
+pub type AppliedLogId = Arc<Mutex<Option<openraft::type_config::alias::LogIdOf<TypeConfig>>>>;
+
 impl CoordinodeStateMachine {
+    /// The last log id this state machine applied, as it stands whenever it
+    /// is read: what the node folds into the trees' bases once the applies
+    /// have stopped.
+    #[must_use]
+    pub fn applied(&self) -> AppliedLogId {
+        Arc::clone(&self.last_applied)
+    }
+
+    /// Test builds only: where this state machine's applies stop.
+    #[cfg(feature = "test-faults")]
+    #[must_use]
+    pub fn apply_pause(&self) -> ApplyPause {
+        self.apply_pause.clone()
+    }
+
     /// Open the state machine over `engine`; see [`Self::with_oracle`] for
     /// the errors.
     pub fn new(engine: Arc<StorageEngine>) -> Result<Self, io::Error> {
@@ -2229,7 +2306,7 @@ impl CoordinodeStateMachine {
         Ok(Self {
             engine: crate::engine_hold::EngineHold::new(engine, "state machine"),
             oracle,
-            last_applied: Mutex::new(last_applied),
+            last_applied: Arc::new(Mutex::new(last_applied)),
             last_membership: Mutex::new(last_membership),
             dedup: Mutex::new(HashMap::new()),
             last_dedup_gc: Mutex::new(Instant::now()),
@@ -2245,6 +2322,8 @@ impl CoordinodeStateMachine {
             granted_bytes,
             #[cfg(test)]
             after_proposals: None,
+            #[cfg(feature = "test-faults")]
+            apply_pause: ApplyPause::default(),
             gate,
             _hold: engine_work.start(),
             engine_work,
@@ -2757,6 +2836,8 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                     if let Some(hook) = &mut self.after_proposals {
                         hook(index);
                     }
+                    #[cfg(feature = "test-faults")]
+                    self.apply_pause.stop_at(index).await;
                     // Before the closure record: whatever the total's write
                     // leaves for the closure to account is the entry's own,
                     // settled by its record, never a later entry's.

@@ -100,7 +100,11 @@ pub(crate) fn run_backup(
             .map_err(|e| format!("failed to open database: {e}"))?,
     );
 
-    let snapshot = engine.snapshot();
+    // One pinned cut for everything the backup holds: the records, the
+    // dictionary and the deployment identity framed with them.
+    let (snapshot, _pin) = engine
+        .pin_capture_cut()
+        .map_err(|e| format!("backup refused: {e}"))?;
     let shard_id = 1u16;
 
     // Readable too: the raft-snapshot format reads its body back to checksum it.
@@ -112,10 +116,9 @@ pub(crate) fn run_backup(
         .open(&output)
         .map_err(|e| format!("failed to create output file '{output}': {e}"))?;
     let mut writer = std::io::BufWriter::new(file);
-    // Taken after the snapshot: it covers every binding the snapshot's
-    // records use.
-    let dictionary = coordinode_storage::engine::metadata::load_field_dictionary(&engine)
-        .map_err(|e| format!("read the field dictionary: {e}"))?;
+    let dictionary =
+        coordinode_storage::engine::metadata::load_field_dictionary_at(&engine, snapshot)
+            .map_err(|e| format!("read the field dictionary: {e}"))?;
 
     let stats = match format {
         coordinode_embed::backup::BackupFormat::Json => {
@@ -169,8 +172,9 @@ pub(crate) fn run_backup(
                 .map_err(|e| format!("serialize the field dictionary: {e}"))?;
             let interner_len = u32::try_from(interner_bytes.len())
                 .map_err(|_| "field interner too large to frame".to_string())?;
-            let deployment = coordinode_storage::engine::metadata::bound_deployment(&engine)
-                .map_err(|e| format!("read the deployment identity: {e}"))?;
+            let deployment =
+                coordinode_storage::engine::metadata::bound_deployment_at(&engine, snapshot)
+                    .map_err(|e| format!("read the deployment identity: {e}"))?;
             let mut domain = [0u8; 17];
             if let Some(id) = deployment {
                 domain[0] = 1;
@@ -186,12 +190,12 @@ pub(crate) fn run_backup(
                 .and_then(|()| file.write_all(&interner_bytes))
                 .and_then(|()| file.write_all(&domain))
                 .map_err(|e| format!("backup write failed: {e}"))?;
-            let snapshot_bytes =
-                // Read from the live store while writes go on, so no
-                // inventory matches it exactly: a restore checks every index
-                // copy before using it.
-                coordinode_raft::snapshot::write_full_snapshot(&engine, None, &mut file)
-                    .map_err(|e| format!("backup failed: {e}"))?;
+            // No inventory is sent: a restore checks every index copy
+            // before using it.
+            let snapshot_bytes = coordinode_raft::snapshot::write_full_snapshot_at(
+                &engine, snapshot, None, &mut file,
+            )
+            .map_err(|e| format!("backup failed: {e}"))?;
             info!(
                 interner_bytes = interner_bytes.len(),
                 snapshot_bytes, "backup complete (raft-snapshot)"
@@ -240,8 +244,6 @@ pub(crate) fn run_restore(
     };
 
     let storage_config = admin_storage_config(config_path.as_deref(), &data_dir)?;
-    let db = coordinode_embed::Database::open_with_config(storage_config)
-        .map_err(|e| format!("failed to open database: {e}"))?;
 
     // A bzip2/gzip-compressed input is decompressed tool-side (pure Rust);
     // an uncompressed one passes through unchanged. A logical restore reads
@@ -251,99 +253,30 @@ pub(crate) fn run_restore(
     };
     match format {
         coordinode_embed::backup::BackupFormat::RaftSnapshot => {
-            use std::io::Read;
-            let mut reader = coordinode_embed::backup::restore::RestoreSource::open(&source)
+            let limit = admin_memory_limit(config_path.as_deref())?;
+            let budget = coordinode_core::budget::QueryBudget::new(limit);
+            // One handle for both passes: a file renamed over the path in
+            // between is not the one installed.
+            let file = std::fs::File::open(&input)
                 .map_err(|e| format!("failed to read input file '{input}': {e}"))?;
-            // Frame: [mode u8][u32 interner_len][interner]
-            // [u8 has_deployment][16-byte deployment][snapshot].
-            // The snapshot is installed first, then the framed dictionary's
-            // exact bindings are published: installing replaces the Schema
-            // partition wholesale and would drop bindings a snapshot taken
-            // by 0.6 does not carry. This tool runs offline, so nothing reads
-            // the store in between; an interrupted restore leaves a store
-            // that refuses to open and is restored again.
-            let mut frame = [0u8; 5];
-            reader
-                .read_exact(&mut frame)
-                .map_err(|e| format!("raft-snapshot file truncated (no frame header): {e}"))?;
-            match frame[0] {
-                SNAPSHOT_MODE_FULL => {}
-                // Without the deployment its operation records belong to, a
-                // restored store could not tell their descriptors from
-                // another domain's.
-                SNAPSHOT_MODE_FULL_WITHOUT_DOMAIN => {
-                    return Err(
-                        "this raft-snapshot backup was taken by an earlier release and does \
-                         not carry its deployment identity; take a new backup"
-                            .into(),
-                    );
-                }
-                // 0.6 also wrote seqno-bounded deltas; a delta holds only
-                // what changed after a seqno and cannot stand alone.
-                1 => {
-                    return Err(
-                        "this is an incremental raft-snapshot backup; only whole-database \
-                         backups restore. Take a full backup with the release that wrote it"
-                            .into(),
-                    );
-                }
-                other => return Err(format!("unknown snapshot mode byte: {other}").into()),
-            }
-            let interner_len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
-            // Grown from the bytes actually read: a corrupt length ends in
-            // the truncation error, not in a huge allocation.
-            let mut interner_bytes = Vec::new();
-            (&mut reader)
-                .take(u64::from(interner_len))
-                .read_to_end(&mut interner_bytes)
-                .map_err(|e| format!("restore read failed: {e}"))?;
-            if interner_bytes.len() as u64 != u64::from(interner_len) {
-                return Err("raft-snapshot file truncated (interner body)".into());
-            }
-            let mut domain = [0u8; 17];
-            reader
-                .read_exact(&mut domain)
-                .map_err(|e| format!("raft-snapshot file truncated (deployment): {e}"))?;
-            let deployment = match domain[0] {
-                0 => None,
-                1 => coordinode_core::group::DeploymentId::from_slice(&domain[1..]),
-                other => return Err(format!("unknown deployment flag: {other}").into()),
-            };
-            // The admission fences of the history the image replaces: the
-            // image must not reopen what that history closed or retired.
-            let surviving = coordinode_storage::engine::operations::admission_fences(db.engine())
-                .map_err(|e| format!("read the operation fences: {e}"))?;
-            coordinode_raft::snapshot::replace_database_from_reader(db.engine(), &mut reader)
-                .map_err(|e| format!("restore failed: {e}"))?;
-            coordinode_storage::engine::operations::fence_restored(db.engine(), &surviving)
-                .map_err(|e| format!("fence the restored operation records: {e}"))?;
-            // The store continues the image's domain, bound in the install's
-            // batch with the image's records: the replaced database's domain
-            // goes with it, and its descriptors are fenced above. A
-            // descriptor issued before the backup resolves to its recorded
-            // outcome here.
-            let bound = coordinode_storage::engine::metadata::bound_deployment(db.engine())
-                .map_err(|e| format!("read the restored deployment identity: {e}"))?;
-            if let Some(id) = deployment
-                && bound != Some(id)
-            {
-                return Err(format!(
-                    "the backup's frame names deployment {id}, but its image bound this \
-                     store to {bound:?}; the backup is inconsistent"
-                )
-                .into());
-            }
-            db.engine()
-                .persist()
-                .map_err(|e| format!("persist the restored operation fences: {e}"))?;
-            db.adopt_field_bindings(&interner_bytes)
-                .map_err(|e| format!("restore the field dictionary failed: {e}"))?;
+            // Checked through before the target is looked at, holding no
+            // more than the memory limit at once.
+            let mut reader = read_pass(&file)?;
+            let frame = read_frame(&mut reader, &budget)?;
+            let check = coordinode_raft::snapshot::check_image(&mut reader, &budget)
+                .map_err(|e| format!("the backup's image is not valid: {e}"))?;
+            drop(reader);
+            frame.describes(&check)?;
+            restore_snapshot_backup(storage_config, &file, &frame, &check, &budget)?;
             info!(
-                interner_bytes = interner_len,
+                memory_peak_bytes = budget.memory_peak(),
+                memory_limit_bytes = limit,
                 "restore complete (raft-snapshot)"
             );
         }
         logical => {
+            let db = coordinode_embed::Database::open_with_config(storage_config)
+                .map_err(|e| format!("failed to open database: {e}"))?;
             let options = coordinode_embed::backup::restore::RestoreOptions {
                 only_labels: label_filter.as_ref(),
                 force,
@@ -363,6 +296,219 @@ pub(crate) fn run_restore(
     }
 
     Ok(())
+}
+
+/// The memory limit an offline restore holds itself to: the configured
+/// `query_memory_limit_mb`, or the default query limit.
+fn admin_memory_limit(config_path: Option<&str>) -> Result<u64, Box<dyn std::error::Error>> {
+    let mib = match config_path {
+        Some(p) => {
+            config::ServerConfig::load(Some(p))
+                .map_err(|e| format!("config error: {e}"))?
+                .query_memory_limit_mb
+        }
+        None => None,
+    };
+    match mib {
+        None => Ok(coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT),
+        Some(mib) => mib
+            .checked_mul(1 << 20)
+            .ok_or_else(|| format!("query_memory_limit_mb = {mib} does not fit in bytes").into()),
+    }
+}
+
+/// A fresh pass over the restore input `file` from its start, decompressed
+/// as it is read.
+fn read_pass(
+    file: &std::fs::File,
+) -> Result<Box<dyn std::io::BufRead>, Box<dyn std::error::Error>> {
+    use std::io::Seek;
+    let mut handle = file
+        .try_clone()
+        .map_err(|e| format!("read the input file: {e}"))?;
+    handle
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("read the input file: {e}"))?;
+    Ok(decompressing_reader(handle).map_err(|e| format!("read the input file: {e}"))?)
+}
+
+/// The frame of a raft-snapshot backup, ahead of its image.
+struct Frame<'b> {
+    interner_bytes: Vec<u8>,
+    deployment: Option<coordinode_core::group::DeploymentId>,
+    _charge: coordinode_core::budget::MemoryCharge<'b>,
+}
+
+impl Frame<'_> {
+    /// Whether `other` frames the same image as this.
+    fn same_as(&self, other: &Frame<'_>) -> bool {
+        self.interner_bytes == other.interner_bytes && self.deployment == other.deployment
+    }
+
+    /// Refuse a frame that does not describe `check`, the image it carries.
+    fn describes(
+        &self,
+        check: &coordinode_raft::snapshot::ImageCheck<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.deployment != check.domain() {
+            return Err(format!(
+                "the backup's frame names deployment {:?}, but its image belongs to {:?}; the \
+                 backup is inconsistent",
+                self.deployment,
+                check.domain()
+            )
+            .into());
+        }
+        // Read in place, in id order as both are kept: nothing is built.
+        let invalid = |e| format!("the backup's field dictionary is not valid: {e}");
+        let mut framed = coordinode_core::graph::intern::EncodedBindings::new(&self.interner_bytes)
+            .map_err(invalid)?;
+        let carried = check.field_bindings();
+        let mut same = framed.len() == carried.len();
+        for (name, id) in carried {
+            match framed.next() {
+                Some(Ok((framed_name, framed_id))) => {
+                    same &= framed_name == name && framed_id == *id;
+                }
+                Some(Err(e)) => return Err(invalid(e).into()),
+                None => same = false,
+            }
+        }
+        if let Some(Err(e)) = framed.next() {
+            return Err(invalid(e).into());
+        }
+        if !same {
+            return Err(
+                "the backup's frame and image carry different field dictionaries; the backup \
+                 is inconsistent"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Read the frame `[mode u8][u32 interner_len][interner][u8 has_deployment]
+/// [16-byte deployment]` ahead of a raft-snapshot backup's image, the
+/// dictionary's bytes reserved from `budget` before they are read.
+fn read_frame<'b>(
+    reader: &mut impl std::io::Read,
+    budget: &'b coordinode_core::budget::QueryBudget,
+) -> Result<Frame<'b>, Box<dyn std::error::Error>> {
+    let mut frame = [0u8; 5];
+    reader
+        .read_exact(&mut frame)
+        .map_err(|e| format!("raft-snapshot file truncated (no frame header): {e}"))?;
+    match frame[0] {
+        SNAPSHOT_MODE_FULL => {}
+        // Without the deployment its operation records belong to, a restored
+        // store could not tell their descriptors from another domain's.
+        SNAPSHOT_MODE_FULL_WITHOUT_DOMAIN => {
+            return Err(
+                "this raft-snapshot backup was taken by an earlier release and does not carry \
+                 its deployment identity; take a new backup"
+                    .into(),
+            );
+        }
+        // 0.6 also wrote seqno-bounded deltas; a delta holds only what
+        // changed after a seqno and cannot stand alone.
+        1 => {
+            return Err(
+                "this is an incremental raft-snapshot backup; only whole-database backups \
+                 restore. Take a full backup with the release that wrote it"
+                    .into(),
+            );
+        }
+        other => return Err(format!("unknown snapshot mode byte: {other}").into()),
+    }
+    let interner_len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+    // Reserved before it is read: a length past the limit is refused, not
+    // allocated. Held, and charged, as long as the frame.
+    let charge = budget
+        .reserve(u64::from(interner_len))
+        .map_err(|e| format!("the backup's field dictionary does not fit the memory limit: {e}"))?;
+    let mut interner_bytes = vec![0u8; interner_len as usize];
+    reader
+        .read_exact(&mut interner_bytes)
+        .map_err(|e| format!("raft-snapshot file truncated (interner body): {e}"))?;
+    let mut domain = [0u8; 17];
+    reader
+        .read_exact(&mut domain)
+        .map_err(|e| format!("raft-snapshot file truncated (deployment): {e}"))?;
+    let deployment = match domain[0] {
+        0 => None,
+        1 => coordinode_core::group::DeploymentId::from_slice(&domain[1..]),
+        other => return Err(format!("unknown deployment flag: {other}").into()),
+    };
+    Ok(Frame {
+        interner_bytes,
+        deployment,
+        _charge: charge,
+    })
+}
+
+/// Install the backup in `file`, checked as `frame` and `check`, as the
+/// whole database at `storage_config`'s directories, which must be empty or
+/// hold the unfinished restore of this same image. The directories are
+/// claimed before the store is opened and released only once everything
+/// installed is durable and the claim is ended: a restore cut short leaves a
+/// store no ordinary open serves, and running it again starts its install
+/// over.
+fn restore_snapshot_backup(
+    storage_config: coordinode_storage::engine::config::StorageConfig,
+    file: &std::fs::File,
+    frame: &Frame<'_>,
+    check: &coordinode_raft::snapshot::ImageCheck<'_>,
+    budget: &coordinode_core::budget::QueryBudget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let claim = coordinode_storage::format::begin_restore(&storage_config, check.checksum())
+        .map_err(|e| format!("restore refused: {e}"))?;
+    abort_at("claimed");
+    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = coordinode_storage::engine::core::StorageEngine::open_restoring(
+        &storage_config,
+        oracle,
+        claim,
+    )
+    .map_err(|e| format!("failed to open the target: {e}"))?;
+    let mut reader = read_pass(file)?;
+    if !read_frame(&mut reader, budget)?.same_as(frame) {
+        return Err(
+            "the input changed between its check and its install; nothing installed is \
+             served, and the next attempt starts over"
+                .into(),
+        );
+    }
+    coordinode_raft::snapshot::install_image(&engine, &mut reader, check, budget)
+        .map_err(|e| format!("restore failed: {e}"))?;
+    abort_at("installed");
+    // The store continues the image's domain, bound with its records. Every
+    // incarnation the image holds is closed, so a descriptor issued before
+    // the backup resolves to its recorded outcome and admits nothing new. The
+    // target held no history of its own.
+    coordinode_storage::engine::operations::fence_restored(&engine, &[])
+        .map_err(|e| format!("fence the restored operation records: {e}"))?;
+    engine
+        .persist()
+        .map_err(|e| format!("persist the restored database: {e}"))?;
+    abort_at("persisted");
+    // While the engine still holds the directories.
+    coordinode_storage::format::finish_restore(&storage_config)
+        .map_err(|e| format!("finish the restore: {e}"))?;
+    drop(engine);
+    Ok(())
+}
+
+/// Test builds only: COORDINODE_TEST_RESTORE_ABORT names a step of the
+/// restore at which the process dies on the spot, so a test cuts a restore
+/// short at that step through the process.
+fn abort_at(step: &str) {
+    #[cfg(feature = "test-faults")]
+    if std::env::var("COORDINODE_TEST_RESTORE_ABORT").as_deref() == Ok(step) {
+        std::process::abort();
+    }
+    #[cfg(not(feature = "test-faults"))]
+    let _ = step;
 }
 
 /// A restore input file, decompressed as it is read.

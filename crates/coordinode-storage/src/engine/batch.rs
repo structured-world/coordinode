@@ -49,6 +49,96 @@ use crate::error::StorageResult;
 /// of 16 made every mid-size multi-partition commit pay the rayon wake-up.
 const PARALLEL_THRESHOLD: usize = 1024;
 
+/// Bytes one entry of a tree batch holds beyond its key and value: the
+/// batch's entry and the entry it is materialized into before the memtable
+/// takes it.
+const TREE_ENTRY_SLOT: u64 = 2 * core::mem::size_of::<lsm_tree::Slice>() as u64
+    + core::mem::size_of::<u64>() as u64
+    + core::mem::size_of::<lsm_tree::InternalValue>() as u64
+    + SEEN_SLOT;
+
+/// An entry's share of the table the tree batch checks its keys in for
+/// mixed operations as it materializes: a key reference and an operation
+/// kind, with the slot's control byte. The table holds up to 8/7 of the
+/// next power of two above its entries: up to 16/7 slots per entry, of
+/// which the doubling in [`STAGED_SLOTS`] pays two, and this the 8/7.
+const SEEN_SLOT: u64 =
+    (core::mem::size_of::<(&[u8], lsm_tree::ValueType)>() as u64 + 1).div_ceil(7) * 8;
+
+/// What one such table holds once, whatever its entries: the trailing
+/// group of control bytes past its slots.
+const SEEN_GROUP: u64 = 16;
+
+/// Bytes every staged mutation holds beyond the bytes it carries: its own
+/// slot, its slot in the commit's partition group, its tally slot and the
+/// two tree batch entries it becomes (the write and its unit record), each
+/// doubled for the growth of the container holding it.
+const STAGED_SLOTS: u64 = 2
+    * (core::mem::size_of::<Mutation>() as u64
+        + core::mem::size_of::<&Mutation>() as u64
+        + crate::engine::material::COUNTED_SLOT
+        + 2 * TREE_ENTRY_SLOT);
+
+/// The most bytes a put of `key_len` and `value_len` bytes staged in a
+/// [`WriteBatch`] holds at once until [`WriteBatch::commit`] hands it to
+/// the memtables: the staged key and value, their copy in the tree batch,
+/// and the unit record that copies the key once more, with their slots.
+/// What the memtables keep afterwards is the store's, not the caller's. A
+/// store preparing an index replacement writes an index entry twice more;
+/// an offline restore's fresh store prepares none.
+#[must_use]
+pub fn staged_put_bytes(key_len: u64, value_len: u64) -> u64 {
+    3 * key_len + 2 * value_len + crate::engine::material::UNIT_RECORD_FIXED + STAGED_SLOTS
+}
+
+/// [`staged_put_bytes`] for a delete of a `key_len`-byte key.
+#[must_use]
+pub fn staged_delete_bytes(key_len: u64) -> u64 {
+    3 * key_len + crate::engine::material::UNIT_RECORD_FIXED + STAGED_SLOTS
+}
+
+/// The bytes a commit holds once per batch, besides its mutations: the
+/// buffer translating an index key and the one encoding unit records, each
+/// as long as the longest key, the batch's tally record, its partition
+/// groups and the key tables their tree batches check.
+#[must_use]
+pub fn staged_batch_bytes(longest_key: u64) -> u64 {
+    let groups = Partition::all().len() as u64
+        * 2
+        * (core::mem::size_of::<(Partition, Vec<&Mutation>)>() as u64 + 16 + SEEN_GROUP);
+    2 * longest_key + crate::engine::material::UNIT_RECORD_FIXED + 32 + groups
+}
+
+/// The header fields a unit's compact frame carries once (its timestamps,
+/// id, flags and operation count), each a varint of at most ten bytes.
+const FRAME_UNIT_HEAD: u64 = 64;
+
+/// The fields a frame carries per operation: its kind, partition and the
+/// lengths of its key and value, each a varint of at most ten bytes.
+const FRAME_OP_HEAD: u64 = 32;
+
+/// What the journal's entry adds around a frame: its index, term,
+/// timestamp, shard and op framing.
+const JOURNAL_ENTRY_HEAD: u64 = 64;
+
+/// The most bytes a journaled node-local write of one record of `key_len`
+/// and `value_len` bytes ([`StorageEngine::commit_local`]) holds at once
+/// beside what the memtables keep: the record as handed in and as resolved
+/// for the trees, each staged ([`staged_put_bytes`]) with the batch's own
+/// buffers; its compact frame and the journal entry encoding it, each
+/// doubled for the growth of its buffer; and the bounds of the markers a
+/// coverage fold removes, a pair in every tree.
+#[must_use]
+pub fn local_record_bytes(key_len: u64, value_len: u64) -> u64 {
+    let frame = key_len + value_len + FRAME_UNIT_HEAD + FRAME_OP_HEAD;
+    let fold = Partition::all().len() as u64 * 2 * 2 * crate::engine::coverage::MARKER_LEN as u64;
+    2 * staged_put_bytes(key_len, value_len)
+        + staged_batch_bytes(key_len)
+        + 2 * frame
+        + 2 * (frame + JOURNAL_ENTRY_HEAD)
+        + fold
+}
+
 /// A mutation to be applied in a write batch.
 #[derive(Debug)]
 pub(crate) enum Mutation {

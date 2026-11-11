@@ -2856,6 +2856,179 @@ async fn a_registration_lost_before_flush_replays_to_the_same_ids() {
     );
 }
 
+// -- Offline capture cut --
+
+/// Entry `index`: a put of `key` = `value` into `partition` committed at
+/// `ts`, carrying the closed bound `closed_below`.
+fn capture_entry(
+    index: u64,
+    ts: u64,
+    partition: PartitionId,
+    key: &[u8],
+    value: &[u8],
+    closed_below: u64,
+) -> Entry {
+    use openraft::entry::RaftEntry;
+    Entry::new_normal(
+        log_id(1, index),
+        Request {
+            proposals: vec![RaftProposal {
+                id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
+                mutations: vec![Mutation::Put {
+                    partition,
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(ts),
+                start_ts: Timestamp::from_raw(ts - 1),
+                bypass_rate_limiter: false,
+            }],
+            closed_below,
+        },
+    )
+}
+
+/// What an offline capture of `engine` reads of `key` in `part`, or why it
+/// refused.
+fn captured(
+    engine: &StorageEngine,
+    part: Partition,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    let (cut, _pin) = engine.pin_capture_cut().map_err(|e| e.to_string())?;
+    engine
+        .snapshot_get(&cut, part, key)
+        .map(|value| value.map(|v| v.to_vec()))
+        .map_err(|e| e.to_string())
+}
+
+/// A capture reads at the closed bound, which is exclusive: of the commits a
+/// member applied, those below the bound are in, the one at it and the one
+/// above it are out, however far the member applied.
+#[tokio::test]
+async fn an_offline_capture_takes_only_commits_below_the_closed_bound() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    {
+        let (engine, oracle) = open_rig_engine(&rig);
+        let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+            .expect("open");
+        let t = oracle.current().as_raw() + 1_000;
+        apply_entries(
+            &mut sm,
+            vec![
+                capture_entry(1, t + 1, PartitionId::Node, b"node:00:below", b"v", 0),
+                capture_entry(2, t + 2, PartitionId::Node, b"node:00:at", b"v", t + 2),
+                capture_entry(3, t + 3, PartitionId::Node, b"node:00:above", b"v", 0),
+                capture_entry(4, t + 4, PartitionId::Node, b"node:00:last", b"v", 0),
+            ],
+        )
+        .await;
+        drop(sm);
+        engine.persist().expect("persist");
+    }
+    let (engine, _) = open_rig_engine(&rig);
+    let read = |key: &[u8]| captured(&engine, Partition::Node, key).expect("a qualified cut");
+    assert!(read(b"node:00:below").is_some(), "below the bound");
+    assert!(read(b"node:00:at").is_none(), "at the bound");
+    assert!(read(b"node:00:above").is_none(), "above the bound");
+}
+
+/// A member whose closed bound reached disk in the Schema tree while a
+/// partition it covers lost the entries behind it is not captured as if the
+/// bound held: the capture refuses, or holds what the bound covers.
+#[tokio::test]
+async fn an_offline_capture_refuses_a_bound_its_partitions_do_not_hold() {
+    use lsm_tree::AbstractTree;
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    {
+        let (engine, oracle) = open_rig_engine(&rig);
+        let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+            .expect("open");
+        let t = oracle.current().as_raw() + 1_000;
+        let mut entries: Vec<Entry> = (1..=4)
+            .map(|i| capture_entry(i, t + i, PartitionId::Node, b"node:00:early", b"v", 0))
+            .collect();
+        apply_entries(&mut sm, std::mem::take(&mut entries)).await;
+        engine.persist().expect("everything up to the fold on disk");
+        apply_entries(
+            &mut sm,
+            vec![
+                capture_entry(5, t + 5, PartitionId::Node, b"node:00:lost", b"v", 0),
+                capture_entry(6, t + 6, PartitionId::Node, b"node:00:later", b"v", t + 6),
+                capture_entry(7, t + 7, PartitionId::Node, b"node:00:later", b"v", 0),
+                capture_entry(8, t + 8, PartitionId::Node, b"node:00:later", b"v", 0),
+                capture_entry(9, t + 9, PartitionId::Node, b"node:00:later", b"v", t + 9),
+            ],
+        )
+        .await;
+        // The bound that covers entry 5 reaches disk; entry 5 itself does not.
+        let schema = engine.tree(Partition::Schema).unwrap();
+        schema.flush_active_memtable(0).unwrap();
+        schema.persist_flushes().unwrap();
+        drop(sm);
+        rig.cut(engine);
+    }
+    let (engine, _) = open_rig_engine(&rig);
+    match captured(&engine, Partition::Node, b"node:00:lost") {
+        Err(_) => {}
+        Ok(value) => assert!(value.is_some(), "the cut lacks a commit its bound covers"),
+    }
+}
+
+/// The consumer registry keeps no history of its own: a capture at an
+/// earlier closed bound, after a later registration change was compacted
+/// over the one at the bound, refuses rather than read the later one.
+#[tokio::test]
+async fn an_offline_capture_does_not_read_a_later_registry_at_an_earlier_cut() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    {
+        let (engine, oracle) = open_rig_engine(&rig);
+        let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+            .expect("open");
+        let t = oracle.current().as_raw() + 1_000;
+        apply_entries(
+            &mut sm,
+            vec![
+                capture_entry(
+                    1,
+                    t + 1,
+                    PartitionId::Registry,
+                    b"reg:consumer",
+                    b"first",
+                    0,
+                ),
+                capture_entry(2, t + 2, PartitionId::Node, b"node:00:a", b"v", t + 2),
+                capture_entry(
+                    3,
+                    t + 3,
+                    PartitionId::Registry,
+                    b"reg:consumer",
+                    b"second",
+                    0,
+                ),
+                capture_entry(4, t + 4, PartitionId::Node, b"node:00:b", b"v", 0),
+            ],
+        )
+        .await;
+        drop(sm);
+        engine.persist().expect("persist");
+        engine.set_gc_watermark(t + 100);
+        engine
+            .force_compaction(Partition::Registry)
+            .expect("compact the registry");
+        engine.persist().expect("persist");
+    }
+    let (engine, _) = open_rig_engine(&rig);
+    match captured(&engine, Partition::Registry, b"reg:consumer") {
+        Err(_) => {}
+        Ok(value) => assert_eq!(
+            value.as_deref(),
+            Some(&b"first"[..]),
+            "the registry at the cut, not a later one"
+        ),
+    }
+}
+
 // -- Crash campaign --
 
 const RAFT_CAMPAIGN_ENTRIES: u64 = 24;

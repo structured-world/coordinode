@@ -62,6 +62,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod alloc_peak;
 pub mod client;
 pub mod kill;
 pub mod pki;

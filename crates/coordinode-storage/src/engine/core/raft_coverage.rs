@@ -272,6 +272,16 @@ impl RaftCoverage {
             .min_by_key(|(next, _)| *next)
     }
 
+    /// One past the entries `partition`'s tree holds all of, `None` when it
+    /// records no base.
+    #[must_use]
+    pub fn base_of(&self, partition: Partition) -> Option<u64> {
+        self.trees
+            .get(&partition)
+            .and_then(TreeCoverage::base)
+            .map(|(next, _)| next)
+    }
+
     /// One past the highest entry any tree records: from there on, no tree
     /// holds anything the state machine has to skip.
     #[must_use]

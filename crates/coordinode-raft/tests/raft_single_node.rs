@@ -96,6 +96,217 @@ async fn e2e_propose_multi_partition_and_read() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A node that applies entries while it goes down still records on disk
+/// every entry it applied: an offline copy is qualified by the trees'
+/// bases, so they reach past every entry any tree holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_node_records_every_entry_it_applied() {
+    let (_dir, engine) = test_engine();
+    let node = RaftNode::single_node(Arc::clone(&engine))
+        .await
+        .expect("bootstrap");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let ids = Arc::new(ProposalIdGenerator::new());
+    let put = |id, key: &[u8], ts: u64| RaftProposal {
+        id,
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: key.to_vec(),
+            value: b"v".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts - 1),
+        bypass_rate_limiter: false,
+    };
+    node.pipeline()
+        .propose_and_wait(&put(ids.next(), b"node:1:early", 1_000))
+        .expect("write");
+    let late = node.pipeline();
+    let late_write = put(ids.next(), b"node:1:late", 1_001);
+    node.before_consensus_stop(async move {
+        tokio::task::spawn_blocking(move || late.propose_and_wait(&late_write))
+            .await
+            .expect("join")
+            .expect("a write while the node goes down");
+    });
+    node.shutdown().await.expect("shutdown");
+    drop(node);
+
+    let coverage = engine.raft_coverage().expect("coverage");
+    let held = coverage.skip_until();
+    for &part in Partition::all() {
+        if part == Partition::Raft {
+            continue;
+        }
+        let base = coverage.base_of(part).unwrap_or(0);
+        assert!(
+            base >= held,
+            "{} records the log only below {base}, but trees hold entries below {held}",
+            part.name()
+        );
+    }
+}
+
+/// A node whose consensus work does not let go of the engine within its
+/// drain (a stalled apply or snapshot build, which may still go on) does
+/// not record any applied prefix as final: the trees' bases stay where
+/// they were, and an offline copy of the store is refused rather than
+/// qualified by a prefix the work could still change.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_stopped_with_work_still_running_claims_no_final_prefix() {
+    let (_dir, engine) = test_engine();
+    let node = RaftNode::single_node(Arc::clone(&engine))
+        .await
+        .expect("bootstrap");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    node.pipeline()
+        .propose_and_wait(&RaftProposal {
+            id: ProposalIdGenerator::new().next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:held".to_vec(),
+                value: b"v".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(1_000),
+            start_ts: Timestamp::from_raw(999),
+            bypass_rate_limiter: false,
+        })
+        .expect("write");
+    let before = engine
+        .raft_coverage()
+        .expect("coverage")
+        .base_of(Partition::Node);
+    let held = node.hold_consensus_work();
+    node.set_work_drain(std::time::Duration::from_millis(100));
+    node.shutdown().await.expect("shutdown");
+    let after = engine
+        .raft_coverage()
+        .expect("coverage")
+        .base_of(Partition::Node);
+    drop(held);
+    drop(node);
+    assert_eq!(
+        after, before,
+        "a prefix was recorded while work still held the engine"
+    );
+}
+
+/// An apply stopped part way through a shutdown: its proposal is in the
+/// trees, the entry does not count as applied, and the shutdown's drain
+/// ends first. The stop records no prefix covering that entry, so a copy
+/// of the store taken now is not qualified by it; once the apply is let go
+/// and ends, the directory frees, and a reopen holds the entry, applied
+/// again from the log, and goes on writing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_apply_stopped_through_shutdown_is_not_recorded_and_reopens() {
+    init_test_tracing();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let put = |id, key: &[u8], ts: u64| RaftProposal {
+        id,
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: key.to_vec(),
+            value: b"v".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts - 1),
+        bypass_rate_limiter: false,
+    };
+    let ids = ProposalIdGenerator::new();
+
+    let held_index = {
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let node = RaftNode::single_node(Arc::clone(&engine))
+            .await
+            .expect("bootstrap");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        node.pipeline()
+            .propose_and_wait(&put(ids.next(), b"node:1:early", 1_000))
+            .expect("write");
+        let held_index = node.applied_index() + 1;
+        let (reached, release) = node.pause_apply_at(held_index);
+        let pipeline = node.pipeline();
+        let held = put(ids.next(), b"node:1:held", 1_001);
+        // The write's answer never comes: the node stops under it.
+        let writer = tokio::task::spawn_blocking(move || pipeline.propose_and_wait(&held));
+        reached.await.expect("the apply stopped at the held entry");
+        assert_eq!(
+            engine
+                .get(Partition::Node, b"node:1:held")
+                .expect("read")
+                .as_deref(),
+            Some(b"v".as_slice()),
+            "the stopped apply has its proposal in the tree"
+        );
+
+        let parts: Vec<Partition> = Partition::all()
+            .iter()
+            .copied()
+            .filter(|&part| part != Partition::Raft)
+            .collect();
+        let bases = |engine: &StorageEngine| {
+            let coverage = engine.raft_coverage().expect("coverage");
+            parts
+                .iter()
+                .map(|&part| coverage.base_of(part))
+                .collect::<Vec<_>>()
+        };
+        let before = bases(&engine);
+        node.set_work_drain(std::time::Duration::from_millis(100));
+        node.shutdown().await.expect("shutdown");
+        let after = bases(&engine);
+        assert_eq!(
+            after, before,
+            "the stop recorded a prefix while the apply of entry {held_index} was still running"
+        );
+        assert!(
+            after.iter().all(|base| base.unwrap_or(0) <= held_index),
+            "a base covers entry {held_index}, though its apply has not ended: {after:?}"
+        );
+        assert!(
+            StorageEngine::open(&config).is_err(),
+            "the directory is free while the stopped apply still holds the engine"
+        );
+
+        drop(release);
+        node.consensus_work_released().await;
+        let _ = writer.await.expect("join");
+        drop(node);
+        held_index
+    };
+
+    let engine = Arc::new(StorageEngine::open(&config).expect("reopen once the apply ended"));
+    let mut node = RaftNode::open(1, Arc::clone(&engine))
+        .await
+        .expect("resume");
+    node.wait_for_applied(held_index, std::time::Duration::from_secs(30))
+        .await
+        .expect("the held entry applies after the reopen");
+    for key in [b"node:1:early".as_slice(), b"node:1:held"] {
+        assert_eq!(
+            engine.get(Partition::Node, key).expect("read").as_deref(),
+            Some(b"v".as_slice()),
+            "{} lost across the reopen",
+            String::from_utf8_lossy(key)
+        );
+    }
+    node.pipeline()
+        .propose_and_wait(&put(
+            ProposalIdGenerator::with_base(1_000).next(),
+            b"node:1:after",
+            2_000,
+        ))
+        .expect("a write after the reopen");
+    node.shutdown().await.expect("shutdown");
+}
+
 /// Watermark advances with each proposal and wait_for_applied works.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_applied_watermark_tracking() {

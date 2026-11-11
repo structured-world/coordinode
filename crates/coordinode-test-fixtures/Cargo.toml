@@ -29,6 +29,10 @@ rustls = { version = "0.23", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower-service = "0.3"
+# Counting what a piece of work held at once (`alloc_peak`).
+tracking-allocator = { version = "0.4", default-features = false }
+# `alloc_peak` counts the work the measured code hands to the rayon pool.
+rayon = { workspace = true }
 
 # Crash-test children send themselves SIGKILL.
 [target.'cfg(unix)'.dependencies]

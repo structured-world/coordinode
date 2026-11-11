@@ -122,10 +122,41 @@ pub fn recorded_deployment(engine: &StorageEngine) -> StorageResult<Option<Deplo
 /// A record does not decode; [`StorageError::DeploymentConflict`] when the
 /// record and the enrollment both exist and disagree.
 pub fn bound_deployment(engine: &StorageEngine) -> StorageResult<Option<DeploymentId>> {
-    let recorded = recorded_deployment(engine)?;
-    let enrolled = match engine.get(Partition::Schema, ENROLLED_DEPLOYMENT_KEY)? {
+    binding_of(
+        recorded_deployment(engine)?,
+        engine.get(Partition::Schema, ENROLLED_DEPLOYMENT_KEY)?,
+    )
+}
+
+/// [`bound_deployment`] as it stood at `snapshot`, a seqno the caller pinned.
+///
+/// # Errors
+///
+/// As [`bound_deployment`]; the snapshot is no longer retained.
+pub fn bound_deployment_at(
+    engine: &StorageEngine,
+    snapshot: lsm_tree::SeqNo,
+) -> StorageResult<Option<DeploymentId>> {
+    let recorded = match engine.snapshot_get(&snapshot, Partition::Schema, DEPLOYMENT_KEY)? {
         None => None,
         Some(bytes) => Some(DeploymentId::from_slice(&bytes).ok_or_else(|| {
+            StorageError::Serialization("the deployment record does not decode".into())
+        })?),
+    };
+    binding_of(
+        recorded,
+        engine.snapshot_get(&snapshot, Partition::Schema, ENROLLED_DEPLOYMENT_KEY)?,
+    )
+}
+
+/// The binding a deployment record and an enrollment record give together.
+fn binding_of(
+    recorded: Option<DeploymentId>,
+    enrolled: Option<impl AsRef<[u8]>>,
+) -> StorageResult<Option<DeploymentId>> {
+    let enrolled = match enrolled {
+        None => None,
+        Some(bytes) => Some(DeploymentId::from_slice(bytes.as_ref()).ok_or_else(|| {
             StorageError::Serialization("the enrollment record does not decode".into())
         })?),
     };
@@ -423,9 +454,30 @@ pub fn load_field_dictionary(engine: &StorageEngine) -> StorageResult<FieldInter
     // No binding is written while this reads: a binding applied between the
     // two scans would show its name record without its id record.
     let _exclusive = engine.metadata_exclusive();
-    let by_id = read_id_records(engine, FIELD_ID_KEY_PREFIX)?;
+    dictionary_from(|prefix| engine.prefix_scan(Partition::Schema, prefix))
+}
+
+/// [`load_field_dictionary`] as it stood at `snapshot`, a seqno the caller
+/// pinned: both scans read the same cut, so no lock is taken.
+///
+/// # Errors
+///
+/// As [`load_field_dictionary`]; the snapshot is no longer retained.
+pub fn load_field_dictionary_at(
+    engine: &StorageEngine,
+    snapshot: lsm_tree::SeqNo,
+) -> StorageResult<FieldInterner> {
+    dictionary_from(|prefix| engine.snapshot_prefix_iter(&snapshot, Partition::Schema, prefix))
+}
+
+/// The dictionary the Schema records `scan` yields hold, checked record
+/// against record.
+fn dictionary_from(
+    scan: impl Fn(&[u8]) -> StorageResult<crate::engine::StorageIter>,
+) -> StorageResult<FieldInterner> {
+    let by_id = read_id_records(scan(FIELD_ID_KEY_PREFIX)?)?;
     let mut by_name = 0usize;
-    for guard in engine.prefix_scan(Partition::Schema, FIELD_NAME_KEY_PREFIX)? {
+    for guard in scan(FIELD_NAME_KEY_PREFIX)? {
         let (key, value) = guard.into_inner()?;
         let name = std::str::from_utf8(&key[FIELD_NAME_KEY_PREFIX.len()..])
             .map_err(|_| DictionaryError::Malformed("a name record key is not UTF-8".into()))?;
@@ -508,11 +560,10 @@ pub fn field_bindings_above(
 }
 
 fn read_id_records(
-    engine: &StorageEngine,
-    prefix: &[u8],
+    records: crate::engine::StorageIter,
 ) -> StorageResult<std::collections::BTreeMap<u32, String>> {
     let mut by_id = std::collections::BTreeMap::new();
-    for guard in engine.prefix_scan(Partition::Schema, prefix)? {
+    for guard in records {
         let (key, value) = guard.into_inner()?;
         let id = decode_field_id_key(&key).ok_or_else(|| {
             DictionaryError::Malformed("an id record key does not name an id".into())

@@ -313,7 +313,7 @@ fn a_held_directory_is_refused_and_reopens_once_released() {
         .expect("a directory a live handle holds was opened twice");
     assert!(
         matches!(refused, coordinode_embed::DatabaseError::Storage(_))
-            && refused.to_string().contains("Locked"),
+            && refused.to_string().contains("in use by another open store"),
         "the second open names the held store: {refused:?}"
     );
     assert_eq!(

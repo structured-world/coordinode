@@ -35,6 +35,265 @@ static STEPS: &[MigrationStep] = &[
     },
 ];
 
+/// A config of durable endpoints at `dirs`, the first one primary.
+fn endpoints(dirs: &[&Path]) -> StorageConfig {
+    use crate::engine::config::{EndpointConfig, Media, Tier};
+    StorageConfig::with_endpoints(
+        dirs.iter()
+            .enumerate()
+            .map(|(i, dir)| {
+                EndpointConfig::new(
+                    format!("e{i}"),
+                    dir,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// A restore claims every endpoint or none: one occupied directory, even a
+/// secondary one, refuses the claim, and the primary is not created.
+#[test]
+fn a_restore_claim_needs_every_endpoint_empty() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (primary, secondary) = (root.path().join("p"), root.path().join("s"));
+    touch(&secondary, "table");
+    let config = endpoints(&[&primary, &secondary]);
+    let refused = begin_restore(&config, 7).expect_err("an occupied endpoint");
+    assert!(
+        matches!(refused, StorageError::RestoreTarget { .. }),
+        "{refused}"
+    );
+    assert!(!primary.exists(), "nothing was claimed");
+}
+
+/// Between the claim and its end only the open of that same restore is let
+/// in; afterwards every open is.
+#[test]
+fn a_claimed_directory_opens_only_for_its_restore() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("data");
+    let config = endpoints(&[&dir]);
+    let claim = begin_restore(&config, 7).expect("claim");
+    assert!(
+        matches!(prepare(&config), Err(StorageError::StoreInUse { .. })),
+        "the claim holds the directory"
+    );
+    drop(claim);
+    assert!(matches!(
+        prepare(&config),
+        Err(StorageError::RestoreIncomplete { image: 7, .. })
+    ));
+    assert!(matches!(
+        begin_restore(&config, 8),
+        Err(StorageError::RestoreTarget { .. })
+    ));
+    let claim = begin_restore(&config, 7).expect("the same image claims it again");
+    let restoring = prepare_restoring(&config, claim).expect("the restore itself");
+    finish_restore(&config).expect("finish");
+    drop(restoring);
+    prepare(&config).expect("an ordinary open");
+}
+
+/// A restore owns its target from the check that found it empty until the
+/// claim is written: neither another restore, even of the same image, nor an
+/// ordinary open gets in between.
+#[test]
+fn nothing_gets_between_the_emptiness_check_and_the_claim() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = endpoints(&[&root.path().join("p"), &root.path().join("s")]);
+    let mut first = true;
+    let mut rival = None;
+    let mut open = None;
+    begin_restore_with(&config, 7, &mut || {
+        if std::mem::take(&mut first) {
+            rival = Some(begin_restore(&config, 7).is_ok());
+            open = Some(prepare(&config).is_ok());
+        }
+        Ok(())
+    })
+    .expect("the first restore claims");
+    assert_eq!(rival, Some(false), "a second restore got in");
+    assert_eq!(open, Some(false), "an ordinary open got in");
+}
+
+/// A claim cut short at any of its writes leaves a target the same restore
+/// takes up again, and that no ordinary open takes for a store once any of
+/// the claim is on disk.
+#[test]
+fn a_claim_cut_short_at_any_write_is_taken_up_by_the_same_restore() {
+    let root = tempfile::tempdir().expect("tempdir");
+    for cut in 0.. {
+        let base = root.path().join(format!("cut-{cut}"));
+        let (primary, secondary) = (base.join("p"), base.join("s"));
+        let config = endpoints(&[&primary, &secondary]);
+        let mut calls = 0;
+        let claimed = begin_restore_with(&config, 7, &mut || {
+            calls += 1;
+            if calls > cut {
+                Err(StorageError::Io("cut".into()))
+            } else {
+                Ok(())
+            }
+        });
+        if claimed.is_ok() {
+            assert!(cut > 0, "the claim has steps");
+            break;
+        }
+        let written = [&primary, &secondary]
+            .iter()
+            .any(|dir| !is_empty(dir).expect("list"));
+        if written {
+            assert!(
+                prepare(&config).is_err(),
+                "cut {cut}: an ordinary open took a partly claimed target"
+            );
+        }
+        begin_restore(&config, 7)
+            .unwrap_or_else(|e| panic!("cut {cut}: the same restore was refused: {e}"));
+        assert!(
+            prepare(&config).is_err(),
+            "cut {cut}: claimed target opened"
+        );
+    }
+}
+
+/// Taking up an unfinished restore does not take in a directory the claim
+/// never covered: with another endpoint in place of one it claimed, holding
+/// a store, the restore is refused and that store left as it was.
+#[test]
+fn a_resumed_claim_does_not_take_in_another_endpoint() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (a, b, c) = (
+        root.path().join("a"),
+        root.path().join("b"),
+        root.path().join("c"),
+    );
+    begin_restore(&endpoints(&[&a, &b]), 7).expect("claim a and b");
+    touch(&c, "foreign-table");
+    let refused = begin_restore(&endpoints(&[&a, &c]), 7);
+    assert!(refused.is_err(), "a foreign endpoint was taken in");
+    assert_eq!(
+        std::fs::read_dir(&c).expect("list").count(),
+        1,
+        "the foreign endpoint was changed"
+    );
+}
+
+/// Two endpoints naming one directory are refused by the restore and by an
+/// ordinary open alike, rather than taken for a store holding itself.
+#[test]
+fn endpoints_naming_one_directory_are_refused() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("d");
+    let alias = root.path().join("d").join("..").join("d");
+    let config = endpoints(&[&dir, &alias]);
+    assert!(matches!(
+        begin_restore(&config, 7),
+        Err(StorageError::InvalidConfig(_))
+    ));
+    assert!(matches!(
+        prepare(&config),
+        Err(StorageError::InvalidConfig(_))
+    ));
+}
+
+/// A stop part way through ending a restore leaves the primary's claim,
+/// which covers its directories: the same restore takes them up again,
+/// whatever a secondary holds by then.
+#[test]
+fn a_restore_stopped_while_ending_is_taken_up_again() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (primary, secondary) = (root.path().join("p"), root.path().join("s"));
+    let config = endpoints(&[&primary, &secondary]);
+    drop(begin_restore(&config, 7).expect("claim"));
+    touch(&secondary, "table");
+    std::fs::remove_file(secondary.join(RESTORE_FILE)).expect("secondary claim ended");
+    assert!(
+        prepare(&config).is_err(),
+        "the primary's claim still stands"
+    );
+    drop(begin_restore(&config, 7).expect("taken up again"));
+}
+
+/// A restore that stops while it ends never leaves one of its directories
+/// free for another store: whatever claim went first, an open with another
+/// primary over its secondary is refused, and the store itself still opens,
+/// or its restore is taken up again, under its own configuration.
+#[test]
+fn a_restore_ending_part_way_keeps_its_secondary_bound() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (a, b, c) = (
+        root.path().join("a"),
+        root.path().join("b"),
+        root.path().join("c"),
+    );
+    let config = endpoints(&[&a, &b]);
+    let restoring =
+        prepare_restoring(&config, begin_restore(&config, 7).expect("claim")).expect("open");
+    touch(&b, "table");
+    let stopped = finish_restore_with(&config, &mut || Err(StorageError::Io("cut".into())));
+    assert!(
+        stopped.is_err(),
+        "the ending was cut after its first removal"
+    );
+    drop(restoring);
+
+    assert!(
+        prepare(&endpoints(&[&c, &b])).is_err(),
+        "the secondary opened under another primary"
+    );
+    // The primary's claim went first: the store is published. It opens under
+    // its own configuration, which clears the secondary's leftover claim,
+    // and a restore over it is refused as over any store.
+    let opened = prepare(&config).expect("the published store opens");
+    assert!(
+        read_claim(&b).expect("read").is_none(),
+        "the leftover claim is cleared"
+    );
+    drop(opened);
+    assert!(
+        matches!(
+            begin_restore(&config, 7),
+            Err(StorageError::RestoreTarget { .. })
+        ),
+        "a restore over the published store was let in"
+    );
+}
+
+/// A claim the ordinary open cannot see is no claim: with a volatile first
+/// endpoint, either the restore is refused or the open still refuses the
+/// claimed directory.
+#[test]
+fn a_claim_is_seen_by_every_open_of_its_configuration() {
+    use crate::engine::config::{EndpointConfig, Media, Tier};
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "mem",
+            root.path().join("mem"),
+            Media::Hdd,
+            Durability::Volatile,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "disk",
+            root.path().join("disk"),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        ),
+    ]);
+    let claimed = begin_restore(&config, 7).is_ok();
+    assert!(
+        !claimed || prepare(&config).is_err(),
+        "an ordinary open did not see the claim"
+    );
+}
+
 #[test]
 fn a_new_directory_is_marked_with_the_current_format() {
     let root = tempfile::tempdir().expect("tempdir");
