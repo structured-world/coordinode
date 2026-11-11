@@ -36,6 +36,12 @@ use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_storage::engine::applied::AppliedStop;
 use coordinode_storage::engine::coordinator::SnapshotPin;
 use coordinode_storage::engine::core::StorageEngine;
+// The progress of a registration already admitted (its acknowledgements,
+// heartbeats, cancellation and expiry) releases the history it holds: it is
+// admitted from the room kept for the store's own recovery work, never
+// refused with the client writes a full store turns away. A new
+// registration takes on retention and is a client write.
+use coordinode_storage::engine::footprint::ReclaimScope;
 use coordinode_storage::engine::oplog_journal::JournalHold;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
@@ -43,8 +49,8 @@ use parking_lot::{Condvar, Mutex};
 
 use super::SeqnoConsumerRegistry;
 use super::entry::{
-    HEARTBEAT_KEY_PREFIX, Heartbeat, REGISTRY_KEY_PREFIX, RegistryEntry, encode_heartbeat_key,
-    encode_registry_key,
+    HEARTBEAT_KEY_PREFIX, Heartbeat, MAX_CONSUMER_ID_BYTES, REGISTRY_KEY_PREFIX, RegistryEntry,
+    encode_heartbeat_key, encode_registry_key,
 };
 use super::source::RetentionSource;
 use super::types::{
@@ -88,6 +94,109 @@ impl Clock for SystemClock {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+}
+
+/// The most consumer incarnations whose heartbeats the leader buffers
+/// between flushes. One flush writes them all as one batch, so the buffer
+/// and the batch stay bounded however many consumers heartbeat.
+const MAX_PENDING_HEARTBEATS: usize = 4_096;
+
+/// The most bytes of consumer ids the buffered heartbeats hold: ids are of
+/// any length, so a count of heartbeats alone bounds no memory.
+const MAX_PENDING_HEARTBEAT_BYTES: usize = 1 << 20;
+
+/// Buffered heartbeats by consumer id: the incarnation that sent the latest
+/// one, and its time. An older incarnation's heartbeat is no sign of life of
+/// a newer registration and is not kept beside it.
+type Beats = HashMap<String, (u64, u64)>;
+
+/// The leader's buffered heartbeats: those waiting for a flush, and the
+/// batch a flush took, kept visible to a sweep judging liveness until it is
+/// written. A batch whose write failed stays the batch, written again before
+/// anything waiting is taken, never merged back. Each part stays within the
+/// buffer's bound, so both together within twice it; the batch is shared
+/// with its writer, not copied.
+#[derive(Debug, Default)]
+struct PendingHeartbeats {
+    waiting: Beats,
+    /// Bytes of the ids in `waiting`.
+    waiting_bytes: usize,
+    writing: Arc<Beats>,
+}
+
+// Every id a registration accepts fits the buffer, so a flush always makes
+// room for its heartbeat.
+const _: () = assert!(MAX_CONSUMER_ID_BYTES <= MAX_PENDING_HEARTBEAT_BYTES);
+
+impl PendingHeartbeats {
+    /// The latest buffered heartbeat of `consumer_id`'s `incarnation`,
+    /// waiting or being written.
+    fn get(&self, consumer_id: &str, incarnation: u64) -> Option<u64> {
+        let of = |beats: &Beats| {
+            beats
+                .get(consumer_id)
+                .filter(|(inc, _)| *inc == incarnation)
+                .map(|(_, ts)| *ts)
+        };
+        match (of(&self.waiting), of(&self.writing)) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// How many heartbeats are buffered, waiting or being written.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.waiting.len() + self.writing.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.waiting.is_empty() && self.writing.is_empty()
+    }
+
+    /// Buffer the heartbeat of `consumer_id`'s `incarnation` at `ts` if the
+    /// waiting part has room for it: a later time for one already waiting
+    /// always fits. The id is copied only once it is known to fit; it is one
+    /// a registration accepts, so an empty waiting part always has room.
+    fn admit(&mut self, consumer_id: &str, incarnation: u64, ts: u64, cap: usize) -> bool {
+        debug_assert!(consumer_id.len() <= MAX_CONSUMER_ID_BYTES);
+        if let Some(beat) = self.waiting.get_mut(consumer_id) {
+            // A newer incarnation replaces the one waiting; an older one is
+            // dropped here as the flush would drop it.
+            if incarnation > beat.0 {
+                *beat = (incarnation, ts);
+            } else if incarnation == beat.0 {
+                beat.1 = beat.1.max(ts);
+            }
+            return true;
+        }
+        let size = consumer_id.len();
+        let empty = self.waiting.is_empty();
+        if !empty
+            && (self.waiting.len() >= cap
+                || self.waiting_bytes + size > MAX_PENDING_HEARTBEAT_BYTES)
+        {
+            return false;
+        }
+        self.waiting
+            .insert(consumer_id.to_owned(), (incarnation, ts));
+        self.waiting_bytes += size;
+        true
+    }
+
+    /// The batch to write: the one a failed write left, or else every
+    /// waiting heartbeat, taken. `None` when there is nothing to write.
+    fn batch(&mut self) -> Option<Arc<Beats>> {
+        if self.writing.is_empty() {
+            if self.waiting.is_empty() {
+                return None;
+            }
+            self.writing = Arc::new(std::mem::take(&mut self.waiting));
+            self.waiting_bytes = 0;
+        }
+        Some(Arc::clone(&self.writing))
     }
 }
 
@@ -183,7 +292,14 @@ struct RegistryCore {
     /// Buffered heartbeats awaiting the next coalesced flush, by consumer id
     /// and the incarnation that sent them: a heartbeat of an ended
     /// incarnation must not keep its successor alive.
-    pending_hb: Mutex<HashMap<(String, u64), u64>>,
+    pending_hb: Mutex<PendingHeartbeats>,
+    /// The most incarnations waiting in `pending_hb`; a heartbeat of another
+    /// one past it, or past [`MAX_PENDING_HEARTBEAT_BYTES`] of their ids,
+    /// flushes the buffer first, on the caller's thread.
+    pending_hb_cap: usize,
+    /// Held by the one flush that writes the buffer at a time: it owns the
+    /// heartbeats it took until their write lands.
+    flushing: Mutex<()>,
     /// What wakes the background service: a heartbeat buffered, a registry
     /// write applied, a stop.
     wake: Wake,
@@ -248,32 +364,28 @@ impl RegistryCore {
         )))
     }
 
-    /// The MVCC starting position of `reg`, pinned in the engine.
+    /// The MVCC starting position of `reg`, pinned in the engine where the
+    /// store still serves reads there: above both the collection watermark
+    /// and the floor of a partition cleared or dropped under a range.
     fn pin_initial(&self, reg: &ConsumerRegistration) -> Result<(u64, SnapshotPin), RegistryError> {
-        let lost = |checkpoint| RegistryError::RetentionLost {
-            checkpoint,
-            floor: self.engine.gc_watermark(),
+        let pinned = |at| {
+            self.engine
+                .pin_readable_snapshot_at(at)
+                .map(|pin| (at, pin))
+                .map_err(|floor| RegistryError::RetentionLost {
+                    checkpoint: at,
+                    floor,
+                })
         };
         match reg.initial_seqno {
-            InitialSeqno::At(at) => self
-                .engine
-                .pin_snapshot_at(at)
-                .map(|pin| (at, pin))
-                .ok_or_else(|| lost(at)),
-            InitialSeqno::FromNow => {
-                let at = self.source.head(reg.kind);
-                self.engine
-                    .pin_snapshot_at(at)
-                    .map(|pin| (at, pin))
-                    .ok_or_else(|| lost(at))
-            }
+            InitialSeqno::At(at) => pinned(at),
+            InitialSeqno::FromNow => pinned(self.source.head(reg.kind)),
             InitialSeqno::FromEarliestRetained => {
-                // The watermark only moves forward: a pin refused at the value
+                // The horizon only moves forward: a pin refused at the value
                 // just read means it moved, and the next read is past it.
                 for _ in 0..TRANSITION_ATTEMPTS {
-                    let at = self.engine.gc_watermark();
-                    if let Some(pin) = self.engine.pin_snapshot_at(at) {
-                        return Ok((at, pin));
+                    if let Ok(held) = pinned(self.engine.oldest_readable_seqno()) {
+                        return Ok(held);
                     }
                 }
                 Err(RegistryError::Replication(format!(
@@ -519,12 +631,13 @@ impl RegistryCore {
         Ok(entry)
     }
 
-    /// The first position held in `kind`'s space: the engine's collection
-    /// watermark for MVCC history, which the engine alone decides, and the
-    /// source's first retained entry for a log.
+    /// The first position held in `kind`'s space: the oldest seqno the engine
+    /// serves reads at for MVCC history (its collection watermark, or a
+    /// cleared partition's floor above it), which the engine alone decides,
+    /// and the source's first retained entry for a log.
     fn retained_from(&self, kind: ConsumerKind) -> u64 {
         if kind.is_seqno_space() {
-            self.engine.gc_watermark()
+            self.engine.oldest_readable_seqno()
         } else {
             self.source.first_retained(kind)
         }
@@ -641,52 +754,101 @@ impl RegistryCore {
     /// writes it.
     #[cfg(test)]
     fn clock_heartbeat(&self, handle: &RegisteredHandle, at: u64) -> Result<(), RegistryError> {
-        self.pending_hb
-            .lock()
-            .insert((handle.consumer_id().to_string(), handle.incarnation()), at);
+        let buffered = self.pending_hb.lock().admit(
+            handle.consumer_id(),
+            handle.incarnation(),
+            at,
+            usize::MAX,
+        );
+        assert!(buffered);
         self.flush_pending_heartbeats()
+    }
+
+    /// Buffer `handle`'s heartbeat at `now`, within the buffer's bound: the
+    /// room is checked and taken under one lock. A full buffer is flushed on
+    /// this thread first, so the heartbeat waits for room rather than being
+    /// dropped or growing the buffer.
+    ///
+    /// # Errors
+    ///
+    /// An id no registration accepts, refused before it is copied; the
+    /// flush failed; or other heartbeats kept the buffer full through every
+    /// flush: retryable backpressure.
+    fn buffer_heartbeat(&self, handle: &RegisteredHandle, now: u64) -> Result<(), RegistryError> {
+        let (id, incarnation) = (handle.consumer_id(), handle.incarnation());
+        if id.len() > MAX_CONSUMER_ID_BYTES {
+            return Err(RegistryError::ConsumerIdTooLong {
+                len: id.len(),
+                max: MAX_CONSUMER_ID_BYTES,
+            });
+        }
+        for _ in 0..TRANSITION_ATTEMPTS {
+            let buffered = self
+                .pending_hb
+                .lock()
+                .admit(id, incarnation, now, self.pending_hb_cap);
+            if buffered {
+                return Ok(());
+            }
+            self.flush_pending_heartbeats()?;
+        }
+        Err(RegistryError::Backpressure(
+            super::types::RetentionPressure::WritePressure,
+        ))
     }
 
     /// Write the buffered heartbeats in one coalesced transaction.
     ///
     /// A heartbeat of an incarnation that has since ended or been replaced is
-    /// dropped: it is no sign of life of anything registered now. Each
-    /// heartbeat stays in the buffer until its write lands, so a sweep judging
-    /// liveness meanwhile still sees it.
+    /// dropped: it is no sign of life of anything registered now. One flush
+    /// writes at a time. A batch whose write failed stays the batch and is
+    /// written first by the next flush, then what waits beside it: the two
+    /// are never merged, so each stays within the buffer's bound.
     fn flush_pending_heartbeats(&self) -> Result<(), RegistryError> {
+        let _progress = ReclaimScope::enter();
+        let _owner = self.flushing.lock();
+        // A retried batch and then the heartbeats that waited beside it.
+        for _ in 0..2 {
+            let Some(batch) = self.pending_hb.lock().batch() else {
+                return Ok(());
+            };
+            // Borrowed from the shared batch: the ids are not copied.
+            let beats: Vec<(&str, u64, u64)> = batch
+                .iter()
+                .map(|(id, (incarnation, ts))| (id.as_str(), *incarnation, *ts))
+                .collect();
+            self.write_heartbeats(&beats)?;
+            drop(beats);
+            self.pending_hb.lock().writing = Arc::default();
+        }
+        Ok(())
+    }
+
+    /// Write `beats` (consumer id, incarnation, time) in one transaction; a
+    /// follower drops them. Its transient copies are the encoded records of
+    /// one batch, within the buffer's bound.
+    fn write_heartbeats(&self, beats_in: &[(&str, u64, u64)]) -> Result<(), RegistryError> {
         for attempt in 0..TRANSITION_ATTEMPTS {
             if attempt > 0 {
                 std::thread::sleep(backoff(attempt));
             }
-            let taken: Vec<((String, u64), u64)> = {
-                let pending = self.pending_hb.lock();
-                if pending.is_empty() {
-                    return Ok(());
-                }
-                pending.iter().map(|(k, ts)| (k.clone(), *ts)).collect()
-            };
-            let mut beats = Vec::with_capacity(taken.len());
-            let mut stale = Vec::new();
-            for ((consumer_id, incarnation), ts) in &taken {
+            let mut beats = Vec::with_capacity(beats_in.len());
+            for &(consumer_id, incarnation, ts) in beats_in {
                 let live = self
                     .read_entry(consumer_id)?
-                    .is_some_and(|(entry, _)| entry.incarnation == *incarnation && entry.is_live());
+                    .is_some_and(|(entry, _)| entry.incarnation == incarnation && entry.is_live());
                 if !live {
-                    stale.push((consumer_id.clone(), *incarnation));
                     continue;
                 }
                 // A time already stored for this incarnation is kept if later.
                 let (stored, _) = self.read_heartbeat(consumer_id)?;
                 let ts_ms = match stored {
-                    Some(hb) if hb.incarnation == *incarnation => hb.ts_ms.max(*ts),
-                    _ => *ts,
+                    Some(hb) if hb.incarnation == incarnation => hb.ts_ms.max(ts),
+                    _ => ts,
                 };
                 beats.push((
                     encode_heartbeat_key(consumer_id),
-                    Heartbeat {
-                        incarnation: *incarnation,
-                        ts_ms,
-                    },
+                    Heartbeat { incarnation, ts_ms },
                 ));
             }
             // Unconditioned: a heartbeat writes only its own record, so a
@@ -710,12 +872,6 @@ impl RegistryCore {
                     // Only the leader records a heartbeat, and a stream on this
                     // member ends at its next acknowledgement, which is refused
                     // the same way: keeping these would only retry for nothing.
-                    let mut pending = self.pending_hb.lock();
-                    for (key, ts) in taken {
-                        if pending.get(&key) == Some(&ts) {
-                            pending.remove(&key);
-                        }
-                    }
                     tracing::debug!(?leader_id, "registry: heartbeats dropped on a follower");
                     return Ok(());
                 }
@@ -723,16 +879,6 @@ impl RegistryCore {
             }
             metrics::counter!("registry_heartbeat_batches_total").increment(1);
             metrics::histogram!("registry_heartbeat_batch_size").record(beats.len() as f64);
-            let mut pending = self.pending_hb.lock();
-            for (key, ts) in taken {
-                // A heartbeat buffered during the write is newer and stays.
-                if pending.get(&key) == Some(&ts) {
-                    pending.remove(&key);
-                }
-            }
-            for key in stale {
-                pending.remove(&key);
-            }
             return Ok(());
         }
         Err(RegistryError::Replication(format!(
@@ -743,6 +889,7 @@ impl RegistryCore {
     /// End every live BOUNDED registration whose bound is crossed, durably and
     /// one record at a time, then refresh the floors.
     fn sweep_evictions(&self) -> Result<Sweep, RegistryError> {
+        let _progress = ReclaimScope::enter();
         // A buffered heartbeat is a sign of life the stored record does not
         // show yet: persist it before judging liveness.
         self.flush_pending_heartbeats()?;
@@ -773,12 +920,8 @@ impl RegistryCore {
                 }
                 // A heartbeat buffered while the flush above was writing is
                 // only in the buffer, and it is a sign of life.
-                if let Some(ts) = self
-                    .pending_hb
-                    .lock()
-                    .get(&(consumer_id.clone(), incarnation))
-                {
-                    current.last_heartbeat_ts_ms = current.last_heartbeat_ts_ms.max(*ts);
+                if let Some(ts) = self.pending_hb.lock().get(&consumer_id, incarnation) {
+                    current.last_heartbeat_ts_ms = current.last_heartbeat_ts_ms.max(ts);
                 }
                 let now = self.clock.now_ms();
                 match current.termination(now, self.source.as_ref()) {
@@ -864,14 +1007,22 @@ pub struct ShardConsumerRegistry {
 
 impl ShardConsumerRegistry {
     /// Open a CE registry over the given engine, proposal pipeline and the
-    /// source its consumers read.
+    /// source its consumers read, publishing the floors of the registrations
+    /// the store already holds before anything else.
+    ///
+    /// # Errors
+    ///
+    /// A stored registration could not be read or decoded. The engine keeps
+    /// holding all history then, as it does from its open until a registry
+    /// publishes the floors: a protection that cannot be recovered is never
+    /// taken as no protection.
     pub fn new(
         engine: Arc<StorageEngine>,
         pipeline: Arc<dyn ProposalPipeline>,
         id_gen: Arc<ProposalIdGenerator>,
         clock: Arc<dyn Clock>,
         source: Arc<dyn RetentionSource>,
-    ) -> Self {
+    ) -> Result<Self, RegistryError> {
         let core = Arc::new(RegistryCore {
             engine,
             pipeline,
@@ -883,7 +1034,9 @@ impl ShardConsumerRegistry {
             floor_publication: Mutex::new(()),
             allow_topology_scopes: false,
             batching_on: AtomicBool::new(false),
-            pending_hb: Mutex::new(HashMap::new()),
+            pending_hb: Mutex::new(PendingHeartbeats::default()),
+            pending_hb_cap: MAX_PENDING_HEARTBEATS,
+            flushing: Mutex::new(()),
             wake: Wake::default(),
             watches: Arc::new(Watches::default()),
             #[cfg(test)]
@@ -892,12 +1045,18 @@ impl ShardConsumerRegistry {
             after_floor_scan: Mutex::new(None),
         });
         // Recover the floors and publish the engine watermark from any
-        // registrations persisted in a prior life. A failure here leaves the
-        // floors unconstrained until the first sweep, which retries it.
-        if let Err(e) = core.recompute_floor() {
-            tracing::warn!(error = %e, "registry: floors not recovered at open");
+        // registrations persisted in a prior life.
+        core.recompute_floor()?;
+        Ok(Self { core })
+    }
+
+    /// A registry buffering heartbeats of at most `cap` incarnations.
+    #[cfg(test)]
+    fn with_pending_heartbeat_cap(mut self, cap: usize) -> Self {
+        if let Some(core) = Arc::get_mut(&mut self.core) {
+            core.pending_hb_cap = cap;
         }
-        Self { core }
+        self
     }
 
     /// EE: also accept `dc` / `rack` scopes (requires a multi-DC topology).
@@ -1193,6 +1352,12 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
         if reg.consumer_id.is_empty() {
             return Err(RegistryError::EmptyConsumerId);
         }
+        if reg.consumer_id.len() > MAX_CONSUMER_ID_BYTES {
+            return Err(RegistryError::ConsumerIdTooLong {
+                len: reg.consumer_id.len(),
+                max: MAX_CONSUMER_ID_BYTES,
+            });
+        }
         self.core.check_scope(&reg.scope)?;
         if matches!(reg.retention, ConsumerRetentionPolicy::Bounded(_))
             && !self.core.source.accounts(reg.kind)
@@ -1253,6 +1418,7 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
     }
 
     fn checkpoint(&self, handle: &RegisteredHandle, seqno: u64) -> Result<(), RegistryError> {
+        let _progress = ReclaimScope::enter();
         let now = self.core.clock.now_ms();
         self.core.transition(handle.consumer_id(), |current| {
             let mut entry = RegistryCore::live_for(current, handle)?;
@@ -1269,35 +1435,29 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
 
     fn heartbeat(&self, handle: &RegisteredHandle) -> Result<(), RegistryError> {
         let now = self.core.clock.now_ms();
-        if self.core.batching_on.load(Ordering::Acquire) {
-            // Buffer; the background flush coalesces into one transaction and
-            // drops it there if the incarnation has ended meanwhile.
-            self.core
-                .pending_hb
-                .lock()
-                .entry((handle.consumer_id().to_string(), handle.incarnation()))
-                .and_modify(|t| *t = (*t).max(now))
-                .or_insert(now);
-            self.core.wake.raise(|r| r.heartbeat_buffered = true);
-            return Ok(());
+        let batched = self.core.batching_on.load(Ordering::Acquire);
+        if !batched {
+            // Unbatched: refuse a handle that no longer addresses a live
+            // registration, then write its heartbeat record at once.
+            let current = self
+                .core
+                .read_entry(handle.consumer_id())?
+                .map(|(entry, _)| entry);
+            RegistryCore::live_for(current, handle)?;
         }
-        // Unbatched: refuse a handle that no longer addresses a live
-        // registration, then write its heartbeat record at once.
-        let current = self
-            .core
-            .read_entry(handle.consumer_id())?
-            .map(|(entry, _)| entry);
-        RegistryCore::live_for(current, handle)?;
-        self.core
-            .pending_hb
-            .lock()
-            .entry((handle.consumer_id().to_string(), handle.incarnation()))
-            .and_modify(|t| *t = (*t).max(now))
-            .or_insert(now);
-        self.core.flush_pending_heartbeats()
+        self.core.buffer_heartbeat(handle, now)?;
+        if batched {
+            // The background flush coalesces it into one transaction and
+            // drops it there if the incarnation has ended meanwhile.
+            self.core.wake.raise(|r| r.heartbeat_buffered = true);
+            Ok(())
+        } else {
+            self.core.flush_pending_heartbeats()
+        }
     }
 
     fn unregister(&self, handle: RegisteredHandle) -> Result<(), RegistryError> {
+        let _progress = ReclaimScope::enter();
         let now = self.core.clock.now_ms();
         self.core.transition(handle.consumer_id(), |current| {
             let entry = RegistryCore::live_for(current, &handle)?;

@@ -365,18 +365,26 @@ impl Admitter {
         }
         let mut fence = node.read_fence();
         // Proving authority for a linearizable read waits on the group: that
-        // wait, too, lasts no longer than the operation.
+        // wait, too, lasts no longer than the operation. The log applied
+        // through its read point is waited for only as the read allows.
+        let (apply_wait, cut) = wait_within(checked.read_concern.wait, checked.deadline);
         let applied = within_deadline_and_cancel(
             checked.deadline,
             checked.cancel.as_ref(),
-            fence.apply_default(
+            fence.apply(
                 checked.read_preference,
                 fence_concern(checked.read_concern.level),
+                coordinode_raft::read_fence::READ_FENCE_TIMEOUT,
+                apply_wait,
             ),
         )
         .await?;
-        if let Err(e) = applied {
-            return fence_refusal(e, node.current_leader(), already_forwarded);
+        match applied {
+            Ok(()) => {}
+            Err(ReadFenceError::NotReady { .. }) if cut => {
+                return Err(DatabaseError::Budget(BudgetStop::Deadline));
+            }
+            Err(e) => return fence_refusal(e, node.current_leader(), already_forwarded),
         }
         let mut read_concern = checked.read_concern;
         if read_concern.is_causal() {
@@ -396,7 +404,7 @@ impl Admitter {
             // what is left is a view holding that prefix, the same bound a
             // causal majority read meets, never an older cut.
             read_concern.level = ReadConcernLevel::Majority;
-            read_concern.after_ts = fence.barrier_bound();
+            read_concern.after_ts = fence.barrier_bound().map_err(fence_error)?;
         }
         let applied_index = fence.applied_index();
         let history = fence.history();
@@ -632,12 +640,7 @@ async fn within_operation<T, F>(
 where
     F: std::future::Future<Output = Result<T, ReadFenceError>>,
 {
-    // The time left is zero once the deadline has passed: no wait at all.
-    let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-    let (wait, cut) = match (wait, left) {
-        (Some(wait), Some(left)) if left < wait => (Some(left), true),
-        (wait, _) => (wait, false),
-    };
+    let (wait, cut) = wait_within(wait, deadline);
     let waited = wait_for(wait);
     let outcome = match cancel {
         Some(cancel) => tokio::select! {
@@ -652,6 +655,18 @@ where
             Err(DatabaseError::Budget(BudgetStop::Deadline))
         }
         outcome => outcome.map_err(fence_error),
+    }
+}
+
+/// The request's own `wait` cut at the operation's `deadline`, and whether the
+/// deadline cut it: a wait that ends at the deadline answers with the
+/// deadline's outcome, not as not ready.
+fn wait_within(wait: Option<Duration>, deadline: Option<Instant>) -> (Option<Duration>, bool) {
+    // The time left is zero once the deadline has passed: no wait at all.
+    let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+    match (wait, left) {
+        (Some(wait), Some(left)) if left < wait => (Some(left), true),
+        (wait, _) => (wait, false),
     }
 }
 

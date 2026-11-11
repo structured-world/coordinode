@@ -115,7 +115,7 @@ impl RetentionSource for LogRetentionSource {
 
     fn first_retained(&self, kind: ConsumerKind) -> u64 {
         if kind.is_seqno_space() {
-            return self.engine.gc_watermark();
+            return self.engine.oldest_readable_seqno();
         }
         match self.floor.get() {
             Some(first) => first,

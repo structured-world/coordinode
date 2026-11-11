@@ -635,6 +635,7 @@ async fn isolated_leader_refuses_a_linearizable_read_within_the_timeout() {
                 ReadPreference::Primary,
                 ReadConcern::Linearizable,
                 fence_timeout,
+                None,
             ),
         )
         .await;

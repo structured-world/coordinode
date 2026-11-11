@@ -233,6 +233,7 @@ fn registry_status(e: RegistryError) -> Status {
     let message = e.to_string();
     match e {
         RegistryError::EmptyConsumerId
+        | RegistryError::ConsumerIdTooLong { .. }
         | RegistryError::UnsupportedScope(_)
         | RegistryError::InvalidRetention(_) => Status::invalid_argument(message),
         RegistryError::AlreadyRegistered { .. } => Status::already_exists(message),

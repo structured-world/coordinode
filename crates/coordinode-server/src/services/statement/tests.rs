@@ -53,10 +53,14 @@ pub(crate) async fn raft() -> (StatementExecutor, Arc<RaftNode>, tempfile::TempD
 }
 
 /// A committed entry held before apply must not turn LOCAL routing (or its
-/// response metadata) into a linearizable wait. Only LINEARIZABLE waits for
-/// that entry, and its own timeout must cover the entire authority check.
+/// response metadata) into a linearizable wait. A LINEARIZABLE read with its
+/// authority proven waits for that entry only as it asks: without a wait it
+/// is refused at once as not ready, with a short one after it, and with a
+/// long one it stays pending until the entry applies and then holds it.
+/// Before, the read waited for the apply whatever it asked, cut only by its
+/// authority timeout.
 #[tokio::test(flavor = "multi_thread")]
-async fn local_admission_does_not_wait_for_linearizable_apply() {
+async fn a_linearizable_read_waits_for_apply_only_as_it_asks() {
     let (executor, node, _dir) = raft().await;
     let engine = executor.database().read().engine_shared();
     let gate = engine.raft_fence().expect("Raft apply gate");
@@ -97,19 +101,58 @@ async fn local_admission_does_not_wait_for_linearizable_apply() {
             ReadPreference::Nearest,
             ReadConcern::Local,
             Duration::from_millis(100),
+            None,
         ),
     )
     .await;
     let mut fence = node.read_fence();
-    let linearizable = tokio::time::timeout(
+    let unwaited = tokio::time::timeout(
         Duration::from_secs(1),
         fence.apply(
             ReadPreference::Nearest,
             ReadConcern::Linearizable,
-            Duration::from_millis(100),
+            Duration::from_secs(5),
+            None,
         ),
     )
     .await;
+    let short = tokio::time::timeout(
+        Duration::from_secs(1),
+        fence.apply(
+            ReadPreference::Nearest,
+            ReadConcern::Linearizable,
+            Duration::from_secs(5),
+            Some(Duration::from_millis(100)),
+        ),
+    )
+    .await;
+    let admitted_unwaited = tokio::time::timeout(
+        Duration::from_secs(1),
+        executor.admit(
+            "RETURN 1",
+            &Requested {
+                read_preference: Some(ReadPreference::Nearest),
+                read_concern: Some(ExecutorReadConcernLevel::Linearizable),
+                ..Default::default()
+            },
+            false,
+        ),
+    )
+    .await;
+    // Asked to wait long, it is still pending while the entry is held.
+    let mut waiting_fence = node.read_fence();
+    let waiting = tokio::spawn(async move {
+        waiting_fence
+            .apply(
+                ReadPreference::Nearest,
+                ReadConcern::Linearizable,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(20)),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pending = !waiting.is_finished();
     let admitted = tokio::time::timeout(
         Duration::from_secs(1),
         executor.admit(
@@ -130,12 +173,42 @@ async fn local_admission_does_not_wait_for_linearizable_apply() {
         .await
         .expect("proposal task")
         .expect("apply proposal");
+    let waited = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the waiting read ends once the entry applies")
+        .expect("waiting task");
     assert!(committed.is_ok(), "entry never committed: {committed:?}");
     assert!(matches!(local, Ok(Ok(()))), "LOCAL waited: {local:?}");
     assert!(
-        matches!(linearizable, Ok(Err(ReadFenceError::LeaseTimeout { .. }))),
-        "LINEARIZABLE did not honor its timeout: {linearizable:?}"
+        matches!(
+            unwaited,
+            Ok(Err(ReadFenceError::NotReady { waited: false, .. }))
+        ),
+        "a LINEARIZABLE read without a wait waited for apply: {unwaited:?}"
     );
+    assert!(
+        matches!(
+            short,
+            Ok(Err(ReadFenceError::NotReady { waited: true, .. }))
+        ),
+        "a short wait ends as not ready: {short:?}"
+    );
+    assert!(
+        matches!(
+            &admitted_unwaited,
+            Ok(Err(DatabaseError::ReadFence {
+                kind: coordinode_embed::db::ReadFenceFailure::NotReady,
+                ..
+            }))
+        ),
+        "admission without a wait refuses as not ready: {admitted_unwaited:?}"
+    );
+    assert!(pending, "a read asking to wait answered before the apply");
+    assert!(
+        matches!(waited, Ok(())),
+        "the waiting read holds the entry once applied: {waited:?}"
+    );
+    assert!(node.applied_index() > before);
     let Ok(Ok(Admission::Run(admitted))) = admitted else {
         panic!("response metadata waited: {admitted:?}");
     };

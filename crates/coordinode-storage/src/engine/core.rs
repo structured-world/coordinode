@@ -153,11 +153,13 @@ pub struct StorageEngine {
     /// once the leader covers it. Mirrors the ledger in `closure`.
     raft_applied_ts: AtomicU64,
     /// The closed bound and the commit ceilings of the Raft log applied
-    /// here, as its [`CLOSURE_KEY`] record holds them, and whether entries
-    /// applied since the record last landed changed it; see
-    /// [`Self::commit_ceiling_through`].
+    /// here, as its [`CLOSURE_KEY`] record and breakpoint records hold them;
+    /// see [`Self::commit_ceiling_through`].
     // no-std: spin::Mutex; held for one update or one search.
-    closure: parking_lot::Mutex<(crate::engine::closure_ledger::ClosureLedger, bool)>,
+    closure: parking_lot::Mutex<ClosureState>,
+    /// The ledger's breakpoint records, read by the footprint's debt: each
+    /// owes its removal. Mirrors the ledger in `closure`.
+    closure_held: Arc<AtomicU64>,
     /// How long a snapshot waits for those commits before stepping behind
     /// them. Runtime-settable: it trades read latency against freshness, and
     /// which side a deployment wants is not known at compile time.
@@ -329,6 +331,10 @@ pub struct StorageEngine {
     /// The lowest journal index a registered consumer still needs, published
     /// by its registry; `u64::MAX` when none needs any.
     consumer_journal_floor: AtomicU64,
+    /// Set at open while the consumer registry's keyspace holds registrations
+    /// whose floors no registry has published yet; collection is held until
+    /// one does.
+    protections_pending: std::sync::atomic::AtomicBool,
     /// Journal indices held while a consumer registering at them publishes
     /// the floor that keeps them.
     journal_holds: crate::engine::oplog_journal::JournalHolds,
@@ -811,6 +817,13 @@ impl StorageEngine {
         // One write buffer for every partition tree: the memtable axis of the
         // write-pressure verdict bounds their unflushed bytes together.
         let write_buffer = Arc::new(lsm_tree::WriteBufferBudget::default());
+        // How many breakpoint records the closure ledger holds, each owing
+        // its removal to the footprint; NO_CLOSURE_LEDGER until a consensus
+        // log's ledger is loaded or written here.
+        let closure_held = Arc::new(AtomicU64::new(NO_CLOSURE_LEDGER));
+        // The Schema tree, once open, without keeping it open.
+        let schema_probe: Arc<std::sync::OnceLock<lsm_tree::WeakTree>> =
+            Arc::new(std::sync::OnceLock::new());
         // What the memtables will write when they are flushed is owed to the
         // footprint from the moment it is in them.
         if !footprints.is_empty() {
@@ -819,12 +832,35 @@ impl StorageEngine {
             );
             let unflushed = Arc::clone(&write_buffer);
             let unpersisted = footprints.unpersisted_debt();
+            let closure_held = Arc::clone(&closure_held);
+            let schema_probe = Arc::clone(&schema_probe);
             footprints.set_debt(move || {
                 // Each memtable is a flush of its own, with its own fixed cost;
                 // a deferred flush done owes the version it is still to write.
+                // The closure ledger owes the removal of its breakpoints, and
+                // the Schema memtable its next entry starts while none is.
                 let waiting = unflushed.unflushed();
                 crate::engine::footprint::flush_debt(waiting.bytes, waiting.memtables)
                     + unpersisted.bytes()
+                    + match closure_held.load(std::sync::atomic::Ordering::Acquire) {
+                        NO_CLOSURE_LEDGER => 0,
+                        held => {
+                            use lsm_tree::AbstractTree;
+                            // Lock-free: the tree's mirror of its latest
+                            // version. A tree not open yet, or closing, has
+                            // nothing in its memtable.
+                            let started = schema_probe
+                                .get()
+                                .and_then(lsm_tree::WeakTree::upgrade)
+                                .is_some_and(|tree| !tree.active_memtable_is_empty());
+                            crate::engine::footprint::closure_debt(held)
+                                + if started {
+                                    0
+                                } else {
+                                    crate::engine::footprint::memtable_start()
+                                }
+                        }
+                    }
             });
         }
         // One maintenance budget for every tree's compaction and the scrub:
@@ -861,6 +897,9 @@ impl StorageEngine {
             });
         }
         trees.insert(Partition::Schema, schema_tree.clone());
+        schema_probe
+            .set(schema_tree.downgrade())
+            .map_err(|_| StorageError::Io("the Schema tree was opened twice".to_string()))?;
 
         // Restore seqno from Schema BEFORE reading routing — the routing
         // get() needs a fresh seqno bound so it observes prior persisted
@@ -877,6 +916,17 @@ impl StorageEngine {
             }
             if let Some(first_servable) = schema_tree.retention_floor().checked_add(1) {
                 seqno.fetch_max(first_servable);
+            }
+            // The cleanup a stored closure ledger owes is owed from the open
+            // on, before any other tree opens or maintenance runs.
+            let head = schema_tree
+                .get(CLOSURE_KEY, seqno.get())
+                .map_err(|e| StorageError::Io(format!("schema get closed bound: {e}")))?;
+            if let Some(head) = head {
+                closure_held.store(
+                    crate::engine::closure_ledger::ClosureLedger::stored_held(&head)?,
+                    std::sync::atomic::Ordering::Release,
+                );
             }
         }
 
@@ -922,6 +972,29 @@ impl StorageEngine {
             if part == Partition::Node {
                 node_routing = Some(routing);
             }
+        }
+
+        // Registrations a consumer registry recorded in an earlier run hold
+        // history this engine cannot read the bounds of: their registry
+        // publishes them once it recovers. Until then nothing is collected,
+        // neither MVCC history nor journal, so no reclamation this open
+        // starts runs ahead of the protections the store owes.
+        // Records only: the apply coverage markers every member keeps in
+        // each tree sit below the user keyspace.
+        let protections_pending = {
+            use lsm_tree::AbstractTree as _;
+            trees.get(&Partition::Registry).is_some_and(|tree| {
+                tree.range(
+                    crate::engine::coverage::USER_KEYSPACE_START..,
+                    lsm_tree::SeqNo::MAX,
+                    None,
+                )
+                .next()
+                .is_some()
+            })
+        };
+        if protections_pending {
+            gc_controller.set_external_floor(0);
         }
 
         // The index tree's installations are known before anything reads or
@@ -1526,10 +1599,8 @@ impl StorageEngine {
             pending_commits,
             closure_frontier: AtomicU64::new(0),
             raft_applied_ts: AtomicU64::new(0),
-            closure: parking_lot::Mutex::new((
-                crate::engine::closure_ledger::ClosureLedger::default(),
-                false,
-            )),
+            closure: parking_lot::Mutex::new(ClosureState::default()),
+            closure_held,
             snapshot_wait: std::sync::atomic::AtomicU64::new(config.snapshot_wait_ms),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
@@ -1579,7 +1650,8 @@ impl StorageEngine {
             footprints,
             footprint_reclaim: parking_lot::Mutex::new(()),
             journal_keep_from: AtomicU64::new(u64::MAX),
-            consumer_journal_floor: AtomicU64::new(u64::MAX),
+            consumer_journal_floor: AtomicU64::new(if protections_pending { 0 } else { u64::MAX }),
+            protections_pending: std::sync::atomic::AtomicBool::new(protections_pending),
             journal_holds: Default::default(),
         };
         engine.drain_local_journal()?;
@@ -1807,7 +1879,11 @@ impl StorageEngine {
         if self.footprints.is_empty() {
             return Ok(crate::engine::footprint::Admitted::default());
         }
+        // A proposal applies from the consensus log, with its entry's
+        // closure records; the Schema memtable they may start is owed by the
+        // ledger itself.
         let bytes = crate::engine::footprint::write_footprint(mutations)
+            + crate::engine::footprint::closure_footprint()
             + self.memtable_starts(mutations.iter().flat_map(written_partitions));
         self.admit_footprint(bytes, class)
     }
@@ -4009,6 +4085,29 @@ impl StorageEngine {
         self.coordinator.pin_snapshot_at(seqno)
     }
 
+    /// Pin a snapshot at `seqno` only if this store still serves reads there,
+    /// or the oldest seqno it does serve.
+    ///
+    /// The watermark alone is not that bound: a partition cleared, or the
+    /// tables a range tombstone spans dropped, stops serving below its own
+    /// floor whatever the watermark says (see [`Self::oldest_readable_seqno`]).
+    /// The floors are checked under the pin: from then on no collection can
+    /// raise one past `seqno`, so a pin granted here protects history that is
+    /// there.
+    pub fn pin_readable_snapshot_at(
+        &self,
+        seqno: lsm_tree::SeqNo,
+    ) -> Result<SnapshotPin, lsm_tree::SeqNo> {
+        let Some(pin) = self.coordinator.pin_snapshot_at(seqno) else {
+            return Err(self.oldest_readable_seqno());
+        };
+        let horizon = self.oldest_readable_seqno();
+        if seqno < horizon {
+            return Err(horizon);
+        }
+        Ok(pin)
+    }
+
     /// The latest complete snapshot, already pinned.
     pub fn pin_latest_snapshot(&self) -> (lsm_tree::SeqNo, Option<SnapshotPin>) {
         self.pin_new_snapshot(|| self.snapshot())
@@ -4181,6 +4280,16 @@ impl StorageEngine {
     /// shape) without ever overriding a live reader's pin. `u64::MAX` clears it.
     pub fn set_consumer_retention_floor(&self, floor: u64) {
         self.coordinator.set_consumer_retention_floor(floor);
+        self.protections_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether this store opened over consumer registrations whose floors no
+    /// registry has published yet: collection, of MVCC history and of the
+    /// journal, is held until one does.
+    pub fn consumer_protections_pending(&self) -> bool {
+        self.protections_pending
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The current GC watermark value: the seqno below which a time-travel
@@ -5823,40 +5932,116 @@ impl StorageEngine {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// The [`CLOSURE_KEY`] record entry `index` writes after its proposals,
-    /// with the timestamp to write it at, when the entry changes what it
-    /// holds: the closed bound `below` it carries (`0` for none), or a commit
-    /// ceiling its proposals raised. `None` when the record stays as it is.
+    /// The Schema writes entry `index` makes after its proposals, with the
+    /// timestamp to write them at, when the entry changes the ledger: the
+    /// [`CLOSURE_KEY`] head with the closed bound `below` it carries (`0` for
+    /// none), a breakpoint record for each commit ceiling its proposals
+    /// raised, and the removal of breakpoints no view the store serves still
+    /// needs, a bounded batch of them. `None` when nothing changes. The plan
+    /// is installed by [`Self::raise_closure_frontier`] once they landed.
+    ///
+    /// `replaying`: the entry's writes are already in the store, which a
+    /// restart's replay skips; it retires nothing then, since its removals
+    /// would be skipped too.
     ///
     /// The timestamp is the larger of the commit ceiling and the bound less
     /// one: no earlier than the entry's own writes, and below every commit
     /// the bound leaves open.
-    pub fn closure_record(&self, below: u64, index: u64) -> Option<(Vec<u8>, u64)> {
-        let state = self.closure.lock();
-        let mut next = state.0.clone();
-        let raised = below > 0 && next.close(below, index);
-        if !(raised || state.1) {
-            return None;
-        }
-        let ceiling = next.applied_ceiling();
-        let at = next
-            .below()
-            .checked_sub(1)
-            .map_or(ceiling, |b| b.max(ceiling));
-        Some((next.encode(), at))
+    ///
+    /// # Errors
+    ///
+    /// The breakpoint records could not be read.
+    pub fn closure_record(
+        &self,
+        below: u64,
+        index: u64,
+        replaying: bool,
+    ) -> StorageResult<Option<(Vec<coordinode_core::txn::proposal::Mutation>, u64)>> {
+        use coordinode_core::txn::proposal::{Mutation, PartitionId};
+
+        let retained = if replaying {
+            0
+        } else {
+            self.oldest_readable_seqno()
+        };
+        let mut state = self.closure.lock();
+        let pending = std::mem::take(&mut state.pending);
+        let plan = state
+            .ledger
+            .plan(&pending, below, index, retained, &StoredBreakpoints(self))?;
+        let head = state.ledger.encode_after(&plan);
+        let writes = if head == state.ledger.encode() && plan.writes_no_breakpoint() {
+            None
+        } else {
+            let mut mutations = vec![Mutation::Put {
+                partition: PartitionId::Schema,
+                key: CLOSURE_KEY.to_vec(),
+                value: head,
+            }];
+            mutations.extend(plan.added().iter().map(|b| Mutation::Put {
+                partition: PartitionId::Schema,
+                key: b.key(),
+                value: b.value().to_vec(),
+            }));
+            mutations.extend(plan.retired().iter().map(|b| Mutation::Delete {
+                partition: PartitionId::Schema,
+                key: b.key(),
+            }));
+            let ceiling = plan
+                .added()
+                .last()
+                .map_or(state.ledger.applied_ceiling(), |b| b.ceiling);
+            let bound = below.max(state.ledger.below());
+            let at = bound.checked_sub(1).map_or(ceiling, |b| b.max(ceiling));
+            Some((mutations, at))
+        };
+        state.prepared = Some(plan);
+        Ok(writes)
     }
 
-    /// Account for entry `index` once its [`Self::closure_record`] landed:
+    /// Account for entry `index` once the writes [`Self::closure_record`]
+    /// planned for it landed: install its breakpoints and retirements, and
     /// raise the closed bound to `below` (`0` for none). Notify every
     /// partition's applied consumers when it rose, even if the entry changed
     /// no keys there.
-    pub fn raise_closure_frontier(&self, below: u64, index: u64) {
+    ///
+    /// # Errors
+    ///
+    /// No plan was made for the entry, or the breakpoint records it needs
+    /// could not be read.
+    pub fn raise_closure_frontier(&self, below: u64, index: u64) -> StorageResult<()> {
         let mut state = self.closure.lock();
-        state.1 = false;
-        if below == 0 || !state.0.close(below, index) {
-            return;
+        let plan = match state.prepared.take() {
+            Some(plan) => {
+                // The records just written applied as the entry's last
+                // proposal: bookkeeping, not a commit of the log.
+                state.pending.retain(|&(at, _)| at != index);
+                plan
+            }
+            // An entry that adds no breakpoint needs no write; one that does
+            // must have planned it, or a reader would be answered from a
+            // breakpoint the store does not hold.
+            None => {
+                let pending = std::mem::take(&mut state.pending);
+                let plan =
+                    state
+                        .ledger
+                        .plan(&pending, below, index, 0, &StoredBreakpoints(self))?;
+                if !plan.writes_no_breakpoint() {
+                    return Err(StorageError::Io(format!(
+                        "entry {index} raised a commit ceiling without its closure record"
+                    )));
+                }
+                plan
+            }
+        };
+        let raised = state.ledger.install(&plan);
+        self.closure_held
+            .store(state.ledger.held(), std::sync::atomic::Ordering::Release);
+        if !raised {
+            return Ok(());
         }
-        let below = state.0.below();
+        let below = state.ledger.below();
         drop(state);
         let previous = self
             .closure_frontier
@@ -5864,6 +6049,7 @@ impl StorageEngine {
         if below > previous {
             self.applied_feed.closed(index, below - 1);
         }
+        Ok(())
     }
 
     /// The latest commit a read here can have seen that a member applying
@@ -5895,26 +6081,29 @@ impl StorageEngine {
     }
 
     /// Record that the Raft entry at `index` carrying `commit_ts` applied
-    /// here. Entries apply in log order, so the prefix's ceiling only grows.
+    /// here. Entries apply in log order, so the prefix's ceiling only grows;
+    /// the entry's closure record makes it a breakpoint readers see.
     pub(crate) fn note_raft_applied(&self, index: u64, commit_ts: u64) {
-        let mut state = self.closure.lock();
-        if state.0.commit(index, commit_ts) {
-            state.1 = true;
-            self.raft_applied_ts.store(
-                state.0.applied_ceiling(),
-                std::sync::atomic::Ordering::Release,
-            );
-        }
+        self.closure.lock().pending.push((index, commit_ts));
+        self.raft_applied_ts
+            .fetch_max(commit_ts, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The commit timestamp a read must reach to hold every commit of the
-    /// Raft log through `index`, an index this member has applied. For a
-    /// prefix the closed bound has not passed, its own highest commit; for
-    /// one it passed, the highest commit of the last prefix it passed, which
-    /// is below the bound. Never a commit after the prefix that is still
-    /// open: a read at an old position waits on no later writer.
-    pub fn commit_ceiling_through(&self, index: u64) -> u64 {
-        self.closure.lock().0.ceiling_through(index)
+    /// Raft log through `index`, an index this member has applied: the
+    /// highest commit of that prefix exactly, never one of a later prefix, so
+    /// a read at an old position waits on no later writer. Once no read the
+    /// store still serves can tell apart a run of old prefixes, it answers
+    /// with the last of their ceilings, which every such read reaches.
+    ///
+    /// # Errors
+    ///
+    /// The breakpoint records could not be read.
+    pub fn commit_ceiling_through(&self, index: u64) -> StorageResult<u64> {
+        self.closure
+            .lock()
+            .ledger
+            .ceiling_through(index, &StoredBreakpoints(self))
     }
 
     /// Read the closed bound and the commit ceilings of the log applied here
@@ -5926,9 +6115,20 @@ impl StorageEngine {
     ///
     /// The record cannot be read or is malformed.
     pub fn reload_closure_frontier(&self) -> StorageResult<()> {
+        use crate::engine::closure_ledger::{BREAKPOINT_PREFIX, Breakpoint, ClosureLedger};
         let ledger = match self.get(Partition::Schema, CLOSURE_KEY)? {
-            Some(bytes) => crate::engine::closure_ledger::ClosureLedger::decode(&bytes)?,
-            None => crate::engine::closure_ledger::ClosureLedger::default(),
+            // The newest breakpoints only, read from the top: never the
+            // whole window.
+            Some(bytes) => ClosureLedger::decode(
+                &bytes,
+                self.prefix_scan_rev(Partition::Schema, BREAKPOINT_PREFIX)?
+                    .map(|guard| {
+                        let (key, value) = guard.into_inner()?;
+                        Breakpoint::decode(&key, &value)
+                    }),
+                &StoredBreakpoints(self),
+            )?,
+            None => ClosureLedger::default(),
         };
         self.closure_frontier
             .store(ledger.below(), std::sync::atomic::Ordering::Release);
@@ -5936,7 +6136,12 @@ impl StorageEngine {
             ledger.applied_ceiling(),
             std::sync::atomic::Ordering::Release,
         );
-        *self.closure.lock() = (ledger, false);
+        self.closure_held
+            .store(ledger.held(), std::sync::atomic::Ordering::Release);
+        *self.closure.lock() = ClosureState {
+            ledger,
+            ..ClosureState::default()
+        };
         Ok(())
     }
 
@@ -7018,12 +7223,75 @@ fn new_maintenance_budget(
 /// rebuild is in progress, named after the partition.
 const REBUILD_INTENT_DIR: &str = "rebuild";
 
-/// Schema record of the Raft log's closed bound and its prefixes' commit
-/// ceilings as applied here, written by the apply of each entry that changes
-/// them; see [`StorageEngine::closure_record`]. It is replicated data, a
-/// function of the log alone, so a snapshot carries it and a restart finds
-/// it with the entries its tree holds.
+/// Schema record of the Raft log's closed bound and the anchor of its
+/// prefixes' commit ceilings as applied here, written by the apply of each
+/// entry that changes them beside the breakpoint records; see
+/// [`StorageEngine::closure_record`]. A snapshot carries both, and a restart
+/// finds them with the entries its tree holds.
 pub const CLOSURE_KEY: &[u8] = b"closure:below";
+
+/// The closure ledger's held count while the store keeps no ledger: a store
+/// that applies no consensus log owes it nothing.
+const NO_CLOSURE_LEDGER: u64 = u64::MAX;
+
+/// The closure ledger and what is staged for it.
+#[derive(Default)]
+struct ClosureState {
+    /// What readers are answered from: only what the store holds.
+    ledger: crate::engine::closure_ledger::ClosureLedger,
+    /// Commits applied since the last entry's plan, `(index, commit_ts)`.
+    pending: Vec<(u64, u64)>,
+    /// The plan of the entry whose records are being written.
+    prepared: Option<crate::engine::closure_ledger::ClosurePlan>,
+}
+
+/// The breakpoint records in the Schema tree.
+struct StoredBreakpoints<'a>(&'a StorageEngine);
+
+impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
+    fn predecessor(
+        &self,
+        from: u64,
+        through: u64,
+    ) -> StorageResult<Option<crate::engine::closure_ledger::Breakpoint>> {
+        use crate::engine::closure_ledger::{Breakpoint, breakpoint_key};
+        self.0
+            .range_scan_rev(
+                Partition::Schema,
+                &breakpoint_key(from),
+                &breakpoint_key(through),
+            )?
+            .next()
+            .map(|guard| {
+                let (key, value) = guard.into_inner()?;
+                Breakpoint::decode(&key, &value)
+            })
+            .transpose()
+    }
+
+    fn following(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<crate::engine::closure_ledger::Breakpoint>> {
+        use crate::engine::closure_ledger::{Breakpoint, breakpoint_key};
+        let Some(from) = after.checked_add(1) else {
+            return Ok(Vec::new());
+        };
+        self.0
+            .range_scan(
+                Partition::Schema,
+                &breakpoint_key(from),
+                &breakpoint_key(u64::MAX),
+            )?
+            .take(limit)
+            .map(|guard| {
+                let (key, value) = guard.into_inner()?;
+                Breakpoint::decode(&key, &value)
+            })
+            .collect()
+    }
+}
 
 /// A journalled op applied without deriving its entry first: the entry's
 /// DERIVED work would otherwise be skipped silently.

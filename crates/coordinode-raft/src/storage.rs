@@ -2335,33 +2335,29 @@ impl CoordinodeStateMachine {
         sub: u32,
         applies: &RaftApplyState,
     ) -> Result<(), io::Error> {
-        if let Some((record, at)) = self.engine.closure_record(closed_below, index) {
-            let replay = self
-                .replay_skip
-                .as_ref()
-                .filter(|_| index < self.skip_until);
+        let replay = self
+            .replay_skip
+            .as_ref()
+            .filter(|_| index < self.skip_until);
+        let held =
+            |part| applies.skips(part, index) || replay.is_some_and(|c| c.holds(part, index, sub));
+        // Records the Schema tree already holds are not written again, so an
+        // entry applied again retires nothing: its removals would not land.
+        let records = self
+            .engine
+            .closure_record(closed_below, index, held(Partition::Schema))
+            .map_err(|e| io::Error::other(format!("plan the closed bound: {e}")))?;
+        if let Some((records, at)) = records {
             self.engine
-                .apply_raft_proposal(
-                    &[Mutation::Put {
-                        partition: coordinode_core::txn::proposal::PartitionId::Schema,
-                        key: coordinode_storage::engine::core::CLOSURE_KEY.to_vec(),
-                        value: record,
-                    }],
-                    at,
-                    index,
-                    sub,
-                    |part| {
-                        applies.skips(part, index)
-                            || replay.is_some_and(|c| c.holds(part, index, sub))
-                    },
-                )
+                .apply_raft_proposal(&records, at, index, sub, held)
                 .map_err(|e| io::Error::other(format!("record the closed bound: {e}")))?;
         }
         if let (Some(oracle), Some(at)) = (&self.oracle, closed_below.checked_sub(1)) {
             oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
         }
-        self.engine.raise_closure_frontier(closed_below, index);
-        Ok(())
+        self.engine
+            .raise_closure_frontier(closed_below, index)
+            .map_err(|e| io::Error::other(format!("install the closed bound: {e}")))
     }
 
     /// The log index openraft re-delivers from when this state machine opens:

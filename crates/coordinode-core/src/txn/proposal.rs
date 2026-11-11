@@ -398,14 +398,17 @@ pub struct RaftProposal {
     pub commit_ts: Timestamp,
     /// Start timestamp — for audit and debugging.
     pub start_ts: Timestamp,
-    /// If true, skip rate limiter acquisition.
+    /// If true, the proposal is the store's own work: it skips rate limiter
+    /// acquisition, and every member admits it from its recovery reserve.
     ///
-    /// Used for latency-sensitive proposals that must not be delayed:
+    /// Used for proposals that must not be delayed or refused:
     /// - Membership changes (add/remove node)
     /// - Delta proposals (commit/abort oracle decisions)
+    /// - Work that gives room back: a consumer's acknowledgement, heartbeat,
+    ///   cancellation or expiry, orphan collection
     ///
-    /// Throttling these would stall the very commits that release the
-    /// limiter's permits, so they skip it entirely.
+    /// Throttling or refusing these would stall the very commits that
+    /// release the limiter's permits or the room client writes wait for.
     pub bypass_rate_limiter: bool,
 }
 

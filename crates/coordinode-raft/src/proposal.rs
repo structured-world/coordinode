@@ -271,7 +271,11 @@ impl RaftProposalPipeline {
                 .admit_proposal(&proposal.mutations, class)
                 .map_err(storage_to_proposal_err),
             (None, Some(space)) => space
-                .reserve(write_footprint(&proposal.mutations), class)
+                .reserve(
+                    write_footprint(&proposal.mutations)
+                        + coordinode_storage::engine::footprint::closure_footprint(),
+                    class,
+                )
                 .map_err(storage_to_proposal_err),
             (None, None) => Ok(Admitted::default()),
         }

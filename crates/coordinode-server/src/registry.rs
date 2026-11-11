@@ -45,7 +45,8 @@ pub(crate) struct RegistryTuning {
 ///
 /// # Errors
 ///
-/// The background service's thread could not be started.
+/// A stored registration could not be recovered, or the background service's
+/// thread could not be started.
 pub(crate) fn build_consumer_registry(
     engine: Arc<StorageEngine>,
     pipeline: Arc<dyn ProposalPipeline>,
@@ -60,7 +61,7 @@ pub(crate) fn build_consumer_registry(
         )),
         Arc::new(SystemClock),
         source,
-    );
+    )?;
     let mut bg_cfg = BackgroundConfig::default();
     if let Some(ms) = tuning.heartbeat_window_ms {
         bg_cfg.heartbeat_window_ms = ms;

@@ -47,13 +47,23 @@ impl Consumers {
     ///
     /// # Errors
     ///
-    /// The journal could not be inspected, or the service's thread could not
-    /// be started.
+    /// The journal could not be inspected, a stored registration could not
+    /// be recovered, the store holds registrations it has no journal of its
+    /// own to serve, or the service's thread could not be started.
     pub(crate) fn open(
         engine: &Arc<StorageEngine>,
         pipeline: &Arc<dyn ProposalPipeline>,
     ) -> Result<Option<Self>, DatabaseError> {
         let Some(source) = LogRetentionSource::over_own_journal(Arc::clone(engine))? else {
+            // The engine holds every version for these registrations until
+            // their floors are published, which nothing here would do.
+            if engine.consumer_protections_pending() {
+                return Err(DatabaseError::Unsupported(
+                    "the store holds consumer registrations, and this database keeps no \
+                     journal of its own to serve them; cancel them on a standalone open first"
+                        .into(),
+                ));
+            }
             return Ok(None);
         };
         let registry = ShardConsumerRegistry::new(
@@ -64,7 +74,7 @@ impl Consumers {
             )),
             Arc::new(SystemClock),
             Arc::new(source),
-        );
+        )?;
         let service = registry.start_background(BackgroundConfig::default())?;
         Ok(Some(Self {
             registry,

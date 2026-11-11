@@ -2022,16 +2022,429 @@ fn partition_trees_sync_as_durably_as_the_oplog() {
     }
 }
 
+/// A durable store in `dir`.
+fn test_config(dir: &std::path::Path) -> StorageConfig {
+    StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )])
+}
+
+/// Apply Raft entry `index` as the apply path does: its commits, then the
+/// closure records it plans, with its coverage, then the plan installed.
+fn apply_closure_entry(engine: &StorageEngine, index: u64, commits: &[u64], below: u64) {
+    for &ts in commits {
+        engine.note_raft_applied(index, ts);
+    }
+    if let Some((records, at)) = engine
+        .closure_record(below, index, false)
+        .expect("plan the closure records")
+    {
+        engine
+            .apply_raft_proposal(&records, at, index, 0, |_| false)
+            .expect("write the closure records");
+    }
+    engine
+        .raise_closure_frontier(below, index)
+        .expect("install the plan");
+}
+
 /// A log position closed long ago keeps a ceiling of its own commits however
 /// many entries applied after it: never the highest commit applied since,
 /// which would make a read at that position wait on later writers.
 #[test]
 fn an_old_closed_position_keeps_its_own_ceiling() {
     let engine = test_engine_memfs();
-    engine.note_raft_applied(1, 10);
-    engine.raise_closure_frontier(11, 1);
-    for index in 2..=20_000 {
-        engine.note_raft_applied(index, 10_000 + index);
+    apply_closure_entry(&engine, 1, &[10], 0);
+    apply_closure_entry(&engine, 2, &[], 11);
+    for index in 3..=2_000 {
+        apply_closure_entry(&engine, index, &[10_000 + index], 0);
     }
-    assert_eq!(engine.commit_ceiling_through(1), 10);
+    assert_eq!(engine.commit_ceiling_through(1).expect("ceiling"), 10);
+}
+
+/// Breakpoints piled up past the cache while the bound stalls, then a bound
+/// closing an early prefix: every position answers its own ceiling, the
+/// closed ones too, before and after a restart, which reads the head and
+/// the newest breakpoints and seeks the rest. Before, the oldest open
+/// positions merged, and a closed position 1 needed commit 20 still open.
+#[test]
+fn every_position_keeps_its_ceiling_past_the_cache_and_a_restart() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let positions =
+        u64::try_from(crate::engine::closure_ledger::CACHED_BREAKPOINTS * 3).expect("small") + 1;
+    {
+        let engine = StorageEngine::open(&test_config(dir.path())).expect("open");
+        for index in 1..=positions {
+            apply_closure_entry(&engine, index, &[index * 10], 0);
+        }
+        apply_closure_entry(&engine, positions + 1, &[], 11);
+        assert_eq!(engine.commit_ceiling_through(1).expect("ceiling"), 10);
+        for index in 1..=positions {
+            assert_eq!(
+                engine.commit_ceiling_through(index).expect("ceiling"),
+                index * 10,
+                "position {index}"
+            );
+        }
+        engine.persist().expect("persist");
+    }
+    let engine = StorageEngine::open(&test_config(dir.path())).expect("reopen");
+    engine.reload_closure_frontier().expect("reload");
+    for index in 1..=positions {
+        assert_eq!(
+            engine.commit_ceiling_through(index).expect("ceiling"),
+            index * 10,
+            "position {index} after a restart"
+        );
+    }
+}
+
+/// The breakpoint records the store holds, counted in the store.
+fn stored_breakpoints(engine: &StorageEngine) -> u64 {
+    engine
+        .prefix_scan(
+            Partition::Schema,
+            crate::engine::closure_ledger::BREAKPOINT_PREFIX,
+        )
+        .expect("scan")
+        .count() as u64
+}
+
+/// How many breakpoint records the ledger counts as held.
+fn ledger_held(engine: &StorageEngine) -> u64 {
+    engine
+        .closure_held
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A clock-backed store in `dir` under a hard limit of `limit` bytes.
+fn clocked_capped(
+    dir: &std::path::Path,
+    limit: u64,
+    reserve: Option<u64>,
+) -> (
+    StorageEngine,
+    Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+) {
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let mut endpoint =
+        EndpointConfig::new("default", dir, Media::Hdd, Durability::Durable, Tier::Warm)
+            .with_hard_limit_bytes(limit);
+    if let Some(reserve) = reserve {
+        endpoint = endpoint.with_recovery_reserve_bytes(reserve);
+    }
+    let engine = StorageEngine::open_with_oracle(
+        &StorageConfig::with_endpoints(vec![endpoint]),
+        Arc::clone(&oracle),
+    )
+    .expect("open");
+    (engine, oracle)
+}
+
+/// Commit one client write as entry `index` the way a consensus member
+/// does: admitted first (its breakpoint and that breakpoint's removal
+/// included), applied, its closure records written, the admission given
+/// back once the entry is applied.
+fn admitted_write(
+    engine: &StorageEngine,
+    oracle: &coordinode_core::txn::timestamp::TimestampOracle,
+    index: u64,
+    value_len: usize,
+) -> bool {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    let write = [Mutation::Put {
+        partition: PartitionId::Node,
+        key: format!("node:1:w{index}").into_bytes(),
+        value: vec![7u8; value_len],
+    }];
+    let Ok(admitted) = engine.admit_proposal(&write, crate::engine::footprint::Admit::Client)
+    else {
+        return false;
+    };
+    let ts = oracle.next().as_raw();
+    engine
+        .apply_raft_proposal(&write, ts, index, 0, |_| false)
+        .expect("apply");
+    if let Some((records, at)) = engine
+        .closure_record(0, index, false)
+        .expect("plan the closure records")
+    {
+        engine
+            .apply_raft_proposal(&records, at, index, 1, |_| false)
+            .expect("write the closure records");
+    }
+    engine.raise_closure_frontier(0, index).expect("install");
+    drop(admitted);
+    true
+}
+
+/// Breakpoints held past the cache owe their removal to the footprint once
+/// their writes' admissions are given back; a restart owes it from the
+/// open, before the ledger is loaded and before any other write is
+/// admitted. At a limit where client writes are already refused, entries
+/// that only close (admitted for nothing) retire bounded batches and
+/// persist without the store passing its limit, with the default recovery
+/// reserve and with none. Before, a commit's admission covered one removal
+/// and was given back at its apply: held breakpoints owed nothing, and a
+/// closing entry's cleanup and the Schema memtable it opened came out of
+/// room nobody reserved.
+#[test]
+fn closing_entries_clean_up_within_the_limit_client_writes_are_refused_at() {
+    closing_entries_clean_up_within_the_limit(None);
+}
+
+/// As above with no recovery reserve: the ledger's cleanup, its Schema
+/// memtable included, is owed in full, not taken from a reserve.
+#[test]
+fn closing_entries_clean_up_within_the_limit_with_no_recovery_reserve() {
+    closing_entries_clean_up_within_the_limit(Some(0));
+}
+
+fn closing_entries_clean_up_within_the_limit(reserve: Option<u64>) {
+    use crate::engine::closure_ledger::RETIRE_BATCH;
+    use crate::engine::footprint::{Admit, closure_debt};
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+
+    // The smallest limit a store takes.
+    const LIMIT: u64 = crate::engine::config::MIN_HARD_LIMIT_BYTES;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let mut index = 0;
+    {
+        let (engine, oracle) = clocked_capped(dir.path(), LIMIT, reserve);
+        engine.set_retention_window(std::time::Duration::from_secs(3_600));
+        // More breakpoints than the cache keeps, then writes until the store
+        // refuses the next one.
+        for _ in 0..crate::engine::closure_ledger::CACHED_BREAKPOINTS + 44 {
+            index += 1;
+            assert!(admitted_write(&engine, &oracle, index, 1_024));
+        }
+        while admitted_write(&engine, &oracle, index + 1, 16 << 10) {
+            index += 1;
+        }
+        engine.persist().expect("persist");
+    }
+    let (engine, oracle) = clocked_capped(dir.path(), LIMIT, reserve);
+    // Owed from the open, before the ledger is loaded.
+    let held = stored_breakpoints(&engine);
+    assert!(held > crate::engine::closure_ledger::CACHED_BREAKPOINTS as u64);
+    let footprint = engine.footprints().get("default").expect("a limit");
+    assert!(
+        footprint.debt() >= closure_debt(held),
+        "an open owes {} for {held} breakpoints before the ledger loads, not their cleanup {}",
+        footprint.debt(),
+        closure_debt(held)
+    );
+    engine.set_retention_window(std::time::Duration::from_secs(3_600));
+    engine.reload_closure_frontier().expect("reload");
+    assert_eq!(ledger_held(&engine), held);
+    // What the flush gave back is taken by writes until clients are refused.
+    while admitted_write(&engine, &oracle, index + 1, 16 << 10) {
+        index += 1;
+    }
+    let held = ledger_held(&engine);
+    let limit = footprint.limit();
+    let probe = [Mutation::Put {
+        partition: PartitionId::Node,
+        key: b"node:1:probe".to_vec(),
+        value: b"v".to_vec(),
+    }];
+    assert!(
+        engine.admit_proposal(&probe, Admit::Client).is_err(),
+        "client writes are refused at the limit"
+    );
+    assert!(
+        footprint.committed() <= footprint.limit(),
+        "client writes passed the limit: {} over {}",
+        footprint.committed(),
+        footprint.limit()
+    );
+
+    engine.set_retention_window(std::time::Duration::ZERO);
+    let mut index = index + 1;
+    while ledger_held(&engine) > 0 {
+        let before = ledger_held(&engine);
+        apply_closure_entry(&engine, index, &[], oracle.next().as_raw() + 1);
+        let retired = before - ledger_held(&engine);
+        assert!(retired > 0 && retired <= RETIRE_BATCH as u64);
+        assert_eq!(stored_breakpoints(&engine), ledger_held(&engine));
+        assert!(
+            footprint.committed() <= footprint.limit(),
+            "the store passed its limit: {} over {}",
+            footprint.committed(),
+            footprint.limit()
+        );
+        index += 1;
+    }
+    // The cleanup's memtable is written out within the limit too.
+    engine
+        .persist()
+        .expect("the cleanup persists within the limit");
+    assert!(
+        footprint.committed() <= footprint.limit(),
+        "the store passed its limit once persisted: {} over {}",
+        footprint.committed(),
+        footprint.limit()
+    );
+    assert_eq!(
+        footprint.limit(),
+        limit,
+        "the limit stayed where it was set"
+    );
+    // Persisted and cleaned up, the ledger owes only its next head and the
+    // Schema memtable that starts.
+    assert_eq!(
+        footprint.debt(),
+        closure_debt(0) + crate::engine::footprint::memtable_start(),
+        "the debt fell with the cleanup from {}",
+        closure_debt(held)
+    );
+}
+
+/// Cleanup interrupted at either side of its records landing leaves a store
+/// whose restart serves every position as before and completes the cleanup:
+/// a plan whose records never landed retires nothing on reopen; records that
+/// landed before the plan was installed are the state reopen reads; an entry
+/// applied again over records the store already holds retires nothing, even
+/// with the served snapshot moved on, so the ledger never counts records the
+/// store still holds as removed.
+#[test]
+fn interrupted_cleanup_reopens_exact_and_completes() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let positions =
+        u64::try_from(crate::engine::closure_ledger::CACHED_BREAKPOINTS).expect("small") + 44;
+    let (first, closing) = {
+        let engine = StorageEngine::open(&test_config(dir.path())).expect("open");
+        let first = engine.snapshot();
+        let pinned = engine
+            .pin_readable_snapshot_at(first)
+            .expect("the current snapshot is served");
+        for index in 1..=positions {
+            apply_closure_entry(&engine, index, &[first + index], 0);
+        }
+        // Everything below the served snapshot may go now.
+        drop(pinned);
+        for _ in 0..positions + 10 {
+            engine
+                .put(Partition::Node, b"node:1:later", b"v")
+                .expect("write");
+        }
+        let closing = positions + 1;
+        // Stopped before landing: a plan that removes breakpoints is made,
+        // and its records are never written.
+        let (records, _) = engine
+            .closure_record(first + positions + 1, closing, false)
+            .expect("plan")
+            .expect("a cleanup batch");
+        assert!(
+            records
+                .iter()
+                .any(|m| matches!(m, coordinode_core::txn::proposal::Mutation::Delete { .. })),
+            "the interrupted plan removes breakpoints"
+        );
+        engine.persist().expect("persist");
+        (first, closing)
+    };
+    let check_exact = |engine: &StorageEngine, from: u64| {
+        for index in from..=positions {
+            assert_eq!(
+                engine.commit_ceiling_through(index).expect("ceiling"),
+                first + index,
+                "position {index}"
+            );
+        }
+    };
+    {
+        let engine = StorageEngine::open(&test_config(dir.path())).expect("reopen");
+        engine.reload_closure_frontier().expect("reload");
+        assert_eq!(ledger_held(&engine), positions, "nothing was retired");
+        assert_eq!(stored_breakpoints(&engine), positions);
+        check_exact(&engine, 1);
+        // Stopped after landing, before the plan is installed.
+        let (records, at) = engine
+            .closure_record(first + positions + 1, closing, false)
+            .expect("plan")
+            .expect("a cleanup batch");
+        engine
+            .apply_raft_proposal(&records, at, closing, 0, |_| false)
+            .expect("records land");
+        engine.persist().expect("persist");
+    }
+    let engine = StorageEngine::open(&test_config(dir.path())).expect("reopen");
+    engine.reload_closure_frontier().expect("reload");
+    let after_batch = ledger_held(&engine);
+    assert!(
+        after_batch < positions,
+        "the landed batch is the state read back"
+    );
+    assert_eq!(stored_breakpoints(&engine), after_batch);
+    // The same entry applied again over records the Schema tree holds.
+    if let Some((records, at)) = engine
+        .closure_record(first + positions + 1, closing, true)
+        .expect("plan")
+    {
+        engine
+            .apply_raft_proposal(&records, at, closing, 0, |part| part == Partition::Schema)
+            .expect("skipped");
+    }
+    engine
+        .raise_closure_frontier(first + positions + 1, closing)
+        .expect("install");
+    assert_eq!(
+        ledger_held(&engine),
+        after_batch,
+        "a replay retires nothing"
+    );
+    assert_eq!(stored_breakpoints(&engine), ledger_held(&engine));
+    // The positions not retired keep their exact ceilings.
+    check_exact(&engine, positions - after_batch + 1);
+    let mut index = closing + 1;
+    while ledger_held(&engine) > 0 {
+        apply_closure_entry(&engine, index, &[], first + positions + 1);
+        assert_eq!(stored_breakpoints(&engine), ledger_held(&engine));
+        index += 1;
+    }
+    let one = engine.commit_ceiling_through(1).expect("ceiling");
+    assert!(
+        one > first,
+        "position 1 never reads below its commit: {one}"
+    );
+}
+
+/// Closing positions 1 and 2 (commits 10 and 20) keeps position 1 at 10
+/// while a snapshot at 10 is still served: a read there after position 1
+/// stays ready. The closed bound alone does not retire the distinction.
+#[test]
+fn a_served_snapshot_keeps_a_closed_positions_ceiling() {
+    let engine = test_engine_memfs();
+    let first = engine.snapshot();
+    let held = engine
+        .pin_readable_snapshot_at(first)
+        .expect("the current snapshot is served");
+    // This store's seqnos are a counter: commits one apart, as its writes.
+    apply_closure_entry(&engine, 1, &[first], 0);
+    apply_closure_entry(&engine, 2, &[first + 1], 0);
+    apply_closure_entry(&engine, 3, &[], first + 2);
+    assert_eq!(engine.commit_ceiling_through(1).expect("ceiling"), first);
+    assert_eq!(
+        engine.commit_ceiling_through(2).expect("ceiling"),
+        first + 1
+    );
+
+    // Once nothing at or below the second commit is served, the two closed
+    // prefixes are one for every read the store can answer.
+    drop(held);
+    for _ in 0..5 {
+        engine
+            .put(Partition::Node, b"node:1:later", b"v")
+            .expect("write");
+    }
+    apply_closure_entry(&engine, 4, &[], first + 2);
+    let served = engine.oldest_readable_seqno();
+    assert!(served > first + 1, "the store moved on: {served}");
+    let one = engine.commit_ceiling_through(1).expect("ceiling");
+    assert!(one >= first && one < served, "position 1 reads {one}");
 }

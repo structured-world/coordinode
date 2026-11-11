@@ -39,25 +39,16 @@ fn a_closed_bound_notifies_partitions_without_changed_keys() {
     let node = engine.subscribe_applied_retained(Partition::Node, 4);
     let edge = engine.subscribe_applied_retained(Partition::EdgeProp, 4);
     let (record, at) = engine
-        .closure_record(200, 2)
+        .closure_record(200, 2, false)
+        .expect("plan")
         .expect("a bound changes the record");
     assert_eq!(at, 199);
     engine
-        .apply_raft_proposal(
-            &[Mutation::Put {
-                partition: PartitionId::Schema,
-                key: crate::engine::core::CLOSURE_KEY.to_vec(),
-                value: record,
-            }],
-            at,
-            2,
-            0,
-            |_| false,
-        )
+        .apply_raft_proposal(&record, at, 2, 0, |_| false)
         .expect("persist the bound");
     assert!(node.try_next().is_none());
     assert!(edge.try_next().is_none());
-    engine.raise_closure_frontier(200, 2);
+    engine.raise_closure_frontier(200, 2).expect("install");
     for sub in [&node, &edge] {
         let Some(AppliedEvent::Keys {
             seq,
@@ -78,8 +69,8 @@ fn a_closed_bound_notifies_partitions_without_changed_keys() {
         assert_eq!(sub.position().delivered(), seq);
         sub.position().release(seq);
     }
-    engine.raise_closure_frontier(200, 2);
-    engine.raise_closure_frontier(150, 1);
+    engine.raise_closure_frontier(200, 2).expect("install");
+    engine.raise_closure_frontier(150, 1).expect("install");
     assert_eq!(engine.closure_frontier(), 200);
     assert!(node.try_next().is_none());
     assert!(edge.try_next().is_none());

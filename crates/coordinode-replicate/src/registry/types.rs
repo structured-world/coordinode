@@ -408,6 +408,16 @@ pub enum RegistryError {
     #[error("consumer_id must be non-empty")]
     EmptyConsumerId,
 
+    /// The registration was rejected because `consumer_id` is longer than
+    /// a consumer's record keys can hold.
+    #[error("consumer_id is {len} bytes, longer than the {max} a registration accepts")]
+    ConsumerIdTooLong {
+        /// The id's length in bytes.
+        len: usize,
+        /// The most bytes an id may have.
+        max: usize,
+    },
+
     /// The registration used a topology scope this deployment does not
     /// support. `dc` / `rack` scopes require a multi-DC topology and are
     /// EE-only; the CE registry accepts only `cluster`, `node`, and `shard`.

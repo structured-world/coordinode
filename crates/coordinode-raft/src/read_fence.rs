@@ -365,12 +365,19 @@ impl ReadFence {
     /// 3. Whether the node exceeds the CE staleness threshold (for follower reads)
     ///
     /// Returns `Ok(())` when all checks pass and the read may proceed.
+    ///
+    /// A linearizable read proves authority (the leader's lease, or a quorum
+    /// round within `timeout`) and then needs the log applied through the
+    /// read point. That is ready or not ready: it is waited for only when the
+    /// read asked for a wait (`apply_wait`), and for at most that long; with
+    /// none it is refused at once as [`ReadFenceError::NotReady`].
     pub async fn apply(
         &mut self,
         preference: ReadPreference,
         concern: ReadConcern,
-        // Bound on the one blocking check here, the linearizable lease read.
+        // Bound on proving authority for a linearizable read.
         timeout: Duration,
+        apply_wait: Option<Duration>,
     ) -> Result<(), ReadFenceError> {
         // A read-only member's consensus is a frozen view: what it believes
         // about leadership and lag says nothing current. It serves what it
@@ -443,29 +450,46 @@ impl ReadFence {
                 if !is_leader {
                     return Err(ReadFenceError::LinearizableRequiresLeader);
                 }
-                tokio::time::timeout(
+                let linearizer = tokio::time::timeout(
                     timeout,
                     self.raft
-                        .ensure_linearizable(openraft::raft::ReadPolicy::LeaseRead),
+                        .get_read_linearizer(openraft::raft::ReadPolicy::LeaseRead),
                 )
                 .await
                 .map_err(|_| ReadFenceError::LeaseTimeout {
                     timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
                 })?
                 .map_err(|e| ReadFenceError::Raft(e.to_string()))?;
+                // A zero wait only checks what is applied already.
+                let ready = linearizer
+                    .try_await_ready(&self.raft, Some(apply_wait.unwrap_or(Duration::ZERO)))
+                    .await
+                    .map_err(|e| ReadFenceError::Raft(e.to_string()))?;
+                if let Err(state) = ready {
+                    return Err(ReadFenceError::NotReady {
+                        missing: format!(
+                            "the log is applied through {:?}, the read point is {}",
+                            state.applied().map(|id| id.index),
+                            state.read_log_id().index()
+                        ),
+                        waited: apply_wait.is_some(),
+                    });
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Apply fence with the default CE timeout (`READ_FENCE_TIMEOUT`).
+    /// Apply fence with the default CE authority timeout
+    /// (`READ_FENCE_TIMEOUT`) and no wait for the log to apply.
     pub async fn apply_default(
         &mut self,
         preference: ReadPreference,
         concern: ReadConcern,
     ) -> Result<(), ReadFenceError> {
-        self.apply(preference, concern, READ_FENCE_TIMEOUT).await
+        self.apply(preference, concern, READ_FENCE_TIMEOUT, None)
+            .await
     }
 
     /// Establish the read's causal bounds here: every commit at or below
@@ -507,7 +531,7 @@ impl ReadFence {
         }
         let deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
         loop {
-            let missing = match self.causal_gap(after_ts, after_position) {
+            let missing = match self.causal_gap(after_ts, after_position)? {
                 Ok(bound) => {
                     // A position met, the read allowed a wait and the
                     // prefix is not closed yet: a view chosen at the closed
@@ -555,31 +579,32 @@ impl ReadFence {
     }
 
     /// The commit timestamp bound the causal bounds amount to when they are
-    /// met here, or what of them is not.
+    /// met here, or what of them is not; an error when the store could not
+    /// tell.
     fn causal_gap(
         &self,
         after_ts: Option<u64>,
         after_position: Option<coordinode_core::txn::read_concern::HistoryPosition>,
-    ) -> Result<Option<u64>, String> {
+    ) -> Result<Result<Option<u64>, String>, ReadFenceError> {
         if let Some(ts) = after_ts {
             let complete = self.complete_through();
             if complete.is_none_or(|through| through < ts) {
-                return Err(match complete {
+                return Ok(Err(match complete {
                     Some(through) => format!(
                         "commits at or below {ts} are not all applied (complete through {through})"
                     ),
                     None => format!("commits at or below {ts} are not known to be applied"),
-                });
+                }));
             }
         }
         let mut bound = after_ts;
         if let Some(position) = after_position {
             let applied = *self.applied_rx.borrow();
             if applied < position.index {
-                return Err(format!(
+                return Ok(Err(format!(
                     "the log is applied through {applied}, the read needs {}",
                     position.index
-                ));
+                )));
             }
             // Applied through the position, the prefix is in this member's
             // latest view. A view chosen lower (at the closed bound) holds it
@@ -587,24 +612,33 @@ impl ReadFence {
             // on as the timestamp its view must reach; it is not required
             // complete here, since a latest view needs no closed bound.
             let prefix = self
-                .engine
-                .as_ref()
-                .map(|engine| engine.commit_ceiling_through(position.index))
+                .prefix_ceiling(position.index)?
                 .filter(|ceiling| *ceiling > 0);
             bound = bound.max(prefix);
         }
-        Ok(bound)
+        Ok(Ok(bound))
+    }
+
+    /// The commit ceiling of the log applied here through `index`; `None`
+    /// without a store to tell.
+    fn prefix_ceiling(&self, index: u64) -> Result<Option<u64>, ReadFenceError> {
+        self.engine
+            .as_ref()
+            .map(|engine| engine.commit_ceiling_through(index))
+            .transpose()
+            .map_err(|e| ReadFenceError::Raft(format!("the log's commit ceilings: {e}")))
     }
 
     /// The commit timestamp bound a linearizable read amounts to once its
     /// authority barrier passed: the commits of the log applied here
     /// through the barrier, which the read's view must hold. `None` without
     /// a store to tell.
-    pub fn barrier_bound(&self) -> Option<u64> {
-        let applied = *self.applied_rx.borrow();
-        self.engine
-            .as_ref()
-            .map(|engine| engine.commit_ceiling_through(applied))
+    ///
+    /// # Errors
+    ///
+    /// The store could not read the log's commit ceilings.
+    pub fn barrier_bound(&self) -> Result<Option<u64>, ReadFenceError> {
+        self.prefix_ceiling(*self.applied_rx.borrow())
     }
 
     /// Return the current applied log index on this node, a position in

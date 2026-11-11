@@ -148,6 +148,14 @@ std::thread_local! {
     static RECLAIMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether this thread runs work that gives room back ([`ReclaimScope`]):
+/// a commit it proposes is the store's own work, admitted from the recovery
+/// reserve on every member that takes it.
+#[must_use]
+pub fn reclaiming() -> bool {
+    RECLAIMING.get()
+}
+
 /// Held while the thread runs work whose commits give room back, the orphan
 /// blob collector's: they are admitted as the store's own recovery records
 /// ([`Admit::on_this_thread`]), so a disk below its free-space reserve or an
@@ -999,6 +1007,51 @@ pub fn write_footprint(mutations: &[coordinode_core::txn::proposal::Mutation]) -
         })
         .sum::<u64>();
     footprint_of(data, mutations.len())
+}
+
+/// The room a commit applied from a consensus log is admitted for beside its
+/// own writes: the breakpoint record its commit may add to the closure
+/// ledger, and that record's later removal. The admission holds both until
+/// the entry is applied, by when the ledger owes the removal
+/// ([`closure_debt`]): the debt is covered from the commit's admission on.
+#[must_use]
+pub fn closure_footprint() -> u64 {
+    use crate::engine::closure_ledger::BREAKPOINT_KEY_LEN;
+    footprint_of(BREAKPOINT_KEY_LEN as u64 + 8, 1) + breakpoint_removal()
+}
+
+/// The room the removal of one breakpoint record takes.
+fn breakpoint_removal() -> u64 {
+    use crate::engine::closure_ledger::BREAKPOINT_KEY_LEN;
+    footprint_of(BREAKPOINT_KEY_LEN as u64, 1)
+}
+
+/// What the closure ledger of a consensus log owes while it holds `held`
+/// breakpoint records: the removal of each, and the head record the next
+/// entry rewrites whether it commits anything or only closes. Owed to the
+/// footprint like the memtables' flushes, so client writes leave the room
+/// its cleanup needs whatever recovery reserve the endpoint has, none
+/// included. While the Schema memtable is empty, the one those writes
+/// start is owed too ([`memtable_start`]).
+///
+/// Called from the footprint's debt, under locks of the trees a compaction
+/// holds: it reads no tree.
+#[must_use]
+pub fn closure_debt(held: u64) -> u64 {
+    use crate::engine::closure_ledger::HEAD_LEN;
+    use crate::engine::core::CLOSURE_KEY;
+    // One removal per record held: bounded by the records, no overflow.
+    footprint_of((CLOSURE_KEY.len() + HEAD_LEN) as u64, 1) + held * breakpoint_removal()
+}
+
+/// What [`flush_debt`] can grow by when a memtable starts beside those
+/// waiting, past its records' own share (which their footprint covers): one
+/// more flush's fixed cost, and at most one more table's allocation ahead.
+/// Owed by whoever is bound to start one; once it has started, the flush
+/// debt counts it instead.
+#[must_use]
+pub const fn memtable_start() -> u64 {
+    FLUSH_ALLOWANCE + MAX_AHEAD
 }
 
 /// The room `count` writes of `data` key and value bytes in all are admitted

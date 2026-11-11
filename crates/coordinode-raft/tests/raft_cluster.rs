@@ -73,16 +73,24 @@ struct TestNode {
     _dir: tempfile::TempDir,
 }
 
+/// A node's store under `dir`, its files held to `hard_limit` bytes; `0`
+/// for no limit.
+fn node_storage(dir: &std::path::Path, hard_limit: u64) -> StorageConfig {
+    StorageConfig::with_endpoints(vec![
+        EndpointConfig::new("default", dir, Media::Hdd, Durability::Durable, Tier::Warm)
+            .with_hard_limit_bytes(hard_limit),
+    ])
+}
+
 /// Create the FIRST node (leader) — calls initialize().
 async fn create_leader(node_id: u64, port: u16) -> TestNode {
+    create_leader_limited(node_id, port, 0).await
+}
+
+/// [`create_leader`] with the node's files held to `hard_limit` bytes.
+async fn create_leader_limited(node_id: u64, port: u16, hard_limit: u64) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
+    let config = node_storage(dir.path(), hard_limit);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let advertise_addr = format!("http://127.0.0.1:{port}");
@@ -108,14 +116,18 @@ async fn create_leader(node_id: u64, port: u16) -> TestNode {
 /// Create a JOINING node — does NOT call initialize(), waits for leader.
 /// It is enrolled in the group `founder` formed.
 async fn create_follower(node_id: u64, port: u16, founder: &TestNode) -> TestNode {
+    create_follower_limited(node_id, port, founder, 0).await
+}
+
+/// [`create_follower`] with the node's files held to `hard_limit` bytes.
+async fn create_follower_limited(
+    node_id: u64,
+    port: u16,
+    founder: &TestNode,
+    hard_limit: u64,
+) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
+    let config = node_storage(dir.path(), hard_limit);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
 
@@ -350,13 +362,20 @@ async fn await_replicated(engine: &StorageEngine, key: &[u8], expected: &[u8]) -
 }
 
 async fn bootstrap_3_node() -> (TestNode, TestNode, TestNode, u16, u16, u16) {
+    bootstrap_3_node_limited(0).await
+}
+
+/// [`bootstrap_3_node`] with every node's files held to `hard_limit` bytes.
+async fn bootstrap_3_node_limited(
+    hard_limit: u64,
+) -> (TestNode, TestNode, TestNode, u16, u16, u16) {
     let p1 = alloc_port();
     let p2 = alloc_port();
     let p3 = alloc_port();
 
-    let n1 = create_leader(1, p1).await;
-    let n2 = create_follower(2, p2, &n1).await;
-    let n3 = create_follower(3, p3, &n1).await;
+    let n1 = create_leader_limited(1, p1, hard_limit).await;
+    let n2 = create_follower_limited(2, p2, &n1, hard_limit).await;
+    let n3 = create_follower_limited(3, p3, &n1, hard_limit).await;
 
     // Membership changes go through the leader, so there has to be one first.
     await_leadership(&n1.node).await;
@@ -377,6 +396,78 @@ async fn bootstrap_3_node() -> (TestNode, TestNode, TestNode, u16, u16, u16) {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     (n1, n2, n3, p1, p2, p3)
+}
+
+/// A group whose members are all past the room client writes may take
+/// still commits its own work through a majority: the followers append an
+/// entry the leader proposed as the store's own work (consumer progress,
+/// collection) from their recovery reserve, as the leader admitted it.
+/// A client write is refused. Before the own-work mark reached the
+/// followers, they refused such an entry like a client write and it never
+/// committed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_group_commits_its_own_work_through_a_majority() {
+    const LIMIT: u64 = 256 << 20;
+    // Room above what each member holds, all of it its recovery reserve.
+    const ROOM: u64 = 8 << 20;
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3, _, _, _) = bootstrap_3_node_limited(LIMIT).await;
+        let pipeline = n1.node.pipeline();
+        let ids = ProposalIdGenerator::with_base(7u64 << 48);
+        let proposal = |key: &[u8], own_work: bool| RaftProposal {
+            id: ids.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: key.to_vec(),
+                value: b"v".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(0),
+            start_ts: Timestamp::from_raw(0),
+            bypass_rate_limiter: own_work,
+        };
+        pipeline
+            .propose_and_wait(&proposal(b"node:1:before", false))
+            .expect("a client write while there is room");
+        for node in [&n2, &n3] {
+            assert!(await_replicated(&node.engine, b"node:1:before", b"v").await);
+        }
+
+        // Every member: what it holds is past its client ceiling, inside
+        // its limit.
+        for node in [&n1, &n2, &n3] {
+            let footprint = node.engine.footprints().get("default").expect("a limit");
+            let held = footprint.committed();
+            footprint.set_limit(held + ROOM, ROOM + (1 << 20));
+            assert!(!footprint.has_room(coordinode_storage::engine::footprint::Admit::Client));
+        }
+
+        let refused = pipeline.propose_and_wait(&proposal(b"node:1:client", false));
+        assert!(
+            matches!(refused, Err(ProposalError::CapacityExhausted { .. })),
+            "a client write is refused: {refused:?}"
+        );
+        let own = proposal(b"node:1:own", true);
+        let committed = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || pipeline.propose_and_wait(&own)),
+        )
+        .await
+        .expect("the group's own work commits through a majority of full members")
+        .expect("join");
+        committed.expect("own work is admitted");
+        for node in [&n2, &n3] {
+            assert!(
+                await_replicated(&node.engine, b"node:1:own", b"v").await,
+                "a full follower holds the group's own work"
+            );
+        }
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.node.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+    assert!(result.is_ok(), "test timed out");
 }
 
 /// Propose on follower returns NotLeader error (not panic, not hang).
@@ -7455,8 +7546,32 @@ fn try_propose_held(
     oracle: &coordinode_core::txn::timestamp::TimestampOracle,
     key: &[u8],
 ) -> Result<u64, ProposalError> {
+    try_propose_held_at(node, engine, oracle, key).map(|(_, ts)| ts)
+}
+
+/// [`propose_held`], answering the write's log position beside its timestamp.
+fn propose_held_at(
+    node: &RaftNode,
+    engine: &StorageEngine,
+    oracle: &coordinode_core::txn::timestamp::TimestampOracle,
+    key: &[u8],
+) -> (u64, u64) {
+    try_propose_held_at(node, engine, oracle, key).expect("propose")
+}
+
+/// [`try_propose_held`], answering the write's log position too.
+fn try_propose_held_at(
+    node: &RaftNode,
+    engine: &StorageEngine,
+    oracle: &coordinode_core::txn::timestamp::TimestampOracle,
+    key: &[u8],
+) -> Result<(u64, u64), ProposalError> {
     let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
-    let id = ProposalIdGenerator::new().next();
+    // A fresh base per write: ids from a new generator repeat, and the log
+    // takes a repeated id for a retry it already applied.
+    let id =
+        ProposalIdGenerator::with_base(coordinode_core::txn::proposal::fresh_proposal_id_base())
+            .next();
     held.seal(id);
     let written = node.pipeline().propose_and_wait(&RaftProposal {
         id,
@@ -7470,7 +7585,7 @@ fn try_propose_held(
         bypass_rate_limiter: false,
     });
     drop(held);
-    written.map(|_| ts)
+    written.map(|outcome| (outcome.applied_index.expect("a replicated write"), ts))
 }
 
 /// Write `key` through the member that leads, again on another when the lead
@@ -7871,15 +7986,21 @@ async fn a_snapshot_carries_the_closed_bound_across_install_and_restart() {
         drop(lagging);
 
         let mut last = 0;
+        // Each write's position in the log, and its commit: the prefix
+        // through the position needs exactly that commit.
+        let mut written = Vec::new();
         for i in 0..5 {
-            last = propose_held(
+            let (index, ts) = propose_held_at(
                 &members[0].node,
                 &members[0].engine,
                 &members[0].oracle,
                 format!("node:snap-{i}").as_bytes(),
             );
+            last = ts;
+            written.push((index, ts));
         }
         await_closed_past(&members, last, "the two members close past the writes").await;
+        assert_prefix_ceilings(&members[0].node, &members[0].engine, &written, "leader").await;
         let applied = members[0].node.applied_index();
         members[0]
             .node
@@ -7935,6 +8056,7 @@ async fn a_snapshot_carries_the_closed_bound_across_install_and_restart() {
             "the installed bound {} is not past the snapshot's last write {last}",
             back.engine.closure_frontier()
         );
+        assert_prefix_ceilings(&back.node, &back.engine, &written, "installed").await;
         let installed = back.engine.closure_frontier();
         back.node.shutdown().await.expect("stop member 3");
         drop(back);
@@ -7944,6 +8066,7 @@ async fn a_snapshot_carries_the_closed_bound_across_install_and_restart() {
             "reopened at {} below the installed {installed}",
             back.engine.closure_frontier()
         );
+        assert_prefix_ceilings(&back.node, &back.engine, &written, "reopened").await;
         assert!(
             back.oracle.next().as_raw() >= installed,
             "the clock resumes at or above the bound"
@@ -7954,6 +8077,35 @@ async fn a_snapshot_carries_the_closed_bound_across_install_and_restart() {
         result.is_ok(),
         "TIMED OUT: a_snapshot_carries_the_closed_bound_across_install_and_restart"
     );
+}
+
+/// Every written position's prefix needs exactly its own commit on `node`,
+/// read from the store and through the read fence a causal read meets: the
+/// snapshot carried the breakpoints, not only the closed bound.
+async fn assert_prefix_ceilings(
+    node: &RaftNode,
+    engine: &StorageEngine,
+    written: &[(u64, u64)],
+    when: &str,
+) {
+    let mut fence = node.read_fence();
+    let history = fence.history().expect("a member knows its history");
+    for &(index, ts) in written {
+        assert_eq!(
+            engine.commit_ceiling_through(index).expect("ceiling"),
+            ts,
+            "{when}: position {index}"
+        );
+        let bound = fence
+            .await_causal(
+                None,
+                Some(coordinode_core::txn::read_concern::HistoryPosition { history, index }),
+                None,
+            )
+            .await
+            .expect("the position is applied here");
+        assert_eq!(bound, Some(ts), "{when}: the fence's bound at {index}");
+    }
 }
 
 /// An idle group still tells its members the last commit landed: the entry

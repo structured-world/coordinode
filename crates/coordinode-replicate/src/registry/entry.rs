@@ -23,6 +23,18 @@ pub(crate) const REGISTRY_KEY_PREFIX: &[u8] = b"consumer:";
 /// consumer lose its version check, however slow the log is.
 pub(crate) const HEARTBEAT_KEY_PREFIX: &[u8] = b"heartbeat:";
 
+/// The longest consumer id a registration accepts: every record key of a
+/// consumer (its longest prefix plus the id) must fit the storage's key
+/// length, a `u16`.
+pub(crate) const MAX_CONSUMER_ID_BYTES: usize = {
+    let prefix = if REGISTRY_KEY_PREFIX.len() > HEARTBEAT_KEY_PREFIX.len() {
+        REGISTRY_KEY_PREFIX.len()
+    } else {
+        HEARTBEAT_KEY_PREFIX.len()
+    };
+    u16::MAX as usize - prefix
+};
+
 /// The full replicated state of one registration on this shard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegistryEntry {

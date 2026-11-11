@@ -145,6 +145,7 @@ fn registry_over(
         clock,
         source,
     )
+    .expect("open the registry")
 }
 
 /// Start the registry's background service with these cadences.
@@ -295,7 +296,7 @@ async fn ee_topology_scopes_accept_dc_and_rack() {
     ] {
         reg.register(ConsumerRegistration {
             scope,
-            ..registration(id, 0, ConsumerRetentionPolicy::Strict)
+            ..registration(id, 1, ConsumerRetentionPolicy::Strict)
         })
         .expect("EE accepts the scope");
     }
@@ -551,14 +552,14 @@ async fn a_late_heartbeat_of_an_ended_incarnation_keeps_nothing_alive() {
     let f = fixture(clock.clone()).await;
     let old = f
         .reg
-        .register(registration("r", 0, ConsumerRetentionPolicy::Strict))
+        .register(registration("r", 1, ConsumerRetentionPolicy::Strict))
         .expect("register");
     f.reg.unregister(old.clone()).expect("cancel");
     let new = f
         .reg
         .register(registration(
             "r",
-            0,
+            1,
             bounded(u64::MAX, u64::MAX, Some(1_000)),
         ))
         .expect("register again");
@@ -594,12 +595,12 @@ async fn bounded_is_refused_where_the_source_cannot_measure_it() {
     f.source.unaccounted.store(true, Ordering::Release);
     assert!(matches!(
         f.reg
-            .register(registration("b", 0, bounded(1_000, 1_000, None)))
+            .register(registration("b", 1, bounded(1_000, 1_000, None)))
             .unwrap_err(),
         RegistryError::InvalidRetention(_)
     ));
     f.reg
-        .register(registration("s", 0, ConsumerRetentionPolicy::Strict))
+        .register(registration("s", 1, ConsumerRetentionPolicy::Strict))
         .expect("STRICT needs no measure");
     f.node.shutdown().await.expect("shutdown");
 }
@@ -941,7 +942,7 @@ fn an_ended_registration_records_where_its_history_started() {
     source.produced(7, 0);
     clock.set(5_000);
     assert_eq!(reg.core.sweep_evictions().expect("sweep").evicted, 1);
-    let collected = reg.core.engine.gc_watermark();
+    let readable = reg.core.engine.oldest_readable_seqno();
     let refused = reg.checkpoint(&mvcc, 20).unwrap_err();
     assert!(
         matches!(
@@ -951,9 +952,9 @@ fn an_ended_registration_records_where_its_history_started() {
                 checkpoint: 7,
                 retained_from,
                 ..
-            } if retained_from <= collected
+            } if retained_from == readable
         ),
-        "the MVCC boundary is the engine's watermark ({collected}): {refused:?}"
+        "the MVCC boundary is the oldest seqno the engine serves ({readable}): {refused:?}"
     );
 }
 
@@ -1094,10 +1095,10 @@ async fn engine_window_governs_when_no_consumer_is_registered() {
     let f = fixture(Arc::new(ManualClock::new(0))).await;
     let h = f
         .reg
-        .register(registration("probe", 0, ConsumerRetentionPolicy::Strict))
+        .register(registration("probe", 1, ConsumerRetentionPolicy::Strict))
         .expect("register");
     f.engine.set_retention_window(Duration::from_millis(1));
-    assert_eq!(f.engine.gc_watermark(), 0, "the consumer holds collection");
+    assert_eq!(f.engine.gc_watermark(), 1, "the consumer holds collection");
     f.reg.unregister(h).expect("cancel");
     assert_eq!(f.engine.gc_watermark(), f.engine.snapshot() - 1_000);
     f.node.shutdown().await.expect("shutdown");
@@ -1226,7 +1227,8 @@ fn a_journal_purge_racing_a_registration_never_passes_its_position() {
         Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
         Arc::new(ManualClock::new(0)),
         Arc::clone(&source),
-    );
+    )
+    .expect("open the registry");
     let at = source.first_retained(ConsumerKind::OplogEvents);
     let after_purge = Arc::new(AtomicU64::new(0));
     *reg.core.before_commit.lock() = Some(Box::new({
@@ -1366,7 +1368,7 @@ async fn batched_heartbeats_flush_and_refresh_liveness() {
         .reg
         .register(registration(
             "hb",
-            0,
+            1,
             bounded(u64::MAX, u64::MAX, Some(10_000)),
         ))
         .expect("register");
@@ -1591,7 +1593,7 @@ async fn a_failed_flush_keeps_its_heartbeats_buffered() {
         .reg
         .register(registration(
             "reader",
-            0,
+            1,
             bounded(u64::MAX, u64::MAX, Some(2_000)),
         ))
         .expect("register");
@@ -1600,15 +1602,7 @@ async fn a_failed_flush_keeps_its_heartbeats_buffered() {
     f.reg.heartbeat(&h).expect("buffer heartbeat");
     f.node.shutdown().await.expect("shutdown");
     assert!(f.reg.core.flush_pending_heartbeats().is_err());
-    assert_eq!(
-        f.reg
-            .core
-            .pending_hb
-            .lock()
-            .get(&("reader".to_string(), 1))
-            .copied(),
-        Some(2_500)
-    );
+    assert_eq!(f.reg.core.pending_hb.lock().get("reader", 1), Some(2_500));
 }
 
 /// The sweep persists buffered heartbeats before judging liveness, and a
@@ -1620,7 +1614,7 @@ fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
     let h = reg
         .register(registration(
             "reader",
-            0,
+            1,
             bounded(u64::MAX, u64::MAX, Some(400)),
         ))
         .expect("register");
@@ -1639,7 +1633,9 @@ fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
         swept.evicted, 0,
         "a reader with a buffered heartbeat was ended"
     );
-    assert_eq!(swept.next_deadline_ms, Some(1_000 + 400 + 1));
+    // The sweep's flush writes the heartbeat that waited beside its first
+    // batch too, so the deadline counts from it.
+    assert_eq!(swept.next_deadline_ms, Some(2_000 + 400 + 1));
     assert_eq!(ended_for(&reg, "reader"), None);
 }
 
@@ -1650,6 +1646,10 @@ struct HookPipeline {
     hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Refuse every proposal as a follower would, naming member 2 leader.
     follower: AtomicBool,
+    /// Refuse every proposal as a failed write.
+    failing: AtomicBool,
+    /// Whether each proposal taken was marked the store's own work.
+    own_work: Mutex<Vec<bool>>,
 }
 
 impl ProposalPipeline for HookPipeline {
@@ -1669,8 +1669,409 @@ impl ProposalPipeline for HookPipeline {
         if let Some(hook) = hook {
             hook();
         }
+        if self.failing.load(Ordering::Acquire) {
+            return Err(coordinode_core::txn::proposal::ProposalError::Storage(
+                "injected write failure".to_string(),
+            ));
+        }
+        self.own_work.lock().push(proposal.bypass_rate_limiter);
         self.inner.propose_and_wait(proposal)
     }
+}
+
+/// The leader's heartbeat buffer holds at most its cap of incarnations: a
+/// heartbeat of another one flushes the buffered ones first, so none is
+/// dropped and the buffer does not grow with the number of consumers.
+#[test]
+fn the_heartbeat_buffer_stays_within_its_cap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = reopen(dir.path());
+    keep_all_history(&engine);
+    let reg = local_registry(&engine)
+        .expect("registry")
+        .with_pending_heartbeat_cap(2);
+    let handles: Vec<RegisteredHandle> = ["a", "b", "c"]
+        .into_iter()
+        .map(|id| {
+            reg.register(registration(id, 1, ConsumerRetentionPolicy::Strict))
+                .expect("register")
+        })
+        .collect();
+    reg.core.batching_on.store(true, Ordering::Release);
+    for h in &handles {
+        reg.heartbeat(h).expect("heartbeat");
+        assert!(
+            reg.core.pending_hb.lock().len() <= 2,
+            "the buffer grew past its cap"
+        );
+    }
+    for id in ["a", "b"] {
+        let (stored, _) = reg.core.read_heartbeat(id).expect("read");
+        assert!(
+            stored.is_some(),
+            "{id}'s heartbeat was flushed, not dropped"
+        );
+    }
+}
+
+/// Heartbeats arriving while a flush writes stay within the bound: the
+/// flush owns what it took (no copy), the next ones wait within the cap,
+/// and one past it waits for the flush instead of growing the buffer. The
+/// heartbeats being written stay visible to a sweep, and every one lands.
+/// Before, the room was checked and taken under two locks, and concurrent
+/// flushes each copied the whole buffer.
+#[test]
+fn heartbeats_stay_bounded_while_a_flush_writes() {
+    let (reg, _clock, _source, pipeline, _dir) = hooked_registry();
+    let reg = reg.with_pending_heartbeat_cap(2);
+    let ids = ["a", "b", "c", "d", "e", "f"];
+    let handles: Vec<RegisteredHandle> = ids
+        .iter()
+        .map(|id| {
+            reg.register(registration(id, 1, ConsumerRetentionPolicy::Strict))
+                .expect("register")
+        })
+        .collect();
+    reg.core.batching_on.store(true, Ordering::Release);
+    reg.heartbeat(&handles[0]).expect("a");
+    reg.heartbeat(&handles[1]).expect("b");
+
+    // The next heartbeat finds the buffer full and flushes it; its write is
+    // held inside the pipeline.
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    *pipeline.hook.lock() = Some(Box::new(move || {
+        held_tx.send(()).expect("report held");
+        release_rx.recv().expect("released");
+    }));
+    std::thread::scope(|s| {
+        let flusher = s.spawn(|| reg.heartbeat(&handles[2]));
+        held_rx.recv().expect("the flush is writing");
+        {
+            let pending = reg.core.pending_hb.lock();
+            assert_eq!(pending.writing.len(), 2, "the flush took the full buffer");
+            assert!(pending.waiting.is_empty());
+            assert_eq!(pending.get("a", 1), Some(0), "still visible");
+        }
+        // Room for two more while the write is held; a third waits for it.
+        reg.heartbeat(&handles[3]).expect("d");
+        reg.heartbeat(&handles[4]).expect("e");
+        let waiter = s.spawn(|| reg.heartbeat(&handles[5]));
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            let pending = reg.core.pending_hb.lock();
+            assert!(pending.waiting.len() <= 2, "waiting past the cap");
+            assert!(pending.len() <= 4, "the buffer grew past twice its cap");
+        }
+        release_tx.send(()).expect("release");
+        flusher.join().expect("join").expect("c");
+        waiter.join().expect("join").expect("f");
+    });
+    reg.core.flush_pending_heartbeats().expect("flush the rest");
+    for id in ids {
+        let (stored, _) = reg.core.read_heartbeat(id).expect("read");
+        assert!(stored.is_some(), "{id}'s heartbeat landed");
+    }
+}
+
+/// Writes that keep failing do not grow the buffer: the batch a failed
+/// write took stays the batch and is written again first, never merged back
+/// into the waiting heartbeats, so waiting and written parts each stay
+/// within the cap however many writes fail. A later heartbeat of an
+/// incarnation in the failed batch waits beside it and the latest time is
+/// what a sweep sees; once writes succeed every heartbeat lands. Before,
+/// each failure merged the batch back, and the next one took both.
+#[test]
+fn repeated_failed_flushes_keep_the_heartbeat_bound() {
+    let (reg, clock, _source, pipeline, _dir) = hooked_registry();
+    let reg = reg.with_pending_heartbeat_cap(2);
+    let handles: Vec<RegisteredHandle> = (0..8)
+        .map(|i| {
+            reg.register(registration(
+                &format!("c{i}"),
+                1,
+                ConsumerRetentionPolicy::Strict,
+            ))
+            .expect("register")
+        })
+        .collect();
+    reg.core.batching_on.store(true, Ordering::Release);
+    pipeline.failing.store(true, Ordering::Release);
+    clock.set(100);
+    reg.heartbeat(&handles[0]).expect("c0");
+    reg.heartbeat(&handles[1]).expect("c1");
+    let within_cap = |round: &str| {
+        let pending = reg.core.pending_hb.lock();
+        assert!(
+            pending.waiting.len() <= 2 && pending.writing.len() <= 2,
+            "{round}: writing={} waiting={} past the cap 2",
+            pending.writing.len(),
+            pending.waiting.len()
+        );
+    };
+    // While the flush writes c0, c1, a newer heartbeat of c0 and one of c2
+    // fill the waiting part; then the write fails.
+    *pipeline.hook.lock() = Some(Box::new({
+        let (reg, clock) = (reg.clone(), Arc::clone(&clock));
+        let (h0, h2) = (handles[0].clone(), handles[2].clone());
+        move || {
+            clock.set(500);
+            reg.heartbeat(&h0).expect("c0 during the write");
+            reg.heartbeat(&h2).expect("c2 during the write");
+        }
+    }));
+    assert!(reg.core.flush_pending_heartbeats().is_err());
+    within_cap("first failure");
+    // The latest time of c0 is what a sweep sees.
+    assert_eq!(reg.core.pending_hb.lock().get("c0", 1), Some(500));
+    // From here every heartbeat finds both parts full; each flush retries
+    // the failed batch, fails again, and the heartbeat is refused.
+    for (i, handle) in handles.iter().enumerate().skip(3) {
+        assert!(reg.heartbeat(handle).is_err(), "c{i} refused");
+        within_cap(&format!("c{i}"));
+    }
+
+    pipeline.failing.store(false, Ordering::Release);
+    reg.core.flush_pending_heartbeats().expect("flush");
+    assert!(reg.core.pending_hb.lock().is_empty());
+    for (id, ts) in [("c0", Some(500)), ("c1", Some(100)), ("c2", Some(500))] {
+        let (stored, _) = reg.core.read_heartbeat(id).expect("read");
+        assert_eq!(stored.map(|hb| hb.ts_ms), ts, "{id}");
+    }
+}
+
+/// The buffer's bound counts the bytes of consumer ids too: ids are of any
+/// length, so a cap on their number alone bounds no memory. One incarnation
+/// per id is kept: a newer one replaces it, an older one is dropped.
+#[test]
+fn the_heartbeat_buffer_bounds_the_bytes_of_its_ids() {
+    let mut pending = PendingHeartbeats::default();
+    let long = "x".repeat(MAX_CONSUMER_ID_BYTES);
+    let fill = MAX_PENDING_HEARTBEAT_BYTES / MAX_CONSUMER_ID_BYTES;
+    for i in 0..fill {
+        let id = format!("{i:05}{}", &long[5..]);
+        assert!(pending.admit(&id, 1, 1, usize::MAX), "{i} fits");
+    }
+    assert!(
+        !pending.admit(&format!("zzzzz{}", &long[5..]), 1, 1, usize::MAX),
+        "another long id past the byte bound waits for a flush"
+    );
+    assert!(pending.waiting_bytes <= MAX_PENDING_HEARTBEAT_BYTES);
+    let first = format!("00000{}", &long[5..]);
+    assert!(pending.admit(&first, 1, 2, usize::MAX), "a later time fits");
+    assert!(
+        pending.admit(&first, 2, 3, usize::MAX),
+        "a newer incarnation"
+    );
+    assert!(
+        pending.admit(&first, 1, 9, usize::MAX),
+        "an older one drops"
+    );
+    assert_eq!(pending.get(&first, 2), Some(3));
+    assert_eq!(pending.get(&first, 1), None);
+    assert_eq!(pending.waiting.len(), fill);
+}
+
+/// A registration or heartbeat of an id longer than a consumer's record
+/// keys can hold is refused with a typed error, before anything is copied
+/// or stored. Before, the storage refused the key by panicking.
+#[test]
+fn an_overlong_consumer_id_is_refused() {
+    let (reg, _clock, _source, pipeline, _dir) = hooked_registry();
+    let id = "x".repeat(MAX_CONSUMER_ID_BYTES + 1);
+    assert!(matches!(
+        reg.register(registration(&id, 1, ConsumerRetentionPolicy::Strict)),
+        Err(RegistryError::ConsumerIdTooLong { len, max })
+            if len == MAX_CONSUMER_ID_BYTES + 1 && max == MAX_CONSUMER_ID_BYTES
+    ));
+    let fits = "y".repeat(MAX_CONSUMER_ID_BYTES);
+    reg.register(registration(&fits, 1, ConsumerRetentionPolicy::Strict))
+        .expect("the longest accepted id registers");
+    reg.core.batching_on.store(true, Ordering::Release);
+    let proposals = pipeline.own_work.lock().len();
+    assert!(matches!(
+        reg.heartbeat(&RegisteredHandle::new(&id, 1)),
+        Err(RegistryError::ConsumerIdTooLong { .. })
+    ));
+    assert!(reg.core.pending_hb.lock().is_empty(), "nothing buffered");
+    assert_eq!(pipeline.own_work.lock().len(), proposals, "nothing written");
+}
+
+/// The proposals a consumer's progress makes (acknowledgement, heartbeat,
+/// cancellation) carry the store's own-work mark, so every member, a
+/// follower appending the entry too, admits them from its recovery reserve;
+/// a new registration's proposal does not, and is refused with client
+/// writes. Before, the mark was set on the leader's thread only and the
+/// proposal went out as a client write.
+#[test]
+fn a_consumers_progress_proposes_the_stores_own_work() {
+    let (reg, _clock, _source, pipeline, _dir) = hooked_registry();
+    let handle = reg
+        .register(registration("sink", 1, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    let registered = std::mem::take(&mut *pipeline.own_work.lock());
+    reg.checkpoint(&handle, 2).expect("acknowledge");
+    reg.heartbeat(&handle).expect("heartbeat");
+    reg.unregister(handle).expect("cancel");
+    let progress = std::mem::take(&mut *pipeline.own_work.lock());
+    assert!(
+        !registered.is_empty() && registered.iter().all(|own| !own),
+        "a registration is a client write: {registered:?}"
+    );
+    assert!(
+        !progress.is_empty() && progress.iter().all(|own| *own),
+        "a consumer's progress is the store's own work: {progress:?}"
+    );
+}
+
+/// An engine over `dir`, opened afresh as a restart opens it.
+fn reopen(dir: &std::path::Path) -> Arc<StorageEngine> {
+    Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new()),
+        )
+        .expect("open engine"),
+    )
+}
+
+/// A registry over `engine` writing through its local pipeline.
+fn local_registry(engine: &Arc<StorageEngine>) -> Result<ShardConsumerRegistry, RegistryError> {
+    ShardConsumerRegistry::new(
+        Arc::clone(engine),
+        Arc::new(
+            coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(engine),
+        ),
+        Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
+        Arc::new(ManualClock::new(0)),
+        FakeSource::new(),
+    )
+}
+
+/// A store reopened over a STRICT MVCC registration keeps the history it
+/// was promised from the open on, not from when its registry recovers:
+/// collection that runs in between (flushes and compactions the open starts,
+/// here forced, with a window that would collect everything) leaves the
+/// promised version in place. Before, the open published no floor, the window
+/// alone governed, and the compaction dropped the version for good.
+#[test]
+fn a_reopened_store_keeps_a_strict_consumers_history_before_its_registry_recovers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let key = b"node:1:promised";
+    let promised = {
+        let engine = reopen(dir.path());
+        keep_all_history(&engine);
+        engine.put(Partition::Node, key, b"v1").expect("v1");
+        let at = engine.snapshot();
+        let reg = local_registry(&engine).expect("registry");
+        reg.register(ConsumerRegistration {
+            kind: ConsumerKind::MvccSnapshotPin,
+            ..registration("backup", at, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("register");
+        engine.put(Partition::Node, key, b"v2").expect("v2");
+        engine.put(Partition::Node, key, b"v3").expect("v3");
+        engine.persist().expect("persist");
+        at
+    };
+
+    let engine = reopen(dir.path());
+    assert!(engine.consumer_protections_pending());
+    engine.set_retention_window(Duration::from_millis(1));
+    engine.persist().expect("persist");
+    engine.major_compact(Partition::Node).expect("compact");
+
+    let reg = local_registry(&engine).expect("recover");
+    assert!(!engine.consumer_protections_pending());
+    assert_eq!(
+        engine
+            .snapshot_get(&promised, Partition::Node, key)
+            .expect("the promised snapshot is still served")
+            .as_deref(),
+        Some(&b"v1"[..])
+    );
+    let h = reg.resume("backup", 1).expect("resume");
+    assert_eq!(reg.check_retention(&h).expect("held"), promised);
+}
+
+/// A registration the reopened store cannot read refuses the registry, and
+/// the store keeps holding all history: an unrecoverable protection is never
+/// taken for none. Before, the registry opened with a warning and no floor,
+/// and the window collected below the lost registration.
+#[test]
+fn an_unreadable_registration_refuses_the_registry_and_keeps_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let engine = reopen(dir.path());
+        engine
+            .put(
+                Partition::Registry,
+                b"consumer:broken",
+                b"\xc1 not a record",
+            )
+            .expect("write");
+        engine.persist().expect("persist");
+    }
+    let engine = reopen(dir.path());
+    engine.set_retention_window(Duration::from_millis(1));
+    assert_eq!(engine.gc_watermark(), 0, "held from the open");
+    assert!(matches!(
+        local_registry(&engine),
+        Err(RegistryError::Replication(_))
+    ));
+    assert_eq!(engine.gc_watermark(), 0, "still held after the refusal");
+    assert!(engine.consumer_protections_pending());
+}
+
+/// A partition cleared above the collection watermark no longer serves reads
+/// below its floor, whatever the watermark says: a registration there is
+/// refused with that floor, one from the earliest retained starts at it, and
+/// a registration it overtook reports its checkpoint lost. Before, all three
+/// went by the watermark and promised history the store no longer had.
+#[test]
+fn a_cleared_partitions_floor_bounds_what_registrations_are_promised() {
+    let (reg, _clock, _source, _pipeline, _dir) = hooked_registry();
+    let engine = Arc::clone(&reg.core.engine);
+    let mvcc = |id: &str, initial_seqno| ConsumerRegistration {
+        kind: ConsumerKind::MvccSnapshotPin,
+        initial_seqno,
+        ..registration(id, 0, ConsumerRetentionPolicy::Strict)
+    };
+    engine
+        .put(Partition::Node, b"node:1:a", b"v")
+        .expect("write");
+    let before = engine.snapshot();
+    let early = reg
+        .register(mvcc("early", InitialSeqno::At(before)))
+        .expect("register");
+    engine.clear_partition(Partition::Node).expect("clear");
+    let horizon = engine.oldest_readable_seqno();
+    assert!(
+        horizon > before && engine.gc_watermark() <= before,
+        "the floor is above the watermark: {horizon} vs {}",
+        engine.gc_watermark()
+    );
+
+    assert!(matches!(
+        reg.register(mvcc("late", InitialSeqno::At(before))),
+        Err(RegistryError::RetentionLost { checkpoint, floor })
+            if checkpoint == before && floor == horizon
+    ));
+    let earliest = reg
+        .register(mvcc("earliest", InitialSeqno::FromEarliestRetained))
+        .expect("register");
+    assert_eq!(reg.check_retention(&earliest).expect("held"), horizon);
+    assert!(matches!(
+        reg.check_retention(&early),
+        Err(RegistryError::RetentionLost { checkpoint, floor })
+            if checkpoint == before && floor == horizon
+    ));
 }
 
 /// A registry over a local engine whose next proposal can run a hook first.
@@ -1701,6 +2102,8 @@ fn hooked_registry() -> (
         inner: coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
         hook: Mutex::new(None),
         follower: AtomicBool::new(false),
+        failing: AtomicBool::new(false),
+        own_work: Mutex::new(Vec::new()),
     });
     let clock = Arc::new(ManualClock::new(0));
     let source = FakeSource::new();
@@ -1710,7 +2113,8 @@ fn hooked_registry() -> (
         Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
         Arc::clone(&clock) as Arc<dyn Clock>,
         Arc::clone(&source) as Arc<dyn RetentionSource>,
-    );
+    )
+    .expect("open the registry");
     (reg, clock, source, pipeline, dir)
 }
 
@@ -1727,10 +2131,7 @@ fn a_follower_sweep_leaves_transitions_to_the_leader() {
     let handle = RegisteredHandle::new("idle", 1);
 
     pipeline.follower.store(true, Ordering::Release);
-    reg.core
-        .pending_hb
-        .lock()
-        .insert(("idle".to_string(), 1), 100);
+    reg.core.pending_hb.lock().admit("idle", 1, 100, usize::MAX);
     clock.set(10_000);
     let swept = reg
         .core

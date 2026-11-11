@@ -2402,7 +2402,10 @@ impl<'a> Transaction<'a> {
                 mutations,
                 commit_ts,
                 start_ts: self.read_ts,
-                bypass_rate_limiter: false,
+                // Work that gives room back (a consumer's progress, orphan
+                // collection) is the store's own: every member that takes
+                // the entry admits it from its recovery reserve.
+                bypass_rate_limiter: crate::engine::footprint::reclaiming(),
             };
             // The proposal carries every write of the commit, so the entry
             // carrying it may close the bound past it.

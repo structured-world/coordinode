@@ -389,6 +389,61 @@ fn a_registration_is_refused_where_the_limit_has_no_room() {
     .expect("admitted once there is room");
 }
 
+/// A consumer admitted before the store ran out of room for client writes
+/// still acknowledges and cancels: its progress releases what it holds, so
+/// it is admitted from the room kept for the store's own recovery work,
+/// while a new registration is refused. Before, the acknowledgement was a
+/// client write like any other and was refused with it, so a consumer at
+/// the limit could not release the history that kept the store full.
+#[test]
+fn an_admitted_consumer_makes_progress_where_new_retention_is_refused() {
+    use coordinode_replicate::RetentionPressure;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+
+    const LIMIT: u64 = 64 << 20;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open_with_config(StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(LIMIT),
+    ]))
+    .expect("open with a limit");
+    let handle = db
+        .register_consumer(log_consumer(
+            "admitted",
+            InitialSeqno::FromNow,
+            ConsumerRetentionPolicy::Strict,
+        ))
+        .expect("register while there is room");
+    write(&mut db, 4, "held");
+    let head = db.consumer_position(&handle).expect("position") + 4;
+
+    // All but a page of the limit is the recovery reserve.
+    db.set_hard_limit("default", LIMIT, Some(LIMIT - 4096))
+        .expect("limit");
+    assert!(matches!(
+        db.register_consumer(log_consumer(
+            "late",
+            InitialSeqno::FromNow,
+            ConsumerRetentionPolicy::Strict,
+        )),
+        Err(DatabaseError::Consumer(RegistryError::Backpressure(
+            RetentionPressure::Footprint { .. }
+        )))
+    ));
+    db.acknowledge_consumer(&handle, head)
+        .expect("an admitted consumer acknowledges at the limit");
+    db.cancel_consumer(handle)
+        .expect("an admitted consumer cancels at the limit");
+}
+
 /// The database reports, per space, the lowest live position and the
 /// registration holding it.
 #[test]

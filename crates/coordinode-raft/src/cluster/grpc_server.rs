@@ -168,7 +168,7 @@ impl GroupReplica {
 fn entries_footprint(
     req: &openraft::raft::AppendEntriesRequest<TypeConfig>,
 ) -> (u64, coordinode_storage::engine::footprint::Admit) {
-    use coordinode_storage::engine::footprint::{Admit, write_footprint};
+    use coordinode_storage::engine::footprint::{Admit, closure_footprint, write_footprint};
     let entries = &req.entries;
     let committed = req.leader_commit.as_ref().map(|id| id.index);
     let mut bytes = 0u64;
@@ -180,7 +180,7 @@ fn entries_footprint(
         if let openraft::entry::EntryPayload::Normal(request) = &entry.payload {
             for proposal in &request.proposals {
                 // Bounded by the size of a message received.
-                bytes += write_footprint(&proposal.mutations);
+                bytes += write_footprint(&proposal.mutations) + closure_footprint();
                 if !proposal.bypass_rate_limiter && !all_committed {
                     class = Admit::Client;
                 }
