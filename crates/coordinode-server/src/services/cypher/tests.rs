@@ -3414,36 +3414,49 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
     );
 
     // Filled until even the room a refusal frees by itself (flushing the
-    // memtables, retiring the journal they cover) takes no more rows.
-    let mut next = 0u32;
-    loop {
-        let from = next;
-        loop {
-            let key = format!("node:0:{next:010}");
-            // Distinct bytes per row, so no codec shrinks the fill.
-            let mut state = u64::from(next).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-            let value: Vec<u8> = (0..32)
-                .flat_map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    state.to_le_bytes()
-                })
-                .collect();
-            match engine.put(Partition::Node, key.as_bytes(), &value) {
-                Ok(()) => next += 1,
-                Err(coordinode_storage::error::StorageError::CapacityExhausted { .. }) => break,
-                Err(other) => panic!("unexpected refusal: {other:?}"),
+    // memtables, retiring the journal and the records they cover) takes no
+    // more rows, with large rows first and then rows of one byte: room too
+    // small for a large row still takes a small write, as the CREATE below
+    // is.
+    fn fill(engine: &StorageEngine, next: &mut u32) {
+        for words in [32usize, 0] {
+            loop {
+                let from = *next;
+                loop {
+                    let key = format!("node:0:{next:010}");
+                    // Distinct bytes per row, so no codec shrinks the fill.
+                    let mut state = u64::from(*next).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                    let mut value: Vec<u8> = (0..words)
+                        .flat_map(|_| {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            state.to_le_bytes()
+                        })
+                        .collect();
+                    if value.is_empty() {
+                        value.push(1);
+                    }
+                    match engine.put(Partition::Node, key.as_bytes(), &value) {
+                        Ok(()) => *next += 1,
+                        Err(coordinode_storage::error::StorageError::CapacityExhausted {
+                            ..
+                        }) => break,
+                        Err(other) => panic!("unexpected refusal: {other:?}"),
+                    }
+                    assert!(*next < 4_000_000, "the endpoint never filled");
+                }
+                if *next == from {
+                    break;
+                }
+                engine
+                    .persist()
+                    .expect("a filled store flushes into its reserve");
             }
-            assert!(next < 1_000_000, "the endpoint never filled");
         }
-        if next == from {
-            break;
-        }
-        engine
-            .persist()
-            .expect("a filled store flushes into its reserve");
     }
+    let mut next = 0u32;
+    fill(&engine, &mut next);
 
     // Step 2: wrap the saturated engine in a Database and stand
     // up the gRPC service. No tonic transport — calling the
@@ -3454,6 +3467,9 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
             coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
         );
     let db = Database::from_engine(dir.path(), engine, oracle, pipeline).expect("from_engine");
+    // The database's open retires what the fill's commits left below every
+    // reader: fill the room that frees too.
+    fill(db.engine(), &mut next);
     let database = std::sync::Arc::new(parking_lot::RwLock::new(db));
     let registry = std::sync::Arc::new(QueryRegistry::new());
     let detector = std::sync::Arc::new(NPlus1Detector::new());
