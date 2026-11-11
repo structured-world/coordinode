@@ -284,14 +284,14 @@ impl CoordinodeProcess {
         kill: bool,
     ) -> Self {
         if kill {
-            force_reap(&mut self.child);
+            reap(&mut self.child).await;
         } else {
             send_sigterm(&self.child);
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline && !has_exited(&mut self.child) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            force_reap(&mut self.child);
+            reap(&mut self.child).await;
         }
         let data_dir = self
             .data_dir
@@ -409,8 +409,7 @@ impl CoordinodeProcess {
     /// after SIGKILL — this is what crash-recovery tests verify.
     pub async fn restart_unclean(mut self) -> Self {
         // SIGKILL: immediate termination, no cleanup, no Drop.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        reap(&mut self.child).await;
 
         // Take the TempDir out before self is dropped.
         let data_dir = self
@@ -447,7 +446,7 @@ impl CoordinodeProcess {
         while Instant::now() < deadline && !has_exited(&mut self.child) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        force_reap(&mut self.child);
+        reap(&mut self.child).await;
 
         // Take the TempDir out of self before self is dropped.
         // This means the Drop impl for this struct won't delete the directory.
@@ -474,7 +473,7 @@ impl CoordinodeProcess {
         while Instant::now() < deadline && !has_exited(&mut self.child) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        force_reap(&mut self.child);
+        reap(&mut self.child).await;
 
         let data_dir = self
             .data_dir
@@ -759,7 +758,7 @@ impl CoordinodeProcess {
     async fn diagnose(&mut self, first: NotReady, within: Duration) -> StartReport {
         // Only this process: its ports and files are what the second start
         // needs, and nothing else is touched.
-        force_reap(&mut self.child);
+        reap(&mut self.child).await;
         eprintln!(
             "--- coordinode on port {} (pid {}) was not ready within {:?}; its output is above. \
              A diagnostic start of the same command follows. ---",
@@ -799,7 +798,7 @@ impl CoordinodeProcess {
         while Instant::now() < deadline && !has_exited(&mut self.child) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        force_reap(&mut self.child);
+        reap(&mut self.child).await;
         let output = std::fs::read_to_string(trace.path())
             .unwrap_or_else(|e| format!("[the diagnostic trace could not be read: {e}]"));
         StartReport {
@@ -862,7 +861,7 @@ impl CoordinodeProcess {
         while Instant::now() < deadline && !has_exited(&mut self.child) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        force_reap(&mut self.child);
+        reap(&mut self.child).await;
         self.data_dir
             .take()
             .expect("data_dir missing: the process was already restarted")
@@ -978,7 +977,7 @@ async fn serve_expecting_refusal(mut cmd: Command) -> (std::process::ExitStatus,
             break Some(status);
         }
         if Instant::now() >= deadline {
-            force_reap(&mut child);
+            reap(&mut child).await;
             break None;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1119,6 +1118,15 @@ fn has_exited(child: &mut Child) -> bool {
 fn force_reap(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// [`force_reap`] for an async caller: the killed child's exit is polled, so
+/// the wait never blocks the runtime the test's own connections run on.
+async fn reap(child: &mut Child) {
+    let _ = child.kill();
+    while !has_exited(child) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

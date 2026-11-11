@@ -1820,7 +1820,7 @@ async fn an_entry_after_the_snapshot_wins_over_the_installed_value() {
     apply_entries(&mut sm, vec![put(2, t2, b"v2")]).await;
 
     // The snapshot reaches the follower after entry 2 was committed.
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let follower_rig = coordinode_test_fixtures::PowerRig::new();
     let (follower, follower_clock) = open_rig_engine(&follower_rig);
     let mut fsm = CoordinodeStateMachine::with_oracle(Arc::clone(&follower), Some(follower_clock))

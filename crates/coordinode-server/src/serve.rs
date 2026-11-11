@@ -1466,7 +1466,8 @@ pub(crate) async fn serve(
         Some(identity) => {
             let clients = match tls_ca.as_ref() {
                 Some(ca_path) => {
-                    let pem = std::fs::read(ca_path)
+                    let pem = tokio::fs::read(ca_path)
+                        .await
                         .map_err(|e| format!("read tls ca {ca_path}: {e}"))?;
                     let roots = coordinode_wire::tls::load_certs(&pem)
                         .map_err(|e| format!("tls ca {ca_path}: {e}"))?;
@@ -1495,13 +1496,16 @@ pub(crate) async fn serve(
         None => {
             if let (Some(cert_path), Some(key_path)) = (tls_cert.as_ref(), tls_key.as_ref()) {
                 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
-                let cert = std::fs::read(cert_path)
+                let cert = tokio::fs::read(cert_path)
+                    .await
                     .map_err(|e| format!("read tls cert {cert_path}: {e}"))?;
-                let key =
-                    std::fs::read(key_path).map_err(|e| format!("read tls key {key_path}: {e}"))?;
+                let key = tokio::fs::read(key_path)
+                    .await
+                    .map_err(|e| format!("read tls key {key_path}: {e}"))?;
                 let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert, &key));
                 if tls_require_client_auth && let Some(ca_path) = tls_ca.as_ref() {
-                    let ca = std::fs::read(ca_path)
+                    let ca = tokio::fs::read(ca_path)
+                        .await
                         .map_err(|e| format!("read tls ca {ca_path}: {e}"))?;
                     tls = tls.client_ca_root(Certificate::from_pem(ca));
                 }

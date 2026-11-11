@@ -317,7 +317,7 @@ async fn vector_search_reports_rebuilding_health() {
         .is_some_and(|h| h.is_ready())
     {
         assert!(std::time::Instant::now() < built_by, "never built");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let svc = VectorServiceImpl::new(Arc::new(RwLock::new(database)));
 
