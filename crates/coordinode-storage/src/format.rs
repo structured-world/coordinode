@@ -129,16 +129,57 @@ pub fn prepare(config: &StorageConfig) -> StorageResult<Prepared> {
     }
     let resolved = canonical(&dirs)?;
     let mut locks = DirectoryLocks::default();
+    // The lock files this open created: a refused open removes them, so a
+    // store it refuses (another format, an unfinished restore) is left as
+    // it found it.
+    let mut created = Vec::new();
     for &dir in &dirs {
         let path = dir.join(LOCK_FILE);
+        let existed = path.exists();
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)
             .map_err(|e| io_at("open", &path, e))?;
-        locks.0.push(hold(dir, file)?);
+        if !existed {
+            created.push(path.clone());
+        }
+        match hold(dir, file) {
+            Ok(file) => locks.0.push(file),
+            Err(e) => return Err(release_created(locks, &created, e)),
+        }
     }
+    match prepare_held(config, &dirs, &resolved) {
+        Ok(format) => Ok(Prepared { format, locks }),
+        Err(e) => Err(release_created(locks, &created, e)),
+    }
+}
+
+/// Let go of `locks` and remove the lock files of `created`, then hand back
+/// `refusal`: what a refused open leaves behind is what it found.
+fn release_created(
+    locks: DirectoryLocks,
+    created: &[PathBuf],
+    refusal: StorageError,
+) -> StorageError {
+    drop(locks);
+    for path in created {
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!(path = %path.display(), error = %e, "a refused open left its lock file");
+        }
+    }
+    refusal
+}
+
+/// The checks [`prepare`] makes holding every directory: an unfinished
+/// restore refuses the open, a published one's secondary claims go, and the
+/// primary is brought to the engine format.
+fn prepare_held(
+    config: &StorageConfig,
+    dirs: &[&Path],
+    resolved: &[PathBuf],
+) -> StorageResult<FormatOpen> {
     // A partial image is never served: only the restore installing it opens
     // the directories until that restore has finished, which the primary's
     // claim tells. A secondary's claim outlives it by a moment and binds the
@@ -166,7 +207,7 @@ pub fn prepare(config: &StorageConfig) -> StorageResult<Prepared> {
         Some(&primary) if primary_durable => read_marker(primary)?.is_some(),
         _ => false,
     };
-    for &dir in &dirs {
+    for &dir in dirs {
         match read_claim(dir)? {
             None => {}
             Some(claim) if claim.endpoints == resolved && published => remove_claim(dir)?,
@@ -184,10 +225,7 @@ pub fn prepare(config: &StorageConfig) -> StorageResult<Prepared> {
             }
         }
     }
-    Ok(Prepared {
-        format: prepare_primary(config)?,
-        locks,
-    })
+    prepare_primary(config)
 }
 
 /// [`prepare`] for the open a restore makes of the directories `claim`

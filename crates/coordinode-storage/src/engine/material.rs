@@ -17,7 +17,7 @@
 //!
 //! Beside it, every unit of the batch gets one record of the unit index,
 //! `0x00 "au" be_u64(seqno) be_u32(ordinal)` = its kind, encoded length and
-//! key (and a range's end), no payload: what the fold ([`fold`]) reads, in
+//! key (and a range's end), no payload: what the material fold reads, in
 //! commit order, to keep each key's reconstruction closure. The ordinal is
 //! the unit's place in its batch, so two equal operands at one seqno stay two
 //! units and a replay of the batch rewrites the same records.

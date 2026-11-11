@@ -6894,7 +6894,7 @@ impl StorageEngine {
 
     /// The Schema writes entry `index` makes after its proposals, with the
     /// timestamp to write them at, when the entry changes the ledger: the
-    /// [`CLOSURE_KEY`] head with the closed bound `below` it carries (`0` for
+    /// ledger's head with the closed bound `below` it carries (`0` for
     /// none), a breakpoint record for each commit ceiling its proposals
     /// raised, and the removal of breakpoints no view the store serves still
     /// needs, a bounded batch of them. `None` when nothing changes. The plan

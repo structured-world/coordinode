@@ -26,8 +26,9 @@ pub use shard::{BackgroundConfig, Clock, RegistryBackground, ShardConsumerRegist
 pub use source::RetentionSource;
 pub use types::{
     ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot, InitialSeqno,
-    PriorIncarnation, RegisteredHandle, RegistrationState, RegistryError, RetentionPressure,
-    RetentionSpace, RetentionSummary, TerminalReason, TopologyScope, ValidatedRetentionBounds,
+    Measure, PriorIncarnation, RegisteredHandle, RegistrationState, RegistryError,
+    RetentionPressure, RetentionSpace, RetentionSummary, TerminalReason, TopologyScope, Unmeasured,
+    ValidatedRetentionBounds,
 };
 pub use watch::RegistrationWatch;
 
