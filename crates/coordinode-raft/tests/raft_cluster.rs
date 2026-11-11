@@ -8355,7 +8355,7 @@ fn try_propose_held_at(
 ) -> Result<(u64, u64), ProposalError> {
     let (ts, held) = engine
         .pending_commits()
-        .obligate_changing(|| oracle.next().as_raw())
+        .obligate_changing(|| oracle.next().as_raw(), None)
         .expect("no ending holds the writes");
     // A fresh base per write: ids from a new generator repeat, and the log
     // takes a repeated id for a retry it already applied.
@@ -8544,7 +8544,7 @@ fn spawn_writes(
             let (ts, held) = leader
                 .engine
                 .pending_commits()
-                .obligate_changing(|| leader.oracle.next().as_raw())
+                .obligate_changing(|| leader.oracle.next().as_raw(), None)
                 .expect("no ending holds the writes");
             let key = format!("node:{prefix}-{i}").into_bytes();
             let pipeline = Arc::clone(&pipeline);
@@ -9106,7 +9106,7 @@ async fn a_closed_position_read_after_a_restart_waits_on_no_later_commit() {
         let (open, held) = members[leader]
             .engine
             .pending_commits()
-            .obligate_changing(|| members[leader].oracle.next().as_raw())
+            .obligate_changing(|| members[leader].oracle.next().as_raw(), None)
             .expect("no ending holds the writes");
         let later = propose_held(
             &members[leader].node,

@@ -277,6 +277,15 @@ impl QueryBudget {
         self.check()
     }
 
+    /// Nanoseconds left before the deadline (`0` once it passed), or `None`
+    /// without one: how long a wait on the query's behalf may last.
+    pub fn time_left_nanos(&self) -> Option<u64> {
+        // Floored at zero on purpose: a passed deadline leaves no time, it is
+        // not an error.
+        self.deadline
+            .map(|(deadline, clock)| deadline.saturating_sub(clock()))
+    }
+
     /// Check the deadline and cancellation now.
     ///
     /// # Errors

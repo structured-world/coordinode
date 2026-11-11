@@ -1047,7 +1047,7 @@ async fn stream_follows_a_raft_node() {
     for i in 1..=3u64 {
         let (ts, held) = engine
             .pending_commits()
-            .obligate_changing(|| oracle.next().as_raw())
+            .obligate_changing(|| oracle.next().as_raw(), None)
             .expect("no ending holds the writes");
         raft_pipeline
             .propose_and_wait(&RaftProposal {

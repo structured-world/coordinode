@@ -1740,7 +1740,7 @@ fn create_multiple_nodes() {
     execute(&plan2, &mut ctx).expect("create b");
 
     // Two ids were used: the next one handed out is the third.
-    assert_eq!(allocator.next().expect("id").as_raw(), 3);
+    assert_eq!(allocator.next(None).expect("id").as_raw(), 3);
 }
 
 // ====== MERGE / UPSERT ======
@@ -1853,7 +1853,7 @@ fn merge_no_duplicate_on_existing() {
 
     // Allocator should NOT have advanced (no new node created): the next id is
     // the first above the starting point.
-    assert_eq!(allocator.next().expect("id").as_raw(), 101);
+    assert_eq!(allocator.next(None).expect("id").as_raw(), 101);
 }
 
 #[test]
@@ -1941,7 +1941,7 @@ fn upsert_updates_when_found() {
 
     // Verify no new node was created: the next id is the first above the
     // starting point.
-    assert_eq!(allocator.next().expect("id").as_raw(), 101);
+    assert_eq!(allocator.next(None).expect("id").as_raw(), 101);
 
     // Verify age was updated
     let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");

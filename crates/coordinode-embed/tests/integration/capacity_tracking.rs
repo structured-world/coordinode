@@ -71,6 +71,18 @@ fn capped(id: &str, dir: &std::path::Path, limit: u64) -> EndpointConfig {
         .with_hard_limit_bytes(limit)
 }
 
+/// A store on one capped endpoint whose compactions never run in the
+/// background. A test of how a full store refuses a client write fills it
+/// first; a compaction running meanwhile holds its output's room only while
+/// it writes and gives its inputs back when it ends, so the room the refusal
+/// is judged by would move under the test. Compaction under a full endpoint
+/// is covered by the tests that start it themselves.
+fn quiet_capped(id: &str, dir: &std::path::Path, limit: u64) -> StorageConfig {
+    let mut config = StorageConfig::with_endpoints(vec![capped(id, dir, limit)]);
+    config.compaction_workers = 0;
+    config
+}
+
 /// Put incompressible rows into `part`, numbered from `from`, until the
 /// footprint refuses one; returns how many were accepted. Any other error
 /// fails the test.
@@ -92,9 +104,10 @@ fn fill(engine: &StorageEngine, part: Partition, prefix: &str) -> u32 {
 }
 
 /// Fill `part` until even the room the store frees by itself (a refusal
-/// flushes the memtables and removes the journal they cover; a flush can
-/// start a compaction) takes no more rows: the next write of the same size
-/// is refused. Returns how many rows were accepted in all.
+/// flushes the memtables and removes the journal they cover) takes no more
+/// rows: the next write of the same size is refused. Returns how many rows
+/// were accepted in all. Run on a [`quiet_capped`] store, so no compaction
+/// gives room back after the last refusal.
 fn saturate(engine: &StorageEngine, part: Partition, prefix: &str) -> u32 {
     let mut total = 0;
     loop {
@@ -107,6 +120,59 @@ fn saturate(engine: &StorageEngine, part: Partition, prefix: &str) -> u32 {
             .persist()
             .expect("a filled store flushes into its reserve");
     }
+}
+
+/// Repeat `write` on fresh keys until the store refuses it, after the
+/// reclamation a refusal runs. A fill refused for a 64-byte put says nothing
+/// of a smaller write: this tops the store off with writes of the very shape
+/// the test then drives, which meets the same room and asks the same bytes.
+/// The store must be held to its limit itself, not to a pending ceiling,
+/// with nothing admitted in flight.
+fn top_off(
+    engine: &StorageEngine,
+    endpoint: &str,
+    mut write: impl FnMut(u32) -> Result<(), StorageError>,
+) {
+    let refused = (0..10_000).any(|i| match write(i) {
+        Ok(()) => false,
+        Err(StorageError::CapacityExhausted { .. }) => true,
+        Err(other) => panic!("unexpected refusal: {other:?}"),
+    });
+    assert!(refused, "the store never refused the write");
+    let footprint = engine.footprints().get(endpoint).expect("the endpoint");
+    assert_eq!(footprint.pending_limit(), None, "held to the limit itself");
+    assert_eq!(footprint.enforced_limit(), footprint.limit());
+    assert_eq!(footprint.admitted(), 0, "nothing admitted in flight");
+}
+
+/// Drive `write`, which the test expects refused, and check the endpoint is
+/// charged no more after it. That alone does not prove nothing landed (a
+/// write into room already allocated charges nothing more): each test checks
+/// the effects of its own write, then [`store_write_lands`].
+fn refused_before_write<T, E>(
+    engine: &StorageEngine,
+    endpoint: &str,
+    write: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let footprint = engine.footprints().get(endpoint).expect("the endpoint");
+    let before = footprint.charged();
+    let result = write();
+    assert!(
+        footprint.charged() <= before,
+        "the refused write grew the endpoint from {before} to {}",
+        footprint.charged()
+    );
+    result
+}
+
+/// After a client write was refused and its effects checked: a write of the
+/// store's own (a Schema record, which takes the recovery reserve) still
+/// lands on the same store, so the refusal was the client admission's, not
+/// the file system's.
+fn store_write_lands(engine: &StorageEngine) {
+    engine
+        .put(Partition::Schema, b"schema:control", b"{}")
+        .expect("the store's own write lands where the client write was refused");
 }
 
 /// What the file system allocated to the files under `root`, each file once
@@ -180,7 +246,7 @@ fn refresh_picks_up_on_disk_sst_bytes() {
 #[test]
 fn full_endpoint_rejects_subsequent_writes() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
+    let config = quiet_capped("small", dir.path(), ROOMY);
     let engine = StorageEngine::open(&config).expect("open");
 
     let accepted = saturate(&engine, Partition::Node, "node:0:");
@@ -211,7 +277,7 @@ fn full_endpoint_rejects_subsequent_writes() {
 #[test]
 fn schema_writes_use_the_recovery_reserve_client_writes_leave() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
+    let config = quiet_capped("small", dir.path(), ROOMY);
     let engine = StorageEngine::open(&config).expect("open");
 
     saturate(&engine, Partition::Node, "node:0:");
@@ -533,6 +599,11 @@ fn cascade_events_counter_increments_on_auto_cascade() {
             Tier::Cold,
         ),
     ]);
+    // No background compaction gives the hot endpoint room back between the
+    // refusal and the refresh that must see it Full (see `quiet_capped`);
+    // the cascade compacts by itself.
+    let mut config = config;
+    config.compaction_workers = 0;
     let engine = StorageEngine::open(&config).expect("open");
 
     let recorder = DebuggingRecorder::new();
@@ -909,7 +980,7 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), ROOMY)]);
+    let config = quiet_capped("ep", dir.path(), ROOMY);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Step 1: write until refused (UP-crossing increments counter).
@@ -974,15 +1045,31 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
 #[test]
 fn delete_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
+    let config = quiet_capped("small", dir.path(), ROOMY);
     let engine = StorageEngine::open(&config).expect("open");
     saturate(&engine, Partition::Node, "node:0:");
+    // Deletes of keys as long as the one below, none of them a filled row.
+    top_off(&engine, "small", |i| {
+        engine.delete(Partition::Node, format!("node:0:9{i:09}").as_bytes())
+    });
 
-    let result = engine.delete(Partition::Node, b"node:0:any-key");
+    // A filled row: a delete that landed would hide it.
+    let result = refused_before_write(&engine, "small", || {
+        engine.delete(Partition::Node, b"node:0:0000000042")
+    });
     assert!(
         matches!(result, Err(StorageError::CapacityExhausted { .. })),
         "delete on a full endpoint must reject with CapacityExhausted, got: {result:?}",
     );
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:0000000042")
+            .expect("get")
+            .as_deref(),
+        Some(&incompressible(42)[..]),
+        "the refused delete left the row"
+    );
+    store_write_lands(&engine);
 }
 
 /// `engine.merge` on a full endpoint MUST reject with `CapacityExhausted`.
@@ -991,17 +1078,35 @@ fn delete_on_full_endpoint_rejects() {
 #[test]
 fn merge_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
+    let config = quiet_capped("small", dir.path(), ROOMY);
     let engine = StorageEngine::open(&config).expect("open");
     // Fill via the Adj partition (Adj is the canonical merge target —
     // posting-list deltas via `engine.merge`).
     saturate(&engine, Partition::Adj, "adj:T:out:");
+    // Operands of the size below on keys as long as its key.
+    top_off(&engine, "small", |i| {
+        engine.merge(
+            Partition::Adj,
+            format!("adj:T:o:{i:04}").as_bytes(),
+            &[0u8; 8],
+        )
+    });
 
-    let result = engine.merge(Partition::Adj, b"adj:T:out:42", &[0u8; 8]);
+    let result = refused_before_write(&engine, "small", || {
+        engine.merge(Partition::Adj, b"adj:T:out:42", &[0u8; 8])
+    });
     assert!(
         matches!(result, Err(StorageError::CapacityExhausted { .. })),
         "merge on a full endpoint must reject with CapacityExhausted, got: {result:?}",
     );
+    assert!(
+        engine
+            .get(Partition::Adj, b"adj:T:out:42")
+            .expect("get")
+            .is_none(),
+        "the refused operand did not land"
+    );
+    store_write_lands(&engine);
 }
 
 /// `WriteBatch::commit` on a full endpoint MUST reject, and nothing of the
@@ -1009,13 +1114,25 @@ fn merge_on_full_endpoint_rejects() {
 #[test]
 fn write_batch_commit_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
+    let config = quiet_capped("small", dir.path(), ROOMY);
     let engine = StorageEngine::open(&config).expect("open");
     saturate(&engine, Partition::Node, "node:0:");
+    // Batches of the shape below: one row, a key as long, a value as large.
+    top_off(&engine, "small", |i| {
+        let mut batch = WriteBatch::new(&engine);
+        batch.put(
+            Partition::Node,
+            format!("node:0:{i:07}").as_bytes(),
+            &incompressible(i)[..],
+        );
+        batch.commit()
+    });
 
-    let mut batch = WriteBatch::new(&engine);
-    batch.put(Partition::Node, b"node:0:batched", &incompressible(7)[..]);
-    let result = batch.commit();
+    let result = refused_before_write(&engine, "small", || {
+        let mut batch = WriteBatch::new(&engine);
+        batch.put(Partition::Node, b"node:0:batched", &incompressible(7)[..]);
+        batch.commit()
+    });
     assert!(
         matches!(result, Err(StorageError::CapacityExhausted { .. })),
         "WriteBatch::commit on a full endpoint must reject, got: {result:?}",
@@ -1026,6 +1143,7 @@ fn write_batch_commit_on_full_endpoint_rejects() {
             .unwrap()
             .is_none()
     );
+    store_write_lands(&engine);
 }
 
 /// A `WriteBatch` mixing the store's metadata with client data is a client
@@ -1035,14 +1153,27 @@ fn write_batch_commit_on_full_endpoint_rejects() {
 #[test]
 fn write_batch_commit_rejects_when_any_partition_endpoint_full() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![capped("small", dir.path(), ROOMY)]);
+    let config = quiet_capped("small", dir.path(), ROOMY);
     let engine = StorageEngine::open(&config).expect("open");
     saturate(&engine, Partition::Node, "node:0:");
+    // Mixed batches of the shape below, keys as long and values as large.
+    top_off(&engine, "small", |i| {
+        let mut batch = WriteBatch::new(&engine);
+        batch.put(
+            Partition::Schema,
+            format!("schema:label:{i:04}").as_bytes(),
+            b"{}",
+        );
+        batch.put(Partition::Node, format!("node:0:{i:05}").as_bytes(), b"v");
+        batch.commit()
+    });
 
-    let mut batch = WriteBatch::new(&engine);
-    batch.put(Partition::Schema, b"schema:label:Test", b"{}");
-    batch.put(Partition::Node, b"node:0:mixed", b"v");
-    let result = batch.commit();
+    let result = refused_before_write(&engine, "small", || {
+        let mut batch = WriteBatch::new(&engine);
+        batch.put(Partition::Schema, b"schema:label:Test", b"{}");
+        batch.put(Partition::Node, b"node:0:mixed", b"v");
+        batch.commit()
+    });
     assert!(
         matches!(result, Err(StorageError::CapacityExhausted { .. })),
         "a mixed batch on a full endpoint must reject, got: {result:?}",
@@ -1054,6 +1185,14 @@ fn write_batch_commit_rejects_when_any_partition_endpoint_full() {
             .is_none(),
         "no part of a refused batch lands"
     );
+    assert!(
+        engine
+            .get(Partition::Node, b"node:0:mixed")
+            .unwrap()
+            .is_none(),
+        "no part of a refused batch lands"
+    );
+    store_write_lands(&engine);
 }
 
 /// Read paths MUST remain functional on a full endpoint:
@@ -1090,7 +1229,7 @@ fn a_node_id_lease_refused_by_the_limit_is_capacity_exhausted() {
 
     let dir = TempDir::new().expect("tempdir");
     let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let storage_config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), ROOMY)]);
+    let storage_config = quiet_capped("ep", dir.path(), ROOMY);
     let engine = std::sync::Arc::new(
         StorageEngine::open_with_oracle(&storage_config, std::sync::Arc::clone(&oracle))
             .expect("open engine"),
@@ -1101,9 +1240,12 @@ fn a_node_id_lease_refused_by_the_limit_is_capacity_exhausted() {
         std::sync::Arc::new(
             coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
         );
-    let mut db =
+    let db =
         Database::from_engine(dir.path(), engine, oracle, pipeline).expect("a full store opens");
-    match db.execute_cypher("CREATE (:First)") {
+    let created = refused_before_write(db.engine(), "ep", || {
+        db.execute_cypher_shared("CREATE (:First)", None, None, None, None)
+    });
+    match created {
         Err(DatabaseError::CapacityExhausted {
             endpoint_id,
             hard_limit_bytes,
@@ -1114,6 +1256,21 @@ fn a_node_id_lease_refused_by_the_limit_is_capacity_exhausted() {
         }
         other => panic!("expected CapacityExhausted, got {other:?}"),
     }
+    // The refusal was the lease's: no range was granted, so no node exists.
+    assert_eq!(
+        coordinode_storage::engine::metadata::node_lease_ceiling(db.engine())
+            .expect("read the lease records"),
+        0,
+        "no lease was granted"
+    );
+    assert!(
+        db.execute_cypher_shared("MATCH (n:First) RETURN n", None, None, None, None)
+            .expect("reads work on a full store")
+            .rows
+            .is_empty(),
+        "the refused statement created no node"
+    );
+    store_write_lands(db.engine());
 }
 
 /// Triggers fire bodies through the same write path as the originating
@@ -1127,7 +1284,7 @@ fn trigger_fail_fast_on_capacity_exhausted() {
 
     let dir = TempDir::new().expect("tempdir");
     let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let storage_config = StorageConfig::with_endpoints(vec![capped("ep", dir.path(), ROOMY)]);
+    let storage_config = quiet_capped("ep", dir.path(), ROOMY);
     let engine = std::sync::Arc::new(
         coordinode_storage::engine::core::StorageEngine::open_with_oracle(
             &storage_config,
@@ -1155,14 +1312,16 @@ fn trigger_fail_fast_on_capacity_exhausted() {
     saturate(&engine, Partition::Node, "node:0:");
 
     let started = Instant::now();
-    let result = db.execute_cypher("CREATE (u:User {name: 'alice'})");
+    let result = refused_before_write(&engine, "ep", || {
+        db.execute_cypher_shared("CREATE (u:User {name: 'alice'})", None, None, None, None)
+    });
     let elapsed = started.elapsed();
 
     let err = match result {
         Err(e) => e,
-        Ok(rows) => panic!(
+        Ok(result) => panic!(
             "expected CapacityExhausted, got Ok with {} rows",
-            rows.len(),
+            result.rows.len(),
         ),
     };
     let msg = format!("{err}");
@@ -1176,6 +1335,12 @@ fn trigger_fail_fast_on_capacity_exhausted() {
             .is_empty(),
         "the trigger's effect is refused with the statement"
     );
+    assert!(
+        db.execute_cypher("MATCH (u:User) RETURN u")
+            .unwrap()
+            .is_empty(),
+        "the refused statement created no node"
+    );
 
     // Wall-time guard: a retry loop with exponential backoff takes
     // seconds; a refusal plus one reclamation takes milliseconds. The
@@ -1186,6 +1351,7 @@ fn trigger_fail_fast_on_capacity_exhausted() {
         "trigger fail-fast must complete in < 5 s (got {elapsed:?}): \
          a longer wall time suggests a hidden retry loop",
     );
+    store_write_lands(&engine);
 }
 
 /// Compaction-driven recovery: fill with rewrites of the same keys until

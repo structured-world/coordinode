@@ -51,6 +51,7 @@ fn an_auto_commit_statement_outwaits_a_slow_commit_in_flight() {
                     Vec::new(),
                     vec![(Partition::Node, node)],
                     coordinode_storage::engine::pending::Material::Changes,
+                    None,
                 )
                 .expect("admit the holder");
             held.send(()).expect("signal");
@@ -66,6 +67,255 @@ fn an_auto_commit_statement_outwaits_a_slow_commit_in_flight() {
         .execute_cypher("MATCH (u:U) RETURN u.n AS n")
         .expect("read");
     assert_eq!(rows[0].get("n"), Some(&Value::Int(2)));
+}
+
+/// A write statement held behind a consumer's ending being decided lasts no
+/// longer than the statement: its deadline ends it with the deadline's
+/// outcome, its cancel with the cancel's, both well before the material
+/// wait's own bound, and neither writes anything. The decision keeps its
+/// scope meanwhile, and the same statement lands once it is released.
+#[test]
+fn a_write_held_behind_a_decision_ends_at_its_deadline_or_cancel() {
+    use coordinode_core::budget::{BudgetStop, CancelFlag};
+    use coordinode_core::graph::types::Value;
+    use coordinode_storage::engine::pending::MATERIAL_WAIT;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    // The label, its field and a NodeId lease are in place before the
+    // decision: the statements below need only their own commit.
+    db.execute_cypher_shared("CREATE (:Held {k: 0})", None, None, None, None)
+        .expect("warm the label, field and lease");
+    let pending = Arc::clone(db.engine().pending_commits());
+    let held = pending
+        .claim_material(Duration::from_secs(5))
+        .expect("nothing shares the material");
+    let bounded = |deadline, cancel| StatementOptions {
+        deadline,
+        cancel,
+        ..StatementOptions::default()
+    };
+    let count = || {
+        db.execute_cypher_shared(
+            "MATCH (n:Held) RETURN count(n) AS c",
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("count")
+        .rows[0]
+            .get("c")
+            .cloned()
+    };
+
+    let started = Instant::now();
+    let timed = db.execute_cypher_shared_with(
+        "CREATE (:Held {k: 1})",
+        None,
+        None,
+        &bounded(Some(Instant::now() + Duration::from_millis(300)), None),
+    );
+    assert!(
+        matches!(timed, Err(DatabaseError::Budget(BudgetStop::Deadline))),
+        "the deadline ends the held write, got {timed:?}"
+    );
+    assert!(
+        started.elapsed() < MATERIAL_WAIT,
+        "waited {:?}",
+        started.elapsed()
+    );
+
+    let cancel = CancelFlag::new();
+    let started = Instant::now();
+    let cancelled = std::thread::scope(|inner| {
+        let thrower = cancel.clone();
+        inner.spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            thrower.cancel();
+        });
+        db.execute_cypher_shared_with(
+            "CREATE (:Held {k: 2})",
+            None,
+            None,
+            &bounded(None, Some(cancel.clone())),
+        )
+    });
+    assert!(
+        matches!(cancelled, Err(DatabaseError::Budget(BudgetStop::Cancelled))),
+        "the cancel ends the held write, got {cancelled:?}"
+    );
+    assert!(
+        started.elapsed() < MATERIAL_WAIT,
+        "waited {:?}",
+        started.elapsed()
+    );
+
+    drop(held);
+    assert_eq!(count(), Some(Value::Int(1)), "neither statement wrote");
+    db.execute_cypher_shared("CREATE (:Held {k: 3})", None, None, None, None)
+        .expect("lands once the decision is released");
+    assert_eq!(count(), Some(Value::Int(2)));
+}
+
+/// The work a write statement does for itself before its commit ends with
+/// the statement too: binding a label and registering a field it uses for
+/// the first time, and taking the NodeId lease its first node needs. Held
+/// behind a consumer's ending being decided, each ends with the statement's
+/// deadline or cancel, well before the material wait's own bound; no row is
+/// written, the decision keeps its scope, and the same statements land once
+/// it is released.
+#[test]
+fn a_statements_own_registrations_and_lease_end_with_it() {
+    use coordinode_core::budget::{BudgetStop, CancelFlag};
+    use coordinode_core::graph::intern::FieldRegistrar as _;
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::schema::label_id::LabelRegistrar as _;
+    use coordinode_storage::engine::pending::MATERIAL_WAIT;
+
+    let bounded = |deadline, cancel| StatementOptions {
+        deadline,
+        cancel,
+        ..StatementOptions::default()
+    };
+    let count = |db: &Database, label: &str| {
+        db.execute_cypher_shared(
+            &format!("MATCH (n:{label}) RETURN count(n) AS c"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("count")
+        .rows[0]
+            .get("c")
+            .cloned()
+    };
+    let held_until = |db: &Database, query: &str, options: &StatementOptions, want: BudgetStop| {
+        let started = Instant::now();
+        let refused = db.execute_cypher_shared_with(query, None, None, options);
+        assert!(
+            matches!(&refused, Err(DatabaseError::Budget(stop)) if *stop == want),
+            "{query}: wanted {want:?}, got {refused:?}"
+        );
+        assert!(
+            started.elapsed() < MATERIAL_WAIT,
+            "{query} waited {:?}",
+            started.elapsed()
+        );
+    };
+
+    // A label and a field never seen before.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    db.execute_cypher_shared("CREATE (:Warm {k: 0})", None, None, None, None)
+        .expect("a lease in hand");
+    let held = db
+        .engine()
+        .pending_commits()
+        .claim_material(Duration::from_secs(5))
+        .expect("nothing shares the material");
+    held_until(
+        &db,
+        "CREATE (:ColdA {fresh_a: 1})",
+        &bounded(Some(Instant::now() + Duration::from_millis(300)), None),
+        BudgetStop::Deadline,
+    );
+    let cancel = CancelFlag::new();
+    std::thread::scope(|inner| {
+        let thrower = cancel.clone();
+        inner.spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            thrower.cancel();
+        });
+        held_until(
+            &db,
+            "CREATE (:ColdB {fresh_b: 1})",
+            &bounded(None, Some(cancel.clone())),
+            BudgetStop::Cancelled,
+        );
+    });
+    // A label in place and a field never seen before: only the field's
+    // registration waits.
+    held_until(
+        &db,
+        "CREATE (:Warm {fresh_c: 1})",
+        &bounded(Some(Instant::now() + Duration::from_millis(300)), None),
+        BudgetStop::Deadline,
+    );
+    let cancel = CancelFlag::new();
+    std::thread::scope(|inner| {
+        let thrower = cancel.clone();
+        inner.spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            thrower.cancel();
+        });
+        held_until(
+            &db,
+            "CREATE (:Warm {fresh_d: 1})",
+            &bounded(None, Some(cancel.clone())),
+            BudgetStop::Cancelled,
+        );
+    });
+    assert!(
+        db.engine()
+            .pending_commits()
+            .claim_material(Duration::from_millis(10))
+            .is_err(),
+        "the decision keeps its scope"
+    );
+    drop(held);
+    assert_eq!(
+        count(&db, "Warm"),
+        Some(Value::Int(1)),
+        "only the warm-up row"
+    );
+    assert_eq!(count(&db, "ColdA"), Some(Value::Int(0)));
+    assert_eq!(count(&db, "ColdB"), Some(Value::Int(0)));
+    db.execute_cypher_shared("CREATE (:ColdA {fresh_a: 1})", None, None, None, None)
+        .expect("lands once the decision is released");
+    assert_eq!(count(&db, "ColdA"), Some(Value::Int(1)));
+
+    // A store with no lease yet: its first node takes one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    db.fields
+        .bind_labels(&["Leased"], None)
+        .expect("bind the label");
+    db.fields
+        .register(&["k"], None)
+        .expect("register the field");
+    let held = db
+        .engine()
+        .pending_commits()
+        .claim_material(Duration::from_secs(5))
+        .expect("nothing shares the material");
+    held_until(
+        &db,
+        "CREATE (:Leased {k: 1})",
+        &bounded(Some(Instant::now() + Duration::from_millis(300)), None),
+        BudgetStop::Deadline,
+    );
+    // Cancelled too, still with no lease in hand.
+    let cancel = CancelFlag::new();
+    std::thread::scope(|inner| {
+        let thrower = cancel.clone();
+        inner.spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            thrower.cancel();
+        });
+        held_until(
+            &db,
+            "CREATE (:Leased {k: 2})",
+            &bounded(None, Some(cancel.clone())),
+            BudgetStop::Cancelled,
+        );
+    });
+    drop(held);
+    assert_eq!(count(&db, "Leased"), Some(Value::Int(0)));
+    db.execute_cypher_shared("CREATE (:Leased {k: 1})", None, None, None, None)
+        .expect("lands once the decision is released");
+    assert_eq!(count(&db, "Leased"), Some(Value::Int(1)));
 }
 
 /// A standalone causal wait lasts no longer than its statement: a read
@@ -91,6 +341,7 @@ fn a_standalone_causal_wait_ends_at_its_deadline_or_cancel() {
                     Vec::new(),
                     Vec::new(),
                     coordinode_storage::engine::pending::Material::Changes,
+                    None,
                 )
                 .expect("admit the commit in flight");
             held.send(ts).expect("signal");
@@ -181,6 +432,7 @@ fn a_standalone_start_waiting_for_its_bound_ends_with_its_cancel() {
                     Vec::new(),
                     Vec::new(),
                     coordinode_storage::engine::pending::Material::Changes,
+                    None,
                 )
                 .expect("admit the commit in flight");
             held.send(ts).expect("signal");
@@ -330,6 +582,7 @@ fn set_while_a_commit_holds_the_node(
                     Vec::new(),
                     vec![(Partition::Node, node)],
                     coordinode_storage::engine::pending::Material::Changes,
+                    None,
                 )
                 .expect("admit the holder");
             held.send(()).expect("signal");
@@ -814,7 +1067,7 @@ fn a_lease_granted_during_a_restore_sends_it_back_to_the_check() {
     let raise = |base: u64, target: u64, token| {
         if !competed.replace(true) {
             // Another allocator is granted (0, NODE_LEASE_SIZE] first.
-            other.reserve().map_err(|e| e.to_string())?;
+            other.reserve(None).map_err(|e| e.to_string())?;
         }
         restorer
             .raise_from(base, target, token)
@@ -2671,6 +2924,7 @@ fn an_ordinary_read_does_not_wait_for_a_commit_in_flight() {
             Vec::new(),
             Vec::new(),
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit an unrelated commit");
 
@@ -2788,6 +3042,7 @@ fn a_standalone_aligned_read_is_taken_below_a_commit_in_flight() {
             Vec::new(),
             Vec::new(),
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit an earlier commit");
     let high = db

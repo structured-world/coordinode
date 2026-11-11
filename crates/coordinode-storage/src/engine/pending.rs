@@ -35,9 +35,52 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
+use coordinode_core::budget::{BudgetStop, QueryBudget};
 use coordinode_core::txn::proposal::ProposalId;
 
 use crate::engine::partition::Partition;
+
+/// The longest a command's wait goes without looking at its own deadline and
+/// cancellation: the period of the check, not a bound under descheduling.
+const STOP_CHECK_SLICE: Duration = Duration::from_millis(50);
+
+/// When a wait bounded by `deadline` on behalf of `stop` wakes next: at the
+/// deadline, at the command's own deadline if sooner, and within a slice to
+/// look at a cancellation, which throws a flag rather than the condvar.
+fn wake_at(deadline: Instant, stop: Option<&QueryBudget>) -> Instant {
+    let Some(stop) = stop else {
+        return deadline;
+    };
+    let now = Instant::now();
+    let mut wake = deadline.min(now + STOP_CHECK_SLICE);
+    if let Some(left) = stop.time_left_nanos() {
+        wake = wake.min(now + Duration::from_nanos(left));
+    }
+    wake
+}
+
+/// What [`AFTER_WAKE`] runs.
+#[cfg(test)]
+type WakeHook = Box<dyn FnOnce(&mut Table)>;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Runs once on this thread right after a wait for the material scope
+    /// wakes, with the table held: what a release and a cancellation landing
+    /// together leave.
+    pub(super) static AFTER_WAKE: core::cell::RefCell<Option<WakeHook>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Run this thread's [`AFTER_WAKE`] hook, if one is set.
+#[cfg(test)]
+fn after_wake(table: &mut Table) {
+    AFTER_WAKE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(table);
+        }
+    });
+}
 
 /// One admitted commit's write scope, keyed by the timestamp it will land at.
 #[derive(Debug)]
@@ -223,6 +266,9 @@ pub enum Refusal {
     /// write that changes the material is retried once it is decided; a
     /// second decision, once the first is.
     MaterialClaimed,
+    /// The command waiting for the material scope reached its own deadline
+    /// or was cancelled first; nothing is held.
+    Stopped(BudgetStop),
 }
 
 /// How long a write that changes the material waits for a terminal decision
@@ -329,25 +375,39 @@ impl PendingCommits {
     }
 
     /// Wait on `table`'s lock until no terminal decision waits for or holds
-    /// the material scope; `false` when `deadline` passed first.
+    /// the material scope; `false` when `deadline` passed first. A command
+    /// waiting on its own behalf passes its budget as `stop`: its deadline
+    /// or cancellation ends the wait with that reason, and is checked once
+    /// more after every wake, so a command stopped as the scope opened is
+    /// not admitted.
     fn await_material_open(
         &self,
         table: &mut parking_lot::MutexGuard<'_, Table>,
-        deadline: Option<Instant>,
-    ) -> bool {
-        while table.material_claim != Claim::Open {
-            match deadline {
-                Some(deadline) => {
-                    if self.finished.wait_until(table, deadline).timed_out()
-                        && table.material_claim != Claim::Open
-                    {
-                        return false;
-                    }
-                }
-                None => self.finished.wait(table),
+        deadline: Instant,
+        stop: Option<&QueryBudget>,
+    ) -> Result<bool, BudgetStop> {
+        loop {
+            if let Some(stop) = stop {
+                stop.check()?;
+            }
+            if table.material_claim == Claim::Open {
+                return Ok(true);
+            }
+            let timed_out = self
+                .finished
+                .wait_until(table, wake_at(deadline, stop))
+                .timed_out();
+            #[cfg(test)]
+            after_wake(table);
+            // The command's own stop first: resumed past both its deadline
+            // and the wait's, it ends with its own reason.
+            if let Some(stop) = stop {
+                stop.check()?;
+            }
+            if timed_out && table.material_claim != Claim::Open && Instant::now() >= deadline {
+                return Ok(false);
             }
         }
-        true
     }
 
     /// Record registration `id`, at `ts`, as sharing the material scope when
@@ -422,17 +482,25 @@ impl PendingCommits {
     /// clock that has not reached it.
     ///
     /// A commit whose writes change the material waits, up to
-    /// [`MATERIAL_WAIT`], for a terminal decision on it to be ordered.
+    /// [`MATERIAL_WAIT`] and no longer than its command's own deadline or
+    /// cancellation (`stop`), for a terminal decision on it to be ordered.
     pub fn admit_allocated<'p>(
         &'p self,
         allocate: impl FnOnce() -> u64,
         scope: Vec<(Partition, Vec<u8>)>,
         guards: Vec<(Partition, Vec<u8>)>,
         material: Material,
+        stop: Option<&QueryBudget>,
     ) -> Result<(u64, Admission<'p>), Refusal> {
         let mut table = self.inner.lock();
+        // A command already stopped is not admitted, whatever it writes.
+        if let Some(stop) = stop {
+            stop.check().map_err(Refusal::Stopped)?;
+        }
         if material == Material::Changes
-            && !self.await_material_open(&mut table, Some(Instant::now() + MATERIAL_WAIT))
+            && !self
+                .await_material_open(&mut table, Instant::now() + MATERIAL_WAIT, stop)
+                .map_err(Refusal::Stopped)?
         {
             return Err(Refusal::MaterialClaimed);
         }
@@ -475,6 +543,7 @@ impl PendingCommits {
         guards: Vec<(Partition, Vec<u8>)>,
         wait: Duration,
         material: Material,
+        stop: Option<&QueryBudget>,
     ) -> Result<(u64, Admission<'p>), Refusal> {
         let deadline = Instant::now() + wait;
         let mut table = self.inner.lock();
@@ -492,14 +561,27 @@ impl PendingCommits {
         };
         // Both waits end together: the commits on its keys landed and no
         // terminal decision holds the material, checked again after each
-        // wake since either can start while the other is waited for.
+        // wake since either can start while the other is waited for. The
+        // command's own deadline and cancellation are checked on every pass,
+        // the last one included, under the lock the admission is taken in.
         loop {
+            if let Some(stop) = stop
+                && let Err(stopped) = stop.check()
+            {
+                unreserve(&mut table, reservation);
+                return Err(Refusal::Stopped(stopped));
+            }
             if material == Material::Changes && table.material_claim != Claim::Open {
-                if self.finished.wait_until(&mut table, deadline).timed_out()
-                    && table.material_claim != Claim::Open
-                {
-                    unreserve(&mut table, reservation);
-                    return Err(Refusal::MaterialClaimed);
+                match self.await_material_open(&mut table, deadline, stop) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        unreserve(&mut table, reservation);
+                        return Err(Refusal::MaterialClaimed);
+                    }
+                    Err(stopped) => {
+                        unreserve(&mut table, reservation);
+                        return Err(Refusal::Stopped(stopped));
+                    }
                 }
                 continue;
             }
@@ -520,7 +602,21 @@ impl PendingCommits {
                 );
                 reservation = Some(id);
             }
-            if self.finished.wait_until(&mut table, deadline).timed_out()
+            let timed_out = self
+                .finished
+                .wait_until(&mut table, wake_at(deadline, stop))
+                .timed_out();
+            #[cfg(test)]
+            after_wake(&mut table);
+            // The command's own stop first, as in the decision's wait.
+            if let Some(stop) = stop
+                && let Err(stopped) = stop.check()
+            {
+                unreserve(&mut table, reservation);
+                return Err(Refusal::Stopped(stopped));
+            }
+            if timed_out
+                && Instant::now() >= deadline
                 && let Some(refusal) = Self::overlap(&table, &candidate)
             {
                 unreserve(&mut table, reservation);
@@ -686,19 +782,25 @@ impl PendingCommits {
     }
 
     /// [`Self::obligate`] for an entry whose writes change the material: it
-    /// shares the material scope, and waits first, up to [`MATERIAL_WAIT`],
-    /// for a terminal decision holding it to be ordered.
+    /// shares the material scope, and waits first, up to [`MATERIAL_WAIT`]
+    /// and no longer than its command's own deadline or cancellation
+    /// (`stop`), for a terminal decision holding it to be ordered.
     ///
     /// # Errors
     ///
     /// [`Refusal::MaterialClaimed`] when a decision still holds the scope at
-    /// the deadline; nothing is held then.
+    /// the deadline, [`Refusal::Stopped`] when the command's own deadline or
+    /// cancellation came first; nothing is held then.
     pub fn obligate_changing(
         self: &Arc<Self>,
         allocate: impl FnOnce() -> u64,
+        stop: Option<&QueryBudget>,
     ) -> Result<(u64, Unlogged), Refusal> {
         let mut table = self.inner.lock();
-        if !self.await_material_open(&mut table, Some(Instant::now() + MATERIAL_WAIT)) {
+        if !self
+            .await_material_open(&mut table, Instant::now() + MATERIAL_WAIT, stop)
+            .map_err(Refusal::Stopped)?
+        {
             return Err(Refusal::MaterialClaimed);
         }
         Ok(self.obligate_in(&mut table, allocate, Material::Changes))
@@ -902,7 +1004,9 @@ impl PendingCommits {
     ) -> Result<(u64, DirectWrite<'_>), Refusal> {
         let mut table = self.inner.lock();
         if material == Material::Changes
-            && !self.await_material_open(&mut table, Some(Instant::now() + MATERIAL_WAIT))
+            && !self
+                .await_material_open(&mut table, Instant::now() + MATERIAL_WAIT, None)
+                .map_err(Refusal::Stopped)?
         {
             return Err(Refusal::MaterialClaimed);
         }

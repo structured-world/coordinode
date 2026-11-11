@@ -158,6 +158,7 @@ fn a_handover_waits_for_a_writer_admitted_under_the_old_epoch() {
             Vec::new(),
             vec![(Partition::Schema, key)],
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("the writer is admitted");
 

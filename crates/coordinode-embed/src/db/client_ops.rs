@@ -256,7 +256,7 @@ impl Database {
         let (commit_ts, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| self.oracle.next().as_raw())
+            .obligate_changing(|| self.oracle.next().as_raw(), None)
             .map_err(|_| coordinode_storage::error::StorageError::MaterialClaimed)?;
         let proposal = RaftProposal {
             id: self.proposal_id_gen.next(),

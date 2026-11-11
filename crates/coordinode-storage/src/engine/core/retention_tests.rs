@@ -1571,6 +1571,7 @@ fn commit_in_flight<'e>(
             vec![(Partition::Node, key.to_vec())],
             Vec::new(),
             crate::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit")
 }

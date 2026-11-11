@@ -14,7 +14,7 @@ fn held_write(
 ) -> (u64, coordinode_storage::engine::pending::Unlogged) {
     engine
         .pending_commits()
-        .obligate_changing(|| oracle.next().as_raw())
+        .obligate_changing(|| oracle.next().as_raw(), None)
         .expect("no ending holds the writes")
 }
 

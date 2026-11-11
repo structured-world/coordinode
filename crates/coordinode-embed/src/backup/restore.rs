@@ -1220,8 +1220,9 @@ fn apoc_id(v: Option<&serde_json::Value>, what: &str) -> Result<u64, RestoreErro
 /// The ids of `names`, registering the missing ones in one batch, durable
 /// before the record that uses them is written.
 fn field_ids(fields: &dyn FieldRegistrar, names: &[&str]) -> Result<Vec<u32>, RestoreError> {
+    // A restore's own registration, made for no statement.
     fields
-        .register(names)
+        .register(names, None)
         .map_err(|e| RestoreError::Storage(e.to_string()))
 }
 

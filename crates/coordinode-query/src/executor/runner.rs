@@ -480,6 +480,11 @@ impl From<coordinode_core::graph::node::IdLeaseError> for ExecutionError {
             coordinode_core::graph::node::IdLeaseError::Held => {
                 ExecutionError::Storage(coordinode_storage::error::StorageError::MaterialClaimed)
             }
+            // The statement's own deadline or cancel, met while the grant
+            // waited: the answer any other wait of it gives.
+            coordinode_core::graph::node::IdLeaseError::Stopped(stop) => {
+                ExecutionError::Budget(stop)
+            }
             // One refusal for a write past an endpoint's hard limit, whether
             // the commit or the identifier it needed met it first.
             coordinode_core::graph::node::IdLeaseError::CapacityExhausted {
@@ -509,6 +514,10 @@ impl From<coordinode_core::graph::intern::DictionaryError> for ExecutionError {
             // Held behind a consumer's ending: the store's typed refusal.
             coordinode_core::graph::intern::DictionaryError::Held => {
                 ExecutionError::Storage(coordinode_storage::error::StorageError::MaterialClaimed)
+            }
+            // As a lease's: the statement stopped while the registration waited.
+            coordinode_core::graph::intern::DictionaryError::Stopped(stop) => {
+                ExecutionError::Budget(stop)
             }
             // The typed refusal a commit past the limit gives.
             coordinode_core::graph::intern::DictionaryError::CapacityExhausted {
@@ -1581,7 +1590,8 @@ impl<'a> ExecutionContext<'a> {
         let Some(registrar) = self.field_registrar else {
             return Ok(names.iter().map(|n| self.interner.intern(n)).collect());
         };
-        let ids = registrar.register(names)?;
+        // The statement's own work: its deadline and cancel bound the wait.
+        let ids = registrar.register(names, Some(&self.budget))?;
         // Callers index the result by position.
         if ids.len() != names.len() {
             return Err(DictionaryError::Registration(format!(
@@ -2015,7 +2025,7 @@ impl<'a> ExecutionContext<'a> {
         }
         let id = match self.label_registrar {
             Some(registrar) => registrar
-                .bind_labels(&[name])
+                .bind_labels(&[name], Some(&self.budget))
                 .map_err(ExecutionError::from)?
                 .first()
                 .copied()
@@ -3804,8 +3814,16 @@ impl<'a> ExecutionContext<'a> {
                 let (ts, held) = self
                     .engine
                     .pending_commits()
-                    .obligate_changing(|| oracle.next().as_raw())
-                    .map_err(|_| coordinode_storage::error::StorageError::MaterialClaimed)?;
+                    .obligate_changing(|| oracle.next().as_raw(), Some(&self.budget))
+                    .map_err(|refusal| match refusal {
+                        // The statement's own deadline or cancellation.
+                        coordinode_storage::engine::pending::Refusal::Stopped(stop) => {
+                            ExecutionError::Budget(stop)
+                        }
+                        _ => ExecutionError::Storage(
+                            coordinode_storage::error::StorageError::MaterialClaimed,
+                        ),
+                    })?;
                 (Timestamp::from_raw(ts), Some(held))
             }
             None => (self.mvcc_read_ts, None),
@@ -15679,7 +15697,8 @@ fn execute_create_node(
     }
 
     for input_row in input_rows {
-        let node_id = ctx.id_allocator.next()?;
+        // A lease this draw takes is the statement's own work.
+        let node_id = ctx.id_allocator.next(Some(&ctx.budget))?;
         let mut row_key = Vec::with_capacity(key_columns.len());
         for column in &key_columns {
             let Some((_, expr)) = properties.iter().find(|(n, _)| n == column) else {

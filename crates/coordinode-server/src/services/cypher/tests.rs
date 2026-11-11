@@ -438,6 +438,7 @@ async fn a_guard_condition_is_refused_beside_a_write_of_the_guard_in_flight() {
             )],
             Vec::new(),
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit the other commit");
 
@@ -2028,7 +2029,7 @@ async fn no_read_is_answered_from_a_hole_below_an_applied_commit() {
         let oracle = engine.oracle().expect("an oracle");
         engine
             .pending_commits()
-            .obligate_changing(|| oracle.next().as_raw())
+            .obligate_changing(|| oracle.next().as_raw(), None)
             .expect("no ending holds the writes")
     };
     let written = svc
@@ -3851,6 +3852,7 @@ fn a_standalone_read_waiting_for_its_bound_holds_no_thread() {
             Vec::new(),
             Vec::new(),
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit the commit in flight");
 

@@ -41,6 +41,7 @@ fn a_scan_reuses_bound_schema_while_an_unrelated_commit_is_pending() {
             vec![(Partition::Node, b"unrelated-held-commit".to_vec())],
             Vec::new(),
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("hold");
     std::thread::scope(|scope| {

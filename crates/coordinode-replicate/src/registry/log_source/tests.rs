@@ -359,6 +359,7 @@ fn a_state_reader_owes_the_commits_from_its_checkpoint() {
             Vec::new(),
             Vec::new(),
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit");
     // The first write lands long after the checkpoint.

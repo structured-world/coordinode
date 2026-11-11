@@ -69,7 +69,10 @@ pub(crate) struct RepairBuild<'a> {
 struct NoNewNodes;
 
 impl IdLeaseReserver for NoNewNodes {
-    fn reserve(&self) -> Result<IdLease, IdLeaseError> {
+    fn reserve(
+        &self,
+        _stop: Option<&coordinode_core::budget::QueryBudget>,
+    ) -> Result<IdLease, IdLeaseError> {
         Err(IdLeaseError::NotGranted(
             "a duplicate repair creates no node".into(),
         ))

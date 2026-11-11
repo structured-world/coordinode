@@ -56,9 +56,9 @@ fn concurrent_first_uses_of_a_name_make_one_proposal() {
             scope.spawn(|| {
                 start.wait();
                 dictionary
-                    .register(&["fresh_a", "fresh_b"])
+                    .register(&["fresh_a", "fresh_b"], None)
                     .expect("register");
-                dictionary.bind_labels(&["Fresh"]).expect("bind");
+                dictionary.bind_labels(&["Fresh"], None).expect("bind");
             });
         }
     });
@@ -67,6 +67,67 @@ fn concurrent_first_uses_of_a_name_make_one_proposal() {
         proposed, 2,
         "one registration and one binding between {writers} writers"
     );
+}
+
+/// A budget of a statement ending `millis` from now.
+pub(crate) fn ending_in(millis: u64) -> QueryBudget {
+    fn now() -> u64 {
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+        u64::try_from(epoch.elapsed().as_nanos()).expect("nanoseconds fit")
+    }
+    QueryBudget::new(1 << 20).with_deadline(now() + millis * 1_000_000, now)
+}
+
+/// A statement's registration or binding waiting behind another one that
+/// holds the dictionary's lock ends with the statement: its deadline, or its
+/// cancel, refuses it with that reason while the lock is still held, and
+/// nothing is published for it. Before, the wait was the holder's.
+#[test]
+fn a_registration_behind_a_held_lock_ends_with_its_statement() {
+    use coordinode_core::budget::CancelFlag;
+    use coordinode_core::schema::label_id::LabelRegistrar as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = crate::Database::open(dir.path()).expect("open");
+    let dictionary = &db.fields;
+    let started = std::time::Instant::now();
+    {
+        let _held = dictionary.registering.lock();
+        assert_eq!(
+            dictionary.register(&["behind_a"], Some(&ending_in(200))),
+            Err(DictionaryError::Stopped(BudgetStop::Deadline))
+        );
+    }
+    {
+        let _held = dictionary.binding.lock();
+        let cancel = CancelFlag::new();
+        let budget = QueryBudget::new(1 << 20).with_cancel(cancel.clone());
+        let refused = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                cancel.cancel();
+            });
+            dictionary.bind_labels(&["Behind"], Some(&budget))
+        });
+        assert_eq!(
+            refused,
+            Err(DictionaryError::Stopped(BudgetStop::Cancelled))
+        );
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let view = dictionary.view().expect("view");
+    assert_eq!(view.lookup("behind_a"), None, "nothing was registered");
+    // Free again, the same names go through.
+    dictionary
+        .register(&["behind_a"], Some(&ending_in(5_000)))
+        .expect("register once the lock is free");
+    dictionary
+        .bind_labels(&["Behind"], Some(&ending_in(5_000)))
+        .expect("bind once the lock is free");
 }
 
 /// The refusal reaches the statement as the not-leader refusal every write

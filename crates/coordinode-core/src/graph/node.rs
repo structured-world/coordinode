@@ -245,6 +245,10 @@ pub enum IdLeaseError {
     /// its wait: nothing was granted; retry.
     #[error("no NodeId lease was granted: held by a consumer's ending being ordered; retry")]
     Held,
+    /// The statement the lease was taken for reached its deadline or was
+    /// cancelled while the grant waited; no lease was installed for it.
+    #[error("no NodeId lease was granted: {0}")]
+    Stopped(crate::budget::BudgetStop),
     /// The reserver answered with a range the allocator cannot use.
     #[error("the NodeId lease ({base}, {ceiling}] is not a valid range")]
     InvalidLease {
@@ -266,12 +270,15 @@ pub enum IdLeaseError {
     note = "the embedded database grants leases through its proposal pipeline"
 )]
 pub trait IdLeaseReserver: Send + Sync {
-    /// Take a new lease.
+    /// Take a new lease, on behalf of the statement whose budget is `stop`
+    /// when one asks for it: its deadline or cancellation ends any wait for
+    /// the grant.
     ///
     /// # Errors
     ///
-    /// The log refused or could not complete the grant.
-    fn reserve(&self) -> Result<IdLease, IdLeaseError>;
+    /// The log refused or could not complete the grant, or
+    /// [`IdLeaseError::Stopped`].
+    fn reserve(&self, stop: Option<&crate::budget::QueryBudget>) -> Result<IdLease, IdLeaseError>;
 }
 
 /// Bits of the counter and ceiling words that carry the lease epoch, above
@@ -353,13 +360,15 @@ impl NodeIdAllocator {
     }
 
     /// Allocate the next node ID for this shard, taking a new lease when the
-    /// current one is used up.
+    /// current one is used up, on behalf of the statement whose budget is
+    /// `stop` when one draws it.
     ///
     /// # Errors
     ///
     /// The sequence space is exhausted, or a lease was needed and not
-    /// granted.
-    pub fn next(&self) -> Result<NodeId, IdLeaseError> {
+    /// granted (with [`IdLeaseError::Stopped`] when the statement stopped
+    /// while the grant waited).
+    pub fn next(&self, stop: Option<&crate::budget::QueryBudget>) -> Result<NodeId, IdLeaseError> {
         loop {
             let drawn = self.counter.fetch_add(1, Ordering::AcqRel) + 1;
             let ceiling = self.ceiling.load(Ordering::Acquire);
@@ -372,11 +381,11 @@ impl NodeIdAllocator {
                         drawn & NODE_ID_MAX_SEQUENCE,
                     ));
                 }
-                self.renew(ceiling)?;
+                self.renew(ceiling, stop)?;
             } else if drawn_epoch == (lease_epoch + 1) & LEASE_EPOCH_MASK {
                 // The draw carried past the top of the sequence space into
                 // the odd epoch no lease ever uses.
-                self.renew(ceiling)?;
+                self.renew(ceiling, stop)?;
             }
             // Otherwise the lease changed after the draw: draw again.
         }
@@ -385,13 +394,17 @@ impl NodeIdAllocator {
     /// Replace the lease whose ceiling word is `exhausted`. Several threads
     /// may exhaust it at once; the first to install a new lease wins and the
     /// leases the others took are left unused.
-    fn renew(&self, exhausted: u64) -> Result<(), IdLeaseError> {
+    fn renew(
+        &self,
+        exhausted: u64,
+        stop: Option<&crate::budget::QueryBudget>,
+    ) -> Result<(), IdLeaseError> {
         let Some(reserver) = &self.reserver else {
             return Err(IdLeaseError::Exhausted {
                 shard_hint: self.shard_hint,
             });
         };
-        let lease = reserver.reserve()?;
+        let lease = reserver.reserve(stop)?;
         if lease.base >= lease.ceiling || lease.ceiling > NODE_ID_MAX_SEQUENCE {
             return Err(IdLeaseError::InvalidLease {
                 base: lease.base,

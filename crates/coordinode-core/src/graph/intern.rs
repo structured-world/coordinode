@@ -152,6 +152,11 @@ pub enum DictionaryError {
     /// write past its wait: nothing was published; retry.
     #[error("field registration held by a consumer's ending being ordered; retry")]
     Held,
+    /// The statement the registration was made for reached its deadline or
+    /// was cancelled while the registration waited; nothing more was
+    /// published.
+    #[error("field registration stopped: {0}")]
+    Stopped(crate::budget::BudgetStop),
 }
 
 /// Check that a registration may carry `names` at all.
@@ -550,14 +555,20 @@ impl Default for FieldInterner {
     note = "an embedded `Database` provides one through `Database::field_registrar`"
 )]
 pub trait FieldRegistrar: Send + Sync {
-    /// The ids of `names`, in order, registering the ones that have none.
-    /// Every returned binding is durable when this returns.
+    /// The ids of `names`, in order, registering the ones that have none, on
+    /// behalf of the statement whose budget is `stop` when one asks: its
+    /// deadline or cancellation ends any wait for the registration. Every
+    /// returned binding is durable when this returns.
     ///
     /// # Errors
     ///
-    /// The batch is invalid, the id space is exhausted, or the registration
-    /// could not be published.
-    fn register(&self, names: &[&str]) -> Result<Vec<u32>, DictionaryError>;
+    /// The batch is invalid, the id space is exhausted, the registration
+    /// could not be published, or [`DictionaryError::Stopped`].
+    fn register(
+        &self,
+        names: &[&str],
+        stop: Option<&crate::budget::QueryBudget>,
+    ) -> Result<Vec<u32>, DictionaryError>;
 
     /// Publish exactly `bindings`, ids included, for data already encoded
     /// with them (a restore). Bindings the dictionary already holds are

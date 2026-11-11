@@ -2219,6 +2219,8 @@ impl<'a> Transaction<'a> {
         // decision on that measure waits for it, and it waits behind one.
         let material = self.changes_material(!counts.is_empty());
         let pending = self.engine.pending_commits();
+        // A statement's commit waits no longer than the statement may.
+        let stop = self.write_budget.as_deref();
         let admitted = match self.overlap_wait {
             Some(wait) => pending.admit_allocated_waiting(
                 || oracle.next().as_raw(),
@@ -2226,10 +2228,15 @@ impl<'a> Transaction<'a> {
                 guards,
                 wait,
                 material,
+                stop,
             ),
-            None => {
-                pending.admit_allocated(|| oracle.next().as_raw(), scope.clone(), guards, material)
-            }
+            None => pending.admit_allocated(
+                || oracle.next().as_raw(),
+                scope.clone(),
+                guards,
+                material,
+                stop,
+            ),
         };
         let (commit_ts_raw, admission) = admitted.map_err(|refusal| match refusal {
             crate::engine::pending::Refusal::Overlap {
@@ -2257,6 +2264,9 @@ impl<'a> Transaction<'a> {
             // A terminal decision on the material held its scope past the
             // wait: retried once it is ordered.
             crate::engine::pending::Refusal::MaterialClaimed => CommitError::Backpressure,
+            // The statement's own deadline or cancellation, met while it
+            // waited: what any other wait of it would answer.
+            crate::engine::pending::Refusal::Stopped(stop) => CommitError::Budget(stop),
             crate::engine::pending::Refusal::AtCapacity { limit } => {
                 tracing::warn!(
                     limit,
@@ -2586,8 +2596,11 @@ impl<'a> Transaction<'a> {
         let (ts, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| oracle.next().as_raw())
-            .map_err(|_| CommitError::Backpressure)?;
+            .obligate_changing(|| oracle.next().as_raw(), self.write_budget.as_deref())
+            .map_err(|refusal| match refusal {
+                crate::engine::pending::Refusal::Stopped(stop) => CommitError::Budget(stop),
+                _ => CommitError::Backpressure,
+            })?;
         if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
             let proposal = RaftProposal {
                 id: id_gen.next(),

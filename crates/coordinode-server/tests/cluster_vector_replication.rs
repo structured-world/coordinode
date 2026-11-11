@@ -902,6 +902,7 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
             vec![(Partition::Node, held_key.clone())],
             vec![],
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit the held commit");
 

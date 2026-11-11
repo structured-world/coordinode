@@ -396,6 +396,7 @@ fn a_commit_in_flight_bounds_the_round() {
             Vec::new(),
             Vec::new(),
             crate::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit");
     committed.commit(

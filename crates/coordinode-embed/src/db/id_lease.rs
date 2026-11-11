@@ -14,9 +14,13 @@ use std::thread::JoinHandle;
 // no-std: spin::Mutex; the condvar has no no-std counterpart, the worker is std-only.
 use parking_lot::{Condvar, Mutex};
 
+use coordinode_core::budget::QueryBudget;
 use coordinode_core::graph::node::{
     IdLease, IdLeaseError, IdLeaseReserver, NODE_ID_MAX_SEQUENCE, NODE_LEASE_TOKEN_LEN,
 };
+use coordinode_storage::engine::pending::Refusal;
+
+use super::fields::lock_within;
 use coordinode_core::txn::proposal::{
     MetadataCommand, Mutation, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
@@ -96,6 +100,7 @@ impl LogLeaseReserver {
         base: u64,
         target: u64,
         token: Option<[u8; NODE_LEASE_TOKEN_LEN]>,
+        stop: Option<&QueryBudget>,
     ) -> Result<bool, IdLeaseError> {
         let id = self.proposal_ids.next();
         // Held as not yet logged until the entry is handed over, so no
@@ -104,8 +109,11 @@ impl LogLeaseReserver {
         let (commit_ts, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| self.oracle.next().as_raw())
-            .map_err(|_| IdLeaseError::Held)?;
+            .obligate_changing(|| self.oracle.next().as_raw(), stop)
+            .map_err(|refusal| match refusal {
+                Refusal::Stopped(stopped) => IdLeaseError::Stopped(stopped),
+                _ => IdLeaseError::Held,
+            })?;
         // The proposal below carries the whole grant.
         held.seal(id);
         let commit_ts = Timestamp::from_raw(commit_ts);
@@ -153,13 +161,14 @@ impl LogLeaseReserver {
         if self.ceiling()? != base {
             return Ok(false);
         }
-        self.grant(base, target, Some(token))
+        // A restore's own grant, made for no statement.
+        self.grant(base, target, Some(token), None)
     }
 }
 
 impl IdLeaseReserver for LogLeaseReserver {
-    fn reserve(&self) -> Result<IdLease, IdLeaseError> {
-        let _granting = self.granting.lock();
+    fn reserve(&self, stop: Option<&QueryBudget>) -> Result<IdLease, IdLeaseError> {
+        let _granting = lock_within(&self.granting, stop).map_err(IdLeaseError::Stopped)?;
         for _ in 0..MAX_GRANT_ATTEMPTS {
             let base = self.ceiling()?;
             if base >= NODE_ID_MAX_SEQUENCE {
@@ -167,7 +176,7 @@ impl IdLeaseReserver for LogLeaseReserver {
             }
             // base < 2^44, so the sum cannot overflow a u64.
             let target = (base + NODE_LEASE_SIZE).min(NODE_ID_MAX_SEQUENCE);
-            if self.grant(base, target, None)? {
+            if self.grant(base, target, None, stop)? {
                 return Ok(IdLease {
                     base,
                     ceiling: target,
@@ -236,7 +245,9 @@ impl Prefetch {
                 }
                 state.wanted = false;
             }
-            match self.source.reserve() {
+            // The spare is taken ahead of any statement: no statement's
+            // budget bounds it.
+            match self.source.reserve(None) {
                 Ok(lease) => self.state.lock().spare = Some(lease),
                 // A member that does not lead gets no lease; the next draw
                 // asks again, in the foreground.
@@ -252,7 +263,7 @@ impl Prefetch {
 }
 
 impl IdLeaseReserver for PrefetchingReserver {
-    fn reserve(&self) -> Result<IdLease, IdLeaseError> {
+    fn reserve(&self, stop: Option<&QueryBudget>) -> Result<IdLease, IdLeaseError> {
         {
             let mut state = self.shared.state.lock();
             if let Some(lease) = state.spare.take() {
@@ -260,7 +271,7 @@ impl IdLeaseReserver for PrefetchingReserver {
                 return Ok(lease);
             }
         }
-        let lease = self.shared.source.reserve()?;
+        let lease = self.shared.source.reserve(stop)?;
         let mut state = self.shared.state.lock();
         if state.spare.is_none() {
             self.shared.want_next(&mut state);
@@ -285,4 +296,5 @@ impl Drop for PrefetchingReserver {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

@@ -412,7 +412,7 @@ impl Database {
         names.dedup();
         for batch in names.chunks(coordinode_core::graph::intern::MAX_REGISTRATION_BATCH) {
             self.fields
-                .bind_labels(batch)
+                .bind_labels(batch, None)
                 .map_err(|e| DatabaseError::from(ExecutionError::from(e)))?;
         }
         Ok(())

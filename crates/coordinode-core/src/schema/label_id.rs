@@ -164,15 +164,18 @@ pub fn decode_label_id_key(key: &[u8]) -> Option<LabelId> {
 )]
 pub trait LabelRegistrar: Send + Sync {
     /// The live identities of `names`, in order, binding the ones that have
-    /// none. Every returned binding is applied when this returns.
+    /// none, on behalf of the statement whose budget is `stop` when one
+    /// asks: its deadline or cancellation ends any wait for the binding.
+    /// Every returned binding is applied when this returns.
     ///
     /// # Errors
     ///
-    /// The batch is invalid, the identity space is exhausted, or the binding
-    /// could not be published.
+    /// The batch is invalid, the identity space is exhausted, the binding
+    /// could not be published, or the statement stopped.
     fn bind_labels(
         &self,
         names: &[&str],
+        stop: Option<&crate::budget::QueryBudget>,
     ) -> Result<alloc::vec::Vec<LabelId>, crate::graph::intern::DictionaryError>;
 }
 

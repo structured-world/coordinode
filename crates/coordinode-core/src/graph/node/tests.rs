@@ -26,14 +26,14 @@ fn node_id_display() {
 #[test]
 fn allocator_starts_from_one() {
     let alloc = NodeIdAllocator::new(0);
-    assert_eq!(alloc.next().expect("id").as_raw(), 1);
-    assert_eq!(alloc.next().expect("id").as_raw(), 2);
+    assert_eq!(alloc.next(None).expect("id").as_raw(), 1);
+    assert_eq!(alloc.next(None).expect("id").as_raw(), 2);
 }
 
 #[test]
 fn allocator_resume() {
     let alloc = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    assert_eq!(alloc.next().expect("id").as_raw(), 101);
+    assert_eq!(alloc.next(None).expect("id").as_raw(), 101);
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn allocator_concurrent() {
         let alloc = Arc::clone(&alloc);
         handles.push(std::thread::spawn(move || {
             (0..500)
-                .map(|_| alloc.next().expect("id").as_raw())
+                .map(|_| alloc.next(None).expect("id").as_raw())
                 .collect::<Vec<_>>()
         }));
     }
@@ -90,7 +90,7 @@ impl TestReserver {
 }
 
 impl IdLeaseReserver for TestReserver {
-    fn reserve(&self) -> Result<IdLease, IdLeaseError> {
+    fn reserve(&self, _stop: Option<&crate::budget::QueryBudget>) -> Result<IdLease, IdLeaseError> {
         if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(IdLeaseError::NotGranted("not the leader".into()));
         }
@@ -115,7 +115,7 @@ fn leased_allocator_draws_only_inside_granted_leases() {
     assert!(reserver.granted().is_empty(), "no lease before a draw");
 
     let ids: Vec<u64> = (0..7)
-        .map(|_| alloc.next().expect("id").sequence())
+        .map(|_| alloc.next(None).expect("id").sequence())
         .collect();
     assert_eq!(ids, [1, 2, 3, 104, 105, 106, 207]);
     assert_eq!(reserver.granted().len(), 3);
@@ -126,7 +126,7 @@ fn leased_allocator_draws_only_inside_granted_leases() {
 fn leased_allocator_carries_its_hint() {
     let reserver = std::sync::Arc::new(TestReserver::new(10, 0));
     let alloc = NodeIdAllocator::leased(7, reserver);
-    let id = alloc.next().expect("id");
+    let id = alloc.next(None).expect("id");
     assert_eq!(id.origin_shard_hint(), 7);
     assert_eq!(id.sequence(), 1);
 }
@@ -141,7 +141,7 @@ fn leased_allocator_fails_when_no_lease_is_granted() {
         .refuse
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        alloc.next(),
+        alloc.next(None),
         Err(IdLeaseError::NotGranted("not the leader".into()))
     );
 
@@ -149,7 +149,7 @@ fn leased_allocator_fails_when_no_lease_is_granted() {
     reserver
         .refuse
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(alloc.next().expect("id").sequence(), 1);
+    assert_eq!(alloc.next(None).expect("id").sequence(), 1);
 }
 
 /// A reserver answering with an empty or out-of-space range is refused.
@@ -157,7 +157,10 @@ fn leased_allocator_fails_when_no_lease_is_granted() {
 fn leased_allocator_rejects_an_invalid_lease() {
     struct Broken(IdLease);
     impl IdLeaseReserver for Broken {
-        fn reserve(&self) -> Result<IdLease, IdLeaseError> {
+        fn reserve(
+            &self,
+            _stop: Option<&crate::budget::QueryBudget>,
+        ) -> Result<IdLease, IdLeaseError> {
             Ok(self.0)
         }
     }
@@ -173,7 +176,7 @@ fn leased_allocator_rejects_an_invalid_lease() {
     ] {
         let alloc = NodeIdAllocator::leased(0, std::sync::Arc::new(Broken(lease)));
         assert_eq!(
-            alloc.next(),
+            alloc.next(None),
             Err(IdLeaseError::InvalidLease {
                 base: lease.base,
                 ceiling: lease.ceiling,
@@ -197,7 +200,7 @@ fn leased_allocator_concurrent_draws_across_lease_changes() {
             let alloc = Arc::clone(&alloc);
             std::thread::spawn(move || {
                 (0..2_000)
-                    .map(|_| alloc.next().expect("id").sequence())
+                    .map(|_| alloc.next(None).expect("id").sequence())
                     .collect::<Vec<_>>()
             })
         })
@@ -260,7 +263,7 @@ fn node_id_compose_panics_on_oversized_sequence() {
 fn allocator_ce_default_uses_hint_zero() {
     let alloc = NodeIdAllocator::new(0);
     assert_eq!(alloc.shard_hint(), 0);
-    let id = alloc.next().expect("id");
+    let id = alloc.next(None).expect("id");
     assert_eq!(id.origin_shard_hint(), 0);
     assert_eq!(id.sequence(), 1);
 }
@@ -268,8 +271,8 @@ fn allocator_ce_default_uses_hint_zero() {
 #[test]
 fn allocator_ee_hint_carried_in_emitted_ids() {
     let alloc = NodeIdAllocator::new(42);
-    let id1 = alloc.next().expect("id");
-    let id2 = alloc.next().expect("id");
+    let id1 = alloc.next(None).expect("id");
+    let id2 = alloc.next(None).expect("id");
     assert_eq!(id1.origin_shard_hint(), 42);
     assert_eq!(id2.origin_shard_hint(), 42);
     assert_eq!(id1.sequence(), 1);
@@ -281,7 +284,7 @@ fn allocator_resume_from_preserves_hint() {
     let persisted = NodeId::compose(7, 1000);
     let alloc = NodeIdAllocator::resume_from(persisted);
     assert_eq!(alloc.shard_hint(), 7);
-    let next = alloc.next().expect("id");
+    let next = alloc.next(None).expect("id");
     assert_eq!(next.origin_shard_hint(), 7);
     assert_eq!(next.sequence(), 1001);
 }
@@ -294,11 +297,14 @@ fn allocator_resume_from_preserves_hint() {
 fn allocator_refuses_past_the_end_of_the_sequence_space() {
     let alloc = NodeIdAllocator::resume_from(NodeId::compose(3, NODE_ID_MAX_SEQUENCE - 1));
     assert_eq!(
-        alloc.next().expect("the last sequence").sequence(),
+        alloc.next(None).expect("the last sequence").sequence(),
         NODE_ID_MAX_SEQUENCE
     );
     for _ in 0..3 {
-        assert_eq!(alloc.next(), Err(IdLeaseError::Exhausted { shard_hint: 3 }));
+        assert_eq!(
+            alloc.next(None),
+            Err(IdLeaseError::Exhausted { shard_hint: 3 })
+        );
     }
 }
 

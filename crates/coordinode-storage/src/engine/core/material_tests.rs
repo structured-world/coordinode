@@ -253,6 +253,7 @@ fn an_observation_stops_at_the_complete_cut() {
             Vec::new(),
             Vec::new(),
             crate::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit");
     apply(

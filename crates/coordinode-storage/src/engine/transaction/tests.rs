@@ -514,6 +514,7 @@ fn a_read_waits_for_pending_work_below_it_and_not_above_it() {
             vec![(Partition::Node, b"a".to_vec())],
             Vec::new(),
             changes,
+            None,
         )
         .expect("admit")
         .1;
@@ -523,6 +524,7 @@ fn a_read_waits_for_pending_work_below_it_and_not_above_it() {
             vec![(Partition::Node, b"b".to_vec())],
             Vec::new(),
             changes,
+            None,
         )
         .expect("admit")
         .1;
@@ -734,6 +736,7 @@ fn a_condition_on_a_record_being_written_by_another_commit_is_refused() {
             vec![(Partition::Node, GUARD.to_vec())],
             Vec::new(),
             crate::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit the other commit");
 

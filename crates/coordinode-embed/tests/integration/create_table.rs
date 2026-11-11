@@ -220,9 +220,69 @@ fn a_stopped_columnar_table_refuses_its_statements_and_not_the_graphs() {
             .cloned()
     };
 
+    // The partitions' verdict as their own trees give it, from their first
+    // levels alone: the table's runs take no part in it. The store's own
+    // bookkeeping of the statements writes the schema partition, so this
+    // may be more than `None` at these thresholds.
+    let own_verdict = |db: &Database| {
+        use lsm_tree::AbstractTree;
+        coordinode_storage::engine::partition::Partition::all()
+            .iter()
+            .map(|&p| {
+                let runs = db.engine().tree(p).expect("tree").l0_run_count();
+                if runs >= 3 {
+                    WritePressure::Stop
+                } else if runs >= 2 {
+                    WritePressure::Slowdown
+                } else {
+                    WritePressure::None
+                }
+            })
+            .max_by_key(|w| match w {
+                WritePressure::None => 0,
+                WritePressure::Slowdown => 1,
+                WritePressure::Stop => 2,
+            })
+            .unwrap_or(WritePressure::None)
+    };
+    // With the graph's own trees compacted to no pressure, its latched
+    // verdict comes back to `None` whatever the table's: the monitor latches
+    // it on its next pass.
+    let judged_alone = |db: &Database, table: WritePressure| {
+        for &p in coordinode_storage::engine::partition::Partition::all() {
+            db.engine()
+                .force_compaction(p)
+                .expect("compact a partition");
+        }
+        assert_eq!(
+            own_verdict(db),
+            WritePressure::None,
+            "the graph's own trees"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let own = own_verdict(db);
+            if db.engine().write_pressure() == own {
+                assert_eq!(db.engine().columnar_write_pressure("Event"), table);
+                return own;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "with the table at {table:?} the graph's verdict {:?} is not its own {own:?}",
+                db.engine().write_pressure()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let mut written = 0i64;
+    let mut slowed = false;
     while db.engine().columnar_write_pressure("Event") != WritePressure::Stop {
+        if !slowed && db.engine().columnar_write_pressure("Event") == WritePressure::Slowdown {
+            judged_alone(&db, WritePressure::Slowdown);
+            slowed = true;
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "{written} statements never stopped the table"
@@ -250,11 +310,9 @@ fn a_stopped_columnar_table_refuses_its_statements_and_not_the_graphs() {
         "no row of it landed"
     );
 
-    // The partitions' verdict is their own: the store's bookkeeping of the
-    // statements (in the schema partition, flushed at this 4 KiB buffer)
-    // may slow it down at these thresholds, but the stopped table does not
-    // stop it.
-    assert_ne!(db.engine().write_pressure(), WritePressure::Stop);
+    assert!(slowed, "the table never showed its slowdown on the way");
+    let own = judged_alone(&db, WritePressure::Stop);
+    assert_ne!(own, WritePressure::Stop, "the graph's own trees stopped it");
     db.execute_cypher("CREATE (:Plain {x: 1})")
         .expect("the graph is judged by its own verdict");
 }

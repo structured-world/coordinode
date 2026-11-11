@@ -209,7 +209,7 @@ impl Commands {
         let (at, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| self.oracle.next().as_raw())
+            .obligate_changing(|| self.oracle.next().as_raw(), None)
             .map_err(|_| coordinode_storage::error::StorageError::MaterialClaimed.to_string())?;
         let mut request = command_request(
             command,

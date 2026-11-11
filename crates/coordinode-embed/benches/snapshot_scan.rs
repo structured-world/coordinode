@@ -52,6 +52,7 @@ fn main() {
             vec![(Partition::Node, b"unrelated-pending-key".to_vec())],
             Vec::new(),
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("hold unrelated commit");
     report(

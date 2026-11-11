@@ -81,6 +81,7 @@ impl coordinode_core::graph::intern::FieldRegistrar for FlakyFields {
     fn register(
         &self,
         _: &[&str],
+        _: Option<&coordinode_core::budget::QueryBudget>,
     ) -> Result<Vec<u32>, coordinode_core::graph::intern::DictionaryError> {
         Err(coordinode_core::graph::intern::DictionaryError::Malformed(
             "read-only in this test".into(),

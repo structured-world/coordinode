@@ -15,6 +15,7 @@ use std::sync::Arc;
 // no-std: spin::RwLock
 use parking_lot::RwLock;
 
+use coordinode_core::budget::{BudgetStop, QueryBudget};
 use coordinode_core::graph::intern::{
     DictionaryError, FieldInterner, FieldRegistrar, MAX_REGISTRATION_BATCH, validate_registration,
 };
@@ -24,11 +25,41 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::metadata::{field_bindings_above, load_field_dictionary};
+use coordinode_storage::engine::pending::Refusal;
 use coordinode_storage::error::StorageError;
 
 /// Schema key the dictionary was kept under by releases that wrote it as one
 /// whole-table value after the data.
 const LEGACY_DICTIONARY_KEY: &[u8] = b"meta:field_interner";
+
+/// The longest a statement's wait for a lock another registration holds
+/// goes without looking at its deadline and cancellation.
+const LOCK_CHECK_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Take `lock` on behalf of the statement whose budget is `stop`: a wait
+/// behind another holder ends with the statement's deadline or cancellation.
+/// Without a statement the wait is the holder's.
+pub(crate) fn lock_within<'a>(
+    lock: &'a parking_lot::Mutex<()>,
+    stop: Option<&QueryBudget>,
+) -> Result<parking_lot::MutexGuard<'a, ()>, BudgetStop> {
+    let Some(stop) = stop else {
+        return Ok(lock.lock());
+    };
+    loop {
+        stop.check()?;
+        // No longer than the statement has left, nor than a slice.
+        let slice = stop.time_left_nanos().map_or(LOCK_CHECK_SLICE, |left| {
+            LOCK_CHECK_SLICE.min(std::time::Duration::from_nanos(left))
+        });
+        if let Some(guard) = lock.try_lock_for(slice) {
+            // Checked again with the lock in hand: a stop that landed while
+            // it was waited for is not overtaken.
+            stop.check()?;
+            return Ok(guard);
+        }
+    }
+}
 
 /// Why the log did not publish a registration, as the statement that needed
 /// it is refused. One this member stopped leading under may still be taken
@@ -169,15 +200,22 @@ impl FieldDictionary {
         Ok(published.view.clone())
     }
 
-    fn propose(&self, command: MetadataCommand) -> Result<(), DictionaryError> {
+    fn propose(
+        &self,
+        command: MetadataCommand,
+        stop: Option<&QueryBudget>,
+    ) -> Result<(), DictionaryError> {
         // Held as not yet logged until the entry is handed over, so no
         // closed bound passes over it meanwhile. The dictionary is Schema
         // records, which consumers are charged for.
         let (commit_ts, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| self.oracle.next().as_raw())
-            .map_err(|_| DictionaryError::Held)?;
+            .obligate_changing(|| self.oracle.next().as_raw(), stop)
+            .map_err(|refusal| match refusal {
+                Refusal::Stopped(stopped) => DictionaryError::Stopped(stopped),
+                _ => DictionaryError::Held,
+            })?;
         let proposal = RaftProposal {
             id: self.proposal_ids.next(),
             mutations: vec![Mutation::Command(command)],
@@ -205,7 +243,11 @@ impl FieldDictionary {
 }
 
 impl FieldRegistrar for FieldDictionary {
-    fn register(&self, names: &[&str]) -> Result<Vec<u32>, DictionaryError> {
+    fn register(
+        &self,
+        names: &[&str],
+        stop: Option<&QueryBudget>,
+    ) -> Result<Vec<u32>, DictionaryError> {
         let mut view = self.view_or_err()?;
         let missing_from = |view: &FieldInterner| {
             let mut missing: Vec<&str> = Vec::new();
@@ -219,13 +261,17 @@ impl FieldRegistrar for FieldDictionary {
         if !missing_from(&view).is_empty() {
             // One registration at a time: the names one waited for are
             // bound by the time it runs, and are not proposed again.
-            let _registering = self.registering.lock();
+            let _registering =
+                lock_within(&self.registering, stop).map_err(DictionaryError::Stopped)?;
             view = self.view_or_err()?;
             for batch in missing_from(&view).chunks(MAX_REGISTRATION_BATCH) {
                 validate_registration(batch)?;
-                self.propose(MetadataCommand::RegisterFields {
-                    names: batch.iter().map(|n| (*n).to_owned()).collect(),
-                })?;
+                self.propose(
+                    MetadataCommand::RegisterFields {
+                        names: batch.iter().map(|n| (*n).to_owned()).collect(),
+                    },
+                    stop,
+                )?;
             }
             view = self.view_or_err()?;
         }
@@ -254,9 +300,13 @@ impl FieldRegistrar for FieldDictionary {
             .collect();
         pairs.sort_unstable_by_key(|&(_, id)| id);
         for batch in pairs.chunks(MAX_REGISTRATION_BATCH) {
-            self.propose(MetadataCommand::AdoptFields {
-                bindings: batch.to_vec(),
-            })?;
+            // A restore's own adoption, made for no statement.
+            self.propose(
+                MetadataCommand::AdoptFields {
+                    bindings: batch.to_vec(),
+                },
+                None,
+            )?;
         }
         let view = self.view_or_err()?;
         match pairs
@@ -283,6 +333,7 @@ impl coordinode_core::schema::label_id::LabelRegistrar for FieldDictionary {
     fn bind_labels(
         &self,
         names: &[&str],
+        stop: Option<&QueryBudget>,
     ) -> Result<Vec<coordinode_core::schema::label_id::LabelId>, DictionaryError> {
         use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
         let store = LocalSchemaStore::new(&self.engine);
@@ -312,7 +363,7 @@ impl coordinode_core::schema::label_id::LabelRegistrar for FieldDictionary {
         }
         // One binding at a time: the labels one waited for are bound by the
         // time it runs, and are not proposed again.
-        let _binding = self.binding.lock();
+        let _binding = lock_within(&self.binding, stop).map_err(DictionaryError::Stopped)?;
         let missing = missing_from(&store)?;
         for batch in missing.chunks(MAX_REGISTRATION_BATCH) {
             validate_registration(batch)?;
@@ -320,9 +371,12 @@ impl coordinode_core::schema::label_id::LabelRegistrar for FieldDictionary {
             // later timestamp than the command is proposed again, at a fresh
             // one; anything else that leaves a name unbound is reported below.
             for _ in 0..MAX_BINDING_ATTEMPTS {
-                self.propose(MetadataCommand::BindLabels {
-                    names: batch.iter().map(|n| (*n).to_owned()).collect(),
-                })?;
+                self.propose(
+                    MetadataCommand::BindLabels {
+                        names: batch.iter().map(|n| (*n).to_owned()).collect(),
+                    },
+                    stop,
+                )?;
                 if batch
                     .iter()
                     .try_fold(true, |all, name| Ok(all && bound(&store, name)?.is_some()))?
@@ -380,4 +434,4 @@ fn refuse_unbound_properties(engine: &StorageEngine) -> Result<(), StorageError>
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests;
+pub(super) mod tests;

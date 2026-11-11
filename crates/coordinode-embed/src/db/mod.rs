@@ -3501,7 +3501,7 @@ impl Database {
         // published, so every member that sees the definition resolves them.
         let ids = self
             .fields
-            .register(&[&descriptor.label, descriptor.property()])
+            .register(&[&descriptor.label, descriptor.property()], None)
             .map_err(ExecutionError::from)?;
         // Published in a catalog commit of its own, which gives the index
         // its identities and binds its name.

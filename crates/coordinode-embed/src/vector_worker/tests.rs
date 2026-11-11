@@ -17,6 +17,7 @@ impl FieldRegistrar for FixedFields {
     fn register(
         &self,
         names: &[&str],
+        _stop: Option<&coordinode_core::budget::QueryBudget>,
     ) -> Result<Vec<u32>, coordinode_core::graph::intern::DictionaryError> {
         names
             .iter()
@@ -359,8 +360,9 @@ impl FieldRegistrar for FlakyFields {
     fn register(
         &self,
         names: &[&str],
+        stop: Option<&coordinode_core::budget::QueryBudget>,
     ) -> Result<Vec<u32>, coordinode_core::graph::intern::DictionaryError> {
-        self.inner.register(names)
+        self.inner.register(names, stop)
     }
 
     fn adopt(
@@ -510,6 +512,7 @@ fn the_watermark_stays_below_a_commit_still_in_flight() {
             vec![(Partition::Node, early_key)],
             Vec::new(),
             coordinode_storage::engine::pending::Material::Changes,
+            None,
         )
         .expect("admit the early commit");
     // A later commit lands and is folded.
