@@ -3,11 +3,11 @@ description: Build archives and run a separate disk-backed consumer on stable Ru
 runs:
   using: composite
   steps:
-    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+    - uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: stable
         components: rustfmt,clippy
-    - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
+    - uses: taiki-e/install-action@v2
       with:
         tool: cargo-hakari@0.9.39,cargo-local-registry@0.2.12
     - name: Install the source-only protobuf compiler and mold

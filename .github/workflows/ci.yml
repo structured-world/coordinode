@@ -158,7 +158,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Build coordinode binary (required by integration tests)
-        run: cargo build -p coordinode-server --all-features
+        run: cargo build --locked -p coordinode-server --all-features
       - name: Run unit + integration tests (nextest)
         # The self-hosted runner is shared (CI, bench, and HNSW workflows can
         # run concurrently), so CPU oversubscription can starve Raft heartbeats
@@ -297,7 +297,7 @@ jobs:
           # See the `test` job: the runner's own bin directory stays out.
           cache-bin: "false"
       - name: Build coordinode binary (required by integration tests)
-        run: cargo build -p coordinode-server --all-features
+        run: cargo build --locked -p coordinode-server --all-features
       - name: Run unit + integration tests (nextest)
         # Same reason as the `test` job: the machine is shared with other
         # runners, so the election-timing-sensitive cluster tests get
@@ -445,11 +445,9 @@ jobs:
     permissions:
       checks: write
       contents: read
-    # The only job here with a token that writes (check runs), so its actions
-    # are taken by commit: a moved tag must not be able to post our checks.
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      - uses: actions/checkout@v7
+      - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 

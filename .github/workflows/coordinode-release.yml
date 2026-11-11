@@ -25,7 +25,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -42,7 +42,7 @@ jobs:
             release_args+=(--release-pr "$RELEASE_PR")
           fi
           python3 -B scripts/release/registry.py "${release_args[@]}"
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@v7
         if: steps.source.outputs.commit != github.sha
         with:
           ref: ${{ steps.source.outputs.commit }}
@@ -88,7 +88,7 @@ jobs:
       - name: Install the verified release-plz build
         if: steps.eligible.outputs.publish == 'true'
         run: bash scripts/release/install_release_plz.sh
-      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
+      - uses: actions/create-github-app-token@v3
         if: steps.eligible.outputs.publish == 'true'
         id: app
         with:
@@ -100,7 +100,7 @@ jobs:
       - name: Obtain the publication credential through OIDC
         if: steps.eligible.outputs.publish == 'true'
         id: crates
-        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish through OIDC
         if: steps.eligible.outputs.publish == 'true'
         env:
@@ -127,7 +127,7 @@ jobs:
             target/crates-io-*-licenses.json target/crates-io-*-sbom.cdx.json
       - name: Keep publication evidence
         if: always() && steps.eligible.outputs.publish == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@v7
         with:
           name: registry-publication
           path: |
@@ -155,13 +155,13 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: rustfmt,clippy
@@ -170,7 +170,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv mold
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
+      - uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks@0.50.0
       - name: Install the verified release-plz build
@@ -189,7 +189,7 @@ jobs:
           fi
           "${python[@]}" -B -m unittest discover -s scripts/release -p 'test_*.py' -v
           "${python[@]}" -B scripts/release/pr_config.py --checkout "$GITHUB_WORKSPACE"
-      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
+      - uses: actions/create-github-app-token@v3
         id: app
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
