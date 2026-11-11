@@ -126,8 +126,28 @@ async fn create_follower_limited(
     founder: &TestNode,
     hard_limit: u64,
 ) -> TestNode {
+    create_follower_granting(
+        node_id,
+        port,
+        founder,
+        hard_limit,
+        coordinode_storage::engine::footprint::grants::DEFAULT_CLIENT_GRANT_BYTES,
+    )
+    .await
+}
+
+/// [`create_follower_limited`] keeping `grant` bytes granted to its leader's
+/// client writes.
+async fn create_follower_granting(
+    node_id: u64,
+    port: u16,
+    founder: &TestNode,
+    hard_limit: u64,
+    grant: u64,
+) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = node_storage(dir.path(), hard_limit);
+    let mut config = node_storage(dir.path(), hard_limit);
+    config.client_grant_bytes = grant;
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
 
@@ -468,6 +488,525 @@ async fn a_full_group_commits_its_own_work_through_a_majority() {
     })
     .await;
     assert!(result.is_ok(), "test timed out");
+}
+
+/// The leader has room for client writes and its followers have none left
+/// beyond the room they granted earlier. Every client write the leader
+/// accepts commits, none is left unacknowledged at the head of the log;
+/// once the grants are spent the next client write is refused before it
+/// reaches the log; the group's own work still commits; what was
+/// acknowledged stays on every member and every member holds its limit.
+/// Before, the leader appended client writes its followers then refused,
+/// and nothing behind the first one could commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_writes_stop_at_the_members_grants_and_own_work_still_commits() {
+    const LIMIT: u64 = 256 << 20;
+    const ROOM: u64 = 16 << 20;
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let (n1, n2, n3, _, _, _) = bootstrap_3_node_limited(LIMIT).await;
+        let pipeline = Arc::new(n1.node.pipeline());
+        let ids = Arc::new(ProposalIdGenerator::with_base(11u64 << 48));
+        let proposal = {
+            let ids = Arc::clone(&ids);
+            move |key: Vec<u8>, bytes: usize, own_work: bool| RaftProposal {
+                id: ids.next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key,
+                    value: vec![7u8; bytes],
+                }],
+                commit_ts: Timestamp::from_raw(0),
+                start_ts: Timestamp::from_raw(0),
+                bypass_rate_limiter: own_work,
+            }
+        };
+        pipeline
+            .propose_and_wait(&proposal(b"node:1:before".to_vec(), 1, false))
+            .expect("a client write while there is room");
+        for node in [&n2, &n3] {
+            assert!(await_replicated(&node.engine, b"node:1:before", &[7u8]).await);
+        }
+        // The followers can grant no more: their client room is below what
+        // they hold. The leader keeps plenty.
+        for node in [&n2, &n3] {
+            let footprint = node.engine.footprints().get("default").expect("a limit");
+            footprint.set_limit(footprint.committed() + ROOM, ROOM + (1 << 20));
+        }
+
+        let propose = |p: RaftProposal| {
+            let pipeline = Arc::clone(&pipeline);
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio::task::spawn_blocking(move || pipeline.propose_and_wait(&p)),
+                )
+                .await
+                .expect("a write is answered, not left at the head of the log")
+                .expect("join")
+            }
+        };
+        let mut accepted = 0u32;
+        let refused = loop {
+            assert!(accepted < 1_000, "the grants were never spent");
+            let key = format!("node:1:client:{accepted}").into_bytes();
+            match propose(proposal(key, 256 << 10, false)).await {
+                Ok(_) => accepted += 1,
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            matches!(refused, ProposalError::MembersFull),
+            "refused before the log once the grants are spent: {refused:?}"
+        );
+        propose(proposal(b"node:1:own".to_vec(), 1, true))
+            .await
+            .expect("the group's own work commits");
+        // The same size again: what is left of the grants is less.
+        let again = propose(proposal(b"node:1:again".to_vec(), 256 << 10, false)).await;
+        assert!(
+            matches!(again, Err(ProposalError::MembersFull)),
+            "a new client write is refused: {again:?}"
+        );
+        for node in [&n1, &n2, &n3] {
+            assert!(await_replicated(&node.engine, b"node:1:own", &[7u8]).await);
+            assert!(await_replicated(&node.engine, b"node:1:before", &[7u8]).await);
+            for n in 0..accepted {
+                let key = format!("node:1:client:{n}").into_bytes();
+                assert!(
+                    await_replicated(&node.engine, &key, &[7u8; 256 << 10]).await,
+                    "an accepted client write is on every member"
+                );
+            }
+            let footprint = node.engine.footprints().get("default").expect("a limit");
+            assert!(
+                footprint.committed() <= footprint.limit(),
+                "a member passed its limit"
+            );
+        }
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.node.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+    assert!(result.is_ok(), "test timed out");
+}
+
+/// Member 2 grants nothing, so only member 3's report lets the leader
+/// append client entries. Member 3 stops after
+/// reporting; the leader appends entries against its report, which member
+/// 2 cannot take, so none commits. Member 3 restarts with no client room
+/// left (all it may still take is its recovery reserve, which pays only
+/// committed entries): the opening holds the room its report reached past
+/// its log again, so it pays for the uncommitted entries when they arrive,
+/// they commit with the leader, and it stays within its limit. Without that
+/// room it refuses them and they never commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_restarted_before_receiving_its_granted_entries_takes_them() {
+    const LIMIT: u64 = 256 << 20;
+    const ROOM: u64 = 16 << 20;
+    const ENTRY: usize = 256 << 10;
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
+        let n1 = create_leader_limited(1, p1, LIMIT).await;
+        let n2 = create_follower_granting(2, p2, &n1, LIMIT, 0).await;
+        let n3 = create_follower_limited(3, p3, &n1, LIMIT).await;
+        await_leadership(&n1.node).await;
+        for (id, port) in [(2, p2), (3, p3)] {
+            n1.node
+                .add_node(id, format!("http://127.0.0.1:{port}"), ident(id))
+                .await
+                .expect("add a member");
+        }
+        n1.node
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+        let pipeline = Arc::new(n1.node.pipeline());
+        let ids = ProposalIdGenerator::with_base(13u64 << 48);
+        let proposal = |key: Vec<u8>| RaftProposal {
+            id: ids.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key,
+                value: vec![7u8; ENTRY],
+            }],
+            commit_ts: Timestamp::from_raw(0),
+            start_ts: Timestamp::from_raw(0),
+            bypass_rate_limiter: false,
+        };
+        let first = proposal(b"node:1:before".to_vec());
+        let leader = Arc::clone(&pipeline);
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || leader.propose_and_wait(&first)),
+        )
+        .await
+        .expect("a client write commits with member 3")
+        .expect("join")
+        .expect("a client write");
+        assert_eq!(
+            n2.engine.footprints().granted_room(),
+            0,
+            "member 2 grants nothing"
+        );
+        // Member 3 has reported, and stored, room for more entries.
+        let footprints = n3.engine.footprints().clone();
+        await_condition(Duration::from_secs(10), "member 3 stored its grant", || {
+            footprints.grant_record().horizon > 0
+        })
+        .await;
+        drop(footprints);
+        // Reports carry the stored room: give one more round to reach the
+        // leader before member 3 stops.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let dir3 = n3._dir;
+        n3.node.shutdown().await.expect("shutdown 3");
+        drop(n3.node);
+        drop(n3.engine);
+
+        // Appended against member 3's report while it is down: member 2
+        // cannot take them, so none can commit yet.
+        let missed: Vec<Vec<u8>> = (0..4)
+            .map(|n| format!("node:1:missed:{n}").into_bytes())
+            .collect();
+        let pending: Vec<_> = missed
+            .iter()
+            .map(|key| {
+                let p = proposal(key.clone());
+                let pipeline = Arc::clone(&pipeline);
+                tokio::task::spawn_blocking(move || pipeline.propose_and_wait(&p))
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            pending.iter().all(|p| !p.is_finished()),
+            "nothing commits without member 3"
+        );
+
+        // Member 3 restarts with no client room: whatever it held, only
+        // its recovery reserve is above it.
+        let e3 =
+            Arc::new(StorageEngine::open(&node_storage(dir3.path(), LIMIT)).expect("reopen 3"));
+        let footprint = e3.footprints().get("default").expect("a limit");
+        footprint.set_limit(footprint.committed() + ROOM, ROOM + (1 << 20));
+        let n3 = {
+            let mut reopened = None;
+            for _ in 0..20 {
+                match RaftNode::open_cluster(
+                    3,
+                    Arc::clone(&e3),
+                    format!("127.0.0.1:{p3}").parse().expect("addr"),
+                    format!("http://127.0.0.1:{p3}"),
+                    conn(3),
+                )
+                .await
+                {
+                    Ok(node) => {
+                        reopened = Some(node);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                }
+            }
+            reopened.expect("reopen member 3")
+        };
+        for p in pending {
+            tokio::time::timeout(Duration::from_secs(20), p)
+                .await
+                .expect("the entries commit once the restarted member takes them")
+                .expect("join")
+                .expect("committed");
+        }
+        for key in &missed {
+            assert!(
+                await_replicated(&e3, key, &[7u8; ENTRY]).await,
+                "the restarted member holds the entries written against its grant"
+            );
+        }
+        assert!(
+            footprint.committed() <= footprint.limit(),
+            "the restarted member passed its limit"
+        );
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.shutdown().await.expect("shutdown 3 again");
+    })
+    .await;
+    assert!(result.is_ok(), "test timed out");
+}
+
+/// A member whose journal stops answering (the store its log writer and a
+/// further grant both go through) stops taking entries, as a member whose
+/// disk stops does; the write of its grant waits on a blocking thread,
+/// never on the path that answers the leader, so the member keeps answering
+/// heartbeats, the group commits through the other members, and no report
+/// reaches past what is stored. Once the journal answers the member catches
+/// up and its further grant lands. Client write latency before and during
+/// the stall is printed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_with_a_stopped_journal_keeps_answering_and_catches_up() {
+    const LIMIT: u64 = 256 << 20;
+    const WRITES: u64 = 100;
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let (n1, n2, n3, _, _, _) = bootstrap_3_node_limited(LIMIT).await;
+        let pipeline = Arc::new(n1.node.pipeline());
+        let ids = Arc::new(ProposalIdGenerator::with_base(17u64 << 48));
+        let write = |key: String| {
+            let pipeline = Arc::clone(&pipeline);
+            let ids = Arc::clone(&ids);
+            async move {
+                let p = RaftProposal {
+                    id: ids.next(),
+                    mutations: vec![Mutation::Put {
+                        partition: PartitionId::Node,
+                        key: key.into_bytes(),
+                        value: vec![7u8; 4 << 10],
+                    }],
+                    commit_ts: Timestamp::from_raw(0),
+                    start_ts: Timestamp::from_raw(0),
+                    bypass_rate_limiter: false,
+                };
+                let started = std::time::Instant::now();
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio::task::spawn_blocking(move || pipeline.propose_and_wait(&p)),
+                )
+                .await
+                .expect("a write is answered")
+                .expect("join")
+                .expect("committed");
+                started.elapsed()
+            }
+        };
+        let percentiles = |mut times: Vec<Duration>| {
+            times.sort();
+            let at = |q: f64| times[((times.len() as f64 - 1.0) * q) as usize];
+            (at(0.5), at(0.99))
+        };
+
+        // Steady writes with every member answering.
+        let syncs_before = n3.engine.journal_syncs().expect("a durable journal");
+        let mut steady = Vec::new();
+        for n in 0..WRITES {
+            steady.push(write(format!("node:1:steady:{n}")).await);
+        }
+        let syncs = n3.engine.journal_syncs().expect("a durable journal") - syncs_before;
+        let (p50, p99) = percentiles(steady);
+        eprintln!(
+            "steady: {WRITES} writes, member journal syncs {syncs} ({:.2}/write), \
+             write p50 {p50:?} p99 {p99:?}",
+            syncs as f64 / WRITES as f64
+        );
+
+        // Member 3 settles: no further horizon in flight and its pool at
+        // or above its target, so nothing raises the horizon until writes
+        // spend the pool again. Its journal then stops, and what is stored
+        // is the baseline no report may pass while it stays stopped.
+        let footprints = n3.engine.footprints().clone();
+        let target = coordinode_storage::engine::footprint::grants::DEFAULT_CLIENT_GRANT_BYTES;
+        await_condition(Duration::from_secs(10), "member 3 settles", || {
+            !footprints.grant_raising() && footprints.granted_room() >= target
+        })
+        .await;
+        let stall = n3.engine.hold_journal().expect("a durable journal");
+        let stored = footprints.grant_record().horizon;
+        // A larger target refills the pool (an admission, no journal) and
+        // asks for a further horizon, whose store now waits on the journal.
+        n3.engine.set_client_grant(4 * target);
+        await_condition(
+            Duration::from_secs(5),
+            "a further horizon is being stored",
+            || footprints.grant_raising(),
+        )
+        .await;
+        let acked = |n1: &RaftNode| {
+            use openraft::async_runtime::watch::WatchReceiver;
+            n1.raft()
+                .metrics()
+                .borrow_watched()
+                .heartbeat
+                .as_ref()
+                .and_then(|beats| beats.get(&3).copied().flatten())
+        };
+        let acked_at_stall = acked(&n1.node);
+        let mut stalled = Vec::new();
+        for n in 0..WRITES {
+            stalled.push(write(format!("node:1:stalled:{n}")).await);
+        }
+        let (p50, p99) = percentiles(stalled);
+        eprintln!("member 3 journal stopped: write p50 {p50:?} p99 {p99:?}");
+        await_condition(
+            Duration::from_secs(5),
+            "the stalled member keeps answering heartbeats",
+            || acked(&n1.node) > acked_at_stall,
+        )
+        .await;
+        assert_eq!(
+            footprints.grant_record().horizon,
+            stored,
+            "nothing is stored past the stopped journal"
+        );
+        assert!(footprints.grant_raising(), "the store still waits");
+
+        drop(stall);
+        let last = format!("node:1:stalled:{}", WRITES - 1).into_bytes();
+        assert!(
+            await_replicated(&n3.engine, &last, &[7u8; 4 << 10]).await,
+            "the member catches up once its journal answers"
+        );
+        await_condition(
+            Duration::from_secs(10),
+            "the further horizon lands once the journal answers",
+            || footprints.grant_record().horizon > stored,
+        )
+        .await;
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.node.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+    assert!(result.is_ok(), "test timed out");
+}
+
+/// What one group measured in [`the_cost_of_a_grant_in_steady_writes`].
+#[derive(Debug)]
+struct GrantCost {
+    /// Further horizons member 3 stored, each a synced journal write.
+    stores: u64,
+    /// Journal syncs member 3 made over the writes, from any writer.
+    syncs: u64,
+    /// Client bytes the writes were admitted for, as members pay for them.
+    accounted: u64,
+    p50: Duration,
+    p99: Duration,
+    /// The most member 3's pool held, free and for unapplied entries.
+    peak: u64,
+}
+
+/// Form a 3-member group whose members hold `limit` bytes at most (0: no
+/// limit, so no grants) and grant the default room, run `writes` client
+/// writes of 4 KiB through it one after another, and measure them.
+async fn grant_cost(limit: u64, writes: u64, base: u64) -> GrantCost {
+    let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
+    let n1 = create_leader_limited(1, p1, limit).await;
+    let n2 = create_follower_limited(2, p2, &n1, limit).await;
+    let n3 = create_follower_limited(3, p3, &n1, limit).await;
+    await_leadership(&n1.node).await;
+    for (id, port) in [(2, p2), (3, p3)] {
+        n1.node
+            .add_node(id, format!("http://127.0.0.1:{port}"), ident(id))
+            .await
+            .expect("add a member");
+    }
+    n1.node
+        .change_membership(vec![1, 2, 3])
+        .await
+        .expect("membership");
+    let pipeline = Arc::new(n1.node.pipeline());
+    let ids = ProposalIdGenerator::with_base(base << 48);
+    let footprints = n3.engine.footprints().clone();
+    let syncs_before = n3.engine.journal_syncs().expect("a durable journal");
+    let stores_before = footprints.grant_stores();
+    let (mut times, mut accounted, mut peak) = (Vec::new(), 0u64, 0u64);
+    for n in 0..writes {
+        let mutations = vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: format!("node:1:cost:{n}").into_bytes(),
+            value: vec![7u8; 4 << 10],
+        }];
+        // The room members pay for the entry.
+        accounted += coordinode_storage::engine::footprint::write_footprint(&mutations)
+            + coordinode_storage::engine::footprint::closure_footprint();
+        let p = RaftProposal {
+            id: ids.next(),
+            mutations,
+            commit_ts: Timestamp::from_raw(0),
+            start_ts: Timestamp::from_raw(0),
+            bypass_rate_limiter: false,
+        };
+        let pipeline = Arc::clone(&pipeline);
+        let started = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || pipeline.propose_and_wait(&p))
+            .await
+            .expect("join")
+            .expect("committed");
+        times.push(started.elapsed());
+        if limit > 0 {
+            let (free, held) = footprints.granted_held();
+            peak = peak.max(free + held);
+        }
+    }
+    let last = format!("node:1:cost:{}", writes - 1).into_bytes();
+    assert!(await_replicated(&n3.engine, &last, &[7u8; 4 << 10]).await);
+    let syncs = n3.engine.journal_syncs().expect("a durable journal") - syncs_before;
+    let stores = footprints.grant_stores() - stores_before;
+    times.sort();
+    let at = |q: f64| times[((times.len() as f64 - 1.0) * q) as usize];
+    n1.node.shutdown().await.expect("shutdown 1");
+    n2.node.shutdown().await.expect("shutdown 2");
+    n3.node.shutdown().await.expect("shutdown 3");
+    GrantCost {
+        stores,
+        syncs,
+        accounted,
+        p50: at(0.5),
+        p99: at(0.99),
+        peak,
+    }
+}
+
+/// What grants cost in steady client writes, over many refills: two groups
+/// writing at once on this disk, with no hard limit (so no grant at all)
+/// and with one (every member granting the default room). The pool refills
+/// in batches, so member 3 stores a further horizon (a synced journal
+/// write) about once per target's worth of entries, and never holds much
+/// more than twice its target. Numbers are printed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cost_of_a_grant_in_steady_writes() {
+    const WRITES: u64 = 2_400;
+    let target = coordinode_storage::engine::footprint::grants::DEFAULT_CLIENT_GRANT_BYTES;
+    for limit in [0, 1 << 30] {
+        let (a, b) = tokio::time::timeout(Duration::from_secs(600), async {
+            tokio::join!(grant_cost(limit, WRITES, 19), grant_cost(limit, WRITES, 23))
+        })
+        .await
+        .expect("test timed out");
+        for (group, cost) in [("a", &a), ("b", &b)] {
+            let mib = cost.accounted as f64 / f64::from(1u32 << 20);
+            eprintln!(
+                "limit {limit} group {group}: {WRITES} writes, {mib:.1} MiB accounted, \
+                 member 3 horizons stored {} ({:.3}/MiB), journal syncs {} ({:.2}/MiB), \
+                 write p50 {:?} p99 {:?}, member 3 pool peak {:.2} MiB",
+                cost.stores,
+                cost.stores as f64 / mib,
+                cost.syncs,
+                cost.syncs as f64 / mib,
+                cost.p50,
+                cost.p99,
+                cost.peak as f64 / f64::from(1u32 << 20),
+            );
+            if limit == 0 {
+                assert_eq!(cost.stores, 0, "no limit, no grant");
+            } else {
+                // A refill per target's worth of entries, and the first.
+                let refills = cost.accounted / target + 2;
+                assert!(
+                    cost.stores <= refills,
+                    "{} horizons stored for {refills} refills",
+                    cost.stores
+                );
+                assert!(
+                    cost.peak <= 2 * target + (1 << 20),
+                    "the pool held {} bytes",
+                    cost.peak
+                );
+            }
+        }
+    }
 }
 
 /// Propose on follower returns NotLeader error (not panic, not hang).
@@ -2609,6 +3148,7 @@ async fn append_stream_to_stopped_node_ends_with_an_error() {
         let payload = RaftPayload {
             data: rmp_serde::to_vec(&request).expect("encode"),
             group: GroupId::FORMING.raw(),
+            grant: None,
         };
         let mut request = tonic::Request::new(futures_util::stream::iter([payload]));
         coordinode_raft::cluster::version::write_handshake(request.metadata_mut(), &record);

@@ -54,6 +54,10 @@ pub struct GroupReplica {
     /// later: consensus pauses here instead of failing a log fsync on a full
     /// disk, which would stop it for good.
     space: Arc<coordinode_storage::engine::space::SpaceGuard>,
+    /// The store a larger promise of the grant is written to before it is
+    /// reported. Not a hold: a server that outlives the node keeps nothing
+    /// open, and its reports then promise no more than was stored.
+    engine: std::sync::Weak<coordinode_storage::engine::core::StorageEngine>,
     /// While this member lacks committed entries its disk lost, every vote
     /// is withheld: its shorter log could elect a leader without them.
     catch_up: super::catch_up::CatchUp,
@@ -76,30 +80,219 @@ impl GroupReplica {
     /// Reserve the room the entries of `req` take under the hard limits, or
     /// refuse them as unavailable: the leader admitted them against its own
     /// limit, and this member's log append must not meet its limit inside
-    /// the write either. Once they are in the log the room is held until
-    /// they are applied ([`Self::hold_until_applied`]).
-    fn reserve_entries(
-        &self,
-        req: &openraft::raft::AppendEntriesRequest<TypeConfig>,
-    ) -> Result<coordinode_storage::engine::footprint::Admitted, Status> {
-        let (bytes, class) = entries_footprint(req);
-        self.space
-            .reserve(bytes, class)
-            .map_err(|e| Status::unavailable(e.to_string()))
+    /// the write either. The answer to the request settles the room
+    /// ([`OwnWorkRoom`]).
+    fn reserve_entries(&self, req: &openraft::raft::AppendEntriesRequest<TypeConfig>) -> Reserved {
+        reserve_entries(&self.space, req)
     }
 
-    /// Keep `room`, reserved for entries now in the log through `last`,
-    /// until the state machine applied them.
-    fn hold_until_applied(
-        &self,
-        last: Option<u64>,
+    /// The room this member holds for its leader's client entries after its
+    /// last log entry, topped up towards its configured grant first; `None`
+    /// without a hard limit.
+    fn grant(&self) -> Option<crate::proto::replication::ClientGrant> {
+        report_grant(&self.space, &self.engine, &self.raft)
+    }
+
+    /// `data` as the response to an append, carrying this member's grant.
+    fn append_payload(&self, data: Vec<u8>) -> RaftPayload {
+        RaftPayload {
+            grant: self.grant(),
+            ..self.payload(data)
+        }
+    }
+}
+
+/// The room a request's entries hold while it is handled: the recovery
+/// reserve for the group's own work, held until they are applied. What it
+/// set aside from the granted pool is the pool's to settle by what the log
+/// does with the entries: the request's waiter going away proves nothing.
+type Reserved = Result<coordinode_storage::engine::footprint::Admitted, Status>;
+
+/// The rooms a request's entries take, by whose room pays: the group's own
+/// work, the uncommitted client entries, the committed client entries
+/// ([`entries_footprint`]).
+type EntryRooms = (
+    u64,
+    Vec<coordinode_storage::engine::footprint::grants::GrantedEntry>,
+    Vec<coordinode_storage::engine::footprint::grants::GrantedEntry>,
+);
+
+/// Read free space where waiting on the filesystem holds up nothing (a
+/// blocking thread) when the last reading is too old to admit by: the
+/// reservation that follows admits by the reading and never reads it.
+async fn read_free_space(
+    space: &Arc<coordinode_storage::engine::space::SpaceGuard>,
+) -> Result<(), Status> {
+    if !space.needs_reading() {
+        return Ok(());
+    }
+    let space = Arc::clone(space);
+    tokio::task::spawn_blocking(move || space.refresh())
+        .await
+        .map_err(|e| Status::internal(format!("read free space: {e}")))
+}
+
+/// Set aside room for the client entries of `req` from the granted pool,
+/// and reserve the rest (the group's own work, entries already committed)
+/// from the recovery reserve.
+fn reserve_entries(
+    space: &coordinode_storage::engine::space::SpaceGuard,
+    req: &openraft::raft::AppendEntriesRequest<TypeConfig>,
+) -> Reserved {
+    reserve_rooms(space, entries_footprint(req))
+}
+
+/// [`reserve_entries`] for the rooms [`entries_footprint`] took apart. By
+/// the last free-space reading only: it never reads the filesystem, which
+/// [`read_free_space`] did beforehand.
+fn reserve_rooms(
+    space: &coordinode_storage::engine::space::SpaceGuard,
+    (recovery, granted, settled): EntryRooms,
+) -> Reserved {
+    // Client entries are client writes to the disk: below its free-space
+    // reserve it takes none, granted or not. The rest are checked as the
+    // store's own work below.
+    if !granted.is_empty() {
+        space
+            .admit_free_space_as_read()
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+    }
+    space.footprints().stage_granted(&granted).map_err(|e| {
+        tracing::warn!(
+            entries = ?granted,
+            granted_room = space.footprints().granted_room(),
+            "the leader sent client entries past the room this member granted"
+        );
+        Status::unavailable(e.to_string())
+    })?;
+    // Committed client entries spend the grant like any other while it has
+    // room: the leader counted them against it, so the room the member
+    // promised stays where it was rather than growing with each one. What
+    // the grant cannot take the recovery reserve does, for the entries not
+    // paid yet only, decided and held by the pool in one step.
+    space
+        .footprints()
+        .stage_settled(&settled, || space.admit_recovery_as_read())
+        .map_err(|e| Status::unavailable(e.to_string()))?;
+    // Entries that are all client entries need nothing more.
+    if recovery == 0 {
+        return Ok(coordinode_storage::engine::footprint::Admitted::default());
+    }
+    space
+        .reserve_recovery_as_read(recovery)
+        .map_err(|e| Status::unavailable(e.to_string()))
+}
+
+/// What `space` holds granted for client entries after `raft`'s last log
+/// entry, topped up first; a promise larger than stored is written to
+/// `engine` first. The last index is read before the room: an entry
+/// appended in between was paid from the room reported, so the leader
+/// counts it in flight once more rather than not at all.
+fn report_grant(
+    space: &coordinode_storage::engine::space::SpaceGuard,
+    engine: &std::sync::Weak<coordinode_storage::engine::core::StorageEngine>,
+    raft: &RaftInstance,
+) -> Option<crate::proto::replication::ClientGrant> {
+    use openraft::async_runtime::watch::WatchReceiver;
+    let footprints = space.footprints();
+    if footprints.is_empty() {
+        return None;
+    }
+    footprints.top_up_grant();
+    let last_index = raft.metrics().borrow_watched().last_log_index.unwrap_or(0);
+    let (report, raise) = footprints.grant_report(last_index);
+    // The pool reaches past the stored horizon: store the further one off
+    // the runtime, synced; later reports reach it once it is on disk. This
+    // reply is not held for it.
+    if let Some(raised) = raise {
+        let (footprints, engine) = (footprints.clone(), engine.clone());
+        tokio::task::spawn_blocking(move || {
+            let stored =
+                engine
+                    .upgrade()
+                    .is_some_and(|engine| match engine.store_client_grant(raised) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "could not store the client grant");
+                            false
+                        }
+                    });
+            footprints.grant_horizon_stored(raised, stored);
+        });
+    }
+    Some(crate::proto::replication::ClientGrant {
+        epoch: report.epoch,
+        last_index: report.last_index,
+        available: report.available,
+        seq: report.seq,
+    })
+}
+
+/// The own-work room of one append request, owned until the consensus says
+/// what became of its entries. Settled by the answer: kept until applied
+/// through what the log took, given back when it took nothing. Dropped
+/// unsettled (the waiter went away, the core may still append what it
+/// queued), it is kept until the log is applied past the request's last
+/// entry.
+struct OwnWorkRoom {
+    footprints: coordinode_storage::engine::footprint::Footprints,
+    last: u64,
+    room: Option<coordinode_storage::engine::footprint::Admitted>,
+}
+
+impl OwnWorkRoom {
+    fn new(
+        footprints: &coordinode_storage::engine::footprint::Footprints,
+        last: u64,
         room: coordinode_storage::engine::footprint::Admitted,
-    ) {
-        if let Some(last) = last {
-            self.space.footprints().hold_until_applied(last, room);
+    ) -> Self {
+        Self {
+            footprints: footprints.clone(),
+            last,
+            room: Some(room),
         }
     }
 
+    /// The log holds the request's entries through `matched`: `None` when it
+    /// took none of them (a refused vote or a log that does not match).
+    fn settle(mut self, matched: Option<u64>) {
+        let Some(room) = self.room.take() else {
+            return;
+        };
+        match matched {
+            Some(through) => self
+                .footprints
+                .hold_until_applied(through.min(self.last), room),
+            // Given back by its drop.
+            None => drop(room),
+        }
+    }
+
+    /// The matched index an append answer proves, `None` when it proves
+    /// nothing was taken.
+    fn matched(resp: &openraft::raft::AppendEntriesResponse<TypeConfig>, last: u64) -> Option<u64> {
+        use openraft::raft::AppendEntriesResponse;
+        match resp {
+            AppendEntriesResponse::Success => Some(last),
+            AppendEntriesResponse::PartialSuccess(matched) => matched.map(|id| id.index),
+            AppendEntriesResponse::Conflict | AppendEntriesResponse::HigherVote(_) => None,
+        }
+    }
+}
+
+impl Drop for OwnWorkRoom {
+    fn drop(&mut self) {
+        if let Some(room) = self.room.take() {
+            self.footprints.hold_until_applied(self.last, room);
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests;
+
+impl GroupReplica {
     /// Admit a call: its caller must be a member that `op` is open to, its
     /// version record must speak for that member, and its version must
     /// match. Returns the member the caller is. A record naming another
@@ -156,38 +349,44 @@ impl GroupReplica {
         RaftPayload {
             data,
             group: self.group().raw(),
+            grant: None,
         }
     }
 }
 
-/// The room the entries of `req` take under a hard limit, and whose growth
-/// it is: the client's, unless every proposal is the group's own work (as
-/// the leader admitted it) or every entry is committed already. Those may
-/// use the recovery reserve: a committed entry is acknowledged history the
-/// group holds, and refusing it would only leave this member behind.
-fn entries_footprint(
-    req: &openraft::raft::AppendEntriesRequest<TypeConfig>,
-) -> (u64, coordinode_storage::engine::footprint::Admit) {
-    use coordinode_storage::engine::footprint::{Admit, closure_footprint, write_footprint};
-    let entries = &req.entries;
+/// The room the entries of `req` take under a hard limit, split by whose
+/// room pays: the group's own work (as the leader admitted it) takes the
+/// recovery reserve; each uncommitted entry's client proposals must be paid
+/// from the room this member granted its leader, by the entry's index and
+/// term; the client proposals of entries already committed are paid from
+/// that room too while it has it, and otherwise from the recovery reserve,
+/// since a committed entry is acknowledged history the group holds and
+/// refusing it would only leave this member behind. Returns the own work's
+/// room, the uncommitted client entries and the committed ones.
+fn entries_footprint(req: &openraft::raft::AppendEntriesRequest<TypeConfig>) -> EntryRooms {
+    use coordinode_storage::engine::footprint::grants::GrantedEntry;
     let committed = req.leader_commit.as_ref().map(|id| id.index);
-    let mut bytes = 0u64;
-    let all_committed = entries
-        .last()
-        .is_some_and(|last| committed.is_some_and(|c| last.log_id.index <= c));
-    let mut class = Admit::Recovery;
-    for entry in entries {
-        if let openraft::entry::EntryPayload::Normal(request) = &entry.payload {
-            for proposal in &request.proposals {
-                // Bounded by the size of a message received.
-                bytes += write_footprint(&proposal.mutations) + closure_footprint();
-                if !proposal.bypass_rate_limiter && !all_committed {
-                    class = Admit::Client;
-                }
-            }
+    let mut recovery = 0u64;
+    let (mut granted, mut settled) = (Vec::new(), Vec::new());
+    for entry in &req.entries {
+        let (own, client) = super::grants::entry_room(entry);
+        // Bounded by the size of a message received.
+        recovery += own;
+        if client == 0 {
+            continue;
+        }
+        let client = GrantedEntry {
+            index: entry.log_id.index,
+            term: entry.log_id.committed_leader_id().term,
+            bytes: client,
+        };
+        if committed.is_some_and(|c| entry.log_id.index <= c) {
+            settled.push(client);
+        } else {
+            granted.push(client);
         }
     }
-    (bytes, class)
+    (recovery, granted, settled)
 }
 
 /// Why a replica could not be added to a server.
@@ -302,13 +501,14 @@ impl RaftGrpcHandler {
     /// staging received snapshots in `snapshot_dir` (see
     /// [`crate::snapshot::snapshot_dir`]), admitting peers through
     /// `admission` and calls through `gate`, taking writes only while
-    /// `space` has room and withholding votes while `catch_up` is pending.
+    /// `engine`'s store has room and withholding votes while `catch_up` is
+    /// pending.
     pub(crate) fn new(
         raft: Arc<RaftInstance>,
         snapshot_dir: PathBuf,
         gate: Arc<VersionGate>,
         admission: Arc<Admission>,
-        space: Arc<coordinode_storage::engine::space::SpaceGuard>,
+        engine: Arc<coordinode_storage::engine::core::StorageEngine>,
         catch_up: super::catch_up::CatchUp,
     ) -> Self {
         let groups = HostedGroups::default();
@@ -318,7 +518,8 @@ impl RaftGrpcHandler {
             snapshot_dir,
             gate,
             admission,
-            space,
+            space: Arc::clone(engine.space()),
+            engine: Arc::downgrade(&engine),
             catch_up,
         };
         replicas.insert(replica.group(), Arc::new(replica));
@@ -448,12 +649,14 @@ impl RaftService for RaftGrpcHandler {
         // A heartbeat writes nothing and keeps this member following its
         // leader; only entries wait for space, holding theirs until they are
         // applied.
-        let last = req.entries.last().map(|entry| entry.log_id.index);
-        let room = if req.entries.is_empty() {
-            None
-        } else {
-            replica.admit_write()?;
-            Some(replica.reserve_entries(&req)?)
+        let room = match req.entries.last() {
+            None => None,
+            Some(last) => {
+                let last = last.log_id.index;
+                read_free_space(&replica.space).await?;
+                let room = replica.reserve_entries(&req)?;
+                Some(OwnWorkRoom::new(replica.space.footprints(), last, room))
+            }
         };
         replica.catch_up.note(&req);
 
@@ -463,10 +666,11 @@ impl RaftService for RaftGrpcHandler {
             .await
             .map_err(|e| Status::internal(format!("append_entries: {e}")))?;
         if let Some(room) = room {
-            replica.hold_until_applied(last, room);
+            let matched = OwnWorkRoom::matched(&resp, room.last);
+            room.settle(matched);
         }
 
-        Ok(replica.answer(replica.payload(ser(&resp)?)))
+        Ok(replica.answer(replica.append_payload(ser(&resp)?)))
     }
 
     type StreamAppendStream = Pin<Box<dyn Stream<Item = Result<RaftPayload, Status>> + Send>>;
@@ -543,40 +747,54 @@ impl RaftService for RaftGrpcHandler {
         // Heartbeats pass while the disk is below its reserve; the first
         // request carrying entries that do not fit then ends the stream, and
         // the reply stream ends with UNAVAILABLE so the leader backs off and
-        // sends again later. A request's room is held by the stream until its
-        // reply (the consensus answers the requests in order, each once its
-        // entries are in the log), then until its entries are applied.
+        // sends again later. A request's own-work room is owned from before
+        // it reaches the consensus until its answer, which the consensus
+        // gives in order, one per request: kept through what the log took,
+        // given back when it took nothing. Rooms left unanswered when the
+        // stream goes are kept until the log is applied past them: the core
+        // may still append what it queued.
         let space = Arc::clone(&replica.space);
         let cut = Arc::new(core::sync::atomic::AtomicBool::new(false));
         let cut_in = Arc::clone(&cut);
-        let held: Arc<
-            parking_lot::Mutex<
-                std::collections::VecDeque<(
-                    Option<u64>,
-                    coordinode_storage::engine::footprint::Admitted,
-                )>,
-            >,
-        > = Arc::default();
-        let held_in = Arc::clone(&held);
+        let owed: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<OwnWorkRoom>>>> =
+            Arc::default();
+        let owed_in = Arc::clone(&owed);
+        // One request at a time: the next is not taken before this one's
+        // room is settled, so the rooms queue in the order of the answers.
         let input_stream = input_stream.take_while(move |req| {
-            let room = if req.entries.is_empty() {
-                Ok(coordinode_storage::engine::footprint::Admitted::default())
-            } else {
-                let (bytes, class) = entries_footprint(req);
-                space.reserve(bytes, class)
-            };
-            let pass = match room {
-                Ok(room) => {
-                    let last = req.entries.last().map(|entry| entry.log_id.index);
-                    held_in.lock().push_back((last, room));
-                    true
+            let request = req
+                .entries
+                .last()
+                .map(|entry| (entry.log_id.index, entries_footprint(req)));
+            let (space, owed_in, cut_in) = (
+                Arc::clone(&space),
+                Arc::clone(&owed_in),
+                Arc::clone(&cut_in),
+            );
+            async move {
+                let Some((last, rooms)) = request else {
+                    owed_in.lock().push_back(None);
+                    return true;
+                };
+                let room = match read_free_space(&space).await {
+                    Ok(()) => reserve_rooms(&space, rooms),
+                    Err(e) => Err(e),
+                };
+                match room {
+                    Ok(room) => {
+                        owed_in.lock().push_back(Some(OwnWorkRoom::new(
+                            space.footprints(),
+                            last,
+                            room,
+                        )));
+                        true
+                    }
+                    Err(_) => {
+                        cut_in.store(true, core::sync::atomic::Ordering::Release);
+                        false
+                    }
                 }
-                Err(_) => {
-                    cut_in.store(true, core::sync::atomic::Ordering::Release);
-                    false
-                }
-            };
-            futures_util::future::ready(pass)
+            }
         });
         let catch_up = replica.catch_up.clone();
         let input_stream = input_stream.inspect(move |req| catch_up.note(req));
@@ -606,18 +824,24 @@ impl RaftService for RaftGrpcHandler {
         let output = replica.raft.stream_append(input_stream);
 
         // Serialize output stream: StreamAppendResult → RaftPayload
-        let footprints = replica.space.footprints().clone();
+        let (grant_space, grant_engine, grant_raft) = (
+            Arc::clone(&replica.space),
+            replica.engine.clone(),
+            Arc::clone(&replica.raft),
+        );
         let output_stream = output.map(move |result| match result {
             Ok(stream_result) => {
-                // The oldest request's entries are in the log now.
-                if let Some((Some(last), room)) = held.lock().pop_front() {
-                    footprints.hold_until_applied(last, room);
+                // The oldest request is answered.
+                if let Some(Some(room)) = owed.lock().pop_front() {
+                    let matched = stream_result.as_ref().ok().copied().flatten();
+                    room.settle(matched.map(|id| id.index));
                 }
                 let data = rmp_serde::to_vec(&stream_result)
                     .map_err(|e| Status::internal(format!("serialize: {e}")))?;
                 Ok(RaftPayload {
                     data,
                     group: group.raw(),
+                    grant: report_grant(&grant_space, &grant_engine, &grant_raft),
                 })
             }
             Err(fatal) => Err(Status::internal(format!("fatal: {fatal}"))),

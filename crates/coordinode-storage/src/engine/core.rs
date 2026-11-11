@@ -482,6 +482,14 @@ pub enum CrashKind {
     Kill,
 }
 
+/// A journal stopped by [`StorageEngine::hold_journal`]; it answers again
+/// once this is dropped.
+#[cfg(any(test, feature = "test-faults"))]
+#[must_use = "the journal answers again once this is dropped"]
+pub struct JournalStall<'a> {
+    _held: std::sync::MutexGuard<'a, crate::engine::oplog_journal::EmbeddedOplog>,
+}
+
 /// When a [`StorageEngine::commit_local`] call returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalSync {
@@ -765,6 +773,7 @@ impl StorageEngine {
         // with what the endpoints already hold.
         let footprints = crate::engine::footprint::Footprints::open(&config.endpoints)
             .map_err(|e| StorageError::Io(format!("measure the endpoints' footprint: {e}")))?;
+        footprints.set_grant_target(config.client_grant_bytes);
         // A store that does not fit its limit still opens; what it grows
         // while opening is bounded by the phase, held until this returns.
         let _opening = footprints.open_phase();
@@ -2287,6 +2296,96 @@ impl StorageEngine {
     /// Work already waiting on it is held to the new rate at once.
     pub fn set_maintenance_rate(&self, bytes_per_sec: u64) {
         self.maintenance.set_rate(bytes_per_sec);
+    }
+
+    /// Retune the room this member keeps granted for its leader's client
+    /// writes ([`StorageConfig::client_grant_bytes`]): refilled in batches
+    /// of up to twice `bytes` once below it. A larger grant is taken as room
+    /// allows; a smaller one takes back nothing already granted, which the
+    /// leader may count on.
+    pub fn set_client_grant(&self, bytes: u64) {
+        self.footprints.set_grant_target(bytes);
+    }
+
+    /// The stored client grant record of this member; the default before
+    /// the first opening.
+    ///
+    /// # Errors
+    ///
+    /// The record could not be read or has the wrong shape.
+    pub fn client_grant_record(
+        &self,
+    ) -> StorageResult<crate::engine::footprint::grants::GrantRecord> {
+        use crate::engine::footprint::grants::GrantRecord;
+        match self.get(Partition::Raft, CLIENT_GRANT_KEY)? {
+            Some(bytes) if bytes.len() == 16 => {
+                let field = |n: usize| {
+                    let mut word = [0u8; 8];
+                    word.copy_from_slice(&bytes[n * 8..n * 8 + 8]);
+                    u64::from_be_bytes(word)
+                };
+                Ok(GrantRecord {
+                    horizon: field(0),
+                    epoch: field(1),
+                })
+            }
+            Some(_) => Err(StorageError::Serialization(
+                "the client grant record has the wrong length".to_string(),
+            )),
+            None => Ok(GrantRecord::default()),
+        }
+    }
+
+    /// Start opening this member's client grant, before anything else is
+    /// admitted: count this opening in the stored epoch, with the log
+    /// applied through `applied` and the group's applied client bytes
+    /// `total` through `through`. The member then hands the pool its
+    /// unapplied client entries and what the reports reach past them
+    /// ([`crate::engine::footprint::Footprints::recover_granted`]). Returns the
+    /// epoch this process reports under.
+    ///
+    /// # Errors
+    ///
+    /// The record could not be read or stored.
+    pub fn open_client_grant(&self, applied: u64, through: u64, total: u64) -> StorageResult<u64> {
+        let stored = self.client_grant_record()?;
+        let opened = crate::engine::footprint::grants::GrantRecord {
+            epoch: stored
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| StorageError::Serialization("client grant epoch overflow".into()))?,
+            ..stored
+        };
+        self.store_client_grant(opened)?;
+        self.footprints
+            .recover_granted_start(opened, applied, through, total);
+        Ok(opened.epoch)
+    }
+
+    /// Store `record` as this member's client grant record, synced before it
+    /// returns: the store a raised horizon
+    /// ([`crate::engine::footprint::Footprints::grant_report`]) reaches the
+    /// disk through before any report reaches it. Blocking: callers on the
+    /// async runtime run it on a blocking thread.
+    ///
+    /// # Errors
+    ///
+    /// The record could not be written.
+    pub fn store_client_grant(
+        &self,
+        record: crate::engine::footprint::grants::GrantRecord,
+    ) -> StorageResult<()> {
+        let mut value = Vec::with_capacity(16);
+        value.extend_from_slice(&record.horizon.to_be_bytes());
+        value.extend_from_slice(&record.epoch.to_be_bytes());
+        self.commit_local(
+            vec![LocalWrite::Put {
+                partition: Partition::Raft,
+                key: CLIENT_GRANT_KEY.to_vec(),
+                value,
+            }],
+            LocalSync::BeforeUse,
+        )
     }
 
     /// Back the maintenance budget off, down to 5% of its rate, while the
@@ -5527,6 +5626,16 @@ impl StorageEngine {
         }
     }
 
+    /// Stop the journal, as a disk that does not answer would: every write
+    /// and sync of it waits until the returned hold is dropped. `None` for a
+    /// store kept in memory. For fault tests.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn hold_journal(&self) -> Option<JournalStall<'_>> {
+        Some(JournalStall {
+            _held: self.journal_in_use()?.lock().ok()?,
+        })
+    }
+
     /// The journal this store writes: its own, or the member-local one when
     /// its log is a consensus log. A store keeps one of the two once open.
     fn journal_in_use(&self) -> Option<&Arc<Mutex<EmbeddedOplog>>> {
@@ -7229,6 +7338,11 @@ const REBUILD_INTENT_DIR: &str = "rebuild";
 /// [`StorageEngine::closure_record`]. A snapshot carries both, and a restart
 /// finds them with the entries its tree holds.
 pub const CLOSURE_KEY: &[u8] = b"closure:below";
+
+/// This member's client grant record in the Raft partition: the horizon its
+/// reports reached and the count of its openings, two big-endian u64s.
+/// Member-local, written through the member's own journal.
+const CLIENT_GRANT_KEY: &[u8] = b"storage:client_grant";
 
 /// The closure ledger's held count while the store keeps no ledger: a store
 /// that applies no consensus log owes it nothing.

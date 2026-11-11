@@ -679,6 +679,17 @@ impl PendingCommits {
         self.wake_all(table);
     }
 
+    /// Whether a commit admitted or not yet logged below `ts` still holds the
+    /// bound: a timestamp allocated before `ts` that has not reached the log
+    /// or been withdrawn. None can appear once there is none, since the
+    /// clock hands out only later ones. For tests.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn held_below(&self, ts: u64) -> bool {
+        let table = self.inner.lock();
+        table.admitted.values().any(|a| a.commit_ts < ts)
+            || table.unlogged.values().any(|&held| held < ts)
+    }
+
     /// Whether a registration still standing is sealed into `proposal`. While
     /// one is, a bound past its timestamp was handed out only by an entry
     /// carrying `proposal`: every other entry stays below it.

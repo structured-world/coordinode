@@ -189,6 +189,7 @@ pub(crate) async fn serve(
         text_index_retry_ms: _,
         resume_free_bytes: _,
         maintenance_mb_per_sec: _,
+        client_grant_mb: _,
         maintenance_backoff_ms: _,
         compaction_strategy: _,
         write_slowdown_mb_per_sec: _,
@@ -435,6 +436,9 @@ pub(crate) async fn serve(
     }
     if let Some(bytes) = sizes.maintenance_bytes_per_sec {
         storage_config.maintenance_bytes_per_sec = bytes;
+    }
+    if let Some(bytes) = sizes.client_grant_bytes {
+        storage_config.client_grant_bytes = bytes;
     }
     if let Some(bytes) = sizes.write_slowdown_bytes_per_sec {
         storage_config.write_slowdown_bytes_per_sec = bytes;

@@ -543,6 +543,13 @@ pub enum ProposalError {
         hard_limit_bytes: u64,
     },
 
+    /// No majority of the group's members holds room for this client write
+    /// next to the writes already in flight to them, so it was refused
+    /// before it reached the log; nothing was written. Retryable once the
+    /// members apply what they hold.
+    #[error("no majority of the group's members holds room for this write")]
+    MembersFull,
+
     /// Proposal was a duplicate (already applied). Not an error in
     /// normal operation — Raft replay can deliver the same proposal twice.
     #[error("duplicate proposal: {0}")]

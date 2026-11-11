@@ -28,6 +28,7 @@
 
 pub mod admission;
 mod catch_up;
+pub(crate) mod grants;
 pub mod grpc_server;
 pub mod nemesis;
 pub(crate) mod network;
@@ -229,6 +230,78 @@ impl Commands {
         drop(held);
         written
     }
+}
+
+/// Owe again, as the store's own recovery, the room the client entries
+/// `log_store` holds past `applied` take, and the room this member's
+/// reports before the restart reach past its log: what the granted pool
+/// held did not survive the restart. Admitted before the member serves, so
+/// nothing else takes that room first.
+async fn recover_granted_room(
+    log_store: &mut LogStore,
+    engine: &Arc<StorageEngine>,
+    applied: u64,
+) -> Result<(), RaftNodeError> {
+    use coordinode_storage::engine::footprint::grants::GrantedEntry;
+    use openraft::storage::{RaftLogReader, RaftLogStorage};
+    /// Entries read at a time: the open holds one batch, never the log.
+    const BATCH: u64 = 256;
+    let footprints = engine.footprints();
+    if footprints.is_empty() {
+        return Ok(());
+    }
+    let open =
+        |e: &dyn std::fmt::Display| RaftNodeError::Init(format!("open the client grant: {e}"));
+    // The group's applied client bytes, as far as the Schema tree holds
+    // them; the entries past that in the log add theirs.
+    let counted = crate::storage::GrantedBytes::load(engine).map_err(|e| open(&e))?;
+    engine
+        .open_client_grant(applied, counted.through, counted.total)
+        .map_err(|e| open(&e))?;
+    // Every entry past the applied index is in the log: a purge stops below
+    // what every tree holds.
+    let last = log_store
+        .get_log_state()
+        .await
+        .map_err(RaftNodeError::log_open)?
+        .last_log_id
+        .map_or(0, |id| id.index);
+    // A log index is far below u64::MAX.
+    let mut from = applied + 1;
+    while from <= last {
+        let to = (from + BATCH).min(last + 1);
+        let entries = log_store
+            .try_get_log_entries(from..to)
+            .await
+            .map_err(RaftNodeError::log_open)?;
+        let batch: Vec<GrantedEntry> = entries
+            .iter()
+            .filter_map(|entry| {
+                let (_, client) = grants::entry_room(entry);
+                (client > 0).then(|| GrantedEntry {
+                    index: entry.log_id.index,
+                    term: entry.log_id.committed_leader_id().term,
+                    bytes: client,
+                })
+            })
+            .collect();
+        footprints.recover_granted(&batch).map_err(|e| open(&e))?;
+        from = to;
+    }
+    // What the reports reached past the log is held again: the leader may
+    // have appended entries against it that arrive only now.
+    footprints.recover_granted_owed().map_err(|e| open(&e))?;
+    // The first grant is stored before the member serves, so its first
+    // report already carries room: past this point further horizons are
+    // stored off the path that answers the leader, a report later.
+    footprints.top_up_grant();
+    let (_, raise) = footprints.grant_report(last);
+    if let Some(raised) = raise {
+        let stored = engine.store_client_grant(raised);
+        footprints.grant_horizon_stored(raised, stored.is_ok());
+        stored.map_err(|e| open(&e))?;
+    }
+    Ok(())
 }
 
 /// Record the deployment identity `given`, or a fresh one, unless one is
@@ -645,6 +718,9 @@ pub struct RaftNode {
     /// Local-append notifier of the `LogStore`, for `w:1` / `w:N` in the
     /// proposal pipeline.
     append_notifier: Arc<AppendNotifier>,
+    /// The room followers granted for this member's client entries while it
+    /// leads, recorded by the network and admitted against by pipelines.
+    grants: Arc<grants::LeaderGrants>,
     /// gRPC server shutdown signal. Taken by `shutdown()` (or dropped with
     /// the node) to stop the accept loop.
     grpc_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -860,6 +936,7 @@ impl RaftNode {
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
         let append_notifier = log_store.append_notifier();
+        let grants = log_store.leader_grants();
         // Explicit oracle wins; otherwise fall back to the oracle the
         // engine itself stamps writes with (see the cluster constructors
         // for why the state machine must advance it).
@@ -979,6 +1056,7 @@ impl RaftNode {
             engine: crate::engine_hold::EngineHold::new(engine, "raft node"),
             oplog,
             append_notifier,
+            grants,
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
             // No peers to call.
@@ -1123,7 +1201,7 @@ impl RaftNode {
         } else {
             LostCommitted::Refuse
         };
-        let (log_store, lost_through) =
+        let (mut log_store, lost_through) =
             LogStore::open_with(Arc::clone(&engine), lost).map_err(RaftNodeError::log_open)?;
         log_store
             .bind_member(member)
@@ -1142,6 +1220,7 @@ impl RaftNode {
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
         let append_notifier = log_store.append_notifier();
+        let grants = log_store.leader_grants();
         // Wire the engine's own timestamp oracle into the state machine:
         // applied entries carry the leader's commit timestamps, and the
         // local oracle must advance past them or MVCC readers on this
@@ -1183,6 +1262,7 @@ impl RaftNode {
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
+        recover_granted_room(&mut log_store, &engine, *applied_rx.borrow()).await?;
 
         let (closing, closing_rx) = tokio::sync::watch::channel(false);
         let book = Arc::new(network::MemberBook::default());
@@ -1193,6 +1273,7 @@ impl RaftNode {
             deployment: deployment_view.clone(),
             connections: Arc::clone(&connections),
             book: Arc::clone(&book),
+            grants: Arc::clone(&grants),
         };
 
         let raft: RaftInstance =
@@ -1265,7 +1346,7 @@ impl RaftNode {
             crate::snapshot::snapshot_dir(&engine),
             Arc::clone(&version),
             Arc::clone(&admission),
-            Arc::clone(engine.space()),
+            Arc::clone(&engine),
             catch_up.clone(),
         );
 
@@ -1352,6 +1433,7 @@ impl RaftNode {
             engine: crate::engine_hold::EngineHold::new(engine, "raft node"),
             oplog,
             append_notifier,
+            grants,
             grpc_shutdown: std::sync::Mutex::new(grpc_shutdown),
             grpc_task: std::sync::Mutex::new(grpc_task),
             closing,
@@ -2034,6 +2116,7 @@ impl RaftNode {
         .with_version_gate(Arc::clone(&self.version))
         .with_space_guard(Arc::clone(self.engine.space()))
         .with_closure(Arc::clone(self.engine.arc()))
+        .with_grants(Arc::clone(&self.grants))
     }
 
     /// This member's version view: its pair, its group's, and whether it
@@ -2080,11 +2163,12 @@ impl RaftNode {
 
     /// Create a [`WaitForMajorityService`] with custom batch configuration.
     pub fn batch_pipeline_with_config(&self, config: BatchConfig) -> WaitForMajorityService {
-        WaitForMajorityService::spawn_stamping(
+        WaitForMajorityService::spawn_granted(
             Arc::clone(&self.raft),
             RateLimiter::default(),
             config,
             Some(Arc::clone(self.engine.arc())),
+            Some(Arc::clone(&self.grants)),
         )
         .with_space_guard(Arc::clone(self.engine.space()))
     }

@@ -313,6 +313,8 @@ pub struct ByteSizes {
     pub max_request_bytes: usize,
     /// `maintenance_mb_per_sec` in bytes per second (`None` = unthrottled).
     pub maintenance_bytes_per_sec: Option<u64>,
+    /// `client_grant_mb` in bytes (`None` = engine default).
+    pub client_grant_bytes: Option<u64>,
     /// `write_slowdown_mb_per_sec` in bytes per second (`None` = full speed
     /// until the stop threshold).
     pub write_slowdown_bytes_per_sec: Option<u64>,
@@ -507,6 +509,9 @@ pub struct ServerConfig {
     /// MiB per second every compaction and the scrub read and write at most,
     /// together (`None` or 0 = unthrottled).
     pub maintenance_mb_per_sec: Option<u64>,
+    /// MiB a member of a replicated group keeps admitted ahead for its
+    /// leader's client writes (`None` = 4 MiB).
+    pub client_grant_mb: Option<u64>,
     /// Read latency, in ms, above which the maintenance budget backs off
     /// while it has a rate (`None` or 0 = never).
     pub maintenance_backoff_ms: Option<u64>,
@@ -751,6 +756,7 @@ impl Default for ServerConfig {
             text_index_retry_ms: None,
             resume_free_bytes: None,
             maintenance_mb_per_sec: None,
+            client_grant_mb: None,
             maintenance_backoff_ms: None,
             compaction_strategy: None,
             write_slowdown_mb_per_sec: None,
@@ -873,6 +879,10 @@ impl ServerConfig {
             maintenance_bytes_per_sec: self
                 .maintenance_mb_per_sec
                 .map(|mib| mib_to_bytes("maintenance_mb_per_sec", mib))
+                .transpose()?,
+            client_grant_bytes: self
+                .client_grant_mb
+                .map(|mib| mib_to_bytes("client_grant_mb", mib))
                 .transpose()?,
             write_slowdown_bytes_per_sec: self
                 .write_slowdown_mb_per_sec

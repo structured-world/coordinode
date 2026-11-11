@@ -161,6 +161,10 @@ pub struct RaftProposalPipeline {
     /// from (see [`crate::closure`]). Without it entries carry no bound, and
     /// a member applying them can vouch for no cut of the log.
     closure: Option<crate::engine_hold::EngineHold>,
+    /// The room this leader's followers granted for client entries: a client
+    /// write reaches the log only while a majority can pay for it. Without
+    /// it (a group of one) the leader's own admission is the whole check.
+    grants: Option<Arc<crate::cluster::grants::LeaderGrants>>,
 }
 
 impl RaftProposalPipeline {
@@ -174,6 +178,26 @@ impl RaftProposalPipeline {
             version: None,
             space: None,
             closure: None,
+            grants: None,
+        }
+    }
+
+    /// Admit client writes against the room `grants` records the followers
+    /// granted.
+    pub(crate) fn with_grants(mut self, grants: Arc<crate::cluster::grants::LeaderGrants>) -> Self {
+        self.grants = Some(grants);
+        self
+    }
+
+    /// Claim, for one hand-over of a client `proposal`, room on a majority
+    /// of each voter set, right before the hand-over; the claim lasts until
+    /// the log takes it or the leadership ends: every caller hands over right
+    /// after, with nothing between that could refuse. The group's own work
+    /// and a pipeline without grants claim nothing.
+    fn claim_grant(&self, proposal: &RaftProposal) -> Result<(), ProposalError> {
+        match &self.grants {
+            Some(grants) => crate::cluster::grants::claim(grants, &self.raft, proposal).map(drop),
+            None => Ok(()),
         }
     }
 
@@ -293,13 +317,8 @@ impl RaftProposalPipeline {
     /// Create a pipeline with a custom rate limiter capacity.
     pub fn with_max_pending(raft: Arc<RaftInstance>, max_pending: u32) -> Self {
         Self {
-            raft,
             rate_limiter: RateLimiter::new(max_pending),
-            runtime: tokio::runtime::Handle::try_current().ok(),
-            append_notifier: None,
-            version: None,
-            space: None,
-            closure: None,
+            ..Self::new(raft)
         }
     }
 
@@ -358,7 +377,10 @@ impl RaftProposalPipeline {
         let raft = Arc::clone(&self.raft);
         let (request, hold) = self.entry(proposal, 0).await?;
         let id = proposal.id;
-        self.spawn_handle()?.spawn(async move {
+        let spawn = self.spawn_handle()?;
+        // Right before the hand-over: nothing between them fails.
+        self.claim_grant(proposal)?;
+        spawn.spawn(async move {
             let written = raft.client_write(request).await;
             // Handed to the log (or refused) by now.
             drop(hold);
@@ -414,7 +436,10 @@ impl RaftProposalPipeline {
         let _permit = self.admit(proposal, 0).await?;
         let raft = Arc::clone(&self.raft);
         let (request, hold) = self.entry(proposal, 0).await?;
-        let mut commit = self.spawn_handle()?.spawn(async move {
+        let spawn = self.spawn_handle()?;
+        // Right before the hand-over: nothing between them fails.
+        self.claim_grant(proposal)?;
+        let mut commit = spawn.spawn(async move {
             let written = raft.client_write(request).await;
             // Handed to the log (or refused) by now.
             drop(hold);
@@ -531,6 +556,14 @@ impl RaftProposalPipeline {
             // Stamped per attempt: a retry is a new hand-over. The caller's
             // own hold covers the timestamp until this returns.
             let (request, _hold) = self.entry(proposal, attempt).await?;
+            // Each hand-over is an entry the members pay for. A retry's
+            // refusal says only that it wrote nothing: an earlier attempt is
+            // in the log, where it may commit.
+            match self.claim_grant(proposal) {
+                Ok(()) => {}
+                Err(_) if attempt > 0 => return Err(ProposalError::Timeout { retries: attempt }),
+                Err(e) => return Err(e),
+            }
             let leading = crate::authority::leading_term(&self.raft);
             let write = tokio::time::timeout(timeout, self.raft.client_write(request));
             let result = match leading {
@@ -589,6 +622,8 @@ impl RaftProposalPipeline {
                 }
                 Err(_elapsed) => {
                     // Timeout — retry with exponential backoff
+                    #[cfg(test)]
+                    ATTEMPT_TIMED_OUT.notify_one();
                     metrics::counter!("coordinode_raft_proposal_retries_total").increment(1);
                     tracing::warn!(
                         proposal_id = %proposal.id,
@@ -609,6 +644,12 @@ impl RaftProposalPipeline {
         })
     }
 }
+
+/// Told each time an attempt of [`RaftProposalPipeline::propose_async`] times
+/// out after handing its entry over, so a test sees the unknown outcome
+/// happen rather than infer it from time passing.
+#[cfg(test)]
+pub(crate) static ATTEMPT_TIMED_OUT: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Extract leader ID from a ClientWriteError::ForwardToLeader, if present.
 ///

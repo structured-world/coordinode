@@ -170,6 +170,34 @@ const KEY_PURGED: &[u8] = b"raft:purged";
 const KEY_CATCH_UP: &[u8] = b"raft:catch-up";
 /// The member and group the store's consensus records belong to.
 const KEY_MEMBER: &[u8] = b"raft:member";
+/// The group's running total of applied client bytes in the Schema tree
+/// ([`GrantedBytes`]): part of the replicated state, so a snapshot carries
+/// it (Schema keys under `raft:` are member-local and stay behind).
+const KEY_GRANTED_BYTES: &[u8] = b"group:granted-bytes";
+
+/// The client bytes of every entry the group applied through `through`, as
+/// members pay for them: the same at the same index on every member, the
+/// coordinate a member's promise of room to its leader is stored in.
+///
+/// One record, rewritten by each client entry with the store's own next
+/// version rather than a commit timestamp: entries apply in log order but
+/// their commit timestamps need not follow it, and the record is no commit
+/// a read could wait for. Its latest version is the current total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GrantedBytes {
+    /// The last entry counted.
+    pub(crate) through: u64,
+    /// Client bytes of the entries through it.
+    pub(crate) total: u64,
+}
+
+impl GrantedBytes {
+    /// The total `engine`'s applied state records; none before the first
+    /// client entry.
+    pub(crate) fn load(engine: &StorageEngine) -> Result<Self, io::Error> {
+        Ok(load_stored(engine, Partition::Schema, KEY_GRANTED_BYTES)?.unwrap_or_default())
+    }
+}
 
 /// An existing member whose promise (its vote) neither copy can prove: the
 /// Raft tree lost it and the second copy is gone, damaged or another
@@ -748,6 +776,9 @@ pub struct LogStore {
     oplog: Arc<Mutex<OplogManager>>,
     /// Waiters for "my proposal is durable in this log", see [`AppendNotifier`].
     append_notifier: Arc<AppendNotifier>,
+    /// The room followers granted for this member's client entries while it
+    /// leads; told which admitted proposal each appended entry carries.
+    grants: Arc<crate::cluster::grants::LeaderGrants>,
     /// Writes appends and makes them durable off the Raft core, and answers
     /// them.
     sync: Arc<crate::log_sync::LogSync>,
@@ -978,6 +1009,13 @@ impl LogStore {
         Arc::clone(&self.append_notifier)
     }
 
+    /// The room followers granted for this member's client entries, which
+    /// the network records and the proposal pipeline admits against. Cloned
+    /// out before the `LogStore` is moved into `openraft::Raft`.
+    pub(crate) fn leader_grants(&self) -> Arc<crate::cluster::grants::LeaderGrants> {
+        Arc::clone(&self.grants)
+    }
+
     /// The [`EngineWork`] this store and its readers count in. The state
     /// machine joins it through
     /// [`CoordinodeStateMachine::with_engine_work`], so a node waits on one
@@ -1161,6 +1199,7 @@ impl LogStore {
             engine: crate::engine_hold::EngineHold::new(engine, "raft log store"),
             oplog,
             append_notifier,
+            grants: Arc::default(),
             sync,
             tail,
             last_log_id: Arc::new(Mutex::new(last_log_id)),
@@ -1486,6 +1525,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             last_log_id: Arc::clone(&self.last_log_id),
             last_purged: Arc::clone(&self.last_purged),
             append_notifier: Arc::clone(&self.append_notifier),
+            grants: Arc::clone(&self.grants),
             sync: Arc::clone(&self.sync),
             tail: Arc::clone(&self.tail),
             hold: self.hold.another(),
@@ -1589,6 +1629,23 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             callback.io_completed(Ok(()));
             return Ok(());
         };
+        // A client proposal this member admitted as leader is in flight to
+        // its followers from here on; a client entry it set aside room for as
+        // a follower is paid by the log taking it.
+        for (id, index) in &appended {
+            self.grants.appended(*id, *index);
+        }
+        let footprints = self.engine.footprints();
+        if !footprints.is_empty() {
+            for entry in &entries {
+                let (_, client) = crate::cluster::grants::entry_room(entry);
+                footprints.granted_appended(
+                    entry.log_id.index,
+                    entry.log_id.committed_leader_id().term,
+                    client,
+                );
+            }
+        }
         // In the tail first, so a read sees the entries at once; the writer
         // thread writes and syncs them, and only then is openraft told (the
         // crash-safety boundary) and the writers answered. The Raft core does
@@ -1625,6 +1682,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             .map_err(|e| io::Error::other(e.to_string()))?;
         self.tail.lock().truncate_from(keep_exclusive);
         self.sync.truncated(keep_exclusive);
+        // What the cut entries paid of the granted room goes back.
+        self.engine.footprints().granted_truncated(keep_exclusive);
 
         *self
             .last_log_id
@@ -1797,6 +1856,9 @@ pub struct CoordinodeStateMachine {
     skip_until: u64,
     /// The coverage base last written to every tree: all entries below it.
     folded: u64,
+    /// The group's applied client bytes, as recorded at the last entry
+    /// carrying any.
+    granted_bytes: GrantedBytes,
     /// Where the applies stand, held while applying; registered with the
     /// engine as its Raft apply fence.
     gate: Arc<RaftApplyGate>,
@@ -2024,6 +2086,9 @@ impl CoordinodeStateMachine {
         let folded = 0;
         let skip_until = replay_skip.as_ref().map_or(0, RaftCoverage::skip_until);
         let last_membership = Self::load_membership(&engine)?;
+        // As far as the Schema tree holds it; the entries replayed past that
+        // count again.
+        let granted_bytes = GrantedBytes::load(&engine)?;
 
         // Initialize applied watermark from the resume point.
         let initial_index = last_applied.map(|id| id.index).unwrap_or(0);
@@ -2063,6 +2128,7 @@ impl CoordinodeStateMachine {
             replay_skip,
             skip_until,
             folded,
+            granted_bytes,
             gate,
             _hold: engine_work.start(),
             engine_work,
@@ -2360,6 +2426,62 @@ impl CoordinodeStateMachine {
             .map_err(|e| io::Error::other(format!("install the closed bound: {e}")))
     }
 
+    /// Count the client bytes of entry `index` (`request`, as members pay
+    /// for it) into the group's running total, recorded in the Schema tree
+    /// as position `sub` of the entry with its coverage marker: replayed
+    /// exactly once, and carried by a snapshot, so every member reads the
+    /// same total at the same index whatever log it holds. An entry at or
+    /// below the recorded position is counted already.
+    fn apply_granted_bytes(
+        &mut self,
+        request: &Request,
+        index: u64,
+        sub: u32,
+        applies: &RaftApplyState,
+    ) -> Result<(), io::Error> {
+        let client: u64 = request
+            .proposals
+            .iter()
+            .filter(|proposal| !proposal.bypass_rate_limiter)
+            .map(crate::cluster::grants::proposal_room)
+            .sum();
+        if client == 0 || index <= self.granted_bytes.through {
+            return Ok(());
+        }
+        let total = GrantedBytes {
+            through: index,
+            // Bounded by the bytes the group ever applied.
+            total: self.granted_bytes.total + client,
+        };
+        let replay = self
+            .replay_skip
+            .as_ref()
+            .filter(|_| index < self.skip_until);
+        let held =
+            |part| applies.skips(part, index) || replay.is_some_and(|c| c.holds(part, index, sub));
+        let value = rmp_serde::to_vec(&total).map_err(|e| io::Error::other(e.to_string()))?;
+        // No commit timestamp: the store gives the record its next version,
+        // later than every version this member applied before it, so the
+        // latest version is the latest total whatever order the entries'
+        // commit timestamps came in. A record no read waits for raises no
+        // applied commit ceiling.
+        self.engine
+            .apply_raft_proposal(
+                &[Mutation::Put {
+                    partition: coordinode_core::txn::proposal::PartitionId::Schema,
+                    key: KEY_GRANTED_BYTES.to_vec(),
+                    value,
+                }],
+                0,
+                index,
+                sub,
+                held,
+            )
+            .map_err(|e| io::Error::other(format!("record the granted bytes: {e}")))?;
+        self.granted_bytes = total;
+        Ok(())
+    }
+
     /// The log index openraft re-delivers from when this state machine opens:
     /// one past the position every partition tree is known to hold.
     pub fn next_to_apply(&self) -> Result<u64, io::Error> {
@@ -2545,7 +2667,11 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                     let sub = u32::try_from(request.proposals.len()).map_err(|_| {
                         io::Error::other(format!("entry {index} carries over 2^32 proposals"))
                     })?;
-                    self.apply_closure(request.closed_below, index, sub, &gate.applies)?;
+                    // Before the closure record: whatever the total's write
+                    // leaves for the closure to account is the entry's own,
+                    // settled by its record, never a later entry's.
+                    self.apply_granted_bytes(request, index, sub, &gate.applies)?;
+                    self.apply_closure(request.closed_below, index, sub + 1, &gate.applies)?;
                     Response {
                         mutations_applied: total,
                     }
@@ -2580,7 +2706,11 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
 
             // What the entry owes is in the memtables now; the room held for
             // it since this member took it goes back.
-            self.engine.footprints().applied(index);
+            self.engine.footprints().applied(
+                index,
+                self.granted_bytes.through,
+                self.granted_bytes.total,
+            );
 
             // Broadcast applied watermark (ignore send error — receivers may be dropped)
             let _ = self.applied_tx.send(entry.log_id.index);
@@ -2728,8 +2858,14 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         // The snapshot's entries are applied now; waiters on the watermark
         // must not have to wait for a later entry that an idle cluster never
         // sends.
+        // The installed state carries the group's applied client bytes.
+        self.granted_bytes = GrantedBytes::load(&self.engine)?;
         if let Some(log_id) = meta.last_log_id {
-            self.engine.footprints().applied(log_id.index);
+            self.engine.footprints().applied(
+                log_id.index,
+                self.granted_bytes.through,
+                self.granted_bytes.total,
+            );
             self.applied_tx.send_if_modified(|applied| {
                 let raised = log_id.index > *applied;
                 if raised {

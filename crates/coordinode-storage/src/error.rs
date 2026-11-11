@@ -61,6 +61,16 @@ pub enum StorageError {
         hard_limit_bytes: u64,
     },
 
+    /// No majority of the replicated group's members holds room for this
+    /// client write next to the writes already in flight to them: refused
+    /// before anything was written, so no member meets its hard limit with
+    /// the write in its log. Retryable once the members apply what they hold.
+    #[error(
+        "no majority of the group's members holds room for this write; it is refused \
+         until they apply the writes in flight"
+    )]
+    MembersFull,
+
     /// A snapshot read below the MVCC retention horizon. History at that seqno
     /// may already be collected, so the read is refused instead of answering
     /// from whatever survived. Raise `retention_window_secs` or read at or

@@ -880,6 +880,20 @@ pub struct StorageConfig {
     /// Default 2 GiB.
     pub resume_free_bytes: u64,
 
+    /// Room, in bytes, a member of a replicated group keeps admitted ahead
+    /// from its client capacity for the client writes its leader sends, and
+    /// reports to the leader: the leader appends a client write only while
+    /// a majority holds room for it, so no member meets its hard limit with
+    /// it in its log. The member refills in batches: once below this much
+    /// free, it admits up to twice this much, which entries spend down
+    /// before the next batch, so it stores a further grant once per batch
+    /// rather than once per write. It holds between this and twice this
+    /// free (plus what unapplied entries hold), whether or not writes come;
+    /// a member short of room grants what fits. Only an endpoint with a hard
+    /// limit holds it. Default 4 MiB. Retunable at runtime through
+    /// `StorageEngine::set_client_grant`.
+    pub client_grant_bytes: u64,
+
     /// Bytes per second the background maintenance of this engine (every
     /// compaction and scrub, over every tree together) reads and writes at
     /// most, so it cannot saturate the disk the foreground needs. `0`
@@ -1099,6 +1113,7 @@ impl StorageConfig {
             relocated: false,
             min_free_bytes: crate::engine::space::DEFAULT_MIN_FREE_BYTES,
             resume_free_bytes: crate::engine::space::DEFAULT_RESUME_FREE_BYTES,
+            client_grant_bytes: crate::engine::footprint::grants::DEFAULT_CLIENT_GRANT_BYTES,
             maintenance_bytes_per_sec: 0,
             maintenance_backoff_ms: 0,
             compaction_strategy: crate::engine::CompactionStrategyKind::Leveled,

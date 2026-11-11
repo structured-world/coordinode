@@ -214,8 +214,9 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         DatabaseError::WriteBackpressure
         | DatabaseError::UniquenessUnresolved { .. }
         | DatabaseError::MemberBusy => "53000",
-        // disk_full: the disk is below its reserve, writes wait for space.
-        DatabaseError::StorageFull { .. } => "53100",
+        // disk_full: the disk is below its reserve, writes wait for space; or
+        // no majority of the members holds room for the write.
+        DatabaseError::StorageFull { .. } | DatabaseError::MembersFull => "53100",
         // read_only_sql_transaction: this member takes no writes, the leader
         // does, and a read-only member is read-only for the same reason.
         DatabaseError::NotLeader { .. } | DatabaseError::Mismatched(_) => "25006",

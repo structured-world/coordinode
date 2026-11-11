@@ -140,6 +140,36 @@ fn flush_debt_covers_each_flush_of_a_split() {
     assert_eq!(flush_debt(10, 0), one(10));
 }
 
+/// Parts split off an admission and absorbed back keep the endpoint's
+/// admitted total exact: nothing is admitted twice or given back early, and
+/// dropping every part gives all of it back once.
+#[test]
+fn split_and_absorbed_admissions_keep_the_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let footprints = Footprints::open(&[endpoint(dir.path(), 100 * UNIT)]).unwrap();
+    let footprint = Arc::clone(footprints.get("ep").unwrap());
+    let mut pool = footprints.admit(10 * UNIT, Admit::Client).unwrap();
+    assert_eq!(pool.bytes(), 10 * UNIT);
+    let part = pool.split_off(3 * UNIT).expect("held");
+    assert!(pool.split_off(8 * UNIT).is_none(), "more than is held");
+    assert_eq!((pool.bytes(), part.bytes()), (7 * UNIT, 3 * UNIT));
+    assert_eq!(footprint.admitted(), 10 * UNIT, "a split admits nothing");
+    drop(part);
+    assert_eq!(footprint.admitted(), 7 * UNIT);
+    pool.absorb(footprints.admit(2 * UNIT, Admit::Client).unwrap());
+    assert_eq!(pool.bytes(), 9 * UNIT);
+    assert_eq!(
+        footprint.admitted(),
+        9 * UNIT,
+        "absorbed, not counted twice"
+    );
+    let mut empty = Admitted::default();
+    empty.absorb(pool);
+    assert_eq!(empty.bytes(), 9 * UNIT);
+    drop(empty);
+    assert_eq!(footprint.admitted(), 0);
+}
+
 /// Racing admissions never admit more than fits.
 #[test]
 fn concurrent_admissions_never_overcommit() {

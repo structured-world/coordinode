@@ -1188,6 +1188,34 @@ fn the_maintenance_budget_parses_and_reaches_the_storage_config() {
     assert_eq!(sc.maintenance_backoff_ms, 0);
 }
 
+/// The client grant parses from the file in MiB and reaches the storage
+/// config in bytes; unset, the engine's default stays.
+#[test]
+fn the_client_grant_parses_and_reaches_the_storage_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "client_grant_mb: 16\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(
+        c.byte_sizes().expect("sizes").client_grant_bytes,
+        Some(16 * 1024 * 1024)
+    );
+    assert_eq!(
+        ServerConfig::default()
+            .byte_sizes()
+            .expect("sizes")
+            .client_grant_bytes,
+        None
+    );
+    assert_eq!(
+        ServerConfig::default()
+            .resolve_storage_config()
+            .expect("valid topology")
+            .client_grant_bytes,
+        coordinode_storage::engine::footprint::grants::DEFAULT_CLIENT_GRANT_BYTES
+    );
+}
+
 /// The compaction strategy, write slowdown rate, vector locality depth and
 /// columnar encoding level parse from the file and reach the engine; left
 /// unset, each keeps the engine's default.

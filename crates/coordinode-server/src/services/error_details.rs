@@ -135,6 +135,10 @@ pub enum Reason {
     /// carries `path`, `available_bytes` and `min_free_bytes`. Retry once
     /// space is freed.
     StorageFull,
+    /// No majority of the replicated group's members holds room for the
+    /// write next to the writes already in flight to them. Nothing was
+    /// written; retry once they apply what they hold.
+    MembersFull,
     /// A schema rule refused the write: an undeclared property on a strict
     /// label, or an attempt to set a computed one.
     SchemaViolation,
@@ -330,6 +334,7 @@ impl Reason {
             Reason::TransactionTooLarge => "TRANSACTION_TOO_LARGE",
             Reason::CapacityExhausted => "CAPACITY_EXHAUSTED",
             Reason::StorageFull => "STORAGE_FULL",
+            Reason::MembersFull => "MEMBERS_FULL",
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
             Reason::MemberBusy => "MEMBER_BUSY",
@@ -412,6 +417,9 @@ impl Reason {
             // Space comes back when someone frees it, not soon: a floor that
             // keeps clients from hammering a node that only serves reads.
             Reason::StorageFull => Some(std::time::Duration::from_secs(5)),
+            // Room comes back as the members apply the writes in flight,
+            // within their apply lag rather than an operator's cleanup.
+            Reason::MembersFull => Some(std::time::Duration::from_millis(500)),
             // The proof shrinks as the build covers more of the stored
             // nodes; an immediate retry reads almost as much again.
             Reason::UniquenessUnresolved => Some(std::time::Duration::from_secs(1)),

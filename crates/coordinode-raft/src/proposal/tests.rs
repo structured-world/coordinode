@@ -619,79 +619,154 @@ async fn a_sealed_write_retried_after_an_unknown_outcome_lands_once() {
         RaftProposalPipeline::with_max_pending(Arc::clone(node.raft()), 2)
             .with_closure(Arc::clone(&engine)),
     );
-    // A member-local record written as the first attempt is stamped holds
-    // its bound below the write; the run then shows nothing about the
-    // retry past the bound, and goes again with a fresh counter.
-    for run in 0..3 {
-        let gate = pipeline.rate_limiter.acquire(0).await.expect("permit");
-        let key = format!("counter:once-{run}").into_bytes();
-        let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
-        let proposal = RaftProposal {
-            id: ids.next(),
-            mutations: vec![Mutation::Merge {
-                partition: PartitionId::Counter,
-                key: key.clone(),
-                operand: coordinode_storage::engine::merge::encode_counter_delta(1),
-            }],
-            commit_ts: Timestamp::from_raw(ts),
-            start_ts: Timestamp::from_raw(ts),
-            bypass_rate_limiter: false,
-        };
-        held.seal(proposal.id);
+    let gate = pipeline.rate_limiter.acquire(0).await.expect("permit");
+    let key = b"counter:once".to_vec();
+    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let proposal = RaftProposal {
+        id: ids.next(),
+        mutations: vec![Mutation::Merge {
+            partition: PartitionId::Counter,
+            key: key.clone(),
+            operand: coordinode_storage::engine::merge::encode_counter_delta(1),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts),
+        bypass_rate_limiter: false,
+    };
+    held.seal(proposal.id);
+    // Whatever was allocated before the write (a member-local record being
+    // written) ends before the write is stamped; nothing later can hold below
+    // it, so its own entry is what closes the bound past it.
+    until(Duration::from_secs(10), "earlier holds end", || {
+        !engine.pending_commits().held_below(ts)
+    })
+    .await;
+    let logged_before = last_log_index(&node);
 
-        SYNC_STALL_MS.store(
-            u64::try_from(STALL.as_millis()).expect("small"),
-            Ordering::Relaxed,
-        );
-        let write = {
-            let pipeline = Arc::clone(&pipeline);
-            let proposal = proposal.clone();
-            tokio::spawn(async move { pipeline.propose_async(&proposal).await })
-        };
-        tokio::time::sleep(BASE_TIMEOUT + Duration::from_millis(300)).await;
-        SYNC_STALL_MS.store(0, Ordering::Relaxed);
-        assert!(
-            !write.is_finished(),
-            "the first attempt timed out and the retry waits for its permits"
-        );
-        let mut landed = false;
-        for _ in 0..300 {
-            if engine
-                .get(Partition::Counter, &key)
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                landed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(landed, "the first attempt, unanswered, landed");
-        // Its own entry closes the bound at once when nothing lower is held.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let closed = engine.closure_frontier() > ts;
-        assert!(!write.is_finished(), "the retry has not been stamped yet");
+    // The log's sync stalls past the first attempt's timeout: it is handed
+    // over and gets no answer in time.
+    SYNC_STALL_MS.store(
+        u64::try_from(STALL.as_millis()).expect("small"),
+        Ordering::Relaxed,
+    );
+    let write = {
+        let pipeline = Arc::clone(&pipeline);
+        let proposal = proposal.clone();
+        tokio::spawn(async move { pipeline.propose_async(&proposal).await })
+    };
+    tokio::time::timeout(STALL, crate::proposal::ATTEMPT_TIMED_OUT.notified())
+        .await
+        .expect("the first attempt times out");
+    SYNC_STALL_MS.store(0, Ordering::Relaxed);
+    assert!(
+        last_log_index(&node) > logged_before,
+        "the first attempt was handed over: its entry is in the log"
+    );
 
-        drop(gate);
-        let outcome = write.await.expect("write task");
-        assert!(
-            outcome.is_ok(),
-            "the retry of a write that landed answers success: {outcome:?}"
-        );
-        let stored = engine
+    // The retry waits for its permits until the first attempt, unanswered,
+    // is applied and its own entry closed the bound past it.
+    until(Duration::from_secs(30), "the first attempt lands", || {
+        engine
             .get(Partition::Counter, &key)
-            .expect("read the counter")
-            .expect("the counter exists");
-        let count = i64::from_le_bytes(stored[..].try_into().expect("an i64"));
-        assert_eq!(count, 1, "the write's effect applied once");
-        drop(held);
-        if closed {
-            node.shutdown().await.expect("shutdown");
-            return;
-        }
+            .ok()
+            .flatten()
+            .is_some()
+    })
+    .await;
+    until(
+        Duration::from_secs(10),
+        "its own entry closes the bound past it",
+        || engine.closure_frontier() > ts,
+    )
+    .await;
+    assert!(!write.is_finished(), "the retry waits for its permits");
+
+    drop(gate);
+    let outcome = write.await.expect("write task");
+    assert!(
+        outcome.is_ok(),
+        "the retry of a write that landed answers success: {outcome:?}"
+    );
+    let stored = engine
+        .get(Partition::Counter, &key)
+        .expect("read the counter")
+        .expect("the counter exists");
+    let count = i64::from_le_bytes(stored[..].try_into().expect("an i64"));
+    assert_eq!(count, 1, "the write's effect applied once");
+    drop(held);
+    node.shutdown().await.expect("shutdown");
+}
+
+/// A commit allocated earlier and still held keeps the bound below a later
+/// write's own entry: the entry lands, the bound stays below it until the
+/// earlier hold ends, then a closing entry covers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_earlier_hold_keeps_the_bound_below_a_later_write() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine =
+        Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open"));
+    let node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+        .await
+        .expect("open raft node");
+    settle(&node, &engine, &oracle).await;
+    let pipeline = RaftProposalPipeline::with_max_pending(Arc::clone(node.raft()), 2)
+        .with_closure(Arc::clone(&engine));
+    let (earlier, earlier_held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let proposal = RaftProposal {
+        id: ProposalIdGenerator::new().next(),
+        mutations: vec![Mutation::Merge {
+            partition: PartitionId::Counter,
+            key: b"counter:held-below".to_vec(),
+            operand: coordinode_storage::engine::merge::encode_counter_delta(1),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts),
+        bypass_rate_limiter: false,
+    };
+    held.seal(proposal.id);
+    pipeline.propose_async(&proposal).await.expect("committed");
+    assert!(
+        engine.closure_frontier() <= earlier,
+        "the earlier hold keeps the bound below the write"
+    );
+    drop(earlier_held);
+    drop(held);
+    until(
+        Duration::from_secs(10),
+        "a closing entry covers the write once the hold ends",
+        || engine.closure_frontier() > ts,
+    )
+    .await;
+    node.shutdown().await.expect("shutdown");
+}
+
+/// The last log index `node` holds.
+fn last_log_index(node: &RaftNode) -> u64 {
+    use openraft::async_runtime::watch::WatchReceiver;
+    node.raft()
+        .metrics()
+        .borrow_watched()
+        .last_log_index
+        .unwrap_or(0)
+}
+
+/// Wait until `cond` holds, for at most `within`; fail naming `what` if it
+/// never does.
+async fn until(within: Duration, what: &str, cond: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
+    while !cond() {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    unreachable!("in no run did the first attempt's own entry close the write")
 }
 
 /// An early answer proves where the entry is, not that it committed: the

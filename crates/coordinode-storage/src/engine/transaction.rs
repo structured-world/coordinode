@@ -282,6 +282,7 @@ fn proposal_err_to_commit(err: ProposalError) -> CommitError {
             used_bytes,
             hard_limit_bytes,
         }),
+        ProposalError::MembersFull => CommitError::Storage(StorageError::MembersFull),
         // Kept structured all the way up: the caller's response is to retry at
         // the leader, and it needs the id to do that.
         ProposalError::NotLeader { leader_id } => CommitError::NotLeader { leader_id },

@@ -1196,6 +1196,182 @@ async fn a_partition_ahead_of_the_applies_travels_with_its_position() {
     assert_eq!(counter(&follower), counter(&leader));
 }
 
+/// The group's applied client bytes as `engine`'s applied state records
+/// them.
+fn granted(engine: &StorageEngine) -> GrantedBytes {
+    GrantedBytes::load(engine).expect("read the granted bytes")
+}
+
+/// Entries apply in log order but may carry commit timestamps out of order:
+/// the later entry, stamped earlier, still records the current total, read
+/// back as such at once, after the store is closed and opened again, on a
+/// follower that installs a snapshot of it, and counted on from by the next
+/// entry. Before, the total was one key whose versions were ordered by the
+/// entries' timestamps, so the earlier-stamped later total hid under the
+/// earlier one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_applied_client_bytes_follow_the_log_not_the_timestamps() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let (engine, oracle) = open_rig_engine(&rig);
+    let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+        .expect("open");
+    let (early, late) = (oracle.next().as_raw(), oracle.next().as_raw());
+    let first = node_key_entry(1, late, b"node:1:a", b"a1");
+    let second = node_key_entry(2, early, b"node:1:b", b"b1");
+    let room = |entry: &Entry| crate::cluster::grants::entry_room(entry).1;
+    let total = GrantedBytes {
+        through: 2,
+        total: room(&first) + room(&second),
+    };
+    let entries = vec![first, second];
+    apply_entries(&mut sm, entries.clone()).await;
+    assert_eq!(granted(&engine), total, "read back at once");
+
+    // A clean close and a real reopen of the store; openraft delivers the
+    // entries past the folded coverage again.
+    drop(sm);
+    drop(engine);
+    let (engine, oracle) = open_rig_engine(&rig);
+    let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+        .expect("reopen");
+    assert_eq!(granted(&engine), total, "after a reopen");
+    assert_eq!(sm.granted_bytes, total);
+    apply_entries(&mut sm, entries).await;
+    assert_eq!(granted(&engine), total, "counted once when delivered again");
+
+    let (meta, bytes) = sent(pinned(&mut sm).await);
+    let follower_rig = coordinode_test_fixtures::PowerRig::new();
+    let (follower, follower_oracle) = open_rig_engine(&follower_rig);
+    let mut fsm = CoordinodeStateMachine::with_oracle(Arc::clone(&follower), Some(follower_oracle))
+        .expect("open follower");
+    fsm.install_snapshot(&meta, received(&follower, &bytes))
+        .await
+        .expect("install");
+    assert_eq!(granted(&follower), total, "carried by a snapshot");
+
+    // Stamped before the totals already written, as an entry may be.
+    let next = node_key_entry(3, early, b"node:1:c", b"c1");
+    let after = GrantedBytes {
+        through: 3,
+        total: total.total + room(&next),
+    };
+    apply_entries(&mut sm, vec![next.clone()]).await;
+    apply_entries(&mut fsm, vec![next]).await;
+    assert_eq!(granted(&engine), after);
+    assert_eq!(granted(&follower), after, "the follower counts on");
+    assert_eq!((granted_keys(&engine), granted_keys(&follower)), (1, 1));
+}
+
+/// The keys holding the group's applied client bytes in `engine`.
+fn granted_keys(engine: &StorageEngine) -> usize {
+    engine
+        .prefix_scan(Partition::Schema, b"group:granted-bytes")
+        .expect("scan")
+        .count()
+}
+
+/// Client entries without a commit timestamp (a store without an oracle
+/// stamps none) keep the group's total exact and its state bounded: one
+/// record whatever the number of entries, through applies, a purge-free
+/// reopen with redelivery, a snapshot and the entries after it. Before, every
+/// total was a key of its own, removed only by an entry stamped after it,
+/// which an unstamped entry never is: one key per entry, kept for ever.
+#[tokio::test]
+async fn unstamped_client_entries_keep_one_total() {
+    let (_dir, engine) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
+    let entries: Vec<Entry> = (1..=50u64)
+        .map(|i| node_key_entry(i, 0, format!("node:1:{i}").as_bytes(), b"v"))
+        .collect();
+    let total = GrantedBytes {
+        through: 50,
+        total: entries
+            .iter()
+            .map(|entry| crate::cluster::grants::entry_room(entry).1)
+            .sum(),
+    };
+    apply_entries(&mut sm, entries.clone()).await;
+    assert_eq!(granted(&engine), total);
+    assert_eq!(granted_keys(&engine), 1, "one record for 50 entries");
+
+    drop(sm);
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("reopen");
+    apply_entries(&mut sm, entries).await;
+    assert_eq!(granted(&engine), total, "counted once when delivered again");
+    assert_eq!(granted_keys(&engine), 1);
+
+    let (meta, bytes) = sent(pinned(&mut sm).await);
+    let (_dir2, follower) = test_engine();
+    let mut fsm = CoordinodeStateMachine::new(Arc::clone(&follower)).expect("open follower");
+    fsm.install_snapshot(&meta, received(&follower, &bytes))
+        .await
+        .expect("install");
+    assert_eq!(granted(&follower), total);
+    let next = node_key_entry(51, 0, b"node:1:51", b"v");
+    let after = GrantedBytes {
+        through: 51,
+        total: total.total + crate::cluster::grants::entry_room(&next).1,
+    };
+    apply_entries(&mut fsm, vec![next]).await;
+    assert_eq!(granted(&follower), after);
+    assert_eq!(granted_keys(&follower), 1);
+}
+
+/// The group's applied client bytes are part of the applied state: written
+/// with each client entry, counted once when an entry is delivered again,
+/// and carried by a snapshot, so a follower that installs one in place of
+/// entries it never received reads the leader's total at the same index.
+/// Without it the follower knows nothing of what those entries spent of
+/// the room it granted.
+#[tokio::test]
+async fn the_applied_client_bytes_travel_with_a_snapshot() {
+    let (_dir, leader) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&leader)).expect("open");
+    let entries = vec![
+        node_key_entry(1, 1000, b"node:1:a", b"a1"),
+        node_key_entry(2, 2000, b"node:1:b", b"b1"),
+    ];
+    let expected: u64 = entries
+        .iter()
+        .map(|entry| crate::cluster::grants::entry_room(entry).1)
+        .sum();
+    assert!(expected > 0, "client entries carry bytes");
+    apply_entries(&mut sm, entries.clone()).await;
+    let total = GrantedBytes {
+        through: 2,
+        total: expected,
+    };
+    assert_eq!(granted(&leader), total);
+
+    // Delivered again after a reopen: counted already.
+    drop(sm);
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&leader)).expect("reopen");
+    apply_entries(&mut sm, entries).await;
+    assert_eq!(granted(&leader), total);
+
+    let (meta, bytes) = sent(pinned(&mut sm).await);
+    let (_dir2, follower) = test_engine();
+    let mut fsm = CoordinodeStateMachine::new(Arc::clone(&follower)).expect("open follower");
+    assert_eq!(granted(&follower), GrantedBytes::default());
+    fsm.install_snapshot(&meta, received(&follower, &bytes))
+        .await
+        .expect("install");
+    assert_eq!(granted(&follower), total);
+    assert_eq!(fsm.granted_bytes, total, "the state machine reads it");
+
+    // The next entry counts on from the snapshot's total on both.
+    let next = node_key_entry(3, 3000, b"node:1:c", b"c1");
+    let room = crate::cluster::grants::entry_room(&next).1;
+    apply_entries(&mut sm, vec![next.clone()]).await;
+    apply_entries(&mut fsm, vec![next]).await;
+    let after = GrantedBytes {
+        through: 3,
+        total: expected + room,
+    };
+    assert_eq!(granted(&leader), after);
+    assert_eq!(granted(&follower), after);
+}
+
 #[tokio::test]
 async fn a_snapshot_holds_exactly_the_entries_up_to_its_log_id() {
     // A pinned snapshot is streamed while the state machine keeps applying.
@@ -1293,7 +1469,8 @@ fn node_key_entry(index: u64, ts: u64, key: &[u8], value: &[u8]) -> Entry {
                 value: value.to_vec(),
             }],
             commit_ts: Timestamp::from_raw(ts),
-            start_ts: Timestamp::from_raw(ts - 1),
+            // An unstamped entry (no oracle) carries no start either.
+            start_ts: Timestamp::from_raw(if ts == 0 { 0 } else { ts - 1 }),
             bypass_rate_limiter: false,
         }),
     )

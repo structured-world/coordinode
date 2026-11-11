@@ -746,6 +746,11 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
         DatabaseError::MemberBusy => {
             return status_with_reason(Code::ResourceExhausted, rendered, Reason::MemberBusy, []);
         }
+        // Nothing was written: room comes back as the members apply what
+        // they hold.
+        DatabaseError::MembersFull => {
+            return status_with_reason(Code::ResourceExhausted, rendered, Reason::MembersFull, []);
+        }
         // A write that reached a node which is not the leader.
         // FAILED_PRECONDITION rather than UNAVAILABLE: the server is
         // perfectly available, it is the request that came to the wrong node,

@@ -462,6 +462,7 @@ impl Ask {
         let mut request = tonic::Request::new(RaftPayload {
             data: Vec::new(),
             group: self.group.raw(),
+            grant: None,
         });
         super::version::write_handshake(request.metadata_mut(), &self.gate.local_handshake());
         write_deployment(request.metadata_mut(), self.deployment);

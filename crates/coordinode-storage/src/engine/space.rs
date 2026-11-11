@@ -110,10 +110,22 @@ impl SpaceGuard {
     /// # Errors
     ///
     /// [`StorageError::OutOfSpace`] while writes are paused.
-    pub(crate) fn admit_free_space(&self) -> StorageResult<()> {
+    pub fn admit_free_space(&self) -> StorageResult<()> {
         if self.is_stale() {
             self.refresh();
         }
+        self.admit_free_space_as_read()
+    }
+
+    /// [`Self::admit_free_space`] by the last reading, never reading the
+    /// filesystem: for a caller that cannot wait on it (an async task, a
+    /// lock held) and reads it beforehand where it may wait
+    /// ([`Self::needs_reading`], [`Self::refresh`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::OutOfSpace`] while writes are paused.
+    pub fn admit_free_space_as_read(&self) -> StorageResult<()> {
         if self.paused.load(Ordering::Acquire) {
             metrics::counter!("coordinode_storage_out_of_space_refusals_total").increment(1);
             return Err(self.refusal());
@@ -165,6 +177,36 @@ impl SpaceGuard {
         self.has_room(Admit::Recovery)
     }
 
+    /// [`Self::admit_recovery`] by the last reading, never reading the
+    /// filesystem (see [`Self::admit_free_space_as_read`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit_recovery`].
+    pub fn admit_recovery_as_read(&self) -> StorageResult<()> {
+        self.admit_free_space_recovery_as_read()?;
+        self.has_room(Admit::Recovery)
+    }
+
+    /// [`Self::reserve`] of the store's own work by the last reading, never
+    /// reading the filesystem (see [`Self::admit_free_space_as_read`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reserve`].
+    pub fn reserve_recovery_as_read(&self, bytes: u64) -> StorageResult<Admitted> {
+        self.admit_recovery_as_read()?;
+        self.footprints
+            .admit(bytes, Admit::Recovery.on_this_thread())
+    }
+
+    /// Whether the last free-space reading is too old to answer by: a caller
+    /// that must not wait on the filesystem reads it ([`Self::refresh`])
+    /// where it may wait, then admits by the reading.
+    pub fn needs_reading(&self) -> bool {
+        self.is_stale()
+    }
+
     /// [`Self::admit_recovery`] by free space alone, for a write the engine
     /// then admits on the footprint itself.
     ///
@@ -176,6 +218,11 @@ impl SpaceGuard {
         if self.is_stale() {
             self.refresh();
         }
+        self.admit_free_space_recovery_as_read()
+    }
+
+    /// [`Self::admit_free_space_recovery`] by the last reading.
+    fn admit_free_space_recovery_as_read(&self) -> StorageResult<()> {
         if self.available_bytes() < self.min_free_bytes() / 2 {
             metrics::counter!("coordinode_storage_out_of_space_refusals_total").increment(1);
             return Err(self.refusal());

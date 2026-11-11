@@ -65,6 +65,14 @@ pub fn db_err_to_status(context: &str, err: DatabaseError) -> Status {
                 ],
             );
         }
+        DatabaseError::MembersFull => {
+            return error_details::status_with_reason(
+                tonic::Code::ResourceExhausted,
+                format!("{context}: {err}"),
+                error_details::Reason::MembersFull,
+                [],
+            );
+        }
         DatabaseError::OperationSettled {
             outcome,
             intent_differs,

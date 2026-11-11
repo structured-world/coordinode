@@ -2182,6 +2182,118 @@ fn admitted_write(
     true
 }
 
+/// A report of `engine`'s grant after `last_index` as a member sends it,
+/// once the raise it asked for (if any) is stored: the pool topped up.
+fn grant_report(
+    engine: &StorageEngine,
+    last_index: u64,
+) -> crate::engine::footprint::grants::GrantReport {
+    let footprints = engine.footprints();
+    footprints.top_up_grant();
+    let (report, raise) = footprints.grant_report(last_index);
+    let Some(raised) = raise else {
+        return report;
+    };
+    let stored = engine.store_client_grant(raised).is_ok();
+    footprints.grant_horizon_stored(raised, stored);
+    footprints.grant_report(last_index).0
+}
+
+/// Open `engine`'s client grant as a member does: the log applied through
+/// `applied`, the group's applied client bytes `counted` (through, total),
+/// and `entries` the client entries the log holds past `applied`.
+fn open_grant(
+    engine: &StorageEngine,
+    applied: u64,
+    counted: (u64, u64),
+    entries: &[crate::engine::footprint::grants::GrantedEntry],
+) -> u64 {
+    let epoch = engine
+        .open_client_grant(applied, counted.0, counted.1)
+        .expect("open the grant");
+    engine
+        .footprints()
+        .recover_granted(entries)
+        .expect("hold the entries");
+    engine
+        .footprints()
+        .recover_granted_owed()
+        .expect("hold what is owed");
+    epoch
+}
+
+/// What a member promised its leader is what it reported, not what it is
+/// configured to grant: near its limit, a grant larger than the room left
+/// promises only what it reported, and a restart holds that again (it fits:
+/// the restart freed the pool that held it). Before, the open stored the
+/// configured grant as the promise and the next open demanded all of it,
+/// more than the endpoint could hold.
+#[test]
+fn a_restart_holds_what_was_reported_not_what_was_configured() {
+    const LIMIT: u64 = crate::engine::config::MIN_HARD_LIMIT_BYTES * 2;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let reported = {
+        let (engine, _) = clocked_capped(dir.path(), LIMIT, None);
+        engine.set_client_grant(64 << 20);
+        assert_eq!(open_grant(&engine, 0, (0, 0), &[]), 1);
+        let report = grant_report(&engine, 0);
+        assert!(report.available > 0 && report.available < 64 << 20);
+        assert_eq!(engine.footprints().grant_record().horizon, report.available);
+        report.available
+    };
+    let (engine, _) = clocked_capped(dir.path(), LIMIT, None);
+    engine.set_client_grant(64 << 20);
+    let footprint = engine.footprints().get("default").expect("a limit");
+    let before = footprint.admitted();
+    assert_eq!(
+        open_grant(&engine, 0, (0, 0), &[]),
+        2,
+        "reopens near the limit"
+    );
+    assert_eq!(
+        footprint.admitted() - before,
+        reported,
+        "the room reported is held again before anything else, no more"
+    );
+}
+
+/// A grant reported and spent on an entry applied before a crash (or held
+/// by a snapshot installed in its place), with no report after it, owes
+/// nothing on reopen: the group's applied total counts the entry. Before,
+/// the reopen read only unapplied entries and held the whole report again.
+#[test]
+fn a_spent_grant_owes_nothing_after_a_restart() {
+    use crate::engine::footprint::grants::GrantedEntry;
+    const LIMIT: u64 = 64 << 20;
+    let spent = GrantedEntry {
+        index: 1,
+        term: 1,
+        bytes: 1 << 20,
+    };
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    {
+        let (engine, _) = clocked_capped(dir.path(), LIMIT, None);
+        // A batch of twice the target: 1 MiB, spent by the entry below.
+        engine.set_client_grant(1 << 19);
+        open_grant(&engine, 0, (0, 0), &[]);
+        assert_eq!(grant_report(&engine, 0).available, 1 << 20);
+        engine.footprints().stage_granted(&[spent]).expect("stage");
+        engine.footprints().granted_appended(1, 1, 1 << 20);
+        engine.footprints().applied(1, 1, 1 << 20);
+        // Crash: no report after the entry.
+    }
+    let (engine, _) = clocked_capped(dir.path(), LIMIT, None);
+    engine.set_client_grant(0);
+    let footprint = engine.footprints().get("default").expect("a limit");
+    let before = footprint.admitted();
+    open_grant(&engine, 1, (1, 1 << 20), &[]);
+    assert_eq!(
+        footprint.admitted(),
+        before,
+        "a spent promise holds nothing"
+    );
+}
+
 /// Breakpoints held past the cache owe their removal to the footprint once
 /// their writes' admissions are given back; a restart owes it from the
 /// open, before the ledger is loaded and before any other write is

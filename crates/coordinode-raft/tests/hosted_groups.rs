@@ -471,6 +471,7 @@ async fn a_request_for_a_group_not_hosted_is_refused_by_name() {
             .vote(RaftPayload {
                 data: vote_request(),
                 group: 7,
+                grant: None,
             })
             .await
             .expect_err("a vote for a group not hosted is refused");
@@ -505,6 +506,7 @@ async fn a_record_of_another_group_than_its_message_is_refused() {
         let mut request = tonic::Request::new(RaftPayload {
             data: vote_request(),
             group: GroupId::FORMING.raw(),
+            grant: None,
         });
         write_handshake(request.metadata_mut(), &record);
         stamp(&mut request, &r.node);
@@ -544,6 +546,7 @@ async fn a_stream_message_of_another_group_ends_the_stream() {
         let mut request = tonic::Request::new(futures_util::stream::iter([RaftPayload {
             data: rmp_serde::to_vec(&append).expect("encode"),
             group: 3,
+            grant: None,
         }]));
         write_handshake(request.metadata_mut(), &record);
         stamp(&mut request, &r.node);

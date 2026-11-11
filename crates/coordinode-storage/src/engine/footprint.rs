@@ -1056,12 +1056,15 @@ pub const fn memtable_start() -> u64 {
 
 /// The room `count` writes of `data` key and value bytes in all are admitted
 /// for, bounded from above: each into the journal, then into a table an
-/// eighth larger than what it holds.
+/// eighth larger than what it holds, and as much again for what the file
+/// system allocates ahead of that table, which grows with it
+/// ([`flush_debt`]).
 #[must_use]
 pub fn footprint_of(data: u64, count: usize) -> u64 {
     // Bounded by the bytes the writes hold in memory: no overflow.
     let data = data + count as u64 * MUTATION_OVERHEAD;
-    data + data + data / 8
+    let table = data + data / 8;
+    data + table + table
 }
 
 /// A write's admissions on every capped endpoint, given back when it drops:
@@ -1078,6 +1081,55 @@ impl Admitted {
     /// Whether the admission holds nothing: no endpoint has a limit.
     fn is_empty(&self) -> bool {
         self.held.iter().all(|admission| admission.bytes == 0)
+    }
+
+    /// The bytes held on each capped endpoint (the same on every one); `0`
+    /// with no limit.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.held
+            .iter()
+            .map(|admission| admission.bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Take `bytes` of this admission into one of its own, holding them on
+    /// every endpoint this one does: nothing is given back or admitted anew.
+    /// `None` when this one holds less on some endpoint.
+    #[must_use]
+    pub fn split_off(&mut self, bytes: u64) -> Option<Self> {
+        if self.held.iter().any(|admission| admission.bytes < bytes) {
+            return None;
+        }
+        let held = self
+            .held
+            .iter_mut()
+            .map(|admission| {
+                admission.bytes -= bytes;
+                Admission {
+                    footprint: admission.footprint.clone(),
+                    bytes,
+                }
+            })
+            .collect();
+        Some(Self { held })
+    }
+
+    /// Hold what `other` holds as part of this admission. Both come from the
+    /// same footprints, which admit on their endpoints in one order.
+    pub fn absorb(&mut self, mut other: Self) {
+        if self.held.is_empty() {
+            self.held = std::mem::take(&mut other.held);
+            return;
+        }
+        debug_assert_eq!(self.held.len(), other.held.len(), "the same footprints");
+        for (mine, theirs) in self.held.iter_mut().zip(other.held.iter_mut()) {
+            debug_assert!(Weak::ptr_eq(&mine.footprint, &theirs.footprint));
+            // Both bounded by what one endpoint can hold.
+            mine.bytes += theirs.bytes;
+            theirs.bytes = 0;
+        }
     }
 }
 
@@ -1108,6 +1160,8 @@ pub struct Footprints {
     unapplied: Arc<parking_lot::Mutex<Unapplied>>,
     /// See [`Footprints::flushing`].
     unpersisted: Arc<Unpersisted>,
+    /// Room held for a leader's client entries; see [`grants`].
+    grants: Arc<parking_lot::Mutex<grants::Grants>>,
 }
 
 /// The trees whose flushes installed their tables in memory only, by tree
@@ -1173,6 +1227,7 @@ impl Footprints {
             squeeze: Arc::default(),
             unapplied: Arc::default(),
             unpersisted: Arc::default(),
+            grants: Arc::default(),
         })
     }
 
@@ -1230,13 +1285,20 @@ impl Footprints {
     }
 
     /// The consensus log is applied through `index` (or a snapshot installed
-    /// at it): the room held for the entries up to it goes back.
-    pub fn applied(&self, index: u64) {
-        let mut unapplied = self.unapplied.lock();
-        unapplied.applied = unapplied.applied.max(index);
-        if !unapplied.held.is_empty() {
-            unapplied.held.retain(|(last, _)| *last > index);
+    /// at it), with `granted_total` client bytes applied through
+    /// `granted_through` as the group's applied state records them: the room
+    /// held for the entries up to it goes back.
+    pub fn applied(&self, index: u64, granted_through: u64, granted_total: u64) {
+        {
+            let mut unapplied = self.unapplied.lock();
+            unapplied.applied = unapplied.applied.max(index);
+            if !unapplied.held.is_empty() {
+                unapplied.held.retain(|(last, _)| *last > index);
+            }
         }
+        self.grants
+            .lock()
+            .applied(index, granted_through, granted_total);
     }
 
     /// The flush monitor's wake, which a squeeze notifies.
@@ -1418,6 +1480,8 @@ impl Footprints {
         }
     }
 }
+
+pub mod grants;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
