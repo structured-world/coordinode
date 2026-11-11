@@ -2215,6 +2215,9 @@ impl<'a> Transaction<'a> {
             .filter(|(part, key, _)| !scope.iter().any(|(p, k)| p == part && k == key))
             .map(|(part, key, _)| (*part, key.clone()))
             .collect();
+        // A commit that changes the material shares its scope: a terminal
+        // decision on that measure waits for it, and it waits behind one.
+        let material = self.changes_material(!counts.is_empty());
         let pending = self.engine.pending_commits();
         let admitted = match self.overlap_wait {
             Some(wait) => pending.admit_allocated_waiting(
@@ -2222,8 +2225,11 @@ impl<'a> Transaction<'a> {
                 scope.clone(),
                 guards,
                 wait,
+                material,
             ),
-            None => pending.admit_allocated(|| oracle.next().as_raw(), scope.clone(), guards),
+            None => {
+                pending.admit_allocated(|| oracle.next().as_raw(), scope.clone(), guards, material)
+            }
         };
         let (commit_ts_raw, admission) = admitted.map_err(|refusal| match refusal {
             crate::engine::pending::Refusal::Overlap {
@@ -2248,6 +2254,9 @@ impl<'a> Transaction<'a> {
             // answer is the same one backpressure gives, a retry after a
             // delay rather than an immediate one that bounces off the
             // same ceiling.
+            // A terminal decision on the material held its scope past the
+            // wait: retried once it is ordered.
+            crate::engine::pending::Refusal::MaterialClaimed => CommitError::Backpressure,
             crate::engine::pending::Refusal::AtCapacity { limit } => {
                 tracing::warn!(
                     limit,
@@ -2572,11 +2581,13 @@ impl<'a> Transaction<'a> {
             id: founding_candidate(self.engine)?,
         })];
         // Held as not yet logged until the unit is handed over, so no closed
-        // bound passes over it.
+        // bound passes over it. Its record is in the Schema, which consumers
+        // are charged for.
         let (ts, held) = self
             .engine
             .pending_commits()
-            .obligate(|| oracle.next().as_raw());
+            .obligate_changing(|| oracle.next().as_raw())
+            .map_err(|_| CommitError::Backpressure)?;
         if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
             let proposal = RaftProposal {
                 id: id_gen.next(),
@@ -2604,6 +2615,32 @@ impl<'a> Transaction<'a> {
             ));
         }
         Ok(())
+    }
+
+    /// Whether this attempt's unit, as staged, writes anything a coalesced
+    /// state-delta consumer is charged for: anything but writes into
+    /// partitions none is charged for (the registry's own transactions).
+    /// `counts`: whether it changes kept counts, which it merges into the
+    /// counter partition.
+    fn changes_material(&self, counts: bool) -> crate::engine::pending::Material {
+        use crate::engine::material::accounted;
+        let untouched = !counts
+            && self.merge_adj_ops.is_empty()
+            && self.merge_node_deltas.is_empty()
+            && self.merge_counter_deltas.is_empty()
+            && self.derived.is_empty()
+            && self.operation.is_none()
+            && self.write_buffer.keys().all(|(part, _)| !accounted(*part))
+            && self
+                .range_removals
+                .iter()
+                .all(|(part, ..)| !accounted(*part))
+            && self.stamped.keys().all(|(part, _)| !accounted(*part));
+        if untouched {
+            crate::engine::pending::Material::Untouched
+        } else {
+            crate::engine::pending::Material::Changes
+        }
     }
 
     fn seal_unit(&mut self, wb: WriteBuffer) -> Vec<Mutation> {

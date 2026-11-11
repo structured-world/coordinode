@@ -99,6 +99,17 @@ impl Mutation {
             Self::RemoveRange { start, end, .. } => (start.len() + end.len()) as u64,
         }
     }
+
+    /// The key bytes this mutation's unit record holds: its key, or a
+    /// range's bounds.
+    fn unit_key_bytes(&self) -> u64 {
+        match self {
+            Self::Put { key, .. } | Self::Delete { key, .. } | Self::Merge { key, .. } => {
+                key.len() as u64
+            }
+            Self::RemoveRange { start, end, .. } => (start.len() + end.len()) as u64,
+        }
+    }
 }
 
 /// An atomic write batch with crash safety guarantees.
@@ -211,7 +222,10 @@ impl<'a> WriteBatch<'a> {
             crate::engine::footprint::footprint_of(
                 self.mutations.iter().map(Mutation::data_bytes).sum(),
                 self.mutations.len(),
-            ) + crate::engine::material::record_allowance(self.mutations.len()),
+            ) + crate::engine::material::record_allowance(
+                self.mutations.len(),
+                self.mutations.iter().map(Mutation::unit_key_bytes).sum(),
+            ),
         )?;
         let seqno = engine.next_seqno();
         self.commit_at(seqno)?;
@@ -333,21 +347,21 @@ fn apply_group(
     for mutation in group {
         match mutation {
             Mutation::Put { key, value, .. } => {
-                tally.unit(key, value);
+                tally.put(key, value);
                 batch.insert(addressing.point(key)?, value.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.insert(staging, value.as_slice());
                 }
             }
             Mutation::Delete { key, .. } => {
-                tally.unit(key, &[]);
+                tally.delete(key);
                 batch.remove(addressing.point(key)?);
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.remove(staging);
                 }
             }
             Mutation::Merge { key, operand, .. } => {
-                tally.unit(key, operand);
+                tally.merge(key, operand);
                 batch.merge(addressing.point(key)?, operand.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.merge(staging, operand.as_slice());
@@ -355,7 +369,7 @@ fn apply_group(
             }
             Mutation::RemoveRange { start, end, .. } => {
                 let start = coverage::clamp_user_start(start);
-                tally.unit(start, end);
+                tally.range(start, end);
                 let ranges = addressing.range(start, end);
                 let staging = addressing.staging_range(start, end);
                 for (start, end) in ranges.into_iter().chain(staging) {

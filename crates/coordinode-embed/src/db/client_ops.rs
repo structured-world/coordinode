@@ -251,11 +251,13 @@ impl Database {
     /// Commit the command `mutation` through the write pipeline on its own.
     fn propose_mutation(&self, mutation: Mutation) -> Result<(), DatabaseError> {
         // Held as not yet logged until the entry is handed over, so no
-        // closed bound passes over it meanwhile.
+        // closed bound passes over it meanwhile. A command writes Schema
+        // records, which consumers are charged for.
         let (commit_ts, held) = self
             .engine
             .pending_commits()
-            .obligate(|| self.oracle.next().as_raw());
+            .obligate_changing(|| self.oracle.next().as_raw())
+            .map_err(|_| coordinode_storage::error::StorageError::MaterialClaimed)?;
         let proposal = RaftProposal {
             id: self.proposal_id_gen.next(),
             mutations: vec![mutation],

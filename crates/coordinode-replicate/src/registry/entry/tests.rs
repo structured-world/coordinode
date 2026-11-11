@@ -51,6 +51,7 @@ fn entry(retention: ConsumerRetentionPolicy) -> RegistryEntry {
         checkpoint_seqno: 512,
         last_heartbeat_ts_ms: 1_000,
         started_at: 500,
+        obligation_since_ms: 1_000,
         follows: Some(Box::new(crate::registry::PriorIncarnation {
             incarnation: 2,
             reason: TerminalReason::LivenessExpired,
@@ -181,6 +182,30 @@ fn an_ending_on_a_replaced_observation_is_not_written() {
         ..entry(bounded(1, 1, None))
     };
     assert_eq!(e.termination(10_000, &Replaced), None);
+}
+
+/// A pinned snapshot owes its read whether or not anything was written
+/// since: with no new writes it still ends once its read has been
+/// outstanding longer than its bound, counted from when it was admitted. A
+/// state reader caught up on an idle source owes nothing.
+#[test]
+fn a_pinned_snapshot_owes_its_read_on_an_idle_source() {
+    let pin = RegistryEntry {
+        kind: ConsumerKind::MvccSnapshotPin,
+        obligation_since_ms: 1_000,
+        ..entry(bounded(5_000, u64::MAX - 1, None))
+    };
+    assert_eq!(pin.termination(6_000, &CAUGHT_UP), None);
+    assert_eq!(
+        pin.termination(6_001, &CAUGHT_UP),
+        Some(TerminalReason::ProgressLagExceeded)
+    );
+    assert_eq!(pin.next_deadline_ms(&CAUGHT_UP), Some(6_001));
+    let reader = RegistryEntry {
+        kind: ConsumerKind::LsmStateDelta,
+        ..pin.clone()
+    };
+    assert_eq!(reader.termination(1_000_000, &CAUGHT_UP), None);
 }
 
 /// A heartbeat record round-trips through its fixed form, a record of any

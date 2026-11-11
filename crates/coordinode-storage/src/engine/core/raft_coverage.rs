@@ -31,6 +31,47 @@ const FLOOR_SLOTS: usize = 16;
 /// it changes. The cleared tree holds no other version for the row to hide.
 pub const INSTALLED_ROW_SEQNO: lsm_tree::SeqNo = 0;
 
+/// Installed rows whose unit records are made at once.
+const UNIT_CHUNK: usize = 1024;
+
+/// The key bytes those copies may hold at once.
+const UNIT_CHUNK_BYTES: usize = 8 << 20;
+
+/// Hand the unit records of installed `rows` to `emit` a bounded portion at
+/// a time: the rows are already in memory, their copies for the index are
+/// not all made at once. A portion holds at most [`UNIT_CHUNK`] units and
+/// [`UNIT_CHUNK_BYTES`] of key copies, checked before each copy is made, in
+/// a list sized once for a portion.
+fn installed_units(
+    rows: &Rows,
+    mut emit: impl FnMut(&[crate::engine::material::OwnedUnit]) -> StorageResult<()>,
+) -> StorageResult<()> {
+    let mut units = Vec::with_capacity(UNIT_CHUNK);
+    let mut held = 0usize;
+    for (key, value) in rows {
+        let bytes = crate::engine::material::unit_bytes(key, value);
+        if bytes == 0 {
+            continue;
+        }
+        if units.len() == UNIT_CHUNK || held + key.len() > UNIT_CHUNK_BYTES {
+            emit(&units)?;
+            units.clear();
+            held = 0;
+        }
+        held += key.len();
+        units.push((
+            crate::engine::material::UnitKind::Value,
+            key.clone(),
+            Vec::new(),
+            bytes,
+        ));
+    }
+    if !units.is_empty() {
+        emit(&units)?;
+    }
+    Ok(())
+}
+
 /// Directory under the data dir where partitions are captured for a copy to
 /// another node. Nothing under it outlives the copy; the engine clears what
 /// a crash left behind when it opens.
@@ -180,8 +221,18 @@ pub struct PartitionCopy {
 pub fn is_node_local(partition: Partition, key: &[u8]) -> bool {
     match partition {
         Partition::Raft => true,
-        Partition::Schema => key.starts_with(b"meta:") || key.starts_with(b"raft:"),
-        _ => false,
+        _ => node_local_prefixes(partition)
+            .iter()
+            .any(|prefix| key.starts_with(prefix)),
+    }
+}
+
+/// The key prefixes of `partition`'s node-local rows, outside the Raft
+/// partition (which is node-local whole).
+fn node_local_prefixes(partition: Partition) -> &'static [&'static [u8]] {
+    match partition {
+        Partition::Schema => &[b"meta:", b"raft:"],
+        _ => &[],
     }
 }
 
@@ -464,14 +515,19 @@ impl StorageEngine {
             self.begin_index_transfer()?;
         }
         // Read before anything is cleared, under the repair: no other repair
-        // moves them meanwhile, and a failure leaves the tree as it was.
+        // moves them meanwhile, and a failure leaves the tree as it was. Only
+        // their prefixes are read: a partition repaired because a table of it
+        // is corrupt would otherwise fail on that table before the repair
+        // could drop it.
         let snapshot = self.snapshot();
-        let keep: Rows = self
-            .snapshot_prefix_scan(&snapshot, partition, &[])?
-            .into_iter()
-            .filter(|(key, _)| is_node_local(partition, key))
-            .map(|(key, value)| (key, value.to_vec()))
-            .collect();
+        let mut keep: Rows = Vec::new();
+        for prefix in node_local_prefixes(partition) {
+            keep.extend(
+                self.snapshot_prefix_scan(&snapshot, partition, prefix)?
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_vec())),
+            );
+        }
         self.clear_partition_tree(partition, self.tree(partition)?)?;
         for (key, value) in &keep {
             self.put(partition, key, value)?;
@@ -491,6 +547,14 @@ impl StorageEngine {
                 value,
                 INSTALLED_ROW_SEQNO,
             )?;
+        }
+        // Each installed row is its key's whole closure, below every commit:
+        // the fold takes it as the base later units build on.
+        if crate::engine::material::accounted(partition) {
+            let at = self.next_seqno();
+            installed_units(rows, |units| {
+                crate::engine::material::add_units(tree, INSTALLED_ROW_SEQNO, units, at)
+            })?;
         }
         Ok(repair)
     }

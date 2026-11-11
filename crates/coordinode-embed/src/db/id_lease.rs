@@ -99,11 +99,13 @@ impl LogLeaseReserver {
     ) -> Result<bool, IdLeaseError> {
         let id = self.proposal_ids.next();
         // Held as not yet logged until the entry is handed over, so no
-        // closed bound passes over it meanwhile.
+        // closed bound passes over it meanwhile. The lease is a Schema
+        // record, which consumers are charged for.
         let (commit_ts, held) = self
             .engine
             .pending_commits()
-            .obligate(|| self.oracle.next().as_raw());
+            .obligate_changing(|| self.oracle.next().as_raw())
+            .map_err(|_| IdLeaseError::Held)?;
         // The proposal below carries the whole grant.
         held.seal(id);
         let commit_ts = Timestamp::from_raw(commit_ts);

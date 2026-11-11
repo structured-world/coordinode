@@ -13,14 +13,23 @@
 //! the same seqno is idempotent, so a replay charges nothing twice.
 //!
 //! A seqno is one commit, so the first record at or after `s` is the oldest
-//! work a consumer at `s` has not seen, and the records from `s` on sum to
-//! the material it requires.
+//! work a consumer at `s` has not seen.
+//!
+//! Beside it, every unit of the batch gets one record of the unit index,
+//! `0x00 "au" be_u64(seqno) be_u32(ordinal)` = its kind, encoded length and
+//! key (and a range's end), no payload: what the fold ([`fold`]) reads, in
+//! commit order, to keep each key's reconstruction closure. The ordinal is
+//! the unit's place in its batch, so two equal operands at one seqno stay two
+//! units and a replay of the batch rewrites the same records.
 
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 
 use crate::engine::coverage;
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
+
+pub(crate) mod fold;
+pub(crate) mod summary;
 
 /// The record key prefix.
 const PREFIX: [u8; 3] = [0x00, b'a', b'x'];
@@ -55,24 +64,294 @@ pub(crate) fn unit_bytes(key: &[u8], written: &[u8]) -> u64 {
     (key.len() + written.len()) as u64
 }
 
-/// Sums the units of one tree's batch and puts the record for them.
-#[derive(Debug, Default)]
-pub(crate) struct Tally(u64);
+/// What a unit does to its key's reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnitKind {
+    /// A value: the key's closure is this unit alone.
+    Value,
+    /// A deletion: evidence of the change and what a later operand starts
+    /// from.
+    Delete,
+    /// An operand merged onto the closure so far.
+    Operand,
+    /// A range deletion of `[key, end)`.
+    Range,
+}
 
-impl Tally {
-    /// Count one unit ([`unit_bytes`]).
-    pub(crate) fn unit(&mut self, key: &[u8], written: &[u8]) {
-        // A batch is bounded by memory, so its sum is far below u64::MAX.
-        self.0 += unit_bytes(key, written);
-    }
-
-    /// Put the record for what was counted into `batch` at the batch's
-    /// seqno, when `part` is accounted and anything was.
-    pub(crate) fn record(self, part: Partition, seqno: SeqNo, batch: &mut lsm_tree::WriteBatch) {
-        if self.0 > 0 && accounted(part) {
-            batch.insert(key(seqno).as_slice(), encode(self.0).as_slice());
+impl UnitKind {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Value => 0,
+            Self::Delete => 1,
+            Self::Operand => 2,
+            Self::Range => 3,
         }
     }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Value),
+            1 => Some(Self::Delete),
+            2 => Some(Self::Operand),
+            3 => Some(Self::Range),
+            _ => None,
+        }
+    }
+}
+
+/// One unit of a batch, borrowed from the write it describes.
+#[derive(Debug, Clone, Copy)]
+struct Counted<'a> {
+    kind: UnitKind,
+    key: &'a [u8],
+    end: &'a [u8],
+    bytes: u64,
+}
+
+/// Sums the units of one tree's batch and puts their records.
+#[derive(Debug, Default)]
+pub(crate) struct Tally<'a> {
+    bytes: u64,
+    units: Vec<Counted<'a>>,
+}
+
+impl<'a> Tally<'a> {
+    /// A value written under `key`.
+    pub(crate) fn put(&mut self, key: &'a [u8], value: &[u8]) {
+        self.count(UnitKind::Value, key, &[], unit_bytes(key, value));
+    }
+
+    /// A deletion of `key`.
+    pub(crate) fn delete(&mut self, key: &'a [u8]) {
+        self.count(UnitKind::Delete, key, &[], unit_bytes(key, &[]));
+    }
+
+    /// An operand merged onto `key`.
+    pub(crate) fn merge(&mut self, key: &'a [u8], operand: &[u8]) {
+        self.count(UnitKind::Operand, key, &[], unit_bytes(key, operand));
+    }
+
+    /// A deletion of `[start, end)`.
+    pub(crate) fn range(&mut self, start: &'a [u8], end: &'a [u8]) {
+        self.count(UnitKind::Range, start, end, unit_bytes(start, end));
+    }
+
+    fn count(&mut self, kind: UnitKind, key: &'a [u8], end: &'a [u8], bytes: u64) {
+        // Engine bookkeeping is no unit.
+        if bytes == 0 {
+            return;
+        }
+        // A batch is bounded by memory, so its sum is far below u64::MAX.
+        self.bytes += bytes;
+        self.units.push(Counted {
+            kind,
+            key,
+            end,
+            bytes,
+        });
+    }
+
+    /// Put the record of what was counted and the record of every unit into
+    /// `batch` at the batch's seqno, when `part` is accounted and anything
+    /// was.
+    pub(crate) fn record(self, part: Partition, seqno: SeqNo, batch: &mut lsm_tree::WriteBatch) {
+        if self.bytes == 0 || !accounted(part) {
+            return;
+        }
+        batch.insert(key(seqno).as_slice(), encode(self.bytes).as_slice());
+        let mut value = Vec::new();
+        for (ordinal, unit) in self.units.iter().enumerate() {
+            unit_value(unit.kind, unit.bytes, unit.key, unit.end, &mut value);
+            // A batch holds far fewer than u32::MAX units.
+            batch.insert(unit_key(seqno, ordinal as u32).as_slice(), value.as_slice());
+        }
+    }
+}
+
+/// Encode a unit record's value into `out`.
+pub(crate) fn unit_value(kind: UnitKind, bytes: u64, key: &[u8], end: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.push(kind.tag());
+    out.extend_from_slice(&bytes.to_le_bytes());
+    // Keys are bounded far below u32::MAX by the store's key limit.
+    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    out.extend_from_slice(key);
+    out.extend_from_slice(end);
+}
+
+/// The ordinal after the last unit record `tree` holds at `seqno`.
+fn next_ordinal(tree: &AnyTree, seqno: SeqNo) -> StorageResult<u32> {
+    let start = unit_key(seqno, 0);
+    let end: Vec<u8> = match seqno.checked_add(1) {
+        Some(next) => unit_key(next, 0).to_vec(),
+        None => [0x00, b'a', b'v'].to_vec(),
+    };
+    match tree
+        .range(start.as_slice()..end.as_slice(), SeqNo::MAX, None)
+        .next_back()
+    {
+        Some(guard) => {
+            let (k, v) = guard.into_inner()?;
+            decode_unit(&k, &v)?.ordinal.checked_add(1).ok_or_else(|| {
+                StorageError::Serialization(format!("material units at {seqno} exhaust u32"))
+            })
+        }
+        None => Ok(0),
+    }
+}
+
+/// A unit put back without a batch of its own: kind, key, range end (empty
+/// for a point) and encoded length.
+pub(crate) type OwnedUnit = (UnitKind, Vec<u8>, Vec<u8>, u64);
+
+/// Write unit records for `units` at `seqno`, after the ones `tree` already
+/// holds there, written at `at`: units a rebuild or an installation puts
+/// back without a batch of their own.
+///
+/// # Errors
+///
+/// A record could not be read.
+pub(crate) fn add_units(
+    tree: &AnyTree,
+    seqno: SeqNo,
+    units: &[OwnedUnit],
+    at: SeqNo,
+) -> StorageResult<()> {
+    let mut ordinal = next_ordinal(tree, seqno)?;
+    let mut value = Vec::new();
+    for (kind, key, end, bytes) in units {
+        unit_value(*kind, *bytes, key, end, &mut value);
+        tree.insert(unit_key(seqno, ordinal).as_slice(), value.as_slice(), at);
+        ordinal = ordinal.checked_add(1).ok_or_else(|| {
+            StorageError::Serialization(format!("material units at {seqno} exhaust u32"))
+        })?;
+    }
+    Ok(())
+}
+
+/// The unit index record prefix.
+const UNIT_PREFIX: [u8; 3] = [0x00, b'a', b'u'];
+const UNIT_KEY_LEN: usize = UNIT_PREFIX.len() + 8 + 4;
+/// A unit record's value past its key and end: kind, length, key length.
+const UNIT_HEADER: usize = 1 + 8 + 4;
+
+/// The unit index record of the `ordinal`-th unit at `seqno`.
+pub(crate) fn unit_key(seqno: SeqNo, ordinal: u32) -> [u8; UNIT_KEY_LEN] {
+    let mut out = [0u8; UNIT_KEY_LEN];
+    out[..UNIT_PREFIX.len()].copy_from_slice(&UNIT_PREFIX);
+    out[UNIT_PREFIX.len()..UNIT_PREFIX.len() + 8].copy_from_slice(&seqno.to_be_bytes());
+    out[UNIT_PREFIX.len() + 8..].copy_from_slice(&ordinal.to_be_bytes());
+    out
+}
+
+/// One unit read back from the unit index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Unit {
+    pub(crate) seqno: SeqNo,
+    pub(crate) ordinal: u32,
+    pub(crate) kind: UnitKind,
+    pub(crate) bytes: u64,
+    pub(crate) key: Vec<u8>,
+    /// A range's exclusive end; empty for a point unit.
+    pub(crate) end: Vec<u8>,
+}
+
+fn decode_unit(key: &[u8], value: &[u8]) -> StorageResult<Unit> {
+    let bad = || {
+        StorageError::Serialization(format!(
+            "material unit record {key:02x?} holds {} bytes",
+            value.len()
+        ))
+    };
+    let id = key.strip_prefix(UNIT_PREFIX.as_slice()).ok_or_else(bad)?;
+    let seqno = id
+        .get(..8)
+        .and_then(|s| <[u8; 8]>::try_from(s).ok())
+        .map(u64::from_be_bytes)
+        .ok_or_else(bad)?;
+    let ordinal = id
+        .get(8..12)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(bad)?;
+    let kind = value
+        .first()
+        .copied()
+        .and_then(UnitKind::from_tag)
+        .ok_or_else(bad)?;
+    let bytes = value
+        .get(1..9)
+        .and_then(|s| <[u8; 8]>::try_from(s).ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(bad)?;
+    let key_len = value
+        .get(9..13)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map(|b| u32::from_le_bytes(b) as usize)
+        .ok_or_else(bad)?;
+    let unit_key = value
+        .get(UNIT_HEADER..UNIT_HEADER + key_len)
+        .ok_or_else(bad)?;
+    let end = &value[UNIT_HEADER + key_len..];
+    if kind != UnitKind::Range && !end.is_empty() {
+        return Err(bad());
+    }
+    Ok(Unit {
+        seqno,
+        ordinal,
+        kind,
+        bytes,
+        key: unit_key.to_vec(),
+        end: end.to_vec(),
+    })
+}
+
+/// Up to `limit` units of `tree` from `(seqno, ordinal)` on, below `to`
+/// (exclusive), visible at `snapshot`, in commit order. With `held`, each
+/// unit's copy is reserved there before it is made, and the units stop at
+/// the first that does not fit; the flag says they stopped so.
+///
+/// # Errors
+///
+/// A record could not be read or is malformed.
+pub(crate) fn units_from(
+    tree: &AnyTree,
+    from: (SeqNo, u32),
+    to: SeqNo,
+    snapshot: SeqNo,
+    limit: usize,
+    mut held: Option<&mut coordinode_core::budget::MemoryCharge<'_>>,
+) -> StorageResult<(Vec<Unit>, bool)> {
+    let start = unit_key(from.0, from.1);
+    let end = unit_key(to, 0);
+    if start.as_slice() >= end.as_slice() {
+        return Ok((Vec::new(), false));
+    }
+    let mut out = Vec::new();
+    for guard in tree.range(start.as_slice()..end.as_slice(), snapshot, None) {
+        if out.len() >= limit {
+            break;
+        }
+        let (k, v) = guard.into_inner()?;
+        // The unit's key and range end, and its place in the list.
+        let copy = (v.len() + core::mem::size_of::<Unit>()) as u64;
+        if let Some(held) = held.as_deref_mut()
+            && held.grow(copy).is_err()
+        {
+            return Ok((out, true));
+        }
+        out.push(decode_unit(&k, &v)?);
+    }
+    Ok((out, false))
+}
+
+/// The bytes of the range deletion [`retire_units_below`] writes: its bounds.
+pub(crate) const RETIRE_RECORD_BYTES: u64 = (UNIT_PREFIX.len() + UNIT_KEY_LEN) as u64;
+
+/// Drop `tree`'s unit records below `seqno`, at seqno `at`.
+pub(crate) fn retire_units_below(tree: &AnyTree, seqno: SeqNo, at: SeqNo) {
+    let end = unit_key(seqno, 0);
+    tree.remove_range(UNIT_PREFIX.as_slice(), end.as_slice(), at);
 }
 
 /// The records of a tree rebuilt from a copy's history, counted from the
@@ -82,23 +361,41 @@ impl Tally {
 #[derive(Debug, Default)]
 pub(crate) struct Reinstalled {
     pending: std::collections::BTreeMap<SeqNo, u64>,
+    /// The units reinstalled, by seqno, for the unit index.
+    units: std::collections::BTreeMap<SeqNo, Vec<OwnedUnit>>,
+    /// Units held in `units`.
+    held: usize,
+    /// The bytes of the keys and range ends held in `units`.
+    held_bytes: usize,
 }
 
-/// Seqnos summed in memory before they are added to the tree.
+/// Seqnos (and units) summed in memory before they are added to the tree.
 const REINSTALL_PAGE: usize = 4096;
+/// Key bytes held in memory before they are added to the tree.
+const REINSTALL_BYTES: usize = 8 << 20;
 
 impl Reinstalled {
-    /// Count `bytes` reinstalled at `seqno`.
-    pub(crate) fn add(&mut self, seqno: SeqNo, bytes: u64) {
+    /// Count a unit of `kind` of `key` (and a range's `end`) reinstalled at
+    /// `seqno`.
+    pub(crate) fn add(&mut self, seqno: SeqNo, kind: UnitKind, key: &[u8], end: &[u8], bytes: u64) {
         if bytes > 0 {
             // A tree's versions at one seqno are bounded by one batch.
             *self.pending.entry(seqno).or_insert(0) += bytes;
+            self.units
+                .entry(seqno)
+                .or_default()
+                .push((kind, key.to_vec(), end.to_vec(), bytes));
+            self.held += 1;
+            self.held_bytes += key.len() + end.len();
         }
     }
 
-    /// Whether a page is due ([`Self::spill`]).
+    /// Whether a page is due ([`Self::spill`]): one more unit holds at most
+    /// one key beyond these bounds.
     pub(crate) fn full(&self) -> bool {
         self.pending.len() >= REINSTALL_PAGE
+            || self.held >= REINSTALL_PAGE
+            || self.held_bytes >= REINSTALL_BYTES
     }
 
     /// Add what was counted to `tree`'s records. Each sum is written at
@@ -115,8 +412,14 @@ impl Reinstalled {
         at: SeqNo,
     ) -> StorageResult<()> {
         let pending = core::mem::take(&mut self.pending);
+        let units = core::mem::take(&mut self.units);
+        self.held = 0;
+        self.held_bytes = 0;
         if !accounted(part) {
             return Ok(());
+        }
+        for (seqno, units) in &units {
+            add_units(tree, *seqno, units, at)?;
         }
         for (seqno, bytes) in pending {
             let k = key(seqno);
@@ -135,12 +438,18 @@ impl Reinstalled {
 pub(crate) const RECORD_BYTES: u64 = (KEY_LEN + 8) as u64;
 
 /// The room the records of one apply of `units` writes take, bounded from
-/// above: one record per tree it touches, and it touches at most one tree
-/// per write and no more trees than there are.
-pub(crate) fn record_allowance(units: usize) -> u64 {
+/// above: one record per tree it touches (it touches at most one tree per
+/// write and no more trees than there are), and one unit record per unit,
+/// `keys` being the bytes of the units' keys and range ends together.
+pub(crate) fn record_allowance(units: usize, keys: u64) -> u64 {
     let trees = Partition::all().len();
-    // At most a dozen trees: far below u64::MAX.
+    // At most a dozen trees, and units bounded by the apply's memory: far
+    // below u64::MAX.
     crate::engine::footprint::footprint_of(RECORD_BYTES, 1) * units.min(trees) as u64
+        + crate::engine::footprint::footprint_of(
+            ((UNIT_KEY_LEN + UNIT_HEADER) * units) as u64 + keys,
+            units,
+        )
 }
 
 /// The material from a seqno on, over every accounted tree.

@@ -2370,24 +2370,27 @@ fn closing_entries_clean_up_within_the_limit(reserve: Option<u64>) {
     );
     assert!(
         footprint.committed() <= footprint.limit(),
-        "client writes passed the limit: {} over {}",
+        "client writes passed the limit: {} over {} (charged, admitted, debt {:?})",
         footprint.committed(),
-        footprint.limit()
+        footprint.limit(),
+        (footprint.charged(), footprint.admitted(), footprint.debt())
     );
 
     engine.set_retention_window(std::time::Duration::ZERO);
     let mut index = index + 1;
     while ledger_held(&engine) > 0 {
         let before = ledger_held(&engine);
+        let parts = (footprint.charged(), footprint.admitted(), footprint.debt());
         apply_closure_entry(&engine, index, &[], oracle.next().as_raw() + 1);
         let retired = before - ledger_held(&engine);
         assert!(retired > 0 && retired <= RETIRE_BATCH as u64);
         assert_eq!(stored_breakpoints(&engine), ledger_held(&engine));
         assert!(
             footprint.committed() <= footprint.limit(),
-            "the store passed its limit: {} over {}",
+            "the store passed its limit: {} over {} (charged, admitted, debt before {parts:?}, after {:?})",
             footprint.committed(),
-            footprint.limit()
+            footprint.limit(),
+            (footprint.charged(), footprint.admitted(), footprint.debt())
         );
         index += 1;
     }

@@ -171,11 +171,13 @@ impl FieldDictionary {
 
     fn propose(&self, command: MetadataCommand) -> Result<(), DictionaryError> {
         // Held as not yet logged until the entry is handed over, so no
-        // closed bound passes over it meanwhile.
+        // closed bound passes over it meanwhile. The dictionary is Schema
+        // records, which consumers are charged for.
         let (commit_ts, held) = self
             .engine
             .pending_commits()
-            .obligate(|| self.oracle.next().as_raw());
+            .obligate_changing(|| self.oracle.next().as_raw())
+            .map_err(|_| DictionaryError::Held)?;
         let proposal = RaftProposal {
             id: self.proposal_ids.next(),
             mutations: vec![Mutation::Command(command)],

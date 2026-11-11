@@ -476,6 +476,10 @@ impl From<coordinode_core::graph::node::IdLeaseError> for ExecutionError {
             coordinode_core::graph::node::IdLeaseError::NotLeader { leader_id } => {
                 ExecutionError::NotLeader { leader_id }
             }
+            // Held behind a consumer's ending: the store's typed refusal.
+            coordinode_core::graph::node::IdLeaseError::Held => {
+                ExecutionError::Storage(coordinode_storage::error::StorageError::MaterialClaimed)
+            }
             // One refusal for a write past an endpoint's hard limit, whether
             // the commit or the identifier it needed met it first.
             coordinode_core::graph::node::IdLeaseError::CapacityExhausted {
@@ -501,6 +505,10 @@ impl From<coordinode_core::graph::intern::DictionaryError> for ExecutionError {
             // leader: the statement ran nothing and may be sent again.
             coordinode_core::graph::intern::DictionaryError::NotLeader { leader_id } => {
                 ExecutionError::NotLeader { leader_id }
+            }
+            // Held behind a consumer's ending: the store's typed refusal.
+            coordinode_core::graph::intern::DictionaryError::Held => {
+                ExecutionError::Storage(coordinode_storage::error::StorageError::MaterialClaimed)
             }
             // The typed refusal a commit past the limit gives.
             coordinode_core::graph::intern::DictionaryError::CapacityExhausted {
@@ -3789,13 +3797,15 @@ impl<'a> ExecutionContext<'a> {
             return Ok(LocalIndexStore::new(self.engine).apply_unreplicated(&mutations)?);
         };
         // Held as not yet logged until the entry is handed over, so no
-        // closed bound passes over it meanwhile.
+        // closed bound passes over it meanwhile. Index definitions and the
+        // entries they clear are material consumers are charged for.
         let (commit_ts, held) = match self.mvcc_oracle {
             Some(oracle) => {
                 let (ts, held) = self
                     .engine
                     .pending_commits()
-                    .obligate(|| oracle.next().as_raw());
+                    .obligate_changing(|| oracle.next().as_raw())
+                    .map_err(|_| coordinode_storage::error::StorageError::MaterialClaimed)?;
                 (Timestamp::from_raw(ts), Some(held))
             }
             None => (self.mvcc_read_ts, None),

@@ -50,6 +50,12 @@ pub(crate) struct RegistryEntry {
     pub last_heartbeat_ts_ms: u64,
     /// Where this incarnation's checkpoint started.
     pub started_at: u64,
+    /// When the registry admitted the read this registration owes (clock
+    /// ms): its registration, and for a pinned snapshot each move of its
+    /// checkpoint, which is a new view to read, not an acknowledgement of
+    /// the old one. A pinned snapshot's work is dated from here, not from
+    /// the age of the rows it reads.
+    pub obligation_since_ms: u64,
     /// The ended incarnation of the same id this one followed. Boxed: only a
     /// resync carries one, and every transition moves the record by value.
     pub follows: Option<Box<PriorIncarnation>>,
@@ -121,7 +127,14 @@ impl RegistryEntry {
                 source.retained_bytes_from(self.kind, self.checkpoint_seqno),
             ),
         };
-        let reason = if self.checkpoint_seqno < source.head(self.kind)
+        // A pinned snapshot's read is outstanding until it is done or moved,
+        // new writes or none: its work dates from when it was admitted.
+        let (owes, produced) = if self.kind == ConsumerKind::MvccSnapshotPin {
+            (true, Ok(Some(self.obligation_since_ms)))
+        } else {
+            (self.checkpoint_seqno < source.head(self.kind), produced)
+        };
+        let reason = if owes
             && let Ok(Some(produced)) = produced
             // Same clock rule as above: work stamped after `now_ms` has
             // no age yet.
@@ -158,11 +171,16 @@ impl RegistryEntry {
         let liveness = bounds
             .liveness_timeout_ms()
             .and_then(|t| self.last_heartbeat_ts_ms.checked_add(t)?.checked_add(1));
-        let lag = (self.checkpoint_seqno < source.head(self.kind))
-            .then(|| source.produced_at_ms(self.kind, self.checkpoint_seqno).ok())
-            .flatten()
-            .flatten()
-            .and_then(|at| at.checked_add(bounds.max_progress_lag_ms())?.checked_add(1));
+        let produced = if self.kind == ConsumerKind::MvccSnapshotPin {
+            Some(self.obligation_since_ms)
+        } else {
+            (self.checkpoint_seqno < source.head(self.kind))
+                .then(|| source.produced_at_ms(self.kind, self.checkpoint_seqno).ok())
+                .flatten()
+                .flatten()
+        };
+        let lag =
+            produced.and_then(|at| at.checked_add(bounds.max_progress_lag_ms())?.checked_add(1));
         match (liveness, lag) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),

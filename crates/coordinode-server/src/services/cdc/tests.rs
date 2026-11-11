@@ -1045,7 +1045,10 @@ async fn stream_follows_a_raft_node() {
     let ids = ProposalIdGenerator::new();
     let mut committed = Vec::new();
     for i in 1..=3u64 {
-        let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+        let (ts, held) = engine
+            .pending_commits()
+            .obligate_changing(|| oracle.next().as_raw())
+            .expect("no ending holds the writes");
         raft_pipeline
             .propose_and_wait(&RaftProposal {
                 id: ids.next(),

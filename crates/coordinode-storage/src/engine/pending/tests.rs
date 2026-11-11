@@ -20,7 +20,7 @@ fn admit_at(
     scope: Vec<(Partition, Vec<u8>)>,
 ) -> Result<Admission<'_>, Refusal> {
     pending
-        .admit_allocated(|| ts, scope, Vec::new())
+        .admit_allocated(|| ts, scope, Vec::new(), Material::Changes)
         .map(|(_, a)| a)
 }
 
@@ -32,8 +32,14 @@ fn admit_guarded(
     guards: Vec<(Partition, Vec<u8>)>,
 ) -> Result<Admission<'_>, Refusal> {
     pending
-        .admit_allocated(|| ts, scope, guards)
+        .admit_allocated(|| ts, scope, guards, Material::Changes)
         .map(|(_, a)| a)
+}
+
+/// Hold `ts` as not yet logged, for an entry no consumer's material is in:
+/// what the closed-bound tests hold.
+fn unlogged(pending: &Arc<PendingCommits>, ts: u64) -> (u64, Unlogged) {
+    pending.obligate(|| ts)
 }
 
 fn holder_of(refusal: &Refusal) -> u64 {
@@ -256,7 +262,12 @@ fn a_named_timestamp_waits_for_the_commits_it_covers() {
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let admitted = holder
-            .admit_allocated(|| 50, key(Partition::Node, b"a"), Vec::new())
+            .admit_allocated(
+                || 50,
+                key(Partition::Node, b"a"),
+                Vec::new(),
+                Material::Changes,
+            )
             .map(|(_, a)| a)
             .expect("admit");
         started_tx.send(()).expect("signal");
@@ -434,7 +445,7 @@ fn a_wait_dropped_as_its_commit_finishes_leaves_nothing_behind() {
         let waker = Waker::from(Arc::clone(&by));
         let mut wait = pending.complete_at(1_000_000);
         let (ts, admission) = pending
-            .admit_allocated(|| round + 1, Vec::new(), Vec::new())
+            .admit_allocated(|| round + 1, Vec::new(), Vec::new(), Material::Changes)
             .expect("admit");
         assert_eq!(ts, round + 1);
         assert!(
@@ -470,6 +481,7 @@ fn the_table_refuses_rather_than_growing_without_bound() {
             },
             key(Partition::Node, b"c"),
             Vec::new(),
+            Material::Changes,
         )
         .map(|(_, a)| a)
         .expect_err("the table is full");
@@ -512,6 +524,7 @@ fn a_waiter_is_admitted_once_the_holder_lands() {
                     key(Partition::Schema, b"def"),
                     Vec::new(),
                     Duration::from_secs(10),
+                    Material::Changes,
                 )
                 .map(|(ts, _)| ts)
         });
@@ -538,6 +551,7 @@ fn a_waiter_reserves_its_keys_against_later_commits() {
                     key(Partition::Schema, b"def"),
                     Vec::new(),
                     Duration::from_secs(10),
+                    Material::Changes,
                 )
                 .map(|(ts, _)| ts)
         });
@@ -567,6 +581,7 @@ fn a_waiter_reserves_its_keys_against_later_commits() {
             key(Partition::Schema, b"def"),
             Vec::new(),
             Duration::from_secs(10),
+            Material::Changes,
         );
         assert!(
             matches!(second, Err(Refusal::Reserved { .. })),
@@ -593,6 +608,7 @@ fn a_waiter_gives_up_at_its_deadline_and_releases_its_keys() {
             key(Partition::Schema, b"def"),
             Vec::new(),
             Duration::from_millis(50),
+            Material::Changes,
         )
         .map(|(ts, _)| ts)
         .expect_err("the holder outlasts the wait");
@@ -609,7 +625,7 @@ fn the_closed_bound_stops_below_every_timestamp_not_yet_logged() {
     assert_eq!(pending.stamp_closed_below(|| 50), 51, "nothing held");
 
     let admitted = admit_at(&pending, 60, key(Partition::Node, b"a")).expect("admit");
-    let (held_ts, held) = pending.obligate(|| 55);
+    let (held_ts, held) = unlogged(&pending, 55);
     assert_eq!(held_ts, 55);
     assert_eq!(
         pending.stamp_closed_below(|| 70),
@@ -653,7 +669,7 @@ fn an_entry_closes_the_commit_sealed_into_it_and_nothing_else() {
     assert_eq!(pending.stamp_closed_below(|| 70), 60, "nor an unsealed one");
 
     // A lower timestamp held for another entry still holds the bound.
-    let (_, low) = pending.obligate(|| 55);
+    let (_, low) = unlogged(&pending, 55);
     assert_eq!(pending.stamp_closed_below_sealing(&mut [own], || 70), 55);
     low.seal(other);
     assert_eq!(
@@ -683,10 +699,10 @@ fn a_seal_ends_with_its_registration() {
     use coordinode_core::txn::proposal::ProposalId;
     let pending = Arc::new(table());
     let own = ProposalId::from_raw(7);
-    let (_, held) = pending.obligate(|| 40);
+    let (_, held) = unlogged(&pending, 40);
     held.seal(own);
     drop(held);
-    let (_, next) = pending.obligate(|| 50);
+    let (_, next) = unlogged(&pending, 50);
     assert_eq!(
         pending.stamp_closed_below_sealing(&mut [own], || 60),
         50,
@@ -704,7 +720,7 @@ fn a_closing_entry_is_due_once_per_uncovered_withdrawal() {
     pending.stamp_closed_below(|| 10);
     assert_eq!(pending.closure_due(|| 10), None, "nothing withdrawn");
 
-    let (_, held) = pending.obligate(|| 20);
+    let (_, held) = unlogged(&pending, 20);
     let bound = pending.stamp_closed_below(|| 20);
     assert_eq!(bound, 20, "the entry carrying it stops below it");
     drop(held);
@@ -753,8 +769,8 @@ fn a_local_timestamp_holds_the_bound_but_makes_no_closing_entry_due() {
 #[test]
 fn a_held_timestamp_keeps_a_closing_entry_from_being_due() {
     let pending = Arc::new(table());
-    let (_, low) = pending.obligate(|| 30);
-    let (_, high) = pending.obligate(|| 40);
+    let (_, low) = unlogged(&pending, 30);
+    let (_, high) = unlogged(&pending, 40);
     pending.stamp_closed_below(|| 40);
     drop(high);
     assert_eq!(pending.closure_due(|| 40), None, "30 still holds the bound");
@@ -769,7 +785,7 @@ fn a_withdrawal_wakes_its_waiter() {
     let pending = Arc::new(table());
     let seen = pending.await_withdrawal(0, std::time::Duration::from_millis(10));
     assert_eq!(seen, 0, "the deadline, with nothing withdrawn");
-    let (_, held) = pending.obligate(|| 5);
+    let (_, held) = unlogged(&pending, 5);
     let waiter = {
         let pending = Arc::clone(&pending);
         std::thread::spawn(move || pending.await_withdrawal(0, std::time::Duration::from_secs(10)))
@@ -777,4 +793,148 @@ fn a_withdrawal_wakes_its_waiter() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     drop(held);
     assert_eq!(waiter.join().expect("waiter"), 1);
+}
+
+/// A terminal decision takes the material scope only once every write
+/// sharing it has landed, and reports the highest timestamp they took. While
+/// it waits, a later write that changes the material waits behind it rather
+/// than overtaking it; a write that changes none goes on. The waiting write
+/// registers once the decision is released.
+#[test]
+fn a_material_claim_waits_for_sharers_and_is_not_overtaken() {
+    let pending = Arc::new(table());
+    let first = admit_at(&pending, 10, key(Partition::Node, b"a")).expect("a sharer");
+    std::thread::scope(|s| {
+        let claimer = s.spawn(|| pending.claim_material(Duration::from_secs(10)));
+        // The claim waits for the sharer in flight.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pending.inner.lock().material_claim != Claim::Waiting {
+            assert!(Instant::now() < deadline, "the claim never waited");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // A later write that changes the material waits behind it.
+        let later = s.spawn(|| {
+            pending
+                .admit_allocated(
+                    || 30,
+                    key(Partition::Node, b"b"),
+                    Vec::new(),
+                    Material::Changes,
+                )
+                .map(|(ts, _)| ts)
+        });
+        // One that changes none is not held up.
+        let (_, registry) = pending
+            .admit_allocated(
+                || 20,
+                key(Partition::Registry, b"r"),
+                Vec::new(),
+                Material::Untouched,
+            )
+            .expect("an untouched write goes on");
+        drop(registry);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !claimer.is_finished(),
+            "the claim passed a sharer in flight"
+        );
+        assert!(!later.is_finished(), "a later sharer overtook the claim");
+        drop(first);
+        let claim = claimer.join().expect("claimer").expect("the claim");
+        assert_eq!(claim.through(), 10, "the sharers' highest timestamp");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!later.is_finished(), "a sharer registered under the claim");
+        drop(claim);
+        assert_eq!(later.join().expect("later"), Ok(30));
+    });
+}
+
+/// A decision that keeps the material scope (an ending whose outcome is not
+/// known) holds a new write that changes the material only for that write's
+/// own bound: past [`MATERIAL_WAIT`] each admission path refuses it with
+/// `MaterialClaimed` and holds nothing, and a write that changes no material
+/// is admitted at once. Before, the logged and the direct paths waited for
+/// the decision with no deadline.
+#[test]
+fn a_held_decision_refuses_a_changing_write_at_its_deadline() {
+    let pending = Arc::new(table());
+    let held = pending
+        .claim_material(Duration::from_secs(5))
+        .expect("nothing shares the material");
+    let bounded = |what: &str, refused: Result<u64, Refusal>, started: Instant| {
+        let waited = started.elapsed();
+        assert_eq!(refused, Err(Refusal::MaterialClaimed), "{what}");
+        assert!(
+            waited >= MATERIAL_WAIT && waited < MATERIAL_WAIT + Duration::from_secs(3),
+            "{what} waited {waited:?}"
+        );
+    };
+    std::thread::scope(|s| {
+        let logged = s.spawn(|| {
+            let started = Instant::now();
+            let refused = pending.obligate_changing(|| 40).map(|(ts, _)| ts);
+            (refused, started)
+        });
+        let direct = s.spawn(|| {
+            let started = Instant::now();
+            let refused = pending
+                .admit_direct(|| 41, Material::Changes)
+                .map(|(ts, _)| ts);
+            (refused, started)
+        });
+        let untouched_at = Instant::now();
+        let (ts, untouched) = pending.obligate(|| 42);
+        assert_eq!(ts, 42);
+        assert!(
+            untouched_at.elapsed() < Duration::from_secs(1),
+            "a write that changes no material waited for the decision"
+        );
+        drop(untouched);
+        let (refused, started) = logged.join().expect("logged");
+        bounded("the logged write", refused, started);
+        let (refused, started) = direct.join().expect("direct");
+        bounded("the direct write", refused, started);
+    });
+    assert!(
+        pending.inner.lock().admitted.is_empty(),
+        "a refused write holds nothing"
+    );
+    drop(held);
+    let (ts, after) = pending
+        .obligate_changing(|| 43)
+        .expect("admitted once the decision is released");
+    assert_eq!(ts, 43);
+    drop(after);
+}
+
+/// A claim whose sharers outlast its wait is refused and holds nothing: the
+/// writes that waited behind it go on. A second claim beside a held one is
+/// refused at once.
+#[test]
+fn a_material_claim_that_cannot_be_taken_holds_nothing() {
+    let pending = Arc::new(table());
+    let sharer = admit_at(&pending, 10, key(Partition::Node, b"a")).expect("a sharer");
+    assert_eq!(
+        pending
+            .claim_material(Duration::from_millis(30))
+            .map(|c| c.through()),
+        Err(Refusal::MaterialClaimed)
+    );
+    admit_at(&pending, 11, key(Partition::Node, b"b")).expect("nothing is held");
+    drop(sharer);
+    let held = pending
+        .claim_material(Duration::from_secs(5))
+        .expect("taken once the sharers landed");
+    assert_eq!(
+        pending
+            .claim_material(Duration::from_secs(5))
+            .map(|c| c.through()),
+        Err(Refusal::MaterialClaimed),
+        "one decision at a time"
+    );
+    drop(held);
+    let again = pending
+        .claim_material(Duration::from_secs(5))
+        .expect("free again once released");
+    drop(again);
 }

@@ -760,6 +760,9 @@ impl From<StorageError> for DatabaseError {
                 hard_limit_bytes,
             },
             StorageError::MembersFull => Self::MembersFull,
+            // Held behind a consumer's ending being ordered: retried as any
+            // write backpressure is.
+            StorageError::MaterialClaimed => Self::WriteBackpressure,
             StorageError::OutOfSpace {
                 path,
                 available_bytes,

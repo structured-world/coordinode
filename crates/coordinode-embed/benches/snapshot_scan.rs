@@ -51,6 +51,7 @@ fn main() {
             || oracle.next().as_raw(),
             vec![(Partition::Node, b"unrelated-pending-key".to_vec())],
             Vec::new(),
+            coordinode_storage::engine::pending::Material::Changes,
         )
         .expect("hold unrelated commit");
     report(

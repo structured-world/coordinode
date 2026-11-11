@@ -250,7 +250,11 @@ fn a_stopped_columnar_table_refuses_its_statements_and_not_the_graphs() {
         "no row of it landed"
     );
 
-    assert_eq!(db.engine().write_pressure(), WritePressure::None);
+    // The partitions' verdict is their own: the store's bookkeeping of the
+    // statements (in the schema partition, flushed at this 4 KiB buffer)
+    // may slow it down at these thresholds, but the stopped table does not
+    // stop it.
+    assert_ne!(db.engine().write_pressure(), WritePressure::Stop);
     db.execute_cypher("CREATE (:Plain {x: 1})")
         .expect("the graph is judged by its own verdict");
 }

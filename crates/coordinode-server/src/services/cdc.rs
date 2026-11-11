@@ -300,6 +300,8 @@ fn registry_status(e: RegistryError) -> Status {
             leader_id.map(|id| ("leader_id", id.to_string())),
         ),
         RegistryError::Replication(_) => Status::internal(message),
+        // Raised by the registry's own sweep; a retry reads the outcome.
+        RegistryError::OutcomeUnknown { .. } => Status::unavailable(message),
     }
 }
 

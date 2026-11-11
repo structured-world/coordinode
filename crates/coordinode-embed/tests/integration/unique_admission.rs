@@ -153,7 +153,12 @@ fn a_handover_waits_for_a_writer_admitted_under_the_old_epoch() {
     let (_, writer) = db
         .engine()
         .pending_commits()
-        .admit_allocated(|| u64::MAX, Vec::new(), vec![(Partition::Schema, key)])
+        .admit_allocated(
+            || u64::MAX,
+            Vec::new(),
+            vec![(Partition::Schema, key)],
+            coordinode_storage::engine::pending::Material::Changes,
+        )
         .expect("the writer is admitted");
 
     std::thread::scope(|s| {

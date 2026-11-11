@@ -44,6 +44,7 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::footprint::ReclaimScope;
 use coordinode_storage::engine::oplog_journal::JournalHold;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::pending::MaterialClaim;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
 use parking_lot::{Condvar, Mutex};
 
@@ -65,6 +66,20 @@ use coordinode_storage::engine::applied::AppliedEvent;
 /// reads afresh, so only writers landing between every read and its commit
 /// exhaust them.
 const TRANSITION_ATTEMPTS: u32 = 16;
+
+/// How long a terminal decision waits for the writes sharing the material
+/// scope to land, and then for the cut to cover them. Those writes are in
+/// flight between their validation and their apply.
+const DECISION_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a terminal decision whose write's outcome is unknown waits for
+/// it on the spot; past it the protection is kept and settled by a later
+/// sweep.
+#[cfg(not(test))]
+const RESOLVE_WAIT: Duration = Duration::from_secs(5);
+/// Shorter in tests, which hold an outcome in doubt on purpose.
+#[cfg(test)]
+const RESOLVE_WAIT: Duration = Duration::from_millis(300);
 
 /// Pause before attempt `attempt` (from 1): a lost attempt usually met a
 /// commit to the same record still in flight, which lands within a write's
@@ -288,6 +303,25 @@ impl Wake {
     }
 }
 
+/// Whether a `kind` consumer ending for `reason` ends on its material, which
+/// writes change: a state delta's lag or retained bytes. Silence, and other
+/// kinds' measures (a log's, a fixed snapshot's), are not changed by them.
+fn ends_on(kind: ConsumerKind, reason: TerminalReason) -> bool {
+    kind == ConsumerKind::LsmStateDelta
+        && matches!(
+            reason,
+            TerminalReason::ProgressLagExceeded | TerminalReason::RetainedBytesExceeded
+        )
+}
+
+/// A terminal decision whose outcome is not known: the claim it was measured
+/// and written under, the timestamp of its write, and whose ending it is.
+struct Unresolved {
+    claim: MaterialClaim,
+    commit_ts: u64,
+    consumer_id: String,
+}
+
 /// Shared registry state, held by the facade and the background tasks.
 struct RegistryCore {
     engine: Arc<StorageEngine>,
@@ -328,10 +362,18 @@ struct RegistryCore {
     wake: Wake,
     /// Readers' notices of writes to the records they watch.
     watches: Arc<Watches>,
+    /// A terminal decision whose write was handed to the log with its
+    /// outcome not known: its own claim stays held until a closed bound past
+    /// its timestamp applies here, when the write has applied or never will.
+    unresolved: Mutex<Option<Unresolved>>,
     /// Runs once between a transition's read and its commit: what another
     /// writer does in that window.
     #[cfg(test)]
     before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once between a sweep's first measure of a consumer and the
+    /// attempt that decides on it.
+    #[cfg(test)]
+    before_decide: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once between a floor scan and its publication.
     #[cfg(test)]
     after_floor_scan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -467,12 +509,17 @@ impl RegistryCore {
     /// it is not the record: the caller reads again, and a repeat is refused
     /// once either landed, since the record no longer holds the bytes it
     /// expects.
+    ///
+    /// `claim` is the material scope this attempt holds, if it is a decision
+    /// measured under it: with an outcome not known it is kept, with this
+    /// attempt's timestamp, until the outcome is.
     fn write_conditionally(
         &self,
         consumer_id: &str,
         next: &RegistryEntry,
         read: &ReadBytes,
         on_basis: bool,
+        claim: &mut Option<MaterialClaim>,
     ) -> Result<bool, RegistryError> {
         use coordinode_core::txn::proposal::{MetadataCommand, Mutation, RaftProposal};
         use coordinode_core::txn::timestamp::Timestamp;
@@ -494,6 +541,8 @@ impl RegistryCore {
         })?;
         let id = self.id_gen.next();
         // Held until the entry is handed over, so no closed bound passes it.
+        // Registry records are no consumer's material: a terminal decision
+        // holding the material scope writes this itself.
         let (commit_ts, held) = self
             .engine
             .pending_commits()
@@ -513,16 +562,108 @@ impl RegistryCore {
             // ending, an acknowledgement under a sweep), as for any commit.
             bypass_rate_limiter: coordinode_storage::engine::footprint::reclaiming(),
         };
+        use coordinode_core::txn::proposal::ProposalError;
         match self.pipeline.propose_and_wait(&proposal) {
             Ok(_) => {}
-            Err(coordinode_core::txn::proposal::ProposalError::NotLeader { leader_id }) => {
+            Err(ProposalError::NotLeader { leader_id }) => {
                 return Err(RegistryError::NotLeader { leader_id });
             }
-            // Not known to have landed: whether it did is read below.
-            Err(e) => tracing::warn!(error = %e, consumer_id, "registry: ending outcome unknown"),
+            // Refused before the log: nothing can apply. Whether the record
+            // moved meanwhile is read below.
+            Err(
+                e @ (ProposalError::BelowClosedBound { .. }
+                | ProposalError::LeaderNotReady { .. }
+                | ProposalError::Unencodable(_)
+                | ProposalError::MembersFull
+                | ProposalError::OutOfSpace { .. }
+                | ProposalError::CapacityExhausted { .. }
+                | ProposalError::Mismatched(_)
+                | ProposalError::InvalidWriteConcern(_)),
+            ) => tracing::warn!(error = %e, consumer_id, "registry: write refused before the log"),
+            // Handed to the log, outcome not known: it may still apply.
+            Err(e) => {
+                tracing::warn!(error = %e, consumer_id, "registry: write outcome unknown");
+                drop(held);
+                // A terminal decision keeps its protection until the outcome
+                // is known: the write applies or never will once a closed
+                // bound past its timestamp applies here.
+                if claim.is_some() && !self.resolved(commit_ts, RESOLVE_WAIT) {
+                    if let Some(claim) = claim.take() {
+                        *self.unresolved.lock() = Some(Unresolved {
+                            claim,
+                            commit_ts,
+                            consumer_id: consumer_id.to_string(),
+                        });
+                    }
+                    return Err(RegistryError::OutcomeUnknown {
+                        consumer_id: consumer_id.to_string(),
+                    });
+                }
+                return Ok(self.read_raw(&key)?.as_deref() == Some(value.as_slice()));
+            }
         }
         drop(held);
         Ok(self.read_raw(&key)?.as_deref() == Some(value.as_slice()))
+    }
+
+    /// Whether the write proposed at `commit_ts` applied here or never will,
+    /// waiting up to `wait` for that to be known. On a store with a
+    /// consensus log it is known once a closed bound past `commit_ts`
+    /// applies here: every entry below that bound is in the log before it.
+    /// A store without one applies a write before its proposal returns.
+    fn resolved(&self, commit_ts: u64, wait: Duration) -> bool {
+        self.engine.raft_fence().is_none() || self.engine.await_complete_through(commit_ts, wait)
+    }
+
+    /// Whether `entry` would end on its material now, measured outside the
+    /// material scope: a state delta's lag or retained bytes. Its other
+    /// endings (silence) and other kinds' (a log's, a fixed snapshot's) are
+    /// not changed by later writes to the material.
+    fn ends_on_material(&self, entry: &RegistryEntry) -> bool {
+        entry
+            .termination(self.clock.now_ms(), self.source.as_ref())
+            .is_some_and(|reason| ends_on(entry.kind, reason))
+    }
+
+    /// Take the material scope for a terminal decision, and wait for the cut
+    /// to cover every write that shared it before; `None` when either is not
+    /// had within [`DECISION_WAIT`], holding nothing then.
+    fn claim_decision(&self) -> Option<MaterialClaim> {
+        let claim = self
+            .engine
+            .pending_commits()
+            .claim_material(DECISION_WAIT)
+            .ok()?;
+        // No write ever shared the scope: there is nothing to wait for.
+        (claim.through() == 0
+            || self
+                .engine
+                .await_complete_through(claim.through(), DECISION_WAIT))
+        .then_some(claim)
+    }
+
+    /// Settle a terminal decision whose outcome was not known: release its
+    /// protection once the outcome is. `true` when none is left in doubt,
+    /// and another decision on the material may be taken.
+    fn settle_unresolved(&self) -> bool {
+        let mut unresolved = self.unresolved.lock();
+        match &*unresolved {
+            None => true,
+            Some(doubt) => {
+                if self.resolved(doubt.commit_ts, Duration::ZERO) {
+                    tracing::info!(
+                        consumer_id = doubt.consumer_id,
+                        commit_ts = doubt.commit_ts,
+                        measured_through = doubt.claim.through(),
+                        "registry: an ending in doubt is settled"
+                    );
+                    *unresolved = None;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     /// The heartbeat record of `consumer_id` and its version, the version
@@ -589,31 +730,34 @@ impl RegistryCore {
     /// what it chose, reading again whenever another writer got there first.
     /// Heartbeats do not count as another writer: the record's liveness may
     /// be a heartbeat older than the commit, which only a decision on
-    /// liveness cares about ([`Self::transition_on_liveness`]).
+    /// liveness cares about ([`Self::transition_deciding`]).
     fn transition<T>(
         &self,
         consumer_id: &str,
         decide: impl FnMut(Option<RegistryEntry>) -> Result<Step<T>, RegistryError>,
     ) -> Result<T, RegistryError> {
-        self.transition_with(consumer_id, false, decide)
+        self.transition_with(consumer_id, false, &mut None, decide)
     }
 
     /// [`Self::transition`] for a decision that depends on how long ago the
     /// consumer was last heard from: a heartbeat landing before its commit
     /// makes it read again, so a consumer alive at the commit is never ended
-    /// as silent.
-    fn transition_on_liveness<T>(
+    /// as silent. `claim` is the material scope the attempt holds, if any: an
+    /// ending it writes keeps that claim while its outcome is not known.
+    fn transition_deciding<T>(
         &self,
         consumer_id: &str,
+        claim: &mut Option<MaterialClaim>,
         decide: impl FnMut(Option<RegistryEntry>) -> Result<Step<T>, RegistryError>,
     ) -> Result<T, RegistryError> {
-        self.transition_with(consumer_id, true, decide)
+        self.transition_with(consumer_id, true, claim, decide)
     }
 
     fn transition_with<T>(
         &self,
         consumer_id: &str,
         on_liveness: bool,
+        claim: &mut Option<MaterialClaim>,
         mut decide: impl FnMut(Option<RegistryEntry>) -> Result<Step<T>, RegistryError>,
     ) -> Result<T, RegistryError> {
         for attempt in 0..TRANSITION_ATTEMPTS {
@@ -655,7 +799,7 @@ impl RegistryCore {
                             hook();
                         }
                     }
-                    if self.write_conditionally(consumer_id, &ended, &read, true)? {
+                    if self.write_conditionally(consumer_id, &ended, &read, true, claim)? {
                         if !self.batching_on.load(Ordering::Acquire) {
                             self.recompute_floor()?;
                         }
@@ -683,7 +827,8 @@ impl RegistryCore {
                             seqno_space != entry.kind.is_seqno_space()
                                 || entry.checkpoint_seqno < checkpoint
                         });
-                    if self.write_conditionally(consumer_id, &entry, &read, false)? {
+                    // Not an ending: never under a decision's claim.
+                    if self.write_conditionally(consumer_id, &entry, &read, false, &mut None)? {
                         if lowers || !self.batching_on.load(Ordering::Acquire) {
                             self.recompute_floor()?;
                         }
@@ -996,6 +1141,10 @@ impl RegistryCore {
         let mut evicted = 0usize;
         let mut next_deadline_ms: Option<u64> = None;
         let mut behind = false;
+        // An ending whose outcome was not known is settled first: its
+        // protection stays until it is, and no other decision on the material
+        // is taken meanwhile.
+        let may_decide = self.settle_unresolved();
         for entry in self.scan_entries()? {
             if !entry.is_live() {
                 continue;
@@ -1008,33 +1157,88 @@ impl RegistryCore {
                 }
                 continue;
             }
-            let ended = match self.transition_on_liveness(&consumer_id, |current| {
-                let Some(mut current) = current else {
-                    return Ok(Step::Keep(None));
+            // An ending on a state delta's material is measured again and
+            // ordered with the material scope held by this attempt, so no
+            // write changes what it measured before its outcome is known. The
+            // measure taken here, outside the scope, only says whether to take
+            // it now; a final measure that ends on the material without it is
+            // not written, and the attempt takes the scope and reads again.
+            let mut claim = None;
+            if self.ends_on_material(&entry) {
+                claim = if may_decide {
+                    self.claim_decision()
+                } else {
+                    None
                 };
-                if current.incarnation != incarnation || !current.is_live() {
-                    return Ok(Step::Keep(None));
+                if claim.is_none() {
+                    // Tried again on the next sweep.
+                    behind = true;
+                    continue;
                 }
-                // A heartbeat buffered while the flush above was writing is
-                // only in the buffer, and it is a sign of life.
-                if let Some(ts) = self.pending_hb.lock().get(&consumer_id, incarnation) {
-                    current.last_heartbeat_ts_ms = current.last_heartbeat_ts_ms.max(ts);
+            }
+            #[cfg(test)]
+            {
+                let hook = self.before_decide.lock().take();
+                if let Some(hook) = hook {
+                    hook();
                 }
-                let now = self.clock.now_ms();
-                match current.termination(now, self.source.as_ref()) {
-                    Some(reason) => {
-                        let checkpoint = current.checkpoint_seqno;
-                        Ok(Step::End(
-                            self.terminated(current, reason, now),
-                            Some((reason, checkpoint)),
-                        ))
+            }
+            let transition = loop {
+                let holds = claim.is_some();
+                let mut needs_claim = false;
+                let transition = self.transition_deciding(&consumer_id, &mut claim, |current| {
+                    needs_claim = false;
+                    let Some(mut current) = current else {
+                        return Ok(Step::Keep(None));
+                    };
+                    if current.incarnation != incarnation || !current.is_live() {
+                        return Ok(Step::Keep(None));
                     }
-                    None => Ok(Step::Keep(None)),
+                    // A heartbeat buffered while the flush above was writing
+                    // is only in the buffer, and it is a sign of life.
+                    if let Some(ts) = self.pending_hb.lock().get(&consumer_id, incarnation) {
+                        current.last_heartbeat_ts_ms = current.last_heartbeat_ts_ms.max(ts);
+                    }
+                    let now = self.clock.now_ms();
+                    match current.termination(now, self.source.as_ref()) {
+                        Some(reason) if ends_on(current.kind, reason) && !holds => {
+                            needs_claim = true;
+                            Ok(Step::Keep(None))
+                        }
+                        Some(reason) => {
+                            let checkpoint = current.checkpoint_seqno;
+                            Ok(Step::End(
+                                self.terminated(current, reason, now),
+                                Some((reason, checkpoint)),
+                            ))
+                        }
+                        None => Ok(Step::Keep(None)),
+                    }
+                });
+                if !needs_claim {
+                    break transition;
                 }
-            }) {
+                claim = if may_decide {
+                    self.claim_decision()
+                } else {
+                    None
+                };
+                if claim.is_none() {
+                    behind = true;
+                    break transition;
+                }
+            };
+            // Its outcome known, the attempt gives the scope back; one still
+            // in doubt moved its claim to `unresolved`.
+            drop(claim);
+            let ended = match transition {
                 Ok(ended) => ended,
                 Err(RegistryError::NotLeader { .. }) => {
                     leads = false;
+                    None
+                }
+                Err(RegistryError::OutcomeUnknown { .. }) => {
+                    behind = true;
                     None
                 }
                 Err(e) => return Err(e),
@@ -1136,8 +1340,11 @@ impl ShardConsumerRegistry {
             flushing: Mutex::new(()),
             wake: Wake::default(),
             watches: Arc::new(Watches::default()),
+            unresolved: Mutex::new(None),
             #[cfg(test)]
             before_commit: Mutex::new(None),
+            #[cfg(test)]
+            before_decide: Mutex::new(None),
             #[cfg(test)]
             after_floor_scan: Mutex::new(None),
         });
@@ -1507,6 +1714,7 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                 checkpoint_seqno: checkpoint,
                 last_heartbeat_ts_ms: now,
                 started_at: checkpoint,
+                obligation_since_ms: now,
                 follows,
             };
             Ok(Step::Write(entry, incarnation))
@@ -1523,6 +1731,10 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
             // retention. An acknowledgement is also a sign of life.
             if seqno <= entry.checkpoint_seqno && entry.last_heartbeat_ts_ms >= now {
                 return Ok(Step::Keep(()));
+            }
+            // A pinned snapshot moved is a new view to read, admitted now.
+            if entry.kind == ConsumerKind::MvccSnapshotPin && seqno > entry.checkpoint_seqno {
+                entry.obligation_since_ms = now;
             }
             entry.checkpoint_seqno = entry.checkpoint_seqno.max(seqno);
             entry.last_heartbeat_ts_ms = entry.last_heartbeat_ts_ms.max(now);

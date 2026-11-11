@@ -189,3 +189,31 @@ fn a_reset_is_durable_and_leaves_no_marker() {
     );
     assert_eq!(coverage.skip_until(), 10, "the old marker is gone");
 }
+
+/// Installed rows of the longest keys are handed to the unit index in
+/// portions whose key copies never pass the portion's bound, checked before
+/// a copy is made, and every row is handed over once.
+#[test]
+fn installed_units_hold_no_more_key_bytes_than_a_portion_may() {
+    let long = |n: u32| {
+        let mut key = format!("node:{n:08}:").into_bytes();
+        key.resize(u16::MAX as usize, b'k');
+        key
+    };
+    // One more key than fit a portion exactly.
+    let count = (UNIT_CHUNK_BYTES / u16::MAX as usize + 1) as u32;
+    let rows: Rows = (0..count).map(|n| (long(n), b"v".to_vec())).collect();
+    let mut handed = 0usize;
+    installed_units(&rows, |units| {
+        let held: usize = units.iter().map(|unit| unit.1.len()).sum();
+        assert!(
+            held <= UNIT_CHUNK_BYTES && units.len() <= UNIT_CHUNK,
+            "a portion of {} units holds {held} key bytes",
+            units.len()
+        );
+        handed += units.len();
+        Ok(())
+    })
+    .expect("portions");
+    assert_eq!(handed, rows.len());
+}

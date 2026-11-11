@@ -293,17 +293,34 @@ What a `Bounded` limit measures depends on what the consumer reads:
   committed entry, and the bytes of the journal segments kept from its
   position;
 - a state consumer (`LsmStateDelta`): the age of the oldest commit at or
-  after its position (its commit timestamp), and the logical bytes of every
-  commit from there on: keys, values, merge operands, deletions and range
-  deletion bounds, before compression. Compression, file layout and
-  compaction do not change it. It is what the consumer keeps from
-  collection, not what cancelling it would free: another consumer, a live
-  read or the retention window can hold the same history. The store's hard
-  limit still applies on its own and can refuse writes while a consumer is
-  below its byte limit. A store without a commit-time oracle refuses
-  `Bounded` for state consumers;
-- a pinned snapshot (`MvccSnapshotPin`): `Bounded` is refused; register it
-  `Strict`.
+  after its position (its commit timestamp), and the logical bytes of what
+  it needs to read the keys changed since: for each such key, its last value
+  or deletion and every merge operand applied after it, a range deletion
+  once however many keys it removed. A value overwritten since the position
+  costs nothing, and overwriting a key does not make the oldest work any
+  younger. The bytes are counted before compression; compression, file
+  layout and compaction do not change them. The count is folded from the
+  commits in commit-time order, and a decision to end a consumer reads it
+  brought up to the store's latest complete commit, so a later overwrite
+  that lowered the bytes is counted. While such a decision is measured and
+  written, writes that change the store's data wait for it (commits in
+  flight before it land first, and none arriving after it overtakes it),
+  so no write lands between its measure and its ending; it holds them for
+  its final catch-up and its write only, and until the outcome of that
+  write is known. A commit that waits longer than five seconds is refused
+  as retryable backpressure. It is what the consumer needs, not
+  what cancelling it would free: another consumer, a live read or the
+  retention window can hold the same history. The store's hard limit still
+  applies on its own and can refuse writes while a consumer is below its
+  byte limit. A store without a commit-time oracle refuses `Bounded` for
+  state consumers;
+- a pinned snapshot (`MvccSnapshotPin`): how long its read has been
+  outstanding, counted from when the registration was admitted (moving its
+  checkpoint is a new view to read, admitted then), with or without new
+  writes; and the logical bytes of every key with a value at its position,
+  each key's last value and the merge operands after it, a deleted key
+  costing nothing. Writes after its position do not change it. A store
+  without a commit-time oracle refuses `Bounded` for it too.
 
 A consumer whose measure cannot be read is not ended for it, and its listing
 shows the measure as unavailable rather than as zero.

@@ -720,21 +720,21 @@ pub(crate) fn apply_oplog_ops_at(
             // A replacement being prepared receives the same write in the
             // same batch, as on the live apply path.
             OplogOp::Insert { key, value, .. } => {
-                tally.unit(key, value);
+                tally.put(key, value);
                 batch.insert(addressing.point(key)?, value.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.insert(staging, value.as_slice());
                 }
             }
             OplogOp::Delete { key, .. } => {
-                tally.unit(key, &[]);
+                tally.delete(key);
                 batch.remove(addressing.point(key)?);
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.remove(staging);
                 }
             }
             OplogOp::Merge { key, operand, .. } => {
-                tally.unit(key, operand);
+                tally.merge(key, operand);
                 batch.merge(addressing.point(key)?, operand.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.merge(staging, operand.as_slice());
@@ -742,7 +742,7 @@ pub(crate) fn apply_oplog_ops_at(
             }
             OplogOp::RemoveRange { start, end, .. } => {
                 let start = coverage::clamp_user_start(start);
-                tally.unit(start, end);
+                tally.range(start, end);
                 let ranges = addressing.range(start, end);
                 let staging = addressing.staging_range(start, end);
                 for (start, end) in ranges.into_iter().chain(staging) {

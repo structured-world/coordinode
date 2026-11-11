@@ -131,8 +131,10 @@ impl RetentionSource for LogRetentionSource {
         // what a state reader keeps, not what a pinned snapshot does.
         match kind {
             ConsumerKind::OplogEvents => true,
-            ConsumerKind::LsmStateDelta => self.engine.oracle().is_some(),
-            ConsumerKind::MvccSnapshotPin | ConsumerKind::Ephemeral => false,
+            ConsumerKind::LsmStateDelta | ConsumerKind::MvccSnapshotPin => {
+                self.engine.oracle().is_some()
+            }
+            ConsumerKind::Ephemeral => false,
         }
     }
 
@@ -184,7 +186,27 @@ impl RetentionSource for LogRetentionSource {
         // before compression are what it keeps from collection. A commit
         // above the cut is not counted yet: it is younger than the cut, and
         // counting it in part could age or size a write never wholly applied.
-        match self.engine.observe_material(position) {
+        // The fold is brought to the cut first: a later write can raise or
+        // lower a key's charge, so a decision taken on an older fold could
+        // end a consumer that no longer exceeds its bound. A backlog longer
+        // than one bounded round leaves the measure unavailable this time;
+        // what was folded stays, and the next observation goes on.
+        match self.engine.fold_material_to_cut() {
+            Ok(true) => {}
+            Ok(false) => return Err(Unmeasured::Unreadable),
+            Err(e) => {
+                tracing::warn!(error = %e, position, "registry: material fold could not catch up");
+                return Err(Unmeasured::Unreadable);
+            }
+        }
+        // A pinned snapshot reads every key with a value at its position;
+        // a state reader, the keys changed since.
+        let observed = if kind == ConsumerKind::MvccSnapshotPin {
+            self.engine.observe_snapshot_material(position)
+        } else {
+            self.engine.observe_material(position)
+        };
+        match observed {
             Ok(Observation::Observed {
                 material,
                 generation,

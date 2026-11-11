@@ -50,6 +50,7 @@ fn an_auto_commit_statement_outwaits_a_slow_commit_in_flight() {
                     || oracle.next().as_raw(),
                     Vec::new(),
                     vec![(Partition::Node, node)],
+                    coordinode_storage::engine::pending::Material::Changes,
                 )
                 .expect("admit the holder");
             held.send(()).expect("signal");
@@ -85,7 +86,12 @@ fn a_standalone_causal_wait_ends_at_its_deadline_or_cancel() {
     std::thread::scope(|scope| {
         scope.spawn(move || {
             let (ts, admission) = pending
-                .admit_allocated(|| oracle.next().as_raw(), Vec::new(), Vec::new())
+                .admit_allocated(
+                    || oracle.next().as_raw(),
+                    Vec::new(),
+                    Vec::new(),
+                    coordinode_storage::engine::pending::Material::Changes,
+                )
                 .expect("admit the commit in flight");
             held.send(ts).expect("signal");
             released
@@ -170,7 +176,12 @@ fn a_standalone_start_waiting_for_its_bound_ends_with_its_cancel() {
     std::thread::scope(|scope| {
         scope.spawn(move || {
             let (ts, admission) = pending
-                .admit_allocated(|| oracle.next().as_raw(), Vec::new(), Vec::new())
+                .admit_allocated(
+                    || oracle.next().as_raw(),
+                    Vec::new(),
+                    Vec::new(),
+                    coordinode_storage::engine::pending::Material::Changes,
+                )
                 .expect("admit the commit in flight");
             held.send(ts).expect("signal");
             released
@@ -314,7 +325,12 @@ fn set_while_a_commit_holds_the_node(
     std::thread::scope(|scope| {
         let holder = scope.spawn(move || {
             let (_ts, admission) = pending
-                .admit_allocated(|| u64::MAX - 1, Vec::new(), vec![(Partition::Node, node)])
+                .admit_allocated(
+                    || u64::MAX - 1,
+                    Vec::new(),
+                    vec![(Partition::Node, node)],
+                    coordinode_storage::engine::pending::Material::Changes,
+                )
                 .expect("admit the holder");
             held.send(()).expect("signal");
             match hold {
@@ -2650,7 +2666,12 @@ fn an_ordinary_read_does_not_wait_for_a_commit_in_flight() {
         .expect("seed");
     let pending = Arc::clone(db.engine().pending_commits());
     let (in_flight, admission) = pending
-        .admit_allocated(|| db.oracle.next().as_raw(), Vec::new(), Vec::new())
+        .admit_allocated(
+            || db.oracle.next().as_raw(),
+            Vec::new(),
+            Vec::new(),
+            coordinode_storage::engine::pending::Material::Changes,
+        )
         .expect("admit an unrelated commit");
 
     let majority = ReadConcern::majority();
@@ -2762,7 +2783,12 @@ fn a_standalone_aligned_read_is_taken_below_a_commit_in_flight() {
     let db = Database::open(dir.path()).expect("open");
     let pending = Arc::clone(db.engine().pending_commits());
     let (low, admission) = pending
-        .admit_allocated(|| db.oracle.next().as_raw(), Vec::new(), Vec::new())
+        .admit_allocated(
+            || db.oracle.next().as_raw(),
+            Vec::new(),
+            Vec::new(),
+            coordinode_storage::engine::pending::Material::Changes,
+        )
         .expect("admit an earlier commit");
     let high = db
         .execute_cypher_shared("CREATE (:Later {k: 1})", None, None, None, None)

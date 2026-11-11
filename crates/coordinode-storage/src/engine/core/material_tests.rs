@@ -248,7 +248,12 @@ fn an_observation_stops_at_the_complete_cut() {
     // An earlier commit holds its timestamp, not yet applied.
     let (held_ts, held) = engine
         .pending_commits()
-        .admit_allocated(|| base, Vec::new(), Vec::new())
+        .admit_allocated(
+            || base,
+            Vec::new(),
+            Vec::new(),
+            crate::engine::pending::Material::Changes,
+        )
         .expect("admit");
     apply(
         &engine,
@@ -267,6 +272,7 @@ fn an_observation_stops_at_the_complete_cut() {
     );
     // A checkpoint at the cut itself, so the read does reach the records.
     let checkpoint = held_ts - 1;
+    engine.fold_material_to_cut().expect("fold");
     match engine.observe_material(checkpoint).expect("observe") {
         Observation::Observed {
             through, material, ..
@@ -277,6 +283,7 @@ fn an_observation_stops_at_the_complete_cut() {
         other => panic!("observed nothing: {other:?}"),
     }
     drop(held);
+    engine.fold_material_to_cut().expect("fold");
     match engine.observe_material(checkpoint).expect("observe") {
         Observation::Observed { material, .. } => assert_eq!(material, oracle.from(checkpoint)),
         other => panic!("observed nothing: {other:?}"),
@@ -306,6 +313,7 @@ fn a_rebuild_begun_during_an_observation_voids_it() {
     let dir = TempDir::new().expect("tempdir");
     let start = future_base();
     let engine = oracle_engine(dir.path(), start);
+    engine.fold_material_to_cut().expect("fold");
     let observed = engine
         .observe_material_with(start, || {
             // Begun and left running: the repair holds on past the read.
@@ -601,6 +609,7 @@ fn a_partition_takes_one_repair_at_a_time() {
     // The next repair takes it and finishes.
     let next = engine.begin_rebuild(Partition::Node).expect("next");
     engine.finish_rebuild(next).expect("finish");
+    engine.fold_material_to_cut().expect("fold");
     assert!(matches!(
         engine.observe_material(start).expect("observe"),
         Observation::Observed { .. }
@@ -648,6 +657,7 @@ fn records_from_the_checkpoint_stay_through_an_observation() {
         }],
     );
     let later = base + 2 * crate::engine::material::RETIRE_WINDOW;
+    engine.fold_material_to_cut().expect("fold");
     let observed = engine
         .observe_material_with(base, || {
             // Meanwhile nothing keeps the window back: a commit far ahead
@@ -691,7 +701,7 @@ fn a_direct_write_under_way_holds_the_cut_below_it() {
     let mut batch = lsm_tree::WriteBatch::with_capacity(2);
     batch.insert(b"node:direct".as_slice(), [1u8; 4].as_slice());
     let mut tally = crate::engine::material::Tally::default();
-    tally.unit(b"node:direct", &[1; 4]);
+    tally.put(b"node:direct", &[1; 4]);
     let mut seen = None;
     engine
         .apply_single_with(Partition::Node, batch, tally, |seqno| {

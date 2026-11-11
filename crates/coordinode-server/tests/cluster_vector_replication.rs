@@ -901,6 +901,7 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
             || n1.oracle.next().as_raw(),
             vec![(Partition::Node, held_key.clone())],
             vec![],
+            coordinode_storage::engine::pending::Material::Changes,
         )
         .expect("admit the held commit");
 

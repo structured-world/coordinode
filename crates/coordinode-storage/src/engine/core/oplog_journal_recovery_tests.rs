@@ -1206,10 +1206,16 @@ fn a_persist_writes_tables_only_for_trees_that_took_writes() {
     engine.persist().expect("persist");
     let after = tables(&engine);
     let written = before.iter().zip(&after).filter(|(b, a)| a > b).count();
+    let which: Vec<_> = Partition::all()
+        .iter()
+        .zip(before.iter().zip(&after))
+        .filter(|(_, (b, a))| a > b)
+        .map(|(p, _)| p.name())
+        .collect();
     assert_eq!(
         written,
         2,
-        "trees that got a table: {written} of {}",
+        "trees that got a table: {written} of {}: {which:?}",
         after.len()
     );
     rig.cut(engine);

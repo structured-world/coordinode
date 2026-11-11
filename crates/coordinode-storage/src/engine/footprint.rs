@@ -1006,8 +1006,23 @@ pub fn write_footprint(mutations: &[coordinode_core::txn::proposal::Mutation]) -
             }
         })
         .sum::<u64>();
-    // Each tree the apply touches also takes its material record.
-    footprint_of(data, mutations.len()) + crate::engine::material::record_allowance(mutations.len())
+    // The key bytes the unit records hold.
+    let keys: u64 = mutations
+        .iter()
+        .map(|mutation| match mutation {
+            Mutation::Put { key, .. }
+            | Mutation::Delete { key, .. }
+            | Mutation::Merge { key, .. } => key.len() as u64,
+            Mutation::RemoveRange { start, end, .. } => (start.len() + end.len()) as u64,
+            Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => {
+                DECIDED_MUTATION_BYTES
+            }
+        })
+        .sum::<u64>();
+    // Each tree the apply touches also takes its material record, and each
+    // unit its unit record.
+    footprint_of(data, mutations.len())
+        + crate::engine::material::record_allowance(mutations.len(), keys)
 }
 
 /// The room a commit applied from a consensus log is admitted for beside its

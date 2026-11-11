@@ -507,12 +507,23 @@ fn a_read_waits_for_pending_work_below_it_and_not_above_it() {
 
     let pending = PendingCommits::new(16);
 
+    let changes = crate::engine::pending::Material::Changes;
     let _at_100 = pending
-        .admit_allocated(|| 100, vec![(Partition::Node, b"a".to_vec())], Vec::new())
+        .admit_allocated(
+            || 100,
+            vec![(Partition::Node, b"a".to_vec())],
+            Vec::new(),
+            changes,
+        )
         .expect("admit")
         .1;
     let _at_200 = pending
-        .admit_allocated(|| 200, vec![(Partition::Node, b"b".to_vec())], Vec::new())
+        .admit_allocated(
+            || 200,
+            vec![(Partition::Node, b"b".to_vec())],
+            Vec::new(),
+            changes,
+        )
         .expect("admit")
         .1;
 
@@ -722,6 +733,7 @@ fn a_condition_on_a_record_being_written_by_another_commit_is_refused() {
             || oracle.next().as_raw(),
             vec![(Partition::Node, GUARD.to_vec())],
             Vec::new(),
+            crate::engine::pending::Material::Changes,
         )
         .expect("admit the other commit");
 

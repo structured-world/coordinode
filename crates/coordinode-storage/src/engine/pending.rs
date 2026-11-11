@@ -138,6 +138,40 @@ struct Table {
     /// wait lives: as many as the waits in progress. Woken with the threads
     /// that wait for one.
     wakers: HashMap<u64, Waker>,
+    /// The registrations sharing the material scope, by identity.
+    material: std::collections::HashSet<u64>,
+    /// Where a terminal decision on the material stands.
+    material_claim: Claim,
+    /// The highest timestamp a registration sharing the material scope took:
+    /// a decision's protected cut reaches it.
+    material_last: u64,
+}
+
+/// A terminal decision's hold on the material scope.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// None: writes that change the material share the scope freely.
+    #[default]
+    Open,
+    /// One waits for the writes sharing the scope to land; writes arriving
+    /// meanwhile wait behind it, so it is not overtaken.
+    Waiting,
+    /// One holds the scope: writes that change the material wait.
+    Held,
+}
+
+/// Whether a registration's write can change the material a coalesced
+/// state-delta consumer is measured on. Writes that can share the material
+/// scope with each other; a terminal decision on that measure takes the
+/// scope alone, so no such write lands between its measurement and its
+/// ordered outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Material {
+    /// It writes keys whose closure a consumer is charged for.
+    Changes,
+    /// It writes only records no consumer is charged for: the registry's,
+    /// the log's, a member's own.
+    Untouched,
 }
 
 /// The commits this leader has admitted but not yet applied.
@@ -185,7 +219,16 @@ pub enum Refusal {
         /// The number of commits the table admits at once.
         limit: usize,
     },
+    /// A terminal decision on the material held its scope past the wait: a
+    /// write that changes the material is retried once it is decided; a
+    /// second decision, once the first is.
+    MaterialClaimed,
 }
+
+/// How long a write that changes the material waits for a terminal decision
+/// on it to be ordered, when the write names no wait of its own. A decision
+/// holds the scope for its final catch-up and its ordered write only.
+pub const MATERIAL_WAIT: Duration = Duration::from_secs(5);
 
 impl PendingCommits {
     /// An empty table admitting at most `max_in_flight` commits at once.
@@ -285,6 +328,80 @@ impl PendingCommits {
         }
     }
 
+    /// Wait on `table`'s lock until no terminal decision waits for or holds
+    /// the material scope; `false` when `deadline` passed first.
+    fn await_material_open(
+        &self,
+        table: &mut parking_lot::MutexGuard<'_, Table>,
+        deadline: Option<Instant>,
+    ) -> bool {
+        while table.material_claim != Claim::Open {
+            match deadline {
+                Some(deadline) => {
+                    if self.finished.wait_until(table, deadline).timed_out()
+                        && table.material_claim != Claim::Open
+                    {
+                        return false;
+                    }
+                }
+                None => self.finished.wait(table),
+            }
+        }
+        true
+    }
+
+    /// Record registration `id`, at `ts`, as sharing the material scope when
+    /// its write changes the material.
+    fn share_material(table: &mut Table, id: u64, ts: u64, material: Material) {
+        if material == Material::Changes {
+            table.material.insert(id);
+            table.material_last = table.material_last.max(ts);
+        }
+    }
+
+    /// Take the material scope for a terminal decision: wait, up to `wait`,
+    /// for every registration sharing it to land, while writes that would
+    /// share it wait behind this one. The decision is then measured against
+    /// a cut at or past [`MaterialClaim::through`] and ordered with the
+    /// claim held; no write that changes the material registers until the
+    /// claim is released.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::MaterialClaimed`] when another decision holds or waits for
+    /// the scope, or the registrations sharing it did not all land in
+    /// `wait`; nothing is held then.
+    pub fn claim_material(self: &Arc<Self>, wait: Duration) -> Result<MaterialClaim, Refusal> {
+        let deadline = Instant::now() + wait;
+        let mut table = self.inner.lock();
+        if table.material_claim != Claim::Open {
+            return Err(Refusal::MaterialClaimed);
+        }
+        table.material_claim = Claim::Waiting;
+        while !table.material.is_empty() {
+            if self.finished.wait_until(&mut table, deadline).timed_out()
+                && !table.material.is_empty()
+            {
+                table.material_claim = Claim::Open;
+                // The writes that waited behind it go on.
+                self.wake_all(table);
+                return Err(Refusal::MaterialClaimed);
+            }
+        }
+        table.material_claim = Claim::Held;
+        Ok(MaterialClaim {
+            pending: Arc::clone(self),
+            through: table.material_last,
+        })
+    }
+
+    /// Release the material scope a decision held.
+    fn release_material(&self) {
+        let mut table = self.inner.lock();
+        table.material_claim = Claim::Open;
+        self.wake_all(table);
+    }
+
     /// Admit a commit writing `scope` and conditioned on `guards`, or name
     /// the commit that already holds one of its keys.
     ///
@@ -303,13 +420,22 @@ impl PendingCommits {
     /// allocation happens under the same lock the registration and the
     /// snapshot floor take, so a reader sees either the registration or a
     /// clock that has not reached it.
+    ///
+    /// A commit whose writes change the material waits, up to
+    /// [`MATERIAL_WAIT`], for a terminal decision on it to be ordered.
     pub fn admit_allocated<'p>(
         &'p self,
         allocate: impl FnOnce() -> u64,
         scope: Vec<(Partition, Vec<u8>)>,
         guards: Vec<(Partition, Vec<u8>)>,
+        material: Material,
     ) -> Result<(u64, Admission<'p>), Refusal> {
         let mut table = self.inner.lock();
+        if material == Material::Changes
+            && !self.await_material_open(&mut table, Some(Instant::now() + MATERIAL_WAIT))
+        {
+            return Err(Refusal::MaterialClaimed);
+        }
         let candidate = Admitted {
             commit_ts: 0,
             scope,
@@ -319,7 +445,7 @@ impl PendingCommits {
         if let Some(refusal) = Self::overlap(&table, &candidate) {
             return Err(refusal);
         }
-        self.insert_admitted(&mut table, allocate, candidate)
+        self.insert_admitted(&mut table, allocate, candidate, material)
     }
 
     /// [`Self::admit_allocated`] for a commit that waits its turn instead of
@@ -339,13 +465,16 @@ impl PendingCommits {
     ///
     /// [`Refusal::Reserved`] when another waiter holds one of its keys,
     /// [`Refusal::Overlap`] when an admitted commit still holds one at the
-    /// deadline, [`Refusal::AtCapacity`] at the table's bound.
+    /// deadline, [`Refusal::MaterialClaimed`] when a terminal decision on
+    /// the material still holds its scope then, [`Refusal::AtCapacity`] at
+    /// the table's bound.
     pub fn admit_allocated_waiting<'p>(
         &'p self,
         allocate: impl FnOnce() -> u64,
         scope: Vec<(Partition, Vec<u8>)>,
         guards: Vec<(Partition, Vec<u8>)>,
         wait: Duration,
+        material: Material,
     ) -> Result<(u64, Admission<'p>), Refusal> {
         let deadline = Instant::now() + wait;
         let mut table = self.inner.lock();
@@ -356,7 +485,27 @@ impl PendingCommits {
         };
         Self::refuse_reserved(&table, &candidate)?;
         let mut reservation = None;
-        while Self::overlap(&table, &candidate).is_some() {
+        let unreserve = |table: &mut Table, reservation: Option<u64>| {
+            if let Some(id) = reservation {
+                table.reserved.remove(&id);
+            }
+        };
+        // Both waits end together: the commits on its keys landed and no
+        // terminal decision holds the material, checked again after each
+        // wake since either can start while the other is waited for.
+        loop {
+            if material == Material::Changes && table.material_claim != Claim::Open {
+                if self.finished.wait_until(&mut table, deadline).timed_out()
+                    && table.material_claim != Claim::Open
+                {
+                    unreserve(&mut table, reservation);
+                    return Err(Refusal::MaterialClaimed);
+                }
+                continue;
+            }
+            if Self::overlap(&table, &candidate).is_none() {
+                break;
+            }
             if reservation.is_none() {
                 let id = self
                     .next_id
@@ -374,16 +523,12 @@ impl PendingCommits {
             if self.finished.wait_until(&mut table, deadline).timed_out()
                 && let Some(refusal) = Self::overlap(&table, &candidate)
             {
-                if let Some(id) = reservation {
-                    table.reserved.remove(&id);
-                }
+                unreserve(&mut table, reservation);
                 return Err(refusal);
             }
         }
-        if let Some(id) = reservation {
-            table.reserved.remove(&id);
-        }
-        self.insert_admitted(&mut table, allocate, candidate)
+        unreserve(&mut table, reservation);
+        self.insert_admitted(&mut table, allocate, candidate, material)
     }
 
     /// Register `candidate` under a freshly allocated timestamp.
@@ -392,6 +537,7 @@ impl PendingCommits {
         table: &mut Table,
         allocate: impl FnOnce() -> u64,
         mut candidate: Admitted,
+        material: Material,
     ) -> Result<(u64, Admission<'p>), Refusal> {
         // Accounted before the timestamp is taken: a number allocated and then
         // refused is a hole in the clock nobody closes.
@@ -407,6 +553,7 @@ impl PendingCommits {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         table.index(id, &candidate);
         table.admitted.insert(id, candidate);
+        Self::share_material(table, id, commit_ts, material);
         Ok((commit_ts, Admission { pending: self, id }))
     }
 
@@ -531,14 +678,44 @@ impl PendingCommits {
     /// until the returned [`Unlogged`] is dropped, which the caller does once
     /// the entry is handed to the log (or will never be). Allocation and
     /// registration take one lock, so no bound computed in between can pass
-    /// over the timestamp.
+    /// over the timestamp. For an entry whose writes change no consumer's
+    /// material (see [`Self::obligate_changing`] for one that does).
     pub fn obligate(self: &Arc<Self>, allocate: impl FnOnce() -> u64) -> (u64, Unlogged) {
         let mut table = self.inner.lock();
+        self.obligate_in(&mut table, allocate, Material::Untouched)
+    }
+
+    /// [`Self::obligate`] for an entry whose writes change the material: it
+    /// shares the material scope, and waits first, up to [`MATERIAL_WAIT`],
+    /// for a terminal decision holding it to be ordered.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::MaterialClaimed`] when a decision still holds the scope at
+    /// the deadline; nothing is held then.
+    pub fn obligate_changing(
+        self: &Arc<Self>,
+        allocate: impl FnOnce() -> u64,
+    ) -> Result<(u64, Unlogged), Refusal> {
+        let mut table = self.inner.lock();
+        if !self.await_material_open(&mut table, Some(Instant::now() + MATERIAL_WAIT)) {
+            return Err(Refusal::MaterialClaimed);
+        }
+        Ok(self.obligate_in(&mut table, allocate, Material::Changes))
+    }
+
+    fn obligate_in(
+        self: &Arc<Self>,
+        table: &mut parking_lot::MutexGuard<'_, Table>,
+        allocate: impl FnOnce() -> u64,
+        material: Material,
+    ) -> (u64, Unlogged) {
         let commit_ts = allocate();
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         table.unlogged.insert(id, commit_ts);
+        Self::share_material(table, id, commit_ts, material);
         (
             commit_ts,
             Unlogged {
@@ -550,9 +727,9 @@ impl PendingCommits {
     }
 
     /// [`Self::obligate`] for a write that never goes to the log (a member's
-    /// own records): its timestamp holds the bound while it is written, and
-    /// its release makes no closing entry due, since no entry reached the log
-    /// for one to cover.
+    /// own records, which are no consumer's material): its timestamp holds
+    /// the bound while it is written, and its release makes no closing entry
+    /// due, since no entry reached the log for one to cover.
     pub fn obligate_local(self: &Arc<Self>, allocate: impl FnOnce() -> u64) -> (u64, Unlogged) {
         let (commit_ts, mut held) = self.obligate(allocate);
         held.local = true;
@@ -670,6 +847,7 @@ impl PendingCommits {
 
     fn withdraw(&self, id: u64) {
         let mut table = self.inner.lock();
+        table.material.remove(&id);
         table.sealed.remove(&id);
         if let Some(admitted) = table.admitted.remove(&id) {
             table.unindex(id, &admitted);
@@ -709,9 +887,25 @@ impl PendingCommits {
     /// a timestamp `allocate` takes: like a commit, so no complete snapshot
     /// covers it before all of it has landed. It conditions on nothing and
     /// is never refused: the table counts it, but its caller writes one key
-    /// at a time and holds it only across that write.
-    pub fn admit_direct(&self, allocate: impl FnOnce() -> u64) -> (u64, DirectWrite<'_>) {
+    /// at a time and holds it only across that write. One that changes the
+    /// material waits first, up to [`MATERIAL_WAIT`], for a terminal decision
+    /// on it to be ordered.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::MaterialClaimed`] when a decision still holds the scope at
+    /// the deadline; nothing is held then.
+    pub fn admit_direct(
+        &self,
+        allocate: impl FnOnce() -> u64,
+        material: Material,
+    ) -> Result<(u64, DirectWrite<'_>), Refusal> {
         let mut table = self.inner.lock();
+        if material == Material::Changes
+            && !self.await_material_open(&mut table, Some(Instant::now() + MATERIAL_WAIT))
+        {
+            return Err(Refusal::MaterialClaimed);
+        }
         let candidate = Admitted {
             commit_ts: allocate(),
             scope: Vec::new(),
@@ -723,13 +917,15 @@ impl PendingCommits {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         table.index(id, &candidate);
         table.admitted.insert(id, candidate);
-        (commit_ts, DirectWrite { pending: self, id })
+        Self::share_material(&mut table, id, commit_ts, material);
+        Ok((commit_ts, DirectWrite { pending: self, id }))
     }
 
     /// Release a direct write: it stops holding snapshots, and makes no
     /// closing entry due, since no entry reached the log for one to cover.
     fn withdraw_direct(&self, id: u64) {
         let mut table = self.inner.lock();
+        table.material.remove(&id);
         if let Some(admitted) = table.admitted.remove(&id) {
             table.unindex(id, &admitted);
         }
@@ -741,6 +937,7 @@ impl PendingCommits {
     /// stops holding the bound.
     fn withdraw_unlogged(&self, id: u64, local: bool) {
         let mut table = self.inner.lock();
+        table.material.remove(&id);
         table.sealed.remove(&id);
         if let Some(commit_ts) = table.unlogged.remove(&id)
             && !local
@@ -863,6 +1060,32 @@ pub struct DirectWrite<'p> {
 impl Drop for DirectWrite<'_> {
     fn drop(&mut self) {
         self.pending.withdraw_direct(self.id);
+    }
+}
+
+/// A terminal decision's hold on the material scope
+/// ([`PendingCommits::claim_material`]). Its owner keeps it for as long as
+/// the attempt it protects can still take effect, an unknown outcome
+/// included, and releases it by dropping it.
+#[derive(Debug)]
+#[must_use = "the claim holds every write that changes the material until it drops"]
+pub struct MaterialClaim {
+    pending: Arc<PendingCommits>,
+    through: u64,
+}
+
+impl MaterialClaim {
+    /// The highest timestamp a write sharing the scope took before the
+    /// claim: a measurement taken under it is of a complete cut at or past
+    /// this one.
+    pub fn through(&self) -> u64 {
+        self.through
+    }
+}
+
+impl Drop for MaterialClaim {
+    fn drop(&mut self) {
+        self.pending.release_material();
     }
 }
 

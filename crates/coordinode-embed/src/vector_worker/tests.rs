@@ -509,6 +509,7 @@ fn the_watermark_stays_below_a_commit_still_in_flight() {
             || oracle.next().as_raw(),
             vec![(Partition::Node, early_key)],
             Vec::new(),
+            coordinode_storage::engine::pending::Material::Changes,
         )
         .expect("admit the early commit");
     // A later commit lands and is folded.

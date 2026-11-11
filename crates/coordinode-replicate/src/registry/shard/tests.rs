@@ -2356,3 +2356,528 @@ fn a_registration_under_pressure_is_refused_and_admitted_ones_continue() {
         .expect("register once the pressure eases");
     assert_eq!(late.incarnation(), 1, "the refusal used no incarnation");
 }
+
+/// A registry over a store with no consensus log, measuring the store's own
+/// material: what a state delta consumer is charged is the store's fold.
+struct MaterialRegistry {
+    reg: ShardConsumerRegistry,
+    engine: Arc<StorageEngine>,
+    pipeline: Arc<dyn ProposalPipeline>,
+    ids: Arc<ProposalIdGenerator>,
+    _dir: tempfile::TempDir,
+}
+
+fn material_registry() -> MaterialRegistry {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A clock ahead of the wall clock: the oracle's timestamps follow it.
+    let start = 4_000_000_000_000_000u64;
+    let oracle = Arc::new(
+        coordinode_core::txn::timestamp::TimestampOracle::resume_from(
+            coordinode_core::txn::timestamp::Timestamp::from_raw(start),
+        ),
+    );
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            oracle,
+        )
+        .expect("open engine"),
+    );
+    keep_all_history(&engine);
+    let source: Arc<dyn RetentionSource> = Arc::new(crate::registry::LogRetentionSource::new(
+        Arc::clone(&engine),
+        Vec::new(),
+        coordinode_storage::oplog::manager::OplogManager::open(
+            &dir.path().join("log"),
+            0,
+            1 << 20,
+            1_000,
+            3_600,
+        )
+        .expect("open an empty log")
+        .retained_floor(),
+        Arc::new(|| 0),
+    ));
+    let pipeline: Arc<dyn ProposalPipeline> = Arc::new(
+        coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
+    );
+    let ids = Arc::new(ProposalIdGenerator::with_base(1u64 << 48));
+    let reg = ShardConsumerRegistry::new(
+        Arc::clone(&engine),
+        Arc::clone(&pipeline),
+        Arc::clone(&ids),
+        Arc::new(ManualClock::new(start / 1_000)),
+        source,
+    )
+    .expect("open the registry");
+    MaterialRegistry {
+        reg,
+        engine,
+        pipeline,
+        ids,
+        _dir: dir,
+    }
+}
+
+/// Commit `len` bytes under `key` as a client transaction does, through the
+/// admission every write that changes the material passes; its commit
+/// timestamp.
+fn commit_value(
+    engine: &StorageEngine,
+    pipeline: &dyn ProposalPipeline,
+    ids: &ProposalIdGenerator,
+    key: &[u8],
+    len: usize,
+) -> Result<u64, CommitError> {
+    let oracle = engine.oracle().expect("an oracle");
+    let mut txn = Transaction::begin(engine, Some(oracle.as_ref()), oracle.next());
+    txn.put(Partition::Node, key, &vec![7; len])
+        .expect("stage the write");
+    let write_concern = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &write_concern,
+        pipeline: Some(pipeline),
+        id_gen: Some(ids),
+    };
+    txn.commit(&ctx)
+        .map(|outcome| outcome.commit_ts.expect("a commit timestamp").as_raw())
+}
+
+/// A state delta consumer measured over its byte bound on a large value is
+/// ended only if no write that shrank its material was ordered before the
+/// ending: a client overwriting the value with a small one between the
+/// measurement and the ordered ending lands after it, and the ending was
+/// decided on the material as it stood at its own place in the order.
+/// Before, the overwrite landed first and the consumer was ended on bytes
+/// it no longer required.
+#[test]
+fn a_smaller_write_racing_an_ending_lands_after_it() {
+    let m = material_registry();
+    // Before every write the test makes.
+    let checkpoint = m.engine.oracle().expect("an oracle").next().as_raw();
+    m.reg
+        .register(registration(
+            "delta",
+            checkpoint,
+            bounded(1_000_000_000, 64 << 10, None),
+        ))
+        .expect("register");
+    commit_value(
+        &m.engine,
+        m.pipeline.as_ref(),
+        &m.ids,
+        b"node:value",
+        1 << 20,
+    )
+    .expect("the large value");
+    let small_at = Arc::new(AtomicU64::new(0));
+    let writer = Arc::new(Mutex::new(None));
+    *m.reg.core.before_commit.lock() = Some(Box::new({
+        let (engine, pipeline, ids) = (
+            Arc::clone(&m.engine),
+            Arc::clone(&m.pipeline),
+            Arc::clone(&m.ids),
+        );
+        let (small_at, writer) = (Arc::clone(&small_at), Arc::clone(&writer));
+        move || {
+            // Between the measurement and the ordered ending, another client
+            // replaces the value with a small one.
+            let (done, finished) = std::sync::mpsc::channel();
+            *writer.lock() = Some(std::thread::spawn(move || {
+                let at = commit_value(&engine, pipeline.as_ref(), &ids, b"node:value", 4)
+                    .expect("the small value commits");
+                small_at.store(at, Ordering::Release);
+                let _ = done.send(());
+            }));
+            // Given every chance to land first.
+            let _ = finished.recv_timeout(Duration::from_millis(300));
+        }
+    }));
+    m.reg.core.sweep_evictions().expect("sweep");
+    if let Some(writer) = writer.lock().take() {
+        writer.join().expect("the writer");
+    }
+    let ended_at = m
+        .engine
+        .record_version(Partition::Registry, &encode_registry_key("delta"))
+        .expect("read the record")
+        .expect("a record");
+    assert_eq!(
+        ended_for(&m.reg, "delta"),
+        Some(TerminalReason::RetainedBytesExceeded),
+        "the consumer requiring the large value is ended"
+    );
+    let small = small_at.load(Ordering::Acquire);
+    assert!(
+        small > ended_at,
+        "the small value (at {small}) was ordered before the ending (at {ended_at}) decided on the large one"
+    );
+}
+
+/// A consumer measured within its bound on a first look, then over it on
+/// the final one (a large value landed between), is ended only with the
+/// material scope taken: the final measure without it is not written, the
+/// attempt takes the scope and reads again, and a client overwriting the
+/// value with a small one between that measure and the ordered ending
+/// lands after the ending. Before, the ending went out on the final measure
+/// with no scope held, and the small write landed first.
+#[test]
+fn an_ending_found_only_on_the_final_measure_takes_the_scope_first() {
+    let m = material_registry();
+    let checkpoint = m.engine.oracle().expect("an oracle").next().as_raw();
+    m.reg
+        .register(registration(
+            "delta",
+            checkpoint,
+            bounded(1_000_000_000, 64 << 10, None),
+        ))
+        .expect("register");
+    commit_value(&m.engine, m.pipeline.as_ref(), &m.ids, b"node:value", 4).expect("small");
+    // Between the first look (within the bound) and the decision.
+    *m.reg.core.before_decide.lock() = Some(Box::new({
+        let (engine, pipeline, ids) = (
+            Arc::clone(&m.engine),
+            Arc::clone(&m.pipeline),
+            Arc::clone(&m.ids),
+        );
+        move || {
+            commit_value(&engine, pipeline.as_ref(), &ids, b"node:value", 1 << 20)
+                .expect("the large value");
+        }
+    }));
+    let small_at = Arc::new(Mutex::new(None));
+    let writer = Arc::new(Mutex::new(None));
+    *m.reg.core.before_commit.lock() = Some(Box::new({
+        let (engine, pipeline, ids) = (
+            Arc::clone(&m.engine),
+            Arc::clone(&m.pipeline),
+            Arc::clone(&m.ids),
+        );
+        let (small_at, writer) = (Arc::clone(&small_at), Arc::clone(&writer));
+        move || {
+            let (done, finished) = std::sync::mpsc::channel();
+            *writer.lock() = Some(std::thread::spawn(move || {
+                *small_at.lock() = Some(commit_value(
+                    &engine,
+                    pipeline.as_ref(),
+                    &ids,
+                    b"node:value",
+                    4,
+                ));
+                let _ = done.send(());
+            }));
+            let _ = finished.recv_timeout(Duration::from_millis(300));
+        }
+    }));
+    m.reg.core.sweep_evictions().expect("sweep");
+    if let Some(writer) = writer.lock().take() {
+        writer.join().expect("the writer");
+    }
+    assert_eq!(
+        ended_for(&m.reg, "delta"),
+        Some(TerminalReason::RetainedBytesExceeded),
+        "the consumer over its bound on the final measure is ended"
+    );
+    let ended_at = m
+        .engine
+        .record_version(Partition::Registry, &encode_registry_key("delta"))
+        .expect("read the record")
+        .expect("a record");
+    let written = small_at.lock().take().expect("the writer ran");
+    assert!(
+        match &written {
+            Ok(at) => *at > ended_at,
+            Err(e) => matches!(e, CommitError::Backpressure),
+        },
+        "the small write {written:?} against the ending at {ended_at}"
+    );
+}
+
+/// A pipeline that, once armed, hands the next ending to the log late, on
+/// another thread, and tells its proposer at once that the outcome is not
+/// known: the ending can still apply after the proposer gave up waiting.
+struct LateEnding {
+    inner: Arc<dyn ProposalPipeline>,
+    armed: AtomicBool,
+    late: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl ProposalPipeline for LateEnding {
+    fn propose_and_wait(
+        &self,
+        proposal: &RaftProposal,
+    ) -> Result<
+        coordinode_core::txn::proposal::ProposalOutcome,
+        coordinode_core::txn::proposal::ProposalError,
+    > {
+        use coordinode_core::txn::proposal::{MetadataCommand, Mutation, ProposalError};
+        let ending = proposal.mutations.iter().any(|m| {
+            matches!(
+                m,
+                Mutation::Command(MetadataCommand::ConditionalRegistryWrite { .. })
+            )
+        });
+        if ending && self.armed.swap(false, Ordering::AcqRel) {
+            let (inner, proposal) = (Arc::clone(&self.inner), proposal.clone());
+            *self.late.lock() = Some(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = inner.propose_and_wait(&proposal);
+            }));
+            return Err(ProposalError::Timeout { retries: 3 });
+        }
+        self.inner.propose_and_wait(proposal)
+    }
+}
+
+/// An ending whose outcome is not known keeps the material scope until it
+/// is: the ending, handed to the log late, applies on the large value it
+/// measured; a client overwriting that value meanwhile waits, and lands (or
+/// is refused as retryable) after it; the scope is released once a closed
+/// bound past the ending applies. A lower timestamp held unlogged keeps
+/// every closed bound below the ending meanwhile, so its late entry is
+/// still taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ending_in_doubt_keeps_its_protection_until_its_outcome_is_known() {
+    let DoubtRegistry {
+        engine,
+        oracle,
+        node,
+        raft,
+        late,
+        ids,
+        reg,
+        _dir,
+    } = doubt_registry().await;
+    let checkpoint = oracle.next().as_raw();
+    reg.register(registration(
+        "delta",
+        checkpoint,
+        bounded(1_000_000_000, 64 << 10, None),
+    ))
+    .expect("register");
+    let large = commit_value(&engine, raft.as_ref(), &ids, b"node:value", 1 << 20)
+        .expect("the large value");
+    assert!(
+        engine.await_complete_through(large, Duration::from_secs(10)),
+        "the large value is never known complete"
+    );
+    let (_, low) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let small = Arc::new(Mutex::new(None));
+    let writer = Arc::new(Mutex::new(None));
+    *reg.core.before_commit.lock() = Some(Box::new({
+        let (engine, raft, ids) = (Arc::clone(&engine), Arc::clone(&raft), Arc::clone(&ids));
+        let (small, writer) = (Arc::clone(&small), Arc::clone(&writer));
+        move || {
+            *writer.lock() = Some(std::thread::spawn(move || {
+                *small.lock() = Some(commit_value(&engine, raft.as_ref(), &ids, b"node:value", 4));
+            }));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }));
+    late.armed.store(true, Ordering::Release);
+    reg.core.sweep_evictions().expect("sweep");
+    // The ending applies late; once the held timestamp goes, a bound past it
+    // settles the outcome and the scope is released.
+    if let Some(late) = late.late.lock().take() {
+        late.join().expect("the late ending");
+    }
+    drop(low);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !reg.core.settle_unresolved() {
+        assert!(Instant::now() < deadline, "the outcome was never settled");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if let Some(writer) = writer.lock().take() {
+        writer.join().expect("the writer");
+    }
+    assert_eq!(
+        ended_for(&reg, "delta"),
+        Some(TerminalReason::RetainedBytesExceeded),
+        "the late ending applied"
+    );
+    let ended_at = engine
+        .record_version(Partition::Registry, &encode_registry_key("delta"))
+        .expect("read the record")
+        .expect("a record");
+    let written = small.lock().take().expect("the writer ran");
+    assert!(
+        match &written {
+            Ok(at) => *at > ended_at,
+            // Refused as retryable while it waited behind the decision.
+            Err(e) => matches!(e, CommitError::Backpressure),
+        },
+        "the small write {written:?} against the late ending at {ended_at}"
+    );
+    node.shutdown().await.expect("shutdown");
+}
+
+/// A registry over a one-member Raft group whose pipeline can hand the next
+/// registry write to the log late ([`LateEnding`]).
+struct DoubtRegistry {
+    engine: Arc<StorageEngine>,
+    oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+    node: Arc<RaftNode>,
+    raft: Arc<dyn ProposalPipeline>,
+    late: Arc<LateEnding>,
+    ids: Arc<ProposalIdGenerator>,
+    reg: ShardConsumerRegistry,
+    _dir: tempfile::TempDir,
+}
+
+async fn doubt_registry() -> DoubtRegistry {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let start = 4_000_000_000_000_000u64;
+    let oracle = Arc::new(
+        coordinode_core::txn::timestamp::TimestampOracle::resume_from(
+            coordinode_core::txn::timestamp::Timestamp::from_raw(start),
+        ),
+    );
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            Arc::clone(&oracle),
+        )
+        .expect("open engine"),
+    );
+    keep_all_history(&engine);
+    let node = Arc::new(
+        RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+            .await
+            .expect("raft node"),
+    );
+    let raft: Arc<dyn ProposalPipeline> =
+        Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
+    let late = Arc::new(LateEnding {
+        inner: Arc::clone(&raft),
+        armed: AtomicBool::new(false),
+        late: Mutex::new(None),
+    });
+    let source: Arc<dyn RetentionSource> = Arc::new(crate::registry::LogRetentionSource::new(
+        Arc::clone(&engine),
+        Vec::new(),
+        coordinode_storage::oplog::manager::OplogManager::open(
+            &dir.path().join("log"),
+            0,
+            1 << 20,
+            1_000,
+            3_600,
+        )
+        .expect("open an empty log")
+        .retained_floor(),
+        Arc::new(|| 0),
+    ));
+    let ids = Arc::new(ProposalIdGenerator::with_base(1u64 << 48));
+    let reg = ShardConsumerRegistry::new(
+        Arc::clone(&engine),
+        Arc::clone(&late) as Arc<dyn ProposalPipeline>,
+        Arc::clone(&ids),
+        Arc::new(ManualClock::new(start / 1_000)),
+        source,
+    )
+    .expect("open the registry");
+    DoubtRegistry {
+        engine,
+        oracle,
+        node,
+        raft,
+        late,
+        ids,
+        reg,
+        _dir: dir,
+    }
+}
+
+/// A registry write that is no terminal decision (another consumer's
+/// checkpoint) and whose outcome is not known, made while a sweep holds the
+/// material scope for an ending, neither takes that scope nor reports its
+/// outcome as a decision's: the checkpoint is retried and lands, and the
+/// ending, known applied, leaves no decision in doubt behind. Before, the
+/// scope lived in shared registry state, and the checkpoint moved it into
+/// the doubt record under its own timestamp and returned `OutcomeUnknown`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concurrent_write_in_doubt_does_not_take_a_decisions_scope() {
+    let DoubtRegistry {
+        engine,
+        oracle,
+        node,
+        raft,
+        late,
+        ids,
+        reg,
+        _dir,
+    } = doubt_registry().await;
+    let reg = Arc::new(reg);
+    let at = oracle.next().as_raw();
+    reg.register(registration(
+        "delta",
+        at,
+        bounded(1_000_000_000, 64 << 10, None),
+    ))
+    .expect("register the delta");
+    let other = reg
+        .register(registration(
+            "other",
+            at,
+            bounded(1_000_000_000, 1 << 40, None),
+        ))
+        .expect("register the other");
+    let large = commit_value(&engine, raft.as_ref(), &ids, b"node:value", 1 << 20)
+        .expect("the large value");
+    assert!(
+        engine.await_complete_through(large, Duration::from_secs(10)),
+        "the large value is never known complete"
+    );
+    // Keeps every closed bound below the checkpoint, so its outcome stays
+    // unknown for as long as a decision would wait on it.
+    let (_, low) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let checkpointed = Arc::new(Mutex::new(None));
+    *reg.core.before_commit.lock() = Some(Box::new({
+        let (reg, late, checkpointed) = (
+            Arc::clone(&reg),
+            Arc::clone(&late),
+            Arc::clone(&checkpointed),
+        );
+        let seqno = oracle.next().as_raw();
+        move || {
+            // The sweep holds the scope here; the checkpoint is handed to
+            // the log late.
+            late.armed.store(true, Ordering::Release);
+            *checkpointed.lock() = Some(reg.checkpoint(&other, seqno));
+        }
+    }));
+    reg.core.sweep_evictions().expect("sweep");
+    let doubt = reg
+        .core
+        .unresolved
+        .lock()
+        .as_ref()
+        .map(|d| d.consumer_id.clone());
+    if let Some(late) = late.late.lock().take() {
+        late.join().expect("the late checkpoint");
+    }
+    drop(low);
+    let checkpointed = checkpointed.lock().take().expect("the checkpoint ran");
+    assert!(
+        checkpointed.is_ok(),
+        "a checkpoint is no decision: retried, not reported in doubt: {checkpointed:?}"
+    );
+    assert_eq!(doubt, None, "no decision was left in doubt");
+    assert_eq!(
+        ended_for(&reg, "delta"),
+        Some(TerminalReason::RetainedBytesExceeded),
+        "the ending applied"
+    );
+    node.shutdown().await.expect("shutdown");
+}

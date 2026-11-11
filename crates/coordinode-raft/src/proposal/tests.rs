@@ -6,6 +6,18 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use tempfile::TempDir;
 
+/// A timestamp for a data write, held as not yet logged; no consumer's
+/// ending holds the writes in these tests.
+fn held_write(
+    engine: &StorageEngine,
+    oracle: &coordinode_core::txn::timestamp::TimestampOracle,
+) -> (u64, coordinode_storage::engine::pending::Unlogged) {
+    engine
+        .pending_commits()
+        .obligate_changing(|| oracle.next().as_raw())
+        .expect("no ending holds the writes")
+}
+
 fn test_engine() -> (TempDir, Arc<StorageEngine>) {
     let dir = TempDir::new().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -53,7 +65,7 @@ async fn closed_by_its_own_entry(
     key: &[u8],
 ) -> (RaftProposal, coordinode_storage::engine::pending::Unlogged) {
     for _ in 0..20 {
-        let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+        let (ts, held) = held_write(engine, oracle);
         let proposal = RaftProposal {
             id: ids.next(),
             mutations: vec![Mutation::Put {
@@ -457,7 +469,7 @@ async fn a_retry_below_the_closed_bound_is_not_a_refusal() {
         .await
         .expect("open raft node");
     let pipeline = node.pipeline();
-    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let (ts, held) = held_write(&engine, &oracle);
     let proposal = RaftProposal {
         id: ProposalIdGenerator::new().next(),
         mutations: vec![Mutation::Put {
@@ -535,8 +547,8 @@ async fn a_sealed_commit_is_closed_by_its_own_entry() {
     drop(closed_by_its_own_entry(&node, &engine, &oracle, &ids, b"node:1:alone").await);
 
     // A lower timestamp held for another write, in flight beside this one.
-    let (low, low_held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
-    let (high, high_held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let (low, low_held) = held_write(&engine, &oracle);
+    let (high, high_held) = held_write(&engine, &oracle);
     let later = put(high, b"node:1:later");
     high_held.seal(later.id);
     pipeline.propose_async(&later).await.expect("commit");
@@ -621,7 +633,7 @@ async fn a_sealed_write_retried_after_an_unknown_outcome_lands_once() {
     );
     let gate = pipeline.rate_limiter.acquire(0).await.expect("permit");
     let key = b"counter:once".to_vec();
-    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let (ts, held) = held_write(&engine, &oracle);
     let proposal = RaftProposal {
         id: ids.next(),
         mutations: vec![Mutation::Merge {
@@ -719,8 +731,8 @@ async fn an_earlier_hold_keeps_the_bound_below_a_later_write() {
     settle(&node, &engine, &oracle).await;
     let pipeline = RaftProposalPipeline::with_max_pending(Arc::clone(node.raft()), 2)
         .with_closure(Arc::clone(&engine));
-    let (earlier, earlier_held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
-    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let (earlier, earlier_held) = held_write(&engine, &oracle);
+    let (ts, held) = held_write(&engine, &oracle);
     let proposal = RaftProposal {
         id: ProposalIdGenerator::new().next(),
         mutations: vec![Mutation::Merge {

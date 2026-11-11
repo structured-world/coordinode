@@ -270,7 +270,10 @@ fn closed_write(
     sealed: bool,
 ) -> ClosedWrite {
     let t = Instant::now();
-    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let (ts, held) = engine
+        .pending_commits()
+        .obligate_changing(|| oracle.next().as_raw())
+        .expect("no ending holds the writes");
     let proposal = RaftProposal {
         commit_ts: Timestamp::from_raw(ts),
         start_ts: Timestamp::from_raw(ts),
@@ -395,7 +398,9 @@ fn stamp_costs() {
         let mut held = Vec::with_capacity(batch * 2);
         let mut proposals = Vec::with_capacity(batch);
         for _ in 0..batch {
-            let (ts, hold) = pending.obligate(|| oracle.next().as_raw());
+            let (ts, hold) = pending
+                .obligate_changing(|| oracle.next().as_raw())
+                .expect("no ending holds the writes");
             let proposal = RaftProposal {
                 commit_ts: Timestamp::from_raw(ts),
                 start_ts: Timestamp::from_raw(ts),
@@ -406,7 +411,12 @@ fn stamp_costs() {
             proposals.push(proposal);
         }
         for _ in 0..batch {
-            held.push(pending.obligate(|| oracle.next().as_raw()).1);
+            held.push(
+                pending
+                    .obligate_changing(|| oracle.next().as_raw())
+                    .expect("no ending holds the writes")
+                    .1,
+            );
         }
         let request = coordinode_raft::storage::Request::batch(proposals);
         let mut samples = Vec::new();

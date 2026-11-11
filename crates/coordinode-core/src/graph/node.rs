@@ -241,6 +241,10 @@ pub enum IdLeaseError {
     /// The log did not grant a lease for another reason.
     #[error("no NodeId lease was granted: {0}")]
     NotGranted(String),
+    /// A consumer's ending was being ordered and held the grant's write past
+    /// its wait: nothing was granted; retry.
+    #[error("no NodeId lease was granted: held by a consumer's ending being ordered; retry")]
+    Held,
     /// The reserver answered with a range the allocator cannot use.
     #[error("the NodeId lease ({base}, {ceiling}] is not a valid range")]
     InvalidLease {

@@ -99,6 +99,8 @@ serde_json = { workspace = true }
 nanoid = "0.5"
 test-log = "0.2.21"
 rand = "0.10"
+# The unit tests' allocator: counts what a piece of work held at once.
+tracking-allocator = { version = "0.4", default-features = false }
 
 [[bench]]
 name = "merge_stress"

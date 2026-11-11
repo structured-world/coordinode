@@ -526,6 +526,16 @@ pub enum RegistryError {
     /// timed out). Carries the underlying message.
     #[error("registry replication failed: {0}")]
     Replication(String),
+
+    /// A terminal decision on `consumer_id` was handed to the log and its
+    /// outcome is not known yet: it may still apply. The protection it was
+    /// measured under stays held until the outcome is known; no other
+    /// decision on the material is taken meanwhile.
+    #[error("the ending of {consumer_id:?} was proposed and its outcome is not known yet")]
+    OutcomeUnknown {
+        /// The consumer whose ending is in doubt.
+        consumer_id: String,
+    },
 }
 
 #[cfg(test)]

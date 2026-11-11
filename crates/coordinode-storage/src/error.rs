@@ -263,6 +263,11 @@ pub enum StorageError {
         /// The deployment the store was enrolled in.
         enrolled: coordinode_core::group::DeploymentId,
     },
+
+    /// A decision ending a state consumer held the store's writes past the
+    /// wait: nothing was written; retry once it is ordered.
+    #[error("a consumer's ending is being ordered and held this write past its wait; retry")]
+    MaterialClaimed,
 }
 
 /// `key` as text for a message: printable ASCII as it is, every other byte

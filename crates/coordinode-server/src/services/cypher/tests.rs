@@ -437,6 +437,7 @@ async fn a_guard_condition_is_refused_beside_a_write_of_the_guard_in_flight() {
                 guard_key,
             )],
             Vec::new(),
+            coordinode_storage::engine::pending::Material::Changes,
         )
         .expect("admit the other commit");
 
@@ -2025,7 +2026,10 @@ async fn no_read_is_answered_from_a_hole_below_an_applied_commit() {
         let db = svc.database().read();
         let engine = db.engine();
         let oracle = engine.oracle().expect("an oracle");
-        engine.pending_commits().obligate(|| oracle.next().as_raw())
+        engine
+            .pending_commits()
+            .obligate_changing(|| oracle.next().as_raw())
+            .expect("no ending holds the writes")
     };
     let written = svc
         .execute_cypher(cypher_request("CREATE (n:Hole {v: 1})"))
@@ -3842,7 +3846,12 @@ fn a_standalone_read_waiting_for_its_bound_holds_no_thread() {
         .expect("clock")
         .as_micros() as u64;
     let (_, held) = pending
-        .admit_allocated(|| in_flight, Vec::new(), Vec::new())
+        .admit_allocated(
+            || in_flight,
+            Vec::new(),
+            Vec::new(),
+            coordinode_storage::engine::pending::Material::Changes,
+        )
         .expect("admit the commit in flight");
 
     runtime.block_on(async {
