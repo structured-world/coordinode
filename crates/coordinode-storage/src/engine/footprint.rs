@@ -1006,7 +1006,8 @@ pub fn write_footprint(mutations: &[coordinode_core::txn::proposal::Mutation]) -
             }
         })
         .sum::<u64>();
-    footprint_of(data, mutations.len())
+    // Each tree the apply touches also takes its material record.
+    footprint_of(data, mutations.len()) + crate::engine::material::record_allowance(mutations.len())
 }
 
 /// The room a commit applied from a consensus log is admitted for beside its

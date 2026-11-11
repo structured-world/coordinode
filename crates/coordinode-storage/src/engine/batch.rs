@@ -211,7 +211,7 @@ impl<'a> WriteBatch<'a> {
             crate::engine::footprint::footprint_of(
                 self.mutations.iter().map(Mutation::data_bytes).sum(),
                 self.mutations.len(),
-            ),
+            ) + crate::engine::material::record_allowance(self.mutations.len()),
         )?;
         let seqno = engine.next_seqno();
         self.commit_at(seqno)?;
@@ -325,24 +325,29 @@ fn apply_group(
     let tree = engine.tree(part)?;
     let mut addressing =
         crate::engine::installation::Addressing::new(engine.installations_of(part), tree, seqno);
-    let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 1);
+    let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 2);
+    // The copy a replacement receives is the same logical write: counted once.
+    let mut tally = crate::engine::material::Tally::default();
     // A replacement being prepared for a generation receives the same write
     // in the same batch, so the batch's coverage marker covers it too.
     for mutation in group {
         match mutation {
             Mutation::Put { key, value, .. } => {
+                tally.unit(key, value);
                 batch.insert(addressing.point(key)?, value.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.insert(staging, value.as_slice());
                 }
             }
             Mutation::Delete { key, .. } => {
+                tally.unit(key, &[]);
                 batch.remove(addressing.point(key)?);
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.remove(staging);
                 }
             }
             Mutation::Merge { key, operand, .. } => {
+                tally.unit(key, operand);
                 batch.merge(addressing.point(key)?, operand.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.merge(staging, operand.as_slice());
@@ -350,6 +355,7 @@ fn apply_group(
             }
             Mutation::RemoveRange { start, end, .. } => {
                 let start = coverage::clamp_user_start(start);
+                tally.unit(start, end);
                 let ranges = addressing.range(start, end);
                 let staging = addressing.staging_range(start, end);
                 for (start, end) in ranges.into_iter().chain(staging) {
@@ -361,6 +367,7 @@ fn apply_group(
             }
         }
     }
+    tally.record(part, seqno, &mut batch);
     if let Some(mark) = cover {
         batch.insert(mark.key().as_slice(), &[][..]);
     }

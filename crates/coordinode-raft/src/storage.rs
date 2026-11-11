@@ -616,7 +616,7 @@ pub fn rebuild_partition_from_checkpoint(
                     partition.name()
                 )));
             }
-            engine.begin_partition_rebuild(partition, &rows)?;
+            let repair = engine.begin_partition_rebuild(partition, &rows)?;
             let mut seen: HashMap<u64, usize> = HashMap::new();
             for oplog_entry in entries {
                 let index = oplog_entry.index;
@@ -643,7 +643,7 @@ pub fn rebuild_partition_from_checkpoint(
                     )?;
                 }
             }
-            engine.finish_raft_rebuild(partition, to, payload)
+            engine.finish_raft_rebuild(repair, to, payload)
         })
         .map_err(|e| io::Error::other(format!("rebuild {}: {e}", partition.name())))
 }

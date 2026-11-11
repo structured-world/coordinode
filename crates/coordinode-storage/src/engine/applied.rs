@@ -438,9 +438,28 @@ impl AppliedFeed {
                             replaced = true;
                         }
                     }
-                    // The keys a command writes are decided as it applies and
-                    // are not in the entry, so a Schema follower rereads.
-                    Mutation::Command(_) | Mutation::Operation(_) => {
+                    // A conditional registry write names the keys it may
+                    // write: a follower rereads those, and finds them changed
+                    // or not as the condition decided.
+                    Mutation::Command(
+                        coordinode_core::txn::proposal::MetadataCommand::ConditionalRegistryWrite {
+                            put,
+                            ..
+                        },
+                    ) => {
+                        if subscriber.partition == Partition::Registry {
+                            keys.extend(put.iter().map(|(key, _)| key.clone()));
+                        }
+                    }
+                    // The keys any other command writes are decided as it
+                    // applies and are not in the entry, so a follower of its
+                    // partition rereads.
+                    Mutation::Command(command) => {
+                        if Partition::from(command.partition()) == subscriber.partition {
+                            replaced = true;
+                        }
+                    }
+                    Mutation::Operation(_) => {
                         if subscriber.partition == Partition::Schema {
                             replaced = true;
                         }

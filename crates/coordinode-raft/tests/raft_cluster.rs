@@ -7746,6 +7746,253 @@ async fn field_bindings_agree_on_every_member_across_a_leader_change() {
     );
 }
 
+/// A conditional registry write: `put` lands only if every `expect` holds.
+fn conditional_write(
+    id_gen: &ProposalIdGenerator,
+    expect: &[(&[u8], Option<&[u8]>)],
+    put: &[(&[u8], &[u8])],
+    ts: u64,
+) -> RaftProposal {
+    RaftProposal {
+        id: id_gen.next(),
+        mutations: vec![Mutation::Command(
+            MetadataCommand::ConditionalRegistryWrite {
+                expect: expect
+                    .iter()
+                    .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
+                    .collect(),
+                put: put.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect(),
+            },
+        )],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts - 1),
+        bypass_rate_limiter: false,
+    }
+}
+
+/// A Node write of `key` = `m`, to mark a point in the log.
+fn marker(id_gen: &ProposalIdGenerator, key: &[u8], ts: u64) -> RaftProposal {
+    RaftProposal {
+        id: id_gen.next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: key.to_vec(),
+            value: b"m".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts - 1),
+        bypass_rate_limiter: false,
+    }
+}
+
+/// The registry record `key` holds on `engine`.
+fn registry_record(engine: &StorageEngine, key: &[u8]) -> Option<Vec<u8>> {
+    engine
+        .get(Partition::Registry, key)
+        .expect("read the registry")
+        .map(|v| v.to_vec())
+}
+
+/// Reopen the stopped node `node_id` over its store in `dir`.
+async fn reopen_store_and_member(
+    node_id: u64,
+    port: u16,
+    dir: &tempfile::TempDir,
+) -> (RaftNode, Arc<StorageEngine>) {
+    // The stopped node's last tasks may still hold its store a moment.
+    let mut opened = StorageEngine::open(&node_storage(dir.path(), 0));
+    for _ in 0..50 {
+        if opened.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        opened = StorageEngine::open(&node_storage(dir.path(), 0));
+    }
+    let engine = Arc::new(opened.expect("the stopped member's store reopens"));
+    (reopen_member(node_id, &engine, port).await, engine)
+}
+
+/// A conditional registry write is decided by the ordered apply, so every
+/// member reaches the same outcome however it gets the entry: applied live,
+/// applied after catching up from the log while it was down, applied again
+/// after a restart, or decided under a new leader after the old one died.
+/// A write whose condition failed changes nothing on any member, and stays
+/// refused when a member that missed it decides it later: its decision is
+/// reproduced from the replicated records, never measured again.
+#[tokio::test(flavor = "multi_thread")]
+async fn conditional_registry_writes_decide_alike_across_restart_and_leader_loss() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=off")
+        .with_test_writer()
+        .try_init();
+    const KEY: &[u8] = b"consumer:conditional";
+    const OTHER: &[u8] = b"consumer:untouched";
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let (n1, n2, n3, p1, p2, p3) = bootstrap_3_node().await;
+        await_leadership(&n1.node).await;
+
+        // Member 3 is down while the first writes commit, once it has caught
+        // up with the group it joined.
+        let id_gen = ProposalIdGenerator::with_base(31u64 << 48);
+        n1.node
+            .pipeline()
+            .propose_and_wait(&RaftProposal {
+                id: id_gen.next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:1:joined".to_vec(),
+                    value: b"v".to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(50),
+                start_ts: Timestamp::from_raw(49),
+                bypass_rate_limiter: false,
+            })
+            .expect("a write commits");
+        assert!(await_replicated(&n3.engine, b"node:1:joined", b"v").await);
+        let dir3 = n3._dir;
+        n3.node.shutdown().await.expect("shutdown 3");
+        drop(n3.node);
+        drop(n3.engine);
+
+        let leader = n1.node.pipeline();
+        leader
+            .propose_and_wait(&conditional_write(
+                &id_gen,
+                &[(KEY, None)],
+                &[(KEY, b"v1"), (OTHER, b"kept")],
+                100,
+            ))
+            .expect("the first write commits");
+        // Its condition no longer holds: it commits and is refused.
+        leader
+            .propose_and_wait(&conditional_write(
+                &id_gen,
+                &[(KEY, None)],
+                &[(KEY, b"v2"), (OTHER, b"lost")],
+                110,
+            ))
+            .expect("the refused write commits as an entry");
+        // A write behind the refused one: a member holding it has applied
+        // the refused write too, so what it shows is the decided outcome,
+        // not a state from before the decision.
+        const AFTER_REFUSED: &[u8] = b"node:1:after-refused";
+        leader
+            .propose_and_wait(&marker(&id_gen, AFTER_REFUSED, 120))
+            .expect("the marker commits");
+        for (engine, who) in [(&n1.engine, "n1"), (&n2.engine, "n2")] {
+            assert!(
+                await_replicated(engine, AFTER_REFUSED, b"m").await,
+                "{who} applies past the refused write"
+            );
+            assert_eq!(registry_record(engine, KEY).as_deref(), Some(&b"v1"[..]));
+            assert_eq!(
+                registry_record(engine, OTHER).as_deref(),
+                Some(&b"kept"[..]),
+                "{who} applied a refused write"
+            );
+        }
+
+        // Member 3 comes back and decides both from the log.
+        let (node3, e3) = reopen_store_and_member(3, p3, &dir3).await;
+        assert!(
+            await_replicated(&e3, AFTER_REFUSED, b"m").await,
+            "the restarted member applies past the refused write"
+        );
+        assert_eq!(registry_record(&e3, KEY).as_deref(), Some(&b"v1"[..]));
+        assert_eq!(
+            registry_record(&e3, OTHER).as_deref(),
+            Some(&b"kept"[..]),
+            "the restarted member applied the refused write"
+        );
+
+        // The leader dies; a survivor takes over.
+        drop(leader);
+        n1.node.shutdown().await.expect("shutdown leader");
+        let dir1 = n1._dir;
+        drop(n1.node);
+        drop(n1.engine);
+        let mut new_leader = None;
+        for _ in 0..150 {
+            if n2.node.is_leader().await {
+                new_leader = Some(n2.node.pipeline());
+                break;
+            }
+            if node3.is_leader().await {
+                new_leader = Some(node3.pipeline());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let pipeline = new_leader.expect("a survivor becomes leader");
+        pipeline
+            .propose_and_wait(&conditional_write(
+                &id_gen,
+                &[(KEY, Some(b"v1"))],
+                &[(KEY, b"v3")],
+                200,
+            ))
+            .expect("the new leader's write commits");
+        pipeline
+            .propose_and_wait(&conditional_write(
+                &id_gen,
+                &[(KEY, Some(b"v1"))],
+                &[(KEY, b"v4")],
+                210,
+            ))
+            .expect("the refused write commits as an entry");
+        const AFTER_SECOND: &[u8] = b"node:1:after-second-refused";
+        pipeline
+            .propose_and_wait(&marker(&id_gen, AFTER_SECOND, 220))
+            .expect("the marker commits");
+        for (engine, who) in [(&n2.engine, "n2"), (&e3, "n3")] {
+            assert!(
+                await_replicated(engine, AFTER_SECOND, b"m").await,
+                "{who} applies past the second refused write"
+            );
+        }
+
+        // The old leader rejoins and decides what it missed; a survivor
+        // restarts and decides its log again.
+        drop(pipeline);
+        let (node1, e1) = reopen_store_and_member(1, p1, &dir1).await;
+        assert!(
+            await_replicated(&e1, AFTER_SECOND, b"m").await,
+            "the old leader applies what it missed"
+        );
+        let dir2 = n2._dir;
+        n2.node.shutdown().await.expect("shutdown 2");
+        drop(n2.node);
+        drop(n2.engine);
+        let (node2, e2) = reopen_store_and_member(2, p2, &dir2).await;
+        assert!(
+            await_replicated(&e2, AFTER_SECOND, b"m").await,
+            "a restarted survivor holds its log"
+        );
+        for (engine, who) in [(&e1, "n1"), (&e2, "n2"), (&e3, "n3")] {
+            assert_eq!(
+                registry_record(engine, KEY).as_deref(),
+                Some(&b"v3"[..]),
+                "{who} disagrees"
+            );
+            assert_eq!(
+                registry_record(engine, OTHER).as_deref(),
+                Some(&b"kept"[..]),
+                "{who} applied a refused write"
+            );
+        }
+
+        node1.shutdown().await.expect("shutdown 1");
+        node2.shutdown().await.expect("shutdown 2");
+        node3.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: conditional_registry_writes_decide_alike_across_restart_and_leader_loss"
+    );
+}
+
 /// A member that joins after the log was purged takes the dictionary from the
 /// snapshot and the rest from the log, and once it leads, the names it
 /// registers continue above the frontier it received: a snapshot that lost a

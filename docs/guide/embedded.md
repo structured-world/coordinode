@@ -287,6 +287,27 @@ registration chooses its retention policy; there is no default:
   reason, and its history is no longer kept for it. Heartbeats prove liveness
   only: they never reset the lag.
 
+What a `Bounded` limit measures depends on what the consumer reads:
+
+- a log consumer (`OplogEvents`): the age of the oldest unacknowledged
+  committed entry, and the bytes of the journal segments kept from its
+  position;
+- a state consumer (`LsmStateDelta`): the age of the oldest commit at or
+  after its position (its commit timestamp), and the logical bytes of every
+  commit from there on: keys, values, merge operands, deletions and range
+  deletion bounds, before compression. Compression, file layout and
+  compaction do not change it. It is what the consumer keeps from
+  collection, not what cancelling it would free: another consumer, a live
+  read or the retention window can hold the same history. The store's hard
+  limit still applies on its own and can refuse writes while a consumer is
+  below its byte limit. A store without a commit-time oracle refuses
+  `Bounded` for state consumers;
+- a pinned snapshot (`MvccSnapshotPin`): `Bounded` is refused; register it
+  `Strict`.
+
+A consumer whose measure cannot be read is not ended for it, and its listing
+shows the measure as unavailable rather than as zero.
+
 A log consumer (`ConsumerKind::OplogEvents`) has its position kept in the
 journal; a state or snapshot consumer (`LsmStateDelta`, `MvccSnapshotPin`) in
 the MVCC history. The position is held from the registration on, across

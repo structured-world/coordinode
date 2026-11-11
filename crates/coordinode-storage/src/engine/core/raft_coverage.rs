@@ -16,7 +16,7 @@ use std::sync::Arc;
 use coordinode_core::txn::proposal::Mutation;
 use lsm_tree::AbstractTree;
 
-use super::{Rows, StorageEngine, claim_checkpoint_dir};
+use super::{PartitionRepair, Rows, StorageEngine, claim_checkpoint_dir};
 use crate::engine::MAX_DERIVED_EFFECTS;
 use crate::engine::coverage::{self, Domain, Mark, TreeCoverage};
 use crate::engine::partition::Partition;
@@ -304,8 +304,9 @@ impl StorageEngine {
             | Mutation::Delete { partition, .. }
             | Mutation::Merge { partition, .. }
             | Mutation::RemoveRange { partition, .. } => Partition::from(*partition),
-            // A command's effects are Schema records.
-            Mutation::Command(_) | Mutation::Operation(_) => Partition::Schema,
+            // A command's effects are records of the partition it names.
+            Mutation::Command(command) => Partition::from(command.partition()),
+            Mutation::Operation(_) => Partition::Schema,
             // Resolved above; its entries are index records.
             Mutation::Derive(_) => Partition::Idx,
         };
@@ -441,7 +442,11 @@ impl StorageEngine {
     ///
     /// `partition` is the node-local Raft partition, the node-local rows
     /// cannot be read, or a write fails.
-    pub fn begin_partition_rebuild(&self, partition: Partition, rows: &Rows) -> StorageResult<()> {
+    pub fn begin_partition_rebuild(
+        &self,
+        partition: Partition,
+        rows: &Rows,
+    ) -> StorageResult<PartitionRepair<'_>> {
         if partition == Partition::Raft {
             return Err(StorageError::InvalidConfig(
                 "the Raft partition holds this node's vote and log metadata; \
@@ -449,12 +454,17 @@ impl StorageEngine {
                     .into(),
             ));
         }
+        // The repair is taken before anything changes: a second repair of the
+        // partition is refused with the index transfer status and the tree
+        // as they were.
+        let repair = self.begin_rebuild(partition)?;
         // The copies the index tree receives are qualified only by the
         // inventory the transfer brings, taken once they are in place.
         if partition == Partition::Idx {
             self.begin_index_transfer()?;
         }
-        // Read before anything is cleared: a failure leaves the tree as it was.
+        // Read before anything is cleared, under the repair: no other repair
+        // moves them meanwhile, and a failure leaves the tree as it was.
         let snapshot = self.snapshot();
         let keep: Rows = self
             .snapshot_prefix_scan(&snapshot, partition, &[])?
@@ -462,8 +472,7 @@ impl StorageEngine {
             .filter(|(key, _)| is_node_local(partition, key))
             .map(|(key, value)| (key, value.to_vec()))
             .collect();
-        self.begin_rebuild(partition)?;
-        self.clear_partition(partition)?;
+        self.clear_partition_tree(partition, self.tree(partition)?)?;
         for (key, value) in &keep {
             self.put(partition, key, value)?;
         }
@@ -483,7 +492,7 @@ impl StorageEngine {
                 INSTALLED_ROW_SEQNO,
             )?;
         }
-        Ok(())
+        Ok(repair)
     }
 
     /// Replace each partition of `partitions` with its rows from a Raft
@@ -510,9 +519,12 @@ impl StorageEngine {
         ahead: &[(Partition, RaftPosition)],
         index_inventory: Option<&[u8]>,
     ) -> StorageResult<()> {
+        // Every partition's repair is held until its tree is installed and
+        // durable; a failure drops them, leaving the partitions owed.
+        let mut repairs = Vec::with_capacity(partitions.len());
         for &partition in partitions {
             let rows = rows_of(partition)?;
-            self.begin_partition_rebuild(partition, &rows)?;
+            repairs.push(self.begin_partition_rebuild(partition, &rows)?);
         }
         self.reset_raft_coverage(next, payload)?;
         // Written over the reset's base at a later seqno, and durable before
@@ -532,38 +544,48 @@ impl StorageEngine {
                 self.flush_memtables(tree)?;
             }
         }
-        for &partition in partitions {
-            self.finish_rebuild(partition)?;
-        }
-        if partitions.contains(&Partition::Idx) {
-            self.index_transfer_installed(index_inventory)?;
+        // The index's inventory is taken while its repair still holds it.
+        for repair in repairs {
+            let partition = repair.partition();
+            self.finish_rebuild_with(repair, || {
+                if partition == Partition::Idx {
+                    self.index_transfer_installed(index_inventory)?;
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }
 
-    /// Record that the rebuilt `partition` holds every entry below `next`,
-    /// persist it, and drop the rebuild intent. `payload` is the log id of
-    /// entry `next - 1`.
+    /// Record that the partition `repair` rebuilt holds every entry below
+    /// `next`, persist it, drop the rebuild intent and end the repair.
+    /// `payload` is the log id of entry `next - 1`.
     ///
     /// # Errors
     ///
     /// A flush or intent removal failure.
     pub fn finish_raft_rebuild(
         &self,
-        partition: Partition,
+        repair: PartitionRepair<'_>,
         next: u64,
         payload: &[u8],
     ) -> StorageResult<()> {
+        // Another store's repair is refused before anything changes here.
+        self.check_repair(&repair)?;
+        let partition = repair.partition();
         let tree = self.tree(partition)?;
         // Written after the rebuilt data, so a persisted record implies the
         // data it covers is persisted.
         coverage::write_fold(tree, Domain::Raft, 0, next, payload, self.next_seqno());
-        self.finish_rebuild(partition)?;
         // A partition copy carries no inventory: every index copy in it is
-        // unknown until checked here.
-        if partition == Partition::Idx {
-            self.index_transfer_installed(None)?;
-        }
+        // unknown until checked here, under the repair, so no next repair's
+        // transfer is taken for this one's.
+        self.finish_rebuild_with(repair, || {
+            if partition == Partition::Idx {
+                self.index_transfer_installed(None)?;
+            }
+            Ok(())
+        })?;
         // The partition was replaced wholesale, from a peer's copy or a
         // checkpoint: followers of the applies read it afresh.
         self.applied_feed.replaced(Some(partition));
@@ -647,12 +669,13 @@ impl StorageEngine {
     ) -> StorageResult<()> {
         let Some(fence) = self.raft_fence() else {
             if whole {
-                self.begin_partition_rebuild(partition, &copy.rows)?;
-                self.finish_rebuild(partition)?;
-                if partition == Partition::Idx {
-                    self.index_transfer_installed(None)?;
-                }
-                return Ok(());
+                let repair = self.begin_partition_rebuild(partition, &copy.rows)?;
+                return self.finish_rebuild_with(repair, || {
+                    if partition == Partition::Idx {
+                        self.index_transfer_installed(None)?;
+                    }
+                    Ok(())
+                });
             }
             for (key, value) in &copy.rows {
                 self.put(partition, key, value)?;
@@ -696,8 +719,8 @@ impl StorageEngine {
         next: u64,
         payload: &[u8],
     ) -> StorageResult<()> {
-        self.begin_partition_rebuild(partition, rows)?;
-        self.finish_raft_rebuild(partition, next, payload)
+        let repair = self.begin_partition_rebuild(partition, rows)?;
+        self.finish_raft_rebuild(repair, next, payload)
     }
 
     /// Record, durably, that every tree holds the entries below `next`: what

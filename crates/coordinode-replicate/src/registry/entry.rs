@@ -104,20 +104,45 @@ impl RegistryEntry {
                 return Some(TerminalReason::LivenessExpired);
             }
         }
-        if self.checkpoint_seqno < source.head(self.kind)
-            && let Some(produced) = source.produced_at_ms(self.kind, self.checkpoint_seqno)
+        // A measure the source could not take ends nothing: the protection
+        // stays until the evidence is back. Age and bytes are judged on one
+        // observation of the source.
+        // Where one observation cannot be taken, a log's measures are judged
+        // each on its own (a log whose size is unreadable still has entry
+        // times). The MVCC store's two are only ever judged together: asked
+        // apart, each would be a separate observation, possibly of states
+        // either side of a rebuild.
+        let observed = source.observe(self.kind, self.checkpoint_seqno);
+        let (produced, bytes) = match &observed {
+            Ok(observed) => (Ok(observed.produced_at_ms), Ok(observed.retained_bytes)),
+            Err(_) if self.kind.is_seqno_space() => return None,
+            Err(_) => (
+                source.produced_at_ms(self.kind, self.checkpoint_seqno),
+                source.retained_bytes_from(self.kind, self.checkpoint_seqno),
+            ),
+        };
+        let reason = if self.checkpoint_seqno < source.head(self.kind)
+            && let Ok(Some(produced)) = produced
             // Same clock rule as above: work stamped after `now_ms` has
             // no age yet.
             && now_ms.saturating_sub(produced) > bounds.max_progress_lag_ms()
         {
-            return Some(TerminalReason::ProgressLagExceeded);
-        }
-        if let Some(bytes) = source.retained_bytes_from(self.kind, self.checkpoint_seqno)
+            TerminalReason::ProgressLagExceeded
+        } else if let Ok(bytes) = bytes
             && bytes > bounds.max_retained_bytes()
         {
-            return Some(TerminalReason::RetainedBytesExceeded);
+            TerminalReason::RetainedBytesExceeded
+        } else {
+            return None;
+        };
+        // Checked last, as the ending is about to be written: material the
+        // source replaced since it was observed ends nobody.
+        if let Ok(observed) = &observed
+            && !source.still_current(observed)
+        {
+            return None;
         }
-        None
+        Some(reason)
     }
 
     /// The earliest clock ms at which [`Self::termination`] can change its
@@ -134,7 +159,8 @@ impl RegistryEntry {
             .liveness_timeout_ms()
             .and_then(|t| self.last_heartbeat_ts_ms.checked_add(t)?.checked_add(1));
         let lag = (self.checkpoint_seqno < source.head(self.kind))
-            .then(|| source.produced_at_ms(self.kind, self.checkpoint_seqno))
+            .then(|| source.produced_at_ms(self.kind, self.checkpoint_seqno).ok())
+            .flatten()
             .flatten()
             .and_then(|at| at.checked_add(bounds.max_progress_lag_ms())?.checked_add(1));
         match (liveness, lag) {

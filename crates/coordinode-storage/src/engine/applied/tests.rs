@@ -302,12 +302,10 @@ fn a_snapshot_or_a_rebuilt_partition_reports_the_partition_replaced() {
     assert_eq!(node.next(NO_WAIT), Some(AppliedEvent::Replaced));
     assert_eq!(edges.next(NO_WAIT), Some(AppliedEvent::Replaced));
 
-    engine
+    let repair = engine
         .begin_partition_rebuild(Partition::Node, &Vec::new())
         .expect("begin");
-    engine
-        .finish_raft_rebuild(Partition::Node, 10, &[])
-        .expect("finish");
+    engine.finish_raft_rebuild(repair, 10, &[]).expect("finish");
     assert_eq!(node.next(NO_WAIT), Some(AppliedEvent::Replaced));
     assert_eq!(edges.try_next(), None, "EdgeProp was not rebuilt");
 }

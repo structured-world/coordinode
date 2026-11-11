@@ -120,6 +120,25 @@ pub struct StorageEngine {
     /// the choice of write form only, so process-local and bounded: a lost
     /// or reset count costs one early whole write.
     node_delta_runs: parking_lot::Mutex<rustc_hash::FxHashMap<Vec<u8>, u32>>,
+    /// The readable floor below which material records were last retired
+    /// ([`crate::engine::material`]): no consumer reads below it, so its
+    /// records are dropped, a window at a time.
+    material_retired: core::sync::atomic::AtomicU64,
+    /// Moves whenever a tree's material records stop describing the
+    /// commits they were written for (a rebuild begins or ends, a partition
+    /// is cleared): an observation taken across a move describes no single
+    /// state of the source and is not used.
+    material_generation: core::sync::atomic::AtomicU64,
+    /// One bit per partition (its place in [`Partition::all`]) whose tree is
+    /// under repair: set before the first destructive step, cleared once the
+    /// repaired tree is installed. A repair that fails leaves its bit set,
+    /// with its intent on disk, until a repair of the partition finishes.
+    under_repair: core::sync::atomic::AtomicU64,
+    /// One bit per partition whose repair is running now, held by its
+    /// [`RepairActive`]: a second repair of the same partition is refused
+    /// while it runs, and a repair that fails releases it, leaving the
+    /// partition in [`Self::under_repair`] for the next one.
+    repair_active: core::sync::atomic::AtomicU64,
     /// Held while a metadata command is decided and applied, so each decision
     /// reads every earlier one; on the journalled path it also spans the
     /// journal append, which makes the decisions' order the journal's order.
@@ -411,12 +430,14 @@ fn mutation_partition(mutation: &Mutation) -> Option<Partition> {
 }
 
 /// The trees a mutation writes once it is applied: its own partition, or
-/// for one decided at apply, where its decision lands (a metadata command and
+/// for one decided at apply, where its decision lands (a metadata command in
+/// [the partition it names](coordinode_core::txn::proposal::MetadataCommand::partition),
 /// an operation record in Schema, derived index work in the indexes and
 /// their counters).
 fn written_partitions(mutation: &Mutation) -> impl Iterator<Item = Partition> {
     let parts = match mutation {
-        Mutation::Command(_) | Mutation::Operation(_) => [Some(Partition::Schema), None],
+        Mutation::Command(command) => [Some(Partition::from(command.partition())), None],
+        Mutation::Operation(_) => [Some(Partition::Schema), None],
         Mutation::Derive(_) => [Some(Partition::Idx), Some(Partition::Counter)],
         resolved => [mutation_partition(resolved), None],
     };
@@ -1165,6 +1186,7 @@ impl StorageEngine {
                                     .is_some_and(|c| c.contains(entry.index, 0));
                             if !skip {
                                 apply_oplog_ops_at(
+                                    part,
                                     tree,
                                     (part == Partition::Idx).then_some(&installations),
                                     &ops,
@@ -1601,6 +1623,10 @@ impl StorageEngine {
             claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             schema_generation: AtomicU64::new(0),
             node_delta_runs: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
+            material_retired: core::sync::atomic::AtomicU64::new(0),
+            material_generation: core::sync::atomic::AtomicU64::new(0),
+            under_repair: core::sync::atomic::AtomicU64::new(0),
+            repair_active: core::sync::atomic::AtomicU64::new(0),
             metadata_decisions: parking_lot::Mutex::new(()),
             operation_decisions: crate::engine::operations::DecisionLocks::default(),
             field_dictionary_generation: AtomicU64::new(0),
@@ -3155,14 +3181,22 @@ impl StorageEngine {
         //    that re-reads the corrupt block we are repairing and aborts with a
         //    ChecksumMismatch. The clear is on disk at once while the rebuilt
         //    data is not, so the intent goes first.
-        self.begin_rebuild(partition)?;
-        self.clear_partition(partition)?;
+        let repair = self.begin_rebuild(partition)?;
+        self.clear_partition_tree(partition, self.tree(partition)?)?;
         let mut versions = 0;
+        // The copy's own records are not taken: they also count versions
+        // that are not reinstalled (this node's records, retired
+        // installations). The reinstalled versions are counted again.
+        let mut material = crate::engine::material::Reinstalled::default();
         for event in rebuild::tree_history(&source)? {
-            if self.reinstall_event(partition, source_bindings.as_deref(), event)? {
+            if self.reinstall_event(partition, source_bindings.as_deref(), event, &mut material)? {
                 versions += 1;
             }
+            if material.full() {
+                material.spill(partition, self.tree(partition)?, self.next_seqno())?;
+            }
         }
+        material.spill(partition, self.tree(partition)?, self.next_seqno())?;
         drop(source);
         drop(ckpt);
         for (key, value) in &local {
@@ -3192,6 +3226,7 @@ impl StorageEngine {
                 continue;
             }
             apply_oplog_ops_at(
+                partition,
                 tree,
                 installations,
                 &ops,
@@ -3206,7 +3241,7 @@ impl StorageEngine {
         // 4. With the history on disk and the intent still in place, serve it.
         self.flush_memtables(tree)?;
         self.restore_retention_floor(tree, partition, source_floor)?;
-        self.finish_rebuild(partition)?;
+        self.finish_rebuild(repair)?;
         // The rebuilt tree is on disk: whatever an open-time repair of it
         // lost is restored.
         self.acknowledge_open_repair(partition)?;
@@ -3257,6 +3292,7 @@ impl StorageEngine {
         partition: Partition,
         source_bindings: Option<&crate::engine::installation::Bindings>,
         event: lsm_tree::ScanSinceEvent,
+        material: &mut crate::engine::material::Reinstalled,
     ) -> StorageResult<bool> {
         use lsm_tree::ScanSinceEvent;
 
@@ -3283,6 +3319,7 @@ impl StorageEngine {
                 };
                 let mut added = 0;
                 for (start, end) in logical {
+                    material.add(seqno, crate::engine::material::unit_bytes(&start, &end));
                     let stored = addressing.range(&start, &end);
                     let staging = addressing.staging_range(&start, &end);
                     for (start, end) in stored.into_iter().chain(staging) {
@@ -3293,30 +3330,45 @@ impl StorageEngine {
                 }
                 Some((added, tree.active_memtable().size()))
             }
-            ScanSinceEvent::Insert { key, value, seqno } => {
-                self.reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
+            ScanSinceEvent::Insert { key, value, seqno } => self
+                .reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
                     tree.insert(key, value.clone(), seqno)
                 })?
-            }
+                .map(|(added, memtable, logical)| {
+                    material.add(seqno, crate::engine::material::unit_bytes(&logical, &value));
+                    (added, memtable)
+                }),
             ScanSinceEvent::MergeOperand {
                 key,
                 operand,
                 seqno,
-            } => {
-                self.reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
+            } => self
+                .reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
                     tree.merge(key, operand.clone(), seqno)
                 })?
-            }
-            ScanSinceEvent::PointTombstone { key, seqno } => {
-                self.reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
+                .map(|(added, memtable, logical)| {
+                    material.add(
+                        seqno,
+                        crate::engine::material::unit_bytes(&logical, &operand),
+                    );
+                    (added, memtable)
+                }),
+            ScanSinceEvent::PointTombstone { key, seqno } => self
+                .reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
                     tree.remove(key, seqno)
                 })?
-            }
-            ScanSinceEvent::WeakTombstone { key, seqno } => {
-                self.reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
+                .map(|(added, memtable, logical)| {
+                    material.add(seqno, crate::engine::material::unit_bytes(&logical, &[]));
+                    (added, memtable)
+                }),
+            ScanSinceEvent::WeakTombstone { key, seqno } => self
+                .reinstall_point(partition, source_bindings, &mut addressing, &key, |key| {
                     tree.remove_weak(key, seqno)
                 })?
-            }
+                .map(|(added, memtable, logical)| {
+                    material.add(seqno, crate::engine::material::unit_bytes(&logical, &[]));
+                    (added, memtable)
+                }),
         };
         let Some((added, memtable)) = written else {
             return Ok(false);
@@ -3335,7 +3387,7 @@ impl StorageEngine {
         addressing: &mut crate::engine::installation::Addressing<'_>,
         key: &[u8],
         write: impl Fn(Vec<u8>) -> (u64, u64),
-    ) -> StorageResult<Option<(u64, u64)>> {
+    ) -> StorageResult<Option<(u64, u64, Vec<u8>)>> {
         if coverage::is_reserved(key) {
             return Ok(None);
         }
@@ -3357,7 +3409,7 @@ impl StorageEngine {
             added += more;
             memtable = size;
         }
-        Ok(Some((added, memtable)))
+        Ok(Some((added, memtable, logical)))
     }
 
     /// Rebuild `STORAGE COLUMNAR` table `table_id` from a checkpoint plus the
@@ -3548,18 +3600,119 @@ impl StorageEngine {
     /// Record, durably, that `partition` is about to be rebuilt. Written
     /// before the tree is cleared and removed by [`Self::finish_rebuild`]
     /// once the rebuilt tree is on disk.
-    fn begin_rebuild(&self, partition: Partition) -> StorageResult<()> {
-        write_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))
+    fn begin_rebuild(&self, partition: Partition) -> StorageResult<PartitionRepair<'_>> {
+        // Published before the intent lands and before any tree is touched:
+        // an observation from here on sees the repair, whatever step it is at.
+        let active = self.enter_repair(partition)?;
+        write_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))?;
+        Ok(active)
     }
 
-    /// Persist the rebuilt tree of `partition`, then drop its intent.
-    fn finish_rebuild(&self, partition: Partition) -> StorageResult<()> {
+    /// Take the repair of `partition` and mark it under repair, so no
+    /// observation of material is taken until [`Self::leave_repair`].
+    ///
+    /// # Errors
+    ///
+    /// Another repair of `partition` is running.
+    pub(crate) fn enter_repair(&self, partition: Partition) -> StorageResult<PartitionRepair<'_>> {
+        use core::sync::atomic::Ordering;
+        let bit = repair_bit(partition);
+        if self.repair_active.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+            return Err(StorageError::InvalidConfig(format!(
+                "a repair of the {} partition is already running",
+                partition.name()
+            )));
+        }
+        let active = PartitionRepair {
+            engine: self,
+            partition,
+            bit,
+        };
+        self.under_repair.fetch_or(bit, Ordering::AcqRel);
+        self.move_material_generation();
+        Ok(active)
+    }
+
+    /// End the repair of `partition`: the generation moves first, so an
+    /// observation begun during the repair cannot pass as begun after it.
+    fn leave_repair(&self, partition: Partition) {
+        self.move_material_generation();
+        self.under_repair
+            .fetch_and(!repair_bit(partition), core::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Whether an accounted partition is under repair.
+    fn repairing_material(&self) -> bool {
+        let accounted = Partition::all()
+            .iter()
+            .filter(|&&part| crate::engine::material::accounted(part))
+            .fold(0, |mask, &part| mask | repair_bit(part));
+        self.under_repair
+            .load(core::sync::atomic::Ordering::Acquire)
+            & accounted
+            != 0
+    }
+
+    /// The source generation an observation of material is valid in
+    /// ([`crate::engine::material::Observation::Observed`]): a decision taken
+    /// on one checks this is still it.
+    pub fn material_generation(&self) -> u64 {
+        self.material_generation
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mark that material records may no longer describe the commits they
+    /// were written for ([`Self::observe_material`]).
+    fn move_material_generation(&self) {
+        self.material_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Persist the tree `repair` rebuilt, then drop its intent and end the
+    /// repair. Only the repair's holder can finish it.
+    fn finish_rebuild(&self, repair: PartitionRepair<'_>) -> StorageResult<()> {
+        self.finish_rebuild_with(repair, || Ok(()))
+    }
+
+    /// [`Self::finish_rebuild`] running `last` (the repair's own finishing
+    /// effects, such as qualifying a transferred index) once the tree is
+    /// persisted and while the repair still holds the partition: nothing
+    /// else repairs it, and it is not ready, until `last` is done.
+    ///
+    /// # Errors
+    ///
+    /// `repair` was taken on another store, which is refused before anything
+    /// changes here; a flush, `last` or the intent removal failed, leaving
+    /// the partition owed a repair.
+    fn finish_rebuild_with(
+        &self,
+        repair: PartitionRepair<'_>,
+        last: impl FnOnce() -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        self.check_repair(&repair)?;
+        let partition = repair.partition;
         self.flush_memtables(self.tree(partition)?)?;
         if partition == Partition::Schema {
             // The dictionary was rebuilt: views read before it reread it.
             self.note_field_dictionary_change();
         }
-        remove_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))
+        last()?;
+        remove_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))?;
+        self.leave_repair(partition);
+        drop(repair);
+        Ok(())
+    }
+
+    /// Refuse a repair taken on another store.
+    pub(crate) fn check_repair(&self, repair: &PartitionRepair<'_>) -> StorageResult<()> {
+        if core::ptr::eq(repair.engine, self) {
+            Ok(())
+        } else {
+            Err(StorageError::InvalidConfig(format!(
+                "the repair of the {} partition was taken on another store",
+                repair.partition.name()
+            )))
+        }
     }
 
     /// Apply one journal op during a checkpoint rebuild (shared by the full
@@ -3682,7 +3835,7 @@ impl StorageEngine {
         //    crash part way leaves the ranges' state unknown while the
         //    coverage record still claims the entries, so the intent turns
         //    the next open's repair into a full rebuild.
-        self.begin_rebuild(partition)?;
+        let repair = self.begin_rebuild(partition)?;
         for (start, end) in &ranges {
             self.remove_range(partition, start, end)?;
         }
@@ -3731,7 +3884,7 @@ impl StorageEngine {
                 }
             }
         }
-        self.finish_rebuild(partition)?;
+        self.finish_rebuild(repair)?;
         // The lost ranges are restored and on disk.
         self.acknowledge_open_repair(partition)?;
         Ok(Rebuild::Rebuilt {
@@ -4545,19 +4698,55 @@ impl StorageEngine {
     pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
         let _admitted = self.admit_partition_write(
             [part],
-            crate::engine::footprint::footprint_of((key.len() + value.len()) as u64, 1),
+            crate::engine::footprint::footprint_of((key.len() + value.len()) as u64, 1)
+                + crate::engine::material::record_allowance(1),
         )?;
         let mut addressing = self.addressing(part)?;
-        let seqno = self
-            .coordinator
-            .put_no_capacity_check(part, addressing.point(key)?, value)?;
+        let mut batch = lsm_tree::WriteBatch::with_capacity(3);
+        batch.insert(addressing.point(key)?, value);
         if let Some(staging) = addressing.staging_point(key) {
-            self.coordinator.put_at(part, staging, value, seqno)?;
+            batch.insert(staging, value);
         }
+        let mut tally = crate::engine::material::Tally::default();
+        tally.unit(key, value);
+        self.apply_single(part, batch, tally)?;
         self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
         }
+        Ok(())
+    }
+
+    /// Apply one direct write's `batch` (its key and a replacement's copy)
+    /// at the next seqno, with the record of the material it adds, as one
+    /// lsm batch.
+    fn apply_single(
+        &self,
+        part: Partition,
+        batch: lsm_tree::WriteBatch,
+        tally: crate::engine::material::Tally,
+    ) -> StorageResult<()> {
+        self.apply_single_with(part, batch, tally, |_| {})
+    }
+
+    /// [`Self::apply_single`] with `landing` run once the write holds its
+    /// seqno and before it is applied: where a test looks at the store while
+    /// a direct write is under way.
+    pub(crate) fn apply_single_with(
+        &self,
+        part: Partition,
+        mut batch: lsm_tree::WriteBatch,
+        tally: crate::engine::material::Tally,
+        landing: impl FnOnce(lsm_tree::SeqNo),
+    ) -> StorageResult<()> {
+        let tree = self.tree(part)?;
+        // Held until the whole batch is in: its entries become visible one
+        // by one, so no complete snapshot may cover its seqno before.
+        let (seqno, _landing) = self.pending_commits.admit_direct(|| self.next_seqno());
+        landing(seqno);
+        tally.record(part, seqno, &mut batch);
+        let (added, memtable) = tree.apply_batch(batch, seqno)?;
+        self.coordinator.flush_trigger().wrote(added, memtable);
         Ok(())
     }
 
@@ -4593,16 +4782,21 @@ impl StorageEngine {
     pub fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {
         let _admitted = self.admit_partition_write(
             [part],
-            crate::engine::footprint::footprint_of(key.len() as u64, 1),
+            crate::engine::footprint::footprint_of(key.len() as u64, 1)
+                + crate::engine::material::record_allowance(1),
         )?;
         let mut buf = Vec::new();
         // A generation with no installation here holds nothing to delete.
         if let Some(stored) = self.stored_key(part, key, &mut buf) {
-            let seqno = self.coordinator.delete(part, stored)?;
+            let mut batch = lsm_tree::WriteBatch::with_capacity(3);
+            batch.remove(stored);
             let mut addressing = self.addressing(part)?;
             if let Some(staging) = addressing.staging_point(key) {
-                self.tree(part)?.remove(staging, seqno);
+                batch.remove(staging);
             }
+            let mut tally = crate::engine::material::Tally::default();
+            tally.unit(key, &[]);
+            self.apply_single(part, batch, tally)?;
         }
         self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
@@ -4625,7 +4819,9 @@ impl StorageEngine {
         // of it, however many installations it spans.
         let addressing = self.addressing(part)?;
         let tree = self.tree(part)?;
-        let seqno = self.next_seqno();
+        // Held across the tombstones and the record: separate memtable
+        // writes, which no complete snapshot may see in part.
+        let (seqno, _landing) = self.pending_commits.admit_direct(|| self.next_seqno());
         let start = coverage::clamp_user_start(start);
         let ranges = addressing.range(start, end);
         let staging = addressing.staging_range(start, end);
@@ -4633,6 +4829,14 @@ impl StorageEngine {
             if start < end {
                 tree.remove_range(start, end, seqno);
             }
+        }
+        // Its record follows the tombstones, as on the batch path.
+        let mut record = lsm_tree::WriteBatch::with_capacity(1);
+        let mut tally = crate::engine::material::Tally::default();
+        tally.unit(start, end);
+        tally.record(part, seqno, &mut record);
+        if !record.is_empty() {
+            tree.apply_batch(record, seqno)?;
         }
         self.coordinator.flush_trigger().wrote_unmeasured();
         self.write_taps.replaced(part);
@@ -4654,15 +4858,18 @@ impl StorageEngine {
     pub fn merge(&self, part: Partition, key: &[u8], operand: &[u8]) -> StorageResult<()> {
         let _admitted = self.admit_partition_write(
             [part],
-            crate::engine::footprint::footprint_of((key.len() + operand.len()) as u64, 1),
+            crate::engine::footprint::footprint_of((key.len() + operand.len()) as u64, 1)
+                + crate::engine::material::record_allowance(1),
         )?;
         let mut addressing = self.addressing(part)?;
-        let seqno =
-            self.coordinator
-                .merge_no_capacity_check(part, addressing.point(key)?, operand)?;
+        let mut batch = lsm_tree::WriteBatch::with_capacity(3);
+        batch.merge(addressing.point(key)?, operand);
         if let Some(staging) = addressing.staging_point(key) {
-            self.tree(part)?.merge(staging, operand, seqno);
+            batch.merge(staging, operand);
         }
+        let mut tally = crate::engine::material::Tally::default();
+        tally.unit(key, operand);
+        self.apply_single(part, batch, tally)?;
         self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
@@ -4743,7 +4950,8 @@ impl StorageEngine {
                     MetadataCommand::BindLabels { .. }
                     | MetadataCommand::GrantNodeLease { .. }
                     | MetadataCommand::RecordGroupPair { .. }
-                    | MetadataCommand::RecordDeployment { .. } => DictionaryChange::None,
+                    | MetadataCommand::RecordDeployment { .. }
+                    | MetadataCommand::ConditionalRegistryWrite { .. } => DictionaryChange::None,
                 };
             }
             effects.extend(decided_effects);
@@ -4986,7 +5194,8 @@ impl StorageEngine {
                 })
                 .sum();
             self.admit_footprint(
-                crate::engine::footprint::footprint_of(data, writes.len()),
+                crate::engine::footprint::footprint_of(data, writes.len())
+                    + crate::engine::material::record_allowance(writes.len()),
                 crate::engine::footprint::Admit::Recovery,
             )?
         };
@@ -5264,12 +5473,53 @@ impl StorageEngine {
             // background timer. One uncontended lock per proposal.
             self.coordinator.advance_gc_watermark();
         }
+        self.retire_material();
         // Only now does the engine's read point include `seqno` (an entry
         // applied on a follower can carry a commit timestamp ahead of its
         // clock): invalidated earlier, a read in between would cache the
         // values this commit replaced.
         batch.forget_cached();
         Ok(())
+    }
+
+    /// Drop the material records below the readable floor, once the floor
+    /// has moved a whole window past the last time: one range deletion in
+    /// the reserved namespace of each accounted tree. No consumer can hold a
+    /// checkpoint below the floor, so nobody asks for them again.
+    fn retire_material(&self) {
+        use core::sync::atomic::Ordering;
+        let floor = self.oldest_readable_seqno();
+        let last = self.material_retired.load(Ordering::Acquire);
+        // A window past the last floor would pass u64::MAX: never due.
+        if last
+            .checked_add(crate::engine::material::RETIRE_WINDOW)
+            .is_none_or(|due| floor < due)
+            || self
+                .material_retired
+                .compare_exchange(last, floor, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let at = self.next_seqno();
+        let mut wrote = false;
+        for &part in Partition::all() {
+            if !crate::engine::material::accounted(part) {
+                continue;
+            }
+            // A tree left as it was keeps its records until the next window:
+            // they sit below every checkpoint and are never summed.
+            match self
+                .tree(part)
+                .and_then(|tree| crate::engine::material::retire_below(tree, floor, at))
+            {
+                Ok(retired) => wrote |= retired,
+                Err(e) => tracing::warn!(error = %e, "material retirement skipped a tree"),
+            }
+        }
+        if wrote {
+            self.coordinator.flush_trigger().wrote_unmeasured();
+        }
     }
 
     /// Physically reset a partition to empty: install a fresh empty version and
@@ -5283,6 +5533,33 @@ impl StorageEngine {
     /// Use this before reinstalling a known-good base.
     pub fn clear_partition(&self, part: Partition) -> StorageResult<()> {
         let tree = self.tree(part)?;
+        // A repair of its own: refused while another one runs, and ready
+        // again only when the clear succeeded. Under a durable intent, so a
+        // clear that failed part way, or a crash in it, leaves the partition
+        // owed a repair, also after a reopen.
+        self.clear_partition_with(part, tree, || Ok(()))
+    }
+
+    /// [`Self::clear_partition`] running `cleared` right after the tree is
+    /// cleared, before the repair finishes: where a test fails it there.
+    pub(crate) fn clear_partition_with(
+        &self,
+        part: Partition,
+        tree: &lsm_tree::AnyTree,
+        cleared: impl FnOnce() -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        let repair = self.begin_rebuild(part)?;
+        self.clear_partition_tree(part, tree)?;
+        cleared()?;
+        self.finish_rebuild(repair)
+    }
+
+    /// The clear a rebuild holding the partition's repair makes of its tree.
+    pub(crate) fn clear_partition_tree(
+        &self,
+        part: Partition,
+        tree: &lsm_tree::AnyTree,
+    ) -> StorageResult<()> {
         tree.clear()?;
         // The installations of the index tree outlive its entries: one handed
         // out before the clear is never handed out again.
@@ -5799,6 +6076,116 @@ impl StorageEngine {
             self.scan_prefix_at(part, prefix, self.coordinator.current_seqno())?
                 .rev(),
         ))
+    }
+
+    /// The logical material committed to the partition trees at seqnos in
+    /// `[from, to)` (`to = None`: through the newest commit), over every
+    /// partition but this member's consensus log and the consumer registry:
+    /// what a consumer reading changes from `from` keeps from collection, and
+    /// the first commit it has not seen. Reads one record per commit in the
+    /// range, written with the commit itself.
+    ///
+    /// # Errors
+    ///
+    /// A record could not be read or is malformed.
+    pub fn material_between(
+        &self,
+        from: lsm_tree::SeqNo,
+        to: Option<lsm_tree::SeqNo>,
+    ) -> StorageResult<crate::engine::material::Material> {
+        self.read_material(from, to, lsm_tree::SeqNo::MAX)
+    }
+
+    /// The records in `[from, to)` visible at `snapshot`, over every
+    /// accounted tree.
+    fn read_material(
+        &self,
+        from: lsm_tree::SeqNo,
+        to: Option<lsm_tree::SeqNo>,
+        snapshot: lsm_tree::SeqNo,
+    ) -> StorageResult<crate::engine::material::Material> {
+        let mut material = crate::engine::material::Material::default();
+        for &part in Partition::all() {
+            if crate::engine::material::accounted(part) {
+                crate::engine::material::read_into(
+                    self.tree(part)?,
+                    from,
+                    to,
+                    snapshot,
+                    &mut material,
+                )?;
+            }
+        }
+        Ok(material)
+    }
+
+    /// The material a consumer reading changes from `from` keeps, as one
+    /// observation at this store's complete cut ([`Self::complete_cut`]):
+    /// every commit through the cut is wholly counted (a range deletion and
+    /// its record are two memtable writes, so a read past the cut could see
+    /// one without the other), and its age and bytes come from the same
+    /// records. While a tree is being rebuilt its records are incomplete,
+    /// which is reported, never read as less material.
+    ///
+    /// # Errors
+    ///
+    /// A record or the rebuild intents could not be read.
+    pub fn observe_material(
+        &self,
+        from: lsm_tree::SeqNo,
+    ) -> StorageResult<crate::engine::material::Observation> {
+        self.observe_material_with(from, || {})
+    }
+
+    /// [`Self::observe_material`] with `between` run after the checks and
+    /// before the read: where a test makes the source change under it.
+    pub(crate) fn observe_material_with(
+        &self,
+        from: lsm_tree::SeqNo,
+        between: impl FnOnce(),
+    ) -> StorageResult<crate::engine::material::Observation> {
+        use crate::engine::material::Observation;
+        use core::sync::atomic::Ordering;
+        let generation = self.material_generation.load(Ordering::Acquire);
+        // A repair under way here, or one an earlier run left owed on disk.
+        if self.repairing_material()
+            || self
+                .pending_rebuilds()?
+                .into_iter()
+                .any(crate::engine::material::accounted)
+        {
+            return Ok(Observation::Rebuilding);
+        }
+        // The records from `from` on must stay through the read: a consumer
+        // acknowledging meanwhile can raise the readable floor, and records
+        // below it are retired. Pinned at `from`, the floor stays at or below
+        // it until the read is done; already above it, they may be gone.
+        let Ok(_held) = self.pin_readable_snapshot_at(from) else {
+            return Ok(Observation::Lost);
+        };
+        let Some(through) = self.complete_cut() else {
+            return Ok(Observation::NoCut);
+        };
+        between();
+        let material = if from > through {
+            crate::engine::material::Material::default()
+        } else {
+            // A cut is far below u64::MAX: one past it cannot overflow.
+            self.read_material(from, None, through + 1)?
+        };
+        // A repair that began after the checks set its bit and moved the
+        // generation before touching a tree, and one that also finished
+        // moved it again: either way what was read may mix states.
+        if self.repairing_material()
+            || self.material_generation.load(Ordering::Acquire) != generation
+        {
+            return Ok(Observation::Rebuilding);
+        }
+        Ok(Observation::Observed {
+            through,
+            generation,
+            material,
+        })
     }
 
     /// Keys touched (written, merged, or deleted) at or after `since_seqno`
@@ -7045,7 +7432,14 @@ fn load_or_init_partition_routing(
                 ))
             })?;
             let write_seqno = seqno.next();
-            schema_tree.insert(&key, &encoded, write_seqno);
+            let mut batch = lsm_tree::WriteBatch::with_capacity(2);
+            batch.insert(key.as_slice(), encoded.as_slice());
+            let mut tally = crate::engine::material::Tally::default();
+            tally.unit(&key, &encoded);
+            tally.record(Partition::Schema, write_seqno, &mut batch);
+            schema_tree.apply_batch(batch, write_seqno).map_err(|e| {
+                StorageError::Io(format!("persist routing for {}: {e}", partition.name()))
+            })?;
             tracing::info!(
                 partition = partition.name(),
                 endpoints = ?routing.endpoints_used(),
@@ -7054,6 +7448,44 @@ fn load_or_init_partition_routing(
             Ok(routing)
         }
     }
+}
+
+/// A running repair of one partition, from the step that announces it to
+/// its finish ([`StorageEngine::begin_partition_rebuild`],
+/// [`StorageEngine::finish_raft_rebuild`]): held while it runs, so no other
+/// repair or clear of the partition starts, and released when it ends.
+/// Dropped without its finish, the repair failed: the partition stays owed
+/// a repair, and the next one may start.
+#[must_use = "the repair runs while this is held, and ends with its finish"]
+pub struct PartitionRepair<'e> {
+    engine: &'e StorageEngine,
+    partition: Partition,
+    bit: u64,
+}
+
+impl PartitionRepair<'_> {
+    /// The partition under repair.
+    pub fn partition(&self) -> Partition {
+        self.partition
+    }
+}
+
+impl Drop for PartitionRepair<'_> {
+    fn drop(&mut self) {
+        self.engine
+            .repair_active
+            .fetch_and(!self.bit, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The bit of `partition` in [`StorageEngine::under_repair`]: its place in
+/// [`Partition::all`], which holds far fewer than 64 partitions.
+fn repair_bit(partition: Partition) -> u64 {
+    let place = Partition::all()
+        .iter()
+        .position(|&p| p == partition)
+        .unwrap_or(0);
+    1 << place
 }
 
 /// Flush all active memtables to SST on clean shutdown.
@@ -7666,6 +8098,10 @@ mod merge_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod retention_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod material_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]

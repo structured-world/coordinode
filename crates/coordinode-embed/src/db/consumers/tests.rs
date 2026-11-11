@@ -255,6 +255,63 @@ fn an_mvcc_consumer_holds_collection_at_its_position() {
     assert_eq!(db.consumer_position(&h).expect("held"), at);
 }
 
+/// A BOUNDED state reader is held to the logical bytes of the commits from
+/// its checkpoint: past its byte limit it ends, while one with room left
+/// stays live over the same writes.
+#[test]
+fn a_bounded_state_reader_ends_past_its_byte_limit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    let state = |id: &str, bytes: u64| ConsumerRegistration {
+        kind: ConsumerKind::LsmStateDelta,
+        ..log_consumer(
+            id,
+            InitialSeqno::FromNow,
+            ConsumerRetentionPolicy::Bounded(
+                ValidatedRetentionBounds::new(u64::MAX, bytes, None).expect("bounds"),
+            ),
+        )
+    };
+    db.register_consumer(state("tight", 1_024))
+        .expect("a state reader can be BOUNDED");
+    db.register_consumer(state("roomy", 1 << 40))
+        .expect("register roomy");
+    write(&mut db, 50, "x");
+    let state_of = |id: &str| {
+        db.consumers_list()
+            .expect("list")
+            .into_iter()
+            .find(|c| c.consumer_id == id)
+            .map(|c| (c.state, c.retained_bytes))
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    while matches!(state_of("tight"), Some((RegistrationState::Live, _))) && Instant::now() < until
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        matches!(
+            state_of("tight"),
+            Some((
+                RegistrationState::Terminated {
+                    reason: TerminalReason::RetainedBytesExceeded,
+                    ..
+                },
+                _
+            ))
+        ),
+        "got {:?}",
+        state_of("tight")
+    );
+    let roomy = state_of("roomy").expect("listed");
+    assert_eq!(roomy.0, RegistrationState::Live);
+    assert!(
+        roomy.1.is_some_and(|b| b.is_ok_and(|b| b > 1_024)),
+        "the roomy reader is charged the same writes: {:?}",
+        roomy.1
+    );
+}
+
 /// A physical backup carries the registrations with their incarnations and
 /// positions: the database opened from it keeps the same history for them
 /// and takes them up again, and an ended one stays ended there.
@@ -468,7 +525,11 @@ fn the_database_reports_who_holds_its_history() {
         .expect("a journal view");
     assert_eq!(journal.floor, Some(from));
     assert_eq!(journal.held_by, vec!["holder".to_string()]);
-    assert!(journal.retained_bytes.is_some_and(|b| b > 0));
+    assert!(
+        journal
+            .retained_bytes
+            .is_some_and(|b| b.is_ok_and(|b| b > 0))
+    );
     assert_eq!(journal.refused, None);
     let mvcc = summary
         .iter()

@@ -105,10 +105,10 @@ fn the_source_measures_the_log_it_holds() {
     assert!(source.accounts(kind));
     assert_eq!(source.head(kind), 9);
     assert_eq!(source.first_retained(kind), 3);
-    assert_eq!(source.produced_at_ms(kind, 4), Some(5_000));
+    assert_eq!(source.produced_at_ms(kind, 4), Ok(Some(5_000)));
     assert_eq!(
         source.produced_at_ms(kind, 9),
-        None,
+        Ok(None),
         "nothing written there yet"
     );
 
@@ -139,18 +139,18 @@ fn the_source_answers_an_unmoved_checkpoint_without_reading_the_log() {
     );
     let kind = ConsumerKind::OplogEvents;
 
-    assert_eq!(source.produced_at_ms(kind, 2_999), Some(3_000_000));
+    assert_eq!(source.produced_at_ms(kind, 2_999), Ok(Some(3_000_000)));
     let scanned = source.timeline.bytes_read();
     assert!(
         scanned > 0,
         "answered from the kept timeline, not a fresh read"
     );
     for _ in 0..50 {
-        assert_eq!(source.produced_at_ms(kind, 100), Some(101_000));
+        assert_eq!(source.produced_at_ms(kind, 100), Ok(Some(101_000)));
     }
     let first_ask = source.timeline.bytes_read() - scanned;
     assert!(first_ask < 256 * 1024, "one ask read {first_ask} bytes");
-    assert_eq!(source.produced_at_ms(kind, 100), Some(101_000));
+    assert_eq!(source.produced_at_ms(kind, 100), Ok(Some(101_000)));
     assert_eq!(
         source.timeline.bytes_read() - scanned,
         first_ask,
@@ -161,7 +161,7 @@ fn the_source_answers_an_unmoved_checkpoint_without_reading_the_log() {
     // the segment holding the floor stays scanned.
     source.release_log_below(2_000);
     let before = source.timeline.bytes_read();
-    assert_eq!(source.produced_at_ms(kind, 2_500), Some(2_501_000));
+    assert_eq!(source.produced_at_ms(kind, 2_500), Ok(Some(2_501_000)));
     assert!(source.timeline.bytes_read() - before < 256 * 1024);
 }
 
@@ -186,15 +186,15 @@ fn entries_without_a_commit_owe_no_progress() {
     );
     let kind = ConsumerKind::OplogEvents;
 
-    assert_eq!(source.produced_at_ms(kind, 1), Some(2_000));
+    assert_eq!(source.produced_at_ms(kind, 1), Ok(Some(2_000)));
     assert_eq!(
         source.produced_at_ms(kind, 2),
-        Some(4_000),
+        Ok(Some(4_000)),
         "a closing entry ages from the commit after it"
     );
     assert_eq!(
         source.produced_at_ms(kind, 4),
-        None,
+        Ok(None),
         "nothing but closing entries up to the head is no outstanding work"
     );
 }
@@ -225,11 +225,11 @@ fn a_log_without_segments_retains_nothing_below_the_head() {
     );
 }
 
-/// The MVCC store keeps no write time or size per version, so the source
-/// does not account seqno-space consumers: BOUNDED is refused for them
-/// rather than enforced on numbers that do not exist.
+/// A pinned snapshot's material is every version visible at its cut, which
+/// the store does not account: BOUNDED is refused for it rather than
+/// enforced on numbers that do not exist.
 #[test]
-fn the_source_does_not_account_mvcc_consumers() {
+fn the_source_does_not_account_snapshot_pins() {
     let (engine, _engine_dir) = open_engine();
     let source = LogRetentionSource::new(
         Arc::clone(&engine),
@@ -237,13 +237,81 @@ fn the_source_does_not_account_mvcc_consumers() {
         empty_floor(),
         Arc::new(|| 0),
     );
+    for kind in [ConsumerKind::MvccSnapshotPin, ConsumerKind::Ephemeral] {
+        assert!(kind.is_seqno_space());
+        assert!(!source.accounts(kind));
+        assert_eq!(source.head(kind), engine.snapshot());
+        assert_eq!(source.first_retained(kind), engine.gc_watermark());
+        assert_eq!(
+            source.produced_at_ms(kind, 1),
+            Err(Unmeasured::NotAccounted)
+        );
+        assert_eq!(
+            source.retained_bytes_from(kind, 1),
+            Err(Unmeasured::NotAccounted)
+        );
+    }
+}
+
+/// A state reader's work and material from its checkpoint: an idle store
+/// owes it nothing, however long it waits; its first write starts the age at
+/// that write's commit time, not at the checkpoint; a commit applied out of
+/// timestamp order still counts from its own time; and the bytes are the
+/// logical size of every commit from the checkpoint on.
+#[test]
+fn a_state_reader_owes_the_commits_from_its_checkpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let start = 4_000_000_000_000_000;
+    let oracle = Arc::new(TimestampOracle::resume_from(
+        coordinode_core::txn::timestamp::Timestamp::from_raw(start),
+    ));
+    let engine =
+        Arc::new(StorageEngine::open_with_oracle(&endpoint(dir.path()), oracle).expect("open"));
+    let source = LogRetentionSource::new(
+        Arc::clone(&engine),
+        Vec::new(),
+        empty_floor(),
+        Arc::new(|| 0),
+    );
     let kind = ConsumerKind::LsmStateDelta;
-    assert!(kind.is_seqno_space());
-    assert!(!source.accounts(kind));
-    assert_eq!(source.head(kind), engine.snapshot());
-    assert_eq!(source.first_retained(kind), engine.gc_watermark());
-    assert_eq!(source.produced_at_ms(kind, 1), None);
-    assert_eq!(source.retained_bytes_from(kind, 1), None);
+    assert!(source.accounts(kind));
+    let checkpoint = start + 1_000_000;
+    assert_eq!(source.produced_at_ms(kind, checkpoint), Ok(None), "idle");
+    assert_eq!(source.retained_bytes_from(kind, checkpoint), Ok(0));
+
+    let put = |key: &[u8], len: usize, ts: u64| {
+        engine
+            .apply_proposal_at(
+                &[coordinode_core::txn::proposal::Mutation::Put {
+                    partition: coordinode_core::txn::proposal::PartitionId::Node,
+                    key: key.to_vec(),
+                    value: vec![0; len],
+                }],
+                ts,
+            )
+            .expect("apply");
+    };
+    // The first write lands long after the checkpoint.
+    put(b"node:late", 10, checkpoint + 60_000_000);
+    assert_eq!(
+        source.produced_at_ms(kind, checkpoint),
+        Ok(Some((checkpoint + 60_000_000) / 1_000))
+    );
+    // An earlier commit applied after it is older work.
+    put(b"node:early", 20, checkpoint + 5_000_000);
+    assert_eq!(
+        source.produced_at_ms(kind, checkpoint),
+        Ok(Some((checkpoint + 5_000_000) / 1_000))
+    );
+    assert_eq!(
+        source.retained_bytes_from(kind, checkpoint),
+        Ok((9 + 10) + (10 + 20))
+    );
+    // From between the two, only the later one is owed.
+    assert_eq!(
+        source.retained_bytes_from(kind, checkpoint + 5_000_001),
+        Ok(9 + 10)
+    );
 }
 
 /// Over a store's own journal the source reports the journal's head and

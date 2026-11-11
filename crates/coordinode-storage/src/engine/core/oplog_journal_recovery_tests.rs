@@ -528,6 +528,98 @@ fn late_finalize_behind_a_flushed_newer_commit_survives_a_crash() {
     );
 }
 
+/// A conditional registry write decided at apply comes back with the same
+/// outcome after a power cut: lost with its memtable, the journal replays
+/// it against the same registry it first saw, so it lands again; on disk
+/// already, it is not decided again over the state it produced.
+#[test]
+fn a_conditional_registry_write_keeps_its_outcome_across_a_crash() {
+    use coordinode_core::txn::proposal::MetadataCommand;
+    let rig = PowerRig::new();
+    let conditional = |expect: Option<&[u8]>, put: &[u8]| {
+        vec![Mutation::Command(
+            MetadataCommand::ConditionalRegistryWrite {
+                expect: vec![(b"consumer:c".to_vec(), expect.map(<[u8]>::to_vec))],
+                put: vec![(b"consumer:c".to_vec(), put.to_vec())],
+            },
+        )]
+    };
+    let record = |engine: &StorageEngine| {
+        engine
+            .get(Partition::Registry, b"consumer:c")
+            .expect("read")
+            .map(|v| v.to_vec())
+    };
+    {
+        let (engine, oracle) = rig.open();
+        write_batch(&engine, &oracle, &conditional(None, b"live"));
+        engine.persist().expect("persist the first");
+        write_batch(&engine, &oracle, &conditional(Some(b"live"), b"ended"));
+        rig.cut(engine);
+    }
+    for _ in 0..2 {
+        let (engine, _) = rig.open();
+        assert_eq!(
+            record(&engine).as_deref(),
+            Some(&b"ended"[..]),
+            "the replayed write decided as it first did, once"
+        );
+        engine.persist().expect("persist");
+        rig.cut(engine);
+    }
+}
+
+/// The material each commit added comes back exactly after a power cut: a
+/// commit already on disk keeps its record, one lost with its memtable is
+/// replayed from the journal with its record, and nothing is counted twice,
+/// also after a second recovery.
+#[test]
+fn material_records_survive_a_crash_exactly_once() {
+    let rig = PowerRig::new();
+    let put = |key: &[u8], len: usize| Mutation::Put {
+        partition: PartitionId::Node,
+        key: key.to_vec(),
+        value: vec![5; len],
+    };
+    let (t100, t200);
+    {
+        let (engine, oracle) = rig.open();
+        t100 = oracle.next().as_raw();
+        t200 = oracle.next().as_raw();
+        write_batch_at(&engine, &[put(b"node:00:0200", 20)], t200);
+        engine.persist().expect("persist t200");
+        write_batch_at(
+            &engine,
+            &[
+                put(b"node:00:0100", 10),
+                Mutation::Merge {
+                    partition: PartitionId::Counter,
+                    key: b"counter:c".to_vec(),
+                    operand: crate::engine::merge::encode_counter_delta(1),
+                },
+            ],
+            t100,
+        );
+        rig.cut(engine);
+    }
+    let at = |engine: &StorageEngine, ts: u64| {
+        engine
+            .material_between(ts, Some(ts + 1))
+            .expect("material")
+            .bytes
+    };
+    for _ in 0..2 {
+        let (engine, _) = rig.open();
+        assert_eq!(at(&engine, t200), 12 + 20, "the flushed commit");
+        assert_eq!(
+            at(&engine, t100),
+            (12 + 10) + (9 + 8),
+            "the replayed commit, in both partitions, once"
+        );
+        rig.cut(engine);
+    }
+}
+
 /// An index entry lost in a power cut together with its generation's first
 /// binding is replayed from the journal into a fresh installation of that
 /// generation, beside an earlier generation whose installation was already on

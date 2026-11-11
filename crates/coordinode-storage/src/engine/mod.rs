@@ -17,6 +17,7 @@ pub mod index_copies;
 pub mod installation;
 pub(crate) mod local_journal;
 pub mod local_pipeline;
+pub mod material;
 pub mod merge;
 pub mod metadata;
 pub mod metered_fs;

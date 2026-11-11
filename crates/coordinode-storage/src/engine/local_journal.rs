@@ -119,6 +119,7 @@ impl LocalJournal {
                 let tree = tree_of(trees, part)?;
                 coverage.note_touched(part, entry.index);
                 apply_oplog_ops_at(
+                    part,
                     tree,
                     (part == Partition::Idx).then_some(installations),
                     &ops,
@@ -182,6 +183,7 @@ impl LocalJournal {
             let tree = tree_of(trees, part)?;
             self.coverage.note_touched(part, index);
             apply_oplog_ops_at(
+                part,
                 tree,
                 (part == Partition::Idx).then_some(installations),
                 &ops,

@@ -194,8 +194,17 @@ impl SegmentMap {
         let tree = engine.tree(partition)?;
         let snapshot = engine.snapshot();
 
-        // Key bounds at the current snapshot. No first key => empty partition.
-        let Some(first) = tree.first_key_value(snapshot, None) else {
+        // Key bounds at the current snapshot, over the user keyspace: the
+        // engine's own records below it are no data to place. No first key
+        // => empty partition.
+        let Some(first) = tree
+            .range(
+                crate::engine::coverage::USER_KEYSPACE_START..,
+                snapshot,
+                None,
+            )
+            .next()
+        else {
             return Ok(Self {
                 partition,
                 segments: Vec::new(),

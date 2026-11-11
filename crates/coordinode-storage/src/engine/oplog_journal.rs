@@ -702,6 +702,7 @@ pub(crate) fn op_partition(op: &OplogOp) -> Option<Partition> {
 /// the entry in this tree is persisted. Non-data ops are no-ops.
 /// `installations` is the index tree's catalog when `tree` is the index tree.
 pub(crate) fn apply_oplog_ops_at(
+    part: Partition,
     tree: &AnyTree,
     installations: Option<&crate::engine::installation::Installations>,
     ops: &[&OplogOp],
@@ -710,24 +711,30 @@ pub(crate) fn apply_oplog_ops_at(
     domain: coverage::Domain,
 ) -> StorageResult<()> {
     let mut addressing = crate::engine::installation::Addressing::new(installations, tree, seqno);
-    let mut batch = lsm_tree::WriteBatch::with_capacity(ops.len() + 1);
+    let mut batch = lsm_tree::WriteBatch::with_capacity(ops.len() + 2);
+    // The same record the live apply put, so a replay of a lost memtable
+    // restores it and a repeated one rewrites it unchanged.
+    let mut tally = crate::engine::material::Tally::default();
     for op in ops {
         match op {
             // A replacement being prepared receives the same write in the
             // same batch, as on the live apply path.
             OplogOp::Insert { key, value, .. } => {
+                tally.unit(key, value);
                 batch.insert(addressing.point(key)?, value.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.insert(staging, value.as_slice());
                 }
             }
             OplogOp::Delete { key, .. } => {
+                tally.unit(key, &[]);
                 batch.remove(addressing.point(key)?);
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.remove(staging);
                 }
             }
             OplogOp::Merge { key, operand, .. } => {
+                tally.unit(key, operand);
                 batch.merge(addressing.point(key)?, operand.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.merge(staging, operand.as_slice());
@@ -735,6 +742,7 @@ pub(crate) fn apply_oplog_ops_at(
             }
             OplogOp::RemoveRange { start, end, .. } => {
                 let start = coverage::clamp_user_start(start);
+                tally.unit(start, end);
                 let ranges = addressing.range(start, end);
                 let staging = addressing.staging_range(start, end);
                 for (start, end) in ranges.into_iter().chain(staging) {
@@ -757,6 +765,7 @@ pub(crate) fn apply_oplog_ops_at(
             }
         }
     }
+    tally.record(part, seqno, &mut batch);
     batch.insert(domain.marker_key(index, 0).as_slice(), &[][..]);
     tree.apply_batch(batch, seqno)?;
     Ok(())

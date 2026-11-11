@@ -12,8 +12,8 @@ use coordinode_storage::oplog::tailer::bytes_needed_from;
 
 use coordinode_storage::error::StorageError;
 
-use super::source::RetentionSource;
-use super::types::{ConsumerKind, RetentionPressure};
+use super::source::{Observed, RetentionSource};
+use super::types::{ConsumerKind, RetentionPressure, Unmeasured};
 
 /// The history a store holds for its consumers: a log (a group's consensus
 /// log, or the store's own journal) for log consumers, the MVCC store for the
@@ -126,22 +126,28 @@ impl RetentionSource for LogRetentionSource {
 
     fn accounts(&self, kind: ConsumerKind) -> bool {
         // The log knows when each entry was written and how big its segments
-        // are; the MVCC store keeps neither per version.
-        !kind.is_seqno_space()
+        // are. The MVCC store records the logical material of each commit, at
+        // its commit timestamp: that is a time only with an oracle, and it is
+        // what a state reader keeps, not what a pinned snapshot does.
+        match kind {
+            ConsumerKind::OplogEvents => true,
+            ConsumerKind::LsmStateDelta => self.engine.oracle().is_some(),
+            ConsumerKind::MvccSnapshotPin | ConsumerKind::Ephemeral => false,
+        }
     }
 
-    fn produced_at_ms(&self, kind: ConsumerKind, position: u64) -> Option<u64> {
+    fn produced_at_ms(&self, kind: ConsumerKind, position: u64) -> Result<Option<u64>, Unmeasured> {
         if kind.is_seqno_space() {
-            return None;
+            return self.observe(kind, position).map(|o| o.produced_at_ms);
         }
         // Work a consumer owes starts at the first committed entry from its
         // position: an entry with no commit carries no event and no time.
         match self.timeline.first_committed_at(position, self.head(kind)) {
             // An entry's timestamp is wall-clock microseconds.
-            Ok(ts) => ts.map(|ts| ts / 1_000),
+            Ok(ts) => Ok(ts.map(|ts| ts / 1_000)),
             Err(e) => {
                 tracing::warn!(error = %e, position, "registry: log entry time unreadable");
-                None
+                Err(Unmeasured::Unreadable)
             }
         }
     }
@@ -150,17 +156,60 @@ impl RetentionSource for LogRetentionSource {
         self.timeline.release_below(position);
     }
 
-    fn retained_bytes_from(&self, kind: ConsumerKind, position: u64) -> Option<u64> {
+    fn retained_bytes_from(&self, kind: ConsumerKind, position: u64) -> Result<u64, Unmeasured> {
         if kind.is_seqno_space() {
-            return None;
+            return self.observe(kind, position).map(|o| o.retained_bytes);
         }
-        match bytes_needed_from(&self.log_dirs, position) {
-            Ok(bytes) => Some(bytes),
+        bytes_needed_from(&self.log_dirs, position).map_err(|e| {
+            tracing::warn!(error = %e, "registry: log size unreadable");
+            Unmeasured::Unreadable
+        })
+    }
+
+    fn observe(&self, kind: ConsumerKind, position: u64) -> Result<Observed, Unmeasured> {
+        use coordinode_storage::engine::material::Observation;
+        if !kind.is_seqno_space() {
+            return Ok(Observed {
+                produced_at_ms: self.produced_at_ms(kind, position)?,
+                retained_bytes: self.retained_bytes_from(kind, position)?,
+                generation: None,
+            });
+        }
+        if !self.accounts(kind) {
+            return Err(Unmeasured::NotAccounted);
+        }
+        // The commits from the checkpoint through the store's complete cut:
+        // the first is the oldest work the reader has not seen (its commit
+        // timestamp is wall-clock microseconds), and their logical bytes
+        // before compression are what it keeps from collection. A commit
+        // above the cut is not counted yet: it is younger than the cut, and
+        // counting it in part could age or size a write never wholly applied.
+        match self.engine.observe_material(position) {
+            Ok(Observation::Observed {
+                material,
+                generation,
+                ..
+            }) => Ok(Observed {
+                produced_at_ms: material.first.map(|us| us / 1_000),
+                retained_bytes: material.bytes,
+                generation: Some(generation),
+            }),
+            // Nothing known complete yet, or a tree mid-rebuild: the evidence
+            // is missing, which ends nothing and is no zero.
+            Ok(Observation::NoCut | Observation::Rebuilding | Observation::Lost) => {
+                Err(Unmeasured::Unreadable)
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "registry: log size unreadable");
-                None
+                tracing::warn!(error = %e, position, "registry: material records unreadable");
+                Err(Unmeasured::Unreadable)
             }
         }
+    }
+
+    fn still_current(&self, observed: &Observed) -> bool {
+        observed
+            .generation
+            .is_none_or(|generation| self.engine.material_generation() == generation)
     }
 
     fn admits(&self, _kind: ConsumerKind) -> Result<(), RetentionPressure> {

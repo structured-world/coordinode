@@ -310,13 +310,14 @@ pub struct ConsumerSnapshot {
     pub last_heartbeat_ts_ms: u64,
     /// Age, in ms, of the oldest work a live registration has not
     /// acknowledged: 0 when it has none outstanding, however long ago it last
-    /// acknowledged. `None` when ended or when the source cannot tell.
-    pub progress_lag_ms: Option<u64>,
+    /// acknowledged, [`Unmeasured`] when the source cannot tell. `None` when
+    /// ended.
+    pub progress_lag_ms: Option<Measure>,
     /// Bytes of source history a live registration's checkpoint requires.
     /// Registrations sharing history each count it; the space's total counts
-    /// it once ([`RetentionSummary::retained_bytes`]). `None` when ended or
-    /// when the source cannot account it.
-    pub retained_bytes: Option<u64>,
+    /// it once ([`RetentionSummary::retained_bytes`]). [`Unmeasured`] when
+    /// the source cannot account it; `None` when ended.
+    pub retained_bytes: Option<Measure>,
     /// Whether this live registration's checkpoint is the lowest in its
     /// space, so it is what holds the source's history back.
     pub holds_floor: bool,
@@ -327,6 +328,23 @@ pub struct ConsumerSnapshot {
     /// Where this incarnation's checkpoint started.
     pub started_at: u64,
 }
+
+/// Why a source gave no measure of a consumer's work or material. Never a
+/// zero: a missing measure ends nothing and releases nothing, and is shown
+/// as missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum Unmeasured {
+    /// The source does not account this position space.
+    #[error("the source does not account this space")]
+    NotAccounted,
+    /// The source accounts it, but its evidence could not be read now.
+    #[error("the source's accounting could not be read")]
+    Unreadable,
+}
+
+/// A live registration's measure (progress age in ms, or bytes), or why the
+/// source could not take it.
+pub type Measure = Result<u64, Unmeasured>;
 
 /// Why a store takes on no new retention now: a new registration is refused
 /// for it, retryably, and the space's summary reports it.
@@ -390,9 +408,10 @@ pub struct RetentionSummary {
     pub floor: Option<u64>,
     /// Bytes of source history kept from the floor, shared segments counted
     /// once. Releasing one registration may reclaim none of it: another
-    /// registration, a live reader or recovery can still need it. `None`
-    /// with no floor or when the source cannot account it.
-    pub retained_bytes: Option<u64>,
+    /// registration, a live reader or recovery can still need it.
+    /// [`Unmeasured`] when the source cannot account it; `None` with no
+    /// floor.
+    pub retained_bytes: Option<Measure>,
     /// The registrations at the floor: the ones whose progress or
     /// cancellation would let it rise.
     pub held_by: Vec<String>,

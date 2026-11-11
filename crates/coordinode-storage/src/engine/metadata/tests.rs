@@ -45,6 +45,112 @@ fn apply(engine: &StorageEngine, commit_ts: u64, mutation: Mutation) {
     engine.apply_proposal_at(&[mutation], commit_ts).unwrap();
 }
 
+fn conditional(expect: &[(&[u8], Option<&[u8]>)], put: &[(&[u8], &[u8])]) -> Mutation {
+    Mutation::Command(MetadataCommand::ConditionalRegistryWrite {
+        expect: expect
+            .iter()
+            .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
+            .collect(),
+        put: put.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect(),
+    })
+}
+
+/// A conditional registry write lands only while every record it names
+/// holds the bytes it expects, as the registry stands when it applies: an
+/// earlier write applied first (whatever its timestamp) makes it write
+/// nothing, and an absent record is a condition of its own.
+#[test]
+fn a_conditional_registry_write_is_decided_in_application_order() {
+    let dir = TempDir::new().unwrap();
+    let (engine, oracle) = open(&dir);
+    let read = |key: &[u8]| {
+        engine
+            .get(Partition::Registry, key)
+            .unwrap()
+            .map(|v| v.to_vec())
+    };
+    // Absent as expected: written.
+    apply(
+        &engine,
+        oracle.next().as_raw(),
+        conditional(&[(b"consumer:a", None)], &[(b"consumer:a", b"live")]),
+    );
+    assert_eq!(read(b"consumer:a").as_deref(), Some(&b"live"[..]));
+    // A write of the record applied first, at a lower timestamp than the
+    // condition's own: the condition sees it and writes nothing.
+    let ending_ts = oracle.next().as_raw();
+    let ack_ts = oracle.next().as_raw() - 1;
+    engine
+        .apply_proposal_at(
+            &[Mutation::Put {
+                partition: PartitionId::Registry,
+                key: b"consumer:a".to_vec(),
+                value: b"acked".to_vec(),
+            }],
+            ack_ts,
+        )
+        .unwrap();
+    apply(
+        &engine,
+        ending_ts,
+        conditional(
+            &[(b"consumer:a", Some(b"live")), (b"basis:mvcc", None)],
+            &[(b"consumer:a", b"ended")],
+        ),
+    );
+    assert_eq!(read(b"consumer:a").as_deref(), Some(&b"acked"[..]));
+    // Holding again, with every condition met: written.
+    apply(
+        &engine,
+        oracle.next().as_raw(),
+        conditional(
+            &[(b"consumer:a", Some(b"acked")), (b"basis:mvcc", None)],
+            &[(b"consumer:a", b"ended")],
+        ),
+    );
+    assert_eq!(read(b"consumer:a").as_deref(), Some(&b"ended"[..]));
+}
+
+/// A conditional registry write is routed by the registry partition when an
+/// entry is applied to some trees only (a rebuild replaying the log into one
+/// tree, a recovery whose trees hold the entry or not): replayed into the
+/// registry it is decided and lands; skipped for a registry that already
+/// holds it, it is not decided again over the state it produced.
+#[test]
+fn a_conditional_registry_write_follows_the_registry_partition() {
+    let dir = TempDir::new().unwrap();
+    let (engine, oracle) = open(&dir);
+    let write = conditional(&[(b"consumer:r", None)], &[(b"consumer:r", b"live")]);
+    let read = || {
+        engine
+            .get(Partition::Registry, b"consumer:r")
+            .unwrap()
+            .map(|v| v.to_vec())
+    };
+    // Only the registry takes the entry: it lands.
+    engine
+        .apply_raft_proposal(
+            std::slice::from_ref(&write),
+            oracle.next().as_raw(),
+            1,
+            0,
+            |p| p != Partition::Registry,
+        )
+        .unwrap();
+    assert_eq!(read().as_deref(), Some(&b"live"[..]));
+    // Every tree but the registry takes the next one: nothing changes.
+    let ending = conditional(
+        &[(b"consumer:r", Some(b"live"))],
+        &[(b"consumer:r", b"ended")],
+    );
+    engine
+        .apply_raft_proposal(&[ending], oracle.next().as_raw(), 2, 0, |p| {
+            p == Partition::Registry
+        })
+        .unwrap();
+    assert_eq!(read().as_deref(), Some(&b"live"[..]));
+}
+
 /// New names get the next ids in the order the batch lists them; a name
 /// already bound, or listed twice, keeps its one id.
 #[test]

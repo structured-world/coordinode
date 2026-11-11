@@ -975,23 +975,6 @@ impl LocalMultiModalCoordinator {
         &self.seqno
     }
 
-    /// Single-key put. Stamps the write with the next seqno and
-    /// dispatches to the partition tree. Capacity gating happens at
-    /// the [`crate::engine::core::StorageEngine`] level above —
-    /// callers must invoke `check_partition_capacity` first.
-    pub(crate) fn put_no_capacity_check(
-        &self,
-        part: Partition,
-        key: &[u8],
-        value: &[u8],
-    ) -> StorageResult<lsm_tree::SeqNo> {
-        let tree = self.tree(part)?;
-        let seqno = self.seqno.next();
-        let (added, memtable) = tree.insert(key, value, seqno);
-        self.flush_trigger.wrote(added, memtable);
-        Ok(seqno)
-    }
-
     /// Write `key` at a caller-chosen `seqno` instead of the next one.
     pub(crate) fn put_at(
         &self,
@@ -1004,30 +987,6 @@ impl LocalMultiModalCoordinator {
         let (added, memtable) = tree.insert(key, value, seqno);
         self.flush_trigger.wrote(added, memtable);
         Ok(())
-    }
-
-    /// Single-key tombstone. Stamps with the next seqno.
-    pub(crate) fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<lsm_tree::SeqNo> {
-        let tree = self.tree(part)?;
-        let seqno = self.seqno.next();
-        let (added, memtable) = tree.remove(key, seqno);
-        self.flush_trigger.wrote(added, memtable);
-        Ok(seqno)
-    }
-
-    /// Single-key merge-operand append. Stamps with the next seqno.
-    /// Capacity gating handled above.
-    pub(crate) fn merge_no_capacity_check(
-        &self,
-        part: Partition,
-        key: &[u8],
-        operand: &[u8],
-    ) -> StorageResult<lsm_tree::SeqNo> {
-        let tree = self.tree(part)?;
-        let seqno = self.seqno.next();
-        let (added, memtable) = tree.merge(key, operand, seqno);
-        self.flush_trigger.wrote(added, memtable);
-        Ok(seqno)
     }
 }
 

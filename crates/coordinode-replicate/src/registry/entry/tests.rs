@@ -19,11 +19,20 @@ impl RetentionSource for Fixed {
     fn accounts(&self, _: ConsumerKind) -> bool {
         true
     }
-    fn produced_at_ms(&self, _: ConsumerKind, _: u64) -> Option<u64> {
-        self.produced
+    fn produced_at_ms(
+        &self,
+        _: ConsumerKind,
+        _: u64,
+    ) -> Result<Option<u64>, crate::registry::types::Unmeasured> {
+        Ok(self.produced)
     }
-    fn retained_bytes_from(&self, _: ConsumerKind, _: u64) -> Option<u64> {
+    fn retained_bytes_from(
+        &self,
+        _: ConsumerKind,
+        _: u64,
+    ) -> Result<u64, crate::registry::types::Unmeasured> {
         self.bytes
+            .ok_or(crate::registry::types::Unmeasured::Unreadable)
     }
     fn admits(&self, _: ConsumerKind) -> Result<(), crate::registry::RetentionPressure> {
         Ok(())
@@ -62,6 +71,117 @@ const CAUGHT_UP: Fixed = Fixed {
     produced: None,
     bytes: Some(0),
 };
+
+/// A source whose one observation fails while each measure asked apart
+/// answers, as when a rebuild ends between the calls: the two answers are
+/// of different states.
+struct Torn;
+
+impl RetentionSource for Torn {
+    fn head(&self, _: ConsumerKind) -> u64 {
+        1_000
+    }
+    fn first_retained(&self, _: ConsumerKind) -> u64 {
+        0
+    }
+    fn accounts(&self, _: ConsumerKind) -> bool {
+        true
+    }
+    fn produced_at_ms(
+        &self,
+        _: ConsumerKind,
+        _: u64,
+    ) -> Result<Option<u64>, crate::registry::types::Unmeasured> {
+        Ok(Some(0))
+    }
+    fn retained_bytes_from(
+        &self,
+        _: ConsumerKind,
+        _: u64,
+    ) -> Result<u64, crate::registry::types::Unmeasured> {
+        Ok(u64::MAX)
+    }
+    fn observe(
+        &self,
+        _: ConsumerKind,
+        _: u64,
+    ) -> Result<crate::registry::source::Observed, crate::registry::types::Unmeasured> {
+        Err(crate::registry::types::Unmeasured::Unreadable)
+    }
+    fn admits(&self, _: ConsumerKind) -> Result<(), crate::registry::RetentionPressure> {
+        Ok(())
+    }
+}
+
+/// An MVCC consumer is judged only on one observation: where none can be
+/// taken it is not ended on measures asked apart, which could pair an age
+/// and a size from either side of a rebuild.
+#[test]
+fn an_mvcc_consumer_is_never_judged_on_measures_asked_apart() {
+    let e = RegistryEntry {
+        kind: ConsumerKind::LsmStateDelta,
+        ..entry(bounded(1, 1, None))
+    };
+    assert_eq!(e.termination(10_000, &Torn), None);
+}
+
+/// A source whose observation is past the bounds, but whose material was
+/// replaced after it (a rebuild began): the observation no longer holds.
+struct Replaced;
+
+impl RetentionSource for Replaced {
+    fn head(&self, _: ConsumerKind) -> u64 {
+        1_000
+    }
+    fn first_retained(&self, _: ConsumerKind) -> u64 {
+        0
+    }
+    fn accounts(&self, _: ConsumerKind) -> bool {
+        true
+    }
+    fn produced_at_ms(
+        &self,
+        _: ConsumerKind,
+        _: u64,
+    ) -> Result<Option<u64>, crate::registry::types::Unmeasured> {
+        Ok(Some(0))
+    }
+    fn retained_bytes_from(
+        &self,
+        _: ConsumerKind,
+        _: u64,
+    ) -> Result<u64, crate::registry::types::Unmeasured> {
+        Ok(u64::MAX)
+    }
+    fn observe(
+        &self,
+        _: ConsumerKind,
+        _: u64,
+    ) -> Result<crate::registry::source::Observed, crate::registry::types::Unmeasured> {
+        Ok(crate::registry::source::Observed {
+            produced_at_ms: Some(0),
+            retained_bytes: u64::MAX,
+            generation: Some(1),
+        })
+    }
+    fn still_current(&self, observed: &crate::registry::source::Observed) -> bool {
+        observed.generation == Some(2)
+    }
+    fn admits(&self, _: ConsumerKind) -> Result<(), crate::registry::RetentionPressure> {
+        Ok(())
+    }
+}
+
+/// An ending is not written on an observation the source has since
+/// replaced: the next sweep observes again.
+#[test]
+fn an_ending_on_a_replaced_observation_is_not_written() {
+    let e = RegistryEntry {
+        kind: ConsumerKind::LsmStateDelta,
+        ..entry(bounded(1, 1, None))
+    };
+    assert_eq!(e.termination(10_000, &Replaced), None);
+}
 
 /// A heartbeat record round-trips through its fixed form, a record of any
 /// other length is refused, and its key stays apart from the registration's.

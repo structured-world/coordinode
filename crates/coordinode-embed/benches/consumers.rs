@@ -186,7 +186,8 @@ fn retained_bytes() {
         .into_iter()
         .find(|v| v.space == RetentionSpace::Log)
         .and_then(|v| v.retained_bytes)
-        .unwrap_or(0);
+        .expect("a floor is held")
+        .expect("the journal's size is readable");
     println!(
         "retained after {ROUNDS} writes: stalled consumer keeps {} entries ({bytes} bytes), \
          none registered keeps {}",

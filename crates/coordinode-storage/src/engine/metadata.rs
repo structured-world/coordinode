@@ -65,7 +65,36 @@ pub(crate) fn decide(
         } else {
             vec![schema_put(DEPLOYMENT_KEY.to_vec(), id.as_bytes().to_vec())]
         }),
+        MetadataCommand::ConditionalRegistryWrite { expect, put } => {
+            decide_registry_write(engine, expect, put)
+        }
     }
+}
+
+/// The writes of a conditional registry write: `put`, when every record in
+/// `expect` holds exactly the bytes given against the registry as it is now,
+/// else none. Read at the store's latest applied state, which during an
+/// ordered apply is every earlier entry's registry writes and none of a
+/// later one's, on every member and on a replay alike.
+fn decide_registry_write(
+    engine: &StorageEngine,
+    expect: &[(Vec<u8>, Option<Vec<u8>>)],
+    put: &[(Vec<u8>, Vec<u8>)],
+) -> StorageResult<Vec<Mutation>> {
+    for (key, expected) in expect {
+        let held = engine.get(Partition::Registry, key)?;
+        if held.as_deref() != expected.as_deref() {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(put
+        .iter()
+        .map(|(key, value)| Mutation::Put {
+            partition: PartitionId::Registry,
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect())
 }
 
 /// The deployment's identity, `None` before the founding leader recorded it.

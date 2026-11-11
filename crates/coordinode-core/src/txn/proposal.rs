@@ -286,9 +286,37 @@ pub enum MetadataCommand {
         /// The identity the founding leader chose.
         id: crate::group::DeploymentId,
     },
+    /// Write `put` into the consumer registry only if every record named in
+    /// `expect` holds exactly the bytes given (`None`: no record), decided
+    /// against the registry as the command applies, in log order. Refused,
+    /// writing nothing, when one differs. Its conditions and writes are all
+    /// in the registry partition, so a replay that decides it again after a
+    /// crash reads the same records it read the first time.
+    ConditionalRegistryWrite {
+        /// Registry keys and the exact bytes each must hold.
+        expect: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        /// Registry keys and the values written when every condition holds.
+        put: Vec<(Vec<u8>, Vec<u8>)>,
+    },
 }
 
 impl MetadataCommand {
+    /// The partition every effect of the command lands in: what replay,
+    /// admission and the applied-change feed route it by. One partition per
+    /// command, so a replay that decides it again reads the same tree it
+    /// writes.
+    pub fn partition(&self) -> PartitionId {
+        match self {
+            Self::RegisterFields { .. }
+            | Self::AdoptFields { .. }
+            | Self::BindLabels { .. }
+            | Self::GrantNodeLease { .. }
+            | Self::RecordGroupPair { .. }
+            | Self::RecordDeployment { .. } => PartitionId::Schema,
+            Self::ConditionalRegistryWrite { .. } => PartitionId::Registry,
+        }
+    }
+
     /// Approximate encoded size, for rate limiting and dedup.
     pub fn size_estimate(&self) -> usize {
         match self {
@@ -299,6 +327,14 @@ impl MetadataCommand {
             Self::GrantNodeLease { token, .. } => 16 + token.len(),
             Self::RecordGroupPair { .. } => 12,
             Self::RecordDeployment { .. } => 16,
+            Self::ConditionalRegistryWrite { expect, put } => {
+                let expect: usize = expect
+                    .iter()
+                    .map(|(k, v)| k.len() + v.as_ref().map_or(1, |v| v.len() + 1))
+                    .sum();
+                let put: usize = put.iter().map(|(k, v)| k.len() + v.len()).sum();
+                expect + put
+            }
         }
     }
 }

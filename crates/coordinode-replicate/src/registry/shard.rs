@@ -227,8 +227,31 @@ impl Default for BackgroundConfig {
 enum Step<T> {
     /// Write this record, conditioned on the version read, then answer `T`.
     Write(RegistryEntry, T),
+    /// End the registration with this record, decided again where the log
+    /// applies it: only while the registration, its heartbeat and the
+    /// material basis still hold the bytes this decision read. Answer `T`
+    /// once it is written; read again when it was refused.
+    End(RegistryEntry, T),
     /// Nothing to write; answer `T`.
     Keep(T),
+}
+
+/// The registry key of the logical material basis the MVCC consumers are
+/// measured against. A publication that changes what their checkpoints
+/// require rewrites it, in the registry's own order, so an ending decided
+/// on an earlier basis is refused where it applies.
+pub(crate) const MATERIAL_BASIS_KEY: &[u8] = b"basis:mvcc";
+
+/// A registration as read: the record with its heartbeat's liveness, the
+/// record's version, and its stored bytes.
+type StoredEntry = (RegistryEntry, Option<u64>, Vec<u8>);
+
+/// The registry records a decision read, as their bytes: what an ending
+/// requires to be unchanged where it applies.
+struct ReadBytes {
+    entry: Option<Vec<u8>>,
+    heartbeat: Option<Option<Vec<u8>>>,
+    basis: Option<Vec<u8>>,
 }
 
 /// What holds a new registration's starting position until its floor is
@@ -402,22 +425,104 @@ impl RegistryCore {
         &self,
         consumer_id: &str,
     ) -> Result<Option<(RegistryEntry, Option<u64>)>, RegistryError> {
+        Ok(self
+            .read_entry_with_bytes(consumer_id)?
+            .map(|(entry, version, _)| (entry, version)))
+    }
+
+    /// [`Self::read_entry`] with the registration record's stored bytes.
+    fn read_entry_with_bytes(
+        &self,
+        consumer_id: &str,
+    ) -> Result<Option<StoredEntry>, RegistryError> {
         let key = encode_registry_key(consumer_id);
         let version = self
             .engine
             .record_version(Partition::Registry, &key)
             .map_err(|e| RegistryError::Replication(e.to_string()))?;
-        let raw = self
-            .engine
-            .get(Partition::Registry, &key)
-            .map_err(|e| RegistryError::Replication(e.to_string()))?;
-        let Some(bytes) = raw else {
+        let Some(bytes) = self.read_raw(&key)? else {
             return Ok(None);
         };
         let entry = RegistryEntry::decode(&bytes)
             .map_err(|e| RegistryError::Replication(format!("decode registry entry: {e}")))?;
         let (heartbeat, _) = self.read_heartbeat(consumer_id)?;
-        Ok(Some((entry.with_heartbeat(heartbeat), version)))
+        Ok(Some((entry.with_heartbeat(heartbeat), version, bytes)))
+    }
+
+    /// The stored bytes of registry record `key`.
+    fn read_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>, RegistryError> {
+        self.engine
+            .get(Partition::Registry, key)
+            .map(|raw| raw.map(|bytes| bytes.to_vec()))
+            .map_err(|e| RegistryError::Replication(e.to_string()))
+    }
+
+    /// Propose `next` as the record of `consumer_id`, decided where the log
+    /// applies it against the records `read` holds: the registration (so
+    /// every lifecycle transition, an acknowledgement or an ending, is
+    /// decided against whichever applied before it), its heartbeat when the
+    /// decision was on liveness, and the material basis when `on_basis`.
+    /// `Ok(true)` once `next` is the record; `Ok(false)` when it was refused
+    /// (another write moved one of them first) or its outcome is unknown and
+    /// it is not the record: the caller reads again, and a repeat is refused
+    /// once either landed, since the record no longer holds the bytes it
+    /// expects.
+    fn write_conditionally(
+        &self,
+        consumer_id: &str,
+        next: &RegistryEntry,
+        read: &ReadBytes,
+        on_basis: bool,
+    ) -> Result<bool, RegistryError> {
+        use coordinode_core::txn::proposal::{MetadataCommand, Mutation, RaftProposal};
+        use coordinode_core::txn::timestamp::Timestamp;
+        let key = encode_registry_key(consumer_id);
+        let value = next
+            .encode()
+            .map_err(|e| RegistryError::Replication(format!("encode registry entry: {e}")))?;
+        let mut expect = vec![(key.clone(), read.entry.clone())];
+        if on_basis {
+            expect.push((MATERIAL_BASIS_KEY.to_vec(), read.basis.clone()));
+        }
+        if let Some(heartbeat) = &read.heartbeat {
+            expect.push((encode_heartbeat_key(consumer_id), heartbeat.clone()));
+        }
+        let oracle = self.engine.oracle().ok_or_else(|| {
+            RegistryError::Replication(
+                "the registry needs an engine with a timestamp oracle".into(),
+            )
+        })?;
+        let id = self.id_gen.next();
+        // Held until the entry is handed over, so no closed bound passes it.
+        let (commit_ts, held) = self
+            .engine
+            .pending_commits()
+            .obligate(|| oracle.next().as_raw());
+        held.seal(id);
+        let proposal = RaftProposal {
+            id,
+            mutations: vec![Mutation::Command(
+                MetadataCommand::ConditionalRegistryWrite {
+                    expect,
+                    put: vec![(key.clone(), value.clone())],
+                },
+            )],
+            commit_ts: Timestamp::from_raw(commit_ts),
+            start_ts: Timestamp::from_raw(0),
+            // The store's own work where the thread gives room back (an
+            // ending, an acknowledgement under a sweep), as for any commit.
+            bypass_rate_limiter: coordinode_storage::engine::footprint::reclaiming(),
+        };
+        match self.pipeline.propose_and_wait(&proposal) {
+            Ok(_) => {}
+            Err(coordinode_core::txn::proposal::ProposalError::NotLeader { leader_id }) => {
+                return Err(RegistryError::NotLeader { leader_id });
+            }
+            // Not known to have landed: whether it did is read below.
+            Err(e) => tracing::warn!(error = %e, consumer_id, "registry: ending outcome unknown"),
+        }
+        drop(held);
+        Ok(self.read_raw(&key)?.as_deref() == Some(value.as_slice()))
     }
 
     /// The heartbeat record of `consumer_id` and its version, the version
@@ -446,37 +551,6 @@ impl RegistryCore {
             None => None,
         };
         Ok((heartbeat, version))
-    }
-
-    /// Commit `writes` in one transaction, each conditioned on the version its
-    /// record had when read (`None` for a record that did not exist), and on
-    /// each record in `unchanged` still having the version given. `Ok(false)`
-    /// when another writer moved one of them: the caller reads again.
-    fn commit_writes(
-        &self,
-        writes: &[(RegistryEntry, Option<u64>)],
-        unchanged: &[(Vec<u8>, Option<u64>)],
-    ) -> Result<bool, RegistryError> {
-        if writes.is_empty() {
-            return Ok(true);
-        }
-        self.commit_staged(|txn| {
-            for (entry, version) in writes {
-                let key = encode_registry_key(&entry.consumer_id);
-                let value = entry.encode().map_err(|e| {
-                    RegistryError::Replication(format!("encode registry entry: {e}"))
-                })?;
-                txn.expect_version(Partition::Registry, &key, *version)
-                    .map_err(|e| RegistryError::Replication(e.to_string()))?;
-                txn.put(Partition::Registry, &key, &value)
-                    .map_err(|e| RegistryError::Replication(e.to_string()))?;
-            }
-            for (key, version) in unchanged {
-                txn.expect_version(Partition::Registry, key, *version)
-                    .map_err(|e| RegistryError::Replication(e.to_string()))?;
-            }
-            Ok(())
-        })
     }
 
     /// Commit what `stage` puts into one registry transaction. `Ok(false)`
@@ -547,16 +621,23 @@ impl RegistryCore {
                 std::thread::sleep(backoff(attempt));
             }
             // Read before the record, so the heartbeat merged into it is no
-            // older than the version the commit then requires.
-            let heard = if on_liveness {
-                let (_, version) = self.read_heartbeat(consumer_id)?;
-                vec![(encode_heartbeat_key(consumer_id), version)]
+            // older than the bytes the commit then requires.
+            let heartbeat = if on_liveness {
+                Some(self.read_raw(&encode_heartbeat_key(consumer_id))?)
             } else {
-                Vec::new()
+                None
             };
-            let (current, version) = match self.read_entry(consumer_id)? {
-                Some((entry, version)) => (Some(entry), version),
+            // The basis first: an ending decided now is conditioned on the
+            // one its measurement was taken against, never a later one.
+            let basis = self.read_raw(MATERIAL_BASIS_KEY)?;
+            let (current, entry_bytes) = match self.read_entry_with_bytes(consumer_id)? {
+                Some((entry, _, bytes)) => (Some(entry), Some(bytes)),
                 None => (None, None),
+            };
+            let read = ReadBytes {
+                entry: entry_bytes,
+                heartbeat,
+                basis,
             };
             // What this record holds the floors at now, if anything.
             let held = current
@@ -565,6 +646,22 @@ impl RegistryCore {
                 .map(|entry| (entry.kind.is_seqno_space(), entry.checkpoint_seqno));
             match decide(current)? {
                 Step::Keep(answer) => return Ok(answer),
+                Step::End(ended, answer) => {
+                    #[cfg(test)]
+                    {
+                        // Between the measurement and the ordered decision.
+                        let hook = self.before_commit.lock().take();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    if self.write_conditionally(consumer_id, &ended, &read, true)? {
+                        if !self.batching_on.load(Ordering::Acquire) {
+                            self.recompute_floor()?;
+                        }
+                        return Ok(answer);
+                    }
+                }
                 Step::Write(entry, answer) => {
                     #[cfg(test)]
                     {
@@ -586,7 +683,7 @@ impl RegistryCore {
                             seqno_space != entry.kind.is_seqno_space()
                                 || entry.checkpoint_seqno < checkpoint
                         });
-                    if self.commit_writes(&[(entry, version)], &heard)? {
+                    if self.write_conditionally(consumer_id, &entry, &read, false)? {
                         if lowers || !self.batching_on.load(Ordering::Acquire) {
                             self.recompute_floor()?;
                         }
@@ -927,7 +1024,7 @@ impl RegistryCore {
                 match current.termination(now, self.source.as_ref()) {
                     Some(reason) => {
                         let checkpoint = current.checkpoint_seqno;
-                        Ok(Step::Write(
+                        Ok(Step::End(
                             self.terminated(current, reason, now),
                             Some((reason, checkpoint)),
                         ))
@@ -1504,25 +1601,24 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                     .set(head.saturating_sub(e.checkpoint_seqno) as f64);
                     // Age of the oldest unacknowledged work; a consumer with
                     // none outstanding is not lagging, however long ago it
-                    // last acknowledged. A source that does not account the
-                    // space cannot tell.
-                    progress_lag_ms = if !behind {
-                        Some(0)
+                    // last acknowledged. A source that cannot tell says so,
+                    // and the gauges show NaN rather than a healthy zero.
+                    let lag = if behind {
+                        source
+                            .produced_at_ms(e.kind, e.checkpoint_seqno)
+                            .map(|at| at.map_or(0, |at| now.saturating_sub(at)))
                     } else {
-                        match source.produced_at_ms(e.kind, e.checkpoint_seqno) {
-                            Some(at) => Some(now.saturating_sub(at)),
-                            None => source.accounts(e.kind).then_some(0),
-                        }
+                        Ok(0)
                     };
                     metrics::gauge!("registry_consumer_lag_age_seconds", "consumer_id" => e.consumer_id.clone())
-                        .set(progress_lag_ms.unwrap_or(0) as f64 / 1_000.0);
+                        .set(lag.map_or(f64::NAN, |ms| ms as f64 / 1_000.0));
                     metrics::gauge!("registry_consumer_heartbeat_age_seconds", "consumer_id" => e.consumer_id.clone())
                         .set(now.saturating_sub(e.last_heartbeat_ts_ms) as f64 / 1_000.0);
-                    retained_bytes = source.retained_bytes_from(e.kind, e.checkpoint_seqno);
-                    if let Some(bytes) = retained_bytes {
-                        metrics::gauge!("registry_consumer_retained_bytes", "consumer_id" => e.consumer_id.clone())
-                            .set(bytes as f64);
-                    }
+                    let bytes = source.retained_bytes_from(e.kind, e.checkpoint_seqno);
+                    metrics::gauge!("registry_consumer_retained_bytes", "consumer_id" => e.consumer_id.clone())
+                        .set(bytes.map_or(f64::NAN, |b| b as f64));
+                    progress_lag_ms = Some(lag);
+                    retained_bytes = Some(bytes);
                 }
                 ConsumerSnapshot {
                     holds_floor: floors.held_by(&e),
@@ -1601,9 +1697,16 @@ impl ShardConsumerRegistry {
         .into_iter()
         .map(|(space, kind)| {
             let floor = floors.get(space);
-            let retained_bytes = floor.and_then(|at| source.retained_bytes_from(kind, at));
-            metrics::gauge!("registry_retained_bytes", "space" => space.label())
-                .set(retained_bytes.unwrap_or(0) as f64);
+            let retained_bytes = floor.map(|at| source.retained_bytes_from(kind, at));
+            // Nothing held is zero bytes; a total the source cannot take is
+            // NaN, not zero.
+            metrics::gauge!("registry_retained_bytes", "space" => space.label()).set(
+                match retained_bytes {
+                    None => 0.0,
+                    Some(Ok(bytes)) => bytes as f64,
+                    Some(Err(_)) => f64::NAN,
+                },
+            );
             RetentionSummary {
                 space,
                 floor,

@@ -1,6 +1,6 @@
 use super::*;
 use crate::registry::types::{
-    ConsumerKind, PriorIncarnation, RetentionPressure, ValidatedRetentionBounds,
+    ConsumerKind, PriorIncarnation, RetentionPressure, Unmeasured, ValidatedRetentionBounds,
 };
 use coordinode_core::txn::proposal::RaftProposal;
 use coordinode_raft::cluster::RaftNode;
@@ -29,8 +29,10 @@ impl Clock for ManualClock {
 struct FakeSource {
     head: AtomicU64,
     first: AtomicU64,
-    /// Clock ms each position was produced at.
-    produced: Mutex<HashMap<u64, u64>>,
+    /// Clock ms each position's first work was produced at, `None` where the
+    /// source has proved none is owed; a position missing here is one whose
+    /// evidence the source cannot read.
+    produced: Mutex<HashMap<u64, Option<u64>>>,
     /// Bytes required from any position.
     bytes: AtomicU64,
     unaccounted: AtomicBool,
@@ -51,7 +53,10 @@ impl FakeSource {
         self.first.store(first, Ordering::Release);
     }
     fn produced(&self, position: u64, at_ms: u64) {
-        self.produced.lock().insert(position, at_ms);
+        self.produced.lock().insert(position, Some(at_ms));
+    }
+    fn no_work(&self, position: u64) {
+        self.produced.lock().insert(position, None);
     }
     fn set_bytes(&self, bytes: u64) {
         self.bytes.store(bytes, Ordering::Release);
@@ -71,11 +76,15 @@ impl RetentionSource for FakeSource {
     fn accounts(&self, _: ConsumerKind) -> bool {
         !self.unaccounted.load(Ordering::Acquire)
     }
-    fn produced_at_ms(&self, _: ConsumerKind, position: u64) -> Option<u64> {
-        self.produced.lock().get(&position).copied()
+    fn produced_at_ms(&self, _: ConsumerKind, position: u64) -> Result<Option<u64>, Unmeasured> {
+        self.produced
+            .lock()
+            .get(&position)
+            .copied()
+            .ok_or(Unmeasured::Unreadable)
     }
-    fn retained_bytes_from(&self, _: ConsumerKind, _: u64) -> Option<u64> {
-        Some(self.bytes.load(Ordering::Acquire))
+    fn retained_bytes_from(&self, _: ConsumerKind, _: u64) -> Result<u64, Unmeasured> {
+        Ok(self.bytes.load(Ordering::Acquire))
     }
     fn admits(&self, _: ConsumerKind) -> Result<(), RetentionPressure> {
         if self.pressured.load(Ordering::Acquire) {
@@ -449,6 +458,8 @@ async fn a_consumer_requiring_too_many_bytes_ends() {
     f.reg
         .register(registration("heavy", 3, bounded(u64::MAX, 4_096, None)))
         .expect("register");
+    // Judged on one whole observation: the source can tell its work, none.
+    f.source.no_work(3);
     f.source.set_bytes(4_096);
     assert_eq!(
         f.reg.core.sweep_evictions().expect("sweep").evicted,
@@ -722,6 +733,98 @@ fn an_acknowledgement_racing_an_expiry_keeps_the_consumer() {
     assert_eq!(reg.shard_floor(), 20, "the acknowledgement stands");
 }
 
+/// A change of the material basis published after a consumer was measured
+/// and before its ending applies, under which the consumer is within its
+/// bounds: the ending, decided where the log applies it, finds the basis
+/// moved and writes nothing, and the measure against the new basis ends
+/// nobody.
+#[test]
+fn a_basis_change_racing_an_ending_keeps_a_now_compliant_consumer() {
+    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
+    reg.register(registration("measured", 7, bounded(1_000, 1 << 30, None)))
+        .expect("register");
+    source.set_head(20);
+    source.produced(7, 0);
+    clock.set(5_000);
+
+    *reg.core.before_commit.lock() = Some(Box::new({
+        let engine = Arc::clone(&reg.core.engine);
+        let source = Arc::clone(&source);
+        move || {
+            // The new basis no longer requires the old work.
+            source.produced(7, 4_900);
+            engine
+                .put(Partition::Registry, MATERIAL_BASIS_KEY, b"revision 1")
+                .expect("the basis moves first");
+        }
+    }));
+    assert_eq!(
+        reg.core.sweep_evictions().expect("sweep").evicted,
+        0,
+        "an ending measured on the old basis landed"
+    );
+    assert_eq!(ended_for(&reg, "measured"), None);
+}
+
+/// An acknowledgement already checked and on its way to the log when an
+/// ending applies ahead of it: the ending stands, and the acknowledgement,
+/// decided where the log applies it, finds the registration ended and
+/// writes nothing. Before, it wrote its live record over the ending.
+#[test]
+fn an_acknowledgement_in_flight_behind_an_ending_resurrects_nothing() {
+    let (reg, clock, source, pipeline, _dir) = hooked_registry();
+    let h = reg
+        .register(registration("raced", 7, bounded(1_000, 1 << 30, None)))
+        .expect("register");
+    source.set_head(20);
+    source.produced(7, 0);
+    clock.set(5_000);
+
+    // The ending takes its timestamp and stops before it applies. Meanwhile
+    // an acknowledgement passes its checks (the registration is live),
+    // takes a later timestamp and stops before it applies too. The ending
+    // applies, then the acknowledgement.
+    let (checked_tx, checked) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release) = std::sync::mpsc::channel::<()>();
+    pipeline.later_hooks.lock().push_back(Box::new(move || {
+        checked_tx.send(()).expect("signal");
+        release.recv().expect("released");
+    }));
+    let acknowledging = Arc::new(Mutex::new(None));
+    *pipeline.hook.lock() = Some(Box::new({
+        let (reg, h, acknowledging) = (reg.clone(), h.clone(), Arc::clone(&acknowledging));
+        move || {
+            *acknowledging.lock() = Some(std::thread::spawn(move || reg.checkpoint(&h, 20)));
+            checked
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the acknowledgement passed its checks");
+        }
+    }));
+    reg.core.sweep_evictions().expect("sweep");
+    release_tx.send(()).expect("release");
+    let acknowledged = acknowledging
+        .lock()
+        .take()
+        .expect("spawned")
+        .join()
+        .expect("acknowledgement");
+    assert_eq!(
+        ended_for(&reg, "raced"),
+        Some(TerminalReason::ProgressLagExceeded),
+        "the acknowledgement wrote a live record over the ending"
+    );
+    assert!(
+        matches!(
+            acknowledged,
+            Err(RegistryError::Terminated {
+                reason: TerminalReason::ProgressLagExceeded,
+                ..
+            })
+        ),
+        "the acknowledgement is refused with the ending: {acknowledged:?}"
+    );
+}
+
 /// The other order: the expiry lands first, and the acknowledgement that
 /// follows finds the incarnation ended and changes nothing.
 #[test]
@@ -772,6 +875,38 @@ fn a_read_in_progress_keeps_its_history_when_the_consumer_ends() {
     );
 }
 
+/// A consumer behind the head whose source accounts its space but cannot
+/// read when its work was produced is reported as unmeasured, never as a
+/// consumer with no work waiting: a zero would read as healthy exactly when
+/// the evidence is missing.
+#[test]
+fn a_lag_the_source_cannot_read_is_not_reported_as_zero() {
+    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
+    source.set_head(30);
+    reg.register(ConsumerRegistration {
+        kind: ConsumerKind::OplogEvents,
+        ..registration("blind", 10, ConsumerRetentionPolicy::Strict)
+    })
+    .expect("register");
+    clock.set(6_000);
+
+    let lag = || {
+        reg.list_consumers()
+            .into_iter()
+            .find(|c| c.consumer_id == "blind")
+            .expect("listed")
+            .progress_lag_ms
+    };
+    assert_eq!(
+        lag(),
+        Some(Err(Unmeasured::Unreadable)),
+        "unreadable work time reported as no lag"
+    );
+    // Once the source proves nothing is owed from there, the lag is zero.
+    source.no_work(10);
+    assert_eq!(lag(), Some(Ok(0)));
+}
+
 /// The retention summary counts a space's shared history once, names the
 /// registrations at its floor (the ones whose progress or cancellation lets
 /// it rise), and says when new retention is refused for pressure; each
@@ -806,7 +941,7 @@ fn the_summary_counts_shared_history_once_and_names_who_holds_it() {
     assert_eq!(log_view.floor, Some(10));
     assert_eq!(
         log_view.retained_bytes,
-        Some(1_000),
+        Some(Ok(1_000)),
         "shared history is counted once, not once per registration"
     );
     assert_eq!(log_view.held_by, vec!["slow".to_string()]);
@@ -825,9 +960,9 @@ fn the_summary_counts_shared_history_once_and_names_who_holds_it() {
             .expect("listed")
     };
     assert!(view("slow").holds_floor && !view("fast").holds_floor);
-    assert_eq!(view("slow").progress_lag_ms, Some(5_000));
-    assert_eq!(view("fast").progress_lag_ms, Some(2_000));
-    assert_eq!(view("fast").retained_bytes, Some(1_000));
+    assert_eq!(view("slow").progress_lag_ms, Some(Ok(5_000)));
+    assert_eq!(view("fast").progress_lag_ms, Some(Ok(2_000)));
+    assert_eq!(view("fast").retained_bytes, Some(Ok(1_000)));
 
     // Cancelling the holder moves the floor and the holder to the next one.
     reg.unregister(slow).expect("cancel");
@@ -1644,6 +1779,9 @@ fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
 struct HookPipeline {
     inner: coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline,
     hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run, in order, by the proposals that come after the one `hook` is
+    /// taken by: one each, before it applies.
+    later_hooks: Mutex<std::collections::VecDeque<Box<dyn FnOnce() + Send>>>,
     /// Refuse every proposal as a follower would, naming member 2 leader.
     follower: AtomicBool,
     /// Refuse every proposal as a failed write.
@@ -1668,6 +1806,11 @@ impl ProposalPipeline for HookPipeline {
         let hook = self.hook.lock().take();
         if let Some(hook) = hook {
             hook();
+        } else {
+            let later = self.later_hooks.lock().pop_front();
+            if let Some(later) = later {
+                later();
+            }
         }
         if self.failing.load(Ordering::Acquire) {
             return Err(coordinode_core::txn::proposal::ProposalError::Storage(
@@ -2101,6 +2244,7 @@ fn hooked_registry() -> (
     let pipeline = Arc::new(HookPipeline {
         inner: coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
         hook: Mutex::new(None),
+        later_hooks: Mutex::new(std::collections::VecDeque::new()),
         follower: AtomicBool::new(false),
         failing: AtomicBool::new(false),
         own_work: Mutex::new(Vec::new()),

@@ -7,7 +7,21 @@
 
 use coordinode_storage::engine::oplog_journal::JournalHold;
 
-use super::types::{ConsumerKind, RetentionPressure};
+use super::types::{ConsumerKind, RetentionPressure, Unmeasured};
+
+/// One observation of a checkpoint's work and material
+/// ([`RetentionSource::observe`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Observed {
+    /// Clock ms the oldest unseen work was produced, `None` when none is.
+    pub produced_at_ms: Option<u64>,
+    /// Bytes of source material the checkpoint requires.
+    pub retained_bytes: u64,
+    /// The source state the observation describes, when the source can
+    /// change under it ([`RetentionSource::still_current`]); `None` for a
+    /// source whose answers do not go stale that way.
+    pub generation: Option<u64>,
+}
 
 /// The source behind one consumer position space on a shard.
 #[diagnostic::on_unimplemented(
@@ -29,14 +43,46 @@ pub trait RetentionSource: Send + Sync {
     fn accounts(&self, kind: ConsumerKind) -> bool;
 
     /// Clock ms at which the first work at or after `position` was produced,
-    /// or `None` when there is none up to the head or the source cannot
-    /// tell. Source entries that carry no work (nothing a consumer receives)
-    /// are passed over: they are not owed.
-    fn produced_at_ms(&self, kind: ConsumerKind, position: u64) -> Option<u64>;
+    /// `Ok(None)` when the source has proved there is none up to the head.
+    /// Source entries that carry no work (nothing a consumer receives) are
+    /// passed over: they are not owed.
+    ///
+    /// # Errors
+    ///
+    /// [`Unmeasured`] when the source cannot tell: never a proof of no work.
+    fn produced_at_ms(&self, kind: ConsumerKind, position: u64) -> Result<Option<u64>, Unmeasured>;
 
     /// Bytes of source material a checkpoint at `position` requires the
-    /// source to keep, or `None` when the source cannot account them.
-    fn retained_bytes_from(&self, kind: ConsumerKind, position: u64) -> Option<u64>;
+    /// source to keep.
+    ///
+    /// # Errors
+    ///
+    /// [`Unmeasured`] when the source cannot account them: never zero bytes.
+    fn retained_bytes_from(&self, kind: ConsumerKind, position: u64) -> Result<u64, Unmeasured>;
+
+    /// The work age and the bytes of a checkpoint at `position`, taken from
+    /// one observation of the source, so a judgement never pairs an age and
+    /// a size of two different states. A source whose two answers are
+    /// always consistent may leave the default, which asks each of them.
+    ///
+    /// # Errors
+    ///
+    /// [`Unmeasured`] when either cannot be taken.
+    fn observe(&self, kind: ConsumerKind, position: u64) -> Result<Observed, Unmeasured> {
+        Ok(Observed {
+            produced_at_ms: self.produced_at_ms(kind, position)?,
+            retained_bytes: self.retained_bytes_from(kind, position)?,
+            generation: None,
+        })
+    }
+
+    /// Whether `observed` still describes the source: checked last before a
+    /// registration is ended on it, so material replaced since (a rebuild,
+    /// a cleared tree) ends nobody on numbers that no longer hold.
+    fn still_current(&self, observed: &Observed) -> bool {
+        let _ = observed;
+        true
+    }
 
     /// Whether the source can take on retention for a new `kind` consumer
     /// now, or why not: the registration is then refused as retryable

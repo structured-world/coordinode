@@ -705,6 +705,37 @@ impl PendingCommits {
         }
     }
 
+    /// Register a write applied straight to the trees, outside any log, under
+    /// a timestamp `allocate` takes: like a commit, so no complete snapshot
+    /// covers it before all of it has landed. It conditions on nothing and
+    /// is never refused: the table counts it, but its caller writes one key
+    /// at a time and holds it only across that write.
+    pub fn admit_direct(&self, allocate: impl FnOnce() -> u64) -> (u64, DirectWrite<'_>) {
+        let mut table = self.inner.lock();
+        let candidate = Admitted {
+            commit_ts: allocate(),
+            scope: Vec::new(),
+            guards: Vec::new(),
+        };
+        let commit_ts = candidate.commit_ts;
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        table.index(id, &candidate);
+        table.admitted.insert(id, candidate);
+        (commit_ts, DirectWrite { pending: self, id })
+    }
+
+    /// Release a direct write: it stops holding snapshots, and makes no
+    /// closing entry due, since no entry reached the log for one to cover.
+    fn withdraw_direct(&self, id: u64) {
+        let mut table = self.inner.lock();
+        if let Some(admitted) = table.admitted.remove(&id) {
+            table.unindex(id, &admitted);
+        }
+        self.wake_all(table);
+    }
+
     /// Release an unlogged timestamp. One whose entry went to the log counts
     /// toward a closing entry; a `local` one never reaches the log, so only
     /// stops holding the bound.
@@ -817,6 +848,21 @@ impl Admission<'_> {
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
         self.pending.withdraw(self.id);
+    }
+}
+
+/// A direct write's registration ([`PendingCommits::admit_direct`]), held
+/// until all of it has landed.
+#[derive(Debug)]
+#[must_use = "the registration holds snapshots below the write until it drops"]
+pub struct DirectWrite<'p> {
+    pending: &'p PendingCommits,
+    id: u64,
+}
+
+impl Drop for DirectWrite<'_> {
+    fn drop(&mut self) {
+        self.pending.withdraw_direct(self.id);
     }
 }
 
