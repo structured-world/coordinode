@@ -19,6 +19,20 @@ fn a_property_column_is_found_by_variable_and_name() {
     assert_eq!(property(&row, "m", "title"), None);
 }
 
+/// A column's key is charged before it is made, so the bytes known in advance
+/// must be what keeping the made key counts, for names short and long.
+#[test]
+fn a_column_key_is_charged_what_keeping_it_counts() {
+    for name in ["", "x", "title", &"p".repeat(4_096)] {
+        let column = column_name("n", name);
+        assert_eq!(column, format!("n.{name}"));
+        assert_eq!(
+            column_entry_bytes("n", name),
+            coordinode_core::graph::types::map_entry_bytes(&column)
+        );
+    }
+}
+
 /// The index is charged before it allocates, so the charge must cover what
 /// the hash table and the link list actually hold for every size: a bound
 /// below the table's real buckets would let a statement keep memory its

@@ -885,6 +885,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "tracking-allocator",
  "uuid",
 ]
 

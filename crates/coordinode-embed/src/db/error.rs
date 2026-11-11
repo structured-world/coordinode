@@ -814,6 +814,7 @@ impl From<ExecutionError> for DatabaseError {
             E::Storage(storage) => storage.into(),
             E::Modality(store) => store.into(),
             E::Budget(stop) => Self::Budget(stop),
+            E::ChargeTransfer(refused) => Self::Other(refused.to_string()),
             E::OutcomeUnknown(cause) => Self::WriteOutcomeUnknown {
                 cause,
                 transaction: None,

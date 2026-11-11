@@ -4708,17 +4708,54 @@ impl StorageEngine {
         keys: &[&[u8]],
     ) -> StorageResult<Vec<Option<bytes::Bytes>>> {
         let mut out: Vec<Option<bytes::Bytes>> = vec![None; keys.len()];
+        self.multi_get_each(part, keys, None, |slot, value: Option<StoredValue<'_>>| {
+            out[slot] = value.map(StoredValue::to_bytes);
+            Ok::<(), StorageError>(())
+        })?;
+        Ok(out)
+    }
 
+    /// [`Self::multi_get`] handing each key's value to `each` as the store
+    /// holds it, instead of copying it out: `each` gets the key's index and
+    /// its value or `None`, once per key, in no promised order, and keeps
+    /// what it wants. A reader holding to a memory budget charges a value
+    /// before it copies or decodes it. A value the tiered cache serves is the
+    /// cache's; one read from the tree is a view into its block, copied only
+    /// into the cache when the cache takes it. Under `budget`, the lists this
+    /// read keeps aside for the keys are charged before they exist; the index
+    /// partition's translation of generation keys keeps buffers it does not
+    /// charge.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, the budget's refusal, or what `each` returns.
+    pub fn multi_get_each<E: From<StorageError> + From<coordinode_core::budget::BudgetStop>>(
+        &self,
+        part: Partition,
+        keys: &[&[u8]],
+        budget: Option<&coordinode_core::budget::QueryBudget>,
+        mut each: impl FnMut(usize, Option<StoredValue<'_>>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let ticket = match &self.tiered_cache {
+            Some(_) => core::mem::size_of::<crate::cache::tiered::FillTicket>(),
+            None => 0,
+        };
+        let _scratch = reserve_slots(
+            budget,
+            keys.len(),
+            core::mem::size_of::<usize>() + core::mem::size_of::<&[u8]>() + ticket,
+        )?;
         // Split cache hits from misses; only the misses go to the tree, each
-        // with its ticket taken before the read (see `get`).
-        let mut miss_idx: Vec<usize> = Vec::new();
-        let mut miss_keys: Vec<&[u8]> = Vec::new();
-        let mut tickets = Vec::new();
+        // with its ticket taken before the read (see `get`). Each list holds
+        // room for exactly the keys.
+        let mut miss_idx: Vec<usize> = Vec::with_capacity(keys.len());
+        let mut miss_keys: Vec<&[u8]> = Vec::with_capacity(keys.len());
+        let mut tickets = Vec::with_capacity(if ticket == 0 { 0 } else { keys.len() });
         for (i, key) in keys.iter().enumerate() {
             if let Some(cache) = &self.tiered_cache {
                 if let Some(value) = cache.get(part, key) {
                     self.access_tracker.record(part, key);
-                    out[i] = Some(value);
+                    each(i, Some(StoredValue::Cached(&value)))?;
                     continue;
                 }
                 tickets.push(cache.ticket(part, key));
@@ -4728,24 +4765,28 @@ impl StorageEngine {
         }
 
         if miss_keys.is_empty() {
-            return Ok(out);
+            return Ok(());
         }
 
         let values = self.stored_multi_get(part, &miss_keys, self.coordinator.current_seqno())?;
 
         for (n, (slot, value)) in miss_idx.into_iter().zip(values).enumerate() {
-            if let Some(v) = value {
-                let bytes = bytes::Bytes::copy_from_slice(&v);
-                if let (Some(cache), Some(ticket)) = (&self.tiered_cache, tickets.get(n)) {
+            let Some(v) = value else {
+                each(slot, None)?;
+                continue;
+            };
+            self.access_tracker.record(part, keys[slot]);
+            match (&self.tiered_cache, tickets.get(n)) {
+                (Some(cache), Some(ticket)) => {
+                    let bytes = bytes::Bytes::copy_from_slice(&v);
                     let weight = self.resolve_cache_weight(cache, part, &bytes);
                     cache.fill(part, keys[slot], &bytes, weight, *ticket);
+                    each(slot, Some(StoredValue::Cached(&bytes)))?;
                 }
-                self.access_tracker.record(part, keys[slot]);
-                out[slot] = Some(bytes);
+                _ => each(slot, Some(StoredValue::Tree(&v)))?,
             }
         }
-
-        Ok(out)
+        Ok(())
     }
 
     /// Write a key-value pair to the given partition.
@@ -7066,15 +7107,42 @@ impl StorageEngine {
         part: Partition,
         keys: &[&[u8]],
     ) -> StorageResult<Vec<Option<bytes::Bytes>>> {
+        let mut out: Vec<Option<bytes::Bytes>> = vec![None; keys.len()];
+        self.snapshot_multi_get_each(snapshot, part, keys, None, |slot, value| {
+            out[slot] = value.map(StoredValue::to_bytes);
+            Ok::<(), StorageError>(())
+        })?;
+        Ok(out)
+    }
+
+    /// [`Self::snapshot_multi_get`] handing each key's value to `each` as a
+    /// view into the tree's block, as [`Self::multi_get_each`] does.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure (a snapshot no longer retained among them), or what
+    /// `each` returns. Outside the index partition this read keeps nothing
+    /// aside for the keys; the index partition's translation of generation
+    /// keys keeps buffers `budget` does not charge.
+    pub fn snapshot_multi_get_each<
+        E: From<StorageError> + From<coordinode_core::budget::BudgetStop>,
+    >(
+        &self,
+        snapshot: &lsm_tree::SeqNo,
+        part: Partition,
+        keys: &[&[u8]],
+        _budget: Option<&coordinode_core::budget::QueryBudget>,
+        mut each: impl FnMut(usize, Option<StoredValue<'_>>) -> Result<(), E>,
+    ) -> Result<(), E> {
         self.check_snapshot_retained(*snapshot)?;
         for key in keys {
             self.check_history_of(part, key, *snapshot)?;
         }
         let values = self.stored_multi_get(part, keys, *snapshot)?;
-        Ok(values
-            .into_iter()
-            .map(|v| v.map(|b| bytes::Bytes::copy_from_slice(&b)))
-            .collect())
+        for (slot, value) in values.iter().enumerate() {
+            each(slot, value.as_ref().map(StoredValue::Tree))?;
+        }
+        Ok(())
     }
 
     /// Scan keys by prefix through a previously taken snapshot.
@@ -7509,6 +7577,55 @@ fn run_capacity_refresh<F>(
                     "auto cascade eviction failed",
                 );
             }
+        }
+    }
+}
+
+/// Charge `budget`, when there is one, for `slots` slots of `slot` bytes
+/// about to be allocated, held while the returned charge lives. A count past
+/// memory asks for more than any limit, and is refused.
+pub(crate) fn reserve_slots(
+    budget: Option<&coordinode_core::budget::QueryBudget>,
+    slots: usize,
+    slot: usize,
+) -> Result<Option<coordinode_core::budget::MemoryCharge<'_>>, coordinode_core::budget::BudgetStop>
+{
+    let Some(budget) = budget else {
+        return Ok(None);
+    };
+    let bytes = slots
+        .checked_mul(slot)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(u64::MAX);
+    budget.reserve(bytes).map(Some)
+}
+
+/// A value as the store holds it, handed to a reader that decides what to
+/// copy of it: the tiered cache's own, or a view into a block the tree read.
+/// Neither is the reader's memory; what the reader keeps, it copies.
+#[derive(Debug, Clone, Copy)]
+pub enum StoredValue<'a> {
+    /// Held by the tiered cache.
+    Cached(&'a bytes::Bytes),
+    /// A view into the block the tree read it from.
+    Tree(&'a lsm_tree::UserValue),
+}
+
+impl<'a> StoredValue<'a> {
+    /// The value's bytes, in place.
+    pub fn as_bytes(self) -> &'a [u8] {
+        match self {
+            Self::Cached(bytes) => bytes,
+            Self::Tree(value) => value,
+        }
+    }
+
+    /// The value as bytes of its own: the cache's shared, a tree value
+    /// copied.
+    pub fn to_bytes(self) -> bytes::Bytes {
+        match self {
+            Self::Cached(bytes) => bytes.clone(),
+            Self::Tree(value) => bytes::Bytes::copy_from_slice(value),
         }
     }
 }

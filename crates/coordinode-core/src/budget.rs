@@ -486,6 +486,22 @@ impl Meter for BatchedWork<'_> {
     }
 }
 
+/// Why [`MemoryCharge::transfer`] moved nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TransferRefused {
+    /// The charges belong to different budgets.
+    #[error("a memory charge cannot move to another budget's charge")]
+    OtherBudget,
+    /// The charge holds fewer bytes than were to move.
+    #[error("a memory charge of {held} bytes cannot give {asked}")]
+    MoreThanHeld {
+        /// Bytes the charge holds.
+        held: u64,
+        /// Bytes asked to move.
+        asked: u64,
+    },
+}
+
 /// Memory reserved from a [`QueryBudget`], returned when dropped.
 #[derive(Debug)]
 pub struct MemoryCharge<'b> {
@@ -523,6 +539,36 @@ impl<'b> MemoryCharge<'b> {
         let returned = bytes.min(self.bytes);
         self.budget.give(returned);
         self.bytes -= returned;
+    }
+
+    /// Move `bytes` of this charge to `to`, a charge on the same budget: for
+    /// memory that changes owner (a record moved from a batch into the
+    /// results) and is paid for once.
+    ///
+    /// # Errors
+    ///
+    /// [`TransferRefused`] when `to` belongs to another budget, whose drop
+    /// would return bytes this budget lent, or when this charge holds fewer
+    /// than `bytes`, so part of the memory moved would go unpaid. Neither
+    /// charge changes then.
+    pub fn transfer(
+        &mut self,
+        bytes: u64,
+        to: &mut MemoryCharge<'b>,
+    ) -> Result<(), TransferRefused> {
+        if !core::ptr::eq(self.budget, to.budget) {
+            return Err(TransferRefused::OtherBudget);
+        }
+        let Some(left) = self.bytes.checked_sub(bytes) else {
+            return Err(TransferRefused::MoreThanHeld {
+                held: self.bytes,
+                asked: bytes,
+            });
+        };
+        self.bytes = left;
+        // Within what the budget admitted for both, so it cannot overflow.
+        to.bytes += bytes;
+        Ok(())
     }
 
     /// Keep this charge's bytes reserved for the rest of the query: for

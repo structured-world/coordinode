@@ -13,12 +13,25 @@ pub type Row = BTreeMap<String, Value>;
 /// longer names fall back to an allocated one.
 const COLUMN_NAME_INLINE: usize = 128;
 
-/// The value of column `var.property` in `row`. The name is assembled on the
-/// stack, so a property read per row allocates nothing.
+/// What [`property`] allocates to find `var.property`: nothing for a name
+/// the stack holds, the assembled name past that. A charged reader reserves
+/// it before the lookup.
+pub fn column_lookup_bytes(var: &str, property: &str) -> u64 {
+    let len = var.len() + 1 + property.len();
+    if len > COLUMN_NAME_INLINE {
+        len as u64
+    } else {
+        0
+    }
+}
+
+/// The value of column `var.property` in `row`, by one keyed lookup. A name
+/// the stack holds is assembled there; a longer one allocates
+/// [`column_lookup_bytes`] for the lookup's length.
 pub fn property<'r>(row: &'r Row, var: &str, property: &str) -> Option<&'r Value> {
     let len = var.len() + 1 + property.len();
     if len > COLUMN_NAME_INLINE {
-        return row.get(&format!("{var}.{property}"));
+        return row.get(column_name(var, property).as_str());
     }
     let mut name = [0u8; COLUMN_NAME_INLINE];
     name[..var.len()].copy_from_slice(var.as_bytes());
@@ -138,13 +151,44 @@ pub fn push_charged<T>(
     item: T,
     charge: &mut coordinode_core::budget::MemoryCharge<'_>,
 ) -> Result<(), coordinode_core::budget::BudgetStop> {
+    reserve_one_charged(items, charge)?;
+    items.push(item);
+    Ok(())
+}
+
+/// Makes room in `items` for one more item, charging `charge` before the
+/// room is allocated: a full list doubles (at least four slots).
+pub fn reserve_one_charged<T>(
+    items: &mut Vec<T>,
+    charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+) -> Result<(), coordinode_core::budget::BudgetStop> {
     if items.len() == items.capacity() {
         let grow = items.capacity().max(4);
         charge.grow((grow * core::mem::size_of::<T>()) as u64)?;
         items.reserve_exact(grow);
     }
-    items.push(item);
     Ok(())
+}
+
+/// The column `variable.name`, holding exactly its bytes, so that
+/// [`column_entry_bytes`] is what a row keeping it holds for its key.
+pub fn column_name(variable: &str, name: &str) -> String {
+    let mut column = String::with_capacity(variable.len() + 1 + name.len());
+    column.push_str(variable);
+    column.push('.');
+    column.push_str(name);
+    column
+}
+
+/// What [`row_held_bytes`] counts for the key of an entry under
+/// [`column_name`]`(variable, name)`, known before the key is made.
+pub fn column_entry_bytes(variable: &str, name: &str) -> u64 {
+    key_entry_bytes(variable.len() + 1 + name.len())
+}
+
+/// What [`row_held_bytes`] counts for an entry's key of exactly `len` bytes.
+pub fn key_entry_bytes(len: usize) -> u64 {
+    (core::mem::size_of::<String>() + core::mem::size_of::<usize>() + len) as u64
 }
 
 #[cfg(test)]

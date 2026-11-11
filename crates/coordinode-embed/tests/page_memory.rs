@@ -37,6 +37,38 @@ fn allocated_by<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (value, stats.bytes_allocated + grown)
 }
 
+/// A row's column is found by one keyed lookup: a short name allocates
+/// nothing, a long one no more than [`column_lookup_bytes`] says, which a
+/// charged reader reserves first, however wide the row and whether or not
+/// the column is there.
+#[test]
+fn a_column_lookup_allocates_what_it_is_charged() {
+    use coordinode_query::executor::row::{Row, column_lookup_bytes, property};
+    let long = "a".repeat(64 << 10);
+    let mut row = Row::new();
+    row.insert("n".to_string(), Value::Int(1));
+    for i in 0..20_000 {
+        row.insert(format!("n.c{i}"), Value::Int(i));
+    }
+    row.insert(format!("n.{long}"), Value::Int(3));
+    row.insert("n.b".to_string(), Value::Int(4));
+    for (name, expected) in [
+        (long.as_str(), Some(&Value::Int(3))),
+        (&long[1..], None),
+        ("b", Some(&Value::Int(4))),
+        ("x", None),
+    ] {
+        let (found, allocated) = least_allocated_by(|| property(&row, "n", name));
+        assert_eq!(found, expected, "{}", name.len());
+        assert!(
+            allocated as u64 <= column_lookup_bytes("n", name),
+            "a name of {} bytes allocated {allocated}",
+            name.len()
+        );
+    }
+    assert_eq!(column_lookup_bytes("n", "b"), 0);
+}
+
 /// What `f` returns, and the fewest bytes allocated over a few calls of it:
 /// the count is the whole process's, so a thread of the harness or a one-off
 /// initialization can land in one call; what `f` itself allocates lands in
@@ -162,6 +194,117 @@ fn a_vector_index_read_refuses_candidates_before_reading_them_all() {
     );
 }
 
+/// A temporal node an index finds resolves to its state from its versions,
+/// each charged before it is decoded. A 4 MiB version against 6 MiB of
+/// statement memory: the row the scan hands over fits, the row with the
+/// version's decode does not, so the read is refused with nothing past the
+/// tree's own read allocated. Decoding the version and charging it
+/// afterwards would allocate it whole first.
+#[test]
+fn a_temporal_index_read_refuses_a_version_before_decoding_it() {
+    let mut db = coordinode_embed::Database::open_in_memory().unwrap();
+    for ddl in [
+        "CREATE NODE TYPE Emp TEMPORAL WITH \
+         (name: STRING, tag: STRING, valid_from: INT, valid_to: INT)",
+        "CREATE INDEX emp_tag ON :Emp(tag)",
+    ] {
+        db.execute_cypher(ddl).unwrap();
+    }
+    let body = "b".repeat(4 << 20);
+    db.execute_cypher(&format!(
+        "CREATE (:Emp {{name: '{body}', tag: 'find', valid_from: 0}})"
+    ))
+    .unwrap();
+    let query = "MATCH (n:Emp {tag: 'find'}) RETURN n.tag AS tag";
+    assert!(db.explain_cypher(query).unwrap().contains("IndexScan"));
+    db.set_query_memory_limit(6 << 20).unwrap();
+
+    // What the tree's own read of the node rows allocates, decoding nothing:
+    // the lower read, which hands each value over as it holds it.
+    let snapshot = db.engine().snapshot();
+    let ((), lower) = least_allocated_by(|| {
+        for guard in db
+            .engine()
+            .snapshot_prefix_iter(
+                &snapshot,
+                Partition::Node,
+                coordinode_core::graph::node::NODE_KEY_PREFIX,
+            )
+            .unwrap()
+        {
+            drop(guard.into_inner().unwrap());
+        }
+    });
+    // The statement's first run compiles and keeps its plan; the read is
+    // measured on the next.
+    let _ = db.execute_cypher(query);
+
+    let (refused, allocated) = allocated_by(|| db.execute_cypher(query));
+
+    assert!(
+        matches!(refused, Err(coordinode_embed::DatabaseError::Budget(_))),
+        "{:?}",
+        refused.map(|rows| rows.len())
+    );
+    assert!(
+        allocated < lower + BESIDE_THE_ROWS,
+        "the version was decoded past the budget: {allocated} bytes allocated, \
+         {lower} by the tree's read"
+    );
+}
+
+/// A database holding one temporal `Emp` node, tagged `src`, whose name is
+/// 4 MiB long; its id. Statements run against 10 MiB.
+fn one_large_temporal_node() -> (coordinode_embed::Database, i64) {
+    let mut db = coordinode_embed::Database::open_in_memory().unwrap();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH \
+         (name: STRING, tag: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .unwrap();
+    let body = "b".repeat(4 << 20);
+    let rows = db
+        .execute_cypher(&format!(
+            "CREATE (e:Emp {{name: '{body}', tag: 'src', valid_from: 0}}) RETURN id(e) AS id"
+        ))
+        .unwrap();
+    let id = rows[0]
+        .get("id")
+        .and_then(|value| match value {
+            Value::Int(id) => Some(*id),
+            _ => None,
+        })
+        .expect("the node's id");
+    // Reading the state peaks near 8.4 MiB (the scanned row beside the
+    // decode's bound): against 10 MiB a statement reading only the tag fits.
+    db.set_query_memory_limit(10 << 20).unwrap();
+    (db, id)
+}
+
+/// A node read by its id holds the row it hands on for the statement: the
+/// row a temporal node's state builds carries its 4 MiB name, and a
+/// projection keeping two more copies of the name beside that row does not
+/// fit 10 MiB, so the read is refused, and the next statement runs with the
+/// whole budget again. A row left unpaid would let the projection fit.
+#[test]
+fn a_node_read_by_id_holds_its_row_for_the_statement() {
+    let (mut db, id) = one_large_temporal_node();
+    let read = db.execute_cypher(&format!(
+        "MATCH (e:Emp) WHERE id(e) = {id} RETURN e.name AS n, e.name AS m"
+    ));
+    assert!(
+        matches!(read, Err(coordinode_embed::DatabaseError::Budget(_))),
+        "{:?}",
+        read.map(|rows| rows.len())
+    );
+    let tag = db
+        .execute_cypher(&format!(
+            "MATCH (e:Emp) WHERE id(e) = {id} RETURN e.tag AS t"
+        ))
+        .expect("the budget is whole again");
+    assert_eq!(tag[0].get("t"), Some(&Value::String("src".into())));
+}
+
 /// Every byte a fitting page keeps is charged before it is taken: the read
 /// allocates no more than it charged and the reading itself, the rows,
 /// their list and the cursor included.
@@ -273,6 +416,367 @@ fn the_projection_bound_covers_its_decode() {
             drop(decoded);
         }
     }
+}
+
+/// The bound charged before decoding a whole record covers every byte the
+/// decode allocates, its labels and every property included, for the same
+/// shapes as a projection, with several labels and an overflow map. No
+/// engine runs here, so every allocation counted is the decode's.
+#[test]
+fn the_record_bound_covers_its_decode() {
+    let mut map = BTreeMap::new();
+    map.insert("k".to_string(), Value::Int(1));
+    let mut wide = BTreeMap::new();
+    for n in 0..40 {
+        wide.insert(format!("key{n}"), Value::String("v".repeat(n)));
+    }
+    let shapes = [
+        Value::Int(7),
+        Value::String("t".repeat(1000)),
+        Value::Array((0..200i64).map(Value::Int).collect()),
+        Value::Array(vec![Value::Array(vec![Value::Map(map.clone()); 3]); 5]),
+        Value::Map(map),
+        Value::Map(wide),
+        Value::Vector(vec![0.5; 384]),
+        Value::Blob(vec![9; 4096]),
+    ];
+    for (n, shape) in shapes.into_iter().enumerate() {
+        for extra_too in [false, true] {
+            let mut props = HashMap::new();
+            for field in 0..17u32 {
+                props.insert(field, shape.clone());
+            }
+            let extra = extra_too.then(|| {
+                (0..9)
+                    .map(|k| (format!("loose{k}"), shape.clone()))
+                    .collect::<HashMap<_, _>>()
+            });
+            let record = NodeRecord {
+                labels: (1..=5).map(|l| LabelId::new(l).unwrap()).collect(),
+                props,
+                extra,
+            };
+            assert_record_bound(&record, &format!("shape {n}, extra {extra_too}"));
+        }
+    }
+    // Small and edge records: no labels or one, no properties or one, empty
+    // and one-element containers, a one-entry overflow map.
+    let mut one = BTreeMap::new();
+    one.insert("k".to_string(), Value::Null);
+    let small = [
+        Value::Null,
+        Value::Bool(true),
+        Value::String(String::new()),
+        Value::Array(Vec::new()),
+        Value::Array(vec![Value::Int(1)]),
+        Value::Map(BTreeMap::new()),
+        Value::Map(one),
+        Value::Vector(Vec::new()),
+        Value::Blob(Vec::new()),
+    ];
+    for labels in [0, 1] {
+        let bare = NodeRecord {
+            labels: (1..=labels).map(|l| LabelId::new(l).unwrap()).collect(),
+            props: HashMap::new(),
+            extra: None,
+        };
+        assert_record_bound(&bare, &format!("{labels} labels, no properties"));
+        for (n, value) in small.iter().enumerate() {
+            let mut record = bare.clone();
+            record.set(1, value.clone());
+            assert_record_bound(&record, &format!("{labels} labels, small {n}"));
+            let mut loose = bare.clone();
+            loose.set_extra("x", value.clone());
+            assert_record_bound(&loose, &format!("{labels} labels, loose small {n}"));
+        }
+    }
+}
+
+/// The decode bound of `record`'s encoding covers what decoding it
+/// allocates and what the decoded record holds past its own struct.
+fn assert_record_bound(record: &NodeRecord, what: &str) {
+    let bytes = encode(record);
+    let bound = NodeRecord::decode_bound(&bytes).unwrap();
+    let (decoded, allocated) = allocated_by(|| NodeRecord::from_msgpack(&bytes).unwrap());
+    assert!(
+        allocated <= bound,
+        "{what}: {allocated} allocated, {bound} bound"
+    );
+    let held = decoded.held_bytes() as usize - core::mem::size_of::<NodeRecord>();
+    assert!(held <= bound, "{what}: holds {held}, {bound} bound");
+    assert_eq!(&decoded, record, "{what}");
+}
+
+/// A record of label 1 whose one string property is `bytes` long, with a
+/// nested list of maps beside it, so a decode expands it.
+fn sized_record(bytes: usize) -> NodeRecord {
+    let mut map = BTreeMap::new();
+    map.insert("k".to_string(), Value::Int(1));
+    let mut record = NodeRecord::new(LabelId::new(1).unwrap());
+    record.set(1, Value::String("x".repeat(bytes)));
+    record.set(2, Value::Array(vec![Value::Map(map); 8]));
+    record
+}
+
+/// Store node `id` of shard 0 as `record`, committed in its own transaction.
+fn store_node(engine: &StorageEngine, oracle: &TimestampOracle, id: u64, record: &NodeRecord) {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let mut txn = Transaction::begin(engine, Some(oracle), oracle.next());
+    LocalNodeStore
+        .put(&mut txn, 0, NodeId::from_raw(id), record)
+        .unwrap();
+    let write_concern = coordinode_core::txn::write_concern::WriteConcern::majority();
+    txn.commit(&coordinode_storage::engine::transaction::CommitContext {
+        write_concern: &write_concern,
+        pipeline: None,
+        id_gen: None,
+    })
+    .unwrap();
+}
+
+/// What a batch read under a budget holds: the room its list allocated,
+/// `capacity` slots, and each record's heap.
+fn held_by(records: &[Option<NodeRecord>], capacity: usize) -> u64 {
+    (capacity * core::mem::size_of::<Option<NodeRecord>>()) as u64
+        + records
+            .iter()
+            .flatten()
+            .map(|r| r.held_bytes() - core::mem::size_of::<NodeRecord>() as u64)
+            .sum::<u64>()
+}
+
+/// A batch read under a budget answers as the unmetered one does, through a
+/// snapshot and without one: a record per id in the ids' order, `None` for
+/// an id with no record, a repeated id's record twice. Its charge pays for
+/// what it returns, list and records, and goes back when dropped.
+#[test]
+fn a_charged_batch_read_returns_what_the_unmetered_one_does() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let (engine, oracle, _dir) = engine();
+    for id in 1..=6 {
+        store_node(&engine, &oracle, id, &sized_record(1000 * id as usize));
+    }
+    // A missing id, a repeated one, out of order.
+    let ids: Vec<NodeId> = [3, 9, 1, 3, 6, 2]
+        .into_iter()
+        .map(NodeId::from_raw)
+        .collect();
+    let snapshot = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    let latest = Transaction::new(&engine, None, Timestamp::from_raw(engine.snapshot()), None);
+    for txn in [&snapshot, &latest] {
+        let unmetered = LocalNodeStore.get_many(txn, 0, &ids).unwrap();
+        let budget = QueryBudget::new(64 << 20);
+        let (records, charge) = LocalNodeStore
+            .get_many_charged(txn, 0, &ids, &budget)
+            .unwrap();
+        assert_eq!(records, unmetered);
+        assert_eq!(records[1], None, "no record for the missing id");
+        assert_eq!(records[0], records[3], "the repeated id read twice");
+        assert_eq!(
+            charge.bytes(),
+            held_by(&records, records.capacity()),
+            "it pays for what it returns"
+        );
+        assert_eq!(budget.memory_used(), charge.bytes());
+        drop(charge);
+        assert_eq!(
+            budget.memory_used(),
+            0,
+            "the charge goes back with its records"
+        );
+    }
+}
+
+/// The list a batch read returns is paid for as allocated, an empty input,
+/// small ones and ones whose ids have no record included: a list of none,
+/// one, two or three slots holds room for exactly those, so its charge is
+/// what it holds.
+#[test]
+fn a_small_or_empty_batch_pays_for_the_room_its_list_holds() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let (engine, oracle, _dir) = engine();
+    store_node(&engine, &oracle, 1, &sized_record(100));
+    let txn = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    for ids in [Vec::new(), vec![1u64], vec![1, 7], vec![7, 8, 9], vec![7]] {
+        let ids: Vec<NodeId> = ids.into_iter().map(NodeId::from_raw).collect();
+        let budget = QueryBudget::new(1 << 20);
+        let (records, charge) = LocalNodeStore
+            .get_many_charged(&txn, 0, &ids, &budget)
+            .unwrap();
+        assert_eq!(
+            records.capacity(),
+            ids.len(),
+            "{ids:?}: room for exactly them"
+        );
+        assert_eq!(
+            charge.bytes(),
+            held_by(&records, records.capacity()),
+            "{ids:?}"
+        );
+    }
+}
+
+/// What a batch read keeps aside for its keys is charged before it exists:
+/// twenty thousand ids with no record allocate no more than the budget's
+/// peak beside what the tree's own batched read allocates for them. The
+/// keys, their views and the read's lists of misses taken unpaid would pass
+/// the peak by more than a megabyte.
+#[test]
+fn a_batch_read_charges_what_it_keeps_aside_for_its_keys() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let (engine, oracle, _dir) = engine();
+    store_node(&engine, &oracle, 1, &sized_record(100));
+    let ids: Vec<NodeId> = (1_000..21_000).map(NodeId::from_raw).collect();
+    let snapshot = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    let latest = Transaction::new(&engine, None, Timestamp::from_raw(engine.snapshot()), None);
+    // What the tree's own batched read allocates for these keys, measured
+    // through the engine's snapshot read, which keeps nothing aside of its
+    // own outside the index partition: the tree's per-key state and its
+    // list of results, the lower read's to account for.
+    let keys: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|id| LocalNodeStore::record_key(0, *id))
+        .collect();
+    let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    let snap = engine.snapshot();
+    let ((), tree_read) = least_allocated_by(|| {
+        engine
+            .snapshot_multi_get_each(&snap, Partition::Node, &refs, None, |_, _| {
+                Ok::<(), StorageError>(())
+            })
+            .unwrap();
+    });
+    for txn in [&snapshot, &latest] {
+        let budget = QueryBudget::new(64 << 20);
+        let (read, allocated) = least_allocated_by(|| {
+            LocalNodeStore
+                .get_many_charged(txn, 0, &ids, &budget)
+                .map(|(records, _)| records.len())
+        });
+        assert_eq!(read.unwrap(), ids.len());
+        let peak = budget.memory_peak() as usize;
+        assert!(
+            allocated <= peak + tree_read + BESIDE_THE_ROWS,
+            "{allocated} allocated, {peak} charged at most, {tree_read} by the tree's read"
+        );
+    }
+}
+
+/// A batch read sees what its own transaction wrote and deleted, as the
+/// unmetered read does.
+#[test]
+fn a_charged_batch_read_sees_its_own_writes() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let (engine, oracle, _dir) = engine();
+    for id in 1..=3 {
+        store_node(&engine, &oracle, id, &sized_record(500));
+    }
+    let mut txn = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    let written = sized_record(2000);
+    LocalNodeStore
+        .put(&mut txn, 0, NodeId::from_raw(2), &written)
+        .unwrap();
+    LocalNodeStore
+        .delete(&mut txn, 0, NodeId::from_raw(3))
+        .unwrap();
+    let ids: Vec<NodeId> = (1..=3).map(NodeId::from_raw).collect();
+    let budget = QueryBudget::new(64 << 20);
+    let (records, _charge) = LocalNodeStore
+        .get_many_charged(&txn, 0, &ids, &budget)
+        .unwrap();
+    assert_eq!(records[0], Some(sized_record(500)));
+    assert_eq!(records[1], Some(written), "its own write");
+    assert_eq!(records[2], None, "its own delete");
+    assert_eq!(records, LocalNodeStore.get_many(&txn, 0, &ids).unwrap());
+}
+
+/// A record whose decode does not fit the budget is refused before it is
+/// copied or decoded: a 4 MiB record read from the memtable against 16 KiB
+/// of budget allocates nothing near the record, and the budget is left as it
+/// was. Copying it out and charging after the decode would allocate it
+/// twice over first.
+#[test]
+fn a_record_past_the_budget_is_refused_before_it_is_decoded() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let (engine, oracle, _dir) = engine();
+    store_node(&engine, &oracle, 1, &sized_record(4 << 20));
+    let txn = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    let budget = QueryBudget::new(16 * 1024);
+    let ids = [NodeId::from_raw(1)];
+    let (refused, allocated) = allocated_by(|| {
+        LocalNodeStore
+            .get_many_charged(&txn, 0, &ids, &budget)
+            .map(|_| ())
+    });
+    assert!(
+        matches!(refused, Err(coordinode_modality::StoreError::Budget(_))),
+        "{refused:?}"
+    );
+    assert!(
+        allocated < BESIDE_THE_ROWS,
+        "the refused record was copied or decoded: {allocated} bytes allocated"
+    );
+    assert_eq!(budget.memory_used(), 0, "nothing stays charged");
+    assert!(budget.memory_peak() <= budget.memory_limit());
+}
+
+/// A refusal in the middle of a batch gives back every charge the batch
+/// took: forty 16 KiB records against room for a few of them stop the read
+/// with the budget's refusal, the budget never holds past its limit, and
+/// nothing stays charged once the read returns.
+#[test]
+fn a_refusal_inside_a_batch_gives_back_every_charge() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let (engine, oracle, _dir) = engine();
+    for id in 1..=40 {
+        store_node(&engine, &oracle, id, &sized_record(16 << 10));
+    }
+    let txn = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    let budget = QueryBudget::new(128 * 1024);
+    let ids: Vec<NodeId> = (1..=40).map(NodeId::from_raw).collect();
+    let refused = LocalNodeStore.get_many_charged(&txn, 0, &ids, &budget);
+    assert!(
+        matches!(refused, Err(coordinode_modality::StoreError::Budget(_))),
+        "{:?}",
+        refused.map(|(records, _)| records.len())
+    );
+    assert!(budget.memory_peak() <= budget.memory_limit());
+    assert!(
+        budget.memory_peak() > 64 * 1024,
+        "some records were read first"
+    );
+    assert_eq!(budget.memory_used(), 0, "every charge went back");
 }
 
 /// The combinations of a compound key over two lists are refused before

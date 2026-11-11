@@ -91,6 +91,11 @@ pub enum ExecutionError {
     #[error("{0}")]
     Budget(#[from] coordinode_core::budget::BudgetStop),
 
+    /// The memory a read kept could not move its charge to its new owner:
+    /// an inconsistency in the executor's accounting. Nothing was answered.
+    #[error("{0}")]
+    ChargeTransfer(#[from] coordinode_core::budget::TransferRefused),
+
     /// An index cannot answer (its entries are not proved complete), and the
     /// read of the label's records that would answer instead leads on into
     /// `operator`, which works outside the statement's budget. Refused
@@ -4429,18 +4434,30 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// The state of temporal node `node_id`'s timeline at `at`, read from all
-    /// of its versions under the statement's snapshot (OCC-tracked).
-    pub(crate) fn temporal_node_state(
+    /// of its versions under the statement's snapshot (OCC-tracked), with the
+    /// charge of the record it returns, on `budget`, the statement's: every
+    /// version read is charged before it is decoded and its list before it
+    /// grows, and once the state is chosen the versions not chosen go with
+    /// their charge, the chosen record's staying with the returned one for as
+    /// long as the caller holds it.
+    pub(crate) fn temporal_node_state_charged<'b>(
         &mut self,
         node_id: NodeId,
         at: i64,
-    ) -> Result<crate::executor::temporal_read::StateAt, ExecutionError> {
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> Result<
+        (
+            crate::executor::temporal_read::StateAt,
+            coordinode_core::budget::MemoryCharge<'b>,
+        ),
+        ExecutionError,
+    > {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
         self.sync_txn_state();
         let fields = self.timeline_fields();
         // The node's history is held, and charged, only while its state at
         // `at` is chosen from it.
-        let mut held = self.budget.empty_charge();
+        let mut held = budget.empty_charge();
         let mut versions: Vec<(i64, NodeRecord)> = Vec::new();
         if let Some(known_at) = self.history_at {
             LocalNodeStore::versions_known_at(
@@ -4449,30 +4466,23 @@ impl<'a> ExecutionContext<'a> {
                 node_id,
                 known_at,
                 &self.budget,
-                |valid_from, _, record| {
-                    let record = decode_version(record)?;
-                    held.grow(record.held_bytes())?;
-                    versions.push((valid_from, record));
-                    Ok::<(), ExecutionError>(())
-                },
+                |valid_from, _, record| push_version(&mut versions, &mut held, valid_from, record),
             )?;
-            return Ok(crate::executor::temporal_read::state_at(
-                versions, at, fields,
-            ));
+        } else {
+            let prefix = LocalNodeStore.version_prefix(self.shard_id, node_id);
+            LocalNodeStore.prefix_for_each(&self.txn, &prefix, &self.budget, |key, value| {
+                let Some((_, _, valid_from)) = decode_temporal_node_key(key) else {
+                    return Ok(());
+                };
+                push_version(&mut versions, &mut held, valid_from, value)
+            })?;
         }
-        let prefix = LocalNodeStore.version_prefix(self.shard_id, node_id);
-        LocalNodeStore.prefix_for_each(&self.txn, &prefix, &self.budget, |key, value| {
-            let Some((_, _, valid_from)) = decode_temporal_node_key(key) else {
-                return Ok(());
-            };
-            let record = decode_version(value)?;
-            held.grow(record.held_bytes())?;
-            versions.push((valid_from, record));
-            Ok::<(), ExecutionError>(())
-        })?;
-        Ok(crate::executor::temporal_read::state_at(
-            versions, at, fields,
-        ))
+        let state = crate::executor::temporal_read::state_at(versions, at, fields);
+        let mut chosen = budget.empty_charge();
+        if let crate::executor::temporal_read::StateAt::Positive { record, .. } = &state {
+            held.transfer(record.held_bytes(), &mut chosen)?;
+        }
+        Ok((state, chosen))
     }
 
     /// MVCC-aware typed write of a temporal node version.
@@ -8414,9 +8424,14 @@ impl<'s, 'b> NodeScanFold<'s, 'b> {
         if !carries_all(&record, self.labels, env.labels.implied()) {
             return Ok(());
         }
-        if let Some(row) =
-            node_row_from(self.variable, node_id, &record, self.property_filters, env)?
-        {
+        if let Some(row) = node_row_from(
+            self.variable,
+            node_id,
+            &record,
+            self.property_filters,
+            env,
+            &mut self.kept,
+        )? {
             self.keep(row)?;
         }
         Ok(())
@@ -8435,6 +8450,7 @@ impl<'s, 'b> NodeScanFold<'s, 'b> {
         self.passing
     }
 
+    /// Keep `row`, already charged to `kept` as it was built.
     fn keep(&mut self, row: Row) -> Result<(), ExecutionError> {
         if self.residual.iter().all(|predicate| {
             crate::executor::eval_neutral::eval_neutral(predicate, &row)
@@ -8442,8 +8458,7 @@ impl<'s, 'b> NodeScanFold<'s, 'b> {
         }) {
             self.passing += 1;
         }
-        self.kept.grow(crate::executor::row::row_held_bytes(&row))?;
-        self.results.push(row);
+        crate::executor::row::push_charged(&mut self.results, row, &mut self.kept)?;
         Ok(())
     }
 
@@ -8466,6 +8481,7 @@ impl<'s, 'b> NodeScanFold<'s, 'b> {
                     &record,
                     self.property_filters,
                     &NodeRowEnv::of(ctx),
+                    &mut self.kept,
                 )?
             } else {
                 None
@@ -8473,7 +8489,7 @@ impl<'s, 'b> NodeScanFold<'s, 'b> {
             drop(record);
             self.kept.shrink(bytes);
             if let Some(row) = row {
-                self.kept.grow(crate::executor::row::row_held_bytes(&row))?;
+                crate::executor::row::reserve_one_charged(&mut self.results, &mut self.kept)?;
                 self.results.insert(position, row);
             }
         }
@@ -8509,6 +8525,59 @@ fn named_instants(predicate: &crate::plan::expr::Expr, out: &mut Vec<(String, i6
 }
 
 /// The record one stored version of a temporal node holds.
+/// Keep `record` of node `id`, read under `read`, in `list` under `kept`:
+/// the list's growth is charged before it grows, by as many slots as it
+/// holds and at least four, which pays for the record's struct, and the
+/// record's heap moves from `read`, paid once.
+fn keep_record<'b>(
+    list: &mut Vec<(u64, NodeRecord)>,
+    kept: &mut coordinode_core::budget::MemoryCharge<'b>,
+    read: &mut coordinode_core::budget::MemoryCharge<'b>,
+    id: u64,
+    record: NodeRecord,
+) -> Result<(), ExecutionError> {
+    if list.len() == list.capacity() {
+        let more = list.len().max(4);
+        kept.grow(list_bytes::<(u64, NodeRecord)>(more))?;
+        list.reserve_exact(more);
+    }
+    read.transfer(
+        record.held_bytes() - core::mem::size_of::<NodeRecord>() as u64,
+        kept,
+    )?;
+    list.push((id, record));
+    Ok(())
+}
+
+/// Append the temporal version `bytes`, starting at `valid_from`, to
+/// `versions` under `held`: the list's growth is charged before it grows, by
+/// as many slots as it holds and at least four, and the record its decode's
+/// bound before it is decoded, then what it holds.
+fn push_version(
+    versions: &mut Vec<(i64, NodeRecord)>,
+    held: &mut coordinode_core::budget::MemoryCharge<'_>,
+    valid_from: i64,
+    bytes: &[u8],
+) -> Result<(), ExecutionError> {
+    if versions.len() == versions.capacity() {
+        let more = versions.len().max(4);
+        held.grow(list_bytes::<(i64, NodeRecord)>(more))?;
+        versions.reserve_exact(more);
+    }
+    let record = coordinode_modality::LocalNodeStore::decode_record_charged(bytes, held).map_err(
+        |e| match e {
+            coordinode_modality::StoreError::Decode { message, .. } => {
+                ExecutionError::Serialization(format!(
+                    "temporal node deserialization error: {message}"
+                ))
+            }
+            other => other.into(),
+        },
+    )?;
+    versions.push((valid_from, record));
+    Ok(())
+}
+
 fn decode_version(bytes: &[u8]) -> Result<NodeRecord, ExecutionError> {
     NodeRecord::from_msgpack(bytes).map_err(|e| {
         ExecutionError::Serialization(format!("temporal node deserialization error: {e}"))
@@ -8539,15 +8608,19 @@ fn write_label_columns(
     record: &NodeRecord,
     view: &coordinode_core::schema::labels::LabelView,
 ) -> String {
+    use crate::executor::row::column_name;
     let name_of = |id: LabelId| view.name(id).unwrap_or_default();
     let primary = record.primary_label().map_or("", name_of).to_string();
-    row.insert(format!("{var}.__label__"), Value::String(primary.clone()));
+    row.insert(
+        column_name(var, "__label__"),
+        Value::String(primary.clone()),
+    );
     let membership = bound_membership(view.implied(), record);
     if membership.len() > 1 {
         let mut others: Vec<&str> = membership.iter().skip(1).map(name_of).collect();
         others.sort_unstable();
         row.insert(
-            format!("{var}.__labels__"),
+            column_name(var, "__labels__"),
             Value::Array(
                 core::iter::once(primary.as_str())
                     .chain(others)
@@ -8557,6 +8630,36 @@ fn write_label_columns(
         );
     }
     primary
+}
+
+/// What [`write_label_columns`] makes for `record` under `view`, known
+/// before it is made: the columns a row keeps, as [`row_held_bytes`] counts
+/// them, and the name and list it builds them from.
+///
+/// [`row_held_bytes`]: crate::executor::row::row_held_bytes
+fn label_columns_bytes(
+    var: &str,
+    record: &NodeRecord,
+    view: &coordinode_core::schema::labels::LabelView,
+) -> u64 {
+    use crate::executor::row::column_entry_bytes;
+    const VALUE: u64 = core::mem::size_of::<Value>() as u64;
+    let name_len = |id: LabelId| view.name(id).map_or(0, str::len) as u64;
+    let primary = record.primary_label().map_or(0, name_len);
+    // The column's value and the name it is copied from.
+    let mut bytes = column_entry_bytes(var, "__label__") + VALUE + 2 * primary;
+    let membership = bound_membership(view.implied(), record);
+    if membership.len() > 1 {
+        let names: u64 = membership.iter().map(name_len).sum();
+        // The list of every name, and the list of the other names it is
+        // sorted from.
+        bytes += column_entry_bytes(var, "__labels__")
+            + VALUE
+            + membership.len() as u64 * VALUE
+            + names
+            + (membership.len() as u64 - 1) * core::mem::size_of::<&str>() as u64;
+    }
+    bytes
 }
 
 /// The membership of `record` under `implied`, which the caller compiled
@@ -8625,7 +8728,8 @@ fn carries_all(
 }
 
 /// The row a node scan produces for `record`, or `None` when the record
-/// lacks one of `labels` or fails one of the inline `property_filters`.
+/// lacks one of `labels` or fails one of the inline `property_filters`. The
+/// row is charged to `charge` as [`node_row_from`] charges it.
 fn node_row_if_matching(
     variable: &str,
     labels: &[LabelId],
@@ -8633,6 +8737,7 @@ fn node_row_if_matching(
     record: &NodeRecord,
     property_filters: &[(String, crate::plan::expr::Expr)],
     ctx: &mut ExecutionContext<'_>,
+    charge: &mut coordinode_core::budget::MemoryCharge<'_>,
 ) -> Result<Option<Row>, ExecutionError> {
     if !has_all_labels(record, labels, ctx)? {
         return Ok(None);
@@ -8644,6 +8749,7 @@ fn node_row_if_matching(
         record,
         property_filters,
         &NodeRowEnv::of(ctx),
+        charge,
     )
 }
 
@@ -8713,15 +8819,79 @@ impl<'e> NodeRowEnv<'e> {
 
 /// [`node_row_if_matching`] for a record that carries every label of the
 /// pattern and whose primary label's schema `env` holds.
+///
+/// Every entry of the row, and the copies the inline filters are evaluated
+/// against, is charged to `charge` before it is made. A row returned leaves
+/// exactly what it holds charged; a row the filters reject, or a failure,
+/// leaves nothing.
 fn node_row_from(
     variable: &str,
     node_id: u64,
     record: &NodeRecord,
     property_filters: &[(String, crate::plan::expr::Expr)],
     env: &NodeRowEnv<'_>,
+    charge: &mut coordinode_core::budget::MemoryCharge<'_>,
 ) -> Result<Option<Row>, ExecutionError> {
+    use coordinode_modality::StoreError;
+    let before = charge.bytes();
+    let built = build_node_row(variable, node_id, record, property_filters, env, charge);
+    // The build gives back only what it charged itself.
+    let charged = charge.bytes() - before;
+    let row = match built {
+        Ok(Some(row)) => row,
+        other => {
+            charge.shrink(charged);
+            return other;
+        }
+    };
+    // Charged as an upper bound: an entry a later one replaced, the spare
+    // room of a copied value and the names the label columns were built
+    // from are not held.
+    let held = crate::executor::row::row_held_bytes(&row);
+    if held > charged {
+        charge.shrink(charged);
+        return Err(StoreError::Invariant(format!(
+            "a row of {variable} holds {held} bytes, more than the {charged} charged while it \
+             was built"
+        ))
+        .into());
+    }
+    charge.shrink(charged - held);
+    Ok(Some(row))
+}
+
+/// Insert a copy of `value` under the column `variable.name`, the entry
+/// charged to `charge` before its key or its value is made.
+fn insert_charged(
+    row: &mut Row,
+    variable: &str,
+    name: &str,
+    value: &Value,
+    charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+) -> Result<(), ExecutionError> {
+    use crate::executor::row::{column_entry_bytes, column_name};
+    charge.grow(column_entry_bytes(variable, name) + value.held_bytes())?;
+    row.insert(column_name(variable, name), value.clone());
+    Ok(())
+}
+
+/// The body of [`node_row_from`]: what it charges stays charged, the copies
+/// evaluated against aside.
+fn build_node_row(
+    variable: &str,
+    node_id: u64,
+    record: &NodeRecord,
+    property_filters: &[(String, crate::plan::expr::Expr)],
+    env: &NodeRowEnv<'_>,
+    charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+) -> Result<Option<Row>, ExecutionError> {
+    use crate::executor::row::key_entry_bytes;
+    let id = Value::Int(node_id as i64);
+    charge.grow(
+        core::mem::size_of::<Row>() as u64 + key_entry_bytes(variable.len()) + id.held_bytes(),
+    )?;
     let mut row = Row::new();
-    row.insert(variable.to_string(), Value::Int(node_id as i64));
+    row.insert(variable.to_string(), id);
     let schema = env.schema_of(record);
     // Only the properties the statement reads, unless a computed property,
     // whose expression may read any other, is declared.
@@ -8738,48 +8908,159 @@ fn node_row_from(
                     .and_then(|id| record.props.get(&id))
                     .or_else(|| record.get_extra(name));
                 if let Some(value) = value {
-                    row.insert(format!("{variable}.{name}"), value.clone());
+                    insert_charged(&mut row, variable, name, value, charge)?;
                 }
             }
         }
         None => {
             for (field_id, value) in &record.props {
                 if let Some(field_name) = env.interner.resolve(*field_id) {
-                    row.insert(format!("{variable}.{field_name}"), value.clone());
+                    insert_charged(&mut row, variable, field_name, value, charge)?;
                 }
             }
             // Overflow properties (undeclared properties of a VALIDATED label).
             if let Some(extra) = &record.extra {
                 for (name, value) in extra {
-                    row.insert(format!("{variable}.{name}"), value.clone());
+                    insert_charged(&mut row, variable, name, value, charge)?;
                 }
             }
         }
     }
+    charge.grow(label_columns_bytes(variable, record, env.labels))?;
     write_label_columns(&mut row, variable, record, env.labels);
     if let Some(schema) = schema {
+        charge.grow(computed_columns_bytes(variable, schema))?;
         inject_computed_from_schema(&mut row, variable, schema, env.valid_now);
     }
 
     // Inline property filters. Inside a correlated join (e.g. `UNWIND ... AS
     // e MATCH (a {p: e.x})`) a filter value can reference outer bindings, so
     // it is evaluated against the correlated row extended with this node's:
-    // an inline `{p: e.x}` means the same as `WHERE a.p = e.x`.
+    // an inline `{p: e.x}` means the same as `WHERE a.p = e.x`. The filters
+    // are judged in their order: one naming a literal, a binding or a column
+    // compares with it in place; any other is evaluated over the extended
+    // row, built at the first filter that needs it and held, charged, until
+    // the filters are done.
+    let outer = env.correlated_row;
+    let mut extended: Option<Row> = None;
+    let mut copies = 0;
+    let mut matched = Ok(true);
     for (prop_name, filter_expr) in property_filters {
-        let expected = match env.correlated_row {
-            Some(corr) => {
-                let mut eval_row = corr.clone();
-                eval_row.extend(row.clone());
-                eval_neutral(filter_expr, &eval_row)?
+        // The column lookups of this filter, given back once it is judged.
+        let lookups = crate::executor::row::column_lookup_bytes(variable, prop_name)
+            + filter_lookup_bytes(filter_expr);
+        if let Err(stop) = charge.grow(lookups) {
+            matched = Err(stop.into());
+            break;
+        }
+        let judged = judge_filter(
+            variable,
+            prop_name,
+            filter_expr,
+            &row,
+            outer,
+            &mut extended,
+            &mut copies,
+            charge,
+        );
+        charge.shrink(lookups);
+        match judged {
+            Ok(true) => {}
+            other => {
+                matched = other;
+                break;
             }
-            None => eval_neutral(filter_expr, &row)?,
-        };
-        let actual = super::row::property(&row, variable, prop_name).unwrap_or(&Value::Null);
-        if *actual != expected {
-            return Ok(None);
         }
     }
-    Ok(Some(row))
+    drop(extended);
+    charge.shrink(copies);
+    Ok(matched?.then_some(row))
+}
+
+/// What the column lookups of `expr` allocate when it names a column:
+/// [`crate::executor::row::column_lookup_bytes`] of the node's and the outer
+/// row's lookup, made one after the other.
+fn filter_lookup_bytes(expr: &crate::plan::expr::Expr) -> u64 {
+    use crate::plan::expr::Expr as PExpr;
+    match expr {
+        PExpr::Property { base, key } => match base.as_ref() {
+            PExpr::Variable(var) => crate::executor::row::column_lookup_bytes(var, key),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// Whether `row` holds under `prop_name` the value of `filter_expr`: named
+/// in place, or evaluated over `row` extended over `outer`, which is built
+/// into `extended` the first time it is needed, its copies charged and
+/// added to `copies`.
+#[allow(clippy::too_many_arguments)]
+fn judge_filter(
+    variable: &str,
+    prop_name: &str,
+    filter_expr: &crate::plan::expr::Expr,
+    row: &Row,
+    outer: Option<&Row>,
+    extended: &mut Option<Row>,
+    copies: &mut u64,
+    charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+) -> Result<bool, ExecutionError> {
+    use crate::executor::row::row_held_bytes;
+    let actual = super::row::property(row, variable, prop_name).unwrap_or(&Value::Null);
+    if let Some(expected) = named_value(filter_expr, row, outer) {
+        return Ok(actual == expected);
+    }
+    let eval_row = match outer {
+        None => row,
+        Some(corr) => {
+            if extended.is_none() {
+                let bytes = row_held_bytes(corr) + row_held_bytes(row);
+                charge.grow(bytes)?;
+                *copies += bytes;
+                let mut built = corr.clone();
+                built.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
+                *extended = Some(built);
+            }
+            extended.as_ref().unwrap_or(row)
+        }
+    };
+    Ok(*actual == eval_neutral(filter_expr, eval_row)?)
+}
+
+/// The value a filter expression names without being evaluated, resolved in
+/// `row` extended over `outer` as the evaluator resolves it: a literal, a
+/// binding, or `var.key` as a column or a key of a map bound to `var`.
+/// `None` for any other expression, and for a key of a document, which is
+/// decoded to be read.
+fn named_value<'a>(
+    expr: &'a crate::plan::expr::Expr,
+    row: &'a Row,
+    outer: Option<&'a Row>,
+) -> Option<&'a Value> {
+    use crate::plan::expr::Expr as PExpr;
+    const NULL: &Value = &Value::Null;
+    let binding = |name: &str| row.get(name).or_else(|| outer?.get(name));
+    match expr {
+        PExpr::Literal(value) => Some(value),
+        PExpr::Variable(name) => Some(binding(name).unwrap_or(NULL)),
+        PExpr::Property { base, key } => {
+            let PExpr::Variable(var) = base.as_ref() else {
+                return None;
+            };
+            let column = super::row::property(row, var, key)
+                .or_else(|| super::row::property(outer?, var, key));
+            if column.is_some() {
+                return column;
+            }
+            match binding(var) {
+                Some(Value::Document(_)) => None,
+                Some(Value::Map(map)) => Some(map.get(key.as_str()).unwrap_or(NULL)),
+                _ => Some(NULL),
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Serve a scan of one row-stored table whose key columns `key_filters` all
@@ -8851,18 +9132,25 @@ fn scan_by_table_key(
     let Some(ids) = ctx.pattern_label_ids(labels)? else {
         return Ok(Some(Vec::new()));
     };
-    Ok(Some(
-        node_row_if_matching(
-            variable,
-            &ids,
-            node_id.as_raw(),
-            &record,
-            property_filters,
-            ctx,
-        )?
-        .into_iter()
-        .collect(),
-    ))
+    let budget = Arc::clone(&ctx.budget);
+    let mut kept = budget.empty_charge();
+    let Some(row) = node_row_if_matching(
+        variable,
+        &ids,
+        node_id.as_raw(),
+        &record,
+        property_filters,
+        ctx,
+        &mut kept,
+    )?
+    else {
+        return Ok(Some(Vec::new()));
+    };
+    kept.grow(list_bytes::<Row>(1))?;
+    let rows = vec![row];
+    // The row goes on to the plan's later stages, held for the statement.
+    kept.keep_until_query_ends();
+    Ok(Some(rows))
 }
 
 /// The table and key columns of the node `variable` binds in `row`, when it
@@ -9076,13 +9364,14 @@ fn scan_by_node_id(
         return Ok(Vec::new());
     };
     let node_id = NodeId::from_raw(raw);
-    let record = match ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-        Some(record) => Some(record),
+    let budget = Arc::clone(&ctx.budget);
+    // A temporal node's state stays charged while its row is built from it.
+    let (record, _state) = match ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+        Some(record) => (Some(record), None),
         None => {
             let at = ctx.instant_for(variable);
-            ctx.temporal_node_state(node_id, at)?
-                .positive()
-                .map(|(_, record)| record)
+            let (state, charge) = ctx.temporal_node_state_charged(node_id, at, &budget)?;
+            (state.positive().map(|(_, record)| record), Some(charge))
         }
     };
     let Some(record) = record else {
@@ -9091,11 +9380,24 @@ fn scan_by_node_id(
     let Some(ids) = ctx.pattern_label_ids(labels)? else {
         return Ok(Vec::new());
     };
-    Ok(
-        node_row_if_matching(variable, &ids, raw, &record, property_filters, ctx)?
-            .into_iter()
-            .collect(),
-    )
+    let mut kept = budget.empty_charge();
+    let Some(row) = node_row_if_matching(
+        variable,
+        &ids,
+        raw,
+        &record,
+        property_filters,
+        ctx,
+        &mut kept,
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    kept.grow(list_bytes::<Row>(1))?;
+    let rows = vec![row];
+    // The row goes on to the plan's later stages, held for the statement.
+    kept.keep_until_query_ends();
+    Ok(rows)
 }
 
 /// The `variable.column = value` conjuncts of `predicate`, as scan filters.
@@ -9229,23 +9531,29 @@ fn execute_btree_index_scan(
         // ever held, so a candidate resolves to its state valid at the
         // instant this variable reads at; one with no live state there is no
         // match.
-        let records: Vec<Option<NodeRecord>> = if temporal {
+        let (records, _batch): (Vec<Option<NodeRecord>>, _) = if temporal {
+            // The list charged before it exists, each state's record as it
+            // is read, kept with the batch while its rows are built.
+            let mut charge = budget.reserve(list_bytes::<Option<NodeRecord>>(batch.len()))?;
             let mut states = Vec::with_capacity(batch.len());
             for id in batch {
-                states.push(
-                    ctx.temporal_node_state(*id, at)?
-                        .positive()
-                        .map(|(_, record)| record),
-                );
+                let (state, mut record) = ctx.temporal_node_state_charged(*id, at, &budget)?;
+                record.transfer(record.bytes(), &mut charge)?;
+                states.push(state.positive().map(|(_, record)| record));
             }
-            states
+            (states, charge)
         } else {
             use coordinode_modality::NodeStore as _;
             // One batched multi_get (single version snapshot + batched
-            // bloom/SST traversal) rather than a per-id lookup loop.
-            coordinode_modality::LocalNodeStore.get_many(&ctx.txn, ctx.shard_id, batch)?
+            // bloom/SST traversal) rather than a per-id lookup loop, each
+            // record charged before it is decoded.
+            coordinode_modality::LocalNodeStore.get_many_charged(
+                &ctx.txn,
+                ctx.shard_id,
+                batch,
+                &budget,
+            )?
         };
-        let _batch = budget.reserve(records.iter().flatten().map(NodeRecord::held_bytes).sum())?;
         let candidates = IndexCandidates {
             variable,
             labels: &labels,
@@ -9307,11 +9615,16 @@ impl IndexCandidates<'_> {
                 continue;
             };
             // The label check guards against entries of relabeled nodes.
-            if let Some(row) =
-                node_row_if_matching(self.variable, self.labels, id.as_raw(), &record, &[], ctx)?
-            {
-                kept.grow(crate::executor::row::row_held_bytes(&row))?;
-                results.push(row);
+            if let Some(row) = node_row_if_matching(
+                self.variable,
+                self.labels,
+                id.as_raw(),
+                &record,
+                &[],
+                ctx,
+                kept,
+            )? {
+                crate::executor::row::push_charged(results, row, kept)?;
             }
         }
         Ok(true)
@@ -9499,10 +9812,11 @@ fn execute_hnsw_scan(
                 .chunks(CANDIDATE_BATCH)
                 .zip(kept.chunks(CANDIDATE_BATCH))
             {
-                let records = nodes.get_many(&ctx.txn, ctx.shard_id, batch_ids)?;
-                budget.work(records.len() as u64)?;
-                let _batch =
-                    budget.reserve(records.iter().flatten().map(NodeRecord::held_bytes).sum())?;
+                budget.work(batch_ids.len() as u64)?;
+                // Each record charged before it is decoded; a kept one takes
+                // its share of the batch's charge along, paid once.
+                let (records, mut batch) =
+                    nodes.get_many_charged(&ctx.txn, ctx.shard_id, batch_ids, &budget)?;
                 for (hit, record) in batch_hits.iter().zip(records) {
                     let Some(record) = record else {
                         continue;
@@ -9510,7 +9824,7 @@ fn execute_hnsw_scan(
                     if let Some(label_id) = label_id
                         && ctx.carries(&record.labels, label_id)?
                     {
-                        found_charge.grow(record.held_bytes())?;
+                        batch.transfer(record.held_bytes(), &mut found_charge)?;
                         found.push((hit.id, hit.score, record));
                     }
                 }
@@ -9625,13 +9939,21 @@ fn execute_text_index_scan(
         // Dropped between planning and execution: refused as TextFilter does.
         .ok_or_else(|| text_match_missing_index_error(Some(label), Some(property)))?;
 
-    let mut ids: Vec<NodeId> = matches.keys().map(|id| NodeId::from_raw(*id)).collect();
+    let budget = Arc::clone(&ctx.budget);
+    // The ids, charged before the list holding exactly them exists.
+    let _ids = budget.reserve(list_bytes::<NodeId>(matches.len()))?;
+    let mut ids: Vec<NodeId> = Vec::with_capacity(matches.len());
+    ids.extend(matches.keys().map(|id| NodeId::from_raw(*id)));
     ids.sort_unstable();
     ctx.budget.work(ids.len() as u64)?;
-    let records = coordinode_modality::LocalNodeStore.get_many(&ctx.txn, ctx.shard_id, &ids)?;
-    // The matched records, held while their rows are built.
-    let budget = Arc::clone(&ctx.budget);
-    let _records = budget.reserve(records.iter().flatten().map(NodeRecord::held_bytes).sum())?;
+    // The matched records, each charged before it is decoded and held while
+    // their rows are built.
+    let (records, _records) = coordinode_modality::LocalNodeStore.get_many_charged(
+        &ctx.txn,
+        ctx.shard_id,
+        &ids,
+        &budget,
+    )?;
     let at = ctx.instant_for(binding);
     // A label without an identity is carried by no node.
     let Some(label_id) = ctx.label_id(label)? else {
@@ -9640,13 +9962,14 @@ fn execute_text_index_scan(
     let mut rows = Vec::with_capacity(ids.len());
     for (id, record) in ids.into_iter().zip(records) {
         // A temporal node has no row of its own: its state at the instant
-        // the binding reads at, as the label scan projects it.
-        let record = match record {
-            Some(record) => Some(record),
-            None => ctx
-                .temporal_node_state(id, at)?
-                .positive()
-                .map(|(_, record)| record),
+        // the binding reads at, as the label scan projects it, charged while
+        // its row is built.
+        let (record, _state) = match record {
+            Some(record) => (Some(record), None),
+            None => {
+                let (state, charge) = ctx.temporal_node_state_charged(id, at, &budget)?;
+                (state.positive().map(|(_, record)| record), Some(charge))
+            }
         };
         let Some(record) = record else {
             continue;
@@ -9762,37 +10085,49 @@ fn written_vector_nodes(
     match delta {
         IndexDelta::Nodes(ids) => {
             let budget = &ctx.budget;
-            // The ids, reserved before the list exists.
+            // The ids, reserved before the list holding exactly them exists.
             let _ids = budget.reserve(list_bytes::<NodeId>(ids.len()))?;
-            let mut ids: Vec<NodeId> = ids.iter().copied().collect();
-            ids.sort_unstable();
-            budget.work(ids.len() as u64)?;
+            let mut ids_sorted: Vec<NodeId> = Vec::with_capacity(ids.len());
+            ids_sorted.extend(ids.iter().copied());
+            ids_sorted.sort_unstable();
+            budget.work(ids_sorted.len() as u64)?;
             // Read a batch at a time: one batch's records are held, and
-            // charged, before the next is read; those kept stay charged.
-            for batch in ids.chunks(CANDIDATE_BATCH) {
-                let records = nodes.get_many(&ctx.txn, ctx.shard_id, batch)?;
-                let _batch =
-                    budget.reserve(records.iter().flatten().map(NodeRecord::held_bytes).sum())?;
+            // charged before each is decoded, before the next is read; those
+            // kept take their share along and stay charged.
+            let mut kept = budget.empty_charge();
+            for batch in ids_sorted.chunks(CANDIDATE_BATCH) {
+                let (records, mut read) =
+                    nodes.get_many_charged(&ctx.txn, ctx.shard_id, batch, budget)?;
                 for (id, record) in batch.iter().zip(records) {
                     if let Some(record) = record.filter(|r| record_vector(r, field).is_some()) {
-                        budget.reserve(record.held_bytes())?.keep_until_query_ends();
-                        with_vector.push((id.as_raw(), record));
+                        keep_record(&mut with_vector, &mut kept, &mut read, id.as_raw(), record)?;
                     }
                 }
             }
+            kept.keep_until_query_ends();
         }
         IndexDelta::Unknown => {
             let budget = &ctx.budget;
-            nodes.for_each_in_shard(&ctx.txn, ctx.shard_id, &mut |id, record| {
-                budget.work(1)?;
-                if record_vector(&record, field).is_some() {
-                    // Held from the scan on, so the candidates never exceed
-                    // the statement's memory unaccounted.
-                    budget.reserve(record.held_bytes())?.keep_until_query_ends();
-                    with_vector.push((id.as_raw(), record));
-                }
-                Ok(())
-            })?;
+            let mut kept = budget.empty_charge();
+            coordinode_modality::LocalNodeStore::for_each_stored_in_shard(
+                &ctx.txn,
+                ctx.shard_id,
+                |id, bytes| {
+                    budget.work(1)?;
+                    // Each record charged before it is decoded; one without
+                    // the vector goes with its charge, one with it is held
+                    // from the scan on.
+                    let mut read = budget.empty_charge();
+                    let record = coordinode_modality::LocalNodeStore::decode_record_charged(
+                        bytes, &mut read,
+                    )?;
+                    if record_vector(&record, field).is_some() {
+                        keep_record(&mut with_vector, &mut kept, &mut read, id.as_raw(), record)?;
+                    }
+                    Ok::<(), ExecutionError>(())
+                },
+            )?;
+            kept.keep_until_query_ends();
         }
     }
     // A label without an identity is carried by no node.
@@ -9986,20 +10321,31 @@ struct TargetRowParams<'a> {
     edge_is_temporal: bool,
 }
 
+/// A traversal target's records with their `valid_from`, and the charge
+/// paying for them.
+type ChargedTargets<'b> = (
+    Vec<(NodeRecord, Option<i64>)>,
+    coordinode_core::budget::MemoryCharge<'b>,
+);
+
 /// The state of temporal node `target_id` at the instant `variable` reads at,
-/// with its `valid_from`; empty when the node has no live state then.
-fn temporal_target_state(
+/// with its `valid_from`; empty when the node has no live state then. The
+/// returned charge, on `budget`, pays for the list and the record for as
+/// long as the caller holds them.
+fn temporal_target_state<'b>(
     ctx: &mut ExecutionContext<'_>,
     target_id: NodeId,
     variable: &str,
-) -> Result<Vec<(NodeRecord, Option<i64>)>, ExecutionError> {
+    budget: &'b coordinode_core::budget::QueryBudget,
+) -> Result<ChargedTargets<'b>, ExecutionError> {
     let at = ctx.instant_for(variable);
-    Ok(ctx
-        .temporal_node_state(target_id, at)?
-        .positive()
-        .map(|(valid_from, record)| (record, Some(valid_from)))
-        .into_iter()
-        .collect())
+    let (state, mut charge) = ctx.temporal_node_state_charged(target_id, at, budget)?;
+    let Some((valid_from, record)) = state.positive() else {
+        return Ok((Vec::new(), charge));
+    };
+    charge.grow(list_bytes::<(NodeRecord, Option<i64>)>(1))?;
+    // A list of one holds room for exactly one.
+    Ok((vec![(record, Some(valid_from))], charge))
 }
 
 /// Fetch a target node and build output rows. Returns `Vec` because temporal
@@ -10029,17 +10375,24 @@ fn build_target_rows(
             .is_some_and(|s| s.temporal)
     });
 
-    // At most one (record, valid_from) pair: the target's state, if any.
-    let target_records: Vec<(NodeRecord, Option<i64>)> = if target_is_temporal {
-        temporal_target_state(ctx, target_id, target_variable)?
+    // At most one (record, valid_from) pair: the target's state, if any. A
+    // temporal target's stays charged while its rows are built.
+    let budget = Arc::clone(&ctx.budget);
+    let (target_records, _target): (Vec<(NodeRecord, Option<i64>)>, _) = if target_is_temporal {
+        let (records, charge) = temporal_target_state(ctx, target_id, target_variable, &budget)?;
+        (records, Some(charge))
     } else {
         match ctx.mvcc_get_node(ctx.shard_id, target_id)? {
-            Some(rec) => vec![(rec, None)],
+            Some(rec) => (vec![(rec, None)], None),
             // No plain row: the target may be a temporal node the pattern
             // does not name by label, which lives under per-version keys
             // only. It is read the same way a labelled one is; a dangling
             // edge finds no version either.
-            None => temporal_target_state(ctx, target_id, target_variable)?,
+            None => {
+                let (records, charge) =
+                    temporal_target_state(ctx, target_id, target_variable, &budget)?;
+                (records, Some(charge))
+            }
         }
     };
     if target_records.is_empty() {
@@ -13303,8 +13656,21 @@ fn answer_shared_keys(
     let budget = Arc::clone(&ctx.budget);
     for start in (0..keys.len()).step_by(CANDIDATE_BATCH) {
         let end = (start + CANDIDATE_BATCH).min(keys.len());
+        // The lists this batch of keys keeps aside, each holding room for at
+        // most what it can hold, charged before any exists: the keys' values,
+        // the keys answered and a group of them with their candidates, the
+        // group's ids, and one key's records taken from the group's.
+        let slot = core::mem::size_of::<(usize, Vec<NodeId>)>();
+        let _lists = budget.reserve(
+            list_bytes::<&Value>(end - start)
+                .checked_add(2 * list_bytes::<u8>((end - start) * slot))
+                .and_then(|b| b.checked_add(list_bytes::<NodeId>(CANDIDATE_BATCH)))
+                .and_then(|b| b.checked_add(list_bytes::<Option<NodeRecord>>(CANDIDATE_BATCH)))
+                .unwrap_or(u64::MAX),
+        )?;
         let found = {
-            let values: Vec<&Value> = keys[start..end].iter().map(|k| &k.key).collect();
+            let mut values: Vec<&Value> = Vec::with_capacity(end - start);
+            values.extend(keys[start..end].iter().map(|k| &k.key));
             ctx.index_lookup_each(scan.index, &values)?
         };
         let Ok(found) = found else {
@@ -13314,7 +13680,7 @@ fn answer_shared_keys(
             continue;
         };
         // The keys this batch answers, with their candidates.
-        let mut pending: Vec<(usize, Vec<NodeId>)> = Vec::new();
+        let mut pending: Vec<(usize, Vec<NodeId>)> = Vec::with_capacity(end - start);
         for (at, ids) in (start..end).zip(found) {
             match ids {
                 Some(ids) if ids.len() <= CANDIDATE_BATCH => pending.push((at, ids)),
@@ -13326,8 +13692,8 @@ fn answer_shared_keys(
         // are built.
         let mut group = pending.into_iter().peekable();
         while group.peek().is_some() {
-            let mut members: Vec<(usize, Vec<NodeId>)> = Vec::new();
-            let mut ids: Vec<NodeId> = Vec::new();
+            let mut members: Vec<(usize, Vec<NodeId>)> = Vec::with_capacity(end - start);
+            let mut ids: Vec<NodeId> = Vec::with_capacity(CANDIDATE_BATCH);
             while let Some((_, next)) = group.peek() {
                 if !members.is_empty() && ids.len() + next.len() > CANDIDATE_BATCH {
                     break;
@@ -13338,20 +13704,18 @@ fn answer_shared_keys(
                 ids.extend_from_slice(&member_ids);
                 members.push((at, member_ids));
             }
-            let mut records = coordinode_modality::LocalNodeStore
-                .get_many(&ctx.txn, ctx.shard_id, &ids)?
-                .into_iter();
-            let _batch = budget.reserve(
-                records
-                    .as_slice()
-                    .iter()
-                    .flatten()
-                    .map(NodeRecord::held_bytes)
-                    .sum(),
+            // Each record charged before it is decoded.
+            let (records, _batch) = coordinode_modality::LocalNodeStore.get_many_charged(
+                &ctx.txn,
+                ctx.shard_id,
+                &ids,
+                &budget,
             )?;
+            let mut records = records.into_iter();
             for (at, member_ids) in members {
-                let member_records: Vec<Option<NodeRecord>> =
-                    records.by_ref().take(member_ids.len()).collect();
+                let mut member_records: Vec<Option<NodeRecord>> =
+                    Vec::with_capacity(member_ids.len());
+                member_records.extend(records.by_ref().take(member_ids.len()));
                 let mut rows = Vec::new();
                 let mut kept = budget.empty_charge();
                 let answered = IndexCandidates {
@@ -18440,6 +18804,61 @@ fn execute_merge_nodes(
 /// the current version into a fresh node needs the per-version write path, and
 /// version history is never copied (it would forge the system-time axis). Edge
 /// cloning (`WITH EDGES`) is a tracked follow-up.
+/// The create-time properties of a clone of `source`: its stored properties
+/// when `with_properties`, without the version- and engine-axis fields, and
+/// `valid_from` set to `valid_from` when given. The list is charged to
+/// `copies` for exactly its entries before it exists, and each name and
+/// value before it is copied.
+fn clone_properties(
+    source: &NodeRecord,
+    interner: &FieldInterner,
+    with_properties: bool,
+    valid_from: Option<i64>,
+    copies: &mut coordinode_core::budget::MemoryCharge<'_>,
+) -> Result<Vec<(String, crate::plan::expr::Expr)>, ExecutionError> {
+    fn forwarded(name: &str) -> bool {
+        !matches!(name, "__ingestion_ts__" | "valid_from" | "valid_to")
+    }
+    let stored = source
+        .props
+        .iter()
+        .filter_map(|(field_id, val)| Some((interner.resolve(*field_id)?, val)));
+    let extra = source
+        .extra
+        .iter()
+        .flatten()
+        .map(|(name, val)| (name.as_str(), val));
+    let forwarded_props = || {
+        stored
+            .clone()
+            .chain(extra.clone())
+            .filter(|(name, _)| with_properties && forwarded(name))
+    };
+    let slots = forwarded_props().count() + usize::from(valid_from.is_some());
+    copies.grow(list_bytes::<(String, crate::plan::expr::Expr)>(slots))?;
+    let mut props = Vec::with_capacity(slots);
+    for (name, val) in forwarded_props() {
+        // The value's inline part is in its slot, charged with the list.
+        let heap = val.held_bytes() - core::mem::size_of::<Value>() as u64;
+        copies.grow(name.len() as u64 + heap)?;
+        props.push((
+            name.to_string(),
+            crate::plan::expr::Expr::Literal(val.clone()),
+        ));
+    }
+    // valid_from = NOW for the clone's first version. An explicit
+    // `SET b.valid_from = ...` (applied after create) back-dates it. Its
+    // name is a literal of ten bytes; the value is held inline.
+    if let Some(now_us) = valid_from {
+        copies.grow("valid_from".len() as u64)?;
+        props.push((
+            "valid_from".to_string(),
+            crate::plan::expr::Expr::Literal(Value::Int(now_us)),
+        ));
+    }
+    Ok(props)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_clone_node(
     input_rows: &[Row],
@@ -18487,20 +18906,24 @@ fn execute_clone_node(
         // Non-temporal nodes read through the point key; temporal nodes have no
         // point key (per-version layout), so read the state valid at the
         // requested instant. A deleted or not-yet-valid source has none.
-        let source_rec = match ctx.mvcc_get_node(ctx.shard_id, a_id)? {
-            Some(r) if as_of_us.is_none() => r,
-            _ => ctx
-                .temporal_node_state(a_id, as_of_us.unwrap_or(now_us))?
-                .positive()
-                .map(|(_, record)| record)
-                .ok_or_else(|| {
+        // A temporal source's state stays charged for the whole clone, its
+        // properties copied out of it included.
+        let budget = Arc::clone(&ctx.budget);
+        let (source_rec, _source) = match ctx.mvcc_get_node(ctx.shard_id, a_id)? {
+            Some(r) if as_of_us.is_none() => (r, None),
+            _ => {
+                let (state, charge) =
+                    ctx.temporal_node_state_charged(a_id, as_of_us.unwrap_or(now_us), &budget)?;
+                let record = state.positive().map(|(_, record)| record).ok_or_else(|| {
                     let suffix = as_of_us
                         .map(|t| format!(" as of valid-time {t}"))
                         .unwrap_or_default();
                     ExecutionError::Unsupported(format!(
                         "CLONE NODE source node {a_id} not found{suffix}"
                     ))
-                })?,
+                })?;
+                (record, Some(charge))
+            }
         };
 
         // The clone is created by the names of the labels the source stores,
@@ -18524,41 +18947,16 @@ fn execute_clone_node(
         // is the engine-assigned system-time, and `valid_from` / `valid_to` are
         // the source's valid-time interval — the clone gets its own `valid_from`
         // (NOW) below, so inheriting the source's would back-date the clone.
-        let mut properties: Vec<(String, crate::plan::expr::Expr)> = if with_properties {
-            let mut props = Vec::new();
-            for (field_id, val) in &source_rec.props {
-                let Some(name) = ctx.interner.resolve(*field_id) else {
-                    continue;
-                };
-                if matches!(name, "__ingestion_ts__" | "valid_from" | "valid_to") {
-                    continue;
-                }
-                props.push((
-                    name.to_string(),
-                    crate::plan::expr::Expr::Literal(val.clone()),
-                ));
-            }
-            if let Some(extra) = &source_rec.extra {
-                for (k, v) in extra {
-                    if matches!(k.as_str(), "__ingestion_ts__" | "valid_from" | "valid_to") {
-                        continue;
-                    }
-                    props.push((k.clone(), crate::plan::expr::Expr::Literal(v.clone())));
-                }
-            }
-            props
-        } else {
-            Vec::new()
-        };
-
-        // valid_from = NOW for the clone's first version. An explicit
-        // `SET b.valid_from = ...` (applied after create) back-dates it.
-        if is_temporal {
-            properties.push((
-                "valid_from".to_string(),
-                crate::plan::expr::Expr::Literal(Value::Int(now_us)),
-            ));
-        }
+        // Each property's copy is charged before it is made, and held while
+        // the clone is created from it.
+        let mut copies = budget.empty_charge();
+        let properties = clone_properties(
+            &source_rec,
+            ctx.interner,
+            with_properties,
+            is_temporal.then_some(now_us),
+            &mut copies,
+        )?;
 
         let created = execute_create_node(
             std::slice::from_ref(row),
@@ -21118,9 +21516,29 @@ fn inject_computed_from_schema(row: &mut Row, variable: &str, schema: &LabelSche
             _ => continue,
         };
         let val = evaluate_computed_spec(spec, variable, row, now_us);
-        let col_name = format!("{variable}.{prop_name}");
-        row.insert(col_name, val);
+        row.insert(crate::executor::row::column_name(variable, prop_name), val);
     }
+}
+
+/// What [`inject_computed_from_schema`] adds to a row under `variable`, known
+/// before it is added: every computed value is a number or null, held inline.
+/// The lookup of each value's anchor column, given back once it is read, is
+/// counted too.
+fn computed_columns_bytes(variable: &str, schema: &LabelSchema) -> u64 {
+    use coordinode_core::schema::definition::PropertyType;
+    schema
+        .properties
+        .iter()
+        .filter_map(|(name, def)| match &def.property_type {
+            PropertyType::Computed(spec) => Some((name, spec)),
+            _ => None,
+        })
+        .map(|(name, spec)| {
+            crate::executor::row::column_entry_bytes(variable, name)
+                + core::mem::size_of::<Value>() as u64
+                + crate::executor::row::column_lookup_bytes(variable, spec.anchor_field())
+        })
+        .sum()
 }
 
 /// Evaluate a single ComputedSpec to produce a Value.
@@ -21132,10 +21550,9 @@ fn evaluate_computed_spec(
 ) -> Value {
     use coordinode_core::schema::computed::ComputedSpec;
 
-    let anchor_field = spec.anchor_field();
-    let anchor_key = format!("{variable}.{anchor_field}");
+    // Read per row, uncharged, so found without assembling the column name.
     // Accept both Timestamp and Int as anchor values (Cypher literals are Int).
-    let anchor_us = match row.get(&anchor_key) {
+    let anchor_us = match super::row::property(row, variable, spec.anchor_field()) {
         Some(Value::Timestamp(ts)) => *ts,
         Some(Value::Int(ts)) => *ts,
         _ => return Value::Null, // anchor field missing → cannot compute

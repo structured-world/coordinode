@@ -4207,6 +4207,387 @@ fn mvcc_get_node_temporal_leaves_no_occ_scope() {
     );
 }
 
+/// The state a temporal node's timeline holds at an instant comes with the
+/// charge of its record: the returned charge pays for the chosen record for
+/// as long as the caller holds it, the version not chosen and the list of
+/// versions are given back once the state is chosen, and dropping the charge
+/// returns the rest. A state with no live record comes with nothing charged.
+#[test]
+fn a_temporal_state_comes_with_its_records_charge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+    let engine = StorageEngine::open_with_oracle(
+        &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+            EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            ),
+        ]),
+        oracle.clone(),
+    )
+    .expect("open");
+    let id = NodeId::from_raw(77);
+    let mut first = NodeRecord::new(bind(&engine, "E"));
+    first.set(1, Value::String("f".repeat(64 << 10)));
+    let mut second = NodeRecord::new(bind(&engine, "E"));
+    second.set(1, Value::String("s".repeat(16 << 10)));
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::new(0);
+    let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+    seed_node_temporal(&engine, ctx.shard_id, id, 100, &first);
+    seed_node_temporal(&engine, ctx.shard_id, id, 200, &second);
+    ctx.mvcc_oracle = Some(&oracle);
+    ctx.mvcc_read_ts = oracle.next();
+
+    let budget = coordinode_core::budget::QueryBudget::new(1 << 30);
+    let (state, charge) = ctx
+        .temporal_node_state_charged(id, 150, &budget)
+        .expect("state");
+    let crate::executor::temporal_read::StateAt::Positive { record, .. } = &state else {
+        panic!("the first version holds at 150: {state:?}");
+    };
+    assert_eq!(record, &first);
+    assert_eq!(
+        charge.bytes(),
+        record.held_bytes(),
+        "it pays for the record"
+    );
+    assert_eq!(
+        budget.memory_used(),
+        charge.bytes(),
+        "the version not chosen and the list went back"
+    );
+    drop(charge);
+    assert_eq!(
+        budget.memory_used(),
+        0,
+        "the rest went back with the charge"
+    );
+
+    let (before, nothing) = ctx
+        .temporal_node_state_charged(id, 50, &budget)
+        .expect("state");
+    assert!(before.positive().is_none(), "no version holds at 50");
+    assert_eq!(nothing.bytes(), 0);
+    assert_eq!(budget.memory_used(), 0);
+}
+
+/// The row a read by node id builds is charged entry by entry before each
+/// copy is made: a budget the copy of a large property does not fit refuses
+/// that copy itself (the refusal asks for exactly that column), not the
+/// finished row afterwards. A row kept stays charged for the statement at
+/// exactly what it holds, its list slot included; a row an inline filter
+/// rejects leaves nothing charged.
+#[test]
+fn a_node_row_read_by_id_is_charged_before_its_copies() {
+    use crate::executor::row::{column_entry_bytes, row_held_bytes};
+    use coordinode_core::budget::{BudgetStop, QueryBudget};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+    let engine = StorageEngine::open_with_oracle(
+        &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+            EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            ),
+        ]),
+        oracle.clone(),
+    )
+    .expect("open");
+    let mut interner = FieldInterner::new();
+    let name_field = interner.intern("name");
+    let tag_field = interner.intern("tag");
+    let allocator = NodeIdAllocator::new(0);
+    let large = 1 << 20;
+    let mut record = NodeRecord::new(bind(&engine, "P"));
+    record.set(name_field, Value::String("n".repeat(large)));
+    record.set(tag_field, Value::String("t".into()));
+    let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+    let id = NodeId::from_raw(91);
+    seed_node_record(&engine, ctx.shard_id, id, &record);
+    ctx.mvcc_oracle = Some(&oracle);
+    ctx.mvcc_read_ts = oracle.next();
+    let labels = ["P".to_string()];
+
+    // Room for the record's own read and the small columns, not for a
+    // second copy of the name.
+    ctx.budget = Arc::new(QueryBudget::new(large as u64 / 2));
+    let refused = scan_by_node_id("n", &labels, 91, &[], &mut ctx);
+    let name_entry =
+        column_entry_bytes("n", "name") + Value::String("n".repeat(large)).held_bytes();
+    match refused {
+        Err(ExecutionError::Budget(BudgetStop::Memory { requested, .. })) => assert_eq!(
+            requested, name_entry,
+            "the refusal asks for the copy of the name, before it is made"
+        ),
+        other => panic!("the copy of the name does not fit: {other:?}"),
+    }
+    assert_eq!(ctx.budget.memory_used(), 0, "nothing stays charged");
+
+    ctx.budget = Arc::new(QueryBudget::new(64 << 20));
+    let rows = scan_by_node_id("n", &labels, 91, &[], &mut ctx).expect("fits");
+    let [row] = rows.as_slice() else {
+        panic!("one row: {rows:?}");
+    };
+    assert_eq!(
+        ctx.budget.memory_used(),
+        row_held_bytes(row) + core::mem::size_of::<Row>() as u64,
+        "the row and its list slot stay charged for the statement"
+    );
+
+    ctx.budget = Arc::new(QueryBudget::new(64 << 20));
+    let filter = [(
+        "tag".to_string(),
+        crate::plan::expr::Expr::Literal(Value::String("other".into())),
+    )];
+    let none = scan_by_node_id("n", &labels, 91, &filter, &mut ctx).expect("filtered");
+    assert!(none.is_empty());
+    assert_eq!(
+        ctx.budget.memory_used(),
+        0,
+        "a row the filter rejects leaves nothing charged"
+    );
+}
+
+/// An inline filter naming a binding of the outer row compares with it in
+/// place: a budget that holds the node's row but not a copy of a large outer
+/// row lets the filter through. A filter computed from the outer row is
+/// evaluated over a copy charged while it runs: refused against that budget,
+/// given back under an ample one.
+#[test]
+fn an_inline_filter_reads_the_outer_row_in_place() {
+    use coordinode_core::budget::QueryBudget;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+    let engine = StorageEngine::open_with_oracle(
+        &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+            EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            ),
+        ]),
+        oracle.clone(),
+    )
+    .expect("open");
+    let mut interner = FieldInterner::new();
+    let tag_field = interner.intern("tag");
+    let allocator = NodeIdAllocator::new(0);
+    let mut record = NodeRecord::new(bind(&engine, "P"));
+    record.set(tag_field, Value::String("t".into()));
+    let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+    seed_node_record(&engine, ctx.shard_id, NodeId::from_raw(5), &record);
+    ctx.mvcc_oracle = Some(&oracle);
+    ctx.mvcc_read_ts = oracle.next();
+    let mut outer = Row::new();
+    outer.insert("e".into(), Value::String("t".into()));
+    outer.insert("big".into(), Value::String("b".repeat(1 << 20)));
+    ctx.correlated_row = Some(outer);
+    let labels = ["P".to_string()];
+    let by_binding = [(
+        "tag".to_string(),
+        crate::plan::expr::Expr::Variable("e".into()),
+    )];
+    let computed = [(
+        "tag".to_string(),
+        crate::plan::expr::Expr::Parameter("p".into()),
+    )];
+
+    ctx.budget = Arc::new(QueryBudget::new(256 << 10));
+    let rows = scan_by_node_id("n", &labels, 5, &by_binding, &mut ctx).expect("in place");
+    assert_eq!(rows.len(), 1, "the binding matches the tag");
+
+    ctx.budget = Arc::new(QueryBudget::new(256 << 10));
+    let refused = scan_by_node_id("n", &labels, 5, &computed, &mut ctx);
+    assert!(
+        matches!(refused, Err(ExecutionError::Budget(_))),
+        "the copy of the outer row does not fit: {refused:?}"
+    );
+    assert_eq!(ctx.budget.memory_used(), 0, "nothing stays charged");
+
+    ctx.budget = Arc::new(QueryBudget::new(64 << 20));
+    let none = scan_by_node_id("n", &labels, 5, &computed, &mut ctx).expect("evaluated");
+    assert!(none.is_empty(), "an unbound parameter is null");
+    assert_eq!(ctx.budget.memory_used(), 0, "the copy went back");
+}
+
+/// Inline filters are judged in their order whatever their form: a computed
+/// filter failing before a literal that does not match fails the read, and
+/// a literal that does not match before a failing computed filter ends the
+/// read first, as evaluating every filter over the extended row did.
+#[test]
+fn inline_filters_keep_their_order() {
+    use crate::plan::expr::{BinOp, Expr};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+    let engine = StorageEngine::open_with_oracle(
+        &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+            EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            ),
+        ]),
+        oracle.clone(),
+    )
+    .expect("open");
+    let mut interner = FieldInterner::new();
+    let tag_field = interner.intern("tag");
+    let allocator = NodeIdAllocator::new(0);
+    let mut record = NodeRecord::new(bind(&engine, "P"));
+    record.set(tag_field, Value::String("t".into()));
+    let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+    seed_node_record(&engine, ctx.shard_id, NodeId::from_raw(5), &record);
+    ctx.mvcc_oracle = Some(&oracle);
+    ctx.mvcc_read_ts = oracle.next();
+    let labels = ["P".to_string()];
+    let failing = (
+        "tag".to_string(),
+        Expr::Binary {
+            left: Box::new(Expr::Literal(Value::Int(1))),
+            op: BinOp::Div,
+            right: Box::new(Expr::Literal(Value::Int(0))),
+        },
+    );
+    let other = ("tag".to_string(), Expr::Literal(Value::String("o".into())));
+
+    let failed = scan_by_node_id("n", &labels, 5, &[failing.clone(), other.clone()], &mut ctx);
+    assert!(
+        matches!(failed, Err(ExecutionError::Arithmetic(_))),
+        "the computed filter comes first: {failed:?}"
+    );
+    let rejected = scan_by_node_id("n", &labels, 5, &[other, failing], &mut ctx);
+    assert!(
+        matches!(&rejected, Ok(rows) if rows.is_empty()),
+        "the literal comes first: {rejected:?}"
+    );
+    assert_eq!(ctx.budget.memory_used(), 0);
+}
+
+/// A filter value named in place is the value the evaluator gives over the
+/// node's row extended over the outer one: a column of either row, the node's
+/// winning over the outer's, a key of a map bound in either, a missing column
+/// or key or binding as null. A key of a document is left to the evaluator.
+#[test]
+fn a_named_filter_value_is_what_the_evaluator_gives() {
+    use crate::plan::expr::Expr;
+    let mut row = Row::new();
+    row.insert("n".into(), Value::Int(1));
+    row.insert("n.a".into(), Value::String("local".into()));
+    row.insert("both.k".into(), Value::Int(10));
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("x".to_string(), Value::Int(7));
+    let mut outer = Row::new();
+    outer.insert("e".into(), Value::String("outer".into()));
+    outer.insert("e.c".into(), Value::Int(3));
+    outer.insert("both.k".into(), Value::Int(20));
+    outer.insert("m".into(), Value::Map(map));
+    outer.insert(
+        "d".into(),
+        Value::Document(rmpv::Value::Map(vec![(
+            rmpv::Value::from("x"),
+            rmpv::Value::from(9),
+        )])),
+    );
+    let mut extended = outer.clone();
+    extended.extend(row.clone());
+    let property = |var: &str, key: &str| Expr::Property {
+        base: Box::new(Expr::Variable(var.into())),
+        key: key.into(),
+    };
+    for expr in [
+        Expr::Literal(Value::Int(5)),
+        Expr::Variable("n".into()),
+        Expr::Variable("e".into()),
+        Expr::Variable("missing".into()),
+        property("n", "a"),
+        property("e", "c"),
+        property("both", "k"),
+        property("m", "x"),
+        property("m", "y"),
+        property("e", "nothing"),
+        property("missing", "k"),
+    ] {
+        let named = named_value(&expr, &row, Some(&outer)).cloned();
+        let evaluated = eval_neutral(&expr, &extended).expect("evaluates");
+        assert_eq!(named, Some(evaluated), "{expr:?}");
+    }
+    let in_document = property("d", "x");
+    assert_eq!(named_value(&in_document, &row, Some(&outer)), None);
+    assert_eq!(
+        eval_neutral(&in_document, &extended).expect("evaluates"),
+        Value::Int(9)
+    );
+}
+
+/// A clone's properties are charged before they are copied: their names and
+/// the list holding them, not only their values. A source of many long names
+/// and small values is refused against a budget its values fit and its names
+/// do not; under an ample budget the charge covers everything the list
+/// holds, the clone's own `valid_from` included.
+#[test]
+fn a_clone_charges_its_property_names_and_list() {
+    use coordinode_core::budget::QueryBudget;
+    let mut interner = FieldInterner::new();
+    let mut source = NodeRecord::new(LabelId::new(1).expect("a label id"));
+    for i in 0..2_000 {
+        let name = format!("{i:0>1000}");
+        source.set(interner.intern(&name), Value::Int(i));
+    }
+    let names = 2_000 * 1_000;
+
+    let small = QueryBudget::new(names / 2);
+    let mut copies = small.empty_charge();
+    let refused = clone_properties(&source, &interner, true, Some(7), &mut copies);
+    assert!(
+        matches!(refused, Err(ExecutionError::Budget(_))),
+        "the names do not fit: {:?}",
+        refused.map(|p| p.len())
+    );
+    drop(copies);
+    assert_eq!(small.memory_used(), 0);
+
+    let ample = QueryBudget::new(64 << 20);
+    let mut copies = ample.empty_charge();
+    let props = clone_properties(&source, &interner, true, Some(7), &mut copies).expect("fits");
+    assert_eq!(props.len(), 2_001);
+    let held = (props.capacity() * core::mem::size_of::<(String, crate::plan::expr::Expr)>())
+        as u64
+        + props
+            .iter()
+            .map(|(name, expr)| {
+                let heap = match expr {
+                    crate::plan::expr::Expr::Literal(v) => {
+                        v.held_bytes() - core::mem::size_of::<Value>() as u64
+                    }
+                    other => panic!("a literal: {other:?}"),
+                };
+                name.capacity() as u64 + heap
+            })
+            .sum::<u64>();
+    assert_eq!(copies.bytes(), held, "it pays for exactly what it holds");
+    drop(copies);
+    assert_eq!(ample.memory_used(), 0);
+
+    // A budget of exactly what the copies hold takes them: a value's inline
+    // part, already in its list slot, is not charged twice.
+    let exact = QueryBudget::new(held);
+    let mut copies = exact.empty_charge();
+    clone_properties(&source, &interner, true, Some(7), &mut copies).expect("exactly fits");
+}
+
 #[test]
 fn mvcc_put_node_temporal_does_not_track_in_occ_scope() {
     // Symmetric to mvcc_put_node_does_not_track: pure temporal write

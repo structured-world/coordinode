@@ -6,25 +6,35 @@
 //! top-k while another thread writes vectors.
 //!
 //! The statements use only the public Cypher surface, so the same file runs
-//! against the code before the change. Each prints its row count beside its
-//! latencies (an equal-cost wrong answer shows up as a changed count), and
-//! the heap allocations and bytes allocated per statement, the parameter
-//! map it is handed included. Under concurrent writes the counts include
-//! the writer's.
+//! against the code before the change. Each runs the whole sequence of query
+//! vectors once untimed first and prints the rows of the first query (a
+//! changed count shows a wrong answer, an equal one proves nothing; the
+//! vector_topk bench compares the answers themselves), the heap allocations
+//! and bytes allocated per statement, the parameter map it is handed
+//! included, and the most bytes the allocations born on the statement's
+//! thread held at once (p50, p99 and max over the runs, whichever thread
+//! frees them). Its latencies carry the counting allocator's cost: compare
+//! them only with this bench's own. Under concurrent writes the allocation
+//! counts include the writer's; its allocations are not in the peak.
 
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
-use std::alloc::System;
+#[path = "support/alloc_peak.rs"]
+mod alloc_peak;
+#[path = "support/vectors.rs"]
+mod vectors;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
-use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+use vectors::{params, synth};
 
 #[global_allocator]
-static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+static ALLOCATOR: tracking_allocator::Allocator<std::alloc::System> =
+    tracking_allocator::Allocator::system();
 
 /// The populations measured: dimension and vectors per label.
 const SHAPES: [(usize, usize); 2] = [(128, 20_000), (768, 4_000)];
@@ -32,33 +42,10 @@ const SHAPES: [(usize, usize); 2] = [(128, 20_000), (768, 4_000)];
 const HOT: usize = 1_000;
 /// Timed runs of the statements that read every row.
 const SCANS: usize = 100;
-/// Vectors created per statement while loading.
-const BATCH: usize = 500;
 
 /// Top-10 of the indexed label.
 const TOP_K_V: &str =
     "MATCH (n:V) RETURN n.i AS i, vector_distance(n.e, $q) AS d ORDER BY d LIMIT 10";
-
-/// Components in `[-1, 1)`, deterministic per seed.
-fn synth(seed: u64, dim: usize) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    (0..dim)
-        .map(|_| {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            let u = (s >> 40) as f32 / (1u32 << 24) as f32;
-            2.0 * u - 1.0
-        })
-        .collect()
-}
-
-fn params(entries: Vec<(&str, Value)>) -> HashMap<String, Value> {
-    entries
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect()
-}
 
 /// Rows of `query`, and how long it took.
 fn run(db: &Database, query: &str, p: &HashMap<String, Value>) -> (usize, Duration) {
@@ -75,7 +62,7 @@ fn report(label: &str, rows: usize, mut samples: Vec<Duration>) {
     samples.sort_unstable();
     let at = |q: usize| samples[(samples.len() - 1) * q / 1000];
     println!(
-        "{label}: rows={rows} n={} p50={:?} p99={:?} p999={:?} max={:?}",
+        "{label}: rows of the first query={rows} n={} p50={:?} p99={:?} p999={:?} max={:?}",
         samples.len(),
         at(500),
         at(990),
@@ -84,7 +71,8 @@ fn report(label: &str, rows: usize, mut samples: Vec<Duration>) {
     );
 }
 
-/// Time `runs` executions of `query`, each with the next query vector.
+/// Time `runs` executions of `query`, each with the next query vector, after
+/// one untimed pass over all of them.
 fn measure(db: &Database, label: &str, query: &str, queries: &[Vec<f32>], runs: usize) {
     let p = |i: usize| {
         params(vec![(
@@ -92,62 +80,45 @@ fn measure(db: &Database, label: &str, query: &str, queries: &[Vec<f32>], runs: 
             Value::Vector(queries[i % queries.len()].clone()),
         )])
     };
-    let (rows, _) = run(db, query, &p(0)); // Bind the plan before measurement.
-    let region = Region::new(GLOBAL);
-    let samples = (0..runs).map(|i| run(db, query, &p(i)).1).collect();
-    let change = region.change();
+    let (rows, _) = run(db, query, &p(0));
+    for i in 1..queries.len() {
+        run(db, query, &p(i));
+    }
+    let allocations = alloc_peak::ALLOCATIONS.load(Ordering::Relaxed);
+    let allocated = alloc_peak::ALLOCATED.load(Ordering::Relaxed);
+    let mut peaks = Vec::with_capacity(runs);
+    let samples = (0..runs)
+        .map(|i| {
+            let params = p(i);
+            let (elapsed, peak) = alloc_peak::peak_of(|| run(db, query, &params).1);
+            peaks.push(peak);
+            elapsed
+        })
+        .collect();
+    let allocations = alloc_peak::ALLOCATIONS.load(Ordering::Relaxed) - allocations;
+    let allocated = alloc_peak::ALLOCATED.load(Ordering::Relaxed) - allocated;
     report(label, rows, samples);
+    peaks.sort_unstable();
+    let at = |q: usize| peaks[(peaks.len() - 1) * q / 1000];
     println!(
-        "{label}: allocations/statement={} bytes allocated/statement={}",
-        change.allocations / runs,
-        change.bytes_allocated / runs,
+        "{label}: allocations/statement={} bytes allocated/statement={} peak held p50={} p99={} max={}",
+        allocations / runs,
+        allocated / runs,
+        at(500),
+        at(990),
+        peaks[peaks.len() - 1],
     );
 }
 
-fn load(db: &Database, label: &str, dim: usize, n: usize, seed: u64) {
-    for start in (0..n).step_by(BATCH) {
-        let rows: Vec<Value> = (start..(start + BATCH).min(n))
-            .map(|i| {
-                Value::Map(
-                    [
-                        ("i".to_string(), Value::Int(i as i64)),
-                        ("e".to_string(), Value::Vector(synth(seed + i as u64, dim))),
-                    ]
-                    .into(),
-                )
-            })
-            .collect();
-        db.execute_cypher_shared(
-            &format!("UNWIND $rows AS r CREATE (:{label} {{i: r.i, e: r.e}})"),
-            Some(params(vec![("rows", Value::Array(rows))])),
-            None,
-            None,
-            None,
-        )
-        .expect("load");
-    }
-}
-
 fn main() {
+    alloc_peak::install();
     for (dim, n) in SHAPES {
         // Beside the build, not in the system temporary directory: hosts keep
         // a small root disk and the store grows under the concurrent writes.
         let dir = tempfile::tempdir_in(".").expect("tempdir");
-        let db = Database::open(dir.path()).expect("open");
         // The index exists before the vectors arrive: they enter it on write,
         // with no background build to wait for.
-        db.execute_cypher_shared(
-            &format!(
-                "CREATE VECTOR INDEX v_e ON :V(e) OPTIONS {{metric: \"euclidean\", dimensions: {dim}}}"
-            ),
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("index");
-        load(&db, "V", dim, n, 10);
-        load(&db, "W", dim, n, 10);
+        let db = vectors::open_loaded(dir.path(), dim, n);
         let queries: Vec<Vec<f32>> = (0..64).map(|q| synth(1_000_000 + q, dim)).collect();
         let shape = format!("d{dim} n{n}");
 

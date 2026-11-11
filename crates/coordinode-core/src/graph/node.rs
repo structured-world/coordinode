@@ -445,12 +445,21 @@ pub const NODE_KEY_PREFIX: &[u8] = b"node:";
 /// Big-endian ensures lexicographic ordering matches numeric ordering,
 /// enabling efficient range scans within a shard.
 pub fn encode_node_key(shard_id: u16, node_id: NodeId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(NODE_KEY_PREFIX.len() + 2 + 1 + 8);
-    key.extend_from_slice(NODE_KEY_PREFIX);
-    key.extend_from_slice(&shard_id.to_be_bytes());
-    key.push(b':');
-    key.extend_from_slice(&node_id.as_raw().to_be_bytes());
+    let mut key = Vec::with_capacity(NODE_KEY_LEN);
+    push_node_key(&mut key, shard_id, node_id);
     key
+}
+
+/// Bytes of every key [`encode_node_key`] makes.
+pub const NODE_KEY_LEN: usize = NODE_KEY_PREFIX.len() + 2 + 1 + 8;
+
+/// Append the key [`encode_node_key`] makes to `out`: many keys laid end to
+/// end in one buffer, [`NODE_KEY_LEN`] bytes each.
+pub fn push_node_key(out: &mut Vec<u8>, shard_id: u16, node_id: NodeId) {
+    out.extend_from_slice(NODE_KEY_PREFIX);
+    out.extend_from_slice(&shard_id.to_be_bytes());
+    out.push(b':');
+    out.extend_from_slice(&node_id.as_raw().to_be_bytes());
 }
 
 /// Decode a node key back into (shard_id, node_id).
@@ -1143,6 +1152,27 @@ impl NodeRecord {
         fields: &[u32],
         names: &[&str],
     ) -> Result<usize, rmp_serde::decode::Error> {
+        Self::decoded_bound(data, Some((fields, names)))
+    }
+
+    /// An upper bound of the heap bytes [`Self::from_msgpack`] takes for
+    /// `data`, read from markers and lengths alone: what a reader holding to
+    /// a memory budget reserves before decoding a whole record.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_msgpack`].
+    pub fn decode_bound(data: &[u8]) -> Result<usize, rmp_serde::decode::Error> {
+        Self::decoded_bound(data, None)
+    }
+
+    /// The bound of [`Self::projection_bound`] for the properties `selected`
+    /// names, or of [`Self::decode_bound`] for the whole record, its labels
+    /// included, when it names none.
+    fn decoded_bound(
+        data: &[u8],
+        selected: Option<(&[u32], &[&str])>,
+    ) -> Result<usize, rmp_serde::decode::Error> {
         let syntax = |what: &str, e: &dyn core::fmt::Display| {
             rmp_serde::decode::Error::Syntax(format!("record {what}: {e}"))
         };
@@ -1155,25 +1185,45 @@ impl NodeRecord {
             }
             _ => data,
         };
-        // Bounded by the record's length times a constant: no sum here can
-        // approach usize::MAX for bytes that fit in memory.
-        let mut bound = fields.len() * DECODED_ENTRY;
+        let field_wanted = |field: u32| selected.is_none_or(|(fields, _)| fields.contains(&field));
+        let name_wanted = |name: &str| selected.is_none_or(|(_, names)| names.contains(&name));
         let mut rest = body;
         let len = rmp::decode::read_array_len(&mut rest).map_err(|e| syntax("header", &e))?;
         if len < 2 {
             return Err(syntax("header", &format_args!("{len} elements")));
         }
-        skip_msgpack_value(&mut rest).map_err(|e| syntax("labels", &e))?;
+        // Bounded by the record's length times a constant: no sum here can
+        // approach usize::MAX for bytes that fit in memory.
+        let mut bound = match selected {
+            // A projection allocates its map for the fields it reads.
+            Some((fields, _)) => {
+                skip_msgpack_value(&mut rest).map_err(|e| syntax("labels", &e))?;
+                fields.len() * DECODED_ENTRY
+            }
+            // A whole record allocates its labels exactly, as many as stored.
+            None => {
+                let labels =
+                    rmp::decode::read_array_len(&mut rest).map_err(|e| syntax("labels", &e))?;
+                for _ in 0..labels {
+                    skip_msgpack_value(&mut rest).map_err(|e| syntax("label", &e))?;
+                }
+                labels as usize * core::mem::size_of::<LabelId>()
+            }
+        };
         let count = rmp::decode::read_map_len(&mut rest).map_err(|e| syntax("properties", &e))?;
+        if selected.is_none() {
+            bound += count as usize * DECODED_ENTRY;
+        }
         for _ in 0..count {
             let field: u32 =
                 rmp::decode::read_int(&mut rest).map_err(|e| syntax("property id", &e))?;
             let value = skip_msgpack_value(&mut rest).map_err(|e| syntax("property", &e))?;
-            if fields.contains(&field) {
+            if field_wanted(field) {
                 bound += value;
             }
         }
-        if len > 2 && !names.is_empty() && rest.first() != Some(&0xc0) {
+        let names_wanted = selected.is_none_or(|(_, names)| !names.is_empty());
+        if len > 2 && names_wanted && rest.first() != Some(&0xc0) {
             let count =
                 rmp::decode::read_map_len(&mut rest).map_err(|e| syntax("extra properties", &e))?;
             for _ in 0..count {
@@ -1182,7 +1232,7 @@ impl NodeRecord {
                 rest = tail;
                 let value =
                     skip_msgpack_value(&mut rest).map_err(|e| syntax("extra property", &e))?;
-                if names.contains(&name) {
+                if name_wanted(name) {
                     bound += name.len() + DECODED_ENTRY + value;
                 }
             }

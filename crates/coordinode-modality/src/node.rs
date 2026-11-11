@@ -78,6 +78,31 @@ pub trait NodeStore {
         node_ids: &[NodeId],
     ) -> StoreResult<Vec<Option<NodeRecord>>>;
 
+    /// [`Self::get_many`] holding the records within `budget`: the list of
+    /// results is charged before it is made, and each record, read where the
+    /// store holds it and never copied raw, is charged its decode's bound
+    /// before it is decoded, then what it holds. A record that does not fit
+    /// stops the read with the budget's refusal before it is decoded, and
+    /// every charge taken so far goes back. The returned charge pays for the
+    /// list and the records for as long as the caller holds them; a record
+    /// moved elsewhere takes its share along with
+    /// [`coordinode_core::budget::MemoryCharge::transfer`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_many`], or the budget's refusal
+    /// ([`StoreError::Budget`]).
+    fn get_many_charged<'b>(
+        &self,
+        txn: &Transaction,
+        shard_id: u16,
+        node_ids: &[NodeId],
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StoreResult<(
+        Vec<Option<NodeRecord>>,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )>;
+
     /// Tracked raw read for the query-execution path: encode the key, apply
     /// node-delta read-your-own-writes, then read the raw record bytes joining
     /// the transaction's OCC read-set (in MVCC mode; direct mode tracks
@@ -485,12 +510,143 @@ fn row_key(shard_id: u16, owner: EntryOwner) -> Vec<u8> {
 /// method.
 pub struct LocalNodeStore;
 
+/// A list of `len` empty record slots holding room for exactly `len`: built
+/// as a boxed slice, whose allocation is its length, so a charge of `len`
+/// slots pays for all of it whatever a growing list would round up to.
+fn no_records(len: usize) -> Vec<Option<NodeRecord>> {
+    core::iter::repeat_with(|| None)
+        .take(len)
+        .collect::<Box<[_]>>()
+        .into_vec()
+}
+
 impl LocalNodeStore {
     fn decode_record(bytes: &[u8]) -> StoreResult<NodeRecord> {
         NodeRecord::from_msgpack(bytes).map_err(|e| StoreError::Decode {
             kind: "node record",
             message: format!("{e}"),
         })
+    }
+
+    /// Decode the stored record `bytes` under `charge`: its decode's bound
+    /// is charged before the decode, then trued down to what the record
+    /// holds past its own struct, which the place it is kept pays for. A
+    /// record that does not fit is refused before it is decoded.
+    ///
+    /// # Errors
+    ///
+    /// The budget's refusal, a record that does not decode, or one holding
+    /// more than its bound: a wrong bound, not memory to reserve after it
+    /// was taken ([`StoreError::Invariant`]).
+    pub fn decode_record_charged(
+        bytes: &[u8],
+        charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+    ) -> StoreResult<NodeRecord> {
+        let bound = NodeRecord::decode_bound(bytes).map_err(|e| StoreError::Decode {
+            kind: "node record",
+            message: format!("{e}"),
+        })?;
+        // A bound past u64 asks for more than any limit.
+        let bound = u64::try_from(bound).unwrap_or(u64::MAX);
+        charge.grow(bound)?;
+        let record = match Self::decode_record(bytes) {
+            Ok(record) => record,
+            Err(e) => {
+                charge.shrink(bound);
+                return Err(e);
+            }
+        };
+        let held = record.held_bytes() - core::mem::size_of::<NodeRecord>() as u64;
+        let Some(spare) = bound.checked_sub(held) else {
+            return Err(StoreError::Invariant(format!(
+                "a node record holds {held} bytes past its decode bound of {bound}"
+            )));
+        };
+        charge.shrink(spare);
+        Ok(record)
+    }
+
+    /// Visit every node record of shard `shard_id` at the latest committed
+    /// state, handing `visit` its id and its stored bytes where the store
+    /// holds them, never copied: a reader under a budget charges a record
+    /// before it decodes it with [`Self::decode_record_charged`].
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or what `visit` returns.
+    pub fn for_each_stored_in_shard<E: From<StoreError>>(
+        txn: &Transaction,
+        shard_id: u16,
+        mut visit: impl FnMut(NodeId, &[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut prefix = Vec::with_capacity(8);
+        prefix.extend_from_slice(b"node:");
+        prefix.extend_from_slice(&shard_id.to_be_bytes());
+        prefix.push(b':');
+        let iter = txn
+            .base_prefix_iter(Partition::Node, &prefix)
+            .map_err(StoreError::from)?;
+        for guard in iter {
+            let (key, value) = guard.into_inner().map_err(StoreError::from)?;
+            if key.len() != 16 {
+                continue;
+            }
+            let id_bytes: [u8; 8] = match key[8..16].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            visit(NodeId::from_raw(u64::from_be_bytes(id_bytes)), &value)?;
+        }
+        Ok(())
+    }
+
+    /// Read the records of `node_ids` in one batch, handing `each` the
+    /// stored bytes of each id that has a record, with the id's index, where
+    /// the store holds them: never copied, decoded by `each`. Under
+    /// `budget`, the keys and what the read keeps aside for them are charged
+    /// before they exist and held until it returns. Stops at the first error.
+    fn read_many(
+        txn: &Transaction,
+        shard_id: u16,
+        node_ids: &[NodeId],
+        budget: Option<&coordinode_core::budget::QueryBudget>,
+        mut each: impl FnMut(usize, &[u8]) -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        use coordinode_core::graph::node::{NODE_KEY_LEN, push_node_key};
+        let _keys = match budget {
+            Some(budget) => Some(
+                budget.reserve(
+                    node_ids
+                        .len()
+                        .checked_mul(NODE_KEY_LEN + core::mem::size_of::<&[u8]>())
+                        .and_then(|bytes| u64::try_from(bytes).ok())
+                        .unwrap_or(u64::MAX),
+                )?,
+            ),
+            None => None,
+        };
+        // Every key laid end to end in one buffer holding exactly them, and
+        // a list of views into it holding exactly one per key.
+        let mut keys = Vec::with_capacity(node_ids.len() * NODE_KEY_LEN);
+        for id in node_ids {
+            push_node_key(&mut keys, shard_id, *id);
+        }
+        let mut key_refs: Vec<&[u8]> = Vec::with_capacity(node_ids.len());
+        key_refs.extend(
+            keys.as_chunks::<NODE_KEY_LEN>()
+                .0
+                .iter()
+                .map(<[u8; NODE_KEY_LEN]>::as_slice),
+        );
+        txn.multi_read_untracked_each(
+            Partition::Node,
+            &key_refs,
+            budget,
+            |slot, value| match value {
+                Some(bytes) => each(slot, bytes),
+                None => Ok(()),
+            },
+        )
     }
 
     fn encode_record(record: &NodeRecord) -> StoreResult<Vec<u8>> {
@@ -806,15 +962,39 @@ impl NodeStore for LocalNodeStore {
         shard_id: u16,
         node_ids: &[NodeId],
     ) -> StoreResult<Vec<Option<NodeRecord>>> {
-        let keys: Vec<Vec<u8>> = node_ids
-            .iter()
-            .map(|id| encode_node_key(shard_id, *id))
-            .collect();
-        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-        let raws = txn.multi_read_untracked(Partition::Node, &key_refs)?;
-        raws.into_iter()
-            .map(|opt| opt.map(|bytes| Self::decode_record(&bytes)).transpose())
-            .collect()
+        let mut records = no_records(node_ids.len());
+        Self::read_many(txn, shard_id, node_ids, None, |slot, bytes| {
+            records[slot] = Some(Self::decode_record(bytes)?);
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    fn get_many_charged<'b>(
+        &self,
+        txn: &Transaction,
+        shard_id: u16,
+        node_ids: &[NodeId],
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StoreResult<(
+        Vec<Option<NodeRecord>>,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
+        // A list longer than memory asks for more than any limit.
+        let list = node_ids
+            .len()
+            .checked_mul(core::mem::size_of::<Option<NodeRecord>>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX);
+        let mut charge = budget.reserve(list)?;
+        let mut records = no_records(node_ids.len());
+        // Each record's struct sits in the list charged above; its heap is
+        // charged before it is decoded.
+        Self::read_many(txn, shard_id, node_ids, Some(budget), |slot, bytes| {
+            records[slot] = Some(Self::decode_record_charged(bytes, &mut charge)?);
+            Ok(())
+        })?;
+        Ok((records, charge))
     }
 
     fn get_raw_tracked(
@@ -1246,24 +1426,9 @@ impl NodeStore for LocalNodeStore {
         shard_id: u16,
         visit: &mut dyn FnMut(NodeId, NodeRecord) -> StoreResult<()>,
     ) -> StoreResult<()> {
-        let mut prefix = Vec::with_capacity(8);
-        prefix.extend_from_slice(b"node:");
-        prefix.extend_from_slice(&shard_id.to_be_bytes());
-        prefix.push(b':');
-        let iter = txn.base_prefix_iter(Partition::Node, &prefix)?;
-        for guard in iter {
-            let (key, value) = guard.into_inner()?;
-            if key.len() != 16 {
-                continue;
-            }
-            let id_bytes: [u8; 8] = match key[8..16].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let node_id = NodeId::from_raw(u64::from_be_bytes(id_bytes));
-            visit(node_id, Self::decode_record(&value)?)?;
-        }
-        Ok(())
+        Self::for_each_stored_in_shard(txn, shard_id, |node_id, bytes| {
+            visit(node_id, Self::decode_record(bytes)?)
+        })
     }
 
     fn scan_shard(

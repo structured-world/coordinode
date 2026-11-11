@@ -1120,30 +1120,84 @@ impl<'a> Transaction<'a> {
         keys: &[&[u8]],
     ) -> StorageResult<Vec<Option<Vec<u8>>>> {
         let mut out: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
-        let mut miss_idx: Vec<usize> = Vec::new();
-        let mut miss_keys: Vec<&[u8]> = Vec::new();
+        self.multi_read_untracked_each(part, keys, None, |slot, value| {
+            out[slot] = value.map(<[u8]>::to_vec);
+            Ok::<(), StorageError>(())
+        })?;
+        Ok(out)
+    }
 
+    /// [`Self::multi_read_untracked`] handing each key's value to `each`
+    /// where it is held instead of copying it out: `each` gets the key's
+    /// index and its value or `None`, once per key, in no promised order.
+    /// A key this transaction wrote is answered from its write buffer (a
+    /// delete there is `None`), the others with one batched read through the
+    /// transaction's snapshot, or the latest state without one. A reader
+    /// holding to a memory budget charges a value before it copies or decodes
+    /// it; under `budget`, what this read keeps aside for the keys is charged
+    /// before it exists, as in [`StorageEngine::multi_get_each`].
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, the budget's refusal, or what `each` returns.
+    pub fn multi_read_untracked_each<
+        E: From<StorageError> + From<coordinode_core::budget::BudgetStop>,
+    >(
+        &self,
+        part: Partition,
+        keys: &[&[u8]],
+        budget: Option<&coordinode_core::budget::QueryBudget>,
+        mut each: impl FnMut(usize, Option<&[u8]>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        // The write buffer is probed with one key buffer as long as the
+        // longest key, reused for every key.
+        let probe_len = if self.write_buffer.is_empty() {
+            0
+        } else {
+            keys.iter().map(|key| key.len()).max().unwrap_or(0)
+        };
+        let _lists = crate::engine::core::reserve_slots(
+            budget,
+            keys.len(),
+            core::mem::size_of::<usize>() + core::mem::size_of::<&[u8]>(),
+        )?;
+        let _probe = crate::engine::core::reserve_slots(budget, probe_len, 1)?;
+        // Room for exactly the keys.
+        let mut miss_idx: Vec<usize> = Vec::with_capacity(keys.len());
+        let mut miss_keys: Vec<&[u8]> = Vec::with_capacity(keys.len());
+
+        let mut probe = (part, Vec::with_capacity(probe_len));
         for (i, key) in keys.iter().enumerate() {
-            if let Some(buffered) = self.write_buffer.get(&(part, key.to_vec())) {
-                out[i] = buffered.clone();
-            } else {
-                miss_idx.push(i);
-                miss_keys.push(key);
+            if probe_len > 0 {
+                probe.1.clear();
+                probe.1.extend_from_slice(key);
+                if let Some(buffered) = self.write_buffer.get(&probe) {
+                    each(i, buffered.as_deref())?;
+                    continue;
+                }
             }
+            miss_idx.push(i);
+            miss_keys.push(key);
         }
 
         if miss_keys.is_empty() {
-            return Ok(out);
+            return Ok(());
         }
 
-        let values = match self.snapshot {
-            Some(snap) => self.engine.snapshot_multi_get(&snap, part, &miss_keys)?,
-            None => self.engine.multi_get(part, &miss_keys)?,
+        let mut read = |n: usize, value: Option<crate::engine::core::StoredValue<'_>>| {
+            each(
+                miss_idx[n],
+                value.map(crate::engine::core::StoredValue::as_bytes),
+            )
         };
-        for (slot, value) in miss_idx.into_iter().zip(values) {
-            out[slot] = value.map(|b| b.to_vec());
+        match self.snapshot {
+            Some(snap) => self
+                .engine
+                .snapshot_multi_get_each(&snap, part, &miss_keys, budget, &mut read),
+            None => self
+                .engine
+                .multi_get_each(part, &miss_keys, budget, &mut read),
         }
-        Ok(out)
     }
 
     /// Untracked prefix scan over a partition: snapshot-aware (reads through

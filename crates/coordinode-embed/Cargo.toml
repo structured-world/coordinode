@@ -30,6 +30,9 @@ replication = [
 # Test builds only: steps a test runs inside the index workers. Never
 # enabled in a release build.
 test-hooks = []
+# Bench builds only: the vector top-k bench counts each statement's
+# allocations instead of timing it under the system allocator.
+bench-alloc = []
 
 [dependencies]
 coordinode-core = { workspace = true }
@@ -92,6 +95,8 @@ metrics-util = "0.20"
 tracing-subscriber = { workspace = true }
 # The routing bench counts allocations per command.
 stats_alloc = "0.1"
+# The vector bench counts the bytes a statement's own allocations hold at once.
+tracking-allocator = { version = "0.4", default-features = false }
 # The routing bench's floor: an echo over the members' own mutual TLS.
 tokio-rustls = { version = "0.26", default-features = false }
 rustls-pki-types = { version = "1", features = ["std"] }
@@ -138,6 +143,10 @@ harness = false
 
 [[bench]]
 name = "vector_queries"
+harness = false
+
+[[bench]]
+name = "vector_topk"
 harness = false
 
 [[bench]]

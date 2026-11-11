@@ -15,6 +15,58 @@ fn a_reservation_is_held_until_its_charge_drops() {
     assert_eq!(budget.memory_peak(), 100);
 }
 
+/// Memory that changes owner is paid for once: moving bytes between two
+/// charges of one budget leaves what the budget holds as it was, a move of
+/// more than the source holds is refused with neither charge changed, and
+/// each charge returns what it ends with.
+#[test]
+fn a_charge_moves_to_another_owner_without_paying_twice() {
+    let budget = QueryBudget::new(100);
+    let mut batch = budget.reserve(80).expect("within the limit");
+    let mut found = budget.empty_charge();
+    batch.transfer(30, &mut found).expect("held");
+    assert_eq!((batch.bytes(), found.bytes()), (50, 30));
+    assert_eq!(budget.memory_used(), 80, "nothing paid again");
+    assert_eq!(
+        batch.transfer(51, &mut found),
+        Err(TransferRefused::MoreThanHeld {
+            held: 50,
+            asked: 51
+        }),
+        "memory it does not hold would move unpaid"
+    );
+    assert_eq!((batch.bytes(), found.bytes()), (50, 30), "neither changed");
+    batch.transfer(50, &mut found).expect("all it holds");
+    assert_eq!((batch.bytes(), found.bytes()), (0, 80));
+    drop(batch);
+    assert_eq!(
+        budget.memory_used(),
+        80,
+        "the moved bytes stay with their owner"
+    );
+    drop(found);
+    assert_eq!(budget.memory_used(), 0);
+}
+
+/// A charge never moves to another budget's charge, whose drop would return
+/// bytes the first budget lent: the move is refused and neither budget nor
+/// charge changes.
+#[test]
+fn a_charge_does_not_move_to_another_budget() {
+    let one = QueryBudget::new(100);
+    let other = QueryBudget::new(100);
+    let mut from = one.reserve(40).expect("within the limit");
+    let mut to = other.reserve(10).expect("within the limit");
+    assert_eq!(
+        from.transfer(20, &mut to),
+        Err(TransferRefused::OtherBudget)
+    );
+    assert_eq!((from.bytes(), to.bytes()), (40, 10));
+    drop(from);
+    drop(to);
+    assert_eq!((one.memory_used(), other.memory_used()), (0, 0));
+}
+
 /// Memory handed to the query's later stages stays reserved after its charge
 /// is let go, so what they hold still counts against the limit; an empty
 /// charge grows like any other.
