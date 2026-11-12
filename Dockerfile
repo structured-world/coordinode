@@ -8,11 +8,11 @@
 # before building if proto/ is empty.
 
 # ─── Stage 1: Builder ────────────────────────────────────────────────
-FROM rust:1.99-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
-# Must track rust-toolchain.toml. The file is authoritative for the build, so
-# a base image on a different version either pulls a second toolchain at build
-# time or, if overridden, compiles with something the repository does not pin.
+# The current stable image, as rust-toolchain.toml names stable: the file is
+# authoritative for the build, and a base image on the same channel needs no
+# second toolchain pulled at build time.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools \
