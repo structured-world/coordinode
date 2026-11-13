@@ -30,6 +30,11 @@ type Reader = Option<SnapshotPin>;
 /// ceiling, so the first ones are answered from their stored records.
 const POSITIONS: u64 = 300;
 
+/// The most positions written while looking for one the ledger answers from
+/// its stored record: a machine whose commits raise the ceiling less often
+/// needs more of them before the first leaves memory.
+const MAX_POSITIONS: u64 = 4096;
+
 /// The stalled read, released after this: long against the read's own
 /// deadline, short against the test's.
 const STALL: Duration = Duration::from_secs(3);
@@ -48,8 +53,10 @@ fn now_us() -> u64 {
     .expect("microseconds fit")
 }
 
-/// A single-node member that applied `POSITIONS` commits, each raising the
-/// ceiling: the position and commit of each.
+/// A single-node member that applied at least `POSITIONS` commits: the
+/// coldest position the ledger answers from its stored record, then the
+/// newest, each with its commit ceiling as the engine answered it from
+/// memory right after the apply.
 async fn member() -> (
     tempfile::TempDir,
     Arc<StorageEngine>,
@@ -86,7 +93,24 @@ async fn member() -> (
     let ids = ProposalIdGenerator::new();
     let base = now_us();
     let mut written = Vec::new();
-    for i in 1..=POSITIONS {
+    let mut i = 0;
+    loop {
+        if i >= POSITIONS
+            && written.first().is_some_and(|&(first, _)| {
+                matches!(
+                    engine.commit_ceiling_at(first),
+                    Ok(CommitCeiling::Stored(_))
+                )
+            })
+        {
+            break;
+        }
+        assert!(
+            i < MAX_POSITIONS,
+            "no position left memory after {i} commits; {:?} records held",
+            engine.closure_records_held()
+        );
+        i += 1;
         let ts = base + i * 10;
         let pipeline = node.pipeline();
         let proposal = RaftProposal {
@@ -104,22 +128,18 @@ async fn member() -> (
             .await
             .expect("join")
             .expect("propose");
-        written.push((node.applied_index(), ts));
+        // Answered from memory now: the newest breakpoints are cached.
+        let position = node.applied_index();
+        let ceiling = engine
+            .commit_ceiling_through(position)
+            .expect("the ceiling of a position just applied");
+        written.push((position, ceiling));
     }
     engine.persist().expect("persist the ledger");
-    // Every case reads the first position from its stored record: it must
-    // not be among the breakpoints memory answers.
-    let first = written[0].0;
-    let answered = engine.commit_ceiling_at(first).expect("ceiling");
-    assert!(
-        matches!(answered, CommitCeiling::Stored(_)),
-        "position {first} is answered from memory ({answered:?}); positions {:?}..{:?}, \
-         {:?} records held",
-        written.first(),
-        written.last(),
-        engine.closure_records_held()
-    );
-    (dir, engine, node, written, reader)
+    // The coldest position read from its stored record, and the newest.
+    let cold = written[0];
+    let hot = *written.last().expect("a position");
+    (dir, engine, node, vec![cold, hot], reader)
 }
 
 /// `count` causal reads of position `index`, each given up after 20 ms.
