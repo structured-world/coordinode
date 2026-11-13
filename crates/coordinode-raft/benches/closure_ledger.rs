@@ -12,11 +12,18 @@
 //!
 //! One JSON line per window: the ledger part of an entry's apply (latency;
 //! the most bytes one held at once and what it left held), the records held
-//! at the end and their peak, warm (cached) and cold (stored) lookups
-//! (latency, peak bytes), cold lookups right after a reopen (block cache
-//! empty), the reopen and the ledger's load (time, bytes read through the
-//! filesystem from Linux `/proc/self/io` `rchar`, and the bytes the load
+//! at the end and their peak, lookups the cached breakpoints answer (`hit`)
+//! and lookups they miss, answered from a stored record (`miss`; latency,
+//! peak bytes), the reopen and the ledger's load (time, bytes read through
+//! the filesystem from Linux `/proc/self/io` `rchar`, and the bytes the load
 //! left held), and the Schema tree's bytes.
+//!
+//! The misses run twice over the same positions: the first pass right after
+//! the reopen (the tree's block cache empty), the second with it warm.
+//! Neither drops the operating system's page cache, so neither is a read
+//! from the device. Every lookup is the synchronous store call on the bench
+//! thread: what a read fence adds on top (a blocking thread, a place among
+//! the bounded stored reads) is not in these numbers.
 //!
 //! Run: `cargo bench -p coordinode-raft --bench closure_ledger`.
 
@@ -193,10 +200,10 @@ fn window(name: &str, entries: u64, lag: Option<u64>) {
     }
 
     // Positions over the whole log: the cached newest ones, and older ones
-    // a bounded window answers from its anchor.
+    // the cache misses (a bounded window answers them from its anchor).
     let step = usize::try_from((entries / 1000).max(1)).expect("small");
-    let cold: Vec<u64> = (1..entries.saturating_sub(300)).step_by(step).collect();
-    let warm: Vec<u64> = (entries - 200..=entries).collect();
+    let missed: Vec<u64> = (1..entries.saturating_sub(300)).step_by(step).collect();
+    let cached: Vec<u64> = (entries - 200..=entries).collect();
 
     let read_before = rchar();
     let opened = Instant::now();
@@ -212,9 +219,9 @@ fn window(name: &str, entries: u64, lag: Option<u64>) {
         peak_and_kept_of(|| engine.reload_closure_frontier().expect("load the ledger"));
     let load_ms = loaded.elapsed().as_secs_f64() * 1000.0;
     let load_read = rchar() - read_before;
-    let (cold_reopened, _) = lookups(&engine, &cold);
-    let (cold_ns, cold_peak) = lookups(&engine, &cold);
-    let (warm_ns, warm_peak) = lookups(&engine, &warm);
+    let (miss_first, _) = lookups(&engine, &missed);
+    let (miss_second, miss_peak) = lookups(&engine, &missed);
+    let (hit_ns, hit_peak) = lookups(&engine, &cached);
     let schema_bytes = engine.tree(Partition::Schema).expect("schema").disk_space();
 
     let report = serde_json::json!({
@@ -232,11 +239,11 @@ fn window(name: &str, entries: u64, lag: Option<u64>) {
         "ledger_load_read_bytes": load_read,
         "ledger_load_peak_bytes": load_peak,
         "ledger_load_kept_bytes": load_kept,
-        "warm_lookup_us": percentiles(warm_ns, 1000.0),
-        "warm_lookup_peak_bytes": warm_peak,
-        "cold_lookup_after_reopen_us": percentiles(cold_reopened, 1000.0),
-        "cold_lookup_us": percentiles(cold_ns, 1000.0),
-        "cold_lookup_peak_bytes": cold_peak,
+        "hit_lookup_us": percentiles(hit_ns, 1000.0),
+        "hit_lookup_peak_bytes": hit_peak,
+        "miss_lookup_first_pass_us": percentiles(miss_first, 1000.0),
+        "miss_lookup_second_pass_us": percentiles(miss_second, 1000.0),
+        "miss_lookup_peak_bytes": miss_peak,
         "schema_bytes": schema_bytes,
     });
     println!("{report}");
