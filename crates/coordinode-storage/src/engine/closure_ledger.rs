@@ -417,7 +417,7 @@ pub(crate) enum Ceiling {
 /// by retirement, oldest first (breakpoints are added only past the cached
 /// ones): a record found is still the newest at or before the position, and
 /// a range found empty may have been retired under the read, which the
-/// ledger then answers itself ([`ClosureLedger::ceiling_unstored`]).
+/// ledger then answers itself from memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoredCeiling {
     from: u64,

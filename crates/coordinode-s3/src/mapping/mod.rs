@@ -2,14 +2,14 @@
 //!
 //! Maps S3 concepts to CoordiNode graph storage:
 //!
-//! | S3 Concept     | Graph Concept          |
-//! |----------------|------------------------|
-//! | Bucket         | Namespace / Label      |
-//! | Object key     | Node ID + property     |
-//! | Object data    | BlobStore chunks       |
-//! | ETag           | SHA-256 content hash   |
-//! | StorageClass   | Tier (hot/warm/cold)   |  (EE only)
-//! | Versioning     | MVCC snapshot          |  (EE only)
+//! | S3 Concept     | Graph Concept                    |
+//! |----------------|----------------------------------|
+//! | Bucket         | Namespace / Label                |
+//! | Object key     | Node ID + property               |
+//! | Object data    | BlobStore chunks                 |
+//! | ETag           | SHA-256 content hash             |
+//! | StorageClass   | Tier (hot/warm/cold), EE only    |
+//! | Versioning     | MVCC snapshot, EE only           |
 
 /// Parse an S3-style path into bucket and key components.
 ///

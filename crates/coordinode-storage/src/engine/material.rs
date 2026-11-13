@@ -7,7 +7,7 @@
 //! bounds. Nothing per version records that, and summing it from the versions
 //! themselves would walk every key. So every write to an accounted tree also
 //! puts records into the accounting tree ([`Partition::Accounting`]), at the
-//! write's seqno, under the scope of the tree it describes ([`Head`]: the
+//! write's seqno, under the scope of the tree it describes (`Head`: the
 //! source's tag and the incarnation of its accounting):
 //! `head "ax" be_u64(seqno)` = the logical bytes that seqno wrote there. A put
 //! at the same seqno is idempotent, so a replay charges nothing twice.
