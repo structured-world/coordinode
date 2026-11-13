@@ -246,7 +246,8 @@ impl PageEccPolicy {
 }
 
 /// The recovery reserve an endpoint without a configured one keeps: this
-/// fraction of its hard limit, and at least [`RECOVERY_RECORD_ROOM`].
+/// fraction of its hard limit, and at least [`RECOVERY_RECORD_ROOM`] with
+/// [`RECOVERY_MARGIN`] beside it.
 pub const DEFAULT_RECOVERY_RESERVE_DIVISOR: u64 = 16;
 
 /// The least room one recovery record of the store's own may need beyond
@@ -254,18 +255,26 @@ pub const DEFAULT_RECOVERY_RESERVE_DIVISOR: u64 = 16;
 /// the one its accounting starts in the accounting tree.
 pub const RECOVERY_RECORD_ROOM: u64 = 2 * crate::engine::footprint::MEMTABLE_START_DEBT;
 
+/// The room a reserve keeps beside the starts of [`RECOVERY_RECORD_ROOM`]:
+/// the record's own bytes, and the growth past their admission that client
+/// writes' flushes can still take before it (a flush debt is bounded from
+/// totals, not per memtable). It is what a sixteenth of the smallest limit
+/// leaves beside one memtable start.
+pub const RECOVERY_MARGIN: u64 = MIN_HARD_LIMIT_BYTES / DEFAULT_RECOVERY_RESERVE_DIVISOR
+    - crate::engine::footprint::MEMTABLE_START_DEBT;
+
 // The floor leaves the smallest supported limit most of its room for data.
-const _: () = assert!(RECOVERY_RECORD_ROOM < MIN_HARD_LIMIT_BYTES / 2);
+const _: () = assert!(RECOVERY_RECORD_ROOM + RECOVERY_MARGIN < MIN_HARD_LIMIT_BYTES / 2);
 
 /// The recovery reserve of an endpoint with hard limit `limit` and no
 /// configured reserve: a [`DEFAULT_RECOVERY_RESERVE_DIVISOR`]th of it, and
 /// at a supported limit ([`MIN_HARD_LIMIT_BYTES`] and up) never less than
-/// [`RECOVERY_RECORD_ROOM`].
+/// [`RECOVERY_RECORD_ROOM`] and [`RECOVERY_MARGIN`] together.
 #[must_use]
 pub fn default_recovery_reserve(limit: u64) -> u64 {
     let share = limit / DEFAULT_RECOVERY_RESERVE_DIVISOR;
     if limit >= MIN_HARD_LIMIT_BYTES {
-        share.max(RECOVERY_RECORD_ROOM)
+        share.max(RECOVERY_RECORD_ROOM + RECOVERY_MARGIN)
     } else {
         share
     }
@@ -278,7 +287,7 @@ pub fn default_recovery_reserve(limit: u64) -> u64 {
 /// awaiting removal until its tables are flushed (1 MiB), the flush of the
 /// memtable it covers (its data, an eighth more and 128 KiB, charged ahead
 /// the same way), the room a store may grow while it opens (1 MiB) and the
-/// recovery reserve ([`default_recovery_reserve`]: 768 KiB here). An empty
+/// recovery reserve ([`default_recovery_reserve`]: 896 KiB here). An empty
 /// store takes about
 /// 160 KiB. A limit the operator lowers below what the store already holds
 /// stays valid down to this minimum and is pending, not refused.

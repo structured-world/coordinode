@@ -2,18 +2,22 @@ use super::*;
 
 /// The default recovery reserve holds the room one recovery record of the
 /// store's own may need (the memtables it starts in its tree and in the
-/// accounting tree) at the smallest supported limit, and a sixteenth of a
-/// large one.
+/// accounting tree) and the margin beside it at the smallest supported limit:
+/// the margin a sixteenth of that limit keeps beside one start. A large limit
+/// keeps a sixteenth.
 #[test]
 fn the_default_recovery_reserve_holds_one_recovery_record() {
+    let floor = RECOVERY_RECORD_ROOM + RECOVERY_MARGIN;
+    assert_eq!(default_recovery_reserve(MIN_HARD_LIMIT_BYTES), floor);
     assert_eq!(
-        default_recovery_reserve(MIN_HARD_LIMIT_BYTES),
-        RECOVERY_RECORD_ROOM
+        floor - RECOVERY_RECORD_ROOM,
+        MIN_HARD_LIMIT_BYTES / 16 - crate::engine::footprint::MEMTABLE_START_DEBT,
+        "the margin beside the record's starts is the one a sixteenth leaves beside one start"
     );
     assert_eq!(default_recovery_reserve(1 << 30), (1 << 30) / 16);
     let endpoint = EndpointConfig::new("e", "/x", Media::Hdd, Durability::Durable, Tier::Warm)
         .with_hard_limit_bytes(MIN_HARD_LIMIT_BYTES);
-    assert_eq!(endpoint.recovery_reserve(), RECOVERY_RECORD_ROOM);
+    assert_eq!(endpoint.recovery_reserve(), floor);
 }
 
 /// A columnar table's tree lands its levels where the node partition's land,
