@@ -2860,13 +2860,15 @@ impl RaftNode {
     }
 
     /// The voter to hand leadership to: one that acknowledged this leader
-    /// within an election timeout, the most caught-up of them (the lowest id
-    /// among equals). `None` when this node does not lead or no other voter
-    /// is live.
+    /// within an election timeout, the most caught-up of them, and among
+    /// equals the one heard from last. `None` when this node does not lead or
+    /// no other voter is live.
     ///
     /// A voter the leader has not heard from for that long is taken as gone,
     /// as a follower takes its leader: handing leadership to it would wait
     /// out the transfer timeout and leave the group to an election anyway.
+    /// Inside that window a member that stopped a moment ago still counts;
+    /// its acknowledgement is the older one, so a running equal wins.
     pub fn find_transfer_target(&self) -> Option<u64> {
         use openraft::Instant as _;
         use openraft::async_runtime::watch::WatchReceiver;
@@ -2881,20 +2883,18 @@ impl RaftNode {
             .membership()
             .voter_ids()
             .filter(|&id| id != self.node_id)
-            .filter(|id| {
-                heartbeat
-                    .get(id)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|acked| acked.elapsed() <= live_within)
+            .filter_map(|id| {
+                let acked = heartbeat.get(&id).copied().flatten()?;
+                (acked.elapsed() <= live_within).then_some((id, acked))
             })
-            .max_by_key(|id| {
+            .max_by_key(|&(id, acked)| {
                 let matched = replication
-                    .get(id)
+                    .get(&id)
                     .and_then(Option::as_ref)
                     .map(|log| log.index);
-                (matched, core::cmp::Reverse(*id))
+                (matched, acked)
             })
+            .map(|(id, _)| id)
     }
 
     /// A live voter, other than this leader, that holds every entry of the

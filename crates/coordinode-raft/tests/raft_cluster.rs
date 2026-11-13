@@ -5812,6 +5812,32 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
             "cluster should elect a new leader after graceful shutdown"
         );
 
+        // The new leader hands over next to the member still running, not to
+        // the one that just stopped: both acknowledged it within an election
+        // timeout and hold the same log, and the fresher acknowledgement is
+        // the live one. Before, equals went to the lowest id, the stopped
+        // member, and the next shutdown waited out its transfer timeout.
+        let (leader, other) = if n2.is_leader().await {
+            (&n2, 3)
+        } else {
+            (&n3, 2)
+        };
+        // Asked well inside an election timeout of the stopped member's last
+        // acknowledgement, while it still counts as live.
+        let mut target = None;
+        for _ in 0..5 {
+            target = leader.find_transfer_target();
+            if target == Some(other) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            target,
+            Some(other),
+            "the next handover goes to the running member"
+        );
+
         n2.shutdown().await.expect("s2");
         n3.shutdown().await.expect("s3");
     })
