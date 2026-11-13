@@ -104,6 +104,16 @@ fn assert_exact(engine: &StorageEngine, first: u64, case: &str) {
     );
 }
 
+/// Reopen after a cut with the retirement of folded unit records refused:
+/// the fold at the open retires the units below the retirement window its
+/// cursor reaches, which the commits' timestamps cross whenever the case
+/// runs over a window boundary of the clock, and the unit multiplicity this
+/// file checks is the replay's, read before any retirement.
+fn reopen(rig: &PowerRig) -> StorageEngine {
+    crate::engine::core::material_fold::REFUSE_RETIRE.with(|refuse| refuse.set(true));
+    rig.open().0
+}
+
 /// Persist `parts` alone, then lose power.
 fn persist_then_cut(rig: &PowerRig, engine: StorageEngine, parts: &[Partition]) {
     for &part in parts {
@@ -123,7 +133,7 @@ fn accounting_lost_beside_durable_data_is_replayed_from_the_entries() {
     let (engine, oracle) = rig.open();
     let first = commit_all(&engine, &oracle);
     persist_then_cut(&rig, engine, &[Partition::Node, Partition::Adj]);
-    let (engine, _) = rig.open();
+    let engine = reopen(&rig);
     assert_exact(&engine, first, "data durable, accounting lost");
 }
 
@@ -135,7 +145,7 @@ fn data_lost_beside_durable_accounting_is_replayed_once() {
     let (engine, oracle) = rig.open();
     let first = commit_all(&engine, &oracle);
     persist_then_cut(&rig, engine, &[Partition::Accounting]);
-    let (engine, _) = rig.open();
+    let engine = reopen(&rig);
     assert_exact(&engine, first, "accounting durable, data lost");
 }
 
@@ -148,7 +158,7 @@ fn an_entry_held_by_one_of_its_trees_is_accounted_whole() {
     let (engine, oracle) = rig.open();
     let first = commit_all(&engine, &oracle);
     persist_then_cut(&rig, engine, &[Partition::Node]);
-    let (engine, _) = rig.open();
+    let engine = reopen(&rig);
     assert_exact(
         &engine,
         first,
@@ -163,10 +173,10 @@ fn an_entry_missing_from_one_data_tree_only_replays_that_part() {
     let (engine, oracle) = rig.open();
     let first = commit_all(&engine, &oracle);
     persist_then_cut(&rig, engine, &[Partition::Node, Partition::Accounting]);
-    let (engine, _) = rig.open();
+    let engine = reopen(&rig);
     assert_exact(&engine, first, "adjacency lost alone");
     // A second cut and open replay nothing more.
     rig.cut(engine);
-    let (engine, _) = rig.open();
+    let engine = reopen(&rig);
     assert_exact(&engine, first, "a second open");
 }
