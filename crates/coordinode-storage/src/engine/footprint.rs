@@ -489,9 +489,23 @@ impl Footprint {
         let mut admitted = self.admitted.load(Ordering::Acquire);
         loop {
             // Each term is bounded by the bytes the endpoint can hold.
-            let need = self.charged() + admitted + debt + bytes;
+            let charged = self.charged();
+            let need = charged + admitted + debt + bytes;
             if need > ceiling {
                 metrics::counter!("coordinode_footprint_refusals_total").increment(1);
+                // What the refusal was judged on, at the moment it was taken:
+                // a later reading has moved with flushes and admissions.
+                tracing::debug!(
+                    endpoint = %self.id,
+                    class = ?class,
+                    bytes,
+                    charged,
+                    admitted,
+                    debt,
+                    ceiling,
+                    limit,
+                    "footprint refused a write"
+                );
                 return Err(StorageError::CapacityExhausted {
                     endpoint_id: self.id.clone(),
                     used_bytes: need - bytes,
