@@ -348,7 +348,16 @@ fn open_source(
     // A copy an earlier open left behind is of no use.
     remove_staging(staging, footprints)?;
     let tree_dir = Partition::Schema.name();
-    copy_dir(&checkpoint.join(tree_dir), &staging.join(tree_dir))?;
+    // Charged file by file before it is written; a copy cut short by the
+    // limit or a failure is removed with what it charged.
+    if let Err(e) = copy_dir(
+        &checkpoint.join(tree_dir),
+        &staging.join(tree_dir),
+        footprints,
+    ) {
+        remove_staging(staging, footprints)?;
+        return Err(e);
+    }
     let mut config = config.clone();
     config.endpoints = vec![EndpointConfig::new(
         "source",
@@ -474,8 +483,9 @@ fn reinstall(schema: &AnyTree, event: ScanSinceEvent) -> bool {
     true
 }
 
-/// Copy the directory `from` to `to`, file by file.
-fn copy_dir(from: &Path, to: &Path) -> StorageResult<()> {
+/// Copy the directory `from` to `to`, file by file, each charged to
+/// `footprints` before it is written.
+fn copy_dir(from: &Path, to: &Path, footprints: &Footprints) -> StorageResult<()> {
     let io = |what: &str, path: &Path, e: std::io::Error| {
         StorageError::Io(format!("{what} {path:?}: {e}"))
     };
@@ -494,22 +504,23 @@ fn copy_dir(from: &Path, to: &Path) -> StorageResult<()> {
                 std::fs::create_dir_all(&target).map_err(|e| io("create", &target, e))?;
                 stack.push((source, target));
             } else {
-                std::fs::copy(&source, &target).map_err(|e| io("copy", &source, e))?;
+                super::copy_new(&source, &target, footprints)?;
             }
         }
     }
     Ok(())
 }
 
-/// Remove the staged copy at `staging`, if there is one, and what the
-/// footprint was charged for it.
+/// Remove the staged copy at `staging`, if there is one, and once it is
+/// gone what the footprint was charged for it. A removal that fails keeps
+/// the charge of whatever is left.
 fn remove_staging(staging: &Path, footprints: &Footprints) -> StorageResult<()> {
     // no-std: StoragePort trait, caller-injected
-    let removed = match std::fs::remove_dir_all(staging) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StorageError::Io(format!("remove {staging:?}: {e}"))),
-    };
+    match std::fs::remove_dir_all(staging) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StorageError::Io(format!("remove {staging:?}: {e}"))),
+    }
     footprints.removed_tree(staging);
-    removed
+    Ok(())
 }

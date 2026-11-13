@@ -578,3 +578,102 @@ fn a_corrupt_schema_tree_is_rebuilt_and_a_clean_one_verified_once() {
         "a rebuilt tree is verified again by the repair pass"
     );
 }
+
+/// Bytes the files under `dir` hold, each name counted.
+fn dir_len(dir: &Path) -> u64 {
+    if !dir.exists() {
+        return 0;
+    }
+    tree_files(dir)
+        .values()
+        .map(|bytes| bytes.len() as u64)
+        .sum()
+}
+
+/// The copy of a checkpoint's Schema tree a rebuild at the open stages is
+/// charged to the endpoint's footprint before it is written: an endpoint
+/// with less room than the copy refuses the open, grows by nothing past its
+/// allowance, keeps the checkpoint as it was and the rebuild owed, and the
+/// next open with room finishes it. Copied unmetered, the open passed the
+/// endpoint's limit.
+#[test]
+fn a_schema_copy_that_does_not_fit_the_endpoint_is_refused() {
+    let store = Checkpointed::new(true);
+    let primary = store.primary();
+    {
+        // Rows that do not compress, kept in the checkpoint taken after them.
+        let engine = open_journaled(&store.config).expect("open");
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for i in 0..6_000u32 {
+            let value: Vec<u8> = (0..1024)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
+                })
+                .collect();
+            engine
+                .put(
+                    Partition::Schema,
+                    format!("schema:big:{i:06}").as_bytes(),
+                    &value,
+                )
+                .expect("a schema row");
+        }
+        engine.persist().expect("persist");
+        engine
+            .create_checkpoint(
+                &crate::engine::rebuild::checkpoint_root(&primary).join(format!(
+                    "{}{:020}",
+                    crate::engine::rebuild::CHECKPOINT_PREFIX,
+                    1
+                )),
+            )
+            .expect("checkpoint");
+    }
+    store.cut_a_schema_rebuild_short();
+    let latest = crate::engine::rebuild::latest_checkpoint(
+        &crate::engine::rebuild::checkpoint_root(&primary),
+    )
+    .expect("list")
+    .expect("a checkpoint");
+    let schema_copy = dir_len(&latest.join(Partition::Schema.name()));
+    assert!(
+        schema_copy > 4 * crate::engine::footprint::OVER_LIMIT_ALLOWANCE,
+        "the Schema copy ({schema_copy} bytes) must not fit the room left"
+    );
+    let checkpoint = tree_files(&latest);
+
+    // Room for what the endpoint holds and a little more, not the copy.
+    let held = dir_len(&primary);
+    let mut tight = store.config.clone();
+    tight.endpoints[0] = tight.endpoints[0].clone().with_hard_limit_bytes(
+        crate::engine::config::MIN_HARD_LIMIT_BYTES
+            .max(held + crate::engine::footprint::OVER_LIMIT_ALLOWANCE),
+    );
+    let opened = open_journaled(&tight);
+    let staged = dir_len(&primary.join("schema-source"));
+    assert!(
+        staged <= crate::engine::footprint::OVER_LIMIT_ALLOWANCE,
+        "the refused open wrote {staged} bytes of the copy, past its allowance"
+    );
+    assert!(
+        !primary.join("schema-source").exists(),
+        "the refused copy was left behind"
+    );
+    match opened {
+        Err(StorageError::CapacityExhausted { .. }) => {}
+        Err(e) => panic!("refused for another reason: {e}"),
+        Ok(_) => panic!("the open copied the Schema tree past the endpoint's limit"),
+    }
+    assert_eq!(tree_files(&latest), checkpoint, "the checkpoint changed");
+    assert_eq!(
+        read_rebuild_intents(&primary).expect("intents").partitions,
+        [Partition::Schema],
+        "the rebuild is no longer owed"
+    );
+
+    let engine = open_journaled(&store.config).expect("open with room");
+    store.assert_whole(&engine);
+}
