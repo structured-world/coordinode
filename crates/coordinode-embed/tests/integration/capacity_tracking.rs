@@ -294,6 +294,47 @@ fn schema_writes_use_the_recovery_reserve_client_writes_leave() {
     assert!(allocated_under(dir.path()) <= ROOMY);
 }
 
+/// A store filled to the client ceiling under the default reserve closes and
+/// reopens within its limit, and each time its own record lands: a Schema
+/// write starts its own memtable and its accounting's, both after the flush
+/// a close or an open leaves them empty in, and the reserve holds the room
+/// both owe. Client writes stay refused across the reopen.
+#[test]
+fn a_store_at_the_client_ceiling_closes_and_reopens_with_room_for_its_own_record() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = quiet_capped("small", dir.path(), ROOMY);
+    {
+        let engine = StorageEngine::open(&config).expect("open");
+        saturate(&engine, Partition::Node, "node:0:");
+        engine.persist().expect("persist at the ceiling");
+        engine
+            .put(Partition::Schema, b"schema:label:BeforeClose", b"{}")
+            .expect("the store's own record lands at the client ceiling");
+        assert!(allocated_under(dir.path()) <= ROOMY);
+    }
+    assert!(
+        allocated_under(dir.path()) <= ROOMY,
+        "the close passed the limit"
+    );
+    let engine = StorageEngine::open(&config).expect("reopen at the client ceiling");
+    assert!(
+        allocated_under(dir.path()) <= ROOMY,
+        "the reopen passed the limit"
+    );
+    engine
+        .put(Partition::Schema, b"schema:label:AfterReopen", b"{}")
+        .expect("the store's own record lands after the reopen");
+    assert!(
+        matches!(
+            engine.put(Partition::Node, b"node:0:denied", &incompressible(1)),
+            Err(StorageError::CapacityExhausted { .. })
+        ),
+        "a client write took the room the reserve holds"
+    );
+    engine.persist().expect("persist");
+    assert!(allocated_under(dir.path()) <= ROOMY);
+}
+
 /// Files removed behind the engine's back are not seen while it runs: their
 /// charge stays, so the account never falls below what the engine itself
 /// holds. The next open measures the files as they are.
