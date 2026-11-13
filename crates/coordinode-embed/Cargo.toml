@@ -114,6 +114,10 @@ name = "field_names"
 harness = false
 
 [[bench]]
+name = "open_checkpointed"
+harness = false
+
+[[bench]]
 name = "index_write"
 harness = false
 
