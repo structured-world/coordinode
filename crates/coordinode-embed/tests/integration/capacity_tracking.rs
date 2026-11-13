@@ -321,6 +321,14 @@ fn a_store_at_the_client_ceiling_closes_and_reopens_with_room_for_its_own_record
         allocated_under(dir.path()) <= ROOMY,
         "the reopen passed the limit"
     );
+    assert_eq!(
+        engine
+            .get(Partition::Schema, b"schema:label:BeforeClose")
+            .expect("read")
+            .as_deref(),
+        Some(&b"{}"[..]),
+        "the record written at the ceiling did not survive the close"
+    );
     engine
         .put(Partition::Schema, b"schema:label:AfterReopen", b"{}")
         .expect("the store's own record lands after the reopen");
