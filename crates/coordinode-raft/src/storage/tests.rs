@@ -2933,6 +2933,45 @@ async fn an_offline_capture_takes_only_commits_below_the_closed_bound() {
     assert!(read(b"node:00:above").is_none(), "above the bound");
 }
 
+/// The same member reopened after its clock passed the bound, its Registry
+/// tree compacted (as maintenance does at any time: each apply writes the
+/// tree's coverage marker) before the capture pins its cut: the capture
+/// still reads the state at the bound.
+#[tokio::test]
+async fn an_offline_capture_survives_a_registry_compaction_past_the_bound() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let t = {
+        let (engine, oracle) = open_rig_engine(&rig);
+        let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+            .expect("open");
+        let t = oracle.current().as_raw() + 1_000;
+        apply_entries(
+            &mut sm,
+            vec![
+                capture_entry(1, t + 1, PartitionId::Node, b"node:00:below", b"v", 0),
+                capture_entry(2, t + 2, PartitionId::Node, b"node:00:at", b"v", t + 2),
+                capture_entry(3, t + 3, PartitionId::Node, b"node:00:above", b"v", 0),
+                capture_entry(4, t + 4, PartitionId::Node, b"node:00:last", b"v", 0),
+            ],
+        )
+        .await;
+        drop(sm);
+        engine.persist().expect("persist");
+        t
+    };
+    let (engine, oracle) = open_rig_engine(&rig);
+    // The clock past every commit, so the compaction's threshold is too.
+    while oracle.current().as_raw() <= t + 4 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    engine
+        .force_compaction(Partition::Registry)
+        .expect("compact the registry");
+    let read = |key: &[u8]| captured(&engine, Partition::Node, key).expect("a qualified cut");
+    assert!(read(b"node:00:below").is_some(), "below the bound");
+    assert!(read(b"node:00:at").is_none(), "at the bound");
+}
+
 /// A member whose closed bound reached disk in the Schema tree while a
 /// partition it covers lost the entries behind it is not captured as if the
 /// bound held: the capture refuses, or holds what the bound covers.

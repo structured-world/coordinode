@@ -484,6 +484,12 @@ pub struct GcWatermarkController {
     /// CockroachDB protected timestamp / TiDB service safe point. `u64::MAX`
     /// (the default) imposes no extra constraint.
     external_floor: AtomicU64,
+    /// The closed bound of the group log a member's store holds (exclusive),
+    /// `u64::MAX` for a store without one. An offline capture reads every
+    /// tree but the consensus state's at that bound, so no tree is collected
+    /// past it: the consumer registry included, whose threshold the
+    /// consensus state shares.
+    closed_floor: AtomicU64,
     /// MVCC time-travel retention window in seqno units (HLC microseconds):
     /// the watermark is held back to at least `current_seqno - window` so every
     /// `AS OF TIMESTAMP` inside the window resolves, registry or not. Applied
@@ -513,6 +519,7 @@ impl GcWatermarkController {
             seqno,
             pending,
             external_floor: AtomicU64::new(u64::MAX),
+            closed_floor: AtomicU64::new(u64::MAX),
             retention_window_us: AtomicU64::new(retention_window_us),
             seqno_is_clock,
         };
@@ -533,7 +540,12 @@ impl GcWatermarkController {
         // A durable read can stand below the latest complete snapshot, behind
         // what the journal has not synced yet; its history stays too.
         let current = self.pending.durable_floor(self.seqno.get());
-        let pin_floor = pins.keys().next().copied().unwrap_or(current);
+        let pin_floor = pins
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(current)
+            .min(self.closed_floor.load(Ordering::Acquire));
         self.system_watermark.store(pin_floor, Ordering::Release);
         let mut watermark = pin_floor.min(self.external_floor.load(Ordering::Acquire));
         let window = self.retention_window_us.load(Ordering::Acquire);
@@ -625,6 +637,15 @@ impl GcWatermarkController {
     /// reader's versions to be collected.
     pub fn set_external_floor(&self, floor: u64) {
         self.external_floor.store(floor, Ordering::Release);
+        self.tick();
+    }
+
+    /// Hold every partition's collection at the closed bound `below` of the
+    /// group log the store holds (`0`: none closed, nothing to hold), and
+    /// recompute.
+    pub(crate) fn hold_closed_bound(&self, below: u64) {
+        let floor = if below == 0 { u64::MAX } else { below };
+        self.closed_floor.store(floor, Ordering::Release);
         self.tick();
     }
 
@@ -897,6 +918,12 @@ impl LocalMultiModalCoordinator {
     /// clears the constraint (no registry).
     pub fn set_consumer_retention_floor(&self, floor: u64) {
         self.gc_controller.set_external_floor(floor);
+    }
+
+    /// Hold every partition's collection at the closed bound of the group
+    /// log the store holds. See [`GcWatermarkController::hold_closed_bound`].
+    pub(crate) fn hold_closed_bound(&self, below: u64) {
+        self.gc_controller.hold_closed_bound(below);
     }
 
     /// Set the MVCC time-travel retention window (seqno units, HLC

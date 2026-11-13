@@ -1224,7 +1224,9 @@ async fn check_retention_surfaces_retention_lost() {
 }
 
 /// The time-travel window belongs to the engine: with a tiny window and no
-/// consumer, the watermark sits exactly a window below the current seqno.
+/// consumer, the watermark sits a window below the current seqno, or at the
+/// group's closed bound when that is lower (a capture of the store reads at
+/// that bound, so nothing is collected past it).
 #[tokio::test(flavor = "multi_thread")]
 async fn engine_window_governs_when_no_consumer_is_registered() {
     let f = fixture(Arc::new(ManualClock::new(0))).await;
@@ -1235,7 +1237,10 @@ async fn engine_window_governs_when_no_consumer_is_registered() {
     f.engine.set_retention_window(Duration::from_millis(1));
     assert_eq!(f.engine.gc_watermark(), 1, "the consumer holds collection");
     f.reg.unregister(h).expect("cancel");
-    assert_eq!(f.engine.gc_watermark(), f.engine.snapshot() - 1_000);
+    let window_floor = f.engine.snapshot() - 1_000;
+    let closed = f.engine.closure_frontier();
+    assert!(closed > 1, "the group closed no bound past the consumer");
+    assert_eq!(f.engine.gc_watermark(), window_floor.min(closed));
     f.node.shutdown().await.expect("shutdown");
 }
 

@@ -1173,6 +1173,11 @@ impl StorageEngine {
                     crate::engine::closure_ledger::ClosureLedger::stored_held(&head)?,
                     std::sync::atomic::Ordering::Release,
                 );
+                // A capture of the store reads at its closed bound: nothing
+                // the open or its maintenance collects goes past it.
+                gc_controller.hold_closed_bound(
+                    crate::engine::closure_ledger::ClosureLedger::stored_below(&head)?,
+                );
             }
         }
 
@@ -7653,6 +7658,7 @@ impl StorageEngine {
             .closure_frontier
             .fetch_max(below, std::sync::atomic::Ordering::AcqRel);
         if below > previous {
+            self.coordinator.hold_closed_bound(below);
             self.applied_feed.closed(index, below - 1);
         }
         Ok(())
@@ -7765,6 +7771,7 @@ impl StorageEngine {
         let ledger = self.stored_closure_ledger()?;
         self.closure_frontier
             .store(ledger.below(), std::sync::atomic::Ordering::Release);
+        self.coordinator.hold_closed_bound(ledger.below());
         self.raft_applied_ts.store(
             ledger.applied_ceiling(),
             std::sync::atomic::Ordering::Release,

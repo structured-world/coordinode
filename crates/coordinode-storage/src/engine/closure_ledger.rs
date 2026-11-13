@@ -528,6 +528,15 @@ impl ClosureLedger {
     pub(crate) fn stored_held(bytes: &[u8]) -> StorageResult<u64> {
         Ok(head_fields(bytes)?(5))
     }
+
+    /// The closed bound the head record holds, read from it alone.
+    ///
+    /// # Errors
+    ///
+    /// The record is not one [`Self::encode`] wrote.
+    pub(crate) fn stored_below(bytes: &[u8]) -> StorageResult<u64> {
+        Ok(head_fields(bytes)?(0))
+    }
 }
 
 /// The fields of a head record, by position, once its format and length

@@ -1071,6 +1071,11 @@ horizon for both time-travel reads and lagging-consumer recovery.
   registry and the node's consensus state) is read as it stands now and is
   rewritten on every heartbeat, so compaction keeps only its live version
   plus whatever a running snapshot still reads.
+- A cluster member also keeps every partition's state at its group's closed
+  bound (the newest point below which the log is known complete), so a
+  stopped member's store can be captured offline at that bound. The bound
+  normally trails the newest commit by a fraction of a second; while it
+  stalls, collection waits for it, data and the consumer registry alike.
 - The window is paid for in storage, per key: compaction keeps every version
   of a key written inside the window plus the newest one below it, and folds
   the rest. Budget disk for the data size plus one stored version per update
