@@ -94,9 +94,10 @@ async fn closed_by_its_own_entry(
 #[test]
 fn partition_roundtrip() {
     // Verify to_partition / to_partition_id are inverse.
-    // Partition::Raft is internal-only and has no PartitionId mapping.
+    // Partition::Raft and Partition::Accounting are internal-only and have no
+    // PartitionId mapping.
     for p in Partition::all() {
-        if *p == Partition::Raft {
+        if p.proposal_id().is_none() {
             continue;
         }
         let id = to_partition_id(*p);

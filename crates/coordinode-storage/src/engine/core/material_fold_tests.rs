@@ -22,6 +22,14 @@ fn config(dir: &std::path::Path) -> StorageConfig {
     )])
 }
 
+/// The Node tree's accounting scope.
+fn node_scope(engine: &StorageEngine) -> crate::engine::material::Scope<'_> {
+    let heads = *engine.material_heads();
+    engine
+        .material_scope(&heads, Partition::Node)
+        .expect("scope")
+}
+
 fn engine_at(dir: &std::path::Path, base: u64) -> StorageEngine {
     let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(base)));
     StorageEngine::open_with_oracle(&config(dir), oracle).expect("open")
@@ -576,10 +584,10 @@ fn a_range_past_the_budget_stops_the_round_and_resumes() {
             round,
             "a round left short was published"
         );
-        let tree = engine.tree(Partition::Node).expect("tree");
+        let tree = node_scope(&engine);
         let rested = (0..KEYS)
             .filter(|i| {
-                crate::engine::material::fold::read(tree, format!("node:{i:05}").as_bytes())
+                crate::engine::material::fold::read(&tree, format!("node:{i:05}").as_bytes())
                     .expect("descriptor")
                     .is_some_and(|d| d.rests_on.is_some())
             })
@@ -619,20 +627,25 @@ fn a_round_holds_no_more_memory_than_it_may() {
     // Room for a handful of units of 2 KB keys: each reserves its key's
     // copies and its summary moves at their most, a range page the longest
     // key it could resume from, and the fold its reads at their longest
-    // through the tree's runs.
-    const MEMORY: u64 = 5 << 18;
+    // through the tree's runs. The handful is sized over a tree with no
+    // table; the accounting tree's tables (the open's recount flushed it)
+    // add their reads, the round's three quarters given to the fold.
+    let runs = node_scope(&engine).runs();
+    let reads = crate::engine::material::fold::least_memory(runs)
+        - crate::engine::material::fold::least_memory(0);
+    let memory: u64 = (5 << 18) + reads * 4 / 3;
     let round = engine.material_round().expect("round");
     assert_eq!(
         engine
-            .fold_round_within(&mut folder, target, usize::MAX, MEMORY, true)
+            .fold_round_within(&mut folder, target, usize::MAX, memory, true)
             .expect("round"),
         super::material_fold::Progress::Short,
-        "{UNITS} units of 2 KB keys fitted in {MEMORY} bytes"
+        "{UNITS} units of 2 KB keys fitted in {memory} bytes"
     );
     assert_eq!(engine.material_round().expect("round"), round);
     let mut rounds = 1;
     while engine
-        .fold_round_within(&mut folder, target, usize::MAX, MEMORY, true)
+        .fold_round_within(&mut folder, target, usize::MAX, memory, true)
         .expect("round")
         == super::material_fold::Progress::Short
     {
@@ -641,7 +654,7 @@ fn a_round_holds_no_more_memory_than_it_may() {
     }
     assert!(
         rounds > 2,
-        "{rounds} rounds folded {UNITS} units in {MEMORY} bytes"
+        "{rounds} rounds folded {UNITS} units in {memory} bytes"
     );
 
     // A range deletion over those keys walks no more of them per round than
@@ -658,25 +671,25 @@ fn a_round_holds_no_more_memory_than_it_may() {
     let target = engine.complete_cut().expect("cut") + 1;
     assert_eq!(
         engine
-            .fold_round_within(&mut folder, target, usize::MAX, MEMORY, true)
+            .fold_round_within(&mut folder, target, usize::MAX, memory, true)
             .expect("round"),
         super::material_fold::Progress::Short
     );
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let tree = node_scope(&engine);
     let rested = (0..UNITS)
         .filter(|i| {
             let key = format!("node:{i:03}:{}", "k".repeat(2_000));
-            crate::engine::material::fold::read(tree, key.as_bytes())
+            crate::engine::material::fold::read(&tree, key.as_bytes())
                 .expect("descriptor")
                 .is_some_and(|d| d.rests_on.is_some())
         })
         .count();
     assert!(
         (1..=8).contains(&rested),
-        "a round in {MEMORY} bytes folded {rested} keys of the range"
+        "a round in {memory} bytes folded {rested} keys of the range"
     );
     while engine
-        .fold_round_within(&mut folder, target, usize::MAX, MEMORY, true)
+        .fold_round_within(&mut folder, target, usize::MAX, memory, true)
         .expect("round")
         == super::material_fold::Progress::Short
     {}
@@ -725,7 +738,8 @@ fn a_fold_into_a_flushed_tree_admits_the_flush_it_starts() {
         );
     }
     engine.persist().expect("flush");
-    let tree = engine.tree(Partition::Node).expect("tree");
+    // The tree the fold writes.
+    let tree = engine.tree(Partition::Accounting).expect("tree");
     assert!(tree.active_memtable_is_empty(), "the flush left a memtable");
     let footprint = engine.footprints().get("default").expect("a limit");
     let (limit, reserve) = (footprint.limit(), footprint.reserve());
@@ -785,14 +799,16 @@ fn completing_a_commit_without_memory_writes_nothing() {
             .expect("round"),
         super::material_fold::Progress::Short
     );
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let scope = node_scope(&engine);
     let cursor = || {
-        tree.get(
-            super::material_fold::CURSOR_KEY.as_slice(),
-            lsm_tree::SeqNo::MAX,
-        )
-        .expect("read")
-        .map(|v| v.to_vec())
+        scope
+            .tree
+            .get(
+                scope.head.key(&super::material_fold::CURSOR_KEY),
+                lsm_tree::SeqNo::MAX,
+            )
+            .expect("read")
+            .map(|v| v.to_vec())
     };
     let open = cursor();
     assert!(open.is_some(), "the units were folded");
@@ -835,7 +851,7 @@ fn a_fold_refused_room_changes_nothing() {
             vec![put(PartitionId::Node, &format!("node:{i}"), 50)],
         );
     }
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let scope = node_scope(&engine);
     let target = engine.complete_cut().expect("cut") + 1;
     // The footprint refuses the fold's batches room.
     super::material_fold::REFUSE_ROOM.with(|refuse| refuse.set(true));
@@ -846,21 +862,25 @@ fn a_fold_refused_room_changes_nothing() {
         "a fold was written without room"
     );
     assert!(
-        tree.get(
-            super::material_fold::CURSOR_KEY.as_slice(),
-            lsm_tree::SeqNo::MAX
-        )
-        .expect("read")
-        .is_none(),
+        scope
+            .tree
+            .get(
+                scope.head.key(&super::material_fold::CURSOR_KEY),
+                lsm_tree::SeqNo::MAX
+            )
+            .expect("read")
+            .is_none(),
         "a refused fold moved the cursor"
     );
     assert!(
-        tree.get(
-            super::material_fold::VISIBLE_KEY.as_slice(),
-            lsm_tree::SeqNo::MAX
-        )
-        .expect("read")
-        .is_none(),
+        scope
+            .tree
+            .get(
+                scope.head.key(&super::material_fold::VISIBLE_KEY),
+                lsm_tree::SeqNo::MAX
+            )
+            .expect("read")
+            .is_none(),
         "a refused fold wrote a snapshot record"
     );
     super::material_fold::REFUSE_ROOM.with(|refuse| refuse.set(false));
@@ -981,14 +1001,16 @@ fn a_fold_cut_between_its_marks_and_its_batch_is_rewritten_alike() {
         let cut = engine.fold_material_to_cut();
         super::material_fold::STOP_AFTER_MARKS.with(|s| s.set(false));
         assert!(cut.is_err(), "the write was not cut");
-        let tree = engine.tree(Partition::Node).expect("tree");
+        let scope = node_scope(&engine);
         assert!(
-            tree.get(
-                super::material_fold::CURSOR_KEY.as_slice(),
-                lsm_tree::SeqNo::MAX
-            )
-            .expect("read")
-            .is_none(),
+            scope
+                .tree
+                .get(
+                    scope.head.key(&super::material_fold::CURSOR_KEY),
+                    lsm_tree::SeqNo::MAX
+                )
+                .expect("read")
+                .is_none(),
             "the cut write moved the cursor"
         );
         engine.persist().expect("persist what was written");
@@ -1024,8 +1046,8 @@ fn a_refused_retirement_is_retried_without_new_writes() {
     let later = base + 2 * crate::engine::material::RETIRE_WINDOW;
     let below = later - later % crate::engine::material::RETIRE_WINDOW;
     let retained = |engine: &StorageEngine| {
-        let tree = engine.tree(Partition::Node).expect("tree");
-        crate::engine::material::units_from(tree, (0, 0), below, lsm_tree::SeqNo::MAX, 8, None)
+        let tree = node_scope(engine);
+        crate::engine::material::units_from(&tree, (0, 0), below, lsm_tree::SeqNo::MAX, 8, None)
             .expect("units")
             .0
             .len()
@@ -1080,10 +1102,10 @@ fn folded_unit_records_are_retired_a_window_at_a_time() {
     let later = base + 2 * crate::engine::material::RETIRE_WINDOW;
     committed.commit(&engine, later, vec![put(PartitionId::Node, "node:b", 10)]);
     engine.fold_material_to_cut().expect("fold");
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let tree = node_scope(&engine);
     let below = later - later % crate::engine::material::RETIRE_WINDOW;
     assert!(
-        crate::engine::material::units_from(tree, (0, 0), below, lsm_tree::SeqNo::MAX, 8, None)
+        crate::engine::material::units_from(&tree, (0, 0), below, lsm_tree::SeqNo::MAX, 8, None)
             .expect("units")
             .0
             .is_empty(),

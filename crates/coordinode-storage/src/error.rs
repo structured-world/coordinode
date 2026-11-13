@@ -16,6 +16,11 @@ pub enum StorageError {
     #[error("partition not found: {name}")]
     PartitionNotFound { name: String },
 
+    /// A write named a partition only the engine writes: its records are
+    /// derived from the other partitions' writes. Nothing was written.
+    #[error("partition {name} is written by the storage engine only")]
+    EngineOwnedPartition { name: &'static str },
+
     /// Invalid configuration.
     #[error("invalid storage config: {0}")]
     InvalidConfig(String),

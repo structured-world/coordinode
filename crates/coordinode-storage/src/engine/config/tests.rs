@@ -1,5 +1,23 @@
 use super::*;
 
+/// The default recovery reserve holds the room one recovery record of the
+/// store's own may need (the memtables it starts in its tree and in the
+/// accounting tree) at the smallest supported limit, and a sixteenth of a
+/// large one.
+#[test]
+fn the_default_recovery_reserve_holds_one_recovery_record() {
+    assert_eq!(
+        default_recovery_reserve(MIN_HARD_LIMIT_BYTES),
+        RECOVERY_RECORD_ROOM
+    );
+    assert!(RECOVERY_RECORD_ROOM > MIN_HARD_LIMIT_BYTES / DEFAULT_RECOVERY_RESERVE_DIVISOR);
+    assert!(RECOVERY_RECORD_ROOM < MIN_HARD_LIMIT_BYTES / 2);
+    assert_eq!(default_recovery_reserve(1 << 30), (1 << 30) / 16);
+    let endpoint = EndpointConfig::new("e", "/x", Media::Hdd, Durability::Durable, Tier::Warm)
+        .with_hard_limit_bytes(MIN_HARD_LIMIT_BYTES);
+    assert_eq!(endpoint.recovery_reserve(), RECOVERY_RECORD_ROOM);
+}
+
 /// A columnar table's tree lands its levels where the node partition's land,
 /// under `tables/<id>` on each endpoint instead of `node`, with its manifest
 /// on the primary endpoint and a prefix extractor for its node keys.

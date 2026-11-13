@@ -108,8 +108,10 @@ impl LocalJournal {
                 coverage.note_touched(part, last);
             }
         }
+        let heads = crate::engine::material::Heads::read(tree_of(trees, Partition::Accounting)?)?;
         for entry in &entries {
-            for (part, ops) in by_partition(&entry.ops) {
+            let grouped = by_partition(&entry.ops);
+            for (&part, ops) in &grouped {
                 if covered
                     .get(&part)
                     .is_some_and(|c| c.contains(entry.index, 0))
@@ -119,14 +121,21 @@ impl LocalJournal {
                 let tree = tree_of(trees, part)?;
                 coverage.note_touched(part, entry.index);
                 apply_oplog_ops_at(
-                    part,
                     tree,
                     (part == Partition::Idx).then_some(installations),
-                    &ops,
+                    ops,
                     entry.ts,
                     entry.index,
                     Domain::Local,
                 )?;
+            }
+            // The entry's accounting, from all of it, unless the accounting
+            // tree holds it.
+            if !covered
+                .get(&Partition::Accounting)
+                .is_some_and(|c| c.contains(entry.index, 0))
+            {
+                account(trees, &heads, &grouped, entry.ts, entry.index, &coverage)?;
             }
         }
         if !entries.is_empty() {
@@ -147,23 +156,27 @@ impl LocalJournal {
         &self.log
     }
 
-    /// Journal `writes` and apply them to `trees` at `seqno`, durable before
-    /// returning under [`LocalSync::BeforeUse`]; `fold_seqno` hands out a
-    /// seqno above every one applied so far, for a fold. Returns whether a
-    /// compaction is due.
+    /// Journal `writes` and apply them to `into`'s trees at `seqno`, durable
+    /// before returning under [`LocalSync::BeforeUse`]; `fold_seqno` hands
+    /// out a seqno above every one applied so far, for a fold. Returns
+    /// whether a compaction is due.
     ///
     /// # Errors
     ///
     /// The append or its sync fails, or a write names a missing partition.
     pub(crate) fn commit(
         &self,
-        trees: &HashMap<Partition, AnyTree>,
-        installations: &Installations,
+        into: Targets<'_>,
         writes: Vec<LocalWrite>,
         sync: LocalSync,
         seqno: u64,
         fold_seqno: impl Fn() -> u64,
     ) -> StorageResult<bool> {
+        let Targets {
+            trees,
+            installations,
+            heads,
+        } = into;
         let ops: Vec<OplogOp> = writes.into_iter().map(into_op).collect();
         let bytes = ops.iter().map(op_bytes).sum();
         let level = match sync {
@@ -179,19 +192,20 @@ impl LocalJournal {
             .lock()
             .map_err(|_| StorageError::Io("local journal mutex poisoned".into()))?
             .append_ops(ops, seqno, level, bytes)?;
-        for (part, ops) in by_partition(&applied) {
+        let grouped = by_partition(&applied);
+        for (&part, ops) in &grouped {
             let tree = tree_of(trees, part)?;
             self.coverage.note_touched(part, index);
             apply_oplog_ops_at(
-                part,
                 tree,
                 (part == Partition::Idx).then_some(installations),
-                &ops,
+                ops,
                 seqno,
                 index,
                 Domain::Local,
             )?;
         }
+        account(trees, heads, &grouped, seqno, index, &self.coverage)?;
         if self.coverage.mark_applied(index)
             && let Some(mut folded) = self.coverage.try_lock_folded()
         {
@@ -309,6 +323,40 @@ fn into_op(write: LocalWrite) -> OplogOp {
     }
 }
 
+/// What a local entry is applied to: the partition trees, the index tree's
+/// installations, and the accounting scopes' heads, held by the caller from
+/// the entry's first data effect through its accounting.
+#[derive(Clone, Copy)]
+pub(crate) struct Targets<'a> {
+    pub(crate) trees: &'a HashMap<Partition, AnyTree>,
+    pub(crate) installations: &'a Installations,
+    pub(crate) heads: &'a crate::engine::material::Heads,
+}
+
+/// Apply the accounting of one local entry `index`, its ops `grouped` by
+/// source, at `seqno` under `heads`, with its marker; the accounting tree is
+/// noted touched when it took any.
+fn account(
+    trees: &HashMap<Partition, AnyTree>,
+    heads: &crate::engine::material::Heads,
+    grouped: &HashMap<Partition, Vec<&OplogOp>>,
+    seqno: u64,
+    index: u64,
+    coverage: &Coverage,
+) -> StorageResult<()> {
+    let wrote = crate::engine::oplog_journal::account_oplog_ops(
+        tree_of(trees, Partition::Accounting)?,
+        heads,
+        grouped.iter().map(|(&part, ops)| (part, ops.as_slice())),
+        seqno,
+        Some(Domain::Local.marker_key(index, 0)),
+    )?;
+    if wrote {
+        coverage.note_touched(Partition::Accounting, index);
+    }
+    Ok(())
+}
+
 /// The ops of one entry, grouped by the tree each lands in.
 fn by_partition(ops: &[OplogOp]) -> HashMap<Partition, Vec<&OplogOp>> {
     let mut grouped: HashMap<Partition, Vec<&OplogOp>> = HashMap::new();
@@ -320,7 +368,15 @@ fn by_partition(ops: &[OplogOp]) -> HashMap<Partition, Vec<&OplogOp>> {
     grouped
 }
 
-fn tree_of(trees: &HashMap<Partition, AnyTree>, part: Partition) -> StorageResult<&AnyTree> {
+/// `part`'s tree in `trees`.
+///
+/// # Errors
+///
+/// [`StorageError::PartitionNotFound`] when it is not there.
+pub(crate) fn tree_of(
+    trees: &HashMap<Partition, AnyTree>,
+    part: Partition,
+) -> StorageResult<&AnyTree> {
     trees
         .get(&part)
         .ok_or_else(|| StorageError::PartitionNotFound {

@@ -674,10 +674,13 @@ fn records_from_the_checkpoint_stay_through_an_observation() {
                     value: vec![2; 4],
                 }],
             );
-            // And collection runs before the read reaches the tree.
-            let tree = engine.tree(Partition::Node).expect("tree");
+            // And collection runs over the records before the read reaches
+            // them.
+            let tree = engine.tree(Partition::Accounting).expect("tree");
             tree.flush_active_memtable(0).expect("flush");
-            engine.force_compaction(Partition::Node).expect("compact");
+            engine
+                .force_compaction(Partition::Accounting)
+                .expect("compact");
         })
         .expect("observe");
     match observed {
@@ -693,12 +696,16 @@ fn records_from_the_checkpoint_stay_through_an_observation() {
 }
 
 /// A direct write outside any log holds the complete cut below its seqno
-/// until all of it has landed: its entries become visible one by one, and a
-/// cut past it could count it in part.
+/// until all of it has landed, its accounting in its own tree included: its
+/// data is in the data tree and its accounting not yet in the accounting
+/// tree, and no observation taken in between counts the write, in part or
+/// as empty.
 #[test]
 fn a_direct_write_under_way_holds_the_cut_below_it() {
+    use crate::engine::material::Observation;
     let dir = TempDir::new().expect("tempdir");
-    let engine = oracle_engine(dir.path(), future_base());
+    let start = future_base();
+    let engine = oracle_engine(dir.path(), start);
     let mut batch = lsm_tree::WriteBatch::with_capacity(2);
     batch.insert(b"node:direct".as_slice(), [1u8; 4].as_slice());
     let mut tally = crate::engine::material::Tally::default();
@@ -706,15 +713,35 @@ fn a_direct_write_under_way_holds_the_cut_below_it() {
     let mut seen = None;
     engine
         .apply_single_with(Partition::Node, batch, tally, |seqno| {
-            seen = Some((seqno, engine.complete_cut()));
+            let data = engine
+                .tree(Partition::Node)
+                .expect("tree")
+                .get(b"node:direct", lsm_tree::SeqNo::MAX)
+                .expect("read")
+                .is_some();
+            let cut = engine.complete_cut();
+            let observed = engine.observe_material(start).expect("observe");
+            seen = Some((seqno, data, cut, observed));
         })
         .expect("write");
-    let (seqno, cut) = seen.expect("landing ran");
+    let (seqno, data, cut, observed) = seen.expect("landing ran");
+    assert!(data, "the landing ran before the data was in its tree");
     assert!(
         cut.is_none_or(|cut| cut < seqno),
-        "the cut {cut:?} covered the write at {seqno} before it landed"
+        "the cut {cut:?} covered the write at {seqno} between its two trees"
+    );
+    assert!(
+        !matches!(observed, Observation::Observed { through, .. } if through >= seqno),
+        "an observation between the two trees covered the write: {observed:?}"
     );
     assert!(engine.complete_cut().is_some_and(|cut| cut >= seqno));
+    engine.fold_material_to_cut().expect("fold");
+    match engine.observe_material(seqno).expect("observe") {
+        Observation::Observed { material, .. } => {
+            assert_eq!(material.first, Some(seqno), "the write is the first work");
+        }
+        other => panic!("observed nothing once the write landed: {other:?}"),
+    }
 }
 
 /// A direct write outside any commit (background maintenance) is material

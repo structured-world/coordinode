@@ -6,8 +6,8 @@
 //! charge of what reconstructs it there. Summing those keys one by one would
 //! walk them all. The summary holds the charges in buckets of the newest
 //! change instead, at [`LEVELS`] levels of [`FANOUT`] children each, under
-//! the engine-reserved namespace of the tree they describe:
-//! `0x00 "as" level be_u64(n >> (BITS * level))` = the bytes of every key
+//! the scope of the tree they describe in the accounting tree:
+//! `head 0x00 "as" level be_u64(n >> (BITS * level))` = the bytes of every key
 //! whose newest change `n` falls in that bucket. A sum from `s` reads one
 //! contiguous run of at most `FANOUT - 1` buckets per level.
 //!
@@ -16,8 +16,9 @@
 
 use std::collections::BTreeMap;
 
-use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
+use lsm_tree::{AbstractTree, Guard, SeqNo};
 
+use super::{HEAD_LEN, Head, Scope};
 use crate::error::{StorageError, StorageResult};
 
 /// Bucket key prefix.
@@ -30,8 +31,16 @@ const FANOUT: u64 = 1 << BITS;
 const LEVELS: u8 = (u64::BITS / BITS) as u8;
 const KEY_LEN: usize = PREFIX.len() + 1 + 8;
 
-/// A bucket's key.
+/// A bucket's key past the scope's head.
 pub(crate) type BucketKey = [u8; KEY_LEN];
+
+/// `bucket` under `head`.
+fn scoped(head: Head, bucket: &BucketKey) -> [u8; HEAD_LEN + KEY_LEN] {
+    let mut out = [0u8; HEAD_LEN + KEY_LEN];
+    out[..HEAD_LEN].copy_from_slice(head.bytes());
+    out[HEAD_LEN..].copy_from_slice(bucket);
+    out
+}
 /// The buckets one charge's move touches at most: its old and its new
 /// bucket at every level.
 pub(crate) const MOVES_PER_SHIFT: usize = 2 * LEVELS as usize;
@@ -78,7 +87,7 @@ impl Moves {
         self.0.len()
     }
 
-    /// Add the moves to `tree`'s buckets into `batch`. The buckets are read
+    /// Add the moves to `scope`'s buckets into `batch`. The buckets are read
     /// as they stand: the caller is their one writer. Returns the key and
     /// value bytes written.
     ///
@@ -88,16 +97,17 @@ impl Moves {
     /// past `u64::MAX`: the charges it was built from are not what moved.
     pub(crate) fn write(
         self,
-        tree: &AnyTree,
+        scope: &Scope<'_>,
         batch: &mut lsm_tree::WriteBatch,
     ) -> StorageResult<u64> {
         // Bounded by the buckets one batch moves.
         let mut bytes = 0u64;
-        for (key, delta) in self.0 {
+        for (bucket, delta) in self.0 {
             if delta == 0 {
                 continue;
             }
-            let held = match tree.get(key.as_slice(), SeqNo::MAX)? {
+            let key = scoped(scope.head, &bucket);
+            let held = match scope.tree.get(key.as_slice(), SeqNo::MAX)? {
                 Some(value) => decode(&key, &value)?,
                 None => 0,
             };
@@ -109,7 +119,7 @@ impl Moves {
                         "material summary bucket {key:02x?} holds {held}, moved by {delta}"
                     ))
                 })?;
-            bytes += (KEY_LEN + 8) as u64;
+            bytes += (HEAD_LEN + KEY_LEN + 8) as u64;
             if next == 0 {
                 batch.remove(key.as_slice());
             } else {
@@ -121,24 +131,24 @@ impl Moves {
 }
 
 /// The bytes of every key whose newest change is at or after `s`, in
-/// `tree`'s summary visible at `snapshot`.
+/// `scope`'s summary visible at `snapshot`.
 ///
 /// # Errors
 ///
 /// A bucket could not be read or is malformed.
-pub(crate) fn charge_from(tree: &AnyTree, s: SeqNo, snapshot: SeqNo) -> StorageResult<u64> {
+pub(crate) fn charge_from(scope: &Scope<'_>, s: SeqNo, snapshot: SeqNo) -> StorageResult<u64> {
     let mut total = 0u64;
     let mut below = 0u64;
     let top = LEVELS - 1;
     // The top level's buckets together hold every charge.
-    for (_, bytes) in run(tree, top, 0, FANOUT, snapshot)? {
+    for (_, bytes) in run(scope, top, 0, FANOUT, snapshot)? {
         total = add(total, bytes)?;
     }
     for level in 0..LEVELS {
         // The siblings before `s`'s bucket under the same parent.
         let index = index_at(level, s);
         let first = index & !(FANOUT - 1);
-        for (_, bytes) in run(tree, level, first, index, snapshot)? {
+        for (_, bytes) in run(scope, level, first, index, snapshot)? {
             below = add(below, bytes)?;
         }
     }
@@ -151,7 +161,7 @@ pub(crate) fn charge_from(tree: &AnyTree, s: SeqNo, snapshot: SeqNo) -> StorageR
 
 /// The buckets of `level` with index in `[first, end)`.
 fn run(
-    tree: &AnyTree,
+    scope: &Scope<'_>,
     level: u8,
     first: u64,
     end: u64,
@@ -160,13 +170,19 @@ fn run(
     if first >= end {
         return Ok(Vec::new());
     }
-    let (start, stop) = (bucket(level, first), bucket(level, end));
+    let start = scoped(scope.head, &bucket(level, first));
+    let stop = scoped(scope.head, &bucket(level, end));
     let mut out = Vec::new();
-    for guard in tree.range(start.as_slice()..stop.as_slice(), snapshot, None) {
+    for guard in scope
+        .tree
+        .range(start.as_slice()..stop.as_slice(), snapshot, None)
+    {
         let (k, v) = guard.into_inner()?;
-        let index = <[u8; 8]>::try_from(&k[PREFIX.len() + 1..])
+        let index = k
+            .get(HEAD_LEN + PREFIX.len() + 1..)
+            .and_then(|s| <[u8; 8]>::try_from(s).ok())
             .map(u64::from_be_bytes)
-            .map_err(|_| malformed(&k, &v))?;
+            .ok_or_else(|| malformed(&k, &v))?;
         out.push((index, decode(&k, &v)?));
     }
     Ok(out)
@@ -178,7 +194,7 @@ fn add(sum: u64, bytes: u64) -> StorageResult<u64> {
 }
 
 fn decode(key: &[u8], value: &[u8]) -> StorageResult<u64> {
-    if key.len() != KEY_LEN {
+    if key.len() != HEAD_LEN + KEY_LEN {
         return Err(malformed(key, value));
     }
     <[u8; 8]>::try_from(value)

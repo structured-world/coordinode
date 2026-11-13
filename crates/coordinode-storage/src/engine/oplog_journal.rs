@@ -699,10 +699,10 @@ pub(crate) fn op_partition(op: &OplogOp) -> Option<Partition> {
 /// commit_ts, together with the entry's coverage marker, in the same order
 /// the commit path uses: range tombstones first, then the point ops and the
 /// marker as ONE tree batch, so a persisted marker implies every effect of
-/// the entry in this tree is persisted. Non-data ops are no-ops.
-/// `installations` is the index tree's catalog when `tree` is the index tree.
+/// the entry in this tree is persisted. Non-data ops are no-ops; the
+/// entry's accounting is [`account_oplog_ops`]'s. `installations` is the
+/// index tree's catalog when `tree` is the index tree.
 pub(crate) fn apply_oplog_ops_at(
-    part: Partition,
     tree: &AnyTree,
     installations: Option<&crate::engine::installation::Installations>,
     ops: &[&OplogOp],
@@ -711,30 +711,24 @@ pub(crate) fn apply_oplog_ops_at(
     domain: coverage::Domain,
 ) -> StorageResult<()> {
     let mut addressing = crate::engine::installation::Addressing::new(installations, tree, seqno);
-    let mut batch = lsm_tree::WriteBatch::with_capacity(ops.len() + 2);
-    // The same record the live apply put, so a replay of a lost memtable
-    // restores it and a repeated one rewrites it unchanged.
-    let mut tally = crate::engine::material::Tally::default();
+    let mut batch = lsm_tree::WriteBatch::with_capacity(ops.len() + 1);
     for op in ops {
         match op {
             // A replacement being prepared receives the same write in the
             // same batch, as on the live apply path.
             OplogOp::Insert { key, value, .. } => {
-                tally.put(key, value);
                 batch.insert(addressing.point(key)?, value.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.insert(staging, value.as_slice());
                 }
             }
             OplogOp::Delete { key, .. } => {
-                tally.delete(key);
                 batch.remove(addressing.point(key)?);
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.remove(staging);
                 }
             }
             OplogOp::Merge { key, operand, .. } => {
-                tally.merge(key, operand);
                 batch.merge(addressing.point(key)?, operand.as_slice());
                 if let Some(staging) = addressing.staging_point(key) {
                     batch.merge(staging, operand.as_slice());
@@ -742,7 +736,6 @@ pub(crate) fn apply_oplog_ops_at(
             }
             OplogOp::RemoveRange { start, end, .. } => {
                 let start = coverage::clamp_user_start(start);
-                tally.range(start, end);
                 let ranges = addressing.range(start, end);
                 let staging = addressing.staging_range(start, end);
                 for (start, end) in ranges.into_iter().chain(staging) {
@@ -765,8 +758,52 @@ pub(crate) fn apply_oplog_ops_at(
             }
         }
     }
-    tally.record(part, seqno, &mut batch);
     batch.insert(domain.marker_key(index, 0).as_slice(), &[][..]);
     tree.apply_batch(batch, seqno)?;
     Ok(())
+}
+
+/// Replay one entry's accounting into the accounting tree `acct` at the
+/// entry's commit_ts: the records the live apply put for every source in
+/// `parts` (each source's ops in entry order, so the unit ordinals match),
+/// as one batch with `marker` last. Derived from the whole entry, whichever
+/// data trees already hold their part, and never by applying an operand
+/// again. Returns whether anything was written.
+///
+/// # Errors
+///
+/// The accounting tree refuses the batch.
+pub(crate) fn account_oplog_ops<'a>(
+    acct: &AnyTree,
+    heads: &crate::engine::material::Heads,
+    parts: impl IntoIterator<Item = (Partition, &'a [&'a OplogOp])>,
+    seqno: u64,
+    marker: Option<[u8; coverage::MARKER_LEN]>,
+) -> StorageResult<bool> {
+    let mut tallies: Vec<(Partition, crate::engine::material::Tally<'a>)> = Vec::new();
+    for (part, ops) in parts {
+        let mut tally = crate::engine::material::Tally::default();
+        for op in ops {
+            match op {
+                OplogOp::Insert { key, value, .. } => tally.put(key, value),
+                OplogOp::Delete { key, .. } => tally.delete(key),
+                OplogOp::Merge { key, operand, .. } => tally.merge(key, operand),
+                OplogOp::RemoveRange { start, end, .. } => {
+                    tally.range(coverage::clamp_user_start(start), end);
+                }
+                _ => {}
+            }
+        }
+        tallies.push((part, tally));
+    }
+    let Some(batch) = crate::engine::material::batch_of(
+        tallies.iter().map(|(part, tally)| (*part, tally)),
+        heads,
+        seqno,
+        marker.as_ref().map(<[u8; coverage::MARKER_LEN]>::as_slice),
+    ) else {
+        return Ok(false);
+    };
+    acct.apply_batch(batch, seqno)?;
+    Ok(true)
 }

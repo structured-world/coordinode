@@ -214,13 +214,15 @@ pub struct PartitionCopy {
 }
 
 /// Keys that belong to this node rather than to the replicated data: the
-/// Raft partition (vote, log metadata) and, in Schema, the per-node routing
+/// Raft partition (vote, log metadata), the accounting partition (this
+/// member's count of its own data) and, in Schema, the per-node routing
 /// (`meta:`) and the state machine's own records (`raft:`). They never
 /// travel between nodes and survive a partition's replacement.
 #[must_use]
 pub fn is_node_local(partition: Partition, key: &[u8]) -> bool {
     match partition {
-        Partition::Raft => true,
+        // The accounting counts this member's own data.
+        Partition::Raft | Partition::Accounting => true,
         _ => node_local_prefixes(partition)
             .iter()
             .any(|prefix| key.starts_with(prefix)),
@@ -372,21 +374,53 @@ impl StorageEngine {
             Mutation::Derive(_) => Partition::Idx,
         };
         if mutations.iter().any(|m| skip(partition_of(m))) {
-            let kept: Vec<Mutation> = mutations
-                .iter()
-                .filter(|m| !skip(partition_of(m)))
-                .cloned()
-                .collect();
+            let (held, kept): (Vec<&Mutation>, Vec<&Mutation>) =
+                mutations.iter().partition(|m| skip(partition_of(m)));
+            let kept: Vec<Mutation> = kept.into_iter().cloned().collect();
+            // The accounting tree holds the unit's accounting or none of it:
+            // without it, it is derived from the whole unit, the data the
+            // held trees already have included, and never by applying a held
+            // operand again. A held metadata command's effects were decided
+            // against a state that already holds them and cannot be derived
+            // again: its source's scope is counted from the tree instead.
+            let held: Vec<Mutation> = held.into_iter().cloned().collect();
+            let recount: Vec<Partition> = if skip(Partition::Accounting) {
+                Vec::new()
+            } else {
+                held.iter()
+                    .filter_map(|m| match m {
+                        Mutation::Command(command) => Some(Partition::from(command.partition())),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let accounting = if skip(Partition::Accounting) {
+                crate::engine::material::Accounting::Skip
+            } else {
+                crate::engine::material::Accounting::OwnWritesAnd(&held)
+            };
             let staged = self.applied_feed.stage(index, commit_ts, &kept);
-            self.apply_proposal_covered(&kept, commit_ts, Some(mark))?;
+            if kept.is_empty() {
+                self.apply_accounting_only(commit_ts, mark, accounting)?;
+            } else {
+                self.apply_proposal_covered(&kept, commit_ts, Some(mark), accounting)?;
+            }
+            for source in recount {
+                self.reconstruct_accounting(source)?;
+            }
             staged.publish();
             self.note_raft_applied(index, commit_ts);
             Ok(kept.len())
         } else {
+            let accounting = if skip(Partition::Accounting) {
+                crate::engine::material::Accounting::Skip
+            } else {
+                crate::engine::material::Accounting::OwnWrites
+            };
             // Staged before the write lands: a reader that sees it is told
             // the derived indexes may not hold it yet.
             let staged = self.applied_feed.stage(index, commit_ts, mutations);
-            self.apply_proposal_covered(mutations, commit_ts, Some(mark))?;
+            self.apply_proposal_covered(mutations, commit_ts, Some(mark), accounting)?;
             #[cfg(test)]
             self.applied_feed.pause_after_write();
             staged.publish();
@@ -522,6 +556,13 @@ impl StorageEngine {
                     .into(),
             ));
         }
+        if partition == Partition::Accounting {
+            return Err(StorageError::InvalidConfig(
+                "the accounting partition is this member's count of its own data; \
+                 it is never rebuilt from another copy"
+                    .into(),
+            ));
+        }
         // The repair is taken before anything changes: a second repair of the
         // partition is refused with the index transfer status and the tree
         // as they were.
@@ -566,11 +607,15 @@ impl StorageEngine {
             )?;
         }
         // Each installed row is its key's whole closure, below every commit:
-        // the fold takes it as the base later units build on.
+        // the fold takes it as the base later units build on. The clear
+        // renewed the scope, and the repair keeps any other clear of it off,
+        // so the head copied here stays its own.
         if crate::engine::material::accounted(partition) {
             let at = self.next_seqno();
+            let heads = *self.material_heads();
+            let scope = self.material_scope(&heads, partition)?;
             installed_units(rows, |units| {
-                crate::engine::material::add_units(tree, INSTALLED_ROW_SEQNO, units, at)
+                crate::engine::material::add_units(&scope, INSTALLED_ROW_SEQNO, units, at)
             })?;
         }
         Ok(repair)
@@ -625,6 +670,9 @@ impl StorageEngine {
                 self.flush_memtables(tree)?;
             }
         }
+        // The replaced scopes' accounting carries no marker of its own: it is
+        // on disk before any intent goes.
+        self.flush_memtables(self.tree(Partition::Accounting)?)?;
         // The index's inventory is taken, and the Schema tree's ledger
         // installed, while its repair still holds it.
         for repair in repairs {
@@ -656,6 +704,9 @@ impl StorageEngine {
         // Written after the rebuilt data, so a persisted record implies the
         // data it covers is persisted.
         coverage::write_fold(tree, Domain::Raft, 0, next, payload, self.next_seqno());
+        // The rebuilt scope's accounting carries no marker of its own: it is
+        // on disk before the intent goes.
+        self.flush_memtables(self.tree(Partition::Accounting)?)?;
         // A partition copy carries no inventory: every index copy in it is
         // unknown until checked here, under the repair, so no next repair's
         // transfer is taken for this one's. The Schema tree's ledger is
@@ -683,6 +734,13 @@ impl StorageEngine {
         if partition == Partition::Raft {
             return Err(StorageError::InvalidConfig(
                 "the Raft partition holds this node's vote and log metadata; \
+                 it is never copied to another node"
+                    .into(),
+            ));
+        }
+        if partition == Partition::Accounting {
+            return Err(StorageError::InvalidConfig(
+                "the accounting partition is this member's count of its own data; \
                  it is never copied to another node"
                     .into(),
             ));

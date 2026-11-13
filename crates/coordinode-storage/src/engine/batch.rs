@@ -29,6 +29,8 @@ use rayon::prelude::*;
 use crate::engine::config::FlushPolicy;
 use crate::engine::core::StorageEngine;
 use crate::engine::coverage;
+pub(crate) use crate::engine::material::Accounting;
+use crate::engine::material::Tally;
 use crate::engine::partition::Partition;
 use crate::error::StorageResult;
 
@@ -100,13 +102,18 @@ pub fn staged_delete_bytes(key_len: u64) -> u64 {
 /// The bytes a commit holds once per batch, besides its mutations: the
 /// buffer translating an index key and the one encoding unit records, each
 /// as long as the longest key, the batch's tally record, its partition
-/// groups and the key tables their tree batches check.
+/// groups and their tallies, the key tables their tree batches check, and
+/// the accounting tree's batch with its table and coverage marker.
 #[must_use]
 pub fn staged_batch_bytes(longest_key: u64) -> u64 {
     let groups = Partition::all().len() as u64
         * 2
-        * (core::mem::size_of::<(Partition, Vec<&Mutation>)>() as u64 + 16 + SEEN_GROUP);
-    2 * longest_key + crate::engine::material::UNIT_RECORD_FIXED + 32 + groups
+        * (core::mem::size_of::<(Partition, Vec<&Mutation>)>() as u64
+            + core::mem::size_of::<(Partition, Tally<'static>)>() as u64
+            + 16
+            + SEEN_GROUP);
+    let accounting = SEEN_GROUP + 2 * coverage::MARKER_LEN as u64;
+    2 * longest_key + crate::engine::material::UNIT_RECORD_FIXED + 32 + groups + accounting
 }
 
 /// The header fields a unit's compact frame carries once (its timestamps,
@@ -348,7 +355,7 @@ impl<'a> WriteBatch<'a> {
     /// before it gets here, so the error marks a bug upstream, never a
     /// silent overwrite.
     pub(crate) fn commit_at(self, seqno: lsm_tree::SeqNo) -> StorageResult<()> {
-        self.commit_covered(seqno, None)?;
+        self.commit_covered(seqno, None, Accounting::OwnWrites)?;
         // The engine's read point includes `seqno` once it was allocated, so
         // the writes are visible now.
         self.forget_cached();
@@ -356,14 +363,22 @@ impl<'a> WriteBatch<'a> {
     }
 
     /// [`Self::commit_at`] that also writes the coverage marker `cover` into
-    /// every partition the batch touches, atomically with its effects. The
+    /// every partition the batch touches, atomically with its effects there,
+    /// and the commit's accounting (`accounting` says from what) as one
+    /// batch of the accounting tree after them, with the marker last. The
     /// tiered cache is left as it was: the caller calls
     /// [`forget_cached`](Self::forget_cached) once the writes are visible to
     /// reads, or a read between the two could cache what they replaced.
+    ///
+    /// # Errors
+    ///
+    /// A mutation names an engine-owned partition, or a tree refuses its
+    /// batch.
     pub(crate) fn commit_covered(
         &self,
         seqno: lsm_tree::SeqNo,
         cover: Option<coverage::Mark>,
+        accounting: Accounting<'_>,
     ) -> StorageResult<()> {
         if self.mutations.is_empty() {
             return Ok(());
@@ -373,23 +388,52 @@ impl<'a> WriteBatch<'a> {
 
         // Group by partition, preserving staging order within each group so
         // repeated merge operands on one key resolve in the order they were
-        // staged.
+        // staged, and each source's unit ordinals follow it.
         let mut groups: HashMap<Partition, Vec<&Mutation>> =
             HashMap::with_capacity(Partition::all().len());
         for m in mutations {
-            groups.entry(m.partition()).or_default().push(m);
+            groups.entry(m.partition().writable()?).or_default().push(m);
         }
 
-        if groups.len() >= 2 && mutations.len() >= PARALLEL_THRESHOLD {
-            groups
-                .par_iter()
-                .try_for_each(|(&part, group)| apply_group(engine, part, group, seqno, cover))?;
-        } else {
-            for (&part, group) in &groups {
-                apply_group(engine, part, group, seqno, cover)?;
+        // From the first data effect to the accounting: a clear renewing a
+        // scope waits, so data and accounting land on the same side of it.
+        let heads = engine.material_heads();
+        let tallies: Vec<(Partition, Tally<'_>)> =
+            if groups.len() >= 2 && mutations.len() >= PARALLEL_THRESHOLD {
+                groups
+                    .par_iter()
+                    .map(|(&part, group)| {
+                        apply_group(engine, part, group, seqno, cover).map(|t| (part, t))
+                    })
+                    .collect::<StorageResult<_>>()?
+            } else {
+                let mut tallies = Vec::with_capacity(groups.len());
+                for (&part, group) in &groups {
+                    tallies.push((part, apply_group(engine, part, group, seqno, cover)?));
+                }
+                tallies
+            };
+        match accounting {
+            Accounting::OwnWrites => engine.apply_accounting(
+                tallies.iter().map(|(part, tally)| (*part, tally)),
+                &heads,
+                seqno,
+                cover,
+            )?,
+            Accounting::Skip => {}
+            Accounting::OwnWritesAnd(held) => {
+                let more = crate::engine::material::tally_mutations(held);
+                engine.apply_accounting(
+                    tallies
+                        .iter()
+                        .chain(more.iter())
+                        .map(|(part, tally)| (*part, tally)),
+                    &heads,
+                    seqno,
+                    cover,
+                )?;
             }
         }
-
         Ok(())
     }
 
@@ -419,19 +463,20 @@ impl<'a> WriteBatch<'a> {
 /// memtable is sealed no earlier than any effect's, and a flush, which
 /// persists memtables as a prefix in seal order, never persists the marker
 /// without them. A re-applied tombstone at the same seqno is idempotent.
-fn apply_group(
+/// Returns the group's tally, for the accounting batch.
+fn apply_group<'a>(
     engine: &StorageEngine,
     part: Partition,
-    group: &[&Mutation],
+    group: &[&'a Mutation],
     seqno: lsm_tree::SeqNo,
     cover: Option<coverage::Mark>,
-) -> StorageResult<()> {
+) -> StorageResult<Tally<'a>> {
     let tree = engine.tree(part)?;
     let mut addressing =
         crate::engine::installation::Addressing::new(engine.installations_of(part), tree, seqno);
-    let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 2);
+    let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 1);
     // The copy a replacement receives is the same logical write: counted once.
-    let mut tally = crate::engine::material::Tally::default();
+    let mut tally = Tally::default();
     // A replacement being prepared for a generation receives the same write
     // in the same batch, so the batch's coverage marker covers it too.
     for mutation in group {
@@ -471,14 +516,13 @@ fn apply_group(
             }
         }
     }
-    tally.record(part, seqno, &mut batch);
     if let Some(mark) = cover {
         batch.insert(mark.key().as_slice(), &[][..]);
     }
     let (added, memtable) = tree.apply_batch(batch, seqno)?;
     engine.coordinator().flush_trigger().wrote(added, memtable);
     engine.write_taps().applied(part, group);
-    Ok(())
+    Ok(tally)
 }
 
 #[cfg(test)]

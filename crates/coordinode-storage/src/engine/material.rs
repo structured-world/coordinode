@@ -5,22 +5,32 @@
 //! `s` from collection. What that costs it is the logical size of those
 //! versions, before compression: key, value or operand, deletion and range
 //! bounds. Nothing per version records that, and summing it from the versions
-//! themselves would walk every key. So every write to a tree also puts one
-//! record into the same tree, in the same lsm batch, under the
-//! engine-reserved namespace: `0x00 "ax" be_u64(seqno)` = the logical bytes
-//! that seqno wrote there. Landing in the batch with the data, it reaches the
-//! memtable, a flush and a replay together with what it describes; a put at
-//! the same seqno is idempotent, so a replay charges nothing twice.
+//! themselves would walk every key. So every write to an accounted tree also
+//! puts records into the accounting tree ([`Partition::Accounting`]), at the
+//! write's seqno, under the scope of the tree it describes ([`Head`]: the
+//! source's tag and the incarnation of its accounting):
+//! `head "ax" be_u64(seqno)` = the logical bytes that seqno wrote there. A put
+//! at the same seqno is idempotent, so a replay charges nothing twice.
+//!
+//! The records live apart from the data they describe: commit-ordered keys
+//! in a data tree would give every table of it a key range from the reserved
+//! namespace to its user keys, overlapping every table below it and turning
+//! each compaction of it into a merge. A common seqno is not atomicity across
+//! two trees, so a commit's accounting is one batch of the accounting tree,
+//! with its own coverage marker on a journaled path, applied after the data;
+//! replay derives it from the whole entry, whichever trees already hold
+//! their part.
 //!
 //! A seqno is one commit, so the first record at or after `s` is the oldest
 //! work a consumer at `s` has not seen.
 //!
-//! Beside it, every unit of the batch gets one record of the unit index,
-//! `0x00 "au" be_u64(seqno) be_u32(ordinal)` = its kind, encoded length and
+//! Beside it, every unit gets one record of the unit index,
+//! `head "au" be_u64(seqno) be_u32(ordinal)` = its kind, encoded length and
 //! key (and a range's end), no payload: what the material fold reads, in
 //! commit order, to keep each key's reconstruction closure. The ordinal is
-//! the unit's place in its batch, so two equal operands at one seqno stay two
-//! units and a replay of the batch rewrites the same records.
+//! the unit's place in its source tree's part of the batch, so two equal
+//! operands at one seqno stay two units and a replay of the batch rewrites
+//! the same records.
 
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 
@@ -31,26 +41,172 @@ use crate::error::{StorageError, StorageResult};
 pub(crate) mod fold;
 pub(crate) mod summary;
 
-/// The record key prefix.
-const PREFIX: [u8; 3] = [0x00, b'a', b'x'];
-/// Exclusive end of the record range.
-const END: [u8; 3] = [0x00, b'a', b'y'];
-const KEY_LEN: usize = PREFIX.len() + 8;
+/// Bytes of the head every scoped key of the accounting tree starts with.
+pub(crate) const HEAD_LEN: usize = 5;
 
-/// The record for `seqno`.
-pub(crate) fn key(seqno: SeqNo) -> [u8; KEY_LEN] {
-    let mut key = [0u8; KEY_LEN];
-    key[..PREFIX.len()].copy_from_slice(&PREFIX);
-    key[PREFIX.len()..].copy_from_slice(&seqno.to_be_bytes());
-    key
+/// The head of one source scope's keys in the accounting tree: the source
+/// partition's tag (never `0x00`, the coverage records' namespace, nor the
+/// `0xFE`/`0xFF` of the tree's own records), then the incarnation of its
+/// accounting, big-endian. A clear of the source renews the incarnation, so
+/// what is rebuilt never meets a record of the accounting it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Head([u8; HEAD_LEN]);
+
+impl Head {
+    fn of(part: Partition, incarnation: u32) -> Self {
+        let mut head = [0u8; HEAD_LEN];
+        head[0] = tag(part);
+        head[1..].copy_from_slice(&incarnation.to_be_bytes());
+        Self(head)
+    }
+
+    /// The head's bytes.
+    pub(crate) fn bytes(&self) -> &[u8; HEAD_LEN] {
+        &self.0
+    }
+
+    /// `rest` under this head.
+    pub(crate) fn key(&self, rest: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEAD_LEN + rest.len());
+        out.extend_from_slice(&self.0);
+        out.extend_from_slice(rest);
+        out
+    }
+
+    /// The exclusive end of every key under this head: the next
+    /// incarnation's head, or past the tag at the last one.
+    fn end(&self) -> Vec<u8> {
+        let incarnation = u32::from_be_bytes([self.0[1], self.0[2], self.0[3], self.0[4]]);
+        match incarnation.checked_add(1) {
+            Some(next) => {
+                let mut out = self.0;
+                out[1..].copy_from_slice(&next.to_be_bytes());
+                out.to_vec()
+            }
+            // Tags stop below 0xFE.
+            None => vec![self.0[0] + 1],
+        }
+    }
+}
+
+/// The tag of `part`'s scope: its position from one on.
+fn tag(part: Partition) -> u8 {
+    // At most a dozen partitions: far below 0xFE.
+    part.position() as u8 + 1
+}
+
+/// The first byte of the record of a source's accounting incarnation,
+/// `0xFF tag`.
+const INCARNATION: u8 = 0xFF;
+
+/// The incarnation of every source's accounting, as the accounting tree
+/// records it (zero for a source never cleared).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Heads([u32; Partition::COUNT]);
+
+impl Heads {
+    /// The incarnations `acct` records.
+    ///
+    /// # Errors
+    ///
+    /// A record could not be read or is malformed.
+    pub(crate) fn read(acct: &AnyTree) -> StorageResult<Self> {
+        let mut heads = Self::default();
+        for &part in Partition::all() {
+            let key = [INCARNATION, tag(part)];
+            if let Some(value) = acct.get(key.as_slice(), SeqNo::MAX)? {
+                let bytes = <[u8; 4]>::try_from(value.as_ref()).map_err(|_| {
+                    StorageError::Serialization(format!(
+                        "accounting incarnation of {} holds {} bytes",
+                        part.name(),
+                        value.len()
+                    ))
+                })?;
+                heads.0[part.position()] = u32::from_be_bytes(bytes);
+            }
+        }
+        Ok(heads)
+    }
+
+    /// `part`'s head.
+    pub(crate) fn head(&self, part: Partition) -> Head {
+        Head::of(part, self.0[part.position()])
+    }
+
+    /// Renew `part`'s accounting in `acct` at `seqno`: the next incarnation
+    /// is recorded and every record of the one before is deleted, so what
+    /// follows is written, and read, under the new head.
+    ///
+    /// # Errors
+    ///
+    /// The incarnations are exhausted.
+    pub(crate) fn renew(
+        &mut self,
+        acct: &AnyTree,
+        part: Partition,
+        seqno: SeqNo,
+    ) -> StorageResult<()> {
+        let old = self.head(part);
+        let next = self.0[part.position()].checked_add(1).ok_or_else(|| {
+            StorageError::Serialization(format!(
+                "accounting incarnations of {} exhausted",
+                part.name()
+            ))
+        })?;
+        acct.insert(
+            [INCARNATION, tag(part)].as_slice(),
+            next.to_be_bytes().as_slice(),
+            seqno,
+        );
+        acct.remove_range(old.bytes().as_slice(), old.end().as_slice(), seqno);
+        self.0[part.position()] = next;
+        Ok(())
+    }
+}
+
+/// One source's scope in the accounting tree.
+#[derive(Clone, Copy)]
+pub(crate) struct Scope<'t> {
+    /// The accounting tree.
+    pub(crate) tree: &'t AnyTree,
+    /// The source's head.
+    pub(crate) head: Head,
+}
+
+impl core::fmt::Debug for Scope<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Scope").field("head", &self.head).finish()
+    }
+}
+
+impl<'t> Scope<'t> {
+    /// `part`'s scope in `acct` under `heads`.
+    pub(crate) fn new(acct: &'t AnyTree, heads: &Heads, part: Partition) -> Self {
+        Self {
+            tree: acct,
+            head: heads.head(part),
+        }
+    }
+
+    /// The runs a read of the accounting tree goes through as it stands.
+    pub(crate) fn runs(&self) -> usize {
+        self.tree
+            .current_version()
+            .iter_levels()
+            .map(|level| level.run_count())
+            .sum()
+    }
 }
 
 /// Whether writes to `part` are source material a consumer reads. The
-/// consensus partition holds this member's own log, and the registry holds
-/// the consumers' own records: a consumer acknowledging must not owe itself
-/// work.
+/// consensus partition holds this member's own log, the registry holds the
+/// consumers' own records (a consumer acknowledging must not owe itself
+/// work), and the accounting holds the records describing the rest.
 pub(crate) fn accounted(part: Partition) -> bool {
-    !matches!(part, Partition::Raft | Partition::Registry)
+    !matches!(
+        part,
+        Partition::Raft | Partition::Registry | Partition::Accounting
+    )
 }
 
 /// The logical bytes one write unit adds: its key and what it writes (a
@@ -108,14 +264,15 @@ struct Counted<'a> {
     bytes: u64,
 }
 
-/// Bytes a tree batch's tally holds per unit it counts.
+/// Bytes a tally holds per unit it counts.
 pub(crate) const COUNTED_SLOT: u64 = core::mem::size_of::<Counted<'static>>() as u64;
 
 /// Bytes of a unit record beyond the key it carries: its key and the kind,
 /// length and key-length fields of its value ([`unit_value`]).
 pub(crate) const UNIT_RECORD_FIXED: u64 = UNIT_KEY_LEN as u64 + 1 + 8 + 4;
 
-/// Sums the units of one tree's batch and puts their records.
+/// Sums the units of one source tree's part of a batch and puts their
+/// records.
 #[derive(Debug, Default)]
 pub(crate) struct Tally<'a> {
     bytes: u64,
@@ -158,21 +315,117 @@ impl<'a> Tally<'a> {
         });
     }
 
-    /// Put the record of what was counted and the record of every unit into
-    /// `batch` at the batch's seqno, when `part` is accounted and anything
-    /// was.
-    pub(crate) fn record(self, part: Partition, seqno: SeqNo, batch: &mut lsm_tree::WriteBatch) {
-        if self.bytes == 0 || !accounted(part) {
+    /// Whether this tally puts no record for source `part`.
+    pub(crate) fn writes_nothing(&self, part: Partition) -> bool {
+        self.bytes == 0 || !accounted(part)
+    }
+
+    /// Put the record of what was counted in source `part` and the record of
+    /// every unit into `batch`, a batch of the accounting tree applied at
+    /// `seqno`, under `part`'s head in `heads`, when `part` is accounted and
+    /// anything was counted.
+    pub(crate) fn record(
+        &self,
+        part: Partition,
+        heads: &Heads,
+        seqno: SeqNo,
+        batch: &mut lsm_tree::WriteBatch,
+    ) {
+        if self.writes_nothing(part) {
             return;
         }
-        batch.insert(key(seqno).as_slice(), encode(self.bytes).as_slice());
+        let head = heads.head(part);
+        batch.insert(key(head, seqno).as_slice(), encode(self.bytes).as_slice());
         let mut value = Vec::new();
         for (ordinal, unit) in self.units.iter().enumerate() {
             unit_value(unit.kind, unit.bytes, unit.key, unit.end, &mut value);
             // A batch holds far fewer than u32::MAX units.
-            batch.insert(unit_key(seqno, ordinal as u32).as_slice(), value.as_slice());
+            batch.insert(
+                unit_key(head, seqno, ordinal as u32).as_slice(),
+                value.as_slice(),
+            );
         }
     }
+}
+
+/// The accounting batch of one commit at `seqno`: every source's tally under
+/// `heads`, and `marker` last when the commit is journaled. `None` when no
+/// tally writes anything: the commit touches the accounting tree nowhere.
+pub(crate) fn batch_of<'a>(
+    tallies: impl IntoIterator<Item = (Partition, &'a Tally<'a>)>,
+    heads: &Heads,
+    seqno: SeqNo,
+    marker: Option<&[u8]>,
+) -> Option<lsm_tree::WriteBatch> {
+    let mut batch: Option<lsm_tree::WriteBatch> = None;
+    for (part, tally) in tallies {
+        if tally.writes_nothing(part) {
+            continue;
+        }
+        let batch =
+            batch.get_or_insert_with(|| lsm_tree::WriteBatch::with_capacity(tally.units.len() + 2));
+        tally.record(part, heads, seqno, batch);
+    }
+    if let (Some(batch), Some(marker)) = (batch.as_mut(), marker) {
+        batch.insert(marker, &[][..]);
+    }
+    batch
+}
+
+/// Where a commit's accounting comes from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Accounting<'a> {
+    /// The writes the commit applies.
+    OwnWrites,
+    /// Nothing: the accounting tree already holds the commit's.
+    Skip,
+    /// The writes the commit applies and these resolved mutations of the
+    /// same unit, whose data trees already hold them: a replay applying only
+    /// the data a tree lacks still accounts for all of the unit. A source is
+    /// either applied or held whole, so no source takes units from both.
+    OwnWritesAnd(&'a [coordinode_core::txn::proposal::Mutation]),
+}
+
+/// The tallies of `mutations` (resolved, decided), one per source partition,
+/// each in the order the mutations name it: the order its live apply counts
+/// them in, so the ordinals match.
+pub(crate) fn tally_mutations(
+    mutations: &[coordinode_core::txn::proposal::Mutation],
+) -> Vec<(Partition, Tally<'_>)> {
+    use coordinode_core::txn::proposal::Mutation;
+    let mut tallies: Vec<(Partition, Tally<'_>)> = Vec::new();
+    for mutation in mutations {
+        let partition = match mutation {
+            Mutation::Put { partition, .. }
+            | Mutation::Delete { partition, .. }
+            | Mutation::Merge { partition, .. }
+            | Mutation::RemoveRange { partition, .. } => Partition::from(*partition),
+            // Decided and resolved before an apply: nothing of the kind is
+            // written.
+            Mutation::Command(_) | Mutation::Operation(_) | Mutation::Derive(_) => continue,
+        };
+        if !accounted(partition) {
+            continue;
+        }
+        let at = match tallies.iter().position(|(p, _)| *p == partition) {
+            Some(at) => at,
+            None => {
+                tallies.push((partition, Tally::default()));
+                tallies.len() - 1
+            }
+        };
+        let tally = &mut tallies[at].1;
+        match mutation {
+            Mutation::Put { key, value, .. } => tally.put(key, value),
+            Mutation::Delete { key, .. } => tally.delete(key),
+            Mutation::Merge { key, operand, .. } => tally.merge(key, operand),
+            Mutation::RemoveRange { start, end, .. } => {
+                tally.range(coverage::clamp_user_start(start), end);
+            }
+            Mutation::Command(_) | Mutation::Operation(_) | Mutation::Derive(_) => {}
+        }
+    }
+    tallies
 }
 
 /// Encode a unit record's value into `out`.
@@ -186,14 +439,15 @@ pub(crate) fn unit_value(kind: UnitKind, bytes: u64, key: &[u8], end: &[u8], out
     out.extend_from_slice(end);
 }
 
-/// The ordinal after the last unit record `tree` holds at `seqno`.
-fn next_ordinal(tree: &AnyTree, seqno: SeqNo) -> StorageResult<u32> {
-    let start = unit_key(seqno, 0);
+/// The ordinal after the last unit record `scope` holds at `seqno`.
+fn next_ordinal(scope: &Scope<'_>, seqno: SeqNo) -> StorageResult<u32> {
+    let start = unit_key(scope.head, seqno, 0);
     let end: Vec<u8> = match seqno.checked_add(1) {
-        Some(next) => unit_key(next, 0).to_vec(),
-        None => [0x00, b'a', b'v'].to_vec(),
+        Some(next) => unit_key(scope.head, next, 0).to_vec(),
+        None => scope.head.key(&[0x00, b'a', b'v']),
     };
-    match tree
+    match scope
+        .tree
         .range(start.as_slice()..end.as_slice(), SeqNo::MAX, None)
         .next_back()
     {
@@ -211,24 +465,28 @@ fn next_ordinal(tree: &AnyTree, seqno: SeqNo) -> StorageResult<u32> {
 /// for a point) and encoded length.
 pub(crate) type OwnedUnit = (UnitKind, Vec<u8>, Vec<u8>, u64);
 
-/// Write unit records for `units` at `seqno`, after the ones `tree` already
-/// holds there, written at `at`: units a rebuild or an installation puts
-/// back without a batch of their own.
+/// Write unit records for `units` at `seqno` into `scope`, after the ones it
+/// already holds there, written at `at`: units a rebuild or an installation
+/// puts back without a batch of their own.
 ///
 /// # Errors
 ///
 /// A record could not be read.
 pub(crate) fn add_units(
-    tree: &AnyTree,
+    scope: &Scope<'_>,
     seqno: SeqNo,
     units: &[OwnedUnit],
     at: SeqNo,
 ) -> StorageResult<()> {
-    let mut ordinal = next_ordinal(tree, seqno)?;
+    let mut ordinal = next_ordinal(scope, seqno)?;
     let mut value = Vec::new();
     for (kind, key, end, bytes) in units {
         unit_value(*kind, *bytes, key, end, &mut value);
-        tree.insert(unit_key(seqno, ordinal).as_slice(), value.as_slice(), at);
+        scope.tree.insert(
+            unit_key(scope.head, seqno, ordinal).as_slice(),
+            value.as_slice(),
+            at,
+        );
         ordinal = ordinal.checked_add(1).ok_or_else(|| {
             StorageError::Serialization(format!("material units at {seqno} exhaust u32"))
         })?;
@@ -238,16 +496,26 @@ pub(crate) fn add_units(
 
 /// The unit index record prefix.
 const UNIT_PREFIX: [u8; 3] = [0x00, b'a', b'u'];
-const UNIT_KEY_LEN: usize = UNIT_PREFIX.len() + 8 + 4;
+const UNIT_KEY_LEN: usize = HEAD_LEN + UNIT_PREFIX.len() + 8 + 4;
 /// A unit record's value past its key and end: kind, length, key length.
 const UNIT_HEADER: usize = 1 + 8 + 4;
 
-/// The unit index record of the `ordinal`-th unit at `seqno`.
-pub(crate) fn unit_key(seqno: SeqNo, ordinal: u32) -> [u8; UNIT_KEY_LEN] {
+/// The unit index record of the `ordinal`-th unit at `seqno` under `head`.
+pub(crate) fn unit_key(head: Head, seqno: SeqNo, ordinal: u32) -> [u8; UNIT_KEY_LEN] {
     let mut out = [0u8; UNIT_KEY_LEN];
-    out[..UNIT_PREFIX.len()].copy_from_slice(&UNIT_PREFIX);
-    out[UNIT_PREFIX.len()..UNIT_PREFIX.len() + 8].copy_from_slice(&seqno.to_be_bytes());
-    out[UNIT_PREFIX.len() + 8..].copy_from_slice(&ordinal.to_be_bytes());
+    out[..HEAD_LEN].copy_from_slice(head.bytes());
+    let at = HEAD_LEN + UNIT_PREFIX.len();
+    out[HEAD_LEN..at].copy_from_slice(&UNIT_PREFIX);
+    out[at..at + 8].copy_from_slice(&seqno.to_be_bytes());
+    out[at + 8..].copy_from_slice(&ordinal.to_be_bytes());
+    out
+}
+
+/// The unit index prefix under `head`.
+fn unit_prefix(head: Head) -> [u8; HEAD_LEN + UNIT_PREFIX.len()] {
+    let mut out = [0u8; HEAD_LEN + UNIT_PREFIX.len()];
+    out[..HEAD_LEN].copy_from_slice(head.bytes());
+    out[HEAD_LEN..].copy_from_slice(&UNIT_PREFIX);
     out
 }
 
@@ -270,7 +538,10 @@ fn decode_unit(key: &[u8], value: &[u8]) -> StorageResult<Unit> {
             value.len()
         ))
     };
-    let id = key.strip_prefix(UNIT_PREFIX.as_slice()).ok_or_else(bad)?;
+    let id = key
+        .get(HEAD_LEN..)
+        .and_then(|k| k.strip_prefix(UNIT_PREFIX.as_slice()))
+        .ok_or_else(bad)?;
     let seqno = id
         .get(..8)
         .and_then(|s| <[u8; 8]>::try_from(s).ok())
@@ -313,7 +584,7 @@ fn decode_unit(key: &[u8], value: &[u8]) -> StorageResult<Unit> {
     })
 }
 
-/// Up to `limit` units of `tree` from `(seqno, ordinal)` on, below `to`
+/// Up to `limit` units of `scope` from `(seqno, ordinal)` on, below `to`
 /// (exclusive), visible at `snapshot`, in commit order. With `held`, each
 /// unit's copy is reserved there before it is made, and the units stop at
 /// the first that does not fit; the flag says they stopped so.
@@ -322,20 +593,23 @@ fn decode_unit(key: &[u8], value: &[u8]) -> StorageResult<Unit> {
 ///
 /// A record could not be read or is malformed.
 pub(crate) fn units_from(
-    tree: &AnyTree,
+    scope: &Scope<'_>,
     from: (SeqNo, u32),
     to: SeqNo,
     snapshot: SeqNo,
     limit: usize,
     mut held: Option<&mut coordinode_core::budget::MemoryCharge<'_>>,
 ) -> StorageResult<(Vec<Unit>, bool)> {
-    let start = unit_key(from.0, from.1);
-    let end = unit_key(to, 0);
+    let start = unit_key(scope.head, from.0, from.1);
+    let end = unit_key(scope.head, to, 0);
     if start.as_slice() >= end.as_slice() {
         return Ok((Vec::new(), false));
     }
     let mut out = Vec::new();
-    for guard in tree.range(start.as_slice()..end.as_slice(), snapshot, None) {
+    for guard in scope
+        .tree
+        .range(start.as_slice()..end.as_slice(), snapshot, None)
+    {
         if out.len() >= limit {
             break;
         }
@@ -353,18 +627,20 @@ pub(crate) fn units_from(
 }
 
 /// The bytes of the range deletion [`retire_units_below`] writes: its bounds.
-pub(crate) const RETIRE_RECORD_BYTES: u64 = (UNIT_PREFIX.len() + UNIT_KEY_LEN) as u64;
+pub(crate) const RETIRE_RECORD_BYTES: u64 = (HEAD_LEN + UNIT_PREFIX.len() + UNIT_KEY_LEN) as u64;
 
-/// Drop `tree`'s unit records below `seqno`, at seqno `at`.
-pub(crate) fn retire_units_below(tree: &AnyTree, seqno: SeqNo, at: SeqNo) {
-    let end = unit_key(seqno, 0);
-    tree.remove_range(UNIT_PREFIX.as_slice(), end.as_slice(), at);
+/// Drop `scope`'s unit records below `seqno`, at seqno `at`.
+pub(crate) fn retire_units_below(scope: &Scope<'_>, seqno: SeqNo, at: SeqNo) {
+    let end = unit_key(scope.head, seqno, 0);
+    scope
+        .tree
+        .remove_range(unit_prefix(scope.head).as_slice(), end.as_slice(), at);
 }
 
 /// The records of a tree rebuilt from a copy's history, counted from the
 /// versions actually reinstalled. The history comes in key order, so one
 /// seqno's units arrive scattered: they are summed in a bounded map and
-/// added to the tree's records a page at a time.
+/// added to the scope's records a page at a time.
 #[derive(Debug, Default)]
 pub(crate) struct Reinstalled {
     pending: std::collections::BTreeMap<SeqNo, u64>,
@@ -405,9 +681,9 @@ impl Reinstalled {
             || self.held_bytes >= REINSTALL_BYTES
     }
 
-    /// Add what was counted to `tree`'s records. Each sum is written at
-    /// `at`, a seqno above every earlier page's, so the newest sum is the one
-    /// read whichever of them a flush separated.
+    /// Add what was counted for source `part` to its `scope`'s records.
+    /// Each sum is written at `at`, a seqno above every earlier page's, so
+    /// the newest sum is the one read whichever of them a flush separated.
     ///
     /// # Errors
     ///
@@ -415,7 +691,7 @@ impl Reinstalled {
     pub(crate) fn spill(
         &mut self,
         part: Partition,
-        tree: &AnyTree,
+        scope: &Scope<'_>,
         at: SeqNo,
     ) -> StorageResult<()> {
         let pending = core::mem::take(&mut self.pending);
@@ -426,28 +702,46 @@ impl Reinstalled {
             return Ok(());
         }
         for (seqno, units) in &units {
-            add_units(tree, *seqno, units, at)?;
+            add_units(scope, *seqno, units, at)?;
         }
         for (seqno, bytes) in pending {
-            let k = key(seqno);
-            let held = match tree.get(k.as_slice(), SeqNo::MAX)? {
+            let k = key(scope.head, seqno);
+            let held = match scope.tree.get(k.as_slice(), SeqNo::MAX)? {
                 Some(value) => decode(&k, &value)?.1,
                 None => 0,
             };
             // Both are sums of one seqno's units in one tree.
-            tree.insert(k.as_slice(), encode(held + bytes).as_slice(), at);
+            scope
+                .tree
+                .insert(k.as_slice(), encode(held + bytes).as_slice(), at);
         }
         Ok(())
     }
 }
 
+/// The record key prefix.
+const PREFIX: [u8; 3] = [0x00, b'a', b'x'];
+/// Exclusive end of the record range.
+const END: [u8; 3] = [0x00, b'a', b'y'];
+const KEY_LEN: usize = HEAD_LEN + PREFIX.len() + 8;
+
+/// The record for `seqno` under `head`.
+pub(crate) fn key(head: Head, seqno: SeqNo) -> [u8; KEY_LEN] {
+    let mut out = [0u8; KEY_LEN];
+    out[..HEAD_LEN].copy_from_slice(head.bytes());
+    out[HEAD_LEN..HEAD_LEN + PREFIX.len()].copy_from_slice(&PREFIX);
+    out[HEAD_LEN + PREFIX.len()..].copy_from_slice(&seqno.to_be_bytes());
+    out
+}
+
 /// Key and value bytes of one record.
 pub(crate) const RECORD_BYTES: u64 = (KEY_LEN + 8) as u64;
 
-/// The room the records of one apply of `units` writes take, bounded from
-/// above: one record per tree it touches (it touches at most one tree per
-/// write and no more trees than there are), and one unit record per unit,
-/// `keys` being the bytes of the units' keys and range ends together.
+/// The room the accounting of one apply of `units` writes takes, bounded
+/// from above: one record per source tree it touches (it touches at most one
+/// tree per write and no more trees than there are), one unit record per
+/// unit, `keys` being the bytes of the units' keys and range ends together,
+/// and the coverage marker the accounting batch carries.
 pub(crate) fn record_allowance(units: usize, keys: u64) -> u64 {
     let trees = Partition::all().len();
     // At most a dozen trees, and units bounded by the apply's memory: far
@@ -457,6 +751,7 @@ pub(crate) fn record_allowance(units: usize, keys: u64) -> u64 {
             ((UNIT_KEY_LEN + UNIT_HEADER) * units) as u64 + keys,
             units,
         )
+        + crate::engine::footprint::footprint_of(coverage::MARKER_LEN as u64, 1)
 }
 
 /// The material from a seqno on, over every accounted tree.
@@ -505,24 +800,27 @@ impl Material {
     }
 }
 
-/// Add the records of `tree` in `[from, to)` visible at `snapshot` to
+/// Add the records of `scope` in `[from, to)` visible at `snapshot` to
 /// `material`.
 pub(crate) fn read_into(
-    tree: &AnyTree,
+    scope: &Scope<'_>,
     from: SeqNo,
     to: Option<SeqNo>,
     snapshot: SeqNo,
     material: &mut Material,
 ) -> StorageResult<()> {
-    let start = key(from);
+    let start = key(scope.head, from);
     let end: Vec<u8> = match to {
-        Some(to) => key(to).to_vec(),
-        None => END.to_vec(),
+        Some(to) => key(scope.head, to).to_vec(),
+        None => scope.head.key(&END),
     };
     if start.as_slice() >= end.as_slice() {
         return Ok(());
     }
-    for guard in tree.range(start.as_slice()..end.as_slice(), snapshot, None) {
+    for guard in scope
+        .tree
+        .range(start.as_slice()..end.as_slice(), snapshot, None)
+    {
         let (k, v) = guard.into_inner()?;
         let (seqno, bytes) = decode(&k, &v)?;
         material.add(seqno, bytes)?;
@@ -532,35 +830,40 @@ pub(crate) fn read_into(
 
 /// How far the readable floor moves before the records below it are dropped
 /// (seqnos; with an oracle, microseconds: about a minute). Each retirement
-/// is one range deletion per tree.
+/// is one range deletion per accounted source.
 pub(crate) const RETIRE_WINDOW: SeqNo = 1 << 26;
 
-/// Drop `tree`'s records below `floor`, at seqno `at`, above every record
-/// they cover. A tree with none there takes no write: a deletion would make
-/// it flush a table for nothing. Returns whether it wrote.
+/// Drop `scope`'s records below `floor`, at seqno `at`, above every record
+/// they cover. A scope with none there takes no write: a deletion would make
+/// the tree flush a table for nothing. Returns whether it wrote.
 ///
 /// # Errors
 ///
 /// A record could not be read or is malformed.
-pub(crate) fn retire_below(tree: &AnyTree, floor: SeqNo, at: SeqNo) -> StorageResult<bool> {
-    if first_from(tree, 0, SeqNo::MAX)?.is_none_or(|first| first >= floor) {
+pub(crate) fn retire_below(scope: &Scope<'_>, floor: SeqNo, at: SeqNo) -> StorageResult<bool> {
+    if first_from(scope, 0, SeqNo::MAX)?.is_none_or(|first| first >= floor) {
         return Ok(false);
     }
-    let end = key(floor);
-    tree.remove_range(PREFIX.as_slice(), end.as_slice(), at);
+    let start = scope.head.key(&PREFIX);
+    let end = key(scope.head, floor);
+    scope
+        .tree
+        .remove_range(start.as_slice(), end.as_slice(), at);
     Ok(true)
 }
 
-/// The first seqno at or after `from` with a record in `tree` visible at
+/// The first seqno at or after `from` with a record in `scope` visible at
 /// `snapshot`.
 pub(crate) fn first_from(
-    tree: &AnyTree,
+    scope: &Scope<'_>,
     from: SeqNo,
     snapshot: SeqNo,
 ) -> StorageResult<Option<SeqNo>> {
-    let start = key(from);
-    match tree
-        .range(start.as_slice()..END.as_slice(), snapshot, None)
+    let start = key(scope.head, from);
+    let end = scope.head.key(&END);
+    match scope
+        .tree
+        .range(start.as_slice()..end.as_slice(), snapshot, None)
         .next()
     {
         Some(guard) => {
@@ -578,7 +881,8 @@ pub(crate) fn encode(bytes: u64) -> [u8; 8] {
 
 fn decode(key: &[u8], value: &[u8]) -> StorageResult<(SeqNo, u64)> {
     let seqno = key
-        .strip_prefix(PREFIX.as_slice())
+        .get(HEAD_LEN..)
+        .and_then(|k| k.strip_prefix(PREFIX.as_slice()))
         .and_then(|s| <[u8; 8]>::try_from(s).ok())
         .map(u64::from_be_bytes);
     let bytes = <[u8; 8]>::try_from(value).ok().map(u64::from_le_bytes);

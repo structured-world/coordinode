@@ -19,6 +19,9 @@ use tempfile::TempDir;
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
 
+/// The accounting tree beside the data trees across crash cuts.
+mod accounting;
+
 /// A persistent (oplog-eligible) single-endpoint config rooted at `dir`.
 fn durable_cfg(dir: &TempDir) -> StorageConfig {
     StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -1180,8 +1183,9 @@ fn entries_replayed_at_open_stay_in_the_journal() {
 }
 
 /// Writes that land in two partitions make a persist write tables for those
-/// two trees only: coverage bookkeeping for the journal entries is no reason
-/// to write a table for every other partition.
+/// two trees and the accounting tree their material records went to only:
+/// coverage bookkeeping for the journal entries is no reason to write a
+/// table for every other partition.
 #[test]
 fn a_persist_writes_tables_only_for_trees_that_took_writes() {
     use lsm_tree::AbstractTree;
@@ -1213,9 +1217,9 @@ fn a_persist_writes_tables_only_for_trees_that_took_writes() {
         .map(|(p, _)| p.name())
         .collect();
     assert_eq!(
-        written,
-        2,
-        "trees that got a table: {written} of {}: {which:?}",
+        which,
+        vec!["node", "adj", "acct"],
+        "trees that got a table: {written} of {}",
         after.len()
     );
     rig.cut(engine);
@@ -1253,7 +1257,9 @@ fn a_routine_fold_writes_only_the_trees_its_entries_reached() {
     engine.persist().expect("persist");
     let after = tables(&engine);
     let written = before.iter().zip(&after).filter(|(b, a)| a > b).count();
-    assert_eq!(written, 2, "a fold wrote tables for untouched trees");
+    // The two data trees the commits wrote, and the accounting tree their
+    // material records went to.
+    assert_eq!(written, 3, "a fold wrote tables for untouched trees");
 
     let purged = engine
         .oplog_purge_expired(4_000_000_000, u64::MAX)

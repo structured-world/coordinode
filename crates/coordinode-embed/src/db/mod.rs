@@ -2265,7 +2265,8 @@ impl Database {
 
     /// Change the total owned-footprint ceiling of endpoint `endpoint_id`
     /// (its `hard_limit_bytes`) without a restart, and the recovery reserve
-    /// inside it (`None`: a sixteenth of the limit). A raised limit admits
+    /// inside it (`None`: a sixteenth of the limit, at least the room one
+    /// recovery record of the store's own may need). A raised limit admits
     /// writes at once; a limit below what the endpoint holds deletes nothing
     /// and refuses client writes, reads going on, until the database fits it.
     ///

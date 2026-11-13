@@ -248,6 +248,8 @@ fn partition_to_id(p: Partition) -> PartitionId {
         Partition::Schema => PartitionId::Schema,
         Partition::Idx => PartitionId::Idx,
         Partition::Raft => unreachable!("Raft partition is not exposed to the query layer"),
+        // Refused where an attempt stages a write (`Partition::writable`).
+        Partition::Accounting => unreachable!("an attempt writes no engine-owned partition"),
         Partition::Counter => PartitionId::Counter,
         Partition::VectorF32 => PartitionId::VectorF32,
         Partition::Registry => PartitionId::Registry,
@@ -1006,6 +1008,7 @@ impl<'a> Transaction<'a> {
     /// MVCC-aware write: buffers for atomic flush at commit. Legacy mode writes
     /// straight to the engine.
     pub fn put(&mut self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
+        let part = part.writable()?;
         if self.oracle.is_some() {
             self.admit_staged(STAGED_WRITE + key.len() + value.len())?;
             self.write_buffer
@@ -1035,6 +1038,7 @@ impl<'a> Transaction<'a> {
         prefix: &[u8],
         value: &[u8],
     ) -> StorageResult<()> {
+        let part = part.writable()?;
         if self.oracle.is_none() {
             return Err(StorageError::NoCommitTimestamp);
         }
@@ -1047,6 +1051,7 @@ impl<'a> Transaction<'a> {
     /// MVCC-aware delete: buffers a tombstone for atomic flush. Legacy mode
     /// deletes straight from the engine.
     pub fn delete(&mut self, part: Partition, key: &[u8]) -> StorageResult<()> {
+        let part = part.writable()?;
         if self.oracle.is_some() {
             self.admit_staged(STAGED_WRITE + key.len())?;
             self.write_buffer.insert((part, key.to_vec()), None);
@@ -1064,6 +1069,7 @@ impl<'a> Transaction<'a> {
     /// record that owns it. The attempt neither reads nor writes inside a
     /// range it removes: its reads would still see the range as stored.
     pub fn remove_range(&mut self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        let part = part.writable()?;
         if self.oracle.is_some() {
             self.range_removals
                 .push((part, start.to_vec(), end.to_vec()));

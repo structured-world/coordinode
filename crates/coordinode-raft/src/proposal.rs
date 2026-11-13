@@ -51,8 +51,9 @@ pub fn to_partition(id: PartitionId) -> Partition {
 
 /// Convert `Partition` (storage) to `PartitionId` (core).
 ///
-/// The `Raft` partition is internal to the storage engine (Raft log entries
-/// and metadata) and has no corresponding `PartitionId` in the public API.
+/// The `Raft` partition (Raft log entries and metadata) and the `Accounting`
+/// partition (the engine's own count of its data) are internal to the
+/// storage engine and have no corresponding `PartitionId` in the public API.
 pub fn to_partition_id(p: Partition) -> PartitionId {
     match p {
         Partition::Node => PartitionId::Node,
@@ -63,6 +64,7 @@ pub fn to_partition_id(p: Partition) -> PartitionId {
         Partition::Schema => PartitionId::Schema,
         Partition::Idx => PartitionId::Idx,
         Partition::Raft => unreachable!("Raft partition is internal-only"),
+        Partition::Accounting => unreachable!("accounting partition is internal-only"),
         Partition::Counter => PartitionId::Counter,
         Partition::VectorF32 => PartitionId::VectorF32,
         Partition::Registry => PartitionId::Registry,

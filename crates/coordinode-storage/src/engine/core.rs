@@ -134,6 +134,22 @@ pub struct StorageEngine {
     /// Commits since the last fold round started: a round runs once enough
     /// are due, so the commit path does not fold every commit alone.
     material_fold_due: core::sync::atomic::AtomicU32,
+    /// The head of every source's accounting scope. A write holds it shared
+    /// from its first data effect to its accounting, and a clear renewing a
+    /// scope holds it exclusively, so no write puts its data in the tree a
+    /// clear leaves and its accounting in the scope the clear deletes, or
+    /// the reverse. parking_lot: the uncontended shared path never enters
+    /// the kernel.
+    material_heads: parking_lot::RwLock<crate::engine::material::Heads>,
+    /// Whether the data directory is one on disk, where the intent files
+    /// live: a recount of an accounting scope is then owed durably across a
+    /// crash. A store kept in memory has no later open to owe it to.
+    durable_intents: bool,
+    /// Held by a recount from its intent through its last record, and by a
+    /// persist while it lists the intents it settles: a listed intent is
+    /// one whose records are all in a memtable the persist flushes. Apart
+    /// from the folder, which a fold holds while admission may persist.
+    recounting: parking_lot::Mutex<()>,
     /// One bit per partition (its place in [`Partition::all`]) whose tree is
     /// under repair: set before the first destructive step, cleared once the
     /// repaired tree is installed. A repair that fails leaves its bit set,
@@ -392,6 +408,104 @@ fn material_of(part: Partition) -> crate::engine::pending::Material {
     } else {
         crate::engine::pending::Material::Untouched
     }
+}
+
+/// Count one retained version of `part`'s live `tree` into `material`, as
+/// its write counted it: once per logical write, under its logical key. A
+/// replacement's staging copy of a write is the same write, so only the
+/// version at the write's primary address counts; reserved keys and
+/// versions under a retired installation count nothing.
+fn count_retained(
+    tree: &lsm_tree::AnyTree,
+    installations: Option<&crate::engine::installation::Installations>,
+    bindings: Option<&crate::engine::installation::Bindings>,
+    event: &lsm_tree::ScanSinceEvent,
+    material: &mut crate::engine::material::Reinstalled,
+) -> StorageResult<()> {
+    use crate::engine::material::{UnitKind, unit_bytes};
+    use lsm_tree::ScanSinceEvent;
+    let point = |key: &[u8]| -> StorageResult<Option<Vec<u8>>> {
+        if coverage::is_reserved(key) {
+            return Ok(None);
+        }
+        let logical = match bindings {
+            Some(bindings) => match bindings.logical_key(key) {
+                Some(logical) => logical,
+                None => return Ok(None),
+            },
+            None => key.to_vec(),
+        };
+        let mut addressing =
+            crate::engine::installation::Addressing::new(installations, tree, event.seqno());
+        Ok((addressing.point(&logical)? == key).then_some(logical))
+    };
+    match event {
+        ScanSinceEvent::RangeTombstone {
+            start_key,
+            end_key,
+            seqno,
+        } => {
+            let start = coverage::clamp_user_start(start_key);
+            if start >= end_key.as_ref() {
+                return Ok(());
+            }
+            let logical = match bindings {
+                Some(bindings) => bindings.logical_ranges_until(start, end_key.to_vec()),
+                None => vec![(start.to_vec(), end_key.to_vec())],
+            };
+            let addressing =
+                crate::engine::installation::Addressing::new(installations, tree, *seqno);
+            for (from, to) in logical {
+                // A staging copy of the deletion is no deletion of its own.
+                let primary = addressing
+                    .range(&from, &to)
+                    .into_iter()
+                    .any(|(a, b)| a == start && b == end_key.as_ref());
+                if primary {
+                    material.add(*seqno, UnitKind::Range, &from, &to, unit_bytes(&from, &to));
+                }
+            }
+        }
+        ScanSinceEvent::Insert { key, value, seqno } => {
+            if let Some(logical) = point(key)? {
+                material.add(
+                    *seqno,
+                    UnitKind::Value,
+                    &logical,
+                    &[],
+                    unit_bytes(&logical, value),
+                );
+            }
+        }
+        ScanSinceEvent::MergeOperand {
+            key,
+            operand,
+            seqno,
+        } => {
+            if let Some(logical) = point(key)? {
+                material.add(
+                    *seqno,
+                    UnitKind::Operand,
+                    &logical,
+                    &[],
+                    unit_bytes(&logical, operand),
+                );
+            }
+        }
+        ScanSinceEvent::PointTombstone { key, seqno }
+        | ScanSinceEvent::WeakTombstone { key, seqno } => {
+            if let Some(logical) = point(key)? {
+                material.add(
+                    *seqno,
+                    UnitKind::Delete,
+                    &logical,
+                    &[],
+                    unit_bytes(&logical, &[]),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One `STORAGE COLUMNAR` table as a whole-store snapshot carries it: its id
@@ -1042,11 +1156,20 @@ impl StorageEngine {
         // routing also places the columnar tables' levels.
         #[cfg(feature = "columnar")]
         let mut node_routing = None;
+        // Whether a default routing was written here: the Schema scope's
+        // accounting then owes a count once the accounting tree is open.
+        let mut routing_defaulted = false;
+        // Intents live as files of the data directory itself: a store whose
+        // directory is not one on disk (a memory filesystem) keeps none, and
+        // has no later open to owe a recount to.
+        let durable_intents = config.data_dir().is_dir();
         for &part in Partition::all() {
             if part == Partition::Schema {
                 continue;
             }
             let routing = load_or_init_partition_routing(
+                durable_intents.then(|| config.data_dir()),
+                &mut routing_defaulted,
                 &schema_tree,
                 &seqno,
                 &config.endpoints,
@@ -1221,6 +1344,9 @@ impl StorageEngine {
                             .unwrap_or(0),
                     );
                     let mut replayed = 0usize;
+                    let replay_heads = crate::engine::material::Heads::read(
+                        crate::engine::local_journal::tree_of(&trees, Partition::Accounting)?,
+                    )?;
                     for entry in &entries {
                         // Group the entry's data ops per partition so each
                         // partition receives them as one batch at the entry's
@@ -1251,7 +1377,7 @@ impl StorageEngine {
                             };
                             per_partition.entry(part).or_default().push(op);
                         }
-                        for (part, ops) in per_partition {
+                        for (&part, ops) in &per_partition {
                             let tree = trees.get(&part).ok_or_else(|| {
                                 StorageError::PartitionNotFound {
                                     name: part.name().to_string(),
@@ -1263,16 +1389,37 @@ impl StorageEngine {
                                     .is_some_and(|c| c.contains(entry.index, 0));
                             if !skip {
                                 apply_oplog_ops_at(
-                                    part,
                                     tree,
                                     (part == Partition::Idx).then_some(&installations),
-                                    &ops,
+                                    ops,
                                     entry.ts,
                                     entry.index,
                                     Domain::Journal,
                                 )?;
                                 replayed += ops.len();
                             }
+                        }
+                        // The entry's accounting, from all of it, unless the
+                        // accounting tree holds it. A source under rebuild
+                        // gets its scope counted by that rebuild.
+                        let account = !rebuilding.contains(&Partition::Accounting)
+                            && !covered
+                                .get(&Partition::Accounting)
+                                .is_some_and(|c| c.contains(entry.index, 0));
+                        if account {
+                            crate::engine::oplog_journal::account_oplog_ops(
+                                crate::engine::local_journal::tree_of(
+                                    &trees,
+                                    Partition::Accounting,
+                                )?,
+                                &replay_heads,
+                                per_partition
+                                    .iter()
+                                    .filter(|(part, _)| !rebuilding.contains(part))
+                                    .map(|(&part, ops)| (part, ops.as_slice())),
+                                entry.ts,
+                                Some(Domain::Journal.marker_key(entry.index, 0)),
+                            )?;
                         }
                     }
                     // Not flushed here: the journal keeps every replayed entry,
@@ -1685,6 +1832,9 @@ impl StorageEngine {
             Ok(endpoint) => group_history_evidence(&endpoint.path, &trees)?.is_some(),
             Err(_) => false,
         };
+        let material_heads = crate::engine::material::Heads::read(
+            crate::engine::local_journal::tree_of(&trees, Partition::Accounting)?,
+        )?;
         let coordinator = LocalMultiModalCoordinator::new(
             trees,
             Arc::clone(&seqno),
@@ -1710,6 +1860,9 @@ impl StorageEngine {
             material_generation: core::sync::atomic::AtomicU64::new(0),
             material_fold: parking_lot::Mutex::new(material_fold::Folder::default()),
             material_fold_due: core::sync::atomic::AtomicU32::new(0),
+            material_heads: parking_lot::RwLock::new(material_heads),
+            durable_intents,
+            recounting: parking_lot::Mutex::new(()),
             under_repair: core::sync::atomic::AtomicU64::new(0),
             repair_active: core::sync::atomic::AtomicU64::new(0),
             metadata_decisions: parking_lot::Mutex::new(()),
@@ -1797,6 +1950,19 @@ impl StorageEngine {
             for table in settled {
                 engine.acknowledge_table_repair(&table)?;
             }
+        }
+        // A recount a crash cut short, or one the routing defaults written
+        // above owe, is done before anything reads the accounting.
+        let mut recounts = if engine.durable_intents {
+            read_rebuild_intents(&engine.data_dir)?.recounts
+        } else {
+            Vec::new()
+        };
+        if routing_defaulted && !recounts.contains(&Partition::Schema) {
+            recounts.push(Partition::Schema);
+        }
+        for source in recounts {
+            engine.reconstruct_accounting(source)?;
         }
         // What the open wrote and replayed is folded before the store is
         // handed out, so the first commits fold only themselves. A tree the
@@ -1919,7 +2085,8 @@ impl StorageEngine {
     }
 
     /// Change the hard limit of endpoint `endpoint_id` without a restart, and
-    /// its recovery reserve (`None`: a sixteenth of the limit). A raised
+    /// its recovery reserve (`None`:
+    /// [`default_recovery_reserve`](crate::engine::config::default_recovery_reserve)). A raised
     /// limit admits writes at once. A limit below what the endpoint holds
     /// deletes nothing: it is pending, client writes are refused and the
     /// store's own growth is held to what it holds plus the reserve until
@@ -1954,8 +2121,7 @@ impl StorageEngine {
                  configuration and takes effect at the next open"
             ))
         })?;
-        let reserve =
-            reserve.unwrap_or(limit / crate::engine::config::DEFAULT_RECOVERY_RESERVE_DIVISOR);
+        let reserve = reserve.unwrap_or(crate::engine::config::default_recovery_reserve(limit));
         footprint.set_limit(limit, reserve);
         tracing::info!(
             endpoint = endpoint_id,
@@ -2025,13 +2191,19 @@ impl StorageEngine {
     /// The growth of the flush debt a write into `parts` may cause: one
     /// [`MEMTABLE_START_DEBT`](crate::engine::footprint::MEMTABLE_START_DEBT)
     /// for each distinct tree among them whose active memtable is empty,
-    /// which the write makes one more flush owed. Read without a tree's lock.
+    /// which the write makes one more flush owed, the accounting tree
+    /// counted with any accounted source, whose accounting it receives. Read
+    /// without a tree's lock.
     fn memtable_starts(&self, parts: impl IntoIterator<Item = Partition>) -> u64 {
         use lsm_tree::AbstractTree;
         let all = Partition::all();
         // One bit per partition: a handful of them.
         let mut seen = 0u64;
         let mut starts = 0u64;
+        let parts = parts.into_iter().flat_map(|part| {
+            core::iter::once(part)
+                .chain(crate::engine::material::accounted(part).then_some(Partition::Accounting))
+        });
         for part in parts {
             let Some(bit) = all.iter().position(|p| *p == part) else {
                 continue;
@@ -3296,6 +3468,11 @@ impl StorageEngine {
         let Some(coverage) = self.coverage.as_ref().filter(|_| self.oplog.is_some()) else {
             return Ok(Rebuild::Refused(RebuildRefusal::NoJournal));
         };
+        // The accounting is this member's count of its own data, not data a
+        // copy holds: it is counted again from the live trees.
+        if partition == Partition::Accounting {
+            return self.recount_accounting_tree(coverage);
+        }
 
         // 1. Prove the state before touching the live partition.
         let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
@@ -3358,15 +3535,19 @@ impl StorageEngine {
         // that are not reinstalled (this node's records, retired
         // installations). The reinstalled versions are counted again.
         let mut material = crate::engine::material::Reinstalled::default();
+        // The partition's repair excludes any other clear of it, so its head
+        // stays the one the clear renewed.
+        let heads = *self.material_heads();
+        let scope = self.material_scope(&heads, partition)?;
         for event in rebuild::tree_history(&source)? {
             if self.reinstall_event(partition, source_bindings.as_deref(), event, &mut material)? {
                 versions += 1;
             }
             if material.full() {
-                material.spill(partition, self.tree(partition)?, self.next_seqno())?;
+                material.spill(partition, &scope, self.next_seqno())?;
             }
         }
-        material.spill(partition, self.tree(partition)?, self.next_seqno())?;
+        material.spill(partition, &scope, self.next_seqno())?;
         drop(source);
         drop(ckpt);
         for (key, value) in &local {
@@ -3396,7 +3577,6 @@ impl StorageEngine {
                 continue;
             }
             apply_oplog_ops_at(
-                partition,
                 tree,
                 installations,
                 &ops,
@@ -3404,11 +3584,24 @@ impl StorageEngine {
                 entry.index,
                 Domain::Journal,
             )?;
+            // The renewed scope's units of the entry, without a marker: the
+            // accounting tree's own coverage of the entry describes the
+            // other scopes, which kept theirs.
+            crate::engine::oplog_journal::account_oplog_ops(
+                self.tree(Partition::Accounting)?,
+                &heads,
+                [(partition, ops.as_slice())],
+                entry.ts,
+                None,
+            )?;
             replayed += 1;
         }
         self.coordinator.flush_trigger().wrote_unmeasured();
         self.rebind_coverage(partition, next, &above)?;
-        // 4. With the history on disk and the intent still in place, serve it.
+        // 4. With the history on disk and the intent still in place, serve
+        //    it: the renewed scope's accounting is on disk first, since no
+        //    marker of the accounting tree replays it.
+        self.flush_memtables(self.tree(Partition::Accounting)?)?;
         self.flush_memtables(tree)?;
         self.restore_retention_floor(tree, partition, source_floor)?;
         self.finish_rebuild(repair)?;
@@ -3775,6 +3968,26 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Rebuild the accounting tree of a journaled store from the data trees
+    /// as they stand, under its rebuild intent: every scope is counted again
+    /// ([`Self::clear_partition_tree`]) with writes held back, and the tree
+    /// then covers every entry applied before the count began. An entry
+    /// applied after it wrote its own accounting under its marker.
+    fn recount_accounting_tree(&self, coverage: &Coverage) -> StorageResult<Rebuild> {
+        let (next, above) = coverage.applied_snapshot();
+        let repair = self.begin_rebuild(Partition::Accounting)?;
+        let tree = self.tree(Partition::Accounting)?;
+        self.clear_partition_tree(Partition::Accounting, tree)?;
+        self.rebind_coverage(Partition::Accounting, next, &above)?;
+        self.flush_memtables(tree)?;
+        self.finish_rebuild(repair)?;
+        self.acknowledge_open_repair(Partition::Accounting)?;
+        Ok(Rebuild::Rebuilt {
+            versions: 0,
+            replayed: 0,
+        })
+    }
+
     /// The partitions whose rebuild started and did not finish: a crash
     /// between clearing a tree and persisting its rebuilt data. Such a tree
     /// holds an unknown part of its data and of its coverage record, so only
@@ -3785,6 +3998,22 @@ impl StorageEngine {
     /// The intent directory cannot be read.
     pub fn pending_rebuilds(&self) -> StorageResult<Vec<Partition>> {
         Ok(read_rebuild_intents(&self.data_dir)?.partitions)
+    }
+
+    /// Whether a rebuild left some accounting incomplete: an accounted
+    /// partition's or the accounting tree's rebuild started and did not
+    /// finish. A scope's recount is done before the open hands the store out
+    /// and under the folder afterwards; its intent only waits for the next
+    /// persist.
+    ///
+    /// # Errors
+    ///
+    /// The intent directory cannot be read.
+    pub(crate) fn material_rebuild_pending(&self) -> StorageResult<bool> {
+        Ok(read_rebuild_intents(&self.data_dir)?
+            .partitions
+            .into_iter()
+            .any(|part| crate::engine::material::accounted(part) || part == Partition::Accounting))
     }
 
     /// The `STORAGE COLUMNAR` tables whose rebuild started and did not
@@ -3841,11 +4070,14 @@ impl StorageEngine {
             .fetch_and(!repair_bit(partition), core::sync::atomic::Ordering::AcqRel);
     }
 
-    /// Whether an accounted partition is under repair.
+    /// Whether an accounted partition, or the accounting tree, is under
+    /// repair.
     fn repairing_material(&self) -> bool {
         let accounted = Partition::all()
             .iter()
-            .filter(|&&part| crate::engine::material::accounted(part))
+            .filter(|&&part| {
+                crate::engine::material::accounted(part) || part == Partition::Accounting
+            })
             .fold(0, |mask, &part| mask | repair_bit(part));
         self.under_repair
             .load(core::sync::atomic::Ordering::Acquire)
@@ -5038,6 +5270,7 @@ impl StorageEngine {
     /// beside what the endpoints hold and owe returns
     /// [`StorageError::CapacityExhausted`] without inserting.
     pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
+        let part = part.writable()?;
         let _admitted = self.admit_partition_write(
             [part],
             crate::engine::footprint::footprint_of((key.len() + value.len()) as u64, 1)
@@ -5059,9 +5292,63 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// The accounting scopes' heads, held shared: from a write's first data
+    /// effect through its accounting.
+    pub(crate) fn material_heads(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, crate::engine::material::Heads> {
+        self.material_heads.read()
+    }
+
+    /// `part`'s accounting scope under `heads`.
+    ///
+    /// # Errors
+    ///
+    /// The accounting tree is not open.
+    pub(crate) fn material_scope(
+        &self,
+        heads: &crate::engine::material::Heads,
+        part: Partition,
+    ) -> StorageResult<crate::engine::material::Scope<'_>> {
+        Ok(crate::engine::material::Scope::new(
+            self.tree(Partition::Accounting)?,
+            heads,
+            part,
+        ))
+    }
+
+    /// Apply one commit's accounting at `seqno`: every source's `tallies` as
+    /// one batch of the accounting tree under `heads`, with `cover`'s marker
+    /// last. A commit that accounts nothing writes nothing there.
+    ///
+    /// # Errors
+    ///
+    /// The accounting tree is not open or refuses the batch.
+    pub(crate) fn apply_accounting<'a>(
+        &self,
+        tallies: impl IntoIterator<Item = (Partition, &'a crate::engine::material::Tally<'a>)>,
+        heads: &crate::engine::material::Heads,
+        seqno: lsm_tree::SeqNo,
+        cover: Option<coverage::Mark>,
+    ) -> StorageResult<()> {
+        let marker = cover.map(coverage::Mark::key);
+        let Some(batch) = crate::engine::material::batch_of(
+            tallies,
+            heads,
+            seqno,
+            marker.as_ref().map(<[u8; coverage::MARKER_LEN]>::as_slice),
+        ) else {
+            return Ok(());
+        };
+        let (added, memtable) = self
+            .tree(Partition::Accounting)?
+            .apply_batch(batch, seqno)?;
+        self.coordinator.flush_trigger().wrote(added, memtable);
+        Ok(())
+    }
+
     /// Apply one direct write's `batch` (its key and a replacement's copy)
-    /// at the next seqno, with the record of the material it adds, as one
-    /// lsm batch.
+    /// at the next seqno, then the record of the material it adds.
     fn apply_single(
         &self,
         part: Partition,
@@ -5071,27 +5358,30 @@ impl StorageEngine {
         self.apply_single_with(part, batch, tally, |_| {})
     }
 
-    /// [`Self::apply_single`] with `landing` run once the write holds its
-    /// seqno and before it is applied: where a test looks at the store while
-    /// a direct write is under way.
+    /// [`Self::apply_single`] with `landing` run once the data is in its tree
+    /// and before the accounting is in its own: where a test looks at the
+    /// store while a direct write is between the two trees.
     pub(crate) fn apply_single_with(
         &self,
         part: Partition,
-        mut batch: lsm_tree::WriteBatch,
+        batch: lsm_tree::WriteBatch,
         tally: crate::engine::material::Tally,
         landing: impl FnOnce(lsm_tree::SeqNo),
     ) -> StorageResult<()> {
         let tree = self.tree(part)?;
-        // Held until the whole batch is in: its entries become visible one
-        // by one, so no complete snapshot may cover its seqno before.
+        // Held until the data and the accounting are both in: no complete
+        // snapshot may cover its seqno before, and a failure between them
+        // leaves the seqno uncertified, not a complete empty accounting.
         let (seqno, _landing) = self
             .pending_commits
             .admit_direct(|| self.next_seqno(), material_of(part))
             .map_err(|_| StorageError::MaterialClaimed)?;
-        landing(seqno);
-        tally.record(part, seqno, &mut batch);
+        let heads = self.material_heads();
         let (added, memtable) = tree.apply_batch(batch, seqno)?;
         self.coordinator.flush_trigger().wrote(added, memtable);
+        landing(seqno);
+        self.apply_accounting([(part, &tally)], &heads, seqno, None)?;
+        drop(heads);
         drop(_landing);
         self.fold_after_commit();
         Ok(())
@@ -5127,6 +5417,7 @@ impl StorageEngine {
     /// Admitted on the owned footprint like a put: a tombstone takes memtable
     /// bytes, then table bytes, until a compaction drops what it covers.
     pub fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {
+        let part = part.writable()?;
         let _admitted = self.admit_partition_write(
             [part],
             crate::engine::footprint::footprint_of(key.len() as u64, 1)
@@ -5162,6 +5453,7 @@ impl StorageEngine {
     ///
     /// Not capacity-gated — deleting frees space.
     pub fn remove_range(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        let part = part.writable()?;
         // Every piece at one seqno: a snapshot sees the whole delete or none
         // of it, however many installations it spans.
         let addressing = self.addressing(part)?;
@@ -5172,6 +5464,7 @@ impl StorageEngine {
             .pending_commits
             .admit_direct(|| self.next_seqno(), material_of(part))
             .map_err(|_| StorageError::MaterialClaimed)?;
+        let heads = self.material_heads();
         let start = coverage::clamp_user_start(start);
         let ranges = addressing.range(start, end);
         let staging = addressing.staging_range(start, end);
@@ -5181,13 +5474,10 @@ impl StorageEngine {
             }
         }
         // Its record follows the tombstones, as on the batch path.
-        let mut record = lsm_tree::WriteBatch::with_capacity(1);
         let mut tally = crate::engine::material::Tally::default();
         tally.range(start, end);
-        tally.record(part, seqno, &mut record);
-        if !record.is_empty() {
-            tree.apply_batch(record, seqno)?;
-        }
+        self.apply_accounting([(part, &tally)], &heads, seqno, None)?;
+        drop(heads);
         self.coordinator.flush_trigger().wrote_unmeasured();
         drop(_landing);
         self.fold_after_commit();
@@ -5208,6 +5498,7 @@ impl StorageEngine {
     ///
     /// Invalidates any cached entry for this key (stale after merge).
     pub fn merge(&self, part: Partition, key: &[u8], operand: &[u8]) -> StorageResult<()> {
+        let part = part.writable()?;
         let _admitted = self.admit_partition_write(
             [part],
             crate::engine::footprint::footprint_of((key.len() + operand.len()) as u64, 1)
@@ -5405,7 +5696,12 @@ impl StorageEngine {
                 return Ok(());
             }
             let staged = self.applied_feed.stage(0, commit_ts, &decided.effects);
-            self.apply_proposal_covered(&decided.effects, commit_ts, None)?;
+            self.apply_proposal_covered(
+                &decided.effects,
+                commit_ts,
+                None,
+                crate::engine::material::Accounting::OwnWrites,
+            )?;
             staged.publish();
             return Ok(());
         }
@@ -5413,7 +5709,12 @@ impl StorageEngine {
         // commit timestamp. Staged before the write lands, so a reader that
         // sees it is told the derived indexes may not hold it yet.
         let staged = self.applied_feed.stage(0, commit_ts, mutations);
-        self.apply_proposal_covered(mutations, commit_ts, None)?;
+        self.apply_proposal_covered(
+            mutations,
+            commit_ts,
+            None,
+            crate::engine::material::Accounting::OwnWrites,
+        )?;
         staged.publish();
         Ok(())
     }
@@ -5608,9 +5909,13 @@ impl StorageEngine {
             // The record stays on this member: nothing reaches the log for a
             // closing entry to cover once it is written.
             let (seqno, _held) = self.pending_commits.obligate_local(|| self.next_seqno());
+            let heads = self.material_heads();
             local.commit(
-                self.coordinator.trees(),
-                &self.installations,
+                crate::engine::local_journal::Targets {
+                    trees: self.coordinator.trees(),
+                    installations: &self.installations,
+                    heads: &heads,
+                },
                 writes,
                 sync,
                 seqno,
@@ -5692,9 +5997,18 @@ impl StorageEngine {
         for mutation in resolved.iter() {
             if let Some(partition) = mutation_partition(mutation) {
                 coverage.note_touched(partition, index);
+                // Its accounting lands under the same marker.
+                if crate::engine::material::accounted(partition) {
+                    coverage.note_touched(Partition::Accounting, index);
+                }
             }
         }
-        self.apply_effects_covered(&resolved, commit_ts, Some(mark))?;
+        self.apply_effects_covered(
+            &resolved,
+            commit_ts,
+            Some(mark),
+            crate::engine::material::Accounting::OwnWrites,
+        )?;
         self.note_applied(coverage, index);
         staged.publish();
         Ok(())
@@ -5764,6 +6078,7 @@ impl StorageEngine {
         mutations: &[Mutation],
         commit_ts: u64,
         cover: Option<coverage::Mark>,
+        accounting: crate::engine::material::Accounting<'_>,
     ) -> StorageResult<()> {
         // DERIVED entries are derived from the unit itself and land in the
         // same batch, under the same coverage marker, as the data they index.
@@ -5773,20 +6088,22 @@ impl StorageEngine {
         if mutations.iter().any(|m| matches!(m, Mutation::Command(_))) {
             let _decisions = self.metadata_exclusive();
             let (effects, dictionary) = self.decide_commands(mutations, commit_ts)?;
-            self.apply_effects_covered(&effects, commit_ts, cover)?;
+            self.apply_effects_covered(&effects, commit_ts, cover, accounting)?;
             self.note_dictionary(dictionary);
             return Ok(());
         }
-        self.apply_effects_covered(mutations, commit_ts, cover)
+        self.apply_effects_covered(mutations, commit_ts, cover, accounting)
     }
 
     /// Apply `mutations`, none of them a metadata command, as one batch at
-    /// `commit_ts` together with `cover`.
+    /// `commit_ts` together with `cover`, and the accounting `accounting`
+    /// names.
     fn apply_effects_covered(
         &self,
         mutations: &[Mutation],
         commit_ts: u64,
         cover: Option<coverage::Mark>,
+        accounting: crate::engine::material::Accounting<'_>,
     ) -> StorageResult<()> {
         if mutations.is_empty() {
             return Ok(());
@@ -5833,7 +6150,7 @@ impl StorageEngine {
             (Some(_), ts) if ts > 0 => ts,
             _ => self.next_seqno(),
         };
-        batch.commit_covered(seqno, cover)?;
+        batch.commit_covered(seqno, cover, accounting)?;
         if let Some(oracle) = &self.oracle {
             oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(seqno));
             // The commit path is the retention window's clock tick: with the
@@ -5852,10 +6169,107 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Apply only the accounting of `unit` at `commit_ts` with its marker
+    /// `mark`: the replay of an entry every data tree already holds.
+    ///
+    /// # Errors
+    ///
+    /// The accounting tree is not open or refuses the batch.
+    pub(super) fn apply_accounting_only(
+        &self,
+        commit_ts: u64,
+        mark: coverage::Mark,
+        accounting: crate::engine::material::Accounting<'_>,
+    ) -> StorageResult<()> {
+        let crate::engine::material::Accounting::OwnWritesAnd(unit) = accounting else {
+            return Ok(());
+        };
+        let seqno = match (&self.oracle, commit_ts) {
+            (Some(_), ts) if ts > 0 => ts,
+            _ => self.next_seqno(),
+        };
+        let tallies = crate::engine::material::tally_mutations(unit);
+        let heads = self.material_heads();
+        self.apply_accounting(
+            tallies.iter().map(|(part, tally)| (*part, tally)),
+            &heads,
+            seqno,
+            Some(mark),
+        )
+    }
+
+    /// Rebuild `part`'s accounting from what its tree holds: the scope is
+    /// renewed and every retained version of the tree is counted again, a
+    /// bounded page at a time. For a unit whose accounting is missing while
+    /// its data is in the tree and cannot be derived again (metadata command
+    /// effects decided against a state that now already holds them). Writes
+    /// to the tree wait meanwhile, so the count describes one state of it;
+    /// an observation across it sees the generation move.
+    ///
+    /// # Errors
+    ///
+    /// A tree cannot be read or written.
+    pub(crate) fn reconstruct_accounting(&self, part: Partition) -> StorageResult<()> {
+        if !crate::engine::material::accounted(part) {
+            return Ok(());
+        }
+        {
+            let _recounting = self.recounting.lock();
+            let _folder = self.material_fold.lock();
+            // Durable before the old scope goes, and owed until the next
+            // persist puts the new one on disk ([`Self::persist`], which lists
+            // the intents under `recounting`, so never one of a recount still
+            // writing): a crash before that recounts it at the next open. A
+            // store kept in memory has no next open to owe it to.
+            if self.durable_intents {
+                write_rebuild_intent(&self.data_dir, RebuildTarget::Recount(part))?;
+            }
+            let mut heads = self.material_heads.write();
+            self.move_material_generation();
+            self.recount_scope(&mut heads, part)?;
+        }
+        self.move_material_generation();
+        Ok(())
+    }
+
+    /// [`Self::reconstruct_accounting`] with the fold and the heads held:
+    /// `part`'s scope renewed and counted again from its tree.
+    fn recount_scope(
+        &self,
+        heads: &mut crate::engine::material::Heads,
+        part: Partition,
+    ) -> StorageResult<()> {
+        if !crate::engine::material::accounted(part) {
+            return Ok(());
+        }
+        let acct = self.tree(Partition::Accounting)?;
+        heads.renew(acct, part, self.next_seqno())?;
+        self.forget_material_round()?;
+        let tree = self.tree(part)?;
+        let bindings = self.installations_of(part).map(|i| i.current());
+        let scope = crate::engine::material::Scope::new(acct, heads, part);
+        let mut material = crate::engine::material::Reinstalled::default();
+        for event in rebuild::tree_history(tree)? {
+            count_retained(
+                tree,
+                self.installations_of(part),
+                bindings.as_deref(),
+                &event,
+                &mut material,
+            )?;
+            if material.full() {
+                material.spill(part, &scope, self.next_seqno())?;
+            }
+        }
+        material.spill(part, &scope, self.next_seqno())?;
+        self.coordinator.flush_trigger().wrote_unmeasured();
+        Ok(())
+    }
+
     /// Drop the material records below the readable floor, once the floor
     /// has moved a whole window past the last time: one range deletion in
-    /// the reserved namespace of each accounted tree. No consumer can hold a
-    /// checkpoint below the floor, so nobody asks for them again.
+    /// each accounted source's scope. No consumer can hold a checkpoint below
+    /// the floor, so nobody asks for them again.
     fn retire_material(&self) {
         use core::sync::atomic::Ordering;
         let floor = self.oldest_readable_seqno();
@@ -5873,15 +6287,16 @@ impl StorageEngine {
         }
         let at = self.next_seqno();
         let mut wrote = false;
+        let heads = self.material_heads();
         for &part in Partition::all() {
             if !crate::engine::material::accounted(part) {
                 continue;
             }
-            // A tree left as it was keeps its records until the next window:
-            // they sit below every checkpoint and are never summed.
+            // A scope left as it was keeps its records until the next
+            // window: they sit below every checkpoint and are never summed.
             match self
-                .tree(part)
-                .and_then(|tree| crate::engine::material::retire_below(tree, floor, at))
+                .material_scope(&heads, part)
+                .and_then(|scope| crate::engine::material::retire_below(&scope, floor, at))
             {
                 Ok(retired) => wrote |= retired,
                 Err(e) => tracing::warn!(error = %e, "material retirement skipped a tree"),
@@ -5947,15 +6362,33 @@ impl StorageEngine {
         part: Partition,
         tree: &lsm_tree::AnyTree,
     ) -> StorageResult<()> {
-        // No fold writes into the tree while it is cleared: a batch landing
-        // after the clear would carry a cursor past what is put back.
+        // No fold writes while the tree is cleared: a batch landing after the
+        // clear would carry a cursor past what is put back.
         let _folder = self.material_fold.lock();
-        tree.clear()?;
-        // The tree's fold state went with it: no round covers it until the
-        // fold has gone through what is put back.
-        if crate::engine::material::accounted(part) {
-            self.forget_material_round()?;
+        // No write lands its data on one side of the clear and its
+        // accounting on the other.
+        let mut heads = self.material_heads.write();
+        if part == Partition::Accounting {
+            // Every scope goes with the tree, incarnations included; each is
+            // counted again from what its source holds.
+            tree.clear()?;
+            *heads = crate::engine::material::Heads::default();
+            self.move_material_generation();
+            for &source in Partition::all() {
+                self.recount_scope(&mut heads, source)?;
+            }
+            self.move_material_generation();
+        } else {
+            // The scope's accounting is invalidated before the data changes,
+            // and no round covers it until the fold has gone through what is
+            // put back.
+            if crate::engine::material::accounted(part) {
+                heads.renew(self.tree(Partition::Accounting)?, part, self.next_seqno())?;
+                self.forget_material_round()?;
+            }
+            tree.clear()?;
         }
+        drop(heads);
         // The installations of the index tree outlive its entries: one handed
         // out before the clear is never handed out again.
         if let Some(installations) = self.installations_of(part) {
@@ -6141,6 +6574,15 @@ impl StorageEngine {
     /// performed after the SST flush.  This keeps the WAL small: all data
     /// that was in the WAL is now in SST, so the journal can be truncated.
     pub fn persist(&self) -> StorageResult<()> {
+        // The recounts finished before the flush: a recount writes under
+        // `recounting`, so once it is taken every listed recount's records
+        // are in a memtable the flush below persists, and its intent can go.
+        let settled = if self.durable_intents {
+            let _recounting = self.recounting.lock();
+            read_rebuild_intents(&self.data_dir)?.recounts
+        } else {
+            Vec::new()
+        };
         for tree in self.coordinator.trees().values() {
             self.flush_memtables_in_order(tree)?;
         }
@@ -6154,6 +6596,9 @@ impl StorageEngine {
         // Once per device, not once per tree: every tree lies under the
         // endpoints.
         self.sync_endpoint_devices()?;
+        for source in settled {
+            remove_rebuild_intent(&self.data_dir, RebuildTarget::Recount(source))?;
+        }
         // The retained oplog journal is NOT truncated on flush — it must survive
         // for WAL-replay-repair, and crash recovery skips the entries each
         // partition's coverage record already holds (see `open_embedded`).
@@ -6397,6 +6842,9 @@ impl StorageEngine {
             let _maintenance = crate::engine::footprint::MaintenanceScope::enter();
             tree.major_compact(u64::MAX, watermark)?;
         }
+        // The tree's levels changed: the monitor judges its write pressure
+        // again, which it otherwise does only after a later flush.
+        self.compaction_wake.notify();
         // Operand fold for commutative partitions is time-travel safe: it
         // rewrites each key's merged value with `put`, adding a new version on
         // top while leaving the older operands intact for reads at older
@@ -6500,10 +6948,13 @@ impl StorageEngine {
         snapshot: lsm_tree::SeqNo,
     ) -> StorageResult<crate::engine::material::Material> {
         let mut material = crate::engine::material::Material::default();
+        // A copy: a renewal meanwhile moves the generation, which the
+        // observation checks after its read.
+        let heads = *self.material_heads();
         for &part in Partition::all() {
             if crate::engine::material::accounted(part) {
                 crate::engine::material::read_into(
-                    self.tree(part)?,
+                    &self.material_scope(&heads, part)?,
                     from,
                     to,
                     snapshot,
@@ -6526,11 +6977,14 @@ impl StorageEngine {
     ) -> StorageResult<crate::engine::material::Material> {
         let snapshot = round.at + 1;
         let mut material = crate::engine::material::Material::default();
+        // A copy: a renewal meanwhile moves the generation, which the
+        // observation checks after its read.
+        let heads = *self.material_heads();
         for &part in Partition::all() {
             if !crate::engine::material::accounted(part) {
                 continue;
             }
-            let tree = self.tree(part)?;
+            let tree = &self.material_scope(&heads, part)?;
             material.bytes = material
                 .bytes
                 .checked_add(crate::engine::material::summary::charge_from(
@@ -6575,12 +7029,7 @@ impl StorageEngine {
         use core::sync::atomic::Ordering;
         let generation = self.material_generation.load(Ordering::Acquire);
         // A repair under way here, or one an earlier run left owed on disk.
-        if self.repairing_material()
-            || self
-                .pending_rebuilds()?
-                .into_iter()
-                .any(crate::engine::material::accounted)
-        {
+        if self.repairing_material() || self.material_rebuild_pending()? {
             return Ok(Observation::Rebuilding);
         }
         // The records from `from` on must stay through the read: a consumer
@@ -7976,7 +8425,14 @@ fn routing_key_for(partition: Partition) -> Vec<u8> {
 ///
 /// `relocated`: the store's tables were gathered into `endpoints` from
 /// another layout, so the persisted routing is replaced by the default.
+///
+/// A default written here lands before the accounting tree is open: the
+/// Schema scope's recount is owed durably first (in `intents`, a store on a
+/// real filesystem), the call says it wrote one, and the open counts it once
+/// that tree is there.
 fn load_or_init_partition_routing(
+    intents: Option<&Path>,
+    wrote_default: &mut bool,
     schema_tree: &lsm_tree::AnyTree,
     seqno: &lsm_tree::SharedSequenceNumberGenerator,
     endpoints: &[EndpointConfig],
@@ -8018,12 +8474,13 @@ fn load_or_init_partition_routing(
                     partition.name()
                 ))
             })?;
+            if let Some(dir) = intents {
+                write_rebuild_intent(dir, RebuildTarget::Recount(Partition::Schema))?;
+            }
+            *wrote_default = true;
             let write_seqno = seqno.next();
-            let mut batch = lsm_tree::WriteBatch::with_capacity(2);
+            let mut batch = lsm_tree::WriteBatch::with_capacity(1);
             batch.insert(key.as_slice(), encoded.as_slice());
-            let mut tally = crate::engine::material::Tally::default();
-            tally.put(&key, &encoded);
-            tally.record(Partition::Schema, write_seqno, &mut batch);
             schema_tree.apply_batch(batch, write_seqno).map_err(|e| {
                 StorageError::Io(format!("persist routing for {}: {e}", partition.name()))
             })?;
@@ -8616,12 +9073,18 @@ fn release_cache_layers(
 /// this prefix, so a table never names a partition's.
 const TABLE_INTENT_PREFIX: &str = "table.";
 
+/// The intent file of a recount of a source's accounting scope is its
+/// partition's name behind this prefix.
+const RECOUNT_INTENT_PREFIX: &str = "recount.";
+
 /// A tree a rebuild intent names.
 #[derive(Debug, Clone, Copy)]
 enum RebuildTarget<'a> {
     Partition(Partition),
     #[cfg_attr(not(feature = "columnar"), allow(dead_code))]
     Table(&'a str),
+    /// The accounting scope of a source partition, counted again from it.
+    Recount(Partition),
 }
 
 impl RebuildTarget<'_> {
@@ -8630,6 +9093,7 @@ impl RebuildTarget<'_> {
         match self {
             Self::Partition(partition) => partition.name().to_string(),
             Self::Table(table) => format!("{TABLE_INTENT_PREFIX}{table}"),
+            Self::Recount(partition) => format!("{RECOUNT_INTENT_PREFIX}{}", partition.name()),
         }
     }
 }
@@ -8665,6 +9129,8 @@ fn remove_rebuild_intent(data_dir: &Path, target: RebuildTarget<'_>) -> StorageR
 struct RebuildIntents {
     partitions: Vec<Partition>,
     tables: Vec<String>,
+    /// Sources whose accounting scope is owed a recount.
+    recounts: Vec<Partition>,
 }
 
 fn read_rebuild_intents(data_dir: &Path) -> StorageResult<RebuildIntents> {
@@ -8686,12 +9152,18 @@ fn read_rebuild_intents(data_dir: &Path) -> StorageResult<RebuildIntents> {
             pending.tables.push(table.to_string());
             continue;
         }
-        let part = Partition::all()
-            .iter()
-            .copied()
-            .find(|p| name == p.name())
-            .ok_or_else(unknown)?;
-        pending.partitions.push(part);
+        let named = |name: &str| {
+            Partition::all()
+                .iter()
+                .copied()
+                .find(|p| name == p.name())
+                .ok_or_else(unknown)
+        };
+        if let Some(source) = name.strip_prefix(RECOUNT_INTENT_PREFIX) {
+            pending.recounts.push(named(source)?);
+            continue;
+        }
+        pending.partitions.push(named(name)?);
     }
     Ok(pending)
 }
@@ -8767,6 +9239,10 @@ mod material_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod material_fold_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod accounting_placement_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]

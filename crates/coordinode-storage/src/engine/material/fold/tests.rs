@@ -6,6 +6,14 @@ use crate::engine::partition::Partition;
 use coordinode_core::budget::QueryBudget;
 use tempfile::TempDir;
 
+/// The Node tree's accounting scope: where its folds read and write.
+fn scope(engine: &StorageEngine) -> Scope<'_> {
+    let heads = *engine.material_heads();
+    engine
+        .material_scope(&heads, Partition::Node)
+        .expect("scope")
+}
+
 fn engine(dir: &std::path::Path) -> StorageEngine {
     StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -57,16 +65,17 @@ fn batch_of(fold: Fold<'_>) -> lsm_tree::WriteBatch {
 /// Fold `units` (in commit order): points in batches of `per_batch`, each
 /// range deletion alone, in pages of `page` keys, each page its own batch.
 fn fold(engine: &StorageEngine, units: &[U], per_batch: usize, page: usize) {
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let scope = scope(engine);
+    let tree = scope.tree;
     let commit = |fold: Fold<'_>| {
         tree.apply_batch(batch_of(fold), engine.next_seqno())
             .expect("apply");
     };
-    let mut current = Fold::new(tree);
+    let mut current = Fold::new(scope);
     let mut in_batch = 0;
     for u in units {
         if u.kind == UnitKind::Range {
-            commit(std::mem::replace(&mut current, Fold::new(tree)));
+            commit(std::mem::replace(&mut current, Fold::new(scope)));
             in_batch = 0;
             let tomb = Tomb {
                 seqno: u.seqno,
@@ -74,7 +83,7 @@ fn fold(engine: &StorageEngine, units: &[U], per_batch: usize, page: usize) {
             };
             let mut from: Option<Vec<u8>> = None;
             loop {
-                let mut paged = Fold::new(tree);
+                let mut paged = Fold::new(scope);
                 let next = paged
                     .range_page(tomb, &u.key, &u.end, u.bytes, from.as_deref(), page)
                     .expect("range page");
@@ -92,7 +101,7 @@ fn fold(engine: &StorageEngine, units: &[U], per_batch: usize, page: usize) {
             .expect("fold");
         in_batch += 1;
         if in_batch >= per_batch.max(1) {
-            commit(std::mem::replace(&mut current, Fold::new(tree)));
+            commit(std::mem::replace(&mut current, Fold::new(scope)));
             in_batch = 0;
         }
     }
@@ -233,12 +242,12 @@ fn the_folded_charge_matches_the_closure_definition() {
             1 + (next() % 40) as usize,
             1 + (next() % 4) as usize,
         );
-        let tree = engine.tree(Partition::Node).expect("tree");
+        let scope = scope(&engine);
         let mut probes: Vec<SeqNo> = vec![0, 999, 1_000, seqno, seqno + 1, SeqNo::MAX];
         probes.extend(units.iter().flat_map(|u| [u.seqno, u.seqno + 1]));
         for s in probes {
             assert_eq!(
-                charge_from(tree, s, SeqNo::MAX).expect("read"),
+                charge_from(&scope, s, SeqNo::MAX).expect("read"),
                 oracle(&units, s),
                 "round {round}, from {s}"
             );
@@ -256,9 +265,9 @@ fn repeated_overwrites_charge_the_last_value_only() {
         .map(|n| point(100 + n, b"node:hot", UnitKind::Value, 8 + 1_024))
         .collect();
     fold(&engine, &units, 64, 8);
-    let tree = engine.tree(Partition::Node).expect("tree");
-    assert_eq!(charge_from(tree, 100, SeqNo::MAX).expect("read"), 1_032);
-    assert_eq!(charge_from(tree, 1_100, SeqNo::MAX).expect("read"), 0);
+    let scope = scope(&engine);
+    assert_eq!(charge_from(&scope, 100, SeqNo::MAX).expect("read"), 1_032);
+    assert_eq!(charge_from(&scope, 1_100, SeqNo::MAX).expect("read"), 0);
 }
 
 /// An operand after the continuation needs the base below it, and every
@@ -275,9 +284,9 @@ fn an_operand_after_the_continuation_needs_its_base_below_it() {
         point(40, k, UnitKind::Operand, 15),
     ];
     fold(&engine, &units, 4, 8);
-    let tree = engine.tree(Partition::Node).expect("tree");
-    assert_eq!(charge_from(tree, 35, SeqNo::MAX).expect("read"), 145);
-    assert_eq!(charge_from(tree, 41, SeqNo::MAX).expect("read"), 0);
+    let scope = scope(&engine);
+    assert_eq!(charge_from(&scope, 35, SeqNo::MAX).expect("read"), 145);
+    assert_eq!(charge_from(&scope, 41, SeqNo::MAX).expect("read"), 0);
 }
 
 /// A deleted key still needs its deletion as evidence of the change; a key
@@ -296,10 +305,10 @@ fn a_deletion_is_evidence_and_a_recreation_replaces_it() {
         8,
         8,
     );
-    let tree = engine.tree(Partition::Node).expect("tree");
-    assert_eq!(charge_from(tree, 15, SeqNo::MAX).expect("read"), 9);
+    let scope = scope(&engine);
+    assert_eq!(charge_from(&scope, 15, SeqNo::MAX).expect("read"), 9);
     fold(&engine, &[point(30, k, UnitKind::Value, 40)], 8, 8);
-    assert_eq!(charge_from(tree, 15, SeqNo::MAX).expect("read"), 40);
+    assert_eq!(charge_from(&scope, 15, SeqNo::MAX).expect("read"), 40);
 }
 
 /// A range deletion over many keys is charged once, while a key it deleted
@@ -321,18 +330,18 @@ fn a_range_deletion_is_charged_once_while_a_key_rests_on_it() {
         bytes: 14,
     });
     fold(&engine, &units, 4, 3);
-    let tree = engine.tree(Partition::Node).expect("tree");
-    assert_eq!(charge_from(tree, 50, SeqNo::MAX).expect("read"), 14);
+    let scope = scope(&engine);
+    assert_eq!(charge_from(&scope, 50, SeqNo::MAX).expect("read"), 14);
     // Keys written again leave it; an operand onto one keeps it needed.
     let mut again: Vec<U> = (0..9u64)
         .map(|n| point(60 + n, &key(n), UnitKind::Value, 30))
         .collect();
     again.push(point(80, &key(9), UnitKind::Operand, 12));
     fold(&engine, &again, 3, 3);
-    assert_eq!(charge_from(tree, 75, SeqNo::MAX).expect("read"), 14 + 12);
+    assert_eq!(charge_from(&scope, 75, SeqNo::MAX).expect("read"), 14 + 12);
     fold(&engine, &[point(90, &key(9), UnitKind::Value, 30)], 3, 3);
-    assert_eq!(charge_from(tree, 85, SeqNo::MAX).expect("read"), 30);
-    assert_eq!(charge_from(tree, 0, SeqNo::MAX).expect("read"), 10 * 30);
+    assert_eq!(charge_from(&scope, 85, SeqNo::MAX).expect("read"), 30);
+    assert_eq!(charge_from(&scope, 0, SeqNo::MAX).expect("read"), 10 * 30);
 }
 
 fn long_key(n: u8) -> Vec<u8> {
@@ -398,12 +407,13 @@ fn within_reserve<'t>(
 fn a_metered_fold_holds_no_more_than_it_reserved() {
     let dir = TempDir::new().expect("tempdir");
     let engine = engine(dir.path());
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let scope = scope(&engine);
+    let tree = scope.tree;
     let budget = QueryBudget::new(1 << 30);
     let keys = mixed_keys(6);
     let apply = |batch| tree.apply_batch(batch, engine.next_seqno()).expect("apply");
     apply(within_reserve("points", || {
-        let mut fold = Fold::metered(tree, &budget);
+        let mut fold = Fold::metered(scope, &budget);
         for (i, key) in keys.iter().enumerate() {
             let kind = if i % 3 == 0 {
                 UnitKind::Value
@@ -422,7 +432,7 @@ fn a_metered_fold_holds_no_more_than_it_reserved() {
     loop {
         let mut next = None;
         apply(within_reserve("a range page", || {
-            let mut page = Fold::metered(tree, &budget);
+            let mut page = Fold::metered(scope, &budget);
             let paged = page
                 .range_page(tomb, b"node:", b"node;", 10, from.as_deref(), 2)
                 .expect("page");
@@ -440,7 +450,7 @@ fn a_metered_fold_holds_no_more_than_it_reserved() {
         }
     }
     apply(within_reserve("operands onto a range", || {
-        let mut fold = Fold::metered(tree, &budget);
+        let mut fold = Fold::metered(scope, &budget);
         for (i, key) in keys.iter().enumerate() {
             assert!(
                 fold.unit(60 + i as u64, key, UnitKind::Operand, 7)
@@ -453,7 +463,7 @@ fn a_metered_fold_holds_no_more_than_it_reserved() {
     // take beside the keys dominates.
     let short: Vec<Vec<u8>> = (0..3000u32).map(|n| format!("a{n}").into_bytes()).collect();
     apply(within_reserve("short keys", || {
-        let mut fold = Fold::metered(tree, &budget);
+        let mut fold = Fold::metered(scope, &budget);
         for (i, key) in short.iter().enumerate() {
             assert!(
                 fold.unit(100 + i as u64, key, UnitKind::Value, 3)
@@ -465,7 +475,7 @@ fn a_metered_fold_holds_no_more_than_it_reserved() {
     // A fold that only completes the commit folded before it: its mark,
     // batch and cursor record alone.
     apply(within_reserve("a commit completed", || {
-        let mut fold = Fold::metered(tree, &budget).after(Some(3_099));
+        let mut fold = Fold::metered(scope, &budget).after(Some(3_099));
         assert!(fold.close(), "room for the mark");
         (fold, None)
     }));
@@ -497,11 +507,12 @@ fn a_fold_over_a_cold_tree_of_many_tables_holds_no_more_than_it_reserved() {
     };
     {
         let engine = StorageEngine::open(&config(None)).expect("open");
-        let tree = engine.tree(Partition::Node).expect("tree");
+        let scope = scope(&engine);
+        let tree = scope.tree;
         // Each table holds descriptors of the keys and a stretch of others,
         // with a range deletion over part of them.
         for t in 0..TABLES {
-            let mut fold = Fold::new(tree);
+            let mut fold = Fold::new(scope);
             for (i, key) in keys.iter().enumerate() {
                 fold.unit(t * 100 + i as u64, key, UnitKind::Operand, 5)
                     .expect("unit");
@@ -528,7 +539,8 @@ fn a_fold_over_a_cold_tree_of_many_tables_holds_no_more_than_it_reserved() {
     // Without a block cache every block the reads load is theirs alone; with
     // one, what they load is the cache's, held to the cache's own capacity.
     let engine = StorageEngine::open(&config(Some(0))).expect("open cold");
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let scope = scope(&engine);
+    let tree = scope.tree;
     assert!(
         super::runs(tree) >= 4,
         "the tree has {} runs",
@@ -537,7 +549,7 @@ fn a_fold_over_a_cold_tree_of_many_tables_holds_no_more_than_it_reserved() {
     let budget = QueryBudget::new(1 << 30);
     let apply = |batch| tree.apply_batch(batch, engine.next_seqno()).expect("apply");
     apply(within_reserve("points over a cold tree", || {
-        let mut fold = Fold::metered(tree, &budget);
+        let mut fold = Fold::metered(scope, &budget);
         for (i, key) in keys.iter().enumerate() {
             assert!(
                 fold.unit(5_000 + i as u64, key, UnitKind::Operand, 7)
@@ -554,7 +566,7 @@ fn a_fold_over_a_cold_tree_of_many_tables_holds_no_more_than_it_reserved() {
     loop {
         let mut next = None;
         apply(within_reserve("a range page over a cold tree", || {
-            let mut page = Fold::metered(tree, &budget);
+            let mut page = Fold::metered(scope, &budget);
             let paged = page
                 .range_page(tomb, b"node:", b"node;", 10, from.as_deref(), 64)
                 .expect("page");
@@ -587,8 +599,9 @@ fn a_deep_run_of_many_tables_folds_within_a_rounds_share() {
     let keys = mixed_keys(6);
     {
         let engine = engine(dir.path());
-        let tree = engine.tree(Partition::Node).expect("tree");
-        let mut fold = Fold::new(tree);
+        let scope = scope(&engine);
+        let tree = scope.tree;
+        let mut fold = Fold::new(scope);
         for (i, key) in keys.iter().enumerate() {
             fold.unit(10 + i as u64, key, UnitKind::Operand, 5)
                 .expect("unit");
@@ -622,7 +635,8 @@ fn a_deep_run_of_many_tables_folds_within_a_rounds_share() {
     )]);
     config.block_cache_bytes = 0;
     let engine = StorageEngine::open(&config).expect("open cold");
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let scope = scope(&engine);
+    let tree = scope.tree;
     assert!(super::runs(tree) <= 2, "{} runs", super::runs(tree));
     // What a fold through two runs goes on with, and room for its units: a
     // fraction of what reads reckoned per table would ask.
@@ -634,7 +648,7 @@ fn a_deep_run_of_many_tables_folds_within_a_rounds_share() {
     let budget = QueryBudget::new(share);
     let apply = |batch| tree.apply_batch(batch, engine.next_seqno()).expect("apply");
     apply(within_reserve("points through a deep run", || {
-        let mut fold = Fold::metered(tree, &budget);
+        let mut fold = Fold::metered(scope, &budget);
         for (i, key) in keys.iter().enumerate() {
             assert!(
                 fold.unit(5_000 + i as u64, key, UnitKind::Operand, 7)
@@ -653,7 +667,7 @@ fn a_deep_run_of_many_tables_folds_within_a_rounds_share() {
     loop {
         let mut next = None;
         apply(within_reserve("a range page through a deep run", || {
-            let mut page = Fold::metered(tree, &budget);
+            let mut page = Fold::metered(scope, &budget);
             let result = page
                 .range_page(tomb, b"node:", b"node;", 10, from.as_deref(), 64)
                 .expect("page");
@@ -683,9 +697,10 @@ fn a_deep_run_of_many_tables_folds_within_a_rounds_share() {
 fn a_run_added_while_folding_is_reserved_before_it_is_read() {
     let dir = TempDir::new().expect("tempdir");
     let engine = engine(dir.path());
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let scope = scope(&engine);
+    let tree = scope.tree;
     let budget = QueryBudget::new(1 << 30);
-    let mut fold = Fold::metered(tree, &budget);
+    let mut fold = Fold::metered(scope, &budget);
     assert!(fold.unit(10, b"node:a", UnitKind::Value, 3).expect("unit"));
     let before = fold.runs_held;
     for n in 0..3u64 {
@@ -709,9 +724,10 @@ fn a_run_added_while_folding_is_reserved_before_it_is_read() {
 fn a_range_with_no_room_takes_nothing_in() {
     let dir = TempDir::new().expect("tempdir");
     let engine = engine(dir.path());
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let scope = scope(&engine);
+    let tree = scope.tree;
     let keys = mixed_keys(6);
-    let mut fold = Fold::new(tree);
+    let mut fold = Fold::new(scope);
     for (i, key) in keys.iter().enumerate() {
         fold.unit(10 + i as u64, key, UnitKind::Value, 100)
             .expect("unit");
@@ -726,7 +742,7 @@ fn a_range_with_no_room_takes_nothing_in() {
         let budget = QueryBudget::new(room);
         let mut outcome = None;
         let batch = within_reserve(&format!("a range page in {room} bytes"), || {
-            let mut page = Fold::metered(tree, &budget);
+            let mut page = Fold::metered(scope, &budget);
             outcome = Some(
                 page.range_page(tomb, b"node:", b"node;", 10, None, 4)
                     .expect("page"),
@@ -741,7 +757,7 @@ fn a_range_with_no_room_takes_nothing_in() {
         // Completing a commit with no room for its mark or its write takes
         // nothing in and writes nothing either.
         let batch = within_reserve(&format!("a commit completed in {room} bytes"), || {
-            let mut fold = Fold::metered(tree, &budget).after(Some(40));
+            let mut fold = Fold::metered(scope, &budget).after(Some(40));
             assert!(!fold.close(), "a mark in {room} bytes");
             (fold, None)
         });
@@ -751,7 +767,7 @@ fn a_range_with_no_room_takes_nothing_in() {
     let budget = QueryBudget::new(1 << 30);
     let mut from: Option<Vec<u8>> = None;
     loop {
-        let mut page = Fold::metered(tree, &budget);
+        let mut page = Fold::metered(scope, &budget);
         let next = page
             .range_page(tomb, b"node:", b"node;", 10, from.as_deref(), 4)
             .expect("page");
@@ -763,7 +779,7 @@ fn a_range_with_no_room_takes_nothing_in() {
             RangePage::NoRoom => panic!("no room in a gigabyte"),
         }
     }
-    assert_eq!(charge_from(tree, 50, SeqNo::MAX).expect("read"), 10);
+    assert_eq!(charge_from(&scope, 50, SeqNo::MAX).expect("read"), 10);
 }
 
 /// A unit older than one already folded is refused: the fold runs in commit
@@ -772,8 +788,8 @@ fn a_range_with_no_room_takes_nothing_in() {
 fn a_unit_out_of_commit_order_is_refused() {
     let dir = TempDir::new().expect("tempdir");
     let engine = engine(dir.path());
-    let tree = engine.tree(Partition::Node).expect("tree");
-    let mut fold = Fold::new(tree);
+    let scope = scope(&engine);
+    let mut fold = Fold::new(scope);
     fold.unit(20, b"node:a", UnitKind::Value, 10)
         .expect("first");
     assert!(fold.unit(10, b"node:b", UnitKind::Value, 10).is_err());

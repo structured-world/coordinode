@@ -1,16 +1,16 @@
 //! Rounds of the material fold ([`crate::engine::material::fold`]).
 //!
-//! A round folds every accounted tree's units below one exclusive target
-//! (the complete cut plus one) and then publishes the round. Each tree keeps
-//! its own cursor (`0x00 "ac"`), written in the same batch as the
-//! descriptors and summary that batch folded, so a crash anywhere resumes
-//! where that tree's last batch left it and folds no unit twice. The round
-//! (`0x00 "ag"` in the schema tree) names the target and the seqno of the
-//! last write of the round: an observation reads every tree's summary at a
-//! snapshot just above it, so writes of a round still running are not seen
-//! and the trees are read at one cut. The observation pins that snapshot
-//! for its read; one no longer readable gives no observation, never another
-//! round's buckets.
+//! A round folds every accounted source's units below one exclusive target
+//! (the complete cut plus one) and then publishes the round. Each source
+//! keeps its own cursor (`head 0x00 "ac"` in its scope of the accounting
+//! tree), written in the same batch as the descriptors and summary that
+//! batch folded, so a crash anywhere resumes where that source's last batch
+//! left it and folds no unit twice. The round (`0xFE "ag"` in the accounting
+//! tree) names the target and the seqno of the last write of the round: an
+//! observation reads every source's summary at a snapshot just above it, so
+//! writes of a round still running are not seen and the sources are read at
+//! one cut. The observation pins that snapshot for its read; one no longer
+//! readable gives no observation, never another round's buckets.
 
 use coordinode_core::budget::QueryBudget;
 use lsm_tree::{AbstractTree, SeqNo};
@@ -22,10 +22,10 @@ use crate::engine::material::{self, UnitKind};
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 
-/// Each tree's cursor.
+/// Each source's cursor, under its head.
 pub(super) const CURSOR_KEY: [u8; 3] = [0x00, b'a', b'c'];
-/// The published round, in the schema tree.
-const ROUND_KEY: [u8; 3] = [0x00, b'a', b'g'];
+/// The published round, in the accounting tree, outside every scope.
+const ROUND_KEY: [u8; 3] = [0xFE, b'a', b'g'];
 /// Units read from the index, and keys of a range deletion folded, per
 /// batch.
 const PAGE: usize = 256;
@@ -200,7 +200,7 @@ impl StorageEngine {
     ///
     /// The record could not be read or is malformed.
     pub(crate) fn material_round(&self) -> StorageResult<Option<Round>> {
-        let tree = self.tree(Partition::Schema)?;
+        let tree = self.tree(Partition::Accounting)?;
         let Some(value) = tree.get(ROUND_KEY.as_slice(), SeqNo::MAX)? else {
             return Ok(None);
         };
@@ -222,10 +222,10 @@ impl StorageEngine {
     ///
     /// # Errors
     ///
-    /// The schema tree is unavailable.
+    /// The accounting tree is unavailable.
     pub(super) fn forget_material_round(&self) -> StorageResult<()> {
-        let schema = self.tree(Partition::Schema)?;
-        schema.remove(ROUND_KEY.as_slice(), self.next_seqno());
+        let acct = self.tree(Partition::Accounting)?;
+        acct.remove(ROUND_KEY.as_slice(), self.next_seqno());
         Ok(())
     }
 
@@ -346,21 +346,37 @@ impl StorageEngine {
         let mut value = [0u8; 16];
         value[..8].copy_from_slice(&target.to_le_bytes());
         value[8..].copy_from_slice(&at.to_le_bytes());
-        let schema = self.tree(Partition::Schema)?;
+        let acct = self.tree(Partition::Accounting)?;
         let mut batch = lsm_tree::WriteBatch::with_capacity(1);
         batch.insert(ROUND_KEY.as_slice(), value.as_slice());
         // With the flush owed for a memtable it starts.
         let _admitted = self.admit_footprint(
             crate::engine::footprint::footprint_of((ROUND_KEY.len() + 16) as u64, 1)
-                + self.memtable_starts([Partition::Schema]),
+                + self.memtable_starts([Partition::Accounting]),
             Admit::Recovery,
         )?;
-        let (added, memtable) = schema.apply_batch(batch, at)?;
+        let (added, memtable) = acct.apply_batch(batch, at)?;
         self.coordinator.flush_trigger().wrote(added, memtable);
         Ok(Progress::Reached)
     }
 
-    /// Retry the retirements `folder` holds due, each tree's below the
+    /// `part`'s accounting scope, for the fold holding the folder: a scope
+    /// is renewed only with the folder held, so the head stays this one
+    /// through the fold.
+    fn fold_scope(&self, part: Partition) -> StorageResult<material::Scope<'_>> {
+        let heads = *self.material_heads();
+        self.material_scope(&heads, part)
+    }
+
+    /// `scope`'s cursor.
+    fn cursor_of(scope: &material::Scope<'_>) -> StorageResult<Cursor> {
+        match scope.tree.get(scope.head.key(&CURSOR_KEY), SeqNo::MAX)? {
+            Some(v) => Cursor::decode(&v),
+            None => Ok(Cursor::default()),
+        }
+    }
+
+    /// Retry the retirements `folder` holds due, each source's below the
     /// window its cursor stands in.
     fn retire_due(&self, folder: &mut Folder) -> StorageResult<()> {
         if folder.retire_due == 0 {
@@ -370,11 +386,7 @@ impl StorageEngine {
             if !material::accounted(part) || folder.retire_due & Folder::bit(part) == 0 {
                 continue;
             }
-            let tree = self.tree(part)?;
-            let cursor = match tree.get(CURSOR_KEY.as_slice(), SeqNo::MAX)? {
-                Some(v) => Cursor::decode(&v)?,
-                None => Cursor::default(),
-            };
+            let cursor = Self::cursor_of(&self.fold_scope(part)?)?;
             self.retire_folded_units(folder, part, cursor.seqno)?;
         }
         Ok(())
@@ -392,9 +404,9 @@ impl StorageEngine {
         to: SeqNo,
     ) -> StorageResult<()> {
         let below = to - to % material::RETIRE_WINDOW;
-        let tree = self.tree(part)?;
+        let scope = self.fold_scope(part)?;
         if below == 0
-            || material::units_from(tree, (0, 0), below, SeqNo::MAX, 1, None)?
+            || material::units_from(&scope, (0, 0), below, SeqNo::MAX, 1, None)?
                 .0
                 .is_empty()
         {
@@ -412,14 +424,14 @@ impl StorageEngine {
         } else {
             self.admit_footprint(
                 crate::engine::footprint::footprint_of(material::RETIRE_RECORD_BYTES, 1)
-                    + self.memtable_starts([part]),
+                    + self.memtable_starts([Partition::Accounting]),
                 Admit::Recovery,
             )
         };
         #[cfg(not(test))]
         let admitted = self.admit_footprint(
             crate::engine::footprint::footprint_of(material::RETIRE_RECORD_BYTES, 1)
-                + self.memtable_starts([part]),
+                + self.memtable_starts([Partition::Accounting]),
             Admit::Recovery,
         );
         if let Err(StorageError::CapacityExhausted { .. }) = admitted {
@@ -427,7 +439,7 @@ impl StorageEngine {
             return Ok(());
         }
         let _admitted = admitted?;
-        material::retire_units_below(tree, below, self.next_seqno());
+        material::retire_units_below(&scope, below, self.next_seqno());
         self.coordinator.flush_trigger().wrote_unmeasured();
         folder.retire_due &= !Folder::bit(part);
         Ok(())
@@ -451,11 +463,7 @@ impl StorageEngine {
         {
             return Ok(Progress::Repairing);
         }
-        let tree = self.tree(part)?;
-        let mut cursor = match tree.get(CURSOR_KEY.as_slice(), SeqNo::MAX)? {
-            Some(v) => Cursor::decode(&v)?,
-            None => Cursor::default(),
-        };
+        let mut cursor = Self::cursor_of(&self.fold_scope(part)?)?;
         let from = cursor.seqno;
         let progress = self.fold_tree_from(part, &mut cursor, target, work)?;
         // A cursor that stayed in its window has nothing new to retire,
@@ -477,7 +485,7 @@ impl StorageEngine {
         target: SeqNo,
         work: &mut Work<'_>,
     ) -> StorageResult<Progress> {
-        let tree = self.tree(part)?;
+        let tree = self.fold_scope(part)?;
         while cursor.seqno < target {
             if work.left == 0 {
                 return Ok(Progress::Short);
@@ -488,7 +496,7 @@ impl StorageEngine {
             // `squeezed`: fewer than asked for, without the memory to read
             // more; more may follow.
             let (units, squeezed) = material::units_from(
-                tree,
+                &tree,
                 (cursor.seqno, cursor.ordinal),
                 target,
                 SeqNo::MAX,
@@ -592,7 +600,7 @@ impl StorageEngine {
         cursor: &mut Cursor,
         work: &mut Work<'_>,
     ) -> StorageResult<Progress> {
-        let tree = self.tree(part)?;
+        let tree = self.fold_scope(part)?;
         let tomb = Tomb {
             seqno: unit.seqno,
             ordinal: unit.ordinal,
@@ -638,8 +646,8 @@ impl StorageEngine {
     }
 
     /// Write what `fold` folded from `cursor` and the cursor `next` after it
-    /// as one batch of `part`'s tree, admitted on the footprint as the
-    /// store's own work, and move `cursor` there.
+    /// as one batch of `part`'s scope of the accounting tree, admitted on
+    /// the footprint as the store's own work, and move `cursor` there.
     ///
     /// Before it, the bytes a fixed snapshot needs after each commit the
     /// fold completed are written at that commit's seqno: they are the same
@@ -658,10 +666,13 @@ impl StorageEngine {
         if !fold.ready() {
             return Ok(false);
         }
-        let tree = self.tree(part)?;
+        let scope = self.fold_scope(part)?;
+        let tree = scope.tree;
+        let cursor_key = scope.head.key(&CURSOR_KEY);
+        let visible_key = scope.head.key(&VISIBLE_KEY);
         // Built within the fold's memory, cursor record and marks included,
         // and held by it until applied.
-        let written = fold.write(cursor.visible, CURSOR_KEY.as_slice(), |visible| {
+        let written = fold.write(cursor.visible, cursor_key.as_slice(), |visible| {
             next.visible = visible;
             next.encode()
         })?;
@@ -680,14 +691,14 @@ impl StorageEngine {
         }
         let _admitted = self.admit_footprint(
             crate::engine::footprint::footprint_of(bytes, batch.len() + marks.len())
-                + self.memtable_starts([part]),
+                + self.memtable_starts([Partition::Accounting]),
             Admit::Recovery,
         )?;
         for &(commit, total) in &marks {
             // At the commit's own seqno: a snapshot sees what lies below it,
             // so one at `s` finds the bytes after the last commit below `s`.
             tree.insert(
-                VISIBLE_KEY.as_slice(),
+                visible_key.as_slice(),
                 total.to_le_bytes().as_slice(),
                 commit,
             );
@@ -722,12 +733,7 @@ impl StorageEngine {
         use crate::engine::material::{Material, Observation};
         use core::sync::atomic::Ordering;
         let generation = self.material_generation.load(Ordering::Acquire);
-        if self.repairing_material()
-            || self
-                .pending_rebuilds()?
-                .into_iter()
-                .any(material::accounted)
-        {
+        if self.repairing_material() || self.material_rebuild_pending()? {
             return Ok(Observation::Rebuilding);
         }
         let Ok(_held) = self.pin_readable_snapshot_at(snapshot) else {
@@ -765,12 +771,15 @@ impl StorageEngine {
             return Ok(None);
         }
         let mut total = 0u64;
+        // A copy: a renewal meanwhile moves the generation, which the
+        // observation checks after its read.
+        let heads = *self.material_heads();
         for &part in Partition::all() {
             if !material::accounted(part) {
                 continue;
             }
-            let tree = self.tree(part)?;
-            let bytes = match tree.get(VISIBLE_KEY.as_slice(), snapshot)? {
+            let scope = self.material_scope(&heads, part)?;
+            let bytes = match scope.tree.get(scope.head.key(&VISIBLE_KEY), snapshot)? {
                 Some(v) => <[u8; 8]>::try_from(v.as_ref())
                     .map(u64::from_le_bytes)
                     .map_err(|_| {
@@ -791,5 +800,5 @@ impl StorageEngine {
 
 /// Bytes of `marks` snapshot records.
 fn marks_len(marks: usize) -> usize {
-    marks * (VISIBLE_KEY.len() + 8)
+    marks * (material::HEAD_LEN + VISIBLE_KEY.len() + 8)
 }

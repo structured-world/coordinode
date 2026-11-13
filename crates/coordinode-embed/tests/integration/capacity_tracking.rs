@@ -674,8 +674,8 @@ fn capacity_gauges_emitted_on_refresh() {
     assert_eq!(seen["coordinode_footprint_limit_bytes"], ROOMY as f64);
     assert_eq!(
         seen["coordinode_footprint_reserve_bytes"],
-        (ROOMY / 16) as f64,
-        "the default reserve is a sixteenth of the limit"
+        coordinode_storage::engine::config::default_recovery_reserve(ROOMY) as f64,
+        "the default reserve is a sixteenth of the limit, at least one recovery record's room"
     );
     assert!(seen.contains_key("coordinode_footprint_admitted_bytes"));
     assert!(seen.contains_key("coordinode_footprint_flush_debt_bytes"));

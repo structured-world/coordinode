@@ -15,12 +15,23 @@ fn engine(dir: &std::path::Path) -> StorageEngine {
     .expect("open")
 }
 
+/// The Node tree's accounting scope.
+fn scope(engine: &StorageEngine) -> Scope<'_> {
+    let heads = *engine.material_heads();
+    engine
+        .material_scope(&heads, Partition::Node)
+        .expect("scope")
+}
+
 /// Write `moves` to the Node tree's summary as one batch.
 fn write(engine: &StorageEngine, moves: Moves) {
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let scope = scope(engine);
     let mut batch = lsm_tree::WriteBatch::with_capacity(16);
-    moves.write(tree, &mut batch).expect("write");
-    tree.apply_batch(batch, engine.next_seqno()).expect("apply");
+    moves.write(&scope, &mut batch).expect("write");
+    scope
+        .tree
+        .apply_batch(batch, engine.next_seqno())
+        .expect("apply");
 }
 
 /// The bytes of every key whose newest change is at or after `s`, counted
@@ -53,7 +64,7 @@ const EDGES: [SeqNo; 12] = [
 fn the_sum_from_a_continuation_matches_the_charges_key_by_key() {
     let dir = TempDir::new().expect("tempdir");
     let engine = engine(dir.path());
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let tree = &scope(&engine);
     let mut keys: BTreeMap<u32, (SeqNo, u64)> = BTreeMap::new();
     // A deterministic sequence: an xorshift over the steps.
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -106,7 +117,7 @@ fn the_sum_from_a_continuation_matches_the_charges_key_by_key() {
 fn an_empty_summary_answers_zero_and_keeps_no_buckets() {
     let dir = TempDir::new().expect("tempdir");
     let engine = engine(dir.path());
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let tree = &scope(&engine);
     let mut moves = Moves::default();
     moves.shift(None, Some((1_000, 40)));
     write(&engine, moves);
@@ -118,8 +129,9 @@ fn an_empty_summary_answers_zero_and_keeps_no_buckets() {
         assert_eq!(charge_from(tree, s, SeqNo::MAX).expect("read"), 0);
     }
     let left = tree
+        .tree
         .range(
-            PREFIX.as_slice()..[0x00, b'a', b't'].as_slice(),
+            tree.head.key(&PREFIX)..tree.head.key(&[0x00, b'a', b't']),
             SeqNo::MAX,
             None,
         )
@@ -133,7 +145,7 @@ fn an_empty_summary_answers_zero_and_keeps_no_buckets() {
 fn a_move_past_what_a_bucket_holds_is_refused() {
     let dir = TempDir::new().expect("tempdir");
     let engine = engine(dir.path());
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let tree = &scope(&engine);
     let mut moves = Moves::default();
     moves.shift(Some((7, 10)), None);
     let mut batch = lsm_tree::WriteBatch::with_capacity(16);
@@ -146,7 +158,7 @@ fn a_move_past_what_a_bucket_holds_is_refused() {
 fn a_sum_reads_a_bounded_number_of_buckets() {
     let dir = TempDir::new().expect("tempdir");
     let engine = engine(dir.path());
-    let tree = engine.tree(Partition::Node).expect("tree");
+    let tree = &scope(&engine);
     let mut moves = Moves::default();
     for n in 0..20_000u64 {
         moves.shift(None, Some((n * 7_919, 1)));

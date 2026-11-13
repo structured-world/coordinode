@@ -5,15 +5,16 @@
 //! changed in `[s, r)`, the units that reconstruct the key at `r`: the last
 //! value or deletion of the key and every operand merged onto it since.
 //! Overwritten payloads are not needed. Each key's descriptor
-//! (`0x00 "ak" key`) holds its newest change and the encoded length of the
-//! units of that closure it owns alone; the summary ([`super::summary`])
-//! holds the charges by newest change.
+//! (`head 0x00 "ak" key`, in the source's scope of the accounting tree)
+//! holds its newest change and the encoded length of the units of that
+//! closure it owns alone; the summary ([`super::summary`]) holds the charges
+//! by newest change.
 //!
 //! A range deletion is one unit shared by every key it deleted. It is
-//! charged once (`0x00 "ar" be(seqno) be(ordinal)`), at the newest change
-//! of the keys still resting on it: keys untouched since it are counted,
-//! keys with operands merged onto it are indexed by their newest change
-//! (`0x00 "ad" tombstone be(newest) key`), so the newest one is one step
+//! charged once (`head 0x00 "ar" be(seqno) be(ordinal)`), at the newest
+//! change of the keys still resting on it: keys untouched since it are
+//! counted, keys with operands merged onto it are indexed by their newest
+//! change (`head 0x00 "ad" tombstone be(newest) key`), so the newest one is one step
 //! from the end of that index. A key written or deleted again leaves it;
 //! with no key left on it, it is needed by no reader and charged nothing.
 //!
@@ -25,12 +26,12 @@
 
 use std::collections::BTreeMap;
 
-use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
+use lsm_tree::{AbstractTree, Guard, SeqNo};
 
 use coordinode_core::budget::{MemoryCharge, QueryBudget};
 
-use super::UnitKind;
 use super::summary::Moves;
+use super::{HEAD_LEN, Head, Scope, UnitKind};
 use crate::error::{StorageError, StorageResult};
 
 /// Descriptor key prefix.
@@ -55,22 +56,22 @@ impl Tomb {
         out
     }
 
-    fn record_key(self) -> Vec<u8> {
-        let mut out = TOMB_PREFIX.to_vec();
+    fn record_key(self, head: Head) -> Vec<u8> {
+        let mut out = head.key(&TOMB_PREFIX);
         out.extend_from_slice(&self.id());
         out
     }
 
-    fn dependents_prefix(self) -> Vec<u8> {
-        let mut out = DEPENDENT_PREFIX.to_vec();
+    fn dependents_prefix(self, head: Head) -> Vec<u8> {
+        let mut out = head.key(&DEPENDENT_PREFIX);
         out.extend_from_slice(&self.id());
         out
     }
 
     /// The dependents index entry of the key stored under `suffix`
     /// ([`stored_suffix`]).
-    fn dependent_key(self, newest: SeqNo, suffix: &[u8]) -> Vec<u8> {
-        let mut out = self.dependents_prefix();
+    fn dependent_key(self, head: Head, newest: SeqNo, suffix: &[u8]) -> Vec<u8> {
+        let mut out = self.dependents_prefix(head);
         out.extend_from_slice(&newest.to_be_bytes());
         out.extend_from_slice(suffix);
         out
@@ -79,8 +80,9 @@ impl Tomb {
 
 /// The longest key an LSM key can hold.
 const KEY_LIMIT: usize = u16::MAX as usize;
-/// What the longest metadata key puts before a key: the dependents index.
-const DEPENDENT_HEAD: usize = DEPENDENT_PREFIX.len() + 12 + 8;
+/// What the longest metadata key puts before a key: the scope's head and the
+/// dependents index.
+const DEPENDENT_HEAD: usize = HEAD_LEN + DEPENDENT_PREFIX.len() + 12 + 8;
 /// The longest key stored as it is in the metadata keys.
 const DIRECT_MAX: usize = KEY_LIMIT - DEPENDENT_HEAD - 1;
 /// A longer key's hash and probe.
@@ -104,25 +106,27 @@ fn stored_suffix(key: &[u8], probe: u16) -> Vec<u8> {
     out
 }
 
-/// The descriptor key of the key stored under `suffix`.
-fn descriptor_key(suffix: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PREFIX.len() + suffix.len());
+/// The descriptor key under `head` of the key stored under `suffix`.
+fn descriptor_key(head: Head, suffix: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEAD_LEN + PREFIX.len() + suffix.len());
+    out.extend_from_slice(head.bytes());
     out.extend_from_slice(&PREFIX);
     out.extend_from_slice(suffix);
     out
 }
 
-/// Where `key`'s descriptor is stored and what it holds, skipping stored
-/// forms `taken` by other keys in a fold not written yet.
+/// Where `key`'s descriptor is stored in `scope` and what it holds, skipping
+/// stored forms `taken` by other keys in a fold not written yet.
 fn locate(
-    tree: &AnyTree,
+    scope: &Scope<'_>,
     key: &[u8],
     taken: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> StorageResult<(Vec<u8>, Option<Descriptor>)> {
+    let tree = scope.tree;
     for probe in 0..=u16::MAX {
         let suffix = stored_suffix(key, probe);
         if key.len() <= DIRECT_MAX {
-            let k = descriptor_key(&suffix);
+            let k = descriptor_key(scope.head, &suffix);
             let held = match tree.get(k.as_slice(), SeqNo::MAX)? {
                 Some(v) => Some(decode(&k, &v)?.1),
                 None => None,
@@ -135,7 +139,7 @@ fn locate(
         {
             continue;
         }
-        let k = descriptor_key(&suffix);
+        let k = descriptor_key(scope.head, &suffix);
         match tree.get(k.as_slice(), SeqNo::MAX)? {
             None => return Ok((suffix, None)),
             Some(v) => {
@@ -199,9 +203,9 @@ impl TombState {
 
 type Change<T> = (Option<T>, Option<T>);
 
-/// Units folded into one tree's descriptors and summary, written together.
+/// Units folded into one source's descriptors and summary, written together.
 pub(crate) struct Fold<'t> {
-    tree: &'t AnyTree,
+    scope: Scope<'t>,
     /// Descriptors touched, by key: as read, and as they stand now.
     touched: BTreeMap<Vec<u8>, Change<Descriptor>>,
     /// The stored form of each touched key ([`stored_suffix`]).
@@ -305,9 +309,12 @@ const fn unit_cost(key_len: usize) -> u64 {
     };
     let dependent = DEPENDENT_HEAD + stored;
     let dependents = 2 * (dependent + map_entry(DEPENDENT) + dependent + SLICE_HEAD + BATCH_SLOT);
-    let tomb = map_entry(TOMBS) + 2 * (TOMB_PREFIX.len() + 12 + TOMB_LEN + SLICE_HEAD) + BATCH_SLOT;
+    let tomb = map_entry(TOMBS)
+        + 2 * (HEAD_LEN + TOMB_PREFIX.len() + 12 + TOMB_LEN + SLICE_HEAD)
+        + BATCH_SLOT;
     let moves = UNIT_SHIFTS * super::summary::MOVES_PER_SHIFT * MOVE_COST;
-    let descriptor = 2 * (PREFIX.len() + stored + DESCRIPTOR_LEN + SLICE_HEAD) + BATCH_SLOT;
+    let descriptor =
+        2 * (HEAD_LEN + PREFIX.len() + stored + DESCRIPTOR_LEN + SLICE_HEAD) + BATCH_SLOT;
     // A key is at most u16::MAX bytes: far below u64::MAX.
     (touched + long + dependents + tomb + moves + descriptor + MARK) as u64
 }
@@ -332,7 +339,7 @@ const READS_PER_RUN: usize = 2;
 /// The runs a read of `tree` goes through as it stands: each of its first
 /// level's, and the one of each deeper level. Their tables do not count: a
 /// read holds a run's tables one at a time past its first.
-fn runs(tree: &AnyTree) -> usize {
+fn runs(tree: &lsm_tree::AnyTree) -> usize {
     tree.current_version()
         .iter_levels()
         .map(|level| level.run_count())
@@ -365,8 +372,9 @@ const FOLD_BASE: u64 = (map_first_nodes(TOUCHED)
     + CURSOR_RECORD) as u64;
 
 /// The longest descriptor record a range page reads: a stored form at its
-/// longest and a value carrying the longest key.
-const RANGE_RECORD_MAX: usize = PREFIX.len() + DIRECT_MAX + 1 + DESCRIPTOR_LEN + KEY_LIMIT;
+/// longest under the head and a value carrying the longest key.
+const RANGE_RECORD_MAX: usize =
+    HEAD_LEN + PREFIX.len() + DIRECT_MAX + 1 + DESCRIPTOR_LEN + KEY_LIMIT;
 
 /// The memory a range page takes for one key whose descriptor record is
 /// `record` bytes long: what folding it takes, and its key and stored form
@@ -385,13 +393,19 @@ const fn range_key_cost(record: usize) -> u64 {
 const fn range_page_cost(start: usize, end: usize, from: usize) -> u64 {
     let start = if start < CUT { start } else { CUT };
     let end = if end < CUT { end } else { CUT };
-    let first = if from > 0 { from } else { PREFIX.len() + start };
-    let stop = PREFIX.len() + end + HASHED + 1;
-    let tomb = map_entry(TOMBS) + 2 * (TOMB_PREFIX.len() + 12 + TOMB_LEN + SLICE_HEAD) + BATCH_SLOT;
+    let first = if from > 0 {
+        from
+    } else {
+        HEAD_LEN + PREFIX.len() + start
+    };
+    let stop = HEAD_LEN + PREFIX.len() + end + HASHED + 1;
+    let tomb = map_entry(TOMBS)
+        + 2 * (HEAD_LEN + TOMB_PREFIX.len() + 12 + TOMB_LEN + SLICE_HEAD)
+        + BATCH_SLOT;
     let moves = RANGE_PAGE_SHIFTS * super::summary::MOVES_PER_SHIFT * MOVE_COST;
     // The key the next page resumes from, in the cursor written with this
     // one: copied out of the tree's read, encoded, and copied by the batch.
-    let resume = 3 * (PREFIX.len() + DIRECT_MAX + 1 + SLICE_HEAD);
+    let resume = 3 * (HEAD_LEN + PREFIX.len() + DIRECT_MAX + 1 + SLICE_HEAD);
     // Bounded by a few keys: far below u64::MAX.
     (first + stop + start + end + tomb + moves + resume + MARK) as u64
 }
@@ -401,7 +415,7 @@ const fn range_page_cost(start: usize, end: usize, from: usize) -> u64 {
 /// read's own state and memtable iterators, and in each run (its memtables
 /// counted as one more) the table reads it opens, each standing in a data
 /// block that holds at most one record past the block size.
-pub(crate) fn scan_holds(tree: &AnyTree, longest_record: u64) -> u64 {
+pub(crate) fn scan_holds(tree: &lsm_tree::AnyTree, longest_record: u64) -> u64 {
     let run_read = (RUN_READ - RANGE_RECORD_MAX) as u64 + longest_record;
     // Runs are bounded by the tree's levels and its first level's runs, a
     // record by the engine's key and value limits: far below u64::MAX.
@@ -412,8 +426,11 @@ pub(crate) fn scan_holds(tree: &AnyTree, longest_record: u64) -> u64 {
 /// on: its reads, and a range page between the longest bounds with its
 /// longest key, or the longest point unit.
 pub(crate) const fn least_memory(runs: usize) -> u64 {
-    let range = range_page_cost(KEY_LIMIT, KEY_LIMIT, PREFIX.len() + DIRECT_MAX + 1)
-        + range_key_cost(RANGE_RECORD_MAX);
+    let range = range_page_cost(
+        KEY_LIMIT,
+        KEY_LIMIT,
+        HEAD_LEN + PREFIX.len() + DIRECT_MAX + 1,
+    ) + range_key_cost(RANGE_RECORD_MAX);
     let point = unit_cost(KEY_LIMIT);
     let reads = READS_FIXED as u64 + reads_cost(runs + 1);
     FOLD_BASE + reads + if range > point { range } else { point }
@@ -447,10 +464,10 @@ pub(crate) enum RangePage {
 }
 
 impl<'t> Fold<'t> {
-    /// A fold over `tree`.
-    pub(crate) fn new(tree: &'t AnyTree) -> Self {
+    /// A fold over `scope`.
+    pub(crate) fn new(scope: Scope<'t>) -> Self {
         Self {
-            tree,
+            scope,
             touched: BTreeMap::new(),
             stored: BTreeMap::new(),
             owners: BTreeMap::new(),
@@ -486,13 +503,13 @@ impl<'t> Fold<'t> {
         Ok(())
     }
 
-    /// A fold over `tree` whose memory is reserved from `budget` before it
+    /// A fold over `scope` whose memory is reserved from `budget` before it
     /// is taken: a unit that does not fit is not folded.
-    pub(crate) fn metered(tree: &'t AnyTree, budget: &'t QueryBudget) -> Self {
+    pub(crate) fn metered(scope: Scope<'t>, budget: &'t QueryBudget) -> Self {
         Self {
             held: Some(budget.empty_charge()),
             base: FOLD_BASE + READS_FIXED as u64,
-            ..Self::new(tree)
+            ..Self::new(scope)
         }
     }
 
@@ -513,7 +530,7 @@ impl<'t> Fold<'t> {
         // Every reservation comes before the reads it is for: the runs are
         // counted then, so a flush or a compaction between two reservations
         // is covered at the next one.
-        let runs = runs(self.tree) + 1;
+        let runs = self.scope.runs() + 1;
         let grown = if runs > self.runs_held {
             reads_cost(runs - self.runs_held)
         } else {
@@ -592,7 +609,7 @@ impl<'t> Fold<'t> {
         if let Some((_, now)) = self.touched.get(key) {
             return Ok(*now);
         }
-        let (suffix, held) = locate(self.tree, key, &self.owners)?;
+        let (suffix, held) = locate(&self.scope, key, &self.owners)?;
         self.hold(key, suffix, held);
         Ok(held)
     }
@@ -629,8 +646,8 @@ impl<'t> Fold<'t> {
         if let Some((_, now)) = self.tombs.get(&tomb) {
             return Ok(*now);
         }
-        let k = tomb.record_key();
-        let held = match self.tree.get(k.as_slice(), SeqNo::MAX)? {
+        let k = tomb.record_key(self.scope.head);
+        let held = match self.scope.tree.get(k.as_slice(), SeqNo::MAX)? {
             Some(value) => Some(decode_tomb(&k, &value)?),
             None => None,
         };
@@ -650,7 +667,7 @@ impl<'t> Fold<'t> {
 
     /// The newest change among the touched keys resting on `tomb`.
     fn newest_dependent(&self, tomb: Tomb) -> StorageResult<Option<SeqNo>> {
-        let prefix = tomb.dependents_prefix();
+        let prefix = tomb.dependents_prefix(self.scope.head);
         let newest_of = |key: &[u8]| {
             key.get(prefix.len()..prefix.len() + 8)
                 .and_then(|s| <[u8; 8]>::try_from(s).ok())
@@ -668,6 +685,7 @@ impl<'t> Fold<'t> {
         // Held, skipping what this fold removed: the first one left from
         // the end is the newest.
         for guard in self
+            .scope
             .tree
             .range(prefix.as_slice()..end.as_slice(), SeqNo::MAX, None)
             .rev()
@@ -713,9 +731,10 @@ impl<'t> Fold<'t> {
             ))
         })?;
         let suffix = self.suffix_of(key);
+        let head = self.scope.head;
         let count = if d.touched {
             self.dependents
-                .insert(tomb.dependent_key(d.newest, &suffix), false);
+                .insert(tomb.dependent_key(head, d.newest, &suffix), false);
             &mut state.touched
         } else {
             &mut state.untouched
@@ -782,9 +801,10 @@ impl<'t> Fold<'t> {
                 let rests_on = current.and_then(|d| d.rests_on);
                 if let (Some(d), Some(tomb)) = (current, rests_on) {
                     let suffix = self.suffix_of(key);
+                    let head = self.scope.head;
                     if d.touched {
                         self.dependents
-                            .insert(tomb.dependent_key(d.newest, &suffix), false);
+                            .insert(tomb.dependent_key(head, d.newest, &suffix), false);
                     } else if let Some(mut state) = self.tomb(tomb)? {
                         // Its first operand: the key now has a value resting
                         // on the range deletion.
@@ -798,7 +818,7 @@ impl<'t> Fold<'t> {
                         self.set_tomb(tomb, Some(state));
                     }
                     self.dependents
-                        .insert(tomb.dependent_key(seqno, &suffix), true);
+                        .insert(tomb.dependent_key(head, seqno, &suffix), true);
                     self.settle(tomb)?;
                 }
                 Descriptor {
@@ -865,12 +885,13 @@ impl<'t> Fold<'t> {
         // Stored forms sort by the key's head: every key of the range lies
         // between the heads of its bounds, and the full key of each stored
         // form read is checked against them.
-        let head = |key: &[u8]| key[..key.len().min(CUT)].to_vec();
+        let lead = |key: &[u8]| key[..key.len().min(CUT)].to_vec();
+        let scope_head = self.scope.head;
         let first = match from {
             Some(from) => from.to_vec(),
-            None => descriptor_key(&head(start)),
+            None => descriptor_key(scope_head, &lead(start)),
         };
-        let mut stop = descriptor_key(&head(end));
+        let mut stop = descriptor_key(scope_head, &lead(end));
         stop.extend_from_slice(&[0xff; HASHED + 1]);
         if first.as_slice() >= stop.as_slice() {
             let ended = self.close_range(tomb, 0)?;
@@ -882,6 +903,7 @@ impl<'t> Fold<'t> {
         let mut resume = None;
         let mut walked = 0;
         for guard in self
+            .scope
             .tree
             .range(first.as_slice()..stop.as_slice(), SeqNo::MAX, None)
         {
@@ -903,7 +925,7 @@ impl<'t> Fold<'t> {
             }
             walked += 1;
             let (full, d) = decode(&k, &v)?;
-            let suffix = k[PREFIX.len()..].to_vec();
+            let suffix = k[HEAD_LEN + PREFIX.len()..].to_vec();
             let key = full.unwrap_or_else(|| suffix.clone());
             if key.as_slice() >= start && key.as_slice() < end {
                 keys.push((key, suffix, d));
@@ -992,7 +1014,7 @@ impl<'t> Fold<'t> {
         for (key, (before, after)) in self.touched {
             if before != after {
                 let suffix = self.stored.get(&key).unwrap_or(&key);
-                let k = descriptor_key(suffix);
+                let k = descriptor_key(self.scope.head, suffix);
                 match after {
                     Some(d) => {
                         let mut value = encode(d).to_vec();
@@ -1012,7 +1034,7 @@ impl<'t> Fold<'t> {
         }
         for (tomb, (before, after)) in self.tombs {
             if before != after {
-                let k = tomb.record_key();
+                let k = tomb.record_key(self.scope.head);
                 bytes += (k.len() + TOMB_LEN) as u64;
                 match after {
                     Some(t) => batch.insert(k.as_slice(), encode_tomb(t).as_slice()),
@@ -1028,7 +1050,7 @@ impl<'t> Fold<'t> {
                 batch.remove(k.as_slice());
             }
         }
-        bytes += self.moves.write(self.tree, &mut batch)?;
+        bytes += self.moves.write(&self.scope, &mut batch)?;
         let record = cursor(visible);
         bytes += (cursor_key.len() + record.len()) as u64;
         batch.insert(cursor_key, record.as_slice());
@@ -1041,10 +1063,10 @@ impl<'t> Fold<'t> {
     }
 }
 
-/// `key`'s descriptor as `tree` holds it.
+/// `key`'s descriptor as `scope` holds it.
 #[cfg(test)]
-pub(crate) fn read(tree: &AnyTree, key: &[u8]) -> StorageResult<Option<Descriptor>> {
-    Ok(locate(tree, key, &BTreeMap::new())?.1)
+pub(crate) fn read(scope: &Scope<'_>, key: &[u8]) -> StorageResult<Option<Descriptor>> {
+    Ok(locate(scope, key, &BTreeMap::new())?.1)
 }
 
 /// newest, charge, then the tombstone a key rests on (a flag, seqno,

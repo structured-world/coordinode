@@ -149,7 +149,8 @@ pub struct EndpointConfig {
     /// The part of [`hard_limit_bytes`](Self::hard_limit_bytes) client writes
     /// leave free for flushes, space-reclaiming compactions and the store's
     /// recovery records. Inside the limit, not added to it. `None` takes
-    /// [`DEFAULT_RECOVERY_RESERVE_DIVISOR`]: a sixteenth of the limit.
+    /// [`default_recovery_reserve`]: a sixteenth of the limit, at least the
+    /// room one recovery record may need.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_reserve_bytes: Option<u64>,
     /// Per-block Reed-Solomon ECC policy for SST blocks on this endpoint.
@@ -245,8 +246,27 @@ impl PageEccPolicy {
 }
 
 /// The recovery reserve an endpoint without a configured one keeps: this
-/// fraction of its hard limit.
+/// fraction of its hard limit, and at least [`RECOVERY_RECORD_ROOM`].
 pub const DEFAULT_RECOVERY_RESERVE_DIVISOR: u64 = 16;
+
+/// The least room one recovery record of the store's own may need beyond
+/// its bytes: the flush owed for the memtable it starts in its tree, and for
+/// the one its accounting starts in the accounting tree.
+pub const RECOVERY_RECORD_ROOM: u64 = 2 * crate::engine::footprint::MEMTABLE_START_DEBT;
+
+/// The recovery reserve of an endpoint with hard limit `limit` and no
+/// configured reserve: a [`DEFAULT_RECOVERY_RESERVE_DIVISOR`]th of it, and
+/// at a supported limit ([`MIN_HARD_LIMIT_BYTES`] and up) never less than
+/// [`RECOVERY_RECORD_ROOM`].
+#[must_use]
+pub fn default_recovery_reserve(limit: u64) -> u64 {
+    let share = limit / DEFAULT_RECOVERY_RESERVE_DIVISOR;
+    if limit >= MIN_HARD_LIMIT_BYTES {
+        share.max(RECOVERY_RECORD_ROOM)
+    } else {
+        share
+    }
+}
 
 /// The smallest hard limit an endpoint is configured with: 8 MiB. Below it
 /// the engine's own bounded structures do not fit beside any data at their
@@ -255,7 +275,8 @@ pub const DEFAULT_RECOVERY_RESERVE_DIVISOR: u64 = 16;
 /// awaiting removal until its tables are flushed (1 MiB), the flush of the
 /// memtable it covers (its data, an eighth more and 128 KiB, charged ahead
 /// the same way), the room a store may grow while it opens (1 MiB) and the
-/// recovery reserve (a sixteenth of the limit). An empty store takes about
+/// recovery reserve ([`default_recovery_reserve`]: 768 KiB here). An empty
+/// store takes about
 /// 160 KiB. A limit the operator lowers below what the store already holds
 /// stays valid down to this minimum and is pending, not refused.
 pub const MIN_HARD_LIMIT_BYTES: u64 = 8 << 20;
@@ -346,13 +367,12 @@ impl EndpointConfig {
         self
     }
 
-    /// The recovery reserve in effect: the configured one, or a
-    /// [`DEFAULT_RECOVERY_RESERVE_DIVISOR`]th of the hard limit; never more
-    /// than the limit.
+    /// The recovery reserve in effect: the configured one, or
+    /// [`default_recovery_reserve`]; never more than the limit.
     #[must_use]
     pub fn recovery_reserve(&self) -> u64 {
         self.recovery_reserve_bytes
-            .unwrap_or(self.hard_limit_bytes / DEFAULT_RECOVERY_RESERVE_DIVISOR)
+            .unwrap_or(default_recovery_reserve(self.hard_limit_bytes))
             .min(self.hard_limit_bytes)
     }
 

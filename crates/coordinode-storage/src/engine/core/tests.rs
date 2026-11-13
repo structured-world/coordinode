@@ -923,6 +923,35 @@ fn all_partitions_support_crud() {
         let key = format!("key_{:?}", part);
         let value = format!("val_{:?}", part);
 
+        // Only the engine writes the accounting: a caller's write of any
+        // kind is refused and leaves nothing there.
+        if part == Partition::Accounting {
+            assert!(matches!(
+                engine.put(part, key.as_bytes(), value.as_bytes()),
+                Err(StorageError::EngineOwnedPartition { .. })
+            ));
+            assert!(matches!(
+                engine.merge(part, key.as_bytes(), value.as_bytes()),
+                Err(StorageError::EngineOwnedPartition { .. })
+            ));
+            assert!(matches!(
+                engine.delete(part, key.as_bytes()),
+                Err(StorageError::EngineOwnedPartition { .. })
+            ));
+            assert!(matches!(
+                engine.remove_range(part, b"", b"\xff"),
+                Err(StorageError::EngineOwnedPartition { .. })
+            ));
+            let mut batch = crate::engine::batch::WriteBatch::new(&engine);
+            batch.put(part, key.as_bytes(), value.as_bytes());
+            assert!(matches!(
+                batch.commit(),
+                Err(StorageError::EngineOwnedPartition { .. })
+            ));
+            assert!(engine.get(part, key.as_bytes()).expect("get").is_none());
+            continue;
+        }
+
         engine
             .put(part, key.as_bytes(), value.as_bytes())
             .expect("put failed");

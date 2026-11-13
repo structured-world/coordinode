@@ -2,7 +2,8 @@
 //! its trees.
 //!
 //! [`StorageEngine::pin_store`] pins every replicated tree (each partition but
-//! the node-local Raft one, and every `STORAGE COLUMNAR` table) while no Raft
+//! the node-local Raft and accounting ones, and every `STORAGE COLUMNAR`
+//! table) while no Raft
 //! entry applies, and returns a [`StoreTransfer`]: a byte stream of known
 //! length that reads the pinned files in place as it is consumed. Nothing is
 //! copied, linked or synced to take it, so its cost does not grow with the
@@ -120,7 +121,9 @@ impl TreeName {
         Partition::all()
             .iter()
             .copied()
-            .find(|part| *part != Partition::Raft && part.name() == name)
+            .find(|part| {
+                *part != Partition::Raft && *part != Partition::Accounting && part.name() == name
+            })
             .map(Self::Partition)
             .ok_or_else(|| malformed(format!("tree name {name:?}")))
     }
@@ -437,7 +440,9 @@ impl StorageEngine {
     ) -> StorageResult<(Vec<PinnedTree>, Option<Vec<u8>>)> {
         let mut trees = Vec::with_capacity(Partition::all().len());
         for &part in Partition::all() {
-            if part == Partition::Raft {
+            // The accounting is this member's count of its own data: the
+            // receiver counts what it installs.
+            if part == Partition::Raft || part == Partition::Accounting {
                 continue;
             }
             let tree = self.tree(part)?;
