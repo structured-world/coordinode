@@ -3372,7 +3372,7 @@ impl StorageEngine {
             summary.oplog_bytes +=
                 capture_journal_tail(src, &target.join("oplog"), &self.footprints)?;
         }
-        self.seal_checkpoint(target)?;
+        self.seal_checkpoint(target, replay_floor.unwrap_or(0))?;
         // The newest checkpoint is the one a rebuild starts from: its trees
         // hold every entry below the folded base, and the journal keeps the
         // rest for it.
@@ -3440,8 +3440,17 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Make the checkpoint in `target` durable and name it a store.
-    fn seal_checkpoint(&self, target: &Path) -> StorageResult<()> {
+    /// Make the checkpoint in `target` durable, with the journal index a
+    /// rebuild from it replays from, and name it a store.
+    fn seal_checkpoint(&self, target: &Path, replay_floor: u64) -> StorageResult<()> {
+        use std::io::Write as _;
+        // Read back without opening the checkpoint, which would change it.
+        let path = target.join(REPLAY_FLOOR_FILE);
+        let io = |e: std::io::Error| StorageError::Io(format!("write {path:?}: {e}"));
+        // no-std: StoragePort trait, caller-injected
+        let mut file = std::fs::File::create(&path).map_err(io)?;
+        file.write_all(&replay_floor.to_be_bytes()).map_err(io)?;
+        file.sync_all().map_err(io)?;
         // A checkpoint is a base the Raft log is kept for: durable, both the
         // flushed trees under the endpoints and the copy, before its marker
         // names it a store.
@@ -4450,20 +4459,30 @@ impl StorageEngine {
     }
 
     /// The journal index a rebuild from `checkpoint_dir` replays from: every
-    /// entry below it is in every tree of the checkpoint, by the trees' own
-    /// coverage bases. The repair orchestrator feeds this to
-    /// [`oplog_read_since`], and the journal purge keeps everything at or
-    /// above it. `0` for a checkpoint without coverage records.
+    /// entry below it is in every tree of the checkpoint, folded into each
+    /// tree's coverage base before the trees were captured. The repair
+    /// orchestrator feeds this to [`oplog_read_since`], and the journal purge
+    /// keeps everything at or above it. `0` for a store without a journal.
+    /// Read from the record the checkpoint was sealed with: the checkpoint is
+    /// not opened, so it stays as it was.
+    ///
+    /// # Errors
+    ///
+    /// The checkpoint holds no such record, or it cannot be read.
     ///
     /// [`oplog_read_since`]: Self::oplog_read_since
     pub fn checkpoint_replay_floor(checkpoint_dir: &Path) -> StorageResult<u64> {
-        let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
-        let mut floor = u64::MAX;
-        for tree in ckpt.coordinator.trees().values() {
-            let held = TreeCoverage::read(tree, Domain::Journal)?;
-            floor = floor.min(held.base().map_or(0, |(next, _)| next));
-        }
-        Ok(if floor == u64::MAX { 0 } else { floor })
+        let path = checkpoint_dir.join(REPLAY_FLOOR_FILE);
+        // no-std: StoragePort trait, caller-injected
+        let bytes =
+            std::fs::read(&path).map_err(|e| StorageError::Io(format!("read {path:?}: {e}")))?;
+        let floor: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+            StorageError::Io(format!(
+                "{path:?} holds {} bytes, not a journal index",
+                bytes.len()
+            ))
+        })?;
+        Ok(u64::from_be_bytes(floor))
     }
 
     /// Purge journal segments outside the retention window. No-op when no
@@ -9172,6 +9191,10 @@ fn release_cache_layers(
         }
     }
 }
+
+/// The file of a checkpoint holding, big-endian, the journal index a rebuild
+/// from it replays from.
+const REPLAY_FLOOR_FILE: &str = "replay-floor";
 
 /// The rebuild intent file of a `STORAGE COLUMNAR` table is its id behind
 /// this prefix, so a table never names a partition's.

@@ -253,6 +253,35 @@ fn files_with_bytes(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf
     out
 }
 
+/// Opening a database that keeps a checkpoint reads the checkpoint, never
+/// writes to it: a repair base that changes on every open is not the state
+/// it was taken at. Opened as a store to read its replay floor, it took the
+/// default routes of its one directory and new tables each time.
+#[test]
+fn opening_a_database_leaves_its_checkpoint_as_it_was() {
+    let dir = TempDir::new().expect("tempdir");
+    let checkpoint = {
+        let mut db = crate::Database::open(dir.path()).expect("create");
+        db.execute_cypher("CREATE (:Kept {k: 1})").expect("a node");
+        db.checkpoint(1).expect("checkpoint")
+    };
+    let taken = files_with_bytes(&checkpoint);
+    for _ in 0..2 {
+        let mut db = crate::Database::open(dir.path()).expect("open");
+        assert_eq!(
+            db.execute_cypher("MATCH (n:Kept) RETURN n")
+                .expect("read")
+                .len(),
+            1
+        );
+    }
+    assert_eq!(
+        files_with_bytes(&checkpoint),
+        taken,
+        "an open changed the checkpoint"
+    );
+}
+
 /// Two checkpoints taken at once under one root each get a directory of
 /// their own, and neither writes into the live journal: both name the next
 /// checkpoint the same way, and the second used to copy its sealed segments
