@@ -188,6 +188,17 @@ impl SpaceGuard {
         self.has_room(Admit::Recovery)
     }
 
+    /// Whether every endpoint's hard limit has room for the store's own
+    /// work, free space aside.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::CapacityExhausted`] for an endpoint whose hard limit
+    /// leaves even the store's own work no room.
+    pub fn has_recovery_room(&self) -> StorageResult<()> {
+        self.has_room(Admit::Recovery)
+    }
+
     /// [`Self::reserve`] of the store's own work by the last reading, never
     /// reading the filesystem (see [`Self::admit_free_space_as_read`]).
     ///
@@ -221,8 +232,15 @@ impl SpaceGuard {
         self.admit_free_space_recovery_as_read()
     }
 
-    /// [`Self::admit_free_space_recovery`] by the last reading.
-    fn admit_free_space_recovery_as_read(&self) -> StorageResult<()> {
+    /// [`Self::admit_free_space_recovery`] by the last reading: for a caller
+    /// that checks free space before it learns whether the store's own work
+    /// also needs the hard limits' room ([`Self::has_recovery_room`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::OutOfSpace`] while free space is below half the
+    /// reserve.
+    pub fn admit_free_space_recovery_as_read(&self) -> StorageResult<()> {
         if self.available_bytes() < self.min_free_bytes() / 2 {
             metrics::counter!("coordinode_storage_out_of_space_refusals_total").increment(1);
             return Err(self.refusal());

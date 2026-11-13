@@ -165,14 +165,22 @@ fn reserve_rooms(
         );
         Status::unavailable(e.to_string())
     })?;
-    // Committed client entries spend the grant like any other while it has
-    // room: the leader counted them against it, so the room the member
-    // promised stays where it was rather than growing with each one. What
-    // the grant cannot take the recovery reserve does, for the entries not
-    // paid yet only, decided and held by the pool in one step.
+    // Committed client entries are acknowledged history the member takes as
+    // its own work: out of the upper half of the free-space reserve, with or
+    // without a hard limit, whichever room then pays for them.
+    if !settled.is_empty() {
+        space
+            .admit_free_space_recovery_as_read()
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+    }
+    // They spend the grant like any other while it has room: the leader
+    // counted them against it, so the room the member promised stays where
+    // it was rather than growing with each one. What the grant cannot take
+    // the recovery reserve does, for the entries not paid yet only, decided
+    // and held by the pool in one step.
     space
         .footprints()
-        .stage_settled(&settled, || space.admit_recovery_as_read())
+        .stage_settled(&settled, || space.has_recovery_room())
         .map_err(|e| Status::unavailable(e.to_string()))?;
     // Entries that are all client entries need nothing more.
     if recovery == 0 {

@@ -99,6 +99,48 @@ fn committed_append(
     }
 }
 
+/// A member below its free-space reserve takes no committed client entries,
+/// whether its endpoint has no hard limit or its grant would pay for them:
+/// they are admitted as the store's own work, out of the upper half of the
+/// reserve. Before, the free-space check ran only when the grant could not
+/// pay under a hard limit, so a paused follower took every committed entry.
+#[test]
+fn committed_client_entries_wait_while_the_disk_is_below_its_reserve() {
+    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::core::StorageEngine;
+    let entry = client_entry(1, 1024);
+    let bytes = super::super::grants::entry_room(&entry).1;
+    for limited in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut endpoint = EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        );
+        if limited {
+            endpoint = endpoint.with_hard_limit_bytes(256 << 20);
+        }
+        let mut config = StorageConfig::with_endpoints(vec![endpoint]);
+        if limited {
+            config.client_grant_bytes = bytes * 4;
+        }
+        let engine = StorageEngine::open(&config).unwrap();
+        let space = engine.space();
+        space.footprints().top_up_grant();
+        space.set_reserve(u64::MAX, u64::MAX);
+        let append = committed_append(vec![entry.clone()]);
+        assert!(
+            reserve_entries(space, &append).is_err(),
+            "limited {limited}: a paused member takes no committed client entry"
+        );
+        space.set_reserve(0, 0);
+        let _own = reserve_entries(space, &append)
+            .unwrap_or_else(|e| panic!("limited {limited}: taken once space is freed: {e}"));
+    }
+}
+
 /// A committed entry the grant cannot take falls to the recovery reserve
 /// for its own room only: an entry of the same request already paid takes
 /// nothing again. At a reserve holding the new entry and less than both,
