@@ -46,6 +46,53 @@ pub const CE_STALENESS_THRESHOLD_ENTRIES: u64 = 10_000;
 /// Default timeout for blocking fence operations (majority wait, linearizable).
 pub const READ_FENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The reads of stored commit ceilings a member runs at once. A read is of
+/// one small record; more than a few at once means the disk is not
+/// answering, and more of them would only pile up behind it.
+const STORED_CEILING_READS: usize = 4;
+
+/// Where a member's read fences read the commit ceilings the store keeps on
+/// disk: on a blocking thread, a few at a time. A read whose fence stopped
+/// waiting (its deadline, its cancellation) still runs to its end, holding
+/// its place and the engine as work the member's shutdown waits out, so a
+/// disk that stops answering leaves at most [`STORED_CEILING_READS`] reads
+/// behind however often fences give up.
+#[derive(Clone)]
+pub(crate) struct StoredCeilingReads {
+    places: Arc<tokio::sync::Semaphore>,
+    work: crate::storage::EngineWork,
+}
+
+impl StoredCeilingReads {
+    pub(crate) fn new(work: crate::storage::EngineWork) -> Self {
+        Self {
+            places: Arc::new(tokio::sync::Semaphore::new(STORED_CEILING_READS)),
+            work,
+        }
+    }
+
+    /// Read `stored` from `engine`, waiting for a place first.
+    async fn read(
+        &self,
+        engine: crate::engine_hold::EngineHold,
+        stored: coordinode_storage::engine::core::StoredCeiling,
+    ) -> Result<u64, String> {
+        let place = Arc::clone(&self.places)
+            .acquire_owned()
+            .await
+            .map_err(|e| e.to_string())?;
+        let work = self.work.start();
+        tokio::task::spawn_blocking(move || {
+            let ceiling = engine.read_stored_ceiling(stored);
+            drop((engine, work, place));
+            ceiling
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+    }
+}
+
 /// Which node may serve this read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadPreference {
@@ -246,6 +293,8 @@ pub struct ReadFence {
     version: Option<Arc<crate::cluster::version::VersionGate>>,
     /// The store, whose closed bound tells which commits are all applied.
     engine: Option<crate::engine_hold::EngineHold>,
+    /// Where a commit ceiling the store reads from disk is read.
+    stored_ceilings: Option<StoredCeilingReads>,
     /// The history this member's log belongs to; `None` before its
     /// deployment is known.
     history: Option<coordinode_core::txn::read_concern::HistoryId>,
@@ -266,19 +315,23 @@ impl ReadFence {
             staleness_lag_override: None,
             version: None,
             engine: None,
+            stored_ceilings: None,
             history: None,
         }
     }
 
     /// Judge causal bounds against `engine`'s closed bound and this member's
-    /// `history`.
+    /// `history`, reading the commit ceilings it keeps on disk in
+    /// `stored_ceilings`.
     pub(crate) fn with_causal_source(
         mut self,
         engine: crate::engine_hold::EngineHold,
         history: Option<coordinode_core::txn::read_concern::HistoryId>,
+        stored_ceilings: StoredCeilingReads,
     ) -> Self {
         self.engine = Some(engine);
         self.history = history;
+        self.stored_ceilings = Some(stored_ceilings);
         self
     }
 
@@ -531,7 +584,7 @@ impl ReadFence {
         }
         let deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
         loop {
-            let missing = match self.causal_gap(after_ts, after_position)? {
+            let missing = match self.causal_gap(after_ts, after_position).await? {
                 Ok(bound) => {
                     // A position met, the read allowed a wait and the
                     // prefix is not closed yet: a view chosen at the closed
@@ -581,7 +634,7 @@ impl ReadFence {
     /// The commit timestamp bound the causal bounds amount to when they are
     /// met here, or what of them is not; an error when the store could not
     /// tell.
-    fn causal_gap(
+    async fn causal_gap(
         &self,
         after_ts: Option<u64>,
         after_position: Option<coordinode_core::txn::read_concern::HistoryPosition>,
@@ -612,7 +665,8 @@ impl ReadFence {
             // on as the timestamp its view must reach; it is not required
             // complete here, since a latest view needs no closed bound.
             let prefix = self
-                .prefix_ceiling(position.index)?
+                .prefix_ceiling(position.index)
+                .await?
                 .filter(|ceiling| *ceiling > 0);
             bound = bound.max(prefix);
         }
@@ -620,13 +674,28 @@ impl ReadFence {
     }
 
     /// The commit ceiling of the log applied here through `index`; `None`
-    /// without a store to tell.
-    fn prefix_ceiling(&self, index: u64) -> Result<Option<u64>, ReadFenceError> {
-        self.engine
-            .as_ref()
-            .map(|engine| engine.commit_ceiling_through(index))
-            .transpose()
-            .map_err(|e| ReadFenceError::Raft(format!("the log's commit ceilings: {e}")))
+    /// without a store to tell. A ceiling the store reads from disk is read
+    /// off this task (see [`StoredCeilingReads`]): dropping the future stops
+    /// the wait, not the read.
+    async fn prefix_ceiling(&self, index: u64) -> Result<Option<u64>, ReadFenceError> {
+        use coordinode_storage::engine::core::CommitCeiling;
+        let failed = |e: String| ReadFenceError::Raft(format!("the log's commit ceilings: {e}"));
+        let Some(engine) = &self.engine else {
+            return Ok(None);
+        };
+        match engine.commit_ceiling_at(index) {
+            CommitCeiling::Known(ceiling) => Ok(Some(ceiling)),
+            CommitCeiling::Stored(stored) => {
+                let reads = self.stored_ceilings.as_ref().ok_or_else(|| {
+                    failed("no reader for the ceilings the store keeps on disk".into())
+                })?;
+                reads
+                    .read(engine.share("stored ceiling read"), stored)
+                    .await
+                    .map(Some)
+                    .map_err(failed)
+            }
+        }
     }
 
     /// The commit timestamp bound a linearizable read amounts to once its
@@ -637,8 +706,9 @@ impl ReadFence {
     /// # Errors
     ///
     /// The store could not read the log's commit ceilings.
-    pub fn barrier_bound(&self) -> Result<Option<u64>, ReadFenceError> {
-        self.prefix_ceiling(*self.applied_rx.borrow())
+    pub async fn barrier_bound(&self) -> Result<Option<u64>, ReadFenceError> {
+        let applied = *self.applied_rx.borrow();
+        self.prefix_ceiling(applied).await
     }
 
     /// Return the current applied log index on this node, a position in

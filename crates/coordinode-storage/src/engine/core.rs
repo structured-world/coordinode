@@ -7649,10 +7649,40 @@ impl StorageEngine {
     ///
     /// The breakpoint records could not be read.
     pub fn commit_ceiling_through(&self, index: u64) -> StorageResult<u64> {
-        self.closure
-            .lock()
+        match self.commit_ceiling_at(index) {
+            CommitCeiling::Known(ceiling) => Ok(ceiling),
+            CommitCeiling::Stored(stored) => self.read_stored_ceiling(stored),
+        }
+    }
+
+    /// [`Self::commit_ceiling_through`] as far as memory answers it, without
+    /// a read of the store: a position older than the breakpoints kept in
+    /// memory is answered by [`Self::read_stored_ceiling`], a read of a
+    /// stored record that holds up nothing else here while it runs.
+    pub fn commit_ceiling_at(&self, index: u64) -> CommitCeiling {
+        match self.closure.lock().ledger.ceiling_at(index) {
+            crate::engine::closure_ledger::Ceiling::Known(ceiling) => CommitCeiling::Known(ceiling),
+            crate::engine::closure_ledger::Ceiling::Stored(stored) => CommitCeiling::Stored(stored),
+        }
+    }
+
+    /// Read a commit ceiling [`Self::commit_ceiling_at`] left to the stored
+    /// records. Blocks on the read; it holds no lock the applies or other
+    /// lookups take.
+    ///
+    /// # Errors
+    ///
+    /// The breakpoint records could not be read.
+    pub fn read_stored_ceiling(&self, stored: StoredCeiling) -> StorageResult<u64> {
+        if let Some(ceiling) = stored.find(&StoredBreakpoints(self))? {
+            return Ok(ceiling);
+        }
+        // Found empty: perhaps retired under the read, which the ledger
+        // answers from memory.
+        let state = self.closure.lock();
+        Ok(state
             .ledger
-            .ceiling_through(index, &StoredBreakpoints(self))
+            .ceiling_unstored(stored, state.prepared.as_ref()))
     }
 
     /// Read the closed bound and the commit ceilings of the log applied here
@@ -9038,6 +9068,8 @@ impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
         if from > through {
             return Ok(None);
         }
+        #[cfg(any(test, feature = "test-faults"))]
+        breakpoint_read_gate::pass();
         self.0
             .tree(Partition::Schema)?
             .range(
@@ -9094,6 +9126,57 @@ fn remove_capture_with(fs: &dyn lsm_tree::fs::Fs, dir: &Path) -> StorageResult<(
         Err(e) if e.kind() == lsm_tree::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(StorageError::Io(format!("remove {dir:?}: {e}"))),
     }
+}
+
+/// Holds every read of a stored closure breakpoint until released, as a disk
+/// that stopped answering would, for the process the test runs in.
+#[cfg(any(test, feature = "test-faults"))]
+pub mod breakpoint_read_gate {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static HELD: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
+    static RELEASED: parking_lot::Condvar = parking_lot::Condvar::new();
+    static WAITING: AtomicUsize = AtomicUsize::new(0);
+
+    /// Hold the reads from now on.
+    pub fn hold() {
+        *HELD.lock() = true;
+    }
+
+    /// Let every held read and every later one through.
+    pub fn release() {
+        *HELD.lock() = false;
+        RELEASED.notify_all();
+    }
+
+    /// How many reads are held now.
+    pub fn waiting() -> usize {
+        WAITING.load(Ordering::Acquire)
+    }
+
+    pub(super) fn pass() {
+        let mut held = HELD.lock();
+        if !*held {
+            return;
+        }
+        WAITING.fetch_add(1, Ordering::AcqRel);
+        while *held {
+            RELEASED.wait(&mut held);
+        }
+        WAITING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub use crate::engine::closure_ledger::StoredCeiling;
+
+/// A log position's commit ceiling, as [`StorageEngine::commit_ceiling_at`]
+/// answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitCeiling {
+    /// Answered from memory.
+    Known(u64),
+    /// To read from the stored records ([`StorageEngine::read_stored_ceiling`]).
+    Stored(StoredCeiling),
 }
 
 /// The file that marks a store whose log is a consensus log, in the root of

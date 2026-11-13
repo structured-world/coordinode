@@ -404,7 +404,13 @@ impl Admitter {
             // what is left is a view holding that prefix, the same bound a
             // causal majority read meets, never an older cut.
             read_concern.level = ReadConcernLevel::Majority;
-            read_concern.after_ts = fence.barrier_bound().map_err(fence_error)?;
+            read_concern.after_ts = within_deadline_and_cancel(
+                checked.deadline,
+                checked.cancel.as_ref(),
+                fence.barrier_bound(),
+            )
+            .await?
+            .map_err(fence_error)?;
         }
         let applied_index = fence.applied_index();
         let history = fence.history();

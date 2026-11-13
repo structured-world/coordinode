@@ -707,6 +707,8 @@ pub struct RaftNode {
     snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
     /// Snapshot work holding the engine, which `shutdown()` waits out.
     engine_work: crate::storage::EngineWork,
+    /// The reads of stored commit ceilings this member's read fences run.
+    stored_ceilings: crate::read_fence::StoredCeilingReads,
     /// This node's ID.
     node_id: u64,
     /// Address peers dial to reach this node. `None` for a standalone node and
@@ -1068,6 +1070,7 @@ impl RaftNode {
             raft,
             applied_rx,
             snapshot_builds,
+            stored_ceilings: crate::read_fence::StoredCeilingReads::new(engine_work.clone()),
             engine_work,
             node_id,
             advertise_addr: None,
@@ -1455,6 +1458,7 @@ impl RaftNode {
             raft,
             applied_rx,
             snapshot_builds,
+            stored_ceilings: crate::read_fence::StoredCeilingReads::new(engine_work.clone()),
             engine_work,
             node_id,
             advertise_addr,
@@ -2484,7 +2488,11 @@ impl RaftNode {
     pub fn read_fence(&self) -> crate::read_fence::ReadFence {
         crate::read_fence::ReadFence::new(self.applied_rx.clone(), Arc::clone(&self.raft))
             .with_version_gate(Arc::clone(&self.version))
-            .with_causal_source(self.engine.share("read fence"), self.history())
+            .with_causal_source(
+                self.engine.share("read fence"),
+                self.history(),
+                self.stored_ceilings.clone(),
+            )
     }
 
     /// The history this member's log belongs to, which qualifies its log

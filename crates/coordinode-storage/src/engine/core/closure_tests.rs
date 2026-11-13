@@ -198,6 +198,46 @@ fn a_ledger_that_cannot_be_read_leaves_the_rebuild_owed() {
     );
 }
 
+/// A position older than the cached breakpoints is read from its stored
+/// record, and a read of it that the disk holds up holds up no apply: the
+/// next entries record their commits and close the log meanwhile, and the
+/// read, once the record answers, gets the position's exact ceiling.
+#[test]
+fn a_stalled_stored_ceiling_read_holds_up_no_apply() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let engine = std::sync::Arc::new(StorageEngine::open(&config(dir.path())).expect("open"));
+    let positions =
+        u64::try_from(crate::engine::closure_ledger::CACHED_BREAKPOINTS).expect("small") + 9;
+    for index in 1..=positions {
+        closure_entry(&engine, index, &[index * 10], 0);
+    }
+    super::breakpoint_read_gate::hold();
+    let reader = std::thread::spawn({
+        let engine = std::sync::Arc::clone(&engine);
+        move || engine.commit_ceiling_through(1)
+    });
+    while super::breakpoint_read_gate::waiting() == 0 {
+        std::thread::yield_now();
+    }
+    let applied = std::thread::spawn({
+        let engine = std::sync::Arc::clone(&engine);
+        move || {
+            closure_entry(&engine, positions + 1, &[(positions + 1) * 10], 0);
+            closure_entry(&engine, positions + 2, &[], 15);
+        }
+    });
+    let started = std::time::Instant::now();
+    while !applied.is_finished() && started.elapsed() < std::time::Duration::from_secs(3) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let done = applied.is_finished();
+    super::breakpoint_read_gate::release();
+    applied.join().expect("apply");
+    assert!(done, "the entries waited on the stalled read");
+    assert_eq!(engine.closure_frontier(), 15, "the entries closed the log");
+    assert_eq!(reader.join().expect("read").expect("ceiling"), 10);
+}
+
 /// A store holding the head where an earlier layout kept it, among the
 /// application's Schema rows, is refused when it opens and when its ledger
 /// is read: read as having no ledger, every prefix would look closed.

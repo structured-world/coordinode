@@ -107,6 +107,43 @@ fn position_zero_stays_empty_once_breakpoints_retire() {
     assert_eq!(reopened.ceiling_through(2, &log.held).expect("ceiling"), 20);
 }
 
+/// A position older than the cached breakpoints, read from the records with
+/// the ledger let go, is answered exactly when retirement runs under the
+/// read: while the retiring entry's removals landed and its plan is not yet
+/// installed, from that plan; once installed, from the moved anchor. Read
+/// from the records alone, the range was empty and the old anchor (0)
+/// answered.
+#[test]
+fn a_stored_ceiling_read_empty_under_retirement_is_answered_exactly() {
+    use super::Ceiling;
+    let positions = u64::try_from(CACHED_BREAKPOINTS).expect("small") + 9;
+    let mut log = Log::default();
+    for index in 1..=positions {
+        log.entry(index, &[index * 10], 0, 0);
+    }
+    let stored = match log.ledger.ceiling_at(2) {
+        Ceiling::Stored(stored) => Some(stored),
+        Ceiling::Known(_) => None,
+    }
+    .expect("position 2 is read from the records");
+
+    // The next entry retires the oldest breakpoints; its removals land.
+    let plan = log
+        .ledger
+        .plan(&[], 25, positions + 1, 25, &log.held)
+        .expect("plan");
+    assert!(!plan.retired().is_empty(), "the entry retires nothing");
+    for b in plan.retired() {
+        log.held.0.remove(&b.index);
+    }
+    assert_eq!(stored.find(&log.held).expect("read"), None, "read empty");
+    assert_eq!(log.ledger.ceiling_unstored(stored, Some(&plan)), 20);
+
+    log.ledger.install(&plan);
+    assert_eq!(log.ledger.ceiling_unstored(stored, None), 20);
+    assert_eq!(log.ceiling(2), 20);
+}
+
 /// An open position reads the ceiling of its own prefix, not of the log
 /// after it: a read there waits on no later commit.
 #[test]

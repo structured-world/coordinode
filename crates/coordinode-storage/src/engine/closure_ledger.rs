@@ -339,31 +339,117 @@ impl ClosureLedger {
     /// # Errors
     ///
     /// The breakpoint records could not be read.
+    /// The ceiling of a position whose range of stored records `stored` was
+    /// read empty: retired under the read, by a plan installed since (the
+    /// anchor moved into the range) or by `retiring`, the plan whose removals
+    /// may already have landed; otherwise the range held no breakpoint.
+    pub(crate) fn ceiling_unstored(
+        &self,
+        stored: StoredCeiling,
+        retiring: Option<&ClosurePlan>,
+    ) -> u64 {
+        if self.anchor_through >= stored.from {
+            return self.anchor_ceiling;
+        }
+        retiring
+            .and_then(|plan| {
+                plan.retired
+                    .iter()
+                    .rev()
+                    .find(|b| b.index <= stored.through)
+            })
+            .map_or(stored.otherwise, |b| b.ceiling)
+    }
+
+    #[cfg(test)]
     pub(crate) fn ceiling_through(&self, index: u64, held: &dyn Breakpoints) -> StorageResult<u64> {
+        match self.ceiling_at(index) {
+            Ceiling::Known(ceiling) => Ok(ceiling),
+            Ceiling::Stored(stored) => stored.read(held),
+        }
+    }
+
+    /// [`Self::ceiling_through`] from memory, or where among the stored
+    /// records it is: a position older than the cached breakpoints.
+    pub(crate) fn ceiling_at(&self, index: u64) -> Ceiling {
         if index == 0 {
-            return Ok(0);
+            return Ceiling::Known(0);
         }
         if index <= self.anchor_through {
-            return Ok(self.anchor_ceiling);
+            return Ceiling::Known(self.anchor_ceiling);
         }
         if let Some(front) = self.cache.front()
             && front.index <= index
         {
-            return Ok(self
-                .cache
-                .iter()
-                .rev()
-                .find(|b| b.index <= index)
-                .map_or(self.anchor_ceiling, |b| b.ceiling));
+            return Ceiling::Known(
+                self.cache
+                    .iter()
+                    .rev()
+                    .find(|b| b.index <= index)
+                    .map_or(self.anchor_ceiling, |b| b.ceiling),
+            );
         }
         if self.cache_complete() {
-            return Ok(self.anchor_ceiling);
+            return Ceiling::Known(self.anchor_ceiling);
         }
-        Ok(held
-            .predecessor(self.anchor_through + 1, index)?
-            .map_or(self.anchor_ceiling, |b| b.ceiling))
+        Ceiling::Stored(StoredCeiling {
+            from: self.anchor_through + 1,
+            through: index,
+            otherwise: self.anchor_ceiling,
+        })
+    }
+}
+
+/// A position's commit ceiling, as the ledger in memory answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ceiling {
+    /// Answered from memory.
+    Known(u64),
+    /// Answered by the stored breakpoint records.
+    Stored(StoredCeiling),
+}
+
+/// A commit ceiling to read from the breakpoint records: the ceiling of the
+/// newest breakpoint in `from..=through`, or `otherwise`, the anchor's, when
+/// there is none.
+///
+/// Read without the ledger held, the records may move on meanwhile, and only
+/// by retirement, oldest first (breakpoints are added only past the cached
+/// ones): a record found is still the newest at or before the position, and
+/// a range found empty may have been retired under the read, which the
+/// ledger then answers itself ([`ClosureLedger::ceiling_unstored`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredCeiling {
+    from: u64,
+    through: u64,
+    otherwise: u64,
+}
+
+impl StoredCeiling {
+    /// Read the ceiling from `held`, with no retirement under the read.
+    ///
+    /// # Errors
+    ///
+    /// The breakpoint records could not be read.
+    #[cfg(test)]
+    pub(crate) fn read(self, held: &dyn Breakpoints) -> StorageResult<u64> {
+        Ok(self.find(held)?.unwrap_or(self.otherwise))
     }
 
+    /// The ceiling of the newest record in the range, if the range holds
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// The breakpoint records could not be read.
+    pub(crate) fn find(self, held: &dyn Breakpoints) -> StorageResult<Option<u64>> {
+        Ok(held
+            .predecessor(self.from, self.through)?
+            .map(|b| b.ceiling))
+    }
+}
+
+impl ClosureLedger {
     /// The head record.
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEAD_LEN);
