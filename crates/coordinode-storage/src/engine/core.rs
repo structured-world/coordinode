@@ -228,6 +228,10 @@ pub struct StorageEngine {
     /// The version of the Schema tree whose blocks the open verified before
     /// it read the tree, when it did.
     schema_verified: Option<u64>,
+    /// The Schema tree is owed a rebuild (begun here, or cut short before
+    /// this open): the closure ledger in memory is not the tree's, so no
+    /// commit ceiling is answered until the rebuild installs one.
+    ledger_owed: std::sync::atomic::AtomicBool,
     /// The budget every compaction of every tree and the scrub read and
     /// write under, retuned live (see [`Self::set_maintenance_rate`]).
     maintenance: Arc<lsm_tree::rate_limiter::RateLimiter>,
@@ -1887,6 +1891,12 @@ impl StorageEngine {
         let material_heads = crate::engine::material::Heads::read(
             crate::engine::local_journal::tree_of(&trees, Partition::Accounting)?,
         )?;
+        // A Schema rebuild still owed after the open (a transfer from a peer
+        // cut short) leaves the tree without the ledger it is to install.
+        let schema_owed = durable_intents
+            && read_rebuild_intents(config.data_dir())?
+                .partitions
+                .contains(&Partition::Schema);
         let coordinator = LocalMultiModalCoordinator::new(
             trees,
             Arc::clone(&seqno),
@@ -1936,6 +1946,7 @@ impl StorageEngine {
             fs,
             tree_sync: config.oplog_sync_method.tree_sync_mode(),
             schema_verified,
+            ledger_owed: std::sync::atomic::AtomicBool::new(schema_owed),
             maintenance,
             write_slowdown,
             compaction_wake,
@@ -4140,6 +4151,9 @@ impl StorageEngine {
     /// partition, which no copy rebuilds.
     fn record_kept(&self, partition: Partition, kept: &Rows) -> StorageResult<()> {
         let kept = if partition == Partition::Schema {
+            // From the clear on, the ledger in memory is not the tree's.
+            self.ledger_owed
+                .store(true, std::sync::atomic::Ordering::Release);
             encode_kept_rows(kept)?
         } else {
             Vec::new()
@@ -4244,11 +4258,20 @@ impl StorageEngine {
             self.note_field_dictionary_change();
         }
         last()?;
+        if partition == Partition::Schema {
+            // The rebuilt tree's ledger, whichever way it was rebuilt, is the
+            // one answered from here on.
+            self.reload_closure_frontier()?;
+        }
         remove_rebuild_intent(
             &self.data_dir,
             RebuildTarget::Partition(partition),
             &self.footprints,
         )?;
+        if partition == Partition::Schema {
+            self.ledger_owed
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         self.leave_repair(partition);
         drop(repair);
         Ok(())
@@ -4256,18 +4279,18 @@ impl StorageEngine {
 
     /// What a partition replaced from a copy establishes before its repair
     /// ends ([`Self::finish_rebuild_with`]'s last step): the index tree's
-    /// transferred copies qualified against `index_inventory`, and the
-    /// Schema tree's closure ledger installed for readers, its cleanup owed.
-    /// A failure leaves the partition owed its repair.
+    /// transferred copies qualified against `index_inventory`. (The Schema
+    /// tree's closure ledger is installed by the finish of any of its
+    /// rebuilds.) A failure leaves the partition owed its repair.
     pub(crate) fn establish_replaced(
         &self,
         partition: Partition,
         index_inventory: Option<&[u8]>,
     ) -> StorageResult<()> {
-        match partition {
-            Partition::Idx => self.index_transfer_installed(index_inventory),
-            Partition::Schema => self.reload_closure_frontier(),
-            _ => Ok(()),
+        if partition == Partition::Idx {
+            self.index_transfer_installed(index_inventory)
+        } else {
+            Ok(())
         }
     }
 
@@ -7683,7 +7706,7 @@ impl StorageEngine {
     ///
     /// The breakpoint records could not be read.
     pub fn commit_ceiling_through(&self, index: u64) -> StorageResult<u64> {
-        match self.commit_ceiling_at(index) {
+        match self.commit_ceiling_at(index)? {
             CommitCeiling::Known(ceiling) => Ok(ceiling),
             CommitCeiling::Stored(stored) => self.read_stored_ceiling(stored),
         }
@@ -7693,11 +7716,22 @@ impl StorageEngine {
     /// a read of the store: a position older than the breakpoints kept in
     /// memory is answered by [`Self::read_stored_ceiling`], a read of a
     /// stored record that holds up nothing else here while it runs.
-    pub fn commit_ceiling_at(&self, index: u64) -> CommitCeiling {
-        match self.closure.lock().ledger.ceiling_at(index) {
+    ///
+    /// # Errors
+    ///
+    /// The Schema tree is owed a rebuild: the ledger it is to install is not
+    /// in place, and none other answers for it.
+    pub fn commit_ceiling_at(&self, index: u64) -> StorageResult<CommitCeiling> {
+        let state = self.closure.lock();
+        if self.ledger_owed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(StorageError::InvalidConfig(
+                "the Schema partition is owed a rebuild; its closure ledger is not in place".into(),
+            ));
+        }
+        Ok(match state.ledger.ceiling_at(index) {
             crate::engine::closure_ledger::Ceiling::Known(ceiling) => CommitCeiling::Known(ceiling),
             crate::engine::closure_ledger::Ceiling::Stored(stored) => CommitCeiling::Stored(stored),
-        }
+        })
     }
 
     /// Read a commit ceiling [`Self::commit_ceiling_at`] left to the stored

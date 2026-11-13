@@ -21,6 +21,7 @@ use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
 
 /// The accounting tree beside the data trees across crash cuts.
 mod accounting;
+mod schema_transfer;
 
 /// A persistent (oplog-eligible) single-endpoint config rooted at `dir`.
 fn durable_cfg(dir: &TempDir) -> StorageConfig {

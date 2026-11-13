@@ -683,7 +683,10 @@ impl ReadFence {
         let Some(engine) = &self.engine else {
             return Ok(None);
         };
-        match engine.commit_ceiling_at(index) {
+        match engine
+            .commit_ceiling_at(index)
+            .map_err(|e| failed(e.to_string()))?
+        {
             CommitCeiling::Known(ceiling) => Ok(Some(ceiling)),
             CommitCeiling::Stored(stored) => {
                 let reads = self.stored_ceilings.as_ref().ok_or_else(|| {
