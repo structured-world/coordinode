@@ -122,7 +122,7 @@ fn kill_fuzz_child() {
 /// Rebuild the node partition from `ckpt` and the journal after it, as a
 /// repair of that partition does.
 fn rebuild_nodes(engine: &StorageEngine, ckpt: &Path) {
-    let floor = StorageEngine::checkpoint_replay_floor(ckpt).expect("replay floor");
+    let floor = engine.checkpoint_replay_floor(ckpt).expect("replay floor");
     let since = engine
         .oplog_read_since(floor)
         .expect("read the journal")

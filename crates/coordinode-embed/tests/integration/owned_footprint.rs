@@ -394,9 +394,10 @@ fn a_checkpoint_under_the_cap_is_charged_and_keeps_its_history() {
 
     fill(&mut db, dir.path(), 24);
     assert_accounted(&db, dir.path(), "full with a checkpoint");
-    let floor =
-        coordinode_storage::engine::core::StorageEngine::checkpoint_replay_floor(&checkpoint)
-            .expect("the checkpoint's replay floor");
+    let floor = db
+        .engine()
+        .checkpoint_replay_floor(&checkpoint)
+        .expect("the checkpoint's replay floor");
     let segments = dir.path().join("oplog").join("0");
     let first_kept = std::fs::read_dir(&segments)
         .unwrap()

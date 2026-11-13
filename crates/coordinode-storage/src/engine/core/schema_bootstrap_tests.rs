@@ -677,3 +677,163 @@ fn a_schema_copy_that_does_not_fit_the_endpoint_is_refused() {
     let engine = open_journaled(&store.config).expect("open with room");
     store.assert_whole(&engine);
 }
+
+/// Flip one bit of every byte from `at` of the file at `path`, keeping its
+/// length, or cut it to `at` bytes.
+fn damage_file(path: &Path, at: usize, cut: bool) {
+    let mut bytes = std::fs::read(path).expect("read");
+    if cut {
+        bytes.truncate(at);
+    } else {
+        for byte in &mut bytes[at..] {
+            *byte ^= 0x01;
+        }
+    }
+    std::fs::remove_file(path).expect("unlink");
+    std::fs::write(path, &bytes).expect("write");
+}
+
+/// A checkpoint's replay floor that does not read back whole (a changed
+/// byte, the same length, or a cut file) is refused, never taken as a
+/// journal index: a higher one would let the journal purge entries a
+/// rebuild from the checkpoint needs. Read as eight bare bytes, any eight
+/// bytes were an index.
+#[test]
+fn a_damaged_replay_floor_is_refused() {
+    let store = Checkpointed::new(false);
+    let floor = store.checkpoint.join("replay-floor");
+    let engine = open_journaled(&store.config).expect("open");
+    let read = || engine.checkpoint_replay_floor(&store.checkpoint);
+    let held = read().expect("the floor the checkpoint was sealed with");
+    let whole = std::fs::read(&floor).expect("read the floor");
+
+    damage_file(&floor, 0, false);
+    assert!(
+        read().is_err(),
+        "a changed floor was read as {:?} (sealed {held})",
+        read()
+    );
+    std::fs::write(&floor, &whole).expect("restore");
+    damage_file(&floor, whole.len() / 2, true);
+    assert!(read().is_err(), "a cut floor was read as {:?}", read());
+}
+
+/// A replay floor sealed in another store's checkpoint is refused by this
+/// store, whose deployment it does not belong to: a floor of another
+/// journal's index space would let this journal purge what its own
+/// checkpoint's rebuild needs.
+#[test]
+fn a_replay_floor_of_another_store_is_refused() {
+    use coordinode_core::group::{DEPLOYMENT_KEY, DeploymentId};
+    let bound = |store: &Checkpointed, id: u8| {
+        let engine = open_journaled(&store.config).expect("open");
+        engine
+            .put(Partition::Schema, DEPLOYMENT_KEY, &DeploymentId([id; 16]).0)
+            .expect("bind the deployment");
+        let checkpoint = store.checkpoint.with_file_name(format!(
+            "{}{:020}",
+            crate::engine::rebuild::CHECKPOINT_PREFIX,
+            1
+        ));
+        engine.create_checkpoint(&checkpoint).expect("checkpoint");
+        (engine, checkpoint)
+    };
+    let ours = Checkpointed::new(false);
+    let theirs = Checkpointed::new(false);
+    let (engine, checkpoint) = bound(&ours, 1);
+    let (_, foreign) = bound(&theirs, 2);
+    engine
+        .checkpoint_replay_floor(&checkpoint)
+        .expect("our own floor");
+    std::fs::copy(
+        foreign.join("replay-floor"),
+        checkpoint.join("replay-floor"),
+    )
+    .expect("bring their floor");
+    assert!(
+        engine.checkpoint_replay_floor(&checkpoint).is_err(),
+        "another store's floor was taken"
+    );
+}
+
+/// A Schema rebuild owed with records naming this store's deployment is
+/// refused from a checkpoint of another deployment's store placed as the
+/// latest, rather than rebuilt from its rows.
+#[test]
+fn a_rebuild_from_another_stores_checkpoint_is_refused() {
+    use coordinode_core::group::{DEPLOYMENT_KEY, DeploymentId};
+    let ours = Checkpointed::new(true);
+    {
+        let engine = open_journaled(&ours.config).expect("open");
+        engine
+            .put(Partition::Schema, DEPLOYMENT_KEY, &DeploymentId([1; 16]).0)
+            .expect("bind the deployment");
+    }
+    ours.cut_a_schema_rebuild_short();
+    let theirs = Checkpointed::new(false);
+    let foreign = {
+        let engine = open_journaled(&theirs.config).expect("open");
+        engine
+            .put(Partition::Schema, DEPLOYMENT_KEY, &DeploymentId([2; 16]).0)
+            .expect("bind the deployment");
+        let at = theirs.checkpoint.with_file_name(format!(
+            "{}{:020}",
+            crate::engine::rebuild::CHECKPOINT_PREFIX,
+            1
+        ));
+        engine.create_checkpoint(&at).expect("checkpoint");
+        at
+    };
+    let placed = ours.checkpoint.with_file_name(format!(
+        "{}{:020}",
+        crate::engine::rebuild::CHECKPOINT_PREFIX,
+        9
+    ));
+    for (path, bytes) in tree_files(&foreign) {
+        let to = placed.join(path.strip_prefix(&foreign).expect("under the checkpoint"));
+        std::fs::create_dir_all(to.parent().expect("a parent")).expect("dir");
+        std::fs::write(&to, bytes).expect("copy");
+    }
+
+    match open_journaled(&ours.config) {
+        Err(StorageError::SchemaRecoveryRefused(RebuildRefusal::OtherDeployment)) => {}
+        Err(e) => panic!("refused for another reason: {e}"),
+        Ok(_) => panic!("rebuilt from another store's checkpoint"),
+    }
+}
+
+/// The records a cut-short Schema rebuild keeps in its intent are refused
+/// when they do not read back whole, and the open with them: a changed byte
+/// would otherwise put a route the store never had in place of its own.
+#[test]
+fn damaged_kept_records_refuse_the_open() {
+    let store = Checkpointed::new(true);
+    store.cut_a_schema_rebuild_short();
+    let intent = store
+        .primary()
+        .join(REBUILD_INTENT_DIR)
+        .join(Partition::Schema.name());
+    let whole = std::fs::read(&intent).expect("read the intent");
+    assert!(!whole.is_empty(), "the intent keeps the records");
+
+    // A change inside the last record's value keeps the encoding decodable.
+    damage_file(&intent, whole.len() - 1, false);
+    match open_journaled(&store.config) {
+        Err(StorageError::SchemaRecoveryRefused(RebuildRefusal::LocalStateLost)) => {}
+        Err(e) => panic!("refused for another reason: {e}"),
+        Ok(engine) => panic!(
+            "opened with changed records: routes {:?}",
+            read(&engine, Partition::Schema, &routing_key(Partition::Node))
+        ),
+    }
+    std::fs::write(&intent, &whole[..whole.len() / 2]).expect("cut the intent");
+    assert!(
+        matches!(
+            open_journaled(&store.config),
+            Err(StorageError::SchemaRecoveryRefused(
+                RebuildRefusal::LocalStateLost
+            ))
+        ),
+        "opened with a cut intent"
+    );
+}

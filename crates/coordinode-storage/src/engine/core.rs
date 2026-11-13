@@ -1147,6 +1147,7 @@ impl StorageEngine {
             repair: schema_repair.as_ref(),
             seqno: &seqno,
             journaled: journal_config.is_some() && config.select_oplog_endpoint(0).is_ok(),
+            footprints: &footprints,
             maintenance: &maintenance,
         }
         .settle()?;
@@ -3448,8 +3449,16 @@ impl StorageEngine {
         let path = target.join(REPLAY_FLOOR_FILE);
         let io = |e: std::io::Error| StorageError::Io(format!("write {path:?}: {e}"));
         // no-std: StoragePort trait, caller-injected
+        // The floor counts this store's journal: it names the deployment the
+        // store's history belongs to, so another store's is not taken for it.
+        let mut payload = replay_floor.to_be_bytes().to_vec();
+        payload.extend_from_slice(&deployment_tag(crate::engine::metadata::bound_deployment(
+            self,
+        )?));
+        let record = seal_record(REPLAY_FLOOR_MAGIC, &payload)?;
+        crate::engine::promise::charge_record(&self.footprints, &path, record.len() as u64)?;
         let mut file = std::fs::File::create(&path).map_err(io)?;
-        file.write_all(&replay_floor.to_be_bytes()).map_err(io)?;
+        file.write_all(&record).map_err(io)?;
         file.sync_all().map_err(io)?;
         // A checkpoint is a base the Raft log is kept for: durable, both the
         // flushed trees under the endpoints and the copy, before its marker
@@ -3986,7 +3995,7 @@ impl StorageEngine {
         }
         self.flush_memtables(&tree)?;
         self.restore_retention_floor(&tree, Partition::Node, source_floor)?;
-        remove_rebuild_intent(&self.data_dir, target)?;
+        remove_rebuild_intent(&self.data_dir, target, &self.footprints)?;
         // What an open-time salvage of the table lost is restored.
         self.acknowledge_table_repair(table_id)?;
         Ok(Rebuild::Rebuilt { versions, replayed })
@@ -4135,7 +4144,12 @@ impl StorageEngine {
         } else {
             Vec::new()
         };
-        write_rebuild_intent_with(&self.data_dir, RebuildTarget::Partition(partition), &kept)
+        write_rebuild_intent_with(
+            &self.data_dir,
+            RebuildTarget::Partition(partition),
+            &kept,
+            &self.footprints,
+        )
     }
 
     /// Take the repair of `partition` and mark it under repair, so no
@@ -4230,7 +4244,11 @@ impl StorageEngine {
             self.note_field_dictionary_change();
         }
         last()?;
-        remove_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))?;
+        remove_rebuild_intent(
+            &self.data_dir,
+            RebuildTarget::Partition(partition),
+            &self.footprints,
+        )?;
         self.leave_repair(partition);
         drop(repair);
         Ok(())
@@ -4471,18 +4489,21 @@ impl StorageEngine {
     /// The checkpoint holds no such record, or it cannot be read.
     ///
     /// [`oplog_read_since`]: Self::oplog_read_since
-    pub fn checkpoint_replay_floor(checkpoint_dir: &Path) -> StorageResult<u64> {
+    pub fn checkpoint_replay_floor(&self, checkpoint_dir: &Path) -> StorageResult<u64> {
         let path = checkpoint_dir.join(REPLAY_FLOOR_FILE);
         // no-std: StoragePort trait, caller-injected
         let bytes =
             std::fs::read(&path).map_err(|e| StorageError::Io(format!("read {path:?}: {e}")))?;
-        let floor: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
-            StorageError::Io(format!(
-                "{path:?} holds {} bytes, not a journal index",
-                bytes.len()
-            ))
-        })?;
-        Ok(u64::from_be_bytes(floor))
+        let not_ours =
+            |why: &str| StorageError::Io(format!("{path:?} is not a replay floor: {why}"));
+        let payload = open_record(REPLAY_FLOOR_MAGIC, &bytes).map_err(not_ours)?;
+        let (floor, deployment) = payload
+            .split_first_chunk::<8>()
+            .ok_or_else(|| not_ours("too short"))?;
+        if deployment != deployment_tag(crate::engine::metadata::bound_deployment(self)?) {
+            return Err(not_ours("sealed by a store of another deployment"));
+        }
+        Ok(u64::from_be_bytes(*floor))
     }
 
     /// Purge journal segments outside the retention window. No-op when no
@@ -6720,7 +6741,11 @@ impl StorageEngine {
         // endpoints.
         self.sync_endpoint_devices()?;
         for source in settled {
-            remove_rebuild_intent(&self.data_dir, RebuildTarget::Recount(source))?;
+            remove_rebuild_intent(
+                &self.data_dir,
+                RebuildTarget::Recount(source),
+                &self.footprints,
+            )?;
         }
         // The retained oplog journal is NOT truncated on flush — it must survive
         // for WAL-replay-repair, and crash recovery skips the entries each
@@ -9284,9 +9309,64 @@ fn release_cache_layers(
     }
 }
 
-/// The file of a checkpoint holding, big-endian, the journal index a rebuild
-/// from it replays from.
+/// The file of a checkpoint holding the journal index a rebuild from it
+/// replays from, as a sealed record ([`seal_record`]).
 const REPLAY_FLOOR_FILE: &str = "replay-floor";
+
+/// The kind of a checkpoint's replay floor record.
+const REPLAY_FLOOR_MAGIC: &[u8; 8] = b"CNFLOOR1";
+
+/// The kind of the records a Schema rebuild keeps in its intent.
+const KEPT_ROWS_MAGIC: &[u8; 8] = b"CNKEPT01";
+
+/// A deployment binding as a record holds it: a presence byte and the id.
+fn deployment_tag(deployment: Option<coordinode_core::group::DeploymentId>) -> [u8; 17] {
+    let mut tag = [0u8; 17];
+    if let Some(id) = deployment {
+        tag[0] = 1;
+        tag[1..].copy_from_slice(&id.0);
+    }
+    tag
+}
+
+/// `payload` as a record that reads back only whole and as the kind it was
+/// written as: `magic`, the payload's length, the payload, and a CRC-32C of
+/// all of it.
+fn seal_record(magic: &[u8; 8], payload: &[u8]) -> StorageResult<Vec<u8>> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| StorageError::InvalidConfig(format!("a record of {} bytes", payload.len())))?;
+    let mut bytes = Vec::with_capacity(magic.len() + 4 + payload.len() + 4);
+    bytes.extend_from_slice(magic);
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    let sum = crc32c::crc32c(&bytes);
+    bytes.extend_from_slice(&sum.to_le_bytes());
+    Ok(bytes)
+}
+
+/// The payload of a record [`seal_record`] wrote with `magic`, or why
+/// `bytes` is not one.
+fn open_record<'a>(magic: &[u8; 8], bytes: &'a [u8]) -> Result<&'a [u8], &'static str> {
+    if bytes.len() < magic.len() + 8 {
+        return Err("shorter than its header");
+    }
+    let (body, sum) = bytes.split_at(bytes.len() - 4);
+    let mut stored = [0u8; 4];
+    stored.copy_from_slice(sum);
+    if crc32c::crc32c(body) != u32::from_le_bytes(stored) {
+        return Err("checksum mismatch");
+    }
+    if &body[..magic.len()] != magic {
+        return Err("a record of another kind");
+    }
+    let mut len = [0u8; 4];
+    len.copy_from_slice(&body[magic.len()..magic.len() + 4]);
+    let payload = &body[magic.len() + 4..];
+    if usize::try_from(u32::from_le_bytes(len)).ok() != Some(payload.len()) {
+        return Err("length does not match its payload");
+    }
+    Ok(payload)
+}
 
 /// The rebuild intent file of a `STORAGE COLUMNAR` table is its id behind
 /// this prefix, so a table never names a partition's.
@@ -9320,13 +9400,26 @@ impl RebuildTarget<'_> {
 /// Record, durably, that `target` of the store at `data_dir` holds an
 /// unknown part of its data and of its coverage record, and must be rebuilt.
 fn write_rebuild_intent(data_dir: &Path, target: RebuildTarget<'_>) -> StorageResult<()> {
-    write_rebuild_intent_with(data_dir, target, &[])
+    put_rebuild_intent(data_dir, target, &[])
 }
 
 /// [`write_rebuild_intent`] holding `kept`: what the rebuild keeps of the
 /// tree it clears, durable before the clear, so a rebuild cut short after
-/// it still has them.
+/// it still has them. The file is charged to `footprints` before it is
+/// written.
 fn write_rebuild_intent_with(
+    data_dir: &Path,
+    target: RebuildTarget<'_>,
+    kept: &[u8],
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<()> {
+    let path = data_dir.join(REBUILD_INTENT_DIR).join(target.file_name());
+    crate::engine::promise::charge_record(footprints, &path, kept.len() as u64)?;
+    put_rebuild_intent(data_dir, target, kept)
+}
+
+/// Write the intent file of `target` holding `kept`, durably.
+fn put_rebuild_intent(
     data_dir: &Path,
     target: RebuildTarget<'_>,
     kept: &[u8],
@@ -9362,24 +9455,37 @@ fn read_kept_rows(data_dir: &Path) -> StorageResult<Option<Rows>> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    rmp_serde::from_slice(&bytes)
+    // Records that do not read back whole prove nothing.
+    let Ok(payload) = open_record(KEPT_ROWS_MAGIC, &bytes) else {
+        tracing::error!(path = %path.display(), "the records a Schema rebuild kept are damaged");
+        return Ok(None);
+    };
+    rmp_serde::from_slice(payload)
         .map(Some)
         .map_err(|e| StorageError::Io(format!("decode the records kept in {path:?}: {e}")))
 }
 
 /// `kept` as a rebuild intent holds them.
 fn encode_kept_rows(kept: &Rows) -> StorageResult<Vec<u8>> {
-    rmp_serde::to_vec(kept)
-        .map_err(|e| StorageError::Io(format!("encode the records a rebuild keeps: {e}")))
+    let payload = rmp_serde::to_vec(kept)
+        .map_err(|e| StorageError::Io(format!("encode the records a rebuild keeps: {e}")))?;
+    seal_record(KEPT_ROWS_MAGIC, &payload)
 }
 
-/// Drop the rebuild intent of `target`, its rebuilt tree on disk.
-fn remove_rebuild_intent(data_dir: &Path, target: RebuildTarget<'_>) -> StorageResult<()> {
+/// Drop the rebuild intent of `target`, its rebuilt tree on disk, and what
+/// `footprints` was charged for it.
+fn remove_rebuild_intent(
+    data_dir: &Path,
+    target: RebuildTarget<'_>,
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<()> {
     let dir = data_dir.join(REBUILD_INTENT_DIR);
     let name = target.file_name();
+    let path = dir.join(&name);
     // no-std: StoragePort trait, caller-injected
-    std::fs::remove_file(dir.join(&name))
+    std::fs::remove_file(&path)
         .map_err(|e| StorageError::Io(format!("rebuild intent for {name}: remove: {e}")))?;
+    footprints.removed(&path);
     sync_dir(&dir)
 }
 

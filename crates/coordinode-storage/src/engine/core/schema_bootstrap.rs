@@ -74,6 +74,7 @@ pub(super) struct Bootstrap<'a> {
     /// Whether the store keeps a journal of its own, the source a rebuild
     /// replays.
     pub(super) journaled: bool,
+    pub(super) footprints: &'a Footprints,
     pub(super) maintenance: &'a Arc<lsm_tree::rate_limiter::RateLimiter>,
 }
 
@@ -158,6 +159,7 @@ impl Bootstrap<'_> {
                 data_dir,
                 RebuildTarget::Partition(Partition::Schema),
                 &encode_kept_rows(&kept)?,
+                self.footprints,
             )?;
         }
         // With no checkpoint, nothing here rebuilds the tree: what it lost
@@ -257,7 +259,10 @@ impl SchemaRebuild {
             &staging,
         )?;
         let held = TreeCoverage::read(&source, Domain::Journal)?;
-        if let Some(refusal) = uncovered_entry(&held, entries, (next, &[])) {
+        if let Some(refusal) = self
+            .other_deployment(&source)?
+            .or_else(|| uncovered_entry(&held, entries, (next, &[])))
+        {
             drop(source);
             remove_staging(&staging, footprints)?;
             return Err(StorageError::SchemaRecoveryRefused(refusal));
@@ -322,7 +327,11 @@ impl SchemaRebuild {
         if source_floor < schema.retention_floor() {
             schema.lower_retention_floor(source_floor)?;
         }
-        remove_rebuild_intent(data_dir, RebuildTarget::Partition(Partition::Schema))?;
+        remove_rebuild_intent(
+            data_dir,
+            RebuildTarget::Partition(Partition::Schema),
+            footprints,
+        )?;
         if let Some(repair) = repair {
             schema.acknowledge_repair_report(repair.report.id)?;
         }
@@ -334,6 +343,26 @@ impl SchemaRebuild {
             "the Schema tree was rebuilt from the latest checkpoint and the journal"
         );
         Ok(())
+    }
+}
+
+impl SchemaRebuild {
+    /// Refused when the checkpoint's copy names a deployment the kept
+    /// records do not: the store's binding lands before any history it
+    /// binds, so a checkpoint of this store holding one was taken by a store
+    /// whose records name it too. A checkpoint taken before the binding
+    /// names none.
+    fn other_deployment(&self, source: &AnyTree) -> StorageResult<Option<RebuildRefusal>> {
+        use coordinode_core::group::DEPLOYMENT_KEY;
+        let Some(theirs) = source.get(DEPLOYMENT_KEY, lsm_tree::SeqNo::MAX)? else {
+            return Ok(None);
+        };
+        let ours = self
+            .kept
+            .iter()
+            .find(|(key, _)| key.as_slice() == DEPLOYMENT_KEY)
+            .map(|(_, value)| value.as_slice());
+        Ok((ours != Some(theirs.as_ref())).then_some(RebuildRefusal::OtherDeployment))
     }
 }
 

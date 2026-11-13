@@ -336,7 +336,7 @@ pub fn write_copy(
 /// beside what is already promised, so it takes the reserve client writes
 /// leave and never the room of an admitted write or a flush. Only the growth
 /// of the file is new.
-fn charge_record(footprints: &Footprints, path: &Path, len: u64) -> StorageResult<()> {
+pub(crate) fn charge_record(footprints: &Footprints, path: &Path, len: u64) -> StorageResult<()> {
     let (Some(footprint), Some(charge)) = (footprints.for_path(path), footprints.file(path)) else {
         return Ok(());
     };

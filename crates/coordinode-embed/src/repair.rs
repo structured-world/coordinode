@@ -195,7 +195,7 @@ pub fn verify_and_repair(
 
     // One floor + oplog slice covers every partition's replay-forward; each
     // rebuild skips what its checkpoint tree already holds.
-    let from = StorageEngine::checkpoint_replay_floor(&checkpoint)?;
+    let from = engine.checkpoint_replay_floor(&checkpoint)?;
     let oplog_since = engine.oplog_read_since(from)?.unwrap_or_default();
 
     let mut repaired = Vec::with_capacity(corrupt.len());
@@ -341,7 +341,7 @@ impl CheckpointScheduler {
                         // roll forward from that base.
                         let keep_from = match latest_checkpoint(&root).and_then(|latest| {
                             latest
-                                .map(|c| StorageEngine::checkpoint_replay_floor(&c))
+                                .map(|c| engine.checkpoint_replay_floor(&c))
                                 .transpose()
                         }) {
                             Ok(Some(floor)) => floor,

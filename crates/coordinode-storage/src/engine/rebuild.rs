@@ -116,6 +116,9 @@ pub enum RebuildRefusal {
     /// its consensus state, its closure ledger) were lost, or cannot be
     /// shown intact, and nothing else holds them.
     LocalStateLost,
+    /// The checkpoint belongs to a store of another deployment than the
+    /// records this member keeps name.
+    OtherDeployment,
 }
 
 impl core::fmt::Display for RebuildRefusal {
@@ -134,6 +137,9 @@ impl core::fmt::Display for RebuildRefusal {
                 f,
                 "journal entry {index} changes the table's catalog entry after the checkpoint"
             ),
+            Self::OtherDeployment => {
+                f.write_str("the checkpoint belongs to a store of another deployment")
+            }
             Self::LocalStateLost => f.write_str(
                 "the member's own records in the tree cannot be shown intact and nothing else \
                  holds them",

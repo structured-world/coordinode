@@ -365,7 +365,10 @@ fn a_cancelled_consumer_does_not_release_what_recovery_needs() {
     let mut db = Database::open(dir.path()).expect("open");
     write(&mut db, 2, "base");
     let ckpt = db.checkpoint(1).expect("checkpoint");
-    let replay_from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("replay floor");
+    let replay_from = db
+        .engine()
+        .checkpoint_replay_floor(&ckpt)
+        .expect("replay floor");
     let h = db
         .register_consumer(log_consumer(
             "c",

@@ -960,7 +960,7 @@ impl Database {
             // replays; a floor that cannot be read keeps the whole journal.
             let latest = crate::repair::latest_checkpoint(&root)?;
             if let Some(latest) = &latest {
-                let floor = StorageEngine::checkpoint_replay_floor(latest).unwrap_or_else(|e| {
+                let floor = engine.checkpoint_replay_floor(latest).unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "checkpoint replay floor unreadable; keeping the journal");
                     0
                 });

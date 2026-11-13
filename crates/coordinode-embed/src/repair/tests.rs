@@ -1359,7 +1359,7 @@ fn a_table_rebuild_missing_part_of_the_journal_is_refused() {
     for i in 10..20u32 {
         row(format!("row:{i:06}"));
     }
-    let from = StorageEngine::checkpoint_replay_floor(&checkpoint).expect("floor");
+    let from = engine.checkpoint_replay_floor(&checkpoint).expect("floor");
     let mut suffix = engine
         .oplog_read_since(from)
         .expect("read journal")
@@ -1478,12 +1478,13 @@ fn oplog_purge_keeps_entries_needed_by_checkpoint_replay() {
     }
     engine.persist().expect("persist base");
     create_checkpoint(&engine, &root).expect("checkpoint");
-    let cursor = StorageEngine::checkpoint_replay_floor(
-        &latest_checkpoint(&root)
-            .expect("list")
-            .expect("checkpoint exists"),
-    )
-    .expect("cursor");
+    let cursor = engine
+        .checkpoint_replay_floor(
+            &latest_checkpoint(&root)
+                .expect("list")
+                .expect("checkpoint exists"),
+        )
+        .expect("cursor");
 
     // Post-checkpoint tail: durable in the trees AND sealed in the journal.
     for i in 0..4u32 {
@@ -1548,7 +1549,7 @@ fn a_rebuild_of_the_index_partition_keeps_every_family() {
     let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
     put(&engine, 50, PartitionId::Idx, &late, b"late");
 
-    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let from = engine.checkpoint_replay_floor(&ckpt).expect("floor");
     let since = engine
         .oplog_read_since(from)
         .expect("read")
@@ -1678,7 +1679,7 @@ fn a_rebuild_replays_what_the_checkpoint_tree_lacks() {
     std::fs::remove_dir_all(ckpt.join("oplog")).expect("drop journal copy");
     copy_tree(&dir.path().join("oplog"), &ckpt.join("oplog"));
 
-    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let from = engine.checkpoint_replay_floor(&ckpt).expect("floor");
     let since = engine
         .oplog_read_since(from)
         .expect("read")
@@ -1721,7 +1722,7 @@ fn a_rebuilt_partition_keeps_its_commit_timestamps() {
     let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
     put(&engine, 40, PartitionId::Node, b"node:0:c", b"c");
 
-    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let from = engine.checkpoint_replay_floor(&ckpt).expect("floor");
     let since = engine
         .oplog_read_since(from)
         .expect("read")
@@ -1813,7 +1814,7 @@ fn a_rebuilt_partition_serves_its_history() {
     let before = read_at(before_overwrite);
     assert_eq!(before, vec![(b"node:0:a".to_vec(), b"a-v1".to_vec())]);
 
-    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let from = engine.checkpoint_replay_floor(&ckpt).expect("floor");
     let since = engine
         .oplog_read_since(from)
         .expect("read")
@@ -1839,7 +1840,7 @@ fn a_partition_rebuild_missing_part_of_the_journal_is_refused() {
     put(&engine, 20, PartitionId::Node, b"node:0:b", b"b");
     put(&engine, 30, PartitionId::Node, b"node:0:c", b"c");
 
-    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let from = engine.checkpoint_replay_floor(&ckpt).expect("floor");
     let mut since = engine
         .oplog_read_since(from)
         .expect("read")
@@ -1907,7 +1908,7 @@ fn rebuild_cut_at(op: lsm_tree::fs::FaultOp, skip: u64) -> bool {
     }
     engine.persist().expect("persist base");
     let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
-    let cursor = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let cursor = engine.checkpoint_replay_floor(&ckpt).expect("floor");
     for i in 0..4u32 {
         put(
             &engine,
