@@ -11,15 +11,26 @@
 //! - `delete`: as many keys inserted first (not measured), then deleted.
 //!
 //! The paths: `volatile` (no journal, one direct batch per commit),
-//! `journal` (the embedded journal, one journaled commit each) and `raft`
-//! (proposals applied as a Raft state machine applies them, with markers).
+//! `journal` (the embedded journal, one journaled commit each) and
+//! `local-apply` (proposals applied to the store as a Raft state machine
+//! applies them, with markers; no consensus, no log, no network).
 //!
-//! After the writes the store is persisted and its compactions drained, so
-//! deferred maintenance is counted, not hidden. One JSON line reports the
-//! commit latency percentiles, throughput, bytes the process wrote to
-//! storage (Linux `/proc/self/io`), logical bytes written, every tree's
-//! bytes on disk, compactions by tree and action, each tree's peak first
-//! level runs, and the peak resident memory (Linux `VmHWM`).
+//! The delete workload's keys are inserted, persisted and compacted before
+//! the measured phase begins. Two costs are reported, each with its own
+//! counters taken from the start of the measured phase:
+//!
+//! - `foreground`: the commits alone (latency percentiles, throughput, the
+//!   bytes written and the compactions run while they ran);
+//! - `full`: the commits, then their memtables persisted, then their
+//!   compactions run to the end, which is when no tree owes a compaction
+//!   under the strategy the engine compacts it with and none finished since
+//!   that was read. A run that does not get there within
+//!   `ACCOUNTING_AB_MAINTENANCE_SECS` (default 300) reports the debt left
+//!   by tree instead of hiding it.
+//!
+//! Bytes written are the process's (Linux `/proc/self/io`); beside them the
+//! logical bytes, every tree's bytes on disk, each tree's peak first level
+//! runs and the peak resident memory (Linux `VmHWM`).
 //!
 //! Run: `cargo bench -p coordinode-storage --bench accounting_placement`.
 
@@ -37,9 +48,22 @@ use coordinode_storage::engine::partition::Partition;
 use lsm_tree::AbstractTree;
 use metrics::{CounterFn, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 
-/// Compactions counted by (tree, action).
+/// Compactions by (tree, action).
+type Counts = BTreeMap<(String, String), u64>;
+
+/// Compactions counted by (tree, action), and when the last one finished.
 #[derive(Default)]
-struct Compactions(Mutex<BTreeMap<(String, String), u64>>);
+struct Compactions(Mutex<(Counts, Option<Instant>)>);
+
+impl Compactions {
+    fn counts(&self) -> BTreeMap<(String, String), u64> {
+        self.0.lock().map(|seen| seen.0.clone()).unwrap_or_default()
+    }
+
+    fn last_finished(&self) -> Option<Instant> {
+        self.0.lock().ok().and_then(|seen| seen.1)
+    }
+}
 
 struct Counted(Key, Arc<Compactions>);
 
@@ -53,11 +77,62 @@ impl CounterFn for Counted {
         };
         if let Ok(mut seen) = self.1.0.lock() {
             *seen
+                .0
                 .entry((label("partition"), label("action")))
                 .or_insert(0) += by;
+            seen.1 = Some(Instant::now());
         }
     }
     fn absolute(&self, _: u64) {}
+}
+
+/// The compactions of `after` not yet in `before`, as `tree/action`.
+fn since(
+    before: &BTreeMap<(String, String), u64>,
+    after: &BTreeMap<(String, String), u64>,
+) -> BTreeMap<String, u64> {
+    after
+        .iter()
+        .filter_map(|(key, n)| {
+            let new = n - before.get(key).copied().unwrap_or(0);
+            (new > 0).then(|| (format!("{}/{}", key.0, key.1), new))
+        })
+        .collect()
+}
+
+/// The bytes every tree's compactions still owe, by the strategy the engine
+/// compacts them under (leveled, its default).
+fn compaction_debt(engine: &StorageEngine) -> BTreeMap<&'static str, u64> {
+    let strategy = lsm_tree::compaction::Leveled::default();
+    Partition::all()
+        .iter()
+        .filter_map(|&part| Some((part.name(), engine.tree(part).ok()?)))
+        .map(|(name, tree)| (name, tree.compaction_debt(&strategy)))
+        .filter(|(_, debt)| *debt > 0)
+        .collect()
+}
+
+/// Wait until the store's compactions are done: no tree owes a compaction,
+/// and none finished since that was read (a compaction running owes the
+/// bytes it reads until it finishes). Gives up at `limit`; returns the debt
+/// left then by tree (empty when done).
+fn maintenance_done(
+    engine: &StorageEngine,
+    compactions: &Compactions,
+    limit: Duration,
+) -> BTreeMap<&'static str, u64> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let finished = compactions.last_finished();
+        let debt = compaction_debt(engine);
+        if debt.is_empty() && compactions.last_finished() == finished {
+            return debt;
+        }
+        if Instant::now() >= deadline {
+            return debt;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 struct Capture(Arc<Compactions>);
@@ -86,7 +161,17 @@ impl Recorder for Capture {
 enum Path {
     Volatile,
     Journal,
-    Raft,
+    LocalApply,
+}
+
+impl Path {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Volatile => "volatile",
+            Self::Journal => "journal",
+            Self::LocalApply => "local-apply",
+        }
+    }
 }
 
 fn env(name: &str, default: &str) -> String {
@@ -173,7 +258,7 @@ impl Store {
                 .engine
                 .commit_journaled(unit, self.oracle.next().as_raw())
                 .expect("commit"),
-            Path::Raft => {
+            Path::LocalApply => {
                 self.index += 1;
                 self.engine
                     .apply_raft_proposal(unit, self.oracle.next().as_raw(), self.index, 0, |_| {
@@ -186,13 +271,24 @@ impl Store {
 }
 
 fn main() {
+    // How long the deferred maintenance may run before the debt left is
+    // reported instead.
+    let maintenance_limit = Duration::from_secs(
+        env("ACCOUNTING_AB_MAINTENANCE_SECS", "300")
+            .parse()
+            .expect("maintenance seconds"),
+    );
     let compactions = Arc::new(Compactions::default());
     metrics::set_global_recorder(Capture(Arc::clone(&compactions))).expect("recorder");
 
     let path = match env("ACCOUNTING_AB_PATH", "journal").as_str() {
         "volatile" => Path::Volatile,
-        "raft" => Path::Raft,
-        _ => Path::Journal,
+        "local-apply" => Path::LocalApply,
+        "journal" => Path::Journal,
+        other => {
+            eprintln!("ACCOUNTING_AB_PATH {other}: volatile, journal or local-apply");
+            std::process::exit(2);
+        }
     };
     let workload = env("ACCOUNTING_AB_WORKLOAD", "insert");
     let ops: u64 = env("ACCOUNTING_AB_OPS", "20000").parse().expect("ops");
@@ -226,7 +322,7 @@ fn main() {
     let oracle = Arc::new(TimestampOracle::new());
     let engine = match path {
         Path::Journal => StorageEngine::open_embedded(&config, Arc::clone(&oracle)),
-        Path::Raft => StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)),
+        Path::LocalApply => StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)),
         Path::Volatile => StorageEngine::open(&config),
     }
     .expect("open");
@@ -237,15 +333,21 @@ fn main() {
         index: 0,
     };
 
+    // The keys to delete, with their maintenance done before the measured
+    // phase, so none of it lands in that phase's counters; a debt the
+    // engine leaves standing is reported.
+    let mut preload_debt_left = BTreeMap::new();
     if workload == "delete" {
         for n in 0..ops {
             store.commit(&unit("insert", n));
         }
         store.engine.persist().expect("persist");
+        preload_debt_left = maintenance_done(&store.engine, &compactions, maintenance_limit);
     }
 
     let trees: Vec<Partition> = Partition::all().to_vec();
     let mut l0_peak: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let compactions_before = compactions.counts();
     let written_before = proc_field("io", "write_bytes");
     let mut latencies = Vec::with_capacity(ops as usize);
     let mut logical_bytes = 0u64;
@@ -270,24 +372,20 @@ fn main() {
             }
         }
     }
-    let elapsed = started.elapsed();
+    // The foreground: the commits alone, and what they wrote and compacted
+    // while they ran.
+    let foreground = started.elapsed();
+    let foreground_written = proc_field("io", "write_bytes") - written_before;
+    let foreground_compactions = since(&compactions_before, &compactions.counts());
 
-    // Deferred maintenance is the writes' cost too: persist, then wait for
-    // the compactions to stop.
+    // The full cost adds the deferred work the commits left: their
+    // memtables persisted, then their compactions run to the end.
+    let persisted = Instant::now();
     store.engine.persist().expect("persist");
-    let total = |c: &Compactions| c.0.lock().map(|m| m.values().sum::<u64>()).unwrap_or(0);
-    let mut last = total(&compactions);
-    let mut quiet = Instant::now();
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while quiet.elapsed() < Duration::from_secs(3) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200));
-        let now = total(&compactions);
-        if now != last {
-            last = now;
-            quiet = Instant::now();
-        }
-    }
-    let drained = Instant::now() < deadline;
+    let persist = persisted.elapsed();
+    let debt_left = maintenance_done(&store.engine, &compactions, maintenance_limit);
+    let full = started.elapsed();
+    let maintenance = full - foreground - persist;
     // The counter only grows over the process's life.
     let written = proc_field("io", "write_bytes") - written_before;
 
@@ -303,30 +401,40 @@ fn main() {
         }
     }
     let dir_total = dir_bytes(dir.path());
-    let compactions: BTreeMap<String, u64> = compactions
-        .0
-        .lock()
-        .map(|m| {
-            m.iter()
-                .map(|((tree, action), n)| (format!("{tree}/{action}"), *n))
-                .collect()
-        })
-        .unwrap_or_default();
+    let amplification = |bytes: u64| {
+        if logical_bytes == 0 {
+            0.0
+        } else {
+            bytes as f64 / logical_bytes as f64
+        }
+    };
     let report = serde_json::json!({
-        "path": env("ACCOUNTING_AB_PATH", "journal"),
+        "path": path.name(),
         "workload": workload,
         "ops": ops,
-        "seconds": elapsed.as_secs_f64(),
-        "ops_per_sec": ops as f64 / elapsed.as_secs_f64(),
-        "latency_us": {"p50": pct(0.5), "p99": pct(0.99), "p999": pct(0.999)},
         "logical_bytes": logical_bytes,
-        "written_bytes": written,
-        "write_amplification": if logical_bytes == 0 { 0.0 } else { written as f64 / logical_bytes as f64 },
+        "foreground": {
+            "seconds": foreground.as_secs_f64(),
+            "ops_per_sec": ops as f64 / foreground.as_secs_f64(),
+            "latency_us": {"p50": pct(0.5), "p99": pct(0.99), "p999": pct(0.999)},
+            "written_bytes": foreground_written,
+            "write_amplification": amplification(foreground_written),
+            "compactions": foreground_compactions,
+        },
+        "full": {
+            "seconds": full.as_secs_f64(),
+            "ops_per_sec": ops as f64 / full.as_secs_f64(),
+            "persist_seconds": persist.as_secs_f64(),
+            "maintenance_seconds": maintenance.as_secs_f64(),
+            "written_bytes": written,
+            "write_amplification": amplification(written),
+            "compactions": since(&compactions_before, &compactions.counts()),
+            "compaction_debt_left_bytes": debt_left,
+        },
+        "preload_compaction_debt_left_bytes": preload_debt_left,
         "tree_bytes": tree_bytes,
         "dir_bytes": dir_total,
-        "compactions": compactions,
         "l0_peak": l0_peak,
-        "maintenance_drained": drained,
         "peak_rss_kb": proc_field("status", "VmHWM"),
     });
     println!("{report}");
