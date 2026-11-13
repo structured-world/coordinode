@@ -107,6 +107,10 @@ name = "merge_stress"
 harness = false
 
 [[bench]]
+name = "accounting_placement"
+harness = false
+
+[[bench]]
 name = "mvcc_point_read"
 harness = false
 
