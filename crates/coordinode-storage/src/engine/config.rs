@@ -254,6 +254,9 @@ pub const DEFAULT_RECOVERY_RESERVE_DIVISOR: u64 = 16;
 /// the one its accounting starts in the accounting tree.
 pub const RECOVERY_RECORD_ROOM: u64 = 2 * crate::engine::footprint::MEMTABLE_START_DEBT;
 
+// The floor leaves the smallest supported limit most of its room for data.
+const _: () = assert!(RECOVERY_RECORD_ROOM < MIN_HARD_LIMIT_BYTES / 2);
+
 /// The recovery reserve of an endpoint with hard limit `limit` and no
 /// configured reserve: a [`DEFAULT_RECOVERY_RESERVE_DIVISOR`]th of it, and
 /// at a supported limit ([`MIN_HARD_LIMIT_BYTES`] and up) never less than

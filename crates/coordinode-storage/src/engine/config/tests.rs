@@ -10,8 +10,6 @@ fn the_default_recovery_reserve_holds_one_recovery_record() {
         default_recovery_reserve(MIN_HARD_LIMIT_BYTES),
         RECOVERY_RECORD_ROOM
     );
-    assert!(RECOVERY_RECORD_ROOM > MIN_HARD_LIMIT_BYTES / DEFAULT_RECOVERY_RESERVE_DIVISOR);
-    assert!(RECOVERY_RECORD_ROOM < MIN_HARD_LIMIT_BYTES / 2);
     assert_eq!(default_recovery_reserve(1 << 30), (1 << 30) / 16);
     let endpoint = EndpointConfig::new("e", "/x", Media::Hdd, Durability::Durable, Tier::Warm)
         .with_hard_limit_bytes(MIN_HARD_LIMIT_BYTES);
