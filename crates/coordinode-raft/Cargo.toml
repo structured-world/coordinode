@@ -70,6 +70,10 @@ harness = false
 name = "promise_costs"
 harness = false
 
+[[bench]]
+name = "closure_ledger"
+harness = false
+
 [build-dependencies]
 tonic-prost-build = "0.14"
 

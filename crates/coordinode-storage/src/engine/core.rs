@@ -7457,6 +7457,15 @@ impl StorageEngine {
         }
     }
 
+    /// How many breakpoint records the closure ledger keeps in the store;
+    /// `None` while the store holds no ledger.
+    pub fn closure_records_held(&self) -> Option<u64> {
+        match self.closure_held.load(std::sync::atomic::Ordering::Acquire) {
+            NO_CLOSURE_LEDGER => None,
+            held => Some(held),
+        }
+    }
+
     /// The closed bound of the Raft entries applied here; see
     /// [`Self::complete_cut`].
     pub fn closure_frontier(&self) -> u64 {
