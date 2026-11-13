@@ -32,7 +32,7 @@ fn register_storage_metrics() {
     );
     metrics::describe_counter!(
         "coordinode_storage_compaction_total",
-        "Compactions completed"
+        "Compactions completed, per partition and action: merged (inputs rewritten), moved (tables moved to a deeper level unchanged) or dropped"
     );
     metrics::describe_histogram!(
         "coordinode_storage_compaction_duration_seconds",

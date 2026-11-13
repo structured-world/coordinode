@@ -196,6 +196,16 @@ fn a_compaction_that_did_work_is_counted_for_its_partition() {
     };
     let total = node("coordinode_storage_compaction_total");
     assert!(total >= 1, "a compaction that merged the tables: {seen:?}");
+    // Each counted compaction names what it did: a move and a merge cost
+    // differently.
+    assert!(
+        seen.iter()
+            .filter(|(n, _)| n == "coordinode_storage_compaction_total")
+            .all(|(_, labels)| labels.iter().any(
+                |(k, v)| k == "action" && ["merged", "moved", "dropped"].contains(&v.as_str())
+            )),
+        "a compaction counted without its action: {seen:?}"
+    );
     assert_eq!(
         node("coordinode_storage_compaction_duration_seconds"),
         total

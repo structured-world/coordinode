@@ -446,8 +446,20 @@ fn compaction_worker_loop(receiver: flume::Receiver<CompactionRequest>, compacte
         };
         match result {
             Ok(result) if result.action != lsm_tree::compaction::CompactionAction::Nothing => {
-                metrics::counter!("coordinode_storage_compaction_total", "partition" => source.name())
-                    .increment(1);
+                // A move rewrites nothing, a merge rewrites its inputs: the
+                // two cost differently, so they are counted apart.
+                let action = match result.action {
+                    lsm_tree::compaction::CompactionAction::Merged => "merged",
+                    lsm_tree::compaction::CompactionAction::Moved => "moved",
+                    lsm_tree::compaction::CompactionAction::Dropped => "dropped",
+                    lsm_tree::compaction::CompactionAction::Nothing => "nothing",
+                };
+                metrics::counter!(
+                    "coordinode_storage_compaction_total",
+                    "partition" => source.name(),
+                    "action" => action
+                )
+                .increment(1);
                 metrics::histogram!(
                     "coordinode_storage_compaction_duration_seconds",
                     "partition" => source.name()
@@ -455,6 +467,7 @@ fn compaction_worker_loop(receiver: flume::Receiver<CompactionRequest>, compacte
                 .record(started.elapsed().as_secs_f64());
                 tracing::debug!(
                     partition = source.name(),
+                    action,
                     ?priority,
                     tables_in = result.tables_in,
                     tables_out = result.tables_out,
