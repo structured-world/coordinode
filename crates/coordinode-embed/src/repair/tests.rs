@@ -225,7 +225,7 @@ fn checkpoint_create_latest_and_prune() {
     let c1 = create_checkpoint(&engine, &root).expect("checkpoint 1");
     let c2 = create_checkpoint(&engine, &root).expect("checkpoint 2");
     assert_ne!(c0, c1);
-    assert_eq!(latest_checkpoint(&root), Some(c2.clone()));
+    assert_eq!(latest_checkpoint(&root).expect("list"), Some(c2.clone()));
 
     // Keep newest 2 → c0 pruned, c1 + c2 remain.
     let removed = prune_checkpoints(&engine, &root, 2).expect("prune");
@@ -233,7 +233,7 @@ fn checkpoint_create_latest_and_prune() {
     assert!(!c0.exists());
     assert!(c1.exists());
     assert!(c2.exists());
-    assert_eq!(latest_checkpoint(&root), Some(c2));
+    assert_eq!(latest_checkpoint(&root).expect("list"), Some(c2));
 }
 
 /// Every file under `dir` with its bytes, by path.
@@ -624,7 +624,9 @@ fn scheduler_starts_and_stops_cleanly() {
     std::thread::sleep(Duration::from_millis(400));
     drop(scheduler); // Drop joins the thread without hanging.
     assert!(
-        latest_checkpoint(&checkpoint_root(dir.path())).is_some(),
+        latest_checkpoint(&checkpoint_root(dir.path()))
+            .expect("list")
+            .is_some(),
         "scheduler should have produced a checkpoint"
     );
 }
@@ -1089,7 +1091,9 @@ fn a_table_rebuild_keeps_the_checkpoints_history() {
     // What the checkpoint's copy itself reads, to tell a wrong copy from a
     // wrong rebuild when the comparison fails.
     let checkpoint_reads = || {
-        let checkpoint = latest_checkpoint(&root).expect("a checkpoint");
+        let checkpoint = latest_checkpoint(&root)
+            .expect("list")
+            .expect("a checkpoint");
         let copy = StorageEngine::open_checkpoint(&checkpoint).expect("open the checkpoint");
         snapshots
             .iter()
@@ -1446,7 +1450,9 @@ fn oplog_purge_keeps_entries_needed_by_checkpoint_replay() {
     engine.persist().expect("persist base");
     create_checkpoint(&engine, &root).expect("checkpoint");
     let cursor = StorageEngine::checkpoint_replay_floor(
-        &latest_checkpoint(&root).expect("checkpoint exists"),
+        &latest_checkpoint(&root)
+            .expect("list")
+            .expect("checkpoint exists"),
     )
     .expect("cursor");
 
@@ -2126,7 +2132,9 @@ fn unscopable_loss_falls_back_to_full_rebuild() {
     // metadata, no coverage, an unknowable loss.
     let node_dir = dir.path().join(Partition::Node.name());
     let tables_dir = node_dir.join("tables");
-    let ckpt = latest_checkpoint(&root).expect("checkpoint exists");
+    let ckpt = latest_checkpoint(&root)
+        .expect("list")
+        .expect("checkpoint exists");
     let mut obliterated = 0usize;
     {
         let ckpt_tables = checkpoint_table_names(&tables_dir, &ckpt);

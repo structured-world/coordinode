@@ -529,6 +529,20 @@ table, or the table was dropped, re-created or altered after the checkpoint.
 The report is then not clean, and the data is restored from an off-device
 backup.
 
+The schema partition is settled before anything else the open reads, since
+it holds where every other partition's files live and the database's own
+records. When it is owed a rebuild (its open repair dropped data, a rebuild
+of it was cut short, or the open's verification of a database with a
+checkpoint finds a corrupt block), the open rebuilds it from the latest
+checkpoint and the journal itself, before the other partitions are
+replayed. The checkpoint is copied for this, never changed. The open fails
+with `SchemaRecoveryRefused` instead, leaving the directory, its checkpoints
+and its journal as they are, when the database's own records in the
+partition cannot be shown intact (a repair dropped data whose range could
+hold them), when the journal after the checkpoint is incomplete, or when the
+checkpoint's copy is itself damaged. Without a checkpoint, a database whose
+own records are intact opens and reports the partition for repair as above.
+
 ## Build features
 
 - **Default (standalone).** No consensus, inter-node transport, listener or

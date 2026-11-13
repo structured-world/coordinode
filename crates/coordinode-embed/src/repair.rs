@@ -24,50 +24,10 @@ use coordinode_core::schema::definition::encode_label_current_revision_key;
 use coordinode_core::txn::wake::Wake;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::engine::rebuild::{Rebuild, RebuildRefusal};
+use coordinode_storage::engine::rebuild::{CHECKPOINT_PREFIX, Rebuild, RebuildRefusal};
+pub use coordinode_storage::engine::rebuild::{checkpoint_root, latest_checkpoint};
 use coordinode_storage::error::{StorageError, StorageResult};
-use coordinode_storage::scrub::{ScrubConfig, scrub_all};
-
-const CKPT_PREFIX: &str = "ckpt-";
-
-/// The conventional checkpoint root under an engine's data directory.
-#[must_use]
-pub fn checkpoint_root(data_dir: &Path) -> PathBuf {
-    data_dir.join("checkpoints")
-}
-
-/// Parse the numeric index from a `ckpt-<n>` directory name.
-fn parse_ckpt_index(path: &Path) -> Option<u64> {
-    path.file_name()?
-        .to_str()?
-        .strip_prefix(CKPT_PREFIX)?
-        .parse()
-        .ok()
-}
-
-/// All checkpoint directories under `root`, ascending by index.
-fn list_checkpoints(root: &Path) -> StorageResult<Vec<(u64, PathBuf)>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| StorageError::Io(format!("read checkpoint root {root:?}: {e}")))?;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if let Some(idx) = parse_ckpt_index(&p) {
-            out.push((idx, p));
-        }
-    }
-    out.sort_by_key(|(idx, _)| *idx);
-    Ok(out)
-}
-
-/// The newest checkpoint directory under `root`, if any.
-#[must_use]
-pub fn latest_checkpoint(root: &Path) -> Option<PathBuf> {
-    list_checkpoints(root).ok()?.pop().map(|(_, p)| p)
-}
+use coordinode_storage::scrub::{ScrubConfig, scrub_all_except};
 
 /// Create a checkpoint (repair base + oplog copy) under `root`, named
 /// `ckpt-<next>` with a monotonic zero-padded index so lexical order = age
@@ -76,11 +36,11 @@ pub fn create_checkpoint(engine: &StorageEngine, root: &Path) -> StorageResult<P
     std::fs::create_dir_all(root)
         .map_err(|e| StorageError::Io(format!("create checkpoint root {root:?}: {e}")))?;
     loop {
-        let next = list_checkpoints(root)?
+        let next = coordinode_storage::engine::rebuild::checkpoint_dirs(root)?
             .last()
             .map(|(idx, _)| idx + 1)
             .unwrap_or(0);
-        let target = root.join(format!("{CKPT_PREFIX}{next:020}"));
+        let target = root.join(format!("{CHECKPOINT_PREFIX}{next:020}"));
         match engine.create_checkpoint(&target) {
             Ok(_) => return Ok(target),
             // A concurrent checkpoint took the name between the listing and
@@ -97,7 +57,7 @@ pub fn create_checkpoint(engine: &StorageEngine, root: &Path) -> StorageResult<P
 /// footprint; files it shared with the live store by hard link stay charged.
 pub fn prune_checkpoints(engine: &StorageEngine, root: &Path, keep: usize) -> StorageResult<usize> {
     let keep = keep.max(1);
-    let all = list_checkpoints(root)?;
+    let all = coordinode_storage::engine::rebuild::checkpoint_dirs(root)?;
     if all.len() <= keep {
         return Ok(0);
     }
@@ -168,7 +128,10 @@ pub fn verify_and_repair(
     engine: &StorageEngine,
     checkpoint_root: &Path,
 ) -> StorageResult<RepairReport> {
-    let scrub = scrub_all(engine, &ScrubConfig::default())?;
+    // The open verified the Schema tree before it read it; a version it has
+    // not changed since is not verified again.
+    let verified = |part: Partition| engine.verified_at_open(part);
+    let scrub = scrub_all_except(engine, &ScrubConfig::default(), verified)?;
     let mut full: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
     // A rebuild cut short by a crash left its tree holding an unknown part of
     // its data; the tree scrubs clean, so only its intent says so.
@@ -216,7 +179,7 @@ pub fn verify_and_repair(
         });
     }
 
-    let Some(checkpoint) = latest_checkpoint(checkpoint_root) else {
+    let Some(checkpoint) = latest_checkpoint(checkpoint_root)? else {
         tracing::error!(
             ?corrupt,
             ?corrupt_tables,
@@ -291,7 +254,7 @@ pub fn verify_and_repair(
         }
     }
 
-    let after = scrub_all(engine, &ScrubConfig::default())?;
+    let after = scrub_all_except(engine, &ScrubConfig::default(), verified)?;
     Ok(RepairReport {
         corrupt_partitions: corrupt,
         repaired,
@@ -376,15 +339,17 @@ impl CheckpointScheduler {
                         // The repair floor: keep every entry the latest
                         // checkpoint's trees may lack so a rebuild can always
                         // roll forward from that base.
-                        let keep_from = match latest_checkpoint(&root)
-                            .map(|c| StorageEngine::checkpoint_replay_floor(&c))
-                        {
-                            Some(Ok(floor)) => floor,
-                            Some(Err(e)) => {
+                        let keep_from = match latest_checkpoint(&root).and_then(|latest| {
+                            latest
+                                .map(|c| StorageEngine::checkpoint_replay_floor(&c))
+                                .transpose()
+                        }) {
+                            Ok(Some(floor)) => floor,
+                            Err(e) => {
                                 tracing::warn!(error = %e, "checkpoint replay floor unreadable; skipping oplog purge");
                                 continue;
                             }
-                            None => u64::MAX,
+                            Ok(None) => u64::MAX,
                         };
                         if let Err(e) = engine.oplog_purge_expired(now, keep_from) {
                             tracing::warn!(error = %e, "oplog purge failed");

@@ -958,8 +958,9 @@ impl Database {
             let root = crate::repair::checkpoint_root(engine.data_dir());
             // The journal keeps what a rebuild from the newest checkpoint
             // replays; a floor that cannot be read keeps the whole journal.
-            if let Some(latest) = crate::repair::latest_checkpoint(&root) {
-                let floor = StorageEngine::checkpoint_replay_floor(&latest).unwrap_or_else(|e| {
+            let latest = crate::repair::latest_checkpoint(&root)?;
+            if let Some(latest) = &latest {
+                let floor = StorageEngine::checkpoint_replay_floor(latest).unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "checkpoint replay floor unreadable; keeping the journal");
                     0
                 });
@@ -967,7 +968,7 @@ impl Database {
             }
             // An interrupted rebuild is repaired, or reported, even when its
             // checkpoint has gone since.
-            if crate::repair::latest_checkpoint(&root).is_some()
+            if latest.is_some()
                 || !engine.pending_rebuilds()?.is_empty()
                 || !engine.pending_table_rebuilds()?.is_empty()
             {

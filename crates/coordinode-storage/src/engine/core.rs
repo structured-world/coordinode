@@ -225,6 +225,9 @@ pub struct StorageEngine {
     /// How the trees sync their files: under a barrier a flush is ordered,
     /// and durable once the device caches are flushed.
     tree_sync: lsm_tree::fs::SyncMode,
+    /// The version of the Schema tree whose blocks the open verified before
+    /// it read the tree, when it did.
+    schema_verified: Option<u64>,
     /// The budget every compaction of every tree and the scrub read and
     /// write under, retuned live (see [`Self::set_maintenance_rate`]).
     maintenance: Arc<lsm_tree::rate_limiter::RateLimiter>,
@@ -1100,7 +1103,7 @@ impl StorageEngine {
             .compaction_rate_limiter(Arc::clone(&maintenance))
             .compaction_capacity(Arc::clone(&capacity_pool));
         let (schema_tree, schema_repair) = schema_config.open_or_repair(repair_policy)?;
-        if let Some(report) = schema_repair {
+        let schema_repair = schema_repair.map(|report| {
             tracing::warn!(
                 partition = Partition::Schema.name(),
                 recovered = report.recovered,
@@ -1108,12 +1111,12 @@ impl StorageEngine {
                 scope = ?report.wal_replay_scope(),
                 "partition tree structurally repaired at open"
             );
-            open_repairs.push(OpenRepair {
+            OpenRepair {
                 partition: Partition::Schema,
                 replay_scope: report.wal_replay_scope(),
                 report,
-            });
-        }
+            }
+        });
         trees.insert(Partition::Schema, schema_tree.clone());
         schema_probe
             .set(schema_tree.downgrade())
@@ -1135,6 +1138,23 @@ impl StorageEngine {
             if let Some(first_servable) = schema_tree.retention_floor().checked_add(1) {
                 seqno.fetch_max(first_servable);
             }
+        }
+        // Nothing reads the Schema tree as an answer until its own records
+        // are proved; a rebuild it is owed runs once the journal is read.
+        let settled = schema_bootstrap::Bootstrap {
+            config,
+            schema: &schema_tree,
+            repair: schema_repair.as_ref(),
+            seqno: &seqno,
+            journaled: journal_config.is_some() && config.select_oplog_endpoint(0).is_ok(),
+            maintenance: &maintenance,
+        }
+        .settle()?;
+        let schema_verified = settled.verified;
+        let mut schema_rebuild = settled.rebuild;
+        let mut schema_rebuilt = false;
+        {
+            use lsm_tree::AbstractTree;
             // A store of the layout that kept the ledger among the Schema
             // rows is refused before anything here writes to it.
             refuse_earlier_closure_layout(&schema_tree, seqno.get())?;
@@ -1278,6 +1298,9 @@ impl StorageEngine {
                         footprints.clone(),
                     )?;
                     let entries = journal.read_all()?;
+                    // A rebuild owed already keeps its intent as it is: the
+                    // Schema tree's holds the records the rebuild puts back.
+                    let owed = read_rebuild_intents(config.data_dir())?.partitions;
                     let mut covered: HashMap<Partition, TreeCoverage> =
                         HashMap::with_capacity(trees.len());
                     for (&part, tree) in &trees {
@@ -1296,10 +1319,12 @@ impl StorageEngine {
                                     "a partition's journal coverage record is damaged; the \
                                      partition is rebuilt from the latest checkpoint"
                                 );
-                                write_rebuild_intent(
-                                    config.data_dir(),
-                                    RebuildTarget::Partition(part),
-                                )?;
+                                if !owed.contains(&part) {
+                                    write_rebuild_intent(
+                                        config.data_dir(),
+                                        RebuildTarget::Partition(part),
+                                    )?;
+                                }
                             }
                             Err(e) => return Err(e),
                         }
@@ -1343,6 +1368,26 @@ impl StorageEngine {
                             .max()
                             .unwrap_or(0),
                     );
+                    // The Schema tree's rebuild, before the replay: every
+                    // entry below this index is applied, as the journal and
+                    // every other tree say, and the rebuilt tree holds them
+                    // all. The replay below leaves the tree to it.
+                    if let Some(rebuild) = schema_rebuild.take() {
+                        rebuild.run(schema_bootstrap::RebuildInputs {
+                            config,
+                            schema: crate::engine::local_journal::tree_of(
+                                &trees,
+                                Partition::Schema,
+                            )?,
+                            repair: schema_repair.as_ref(),
+                            seqno: &seqno,
+                            footprints: &footprints,
+                            repair_policy,
+                            entries: &entries,
+                            next: journal.next_index(),
+                        })?;
+                        schema_rebuilt = true;
+                    }
                     let mut replayed = 0usize;
                     let replay_heads = crate::engine::material::Heads::read(
                         crate::engine::local_journal::tree_of(&trees, Partition::Accounting)?,
@@ -1439,6 +1484,12 @@ impl StorageEngine {
             },
             None => None,
         };
+        // A rebuilt Schema tree's repair is met; any other stays owed.
+        if let Some(repair) = schema_repair
+            && !schema_rebuilt
+        {
+            open_repairs.push(repair);
+        }
 
         // ── Member-local journal: open + crash recovery ─────────────────────
         // A store whose log is a consensus log keeps this member's own records
@@ -1883,6 +1934,7 @@ impl StorageEngine {
             data_dir: config.data_dir().to_path_buf(),
             fs,
             tree_sync: config.oplog_sync_method.tree_sync_mode(),
+            schema_verified,
             maintenance,
             write_slowdown,
             compaction_wake,
@@ -3493,32 +3545,31 @@ impl StorageEngine {
         let source_floor = source.retention_floor();
         // The copy's entries are stored under its own installations.
         let source_bindings = ckpt.installations_of(partition).map(|i| i.current());
-        // This node's own records (its consensus state) are newer in the live
-        // store than in any checkpoint and are not taken back from it, unless
-        // the live store cannot give them.
-        let checkpoint_local = ckpt.node_local_rows(partition)?;
 
         // The clear below removes this node's own records with the rest of
         // the tree, so they are read first and put back after the base. A
-        // live tree that cannot give them (the corruption reaches them) gives
-        // way to the checkpoint's copy, the newest one left, except for the
-        // consensus state (vote, log): an older vote would let this node vote
-        // twice in one term, so none is reinstated.
+        // checkpoint's copy of them is no proof of what they are now (a route
+        // or a member record changed since), so a live tree that cannot give
+        // them leaves the rebuild refused. The consensus state (vote, log) is
+        // not taken back from an older copy either: an older vote would let
+        // this node vote twice in one term, so none is reinstated.
         let local = match self.node_local_rows(partition) {
             Ok(local) => local,
-            Err(e) => {
-                let reinstated = partition != Partition::Raft;
+            Err(e) if partition == Partition::Raft => {
                 tracing::warn!(
                     partition = partition.name(),
                     error = %e,
-                    reinstated,
+                    "this node's consensus records could not be read from the damaged tree"
+                );
+                Rows::new()
+            }
+            Err(e) => {
+                tracing::error!(
+                    partition = partition.name(),
+                    error = %e,
                     "this node's own records could not be read from the damaged tree"
                 );
-                if reinstated {
-                    checkpoint_local
-                } else {
-                    Rows::new()
-                }
+                return Ok(Rebuild::Refused(RebuildRefusal::LocalStateLost));
             }
         };
 
@@ -3527,8 +3578,8 @@ impl StorageEngine {
         //    blocks; a range tombstone here would leave them to a compaction
         //    that re-reads the corrupt block we are repairing and aborts with a
         //    ChecksumMismatch. The clear is on disk at once while the rebuilt
-        //    data is not, so the intent goes first.
-        let repair = self.begin_rebuild(partition)?;
+        //    data is not, so the intent goes first, with the records kept.
+        let repair = self.begin_rebuild_keeping(partition, &local)?;
         self.clear_partition_tree(partition, self.tree(partition)?)?;
         let mut versions = 0;
         // The copy's own records are not taken: they also count versions
@@ -4000,6 +4051,21 @@ impl StorageEngine {
         Ok(read_rebuild_intents(&self.data_dir)?.partitions)
     }
 
+    /// Whether the open verified every block of `partition`'s tree, before
+    /// it read it, at the version the tree still has: a verification now
+    /// would read the same blocks for the same answer. Only the Schema tree
+    /// is verified that early, where the open goes on to verify the trees a
+    /// checkpoint backs.
+    #[must_use]
+    pub fn verified_at_open(&self, partition: Partition) -> bool {
+        use lsm_tree::AbstractTree as _;
+        partition == Partition::Schema
+            && self.schema_verified.is_some_and(|version| {
+                self.tree(partition)
+                    .is_ok_and(|tree| tree.current_version().id() == version)
+            })
+    }
+
     /// Whether a rebuild left some accounting incomplete: an accounted
     /// partition's or the accounting tree's rebuild started and did not
     /// finish. A scope's recount is done before the open hands the store out
@@ -4035,6 +4101,32 @@ impl StorageEngine {
         let active = self.enter_repair(partition)?;
         write_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))?;
         Ok(active)
+    }
+
+    /// [`Self::begin_rebuild`] for a rebuild that puts `kept`, the tree's own
+    /// records read before its clear, back after it: the intent holds them,
+    /// so an open after a crash in between still has them.
+    fn begin_rebuild_keeping(
+        &self,
+        partition: Partition,
+        kept: &Rows,
+    ) -> StorageResult<PartitionRepair<'_>> {
+        let active = self.enter_repair(partition)?;
+        self.record_kept(partition, kept)?;
+        Ok(active)
+    }
+
+    /// Write the rebuild intent of `partition`, under a repair taken, with
+    /// the records of its own `kept` that the rebuild puts back after its
+    /// clear. Only the Schema tree has such records outside the consensus
+    /// partition, which no copy rebuilds.
+    fn record_kept(&self, partition: Partition, kept: &Rows) -> StorageResult<()> {
+        let kept = if partition == Partition::Schema {
+            encode_kept_rows(kept)?
+        } else {
+            Vec::new()
+        };
+        write_rebuild_intent_with(&self.data_dir, RebuildTarget::Partition(partition), &kept)
     }
 
     /// Take the repair of `partition` and mark it under repair, so no
@@ -6350,9 +6442,21 @@ impl StorageEngine {
         tree: &lsm_tree::AnyTree,
         cleared: impl FnOnce() -> StorageResult<()>,
     ) -> StorageResult<()> {
-        let repair = self.begin_rebuild(part)?;
+        // The Schema tree's own records (its routes, its member records) are
+        // the store's, not the partition's data: read under the repair, kept
+        // in its intent, and put back after the clear.
+        let repair = self.enter_repair(part)?;
+        let kept = if part == Partition::Schema {
+            self.node_local_rows(part)?
+        } else {
+            Rows::new()
+        };
+        self.record_kept(part, &kept)?;
         self.clear_partition_tree(part, tree)?;
         cleared()?;
+        for (key, value) in &kept {
+            self.put(part, key, value)?;
+        }
         self.finish_rebuild(repair)
     }
 
@@ -9101,6 +9205,18 @@ impl RebuildTarget<'_> {
 /// Record, durably, that `target` of the store at `data_dir` holds an
 /// unknown part of its data and of its coverage record, and must be rebuilt.
 fn write_rebuild_intent(data_dir: &Path, target: RebuildTarget<'_>) -> StorageResult<()> {
+    write_rebuild_intent_with(data_dir, target, &[])
+}
+
+/// [`write_rebuild_intent`] holding `kept`: what the rebuild keeps of the
+/// tree it clears, durable before the clear, so a rebuild cut short after
+/// it still has them.
+fn write_rebuild_intent_with(
+    data_dir: &Path,
+    target: RebuildTarget<'_>,
+    kept: &[u8],
+) -> StorageResult<()> {
+    use std::io::Write as _;
     let dir = data_dir.join(REBUILD_INTENT_DIR);
     let name = target.file_name();
     let io = |what: &str, e: std::io::Error| {
@@ -9108,10 +9224,38 @@ fn write_rebuild_intent(data_dir: &Path, target: RebuildTarget<'_>) -> StorageRe
     };
     // no-std: StoragePort trait, caller-injected
     std::fs::create_dir_all(&dir).map_err(|e| io("create dir", e))?;
-    let file = std::fs::File::create(dir.join(&name)).map_err(|e| io("create", e))?;
+    let mut file = std::fs::File::create(dir.join(&name)).map_err(|e| io("create", e))?;
+    file.write_all(kept).map_err(|e| io("write", e))?;
     file.sync_all().map_err(|e| io("sync", e))?;
     sync_dir(&dir)?;
     sync_dir(data_dir)
+}
+
+/// The Schema tree's own records its pending rebuild keeps
+/// ([`write_rebuild_intent_with`]): `None` when no rebuild of it is pending,
+/// or its intent holds none to prove them by.
+fn read_kept_rows(data_dir: &Path) -> StorageResult<Option<Rows>> {
+    let path = data_dir
+        .join(REBUILD_INTENT_DIR)
+        .join(RebuildTarget::Partition(Partition::Schema).file_name());
+    // no-std: StoragePort trait, caller-injected
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(StorageError::Io(format!("read {path:?}: {e}"))),
+    };
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    rmp_serde::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| StorageError::Io(format!("decode the records kept in {path:?}: {e}")))
+}
+
+/// `kept` as a rebuild intent holds them.
+fn encode_kept_rows(kept: &Rows) -> StorageResult<Vec<u8>> {
+    rmp_serde::to_vec(kept)
+        .map_err(|e| StorageError::Io(format!("encode the records a rebuild keeps: {e}")))
 }
 
 /// Drop the rebuild intent of `target`, its rebuilt tree on disk.
@@ -9207,10 +9351,13 @@ fn apply_columnar_row(
 
 mod material_fold;
 mod raft_coverage;
+mod schema_bootstrap;
 pub use raft_coverage::{
     PartitionCopy, RaftApplyFence, RaftApplyState, RaftCoverage, RaftHeld, RaftPosition,
     is_node_local,
 };
+#[cfg(any(test, feature = "test-faults"))]
+pub use schema_bootstrap::CUT_AFTER_CLEAR as SCHEMA_REBUILD_CUT_AFTER_CLEAR;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
@@ -9247,6 +9394,10 @@ mod accounting_placement_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod closure_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod schema_bootstrap_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]

@@ -174,6 +174,22 @@ pub fn scrub_partition(
 /// [`StorageError`](crate::error::StorageError) if a partition's tree handle
 /// cannot be resolved.
 pub fn scrub_all(engine: &StorageEngine, config: &ScrubConfig) -> StorageResult<ScrubReport> {
+    scrub_all_except(engine, config, |_| false)
+}
+
+/// [`scrub_all`] leaving out each partition `verified` names: one whose
+/// blocks were verified at the version it still has, so a second pass would
+/// read the same blocks for the same answer. A left-out partition counts
+/// no blocks.
+///
+/// # Errors
+/// [`StorageError`](crate::error::StorageError) if a partition's tree handle
+/// cannot be resolved.
+pub fn scrub_all_except(
+    engine: &StorageEngine,
+    config: &ScrubConfig,
+    verified: impl Fn(Partition) -> bool,
+) -> StorageResult<ScrubReport> {
     let start = Instant::now();
     let mut blocks_checked: u64 = 0;
     let mut sst_files_checked: u64 = 0;
@@ -181,6 +197,10 @@ pub fn scrub_all(engine: &StorageEngine, config: &ScrubConfig) -> StorageResult<
     let mut partition_counts = Vec::with_capacity(Partition::all().len());
 
     for &part in Partition::all() {
+        if verified(part) {
+            partition_counts.push((part, 0));
+            continue;
+        }
         let (blocks, ssts, mut errors) = scrub_partition(engine, part, config)?;
         blocks_checked += blocks;
         sst_files_checked += ssts;

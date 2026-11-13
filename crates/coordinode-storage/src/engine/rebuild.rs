@@ -6,13 +6,68 @@
 //! checkpoint and the journal cannot prove the tree's state, the rebuild is
 //! refused and the tree is left as it was.
 
+use std::path::{Path, PathBuf};
+
 use lsm_tree::{AbstractTree as _, AnyTree, ScanSinceEvent};
 
 use crate::engine::coverage::TreeCoverage;
 use crate::engine::oplog_journal::op_partition;
 use crate::engine::partition::Partition;
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp};
+
+/// The name of a checkpoint directory is its index behind this prefix,
+/// zero-padded, so name order is age order.
+pub const CHECKPOINT_PREFIX: &str = "ckpt-";
+
+/// Where a store under `data_dir` keeps its checkpoints: the bases a rebuild
+/// starts from, at the store's open as later.
+#[must_use]
+pub fn checkpoint_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("checkpoints")
+}
+
+/// The checkpoint directories under `root`, oldest first, with their index.
+///
+/// # Errors
+///
+/// `root` exists and cannot be listed.
+pub fn checkpoint_dirs(root: &Path) -> StorageResult<Vec<(u64, PathBuf)>> {
+    // no-std: StoragePort trait, caller-injected
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(StorageError::Io(format!(
+                "read checkpoint root {root:?}: {e}"
+            )));
+        }
+    };
+    let mut dirs: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let index = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix(CHECKPOINT_PREFIX)?
+                .parse()
+                .ok()?;
+            Some((index, path))
+        })
+        .collect();
+    dirs.sort_by_key(|(index, _)| *index);
+    Ok(dirs)
+}
+
+/// The newest checkpoint under `root`, if any.
+///
+/// # Errors
+///
+/// `root` exists and cannot be listed.
+pub fn latest_checkpoint(root: &Path) -> StorageResult<Option<PathBuf>> {
+    Ok(checkpoint_dirs(root)?.pop().map(|(_, path)| path))
+}
 
 /// The outcome of rebuilding a partition or a `STORAGE COLUMNAR` table from a
 /// checkpoint plus the journal.
@@ -57,6 +112,10 @@ pub enum RebuildRefusal {
         /// The first entry changing it.
         index: u64,
     },
+    /// The records this member keeps of its own in the tree (its routes,
+    /// its consensus state, its closure ledger) were lost, or cannot be
+    /// shown intact, and nothing else holds them.
+    LocalStateLost,
 }
 
 impl core::fmt::Display for RebuildRefusal {
@@ -74,6 +133,10 @@ impl core::fmt::Display for RebuildRefusal {
             Self::CatalogChanged { index } => write!(
                 f,
                 "journal entry {index} changes the table's catalog entry after the checkpoint"
+            ),
+            Self::LocalStateLost => f.write_str(
+                "the member's own records in the tree cannot be shown intact and nothing else \
+                 holds them",
             ),
         }
     }

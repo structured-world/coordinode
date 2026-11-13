@@ -566,12 +566,7 @@ impl StorageEngine {
         // The repair is taken before anything changes: a second repair of the
         // partition is refused with the index transfer status and the tree
         // as they were.
-        let repair = self.begin_rebuild(partition)?;
-        // The copies the index tree receives are qualified only by the
-        // inventory the transfer brings, taken once they are in place.
-        if partition == Partition::Idx {
-            self.begin_index_transfer()?;
-        }
+        let repair = self.enter_repair(partition)?;
         // Read before anything is cleared, under the repair: no other repair
         // moves them meanwhile, and a failure leaves the tree as it was. Only
         // their prefixes are read: a partition repaired because a table of it
@@ -585,6 +580,14 @@ impl StorageEngine {
                     .into_iter()
                     .map(|(key, value)| (key, value.to_vec())),
             );
+        }
+        // Durable with the intent, before the clear: a crash after it leaves
+        // them in the intent, not only in a memtable.
+        self.record_kept(partition, &keep)?;
+        // The copies the index tree receives are qualified only by the
+        // inventory the transfer brings, taken once they are in place.
+        if partition == Partition::Idx {
+            self.begin_index_transfer()?;
         }
         self.clear_partition_tree(partition, self.tree(partition)?)?;
         for (key, value) in &keep {

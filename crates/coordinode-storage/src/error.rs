@@ -309,6 +309,14 @@ pub enum StorageError {
         enrolled: coordinode_core::group::DeploymentId,
     },
 
+    /// The Schema tree the open reads first (the routes of every other tree,
+    /// the closure ledger, the member's own records) cannot be shown to hold
+    /// the store's state, and nothing at hand rebuilds it. Nothing was read
+    /// from it as an answer and nothing was initialised; the store, its
+    /// checkpoints and its journal are left as they are.
+    #[error("the Schema partition cannot be qualified for the open: {0}")]
+    SchemaRecoveryRefused(crate::engine::rebuild::RebuildRefusal),
+
     /// A decision ending a state consumer held the store's writes past the
     /// wait: nothing was written; retry once it is ordered.
     #[error("a consumer's ending is being ordered and held this write past its wait; retry")]
