@@ -20,7 +20,7 @@ use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::engine_hold::engine_holders;
 use coordinode_raft::read_fence::STORED_CEILING_READS;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_storage::engine::core::{StorageEngine, breakpoint_read_gate};
+use coordinode_storage::engine::core::{CommitCeiling, StorageEngine, breakpoint_read_gate};
 
 /// More positions than the ledger keeps in memory, each raising the commit
 /// ceiling, so the first ones are answered from their stored records.
@@ -97,6 +97,18 @@ async fn member() -> (
         written.push((node.applied_index(), ts));
     }
     engine.persist().expect("persist the ledger");
+    // Every case reads the first position from its stored record: it must
+    // not be among the breakpoints memory answers.
+    let first = written[0].0;
+    let answered = engine.commit_ceiling_at(first).expect("ceiling");
+    assert!(
+        matches!(answered, CommitCeiling::Stored(_)),
+        "position {first} is answered from memory ({answered:?}); positions {:?}..{:?}, \
+         {:?} records held",
+        written.first(),
+        written.last(),
+        engine.closure_records_held()
+    );
     (dir, engine, node, written)
 }
 

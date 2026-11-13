@@ -244,11 +244,13 @@ fn limited_config(
     limit_mb: u64,
 ) -> std::path::PathBuf {
     let path = dir.join(format!("restore-{limit_mb}.yaml"));
+    // Single-quoted: a backslash in a Windows path is no escape there, and a
+    // quote is doubled (YAML 1.2, 7.3.2).
     std::fs::write(
         &path,
         format!(
-            "data_dir: \"{}\"\nquery_memory_limit_mb: {limit_mb}\n",
-            data.display()
+            "data_dir: '{}'\nquery_memory_limit_mb: {limit_mb}\n",
+            data.display().to_string().replace('\'', "''")
         ),
     )
     .expect("write config");

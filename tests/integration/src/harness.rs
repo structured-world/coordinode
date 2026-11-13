@@ -1158,17 +1158,22 @@ pub fn binary_path() -> PathBuf {
     if bin.exists() {
         return bin;
     }
-    if let Some(target) = profile.parent() {
-        let release = target.join("release").join(&name);
-        if release.exists() {
-            return release;
-        }
+    let release = profile
+        .parent()
+        .map(|target| target.join("release").join(&name));
+    if let Some(release) = &release
+        && release.exists()
+    {
+        return release.clone();
     }
 
     panic!(
-        "coordinode binary not found.\n\
+        "coordinode binary not found at {} or {:?} (test binary {}).\n\
          Build it first: cargo build -p coordinode-server\n\
-         Or set COORDINODE_BIN=/path/to/coordinode"
+         Or set COORDINODE_BIN=/path/to/coordinode",
+        bin.display(),
+        release,
+        exe.display()
     );
 }
 
