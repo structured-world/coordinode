@@ -20,7 +20,11 @@ use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::engine_hold::engine_holders;
 use coordinode_raft::read_fence::STORED_CEILING_READS;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_storage::engine::coordinator::SnapshotPin;
 use coordinode_storage::engine::core::{CommitCeiling, StorageEngine, breakpoint_read_gate};
+
+/// The read [`member`] holds from before its commits.
+type Reader = Option<SnapshotPin>;
 
 /// More positions than the ledger keeps in memory, each raising the commit
 /// ceiling, so the first ones are answered from their stored records.
@@ -51,6 +55,7 @@ async fn member() -> (
     Arc<StorageEngine>,
     RaftNode,
     Vec<(u64, u64)>,
+    Reader,
 ) {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = Arc::new(
@@ -73,6 +78,11 @@ async fn member() -> (
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(node.is_leader().await, "a single node never became leader");
+    // A read the store still serves from before the commits: while it is
+    // held, the ledger keeps every prefix it can tell apart, so the first
+    // positions stay stored breakpoints however soon maintenance moves the
+    // collection floor (otherwise it may fold them into its anchor first).
+    let reader = engine.pin_latest_snapshot().1;
     let ids = ProposalIdGenerator::new();
     let base = now_us();
     let mut written = Vec::new();
@@ -109,7 +119,7 @@ async fn member() -> (
         written.last(),
         engine.closure_records_held()
     );
-    (dir, engine, node, written)
+    (dir, engine, node, written, reader)
 }
 
 /// `count` causal reads of position `index`, each given up after 20 ms.
@@ -173,7 +183,7 @@ fn ceiling_holds(engine: &Arc<StorageEngine>) -> usize {
 /// place, so the reads after it get the places left, and none past them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_cold_ceiling_read_ends_at_once_and_keeps_its_place() {
-    let (_dir, _engine, node, written) = member().await;
+    let (_dir, _engine, node, written, _reader) = member().await;
     let (cold, ceiling) = written[0];
     let history = node.read_fence().history().expect("history");
 
@@ -245,7 +255,7 @@ async fn a_cancelled_cold_ceiling_read_ends_at_once_and_keeps_its_place() {
 /// answers; then all of them let go.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_shutdown_waits_out_stalled_ceiling_reads_only_to_its_drain() {
-    let (_dir, engine, node, written) = member().await;
+    let (_dir, engine, node, written, _reader) = member().await;
     let (cold, _) = written[0];
     let history = node.read_fence().history().expect("history");
 
@@ -301,7 +311,7 @@ async fn a_shutdown_waits_out_stalled_ceiling_reads_only_to_its_drain() {
 /// exact commit.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stalled_cold_ceiling_holds_up_neither_the_runtime_nor_the_deadline() {
-    let (_dir, engine, node, written) = member().await;
+    let (_dir, engine, node, written, _reader) = member().await;
     let (position, ceiling) = written[0];
     assert_eq!(
         engine.commit_ceiling_through(position).expect("ceiling"),
@@ -362,7 +372,7 @@ async fn a_stalled_cold_ceiling_holds_up_neither_the_runtime_nor_the_deadline() 
 /// given up again and again leave a bounded number of reads behind.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stalled_cold_ceiling_holds_up_no_apply_and_leaves_bounded_reads() {
-    let (_dir, _engine, node, written) = member().await;
+    let (_dir, _engine, node, written, _reader) = member().await;
     let (cold, ceiling) = written[0];
     let (hot, hot_ceiling) = *written.last().expect("a hot position");
     let mut fence = node.read_fence();

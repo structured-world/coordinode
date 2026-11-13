@@ -1134,11 +1134,13 @@ async fn reap(child: &mut Child) {
 /// Return the path to the `coordinode` binary.
 ///
 /// Uses `COORDINODE_BIN` env var first (CI / explicit override), then the
-/// build next to this test binary, then the release build of the same target
-/// directory.
+/// build in the nearest directory above this test binary that holds one (its
+/// profile directory, whatever `CARGO_TARGET_DIR` points at), then the
+/// release build beside such a directory.
 ///
-/// The test binary lives at `<target>/<profile>/deps/<test>`, so its profile
-/// directory holds the server build whatever `CARGO_TARGET_DIR` points at.
+/// The test binary sits somewhere under `<target>/<profile>/`: in `deps/`, or
+/// in a build script's `out/` directory, as on some runners. Walking up finds
+/// the profile directory either way.
 ///
 /// Exposed `pub` so integration tests can directly `Command::new(binary_path())`
 /// for non-standard startup scenarios (e.g. checking `--mode=compute` is rejected).
@@ -1149,30 +1151,22 @@ pub fn binary_path() -> PathBuf {
 
     let name = format!("coordinode{}", std::env::consts::EXE_SUFFIX);
     let exe = std::env::current_exe().expect("test binary path");
-    let profile = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .expect("test binary sits in <target>/<profile>/deps");
-
-    let bin = profile.join(&name);
-    if bin.exists() {
+    let above = || exe.ancestors().skip(1);
+    if let Some(bin) = above().map(|dir| dir.join(&name)).find(|bin| bin.exists()) {
         return bin;
     }
-    let release = profile
-        .parent()
-        .map(|target| target.join("release").join(&name));
-    if let Some(release) = &release
-        && release.exists()
+    if let Some(bin) = above()
+        .map(|dir| dir.join("release").join(&name))
+        .find(|bin| bin.exists())
     {
-        return release.clone();
+        return bin;
     }
 
     panic!(
-        "coordinode binary not found at {} or {:?} (test binary {}).\n\
+        "coordinode binary not found in any directory above the test binary {}, \
+         nor in a release directory beside one.\n\
          Build it first: cargo build -p coordinode-server\n\
          Or set COORDINODE_BIN=/path/to/coordinode",
-        bin.display(),
-        release,
         exe.display()
     );
 }
