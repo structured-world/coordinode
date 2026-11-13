@@ -49,7 +49,7 @@ pub const READ_FENCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The reads of stored commit ceilings a member runs at once. A read is of
 /// one small record; more than a few at once means the disk is not
 /// answering, and more of them would only pile up behind it.
-const STORED_CEILING_READS: usize = 4;
+pub const STORED_CEILING_READS: usize = 4;
 
 /// Where a member's read fences read the commit ceilings the store keeps on
 /// disk: on a blocking thread, a few at a time. A read whose fence stopped

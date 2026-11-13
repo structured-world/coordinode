@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
-use coordinode_core::txn::read_concern::HistoryPosition;
+use coordinode_core::txn::read_concern::{HistoryId, HistoryPosition};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::engine_hold::engine_holders;
+use coordinode_raft::read_fence::STORED_CEILING_READS;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::{StorageEngine, breakpoint_read_gate};
 
@@ -96,6 +98,189 @@ async fn member() -> (
     }
     engine.persist().expect("persist the ledger");
     (dir, engine, node, written)
+}
+
+/// `count` causal reads of position `index`, each given up after 20 ms.
+async fn give_up_reads(
+    fence: &mut coordinode_raft::read_fence::ReadFence,
+    history: HistoryId,
+    index: u64,
+    count: usize,
+) {
+    for _ in 0..count {
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(20),
+            fence.await_causal(None, Some(HistoryPosition { history, index }), None),
+        )
+        .await;
+        assert!(gave_up.is_err(), "a stalled read answered: {gave_up:?}");
+    }
+}
+
+/// The reads stopped on the stalled record once `expected` of them reached
+/// it, or after a second: the reads given a place reach the record on
+/// blocking threads, a moment after their fences gave up.
+async fn stalled_reads(expected: usize) -> usize {
+    let started = Instant::now();
+    while breakpoint_read_gate::waiting() < expected && started.elapsed() < Duration::from_secs(1) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // A read past the bound would arrive in the same moment.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    breakpoint_read_gate::waiting()
+}
+
+/// The disk stopped answering stored ceiling reads until this is dropped: a
+/// failed assertion lets the stalled reads go too, so the test runtime's
+/// shutdown, which waits for its blocking threads, fails instead of hanging.
+struct Stall;
+
+impl Stall {
+    fn hold() -> Self {
+        breakpoint_read_gate::hold();
+        Self
+    }
+}
+
+impl Drop for Stall {
+    fn drop(&mut self) {
+        breakpoint_read_gate::release();
+    }
+}
+
+/// The stored ceiling reads still holding the engine.
+fn ceiling_holds(engine: &Arc<StorageEngine>) -> usize {
+    engine_holders(engine)
+        .into_iter()
+        .filter(|name| *name == "stored ceiling read")
+        .count()
+}
+
+/// A fence cancelled outright (its task aborted, no deadline) while its
+/// read is stalled ends at once; the read it started runs on, holding its
+/// place, so the reads after it get the places left, and none past them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_cold_ceiling_read_ends_at_once_and_keeps_its_place() {
+    let (_dir, _engine, node, written) = member().await;
+    let (cold, ceiling) = written[0];
+    let history = node.read_fence().history().expect("history");
+
+    let stall = Stall::hold();
+    let reader = tokio::spawn({
+        let mut fence = node.read_fence();
+        async move {
+            fence
+                .await_causal(
+                    None,
+                    Some(HistoryPosition {
+                        history,
+                        index: cold,
+                    }),
+                    None,
+                )
+                .await
+        }
+    });
+    assert_eq!(
+        stalled_reads(1).await,
+        1,
+        "the read never reached the record"
+    );
+    let cancelled = Instant::now();
+    reader.abort();
+    let ended = tokio::time::timeout(Duration::from_secs(1), reader).await;
+    assert!(
+        matches!(&ended, Ok(Err(e)) if e.is_cancelled()),
+        "the cancelled read did not end: {ended:?}"
+    );
+    assert!(
+        cancelled.elapsed() < Duration::from_millis(500),
+        "the cancellation waited on the stalled record: {:?}",
+        cancelled.elapsed()
+    );
+    assert_eq!(
+        breakpoint_read_gate::waiting(),
+        1,
+        "the cancelled fence's read stopped with it"
+    );
+
+    let mut fence = node.read_fence();
+    give_up_reads(&mut fence, history, cold, 16).await;
+    assert_eq!(
+        stalled_reads(STORED_CEILING_READS).await,
+        STORED_CEILING_READS,
+        "the cancelled read's place was given to another"
+    );
+
+    drop(stall);
+    let bound = fence
+        .await_causal(
+            None,
+            Some(HistoryPosition {
+                history,
+                index: cold,
+            }),
+            None,
+        )
+        .await
+        .expect("met once the record answers");
+    assert_eq!(bound, Some(ceiling), "the prefix's exact commit");
+}
+
+/// A member shut down while its disk stops answering stored ceiling reads:
+/// the shutdown is not held up past its drain, and each read stalled keeps
+/// its place, its engine work and its hold of the engine until the disk
+/// answers; then all of them let go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shutdown_waits_out_stalled_ceiling_reads_only_to_its_drain() {
+    let (_dir, engine, node, written) = member().await;
+    let (cold, _) = written[0];
+    let history = node.read_fence().history().expect("history");
+
+    let stall = Stall::hold();
+    {
+        let mut fence = node.read_fence();
+        give_up_reads(&mut fence, history, cold, 16).await;
+    }
+    assert_eq!(
+        stalled_reads(STORED_CEILING_READS).await,
+        STORED_CEILING_READS
+    );
+    assert_eq!(ceiling_holds(&engine), STORED_CEILING_READS);
+
+    let drain = Duration::from_millis(300);
+    node.set_work_drain(drain);
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(10), node.shutdown())
+        .await
+        .expect("the shutdown waited on the stalled reads")
+        .expect("shutdown");
+    assert!(
+        started.elapsed() >= drain,
+        "the shutdown did not wait for the reads' work: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        breakpoint_read_gate::waiting(),
+        STORED_CEILING_READS,
+        "a stalled read was cut off"
+    );
+    assert_eq!(
+        ceiling_holds(&engine),
+        STORED_CEILING_READS,
+        "a stalled read let go of the engine before its read ended"
+    );
+
+    drop(stall);
+    tokio::time::timeout(Duration::from_secs(5), node.consensus_work_released())
+        .await
+        .expect("the reads' work outlived the disk's answer");
+    assert_eq!(breakpoint_read_gate::waiting(), 0);
+    assert_eq!(
+        ceiling_holds(&engine),
+        0,
+        "a read held the engine past its end"
+    );
 }
 
 /// The causal read of the first position, cold, stalls on its stored record;
@@ -178,30 +363,25 @@ async fn a_stalled_cold_ceiling_holds_up_no_apply_and_leaves_bounded_reads() {
         breakpoint_read_gate::release();
     });
     let started = Instant::now();
-    for _ in 0..64 {
-        let gave_up = tokio::time::timeout(
-            Duration::from_millis(20),
-            fence.await_causal(
-                None,
-                Some(HistoryPosition {
-                    history,
-                    index: cold,
-                }),
-                None,
-            ),
-        )
-        .await;
-        assert!(gave_up.is_err(), "a stalled read answered: {gave_up:?}");
-    }
+    give_up_reads(&mut fence, history, cold, 64).await;
     assert!(
         started.elapsed() < LONG_STALL / 2,
         "the reads given up waited out the stall: {:?}",
         started.elapsed()
     );
-    let stalled = breakpoint_read_gate::waiting();
-    assert!(
-        (1..=8).contains(&stalled),
-        "{stalled} reads of the stalled record are left behind"
+    // The reads that got a place reach the record off the runtime, a moment
+    // after their fences gave up; then exactly as many as there are places
+    // stay behind, and more fences giving up add none.
+    assert_eq!(
+        stalled_reads(STORED_CEILING_READS).await,
+        STORED_CEILING_READS,
+        "the reads of the stalled record left behind"
+    );
+    give_up_reads(&mut fence, history, cold, 64).await;
+    assert_eq!(
+        stalled_reads(STORED_CEILING_READS).await,
+        STORED_CEILING_READS,
+        "more fences giving up left more reads behind"
     );
 
     let applied = tokio::time::timeout(Duration::from_secs(5), async {
