@@ -1869,10 +1869,14 @@ impl RaftNode {
             return Ok(());
         }
 
-        // Add as learner (non-voting, receives log replication)
+        // Add as learner (non-voting, receives log replication). Not blocking:
+        // openraft's blocking form waits, with no deadline, until the learner
+        // has the membership entry, so an unreachable learner would hold this
+        // call and the membership turn forever. Catching up is the join
+        // monitor's to watch, under the node's join timeout.
         let written = self
             .raft
-            .add_learner(node_id, node_info, true)
+            .add_learner(node_id, node_info, false)
             .await
             .map_err(|e| RaftNodeError::Membership(e.to_string()))?;
         self.membership_published(written.log_id.index).await?;
@@ -2706,19 +2710,19 @@ impl RaftNode {
         // Done when a member leads AND this node has applied an entry of its
         // term: that entry is applied only once committed, so the new leader
         // has committed in its term and serves reads and writes, rather than
-        // merely having won the vote. The member is the target, or another
-        // one the group elected in a later term: a leader handing over sends
-        // no heartbeats, so with the target down the others elect themselves,
-        // and the transfer can no longer complete.
-        let node_id = self.node_id;
+        // merely having won the vote. The member is the target, or any member
+        // the group elected in a later term, this node included: a leader
+        // handing over sends no heartbeats, and once the transfer outlives an
+        // election timeout it steps down and stands for election itself. With
+        // the target down the others or this node then win, and the transfer
+        // can no longer complete.
         match self
             .raft
             .wait(Some(std::time::Duration::from_millis(timeout_ms)))
             .metrics(
                 |m| {
                     m.current_leader.is_some_and(|leader| {
-                        leader == target_id
-                            || (leader != node_id && m.current_term > handed_over_in)
+                        leader == target_id || m.current_term > handed_over_in
                     }) && m
                         .last_applied
                         .as_ref()
@@ -2840,7 +2844,8 @@ impl RaftNode {
                     .transfer_leadership_within(target_id, SHUTDOWN_TRANSFER_TIMEOUT_MS)
                     .await
                 {
-                    // Leadership left this node either way.
+                    // The transfer is over either way; whoever leads now,
+                    // this node stops next and the group elects again.
                     Ok(()) | Err(RaftNodeError::TransferSuperseded { .. }) => {}
                     Err(e) => tracing::warn!(target_id, "leadership transfer failed: {e}"),
                 }
@@ -4024,8 +4029,9 @@ pub enum RaftNodeError {
     TransferTimeout { target: u64, timeout_ms: u64 },
 
     /// Leadership was handed to `target`, but the group elected `leader`
-    /// instead (`target` is down or could not win); the transfer is over and
-    /// this node no longer leads.
+    /// instead (`target` is down or could not win); the transfer is over.
+    /// `leader` may be the node that asked for the transfer, which stands for
+    /// election again once the transfer outlives an election timeout.
     #[error("leadership did not move to node {target}: node {leader} leads instead")]
     TransferSuperseded { target: u64, leader: u64 },
 

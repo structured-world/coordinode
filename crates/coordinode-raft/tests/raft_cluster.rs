@@ -5552,8 +5552,9 @@ async fn cluster_graceful_leader_transfer() {
 /// A transfer to a member that is down cannot complete, and says so: the
 /// caller gets an error instead of a success that leaves it forwarding work
 /// to a node that never took over. While the leader hands over it sends no
-/// heartbeats, so the live member elects itself; the transfer then ends
-/// with who leads instead, not after the whole transfer timeout. A member
+/// heartbeats and, past an election timeout, stands again itself, so a live
+/// member is elected; the transfer then ends with who leads instead, not
+/// after the whole transfer timeout. A member
 /// shutting down right after its peer did hands over to that peer and must
 /// not sit out the timeout for it.
 #[tokio::test(flavor = "multi_thread")]
@@ -5623,16 +5624,22 @@ async fn a_transfer_to_a_stopped_member_ends_when_another_leads() {
         let started = std::time::Instant::now();
         let outcome = n1.transfer_leadership_to(3).await;
         let took = started.elapsed();
+        // Either live member may win: the follower that stopped hearing
+        // heartbeats, or the leader that stands again once the transfer
+        // outlives an election timeout. The answer names the one that leads.
+        let leader = match &outcome {
+            Err(RaftNodeError::TransferSuperseded { target: 3, leader }) => Some(*leader),
+            _ => None,
+        };
         assert!(
-            matches!(
-                outcome,
-                Err(RaftNodeError::TransferSuperseded {
-                    target: 3,
-                    leader: 2
-                })
-            ),
+            matches!(leader, Some(1 | 2)),
             "a transfer to a stopped member must end with the member that \
              took over, got {outcome:?}"
+        );
+        let winner = if leader == Some(1) { &n1 } else { &n2 };
+        assert!(
+            winner.is_leader().await,
+            "the transfer must name the member that leads, named {leader:?}"
         );
         assert!(
             took < Duration::from_millis(LEADERSHIP_TRANSFER_TIMEOUT_MS),
