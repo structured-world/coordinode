@@ -1580,9 +1580,15 @@ async fn wait_for_post_decommission_state(
             if let Ok(resp) = client.get_cluster_status(GetClusterStatusRequest {}).await {
                 let s = resp.into_inner();
                 let members: Vec<String> = s.nodes.iter().map(|n| n.node_id.clone()).collect();
-                // Leader reports a populated list; wait until node 1 has been
-                // removed and a survivor holds leadership.
-                if !members.is_empty()
+                // Only the leader reports the membership; a follower lists
+                // itself alone. Wait until the survivor that leads answers,
+                // without node 1. Before, a follower's own entry passed for the
+                // membership whenever the other survivor took the leadership.
+                let from_leader = s
+                    .nodes
+                    .iter()
+                    .any(|n| n.node_id == s.leader_id && n.role == NodeRole::Leader as i32);
+                if from_leader
                     && !members.contains(&"1".to_string())
                     && matches!(s.leader_id.as_str(), "2" | "3")
                 {
