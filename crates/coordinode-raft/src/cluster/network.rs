@@ -479,6 +479,15 @@ impl NetStreamAppend<C> for GrpcNetwork {
         let sent_terms: Arc<parking_lot::Mutex<std::collections::VecDeque<u64>>> = Arc::default();
         let terms_in = Arc::clone(&sent_terms);
         Box::pin(async move {
+            // The first request before anything else: openraft sleeps out the
+            // replication backoff inside the request stream, so a stream that
+            // failed to open before taking a request would retry with no
+            // backoff at all, about once a millisecond while the peer is down.
+            let mut input = input;
+            let Some(first) = input.next().await else {
+                return Ok(Box::pin(futures_util::stream::empty()) as BoxStream<'s, _>);
+            };
+            let input = futures_util::stream::once(std::future::ready(first)).chain(input);
             if let Some(e) = partition {
                 return Err(e);
             }

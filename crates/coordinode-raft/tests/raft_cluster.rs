@@ -3038,6 +3038,57 @@ async fn shutdown_hands_leadership_to_a_live_voter() {
     );
 }
 
+/// A peer that refuses every call is retried at the replication backoff, not
+/// in a loop. The backoff sleeps inside the stream of requests, so a transport
+/// that fails before taking the first request never sleeps it: the leader then
+/// redials the peer about once a millisecond for as long as it is down, which
+/// on a loaded host starves the members that are up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_refuses_every_call_is_retried_at_the_backoff() {
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        // Accepts each connection and drops it at once: every call fails.
+        let refusing = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = refusing.local_addr().expect("local addr");
+        let dialed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let holder = {
+            let dialed = Arc::clone(&dialed);
+            tokio::spawn(async move {
+                while let Ok((conn, _)) = refusing.accept().await {
+                    dialed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    drop(conn);
+                }
+            })
+        };
+
+        let n1 = create_leader(1, alloc_port()).await;
+        await_leadership(&n1.node).await;
+        n1.node
+            .add_node(2, format!("http://{addr}"), ident(2))
+            .await
+            .expect("add learner");
+        // Past the errors that switch the backoff on.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let before = dialed.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let calls = dialed.load(std::sync::atomic::Ordering::Relaxed) - before;
+        // Replication at one try per 200 ms is ten; heartbeats every 50 ms
+        // are forty more. A loop without the backoff dials thousands.
+        assert!(
+            calls < 200,
+            "the leader dialed a refusing peer {calls} times in two seconds"
+        );
+        n1.node.shutdown().await.expect("shutdown");
+        holder.abort();
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_peer_that_refuses_every_call_is_retried_at_the_backoff"
+    );
+}
+
 /// A node shutting down while a call to a peer hangs must neither wait the
 /// call out nor leave anything holding its engine. A peer that accepts the
 /// connection and never answers keeps a replication task inside its call,
