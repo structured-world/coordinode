@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
 use coordinode_replicate::{
-    ConsumerKind, ConsumerRetentionPolicy, InitialSeqno, RegistrationState, RegistryError,
-    TerminalReason, TopologyScope, ValidatedRetentionBounds,
+    ConsumerKind, ConsumerRetentionPolicy, InitialSeqno, RegistryError, TerminalReason,
+    TopologyScope,
 };
 
 use super::*;
@@ -249,53 +249,6 @@ fn a_cancelled_consumer_releases_the_journal_and_refuses_its_handle() {
     assert_eq!(again.incarnation(), h.incarnation() + 1);
 }
 
-/// A BOUNDED consumer that stops heartbeating past its declared liveness
-/// timeout is ended by the background service, with the reason, and its
-/// journal is released; heartbeats keep a live one.
-#[test]
-fn a_silent_bounded_consumer_is_ended_by_the_service() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
-    let bounds = ValidatedRetentionBounds::new(u64::MAX, u64::MAX, Some(300)).expect("bounds");
-    db.register_consumer(log_consumer(
-        "silent",
-        InitialSeqno::FromNow,
-        ConsumerRetentionPolicy::Bounded(bounds),
-    ))
-    .expect("register silent");
-    let alive = db
-        .register_consumer(log_consumer(
-            "alive",
-            InitialSeqno::FromNow,
-            ConsumerRetentionPolicy::Bounded(bounds),
-        ))
-        .expect("register alive");
-    let state = |id: &str| {
-        db.consumers_list()
-            .expect("list")
-            .into_iter()
-            .find(|c| c.consumer_id == id)
-            .map(|c| c.state)
-    };
-    let until = Instant::now() + Duration::from_secs(10);
-    while matches!(state("silent"), Some(RegistrationState::Live)) && Instant::now() < until {
-        db.consumer_heartbeat(&alive).expect("heartbeat");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        matches!(
-            state("silent"),
-            Some(RegistrationState::Terminated {
-                reason: TerminalReason::LivenessExpired,
-                ..
-            })
-        ),
-        "got {:?}",
-        state("silent")
-    );
-    assert_eq!(state("alive"), Some(RegistrationState::Live));
-}
-
 /// An MVCC consumer holds collection of the history it reads at its
 /// position.
 #[test]
@@ -319,63 +272,6 @@ fn an_mvcc_consumer_holds_collection_at_its_position() {
         "collection passed the consumer's position"
     );
     assert_eq!(db.consumer_position(&h).expect("held"), at);
-}
-
-/// A BOUNDED state reader is held to the logical bytes of the commits from
-/// its checkpoint: past its byte limit it ends, while one with room left
-/// stays live over the same writes.
-#[test]
-fn a_bounded_state_reader_ends_past_its_byte_limit() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
-    let state = |id: &str, bytes: u64| ConsumerRegistration {
-        kind: ConsumerKind::LsmStateDelta,
-        ..log_consumer(
-            id,
-            InitialSeqno::FromNow,
-            ConsumerRetentionPolicy::Bounded(
-                ValidatedRetentionBounds::new(u64::MAX, bytes, None).expect("bounds"),
-            ),
-        )
-    };
-    db.register_consumer(state("tight", 1_024))
-        .expect("a state reader can be BOUNDED");
-    db.register_consumer(state("roomy", 1 << 40))
-        .expect("register roomy");
-    write(&mut db, 50, "x");
-    let state_of = |id: &str| {
-        db.consumers_list()
-            .expect("list")
-            .into_iter()
-            .find(|c| c.consumer_id == id)
-            .map(|c| (c.state, c.retained_bytes))
-    };
-    let until = Instant::now() + Duration::from_secs(10);
-    while matches!(state_of("tight"), Some((RegistrationState::Live, _))) && Instant::now() < until
-    {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        matches!(
-            state_of("tight"),
-            Some((
-                RegistrationState::Terminated {
-                    reason: TerminalReason::RetainedBytesExceeded,
-                    ..
-                },
-                _
-            ))
-        ),
-        "got {:?}",
-        state_of("tight")
-    );
-    let roomy = state_of("roomy").expect("listed");
-    assert_eq!(roomy.0, RegistrationState::Live);
-    assert!(
-        roomy.1.is_some_and(|b| b.is_ok_and(|b| b > 1_024)),
-        "the roomy reader is charged the same writes: {:?}",
-        roomy.1
-    );
 }
 
 /// A physical backup carries the registrations with their incarnations and

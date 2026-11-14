@@ -1,7 +1,5 @@
 use super::*;
-use crate::registry::types::{
-    ConsumerKind, PriorIncarnation, RetentionPressure, Unmeasured, ValidatedRetentionBounds,
-};
+use crate::registry::types::{ConsumerKind, PriorIncarnation, RetentionPressure, Unmeasured};
 use coordinode_core::txn::proposal::RaftProposal;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proposal::RaftProposalPipeline;
@@ -35,7 +33,6 @@ struct FakeSource {
     produced: Mutex<HashMap<u64, Option<u64>>>,
     /// Bytes required from any position.
     bytes: AtomicU64,
-    unaccounted: AtomicBool,
     /// Whether the source is out of room for new retention.
     pressured: AtomicBool,
     /// The last log floor the registry released below.
@@ -72,9 +69,6 @@ impl RetentionSource for FakeSource {
     }
     fn first_retained(&self, _: ConsumerKind) -> u64 {
         self.first.load(Ordering::Acquire)
-    }
-    fn accounts(&self, _: ConsumerKind) -> bool {
-        !self.unaccounted.load(Ordering::Acquire)
     }
     fn produced_at_ms(&self, _: ConsumerKind, position: u64) -> Result<Option<u64>, Unmeasured> {
         self.produced
@@ -157,15 +151,10 @@ fn registry_over(
     .expect("open the registry")
 }
 
-/// Start the registry's background service with these cadences.
-fn start_service(
-    reg: &ShardConsumerRegistry,
-    heartbeat_window_ms: u64,
-    eviction_interval_ms: u64,
-) -> RegistryBackground {
+/// Start the registry's background service with this heartbeat window.
+fn start_service(reg: &ShardConsumerRegistry, heartbeat_window_ms: u64) -> RegistryBackground {
     reg.start_background(BackgroundConfig {
         heartbeat_window_ms,
-        eviction_interval_ms,
     })
     .expect("start the registry service")
 }
@@ -183,12 +172,6 @@ async fn stop_service(bg: RegistryBackground) {
 /// over history still held, as the tests' fixed positions need.
 fn keep_all_history(engine: &StorageEngine) {
     engine.set_retention_window(Duration::from_secs(100 * 365 * 24 * 3_600));
-}
-
-fn bounded(lag_ms: u64, bytes: u64, liveness_ms: Option<u64>) -> ConsumerRetentionPolicy {
-    ConsumerRetentionPolicy::Bounded(
-        ValidatedRetentionBounds::new(lag_ms, bytes, liveness_ms).expect("bounds"),
-    )
 }
 
 /// A seqno-space registration starting at `at`.
@@ -350,128 +333,40 @@ async fn a_strict_consumer_survives_missing_heartbeats_and_any_lag() {
     f.source.set_bytes(u64::MAX / 2);
 
     clock.set(1_000 + 365 * 24 * 3_600 * 1_000);
-    let swept = f.reg.core.sweep_evictions().expect("sweep");
-    assert_eq!(swept.evicted, 0);
+    f.reg.core.recompute_floor().expect("publish the floors");
     assert_eq!(ended_for(&f.reg, "strict"), None);
     assert_eq!(f.reg.shard_floor(), 5, "it still holds the floor");
     f.node.shutdown().await.expect("shutdown");
 }
 
-/// BOUNDED liveness: a consumer silent past its timeout ends, durably, with
-/// that reason; the floor it held lifts.
+/// An ordinary registration is progress only: it takes no part in the floor
+/// beside a STRICT one, is admitted while the source refuses new retention,
+/// and stays live however far behind and silent it is.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_silent_bounded_consumer_ends_for_liveness() {
+async fn an_ordinary_registration_holds_nothing_and_is_never_held_back() {
     let clock = Arc::new(ManualClock::new(1_000));
     let f = fixture(clock.clone()).await;
     f.reg
-        .register(registration(
-            "silent",
-            50,
-            bounded(60_000, 1 << 30, Some(5_000)),
-        ))
-        .expect("register");
-    f.reg
         .register(registration("strict", 900, ConsumerRetentionPolicy::Strict))
         .expect("register strict");
-    assert_eq!(f.reg.shard_floor(), 50);
-
-    clock.set(6_000);
-    assert_eq!(
-        f.reg.core.sweep_evictions().expect("sweep").evicted,
-        0,
-        "at the boundary"
-    );
-    clock.set(6_001);
-    assert_eq!(f.reg.core.sweep_evictions().expect("sweep").evicted, 1);
-    assert_eq!(
-        ended_for(&f.reg, "silent"),
-        Some(TerminalReason::LivenessExpired)
-    );
-    assert_eq!(
-        f.reg.shard_floor(),
-        900,
-        "the ended consumer no longer holds retention"
-    );
-    f.node.shutdown().await.expect("shutdown");
-}
-
-/// BOUNDED progress lag: the oldest unacknowledged work outgrowing the limit
-/// ends the registration, and heartbeats do not reset that age.
-#[tokio::test(flavor = "multi_thread")]
-async fn heartbeats_do_not_reset_progress_lag() {
-    let clock = Arc::new(ManualClock::new(10_000));
-    let f = fixture(clock.clone()).await;
-    let h = f
+    f.source.set_pressured(true);
+    let ordinary = f
         .reg
         .register(registration(
-            "lagging",
-            7,
-            bounded(1_000, 1 << 30, Some(60_000)),
+            "ordinary",
+            50,
+            ConsumerRetentionPolicy::Ordinary,
         ))
-        .expect("register");
-    f.source.set_head(20);
-    f.source.produced(7, 10_000);
+        .expect("an ordinary registration takes on no retention");
+    assert_eq!(f.reg.shard_floor(), 900, "only the STRICT one holds");
 
-    for t in [10_500, 10_900, 11_000] {
-        clock.set(t);
-        f.reg.heartbeat(&h).expect("heartbeat");
-        assert_eq!(
-            f.reg.core.sweep_evictions().expect("sweep").evicted,
-            0,
-            "at {t}"
-        );
-    }
-    clock.set(11_001);
-    f.reg.heartbeat(&h).expect("heartbeat");
-    assert_eq!(f.reg.core.sweep_evictions().expect("sweep").evicted, 1);
-    assert_eq!(
-        ended_for(&f.reg, "lagging"),
-        Some(TerminalReason::ProgressLagExceeded)
-    );
-    f.node.shutdown().await.expect("shutdown");
-}
-
-/// An idle source leaves nothing unacknowledged: a consumer caught up with it
-/// is not lagging, however long ago its checkpoint last moved.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_caught_up_consumer_of_an_idle_source_is_not_lagging() {
-    let clock = Arc::new(ManualClock::new(0));
-    let f = fixture(clock.clone()).await;
+    clock.set(1_000 + 365 * 24 * 3_600 * 1_000);
+    f.reg.core.recompute_floor().expect("publish the floors");
+    assert_eq!(ended_for(&f.reg, "ordinary"), None);
     f.reg
-        .register(registration("idle", 42, bounded(1_000, 1 << 30, None)))
-        .expect("register");
-    f.source.set_head(42);
-    f.source.produced(42, 0);
-
-    clock.set(1_000_000);
-    assert_eq!(f.reg.core.sweep_evictions().expect("sweep").evicted, 0);
-    assert_eq!(ended_for(&f.reg, "idle"), None);
-    f.node.shutdown().await.expect("shutdown");
-}
-
-/// BOUNDED bytes: once the material the checkpoint requires exceeds the
-/// limit, the registration ends.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_consumer_requiring_too_many_bytes_ends() {
-    let clock = Arc::new(ManualClock::new(0));
-    let f = fixture(clock.clone()).await;
-    f.reg
-        .register(registration("heavy", 3, bounded(u64::MAX, 4_096, None)))
-        .expect("register");
-    // Judged on one whole observation: the source can tell its work, none.
-    f.source.no_work(3);
-    f.source.set_bytes(4_096);
-    assert_eq!(
-        f.reg.core.sweep_evictions().expect("sweep").evicted,
-        0,
-        "at the limit"
-    );
-    f.source.set_bytes(4_097);
-    assert_eq!(f.reg.core.sweep_evictions().expect("sweep").evicted, 1);
-    assert_eq!(
-        ended_for(&f.reg, "heavy"),
-        Some(TerminalReason::RetainedBytesExceeded)
-    );
+        .checkpoint(&ordinary, 60)
+        .expect("progress is recorded");
+    assert_eq!(f.reg.shard_floor(), 900);
     f.node.shutdown().await.expect("shutdown");
 }
 
@@ -568,11 +463,7 @@ async fn a_late_heartbeat_of_an_ended_incarnation_keeps_nothing_alive() {
     f.reg.unregister(old.clone()).expect("cancel");
     let new = f
         .reg
-        .register(registration(
-            "r",
-            1,
-            bounded(u64::MAX, u64::MAX, Some(1_000)),
-        ))
+        .register(registration("r", 1, ConsumerRetentionPolicy::Strict))
         .expect("register again");
 
     f.reg.core.batching_on.store(true, Ordering::Release);
@@ -583,36 +474,20 @@ async fn a_late_heartbeat_of_an_ended_incarnation_keeps_nothing_alive() {
         f.reg.core.pending_hb.lock().is_empty(),
         "the stale heartbeat was dropped"
     );
-    assert_eq!(
-        f.reg.core.sweep_evictions().expect("sweep").evicted,
-        1,
-        "the new incarnation, never heard from, ended for liveness"
+    let (stored, _) = f.reg.core.read_heartbeat("r").expect("read heartbeat");
+    assert!(
+        stored.is_none_or(|hb| hb.incarnation != new.incarnation()),
+        "no heartbeat of the new incarnation was written: {stored:?}"
     );
-    assert!(matches!(
-        f.reg.resume("r", new.incarnation()).unwrap_err(),
-        RegistryError::Terminated {
-            reason: TerminalReason::LivenessExpired,
-            ..
-        }
-    ));
-    f.node.shutdown().await.expect("shutdown");
-}
-
-/// A BOUNDED limit needs the source to measure what it bounds; one that
-/// cannot is refused, never admitted with an unjudgeable bound.
-#[tokio::test(flavor = "multi_thread")]
-async fn bounded_is_refused_where_the_source_cannot_measure_it() {
-    let f = fixture(Arc::new(ManualClock::new(0))).await;
-    f.source.unaccounted.store(true, Ordering::Release);
-    assert!(matches!(
+    assert_eq!(
         f.reg
-            .register(registration("b", 1, bounded(1_000, 1_000, None)))
-            .unwrap_err(),
-        RegistryError::InvalidRetention(_)
-    ));
-    f.reg
-        .register(registration("s", 1, ConsumerRetentionPolicy::Strict))
-        .expect("STRICT needs no measure");
+            .list_consumers()
+            .iter()
+            .find(|c| c.consumer_id == "r")
+            .map(|c| c.last_heartbeat_ts_ms),
+        Some(1_000),
+        "the new incarnation was not heard from"
+    );
     f.node.shutdown().await.expect("shutdown");
 }
 
@@ -681,109 +556,22 @@ fn heartbeats_landing_during_every_acknowledgement_do_not_end_the_stream() {
     assert_eq!(seen.last_heartbeat_ts_ms, 6_000, "the heartbeats stand");
 }
 
-/// A heartbeat landing after the sweep judged a consumer silent and before
-/// its terminal write keeps the consumer: heartbeats write their own record,
-/// so the expiry is conditioned on that record too and reads again.
+/// An acknowledgement already checked and on its way to the log when a
+/// cancellation applies ahead of it: the cancellation stands, and the
+/// acknowledgement, decided where the log applies it, finds the registration
+/// ended and writes nothing: it never writes a live record over the end.
 #[test]
-fn a_heartbeat_racing_a_liveness_expiry_keeps_the_consumer() {
-    let (reg, clock, _source, _pipeline, _dir) = hooked_registry();
-    clock.set(1_000);
+fn an_acknowledgement_in_flight_behind_a_cancellation_resurrects_nothing() {
+    let (reg, _clock, source, pipeline, _dir) = hooked_registry();
     let h = reg
-        .register(registration(
-            "quiet",
-            7,
-            bounded(60_000, 1 << 30, Some(5_000)),
-        ))
-        .expect("register");
-    clock.set(6_001);
-    *reg.core.before_commit.lock() = Some(Box::new({
-        let (reg, h) = (reg.clone(), h.clone());
-        move || reg.core.clock_heartbeat(&h, 6_001).expect("heartbeat")
-    }));
-    let swept = reg.core.sweep_evictions().expect("sweep");
-    assert_eq!(swept.evicted, 0, "the expiry decided on a stale silence");
-    assert_eq!(ended_for(&reg, "quiet"), None);
-}
-
-/// An acknowledgement and an expiry racing over one record: whichever lands
-/// second decides against what the first left. Here the acknowledgement
-/// lands after the sweep read the lagging record and before its terminal
-/// write; the write finds the record moved, the sweep reads again and finds a
-/// consumer no longer lagging.
-#[test]
-fn an_acknowledgement_racing_an_expiry_keeps_the_consumer() {
-    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
-    let h = reg
-        .register(registration("racer", 7, bounded(1_000, 1 << 30, None)))
+        .register(registration("raced", 7, ConsumerRetentionPolicy::Strict))
         .expect("register");
     source.set_head(20);
-    source.produced(7, 0);
-    clock.set(5_000);
 
-    *reg.core.before_commit.lock() = Some(Box::new({
-        let (reg, h) = (reg.clone(), h.clone());
-        move || {
-            reg.checkpoint(&h, 20)
-                .expect("the acknowledgement lands first")
-        }
-    }));
-    let swept = reg.core.sweep_evictions().expect("sweep");
-    assert_eq!(swept.evicted, 0, "the sweep decided on a stale read");
-    assert_eq!(ended_for(&reg, "racer"), None);
-    assert_eq!(reg.shard_floor(), 20, "the acknowledgement stands");
-}
-
-/// A change of the material basis published after a consumer was measured
-/// and before its ending applies, under which the consumer is within its
-/// bounds: the ending, decided where the log applies it, finds the basis
-/// moved and writes nothing, and the measure against the new basis ends
-/// nobody.
-#[test]
-fn a_basis_change_racing_an_ending_keeps_a_now_compliant_consumer() {
-    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
-    reg.register(registration("measured", 7, bounded(1_000, 1 << 30, None)))
-        .expect("register");
-    source.set_head(20);
-    source.produced(7, 0);
-    clock.set(5_000);
-
-    *reg.core.before_commit.lock() = Some(Box::new({
-        let engine = Arc::clone(&reg.core.engine);
-        let source = Arc::clone(&source);
-        move || {
-            // The new basis no longer requires the old work.
-            source.produced(7, 4_900);
-            engine
-                .put(Partition::Registry, MATERIAL_BASIS_KEY, b"revision 1")
-                .expect("the basis moves first");
-        }
-    }));
-    assert_eq!(
-        reg.core.sweep_evictions().expect("sweep").evicted,
-        0,
-        "an ending measured on the old basis landed"
-    );
-    assert_eq!(ended_for(&reg, "measured"), None);
-}
-
-/// An acknowledgement already checked and on its way to the log when an
-/// ending applies ahead of it: the ending stands, and the acknowledgement,
-/// decided where the log applies it, finds the registration ended and
-/// writes nothing. Before, it wrote its live record over the ending.
-#[test]
-fn an_acknowledgement_in_flight_behind_an_ending_resurrects_nothing() {
-    let (reg, clock, source, pipeline, _dir) = hooked_registry();
-    let h = reg
-        .register(registration("raced", 7, bounded(1_000, 1 << 30, None)))
-        .expect("register");
-    source.set_head(20);
-    source.produced(7, 0);
-    clock.set(5_000);
-
-    // The ending takes its timestamp and stops before it applies. Meanwhile
-    // an acknowledgement passes its checks (the registration is live),
-    // takes a later timestamp and stops before it applies too. The ending
-    // applies, then the acknowledgement.
+    // The cancellation takes its timestamp and stops before it applies.
+    // Meanwhile an acknowledgement passes its checks (the registration is
+    // live), takes a later timestamp and stops before it applies too. The
+    // cancellation applies, then the acknowledgement.
     let (checked_tx, checked) = std::sync::mpsc::channel::<()>();
     let (release_tx, release) = std::sync::mpsc::channel::<()>();
     pipeline.later_hooks.lock().push_back(Box::new(move || {
@@ -800,7 +588,7 @@ fn an_acknowledgement_in_flight_behind_an_ending_resurrects_nothing() {
                 .expect("the acknowledgement passed its checks");
         }
     }));
-    reg.core.sweep_evictions().expect("sweep");
+    reg.unregister(h).expect("cancel");
     release_tx.send(()).expect("release");
     let acknowledged = acknowledging
         .lock()
@@ -810,42 +598,20 @@ fn an_acknowledgement_in_flight_behind_an_ending_resurrects_nothing() {
         .expect("acknowledgement");
     assert_eq!(
         ended_for(&reg, "raced"),
-        Some(TerminalReason::ProgressLagExceeded),
-        "the acknowledgement wrote a live record over the ending"
+        Some(TerminalReason::Cancelled),
+        "the acknowledgement wrote a live record over the end"
     );
     assert!(
         matches!(
             acknowledged,
             Err(RegistryError::Terminated {
-                reason: TerminalReason::ProgressLagExceeded,
+                reason: TerminalReason::Cancelled,
+                checkpoint: 7,
                 ..
             })
         ),
-        "the acknowledgement is refused with the ending: {acknowledged:?}"
+        "the acknowledgement is refused with the end: {acknowledged:?}"
     );
-}
-
-/// The other order: the expiry lands first, and the acknowledgement that
-/// follows finds the incarnation ended and changes nothing.
-#[test]
-fn an_acknowledgement_after_an_expiry_is_refused() {
-    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
-    let h = reg
-        .register(registration("late-ack", 7, bounded(1_000, 1 << 30, None)))
-        .expect("register");
-    source.set_head(20);
-    source.produced(7, 0);
-    clock.set(5_000);
-    assert_eq!(reg.core.sweep_evictions().expect("sweep").evicted, 1);
-    assert!(matches!(
-        reg.checkpoint(&h, 20).unwrap_err(),
-        RegistryError::Terminated {
-            reason: TerminalReason::ProgressLagExceeded,
-            checkpoint: 7,
-            ..
-        }
-    ));
-    assert_eq!(reg.shard_floor(), u64::MAX);
 }
 
 /// Ending a registration releases only its own protection: a read already
@@ -1046,11 +812,11 @@ fn a_resync_records_what_it_followed_and_what_was_missed() {
 /// An ended registration records where its source's history started when it
 /// ended, in its own space: the log's first entry for a log consumer, the
 /// engine's collection watermark for an MVCC one. A late handle learns it
-/// with the reason and checkpoint, so it can tell a policy ending over
-/// history still there from history already gone.
+/// with the reason and checkpoint, so it can tell an ending over history
+/// still there from history already gone.
 #[test]
 fn an_ended_registration_records_where_its_history_started() {
-    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
+    let (reg, _clock, source, _pipeline, _dir) = hooked_registry();
     source.set_first(40);
     source.set_head(90);
     let log = reg
@@ -1060,7 +826,7 @@ fn an_ended_registration_records_where_its_history_started() {
         })
         .expect("register log");
     let mvcc = reg
-        .register(registration("mvcc", 7, bounded(1_000, 1 << 30, None)))
+        .register(registration("mvcc", 7, ConsumerRetentionPolicy::Strict))
         .expect("register mvcc");
     source.set_first(55);
     reg.unregister(log.clone()).expect("cancel");
@@ -1074,16 +840,14 @@ fn an_ended_registration_records_where_its_history_started() {
         }
     ));
 
-    source.produced(7, 0);
-    clock.set(5_000);
-    assert_eq!(reg.core.sweep_evictions().expect("sweep").evicted, 1);
+    reg.unregister(mvcc.clone()).expect("cancel mvcc");
     let readable = reg.core.engine.oldest_readable_seqno();
     let refused = reg.checkpoint(&mvcc, 20).unwrap_err();
     assert!(
         matches!(
             refused,
             RegistryError::Terminated {
-                reason: TerminalReason::ProgressLagExceeded,
+                reason: TerminalReason::Cancelled,
                 checkpoint: 7,
                 retained_from,
                 ..
@@ -1411,7 +1175,7 @@ fn a_journal_purge_racing_a_registration_never_passes_its_position() {
     // the consumer once the floor is republished.
     let head = source.head(ConsumerKind::OplogEvents);
     reg.checkpoint(&h, head).expect("acknowledge");
-    reg.core.sweep_evictions().expect("sweep");
+    reg.core.recompute_floor().expect("publish the floors");
     engine
         .oplog_purge_expired(4_000_000_000, u64::MAX)
         .expect("purge");
@@ -1506,13 +1270,9 @@ async fn batched_heartbeats_flush_and_refresh_liveness() {
     let f = fixture(clock.clone()).await;
     let h = f
         .reg
-        .register(registration(
-            "hb",
-            1,
-            bounded(u64::MAX, u64::MAX, Some(10_000)),
-        ))
+        .register(registration("hb", 1, ConsumerRetentionPolicy::Strict))
         .expect("register");
-    let bg = start_service(&f.reg, 30, 100_000);
+    let bg = start_service(&f.reg, 30);
     clock.set(4_000);
     for _ in 0..5 {
         f.reg.heartbeat(&h).expect("buffer heartbeat");
@@ -1536,51 +1296,13 @@ async fn batched_heartbeats_flush_and_refresh_liveness() {
     f.node.shutdown().await.expect("shutdown");
 }
 
-/// The background sweep ends a BOUNDED consumer once its liveness runs out,
-/// with nothing but the clock to schedule it.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_background_sweep_ends_a_silent_bounded_consumer() {
-    let f = fixture(Arc::new(SystemClock)).await;
-    f.reg
-        .register(registration(
-            "doomed",
-            10,
-            bounded(u64::MAX, u64::MAX, Some(300)),
-        ))
-        .expect("register doomed");
-    f.reg
-        .register(registration(
-            "survivor",
-            500,
-            ConsumerRetentionPolicy::Strict,
-        ))
-        .expect("register survivor");
-    let bg = start_service(&f.reg, 100_000, 30);
-    // The terminal record commits first and the floor moves after it (the
-    // floor never moves ahead of the record), so a reader can see the ended
-    // consumer before the new floor: wait for both.
-    let until = tokio::time::Instant::now() + Duration::from_secs(10);
-    while (ended_for(&f.reg, "doomed").is_none() || f.reg.shard_floor() != 500)
-        && tokio::time::Instant::now() < until
-    {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        ended_for(&f.reg, "doomed"),
-        Some(TerminalReason::LivenessExpired)
-    );
-    assert_eq!(f.reg.shard_floor(), 500);
-    stop_service(bg).await;
-    f.node.shutdown().await.expect("shutdown");
-}
-
 /// A reader watching its registration hears of writes to its own record as
 /// they apply (here, its cancellation) and not of writes to others', once
 /// the notices of the writes made before it watched have been delivered.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watch_hears_of_its_own_record_only() {
     let f = fixture(Arc::new(ManualClock::new(1_000))).await;
-    let bg = start_service(&f.reg, 100_000, 100_000);
+    let bg = start_service(&f.reg, 100_000);
     let mine = f
         .reg
         .register(registration("mine", 10, ConsumerRetentionPolicy::Strict))
@@ -1633,11 +1355,11 @@ async fn a_watch_hears_of_its_own_record_only() {
 
 /// With the background service running, a registration that can lower the
 /// floor still publishes it before returning: the history its position
-/// needs must not be collected while a sweep is far away (100 s here).
+/// needs must not be collected while the service has yet to republish it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lowering_registration_publishes_the_floor_before_returning() {
     let f = fixture(Arc::new(ManualClock::new(1_000))).await;
-    let bg = start_service(&f.reg, 100_000, 100_000);
+    let bg = start_service(&f.reg, 100_000);
     f.reg
         .register(registration("late", 250, ConsumerRetentionPolicy::Strict))
         .expect("register late");
@@ -1651,11 +1373,11 @@ async fn a_lowering_registration_publishes_the_floor_before_returning() {
 }
 
 /// With the background service running, an acknowledgement only raises the
-/// floor, so the sweep its applied write triggers publishes it.
+/// floor, so the publication its applied write wakes raises it.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_acknowledgement_raises_the_floor_through_the_sweep() {
+async fn an_acknowledgement_raises_the_floor_through_the_service() {
     let f = fixture(Arc::new(ManualClock::new(1_000))).await;
-    let bg = start_service(&f.reg, 100_000, 30);
+    let bg = start_service(&f.reg, 100_000);
     let early = f
         .reg
         .register(registration("early", 100, ConsumerRetentionPolicy::Strict))
@@ -1693,12 +1415,12 @@ async fn the_source_learns_the_lowest_acknowledged_log_position() {
     assert_eq!(f.source.released.load(Ordering::Acquire), 100);
 
     f.reg.checkpoint(&early, 300).expect("acknowledge");
-    f.reg.core.sweep_evictions().expect("sweep");
+    f.reg.core.recompute_floor().expect("publish the floors");
     assert_eq!(f.source.released.load(Ordering::Acquire), 250);
 
     f.reg.unregister(early).expect("cancel early");
     f.reg.unregister(late).expect("cancel late");
-    f.reg.core.sweep_evictions().expect("sweep");
+    f.reg.core.recompute_floor().expect("publish the floors");
     assert_eq!(f.source.released.load(Ordering::Acquire), u64::MAX);
     f.node.shutdown().await.expect("shutdown");
 }
@@ -1709,7 +1431,7 @@ async fn the_source_learns_the_lowest_acknowledged_log_position() {
 async fn a_registration_applied_from_elsewhere_moves_the_floor() {
     let clock = Arc::new(ManualClock::new(1_000));
     let f = fixture(clock.clone()).await;
-    let bg = start_service(&f.reg, 100_000, 30);
+    let bg = start_service(&f.reg, 100_000);
     let elsewhere = registry_over(&f.engine, &f.node, clock, Arc::clone(&f.source), 3);
     elsewhere
         .register(registration("remote", 77, ConsumerRetentionPolicy::Strict))
@@ -1731,32 +1453,24 @@ async fn a_failed_flush_keeps_its_heartbeats_buffered() {
     let f = fixture(clock.clone()).await;
     let h = f
         .reg
-        .register(registration(
-            "reader",
-            1,
-            bounded(u64::MAX, u64::MAX, Some(2_000)),
-        ))
+        .register(registration("reader", 1, ConsumerRetentionPolicy::Strict))
         .expect("register");
     f.reg.core.batching_on.store(true, Ordering::Release);
     clock.set(2_500);
     f.reg.heartbeat(&h).expect("buffer heartbeat");
     f.node.shutdown().await.expect("shutdown");
     assert!(f.reg.core.flush_pending_heartbeats().is_err());
-    assert_eq!(f.reg.core.pending_hb.lock().get("reader", 1), Some(2_500));
+    assert_eq!(f.reg.core.pending_hb.lock().len(), 1);
 }
 
-/// The sweep persists buffered heartbeats before judging liveness, and a
-/// heartbeat that arrives while that write is in flight still counts.
+/// A heartbeat that arrives while a flush is writing waits beside the batch
+/// being written, and the same flush writes it after that batch.
 #[test]
-fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
+fn a_heartbeat_buffered_during_a_flush_is_written_by_it() {
     let (reg, clock, _source, pipeline, _dir) = hooked_registry();
     clock.set(1_000);
     let h = reg
-        .register(registration(
-            "reader",
-            1,
-            bounded(u64::MAX, u64::MAX, Some(400)),
-        ))
+        .register(registration("reader", 1, ConsumerRetentionPolicy::Strict))
         .expect("register");
     reg.core.batching_on.store(true, Ordering::Release);
     reg.heartbeat(&h).expect("heartbeat");
@@ -1768,15 +1482,15 @@ fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
             reg.heartbeat(&h).expect("heartbeat during the flush");
         }
     }));
-    let swept = reg.core.sweep_evictions().expect("sweep");
+    reg.core.flush_pending_heartbeats().expect("flush");
+    assert!(reg.core.pending_hb.lock().is_empty());
     assert_eq!(
-        swept.evicted, 0,
-        "a reader with a buffered heartbeat was ended"
+        reg.list_consumers()
+            .iter()
+            .find(|c| c.consumer_id == "reader")
+            .map(|c| c.last_heartbeat_ts_ms),
+        Some(2_000)
     );
-    // The sweep's flush writes the heartbeat that waited beside its first
-    // batch too, so the deadline counts from it.
-    assert_eq!(swept.next_deadline_ms, Some(2_000 + 400 + 1));
-    assert_eq!(ended_for(&reg, "reader"), None);
 }
 
 /// A pipeline that runs a one-shot hook inside the next proposal: what
@@ -2267,37 +1981,32 @@ fn hooked_registry() -> (
     (reg, clock, source, pipeline, dir)
 }
 
-/// On a member that is not the leader the sweep decides nothing: the leader
-/// owns every transition. It still refreshes the floor the member publishes
-/// and keeps the next deadline, so it acts once it leads; heartbeats buffered
-/// here are dropped, since only the leader can record them.
+/// On a member that is not the leader no transition is decided: the leader
+/// owns every one, and a refused one names it. The member still publishes
+/// its floors, and heartbeats buffered here are dropped, since only the
+/// leader can record them.
 #[test]
-fn a_follower_sweep_leaves_transitions_to_the_leader() {
+fn a_follower_leaves_transitions_to_the_leader() {
     let (reg, clock, source, pipeline, _dir) = hooked_registry();
     source.set_head(5);
-    reg.register(registration("idle", 5, bounded(60_000, 1 << 30, Some(400))))
+    reg.register(registration("idle", 5, ConsumerRetentionPolicy::Strict))
         .expect("register on the leader");
     let handle = RegisteredHandle::new("idle", 1);
 
     pipeline.follower.store(true, Ordering::Release);
     reg.core.pending_hb.lock().admit("idle", 1, 100, usize::MAX);
     clock.set(10_000);
-    let swept = reg
-        .core
-        .sweep_evictions()
-        .expect("a follower sweep is not an error");
-    assert_eq!(swept.evicted, 0);
-    assert!(!swept.behind, "a follower schedules no periodic sweep");
-    assert_eq!(
-        swept.next_deadline_ms,
-        Some(401),
-        "the deadline stays for when this member leads"
-    );
-    assert_eq!(ended_for(&reg, "idle"), None, "only the leader ends it");
+    reg.core
+        .flush_pending_heartbeats()
+        .expect("a follower's flush is not an error");
     assert!(
         reg.core.pending_hb.lock().is_empty(),
         "heartbeats only the leader can record are dropped"
     );
+    reg.core
+        .recompute_floor()
+        .expect("a follower publishes its floors");
+    assert_eq!(reg.shard_floor(), 5);
     assert!(
         matches!(
             reg.checkpoint(&handle, 5),
@@ -2305,16 +2014,11 @@ fn a_follower_sweep_leaves_transitions_to_the_leader() {
         ),
         "a transition on a follower names the leader"
     );
-
-    pipeline.follower.store(false, Ordering::Release);
-    assert_eq!(
-        reg.core.sweep_evictions().expect("sweep as leader").evicted,
-        1
-    );
-    assert_eq!(
-        ended_for(&reg, "idle"),
-        Some(TerminalReason::LivenessExpired)
-    );
+    assert!(matches!(
+        reg.unregister(handle),
+        Err(RegistryError::NotLeader { leader_id: Some(2) })
+    ));
+    assert_eq!(ended_for(&reg, "idle"), None);
 }
 
 /// While the source has no room for new retention, a registration is refused
@@ -2362,251 +2066,10 @@ fn a_registration_under_pressure_is_refused_and_admitted_ones_continue() {
     assert_eq!(late.incarnation(), 1, "the refusal used no incarnation");
 }
 
-/// A registry over a store with no consensus log, measuring the store's own
-/// material: what a state delta consumer is charged is the store's fold.
-struct MaterialRegistry {
-    reg: ShardConsumerRegistry,
-    engine: Arc<StorageEngine>,
-    pipeline: Arc<dyn ProposalPipeline>,
-    ids: Arc<ProposalIdGenerator>,
-    _dir: tempfile::TempDir,
-}
-
-fn material_registry() -> MaterialRegistry {
-    let dir = tempfile::tempdir().expect("tempdir");
-    // A clock ahead of the wall clock: the oracle's timestamps follow it.
-    let start = 4_000_000_000_000_000u64;
-    let oracle = Arc::new(
-        coordinode_core::txn::timestamp::TimestampOracle::resume_from(
-            coordinode_core::txn::timestamp::Timestamp::from_raw(start),
-        ),
-    );
-    let engine = Arc::new(
-        StorageEngine::open_with_oracle(
-            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]),
-            oracle,
-        )
-        .expect("open engine"),
-    );
-    keep_all_history(&engine);
-    let source: Arc<dyn RetentionSource> = Arc::new(crate::registry::LogRetentionSource::new(
-        Arc::clone(&engine),
-        Vec::new(),
-        coordinode_storage::oplog::manager::OplogManager::open(
-            &dir.path().join("log"),
-            0,
-            1 << 20,
-            1_000,
-            3_600,
-        )
-        .expect("open an empty log")
-        .retained_floor(),
-        Arc::new(|| 0),
-    ));
-    let pipeline: Arc<dyn ProposalPipeline> = Arc::new(
-        coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(&engine),
-    );
-    let ids = Arc::new(ProposalIdGenerator::with_base(1u64 << 48));
-    let reg = ShardConsumerRegistry::new(
-        Arc::clone(&engine),
-        Arc::clone(&pipeline),
-        Arc::clone(&ids),
-        Arc::new(ManualClock::new(start / 1_000)),
-        source,
-    )
-    .expect("open the registry");
-    MaterialRegistry {
-        reg,
-        engine,
-        pipeline,
-        ids,
-        _dir: dir,
-    }
-}
-
-/// Commit `len` bytes under `key` as a client transaction does, through the
-/// admission every write that changes the material passes; its commit
-/// timestamp.
-fn commit_value(
-    engine: &StorageEngine,
-    pipeline: &dyn ProposalPipeline,
-    ids: &ProposalIdGenerator,
-    key: &[u8],
-    len: usize,
-) -> Result<u64, CommitError> {
-    let oracle = engine.oracle().expect("an oracle");
-    let mut txn = Transaction::begin(engine, Some(oracle.as_ref()), oracle.next());
-    txn.put(Partition::Node, key, &vec![7; len])
-        .expect("stage the write");
-    let write_concern = WriteConcern::default();
-    let ctx = CommitContext {
-        write_concern: &write_concern,
-        pipeline: Some(pipeline),
-        id_gen: Some(ids),
-    };
-    txn.commit(&ctx)
-        .map(|outcome| outcome.commit_ts.expect("a commit timestamp").as_raw())
-}
-
-/// A state delta consumer measured over its byte bound on a large value is
-/// ended only if no write that shrank its material was ordered before the
-/// ending: a client overwriting the value with a small one between the
-/// measurement and the ordered ending lands after it, and the ending was
-/// decided on the material as it stood at its own place in the order.
-/// Before, the overwrite landed first and the consumer was ended on bytes
-/// it no longer required.
-#[test]
-fn a_smaller_write_racing_an_ending_lands_after_it() {
-    let m = material_registry();
-    // Before every write the test makes.
-    let checkpoint = m.engine.oracle().expect("an oracle").next().as_raw();
-    m.reg
-        .register(registration(
-            "delta",
-            checkpoint,
-            bounded(1_000_000_000, 64 << 10, None),
-        ))
-        .expect("register");
-    commit_value(
-        &m.engine,
-        m.pipeline.as_ref(),
-        &m.ids,
-        b"node:value",
-        1 << 20,
-    )
-    .expect("the large value");
-    let small_at = Arc::new(AtomicU64::new(0));
-    let writer = Arc::new(Mutex::new(None));
-    *m.reg.core.before_commit.lock() = Some(Box::new({
-        let (engine, pipeline, ids) = (
-            Arc::clone(&m.engine),
-            Arc::clone(&m.pipeline),
-            Arc::clone(&m.ids),
-        );
-        let (small_at, writer) = (Arc::clone(&small_at), Arc::clone(&writer));
-        move || {
-            // Between the measurement and the ordered ending, another client
-            // replaces the value with a small one.
-            let (done, finished) = std::sync::mpsc::channel();
-            *writer.lock() = Some(std::thread::spawn(move || {
-                let at = commit_value(&engine, pipeline.as_ref(), &ids, b"node:value", 4)
-                    .expect("the small value commits");
-                small_at.store(at, Ordering::Release);
-                let _ = done.send(());
-            }));
-            // Given every chance to land first.
-            let _ = finished.recv_timeout(Duration::from_millis(300));
-        }
-    }));
-    m.reg.core.sweep_evictions().expect("sweep");
-    if let Some(writer) = writer.lock().take() {
-        writer.join().expect("the writer");
-    }
-    let ended_at = m
-        .engine
-        .record_version(Partition::Registry, &encode_registry_key("delta"))
-        .expect("read the record")
-        .expect("a record");
-    assert_eq!(
-        ended_for(&m.reg, "delta"),
-        Some(TerminalReason::RetainedBytesExceeded),
-        "the consumer requiring the large value is ended"
-    );
-    let small = small_at.load(Ordering::Acquire);
-    assert!(
-        small > ended_at,
-        "the small value (at {small}) was ordered before the ending (at {ended_at}) decided on the large one"
-    );
-}
-
-/// A consumer measured within its bound on a first look, then over it on
-/// the final one (a large value landed between), is ended only with the
-/// material scope taken: the final measure without it is not written, the
-/// attempt takes the scope and reads again, and a client overwriting the
-/// value with a small one between that measure and the ordered ending
-/// lands after the ending. Before, the ending went out on the final measure
-/// with no scope held, and the small write landed first.
-#[test]
-fn an_ending_found_only_on_the_final_measure_takes_the_scope_first() {
-    let m = material_registry();
-    let checkpoint = m.engine.oracle().expect("an oracle").next().as_raw();
-    m.reg
-        .register(registration(
-            "delta",
-            checkpoint,
-            bounded(1_000_000_000, 64 << 10, None),
-        ))
-        .expect("register");
-    commit_value(&m.engine, m.pipeline.as_ref(), &m.ids, b"node:value", 4).expect("small");
-    // Between the first look (within the bound) and the decision.
-    *m.reg.core.before_decide.lock() = Some(Box::new({
-        let (engine, pipeline, ids) = (
-            Arc::clone(&m.engine),
-            Arc::clone(&m.pipeline),
-            Arc::clone(&m.ids),
-        );
-        move || {
-            commit_value(&engine, pipeline.as_ref(), &ids, b"node:value", 1 << 20)
-                .expect("the large value");
-        }
-    }));
-    let small_at = Arc::new(Mutex::new(None));
-    let writer = Arc::new(Mutex::new(None));
-    *m.reg.core.before_commit.lock() = Some(Box::new({
-        let (engine, pipeline, ids) = (
-            Arc::clone(&m.engine),
-            Arc::clone(&m.pipeline),
-            Arc::clone(&m.ids),
-        );
-        let (small_at, writer) = (Arc::clone(&small_at), Arc::clone(&writer));
-        move || {
-            let (done, finished) = std::sync::mpsc::channel();
-            *writer.lock() = Some(std::thread::spawn(move || {
-                *small_at.lock() = Some(commit_value(
-                    &engine,
-                    pipeline.as_ref(),
-                    &ids,
-                    b"node:value",
-                    4,
-                ));
-                let _ = done.send(());
-            }));
-            let _ = finished.recv_timeout(Duration::from_millis(300));
-        }
-    }));
-    m.reg.core.sweep_evictions().expect("sweep");
-    if let Some(writer) = writer.lock().take() {
-        writer.join().expect("the writer");
-    }
-    assert_eq!(
-        ended_for(&m.reg, "delta"),
-        Some(TerminalReason::RetainedBytesExceeded),
-        "the consumer over its bound on the final measure is ended"
-    );
-    let ended_at = m
-        .engine
-        .record_version(Partition::Registry, &encode_registry_key("delta"))
-        .expect("read the record")
-        .expect("a record");
-    let written = small_at.lock().take().expect("the writer ran");
-    assert!(
-        match &written {
-            Ok(at) => *at > ended_at,
-            Err(e) => matches!(e, CommitError::Backpressure),
-        },
-        "the small write {written:?} against the ending at {ended_at}"
-    );
-}
-
-/// A pipeline that, once armed, hands the next ending to the log late, on
-/// another thread, and tells its proposer at once that the outcome is not
-/// known: the ending can still apply after the proposer gave up waiting.
+/// A pipeline that, once armed, hands the next registry write to the log
+/// late, on another thread, and tells its proposer at once that the outcome
+/// is not known: the write can still apply after the proposer gave up
+/// waiting.
 struct LateEnding {
     inner: Arc<dyn ProposalPipeline>,
     armed: AtomicBool,
@@ -2640,97 +2103,12 @@ impl ProposalPipeline for LateEnding {
     }
 }
 
-/// An ending whose outcome is not known keeps the material scope until it
-/// is: the ending, handed to the log late, applies on the large value it
-/// measured; a client overwriting that value meanwhile waits, and lands (or
-/// is refused as retryable) after it; the scope is released once a closed
-/// bound past the ending applies. A lower timestamp held unlogged keeps
-/// every closed bound below the ending meanwhile, so its late entry is
-/// still taken.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_ending_in_doubt_keeps_its_protection_until_its_outcome_is_known() {
-    let DoubtRegistry {
-        engine,
-        oracle,
-        node,
-        raft,
-        late,
-        ids,
-        reg,
-        _dir,
-    } = doubt_registry().await;
-    let checkpoint = oracle.next().as_raw();
-    reg.register(registration(
-        "delta",
-        checkpoint,
-        bounded(1_000_000_000, 64 << 10, None),
-    ))
-    .expect("register");
-    let large = commit_value(&engine, raft.as_ref(), &ids, b"node:value", 1 << 20)
-        .expect("the large value");
-    assert!(
-        engine.await_complete_through(large, Duration::from_secs(10)),
-        "the large value is never known complete"
-    );
-    let (_, low) = engine.pending_commits().obligate(|| oracle.next().as_raw());
-    let small = Arc::new(Mutex::new(None));
-    let writer = Arc::new(Mutex::new(None));
-    *reg.core.before_commit.lock() = Some(Box::new({
-        let (engine, raft, ids) = (Arc::clone(&engine), Arc::clone(&raft), Arc::clone(&ids));
-        let (small, writer) = (Arc::clone(&small), Arc::clone(&writer));
-        move || {
-            *writer.lock() = Some(std::thread::spawn(move || {
-                *small.lock() = Some(commit_value(&engine, raft.as_ref(), &ids, b"node:value", 4));
-            }));
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }));
-    late.armed.store(true, Ordering::Release);
-    reg.core.sweep_evictions().expect("sweep");
-    // The ending applies late; once the held timestamp goes, a bound past it
-    // settles the outcome and the scope is released.
-    if let Some(late) = late.late.lock().take() {
-        late.join().expect("the late ending");
-    }
-    drop(low);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !reg.core.settle_unresolved() {
-        assert!(Instant::now() < deadline, "the outcome was never settled");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    if let Some(writer) = writer.lock().take() {
-        writer.join().expect("the writer");
-    }
-    assert_eq!(
-        ended_for(&reg, "delta"),
-        Some(TerminalReason::RetainedBytesExceeded),
-        "the late ending applied"
-    );
-    let ended_at = engine
-        .record_version(Partition::Registry, &encode_registry_key("delta"))
-        .expect("read the record")
-        .expect("a record");
-    let written = small.lock().take().expect("the writer ran");
-    assert!(
-        match &written {
-            Ok(at) => *at > ended_at,
-            // Refused as retryable while it waited behind the decision.
-            Err(e) => matches!(e, CommitError::Backpressure),
-        },
-        "the small write {written:?} against the late ending at {ended_at}"
-    );
-    node.shutdown().await.expect("shutdown");
-}
-
 /// A registry over a one-member Raft group whose pipeline can hand the next
 /// registry write to the log late ([`LateEnding`]).
 struct DoubtRegistry {
-    engine: Arc<StorageEngine>,
     oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
     node: Arc<RaftNode>,
-    raft: Arc<dyn ProposalPipeline>,
     late: Arc<LateEnding>,
-    ids: Arc<ProposalIdGenerator>,
     reg: ShardConsumerRegistry,
     _dir: tempfile::TempDir,
 }
@@ -2783,106 +2161,55 @@ async fn doubt_registry() -> DoubtRegistry {
         .retained_floor(),
         Arc::new(|| 0),
     ));
-    let ids = Arc::new(ProposalIdGenerator::with_base(1u64 << 48));
     let reg = ShardConsumerRegistry::new(
         Arc::clone(&engine),
         Arc::clone(&late) as Arc<dyn ProposalPipeline>,
-        Arc::clone(&ids),
+        Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
         Arc::new(ManualClock::new(start / 1_000)),
         source,
     )
     .expect("open the registry");
     DoubtRegistry {
-        engine,
         oracle,
         node,
-        raft,
         late,
-        ids,
         reg,
         _dir: dir,
     }
 }
 
-/// A registry write that is no terminal decision (another consumer's
-/// checkpoint) and whose outcome is not known, made while a sweep holds the
-/// material scope for an ending, neither takes that scope nor reports its
-/// outcome as a decision's: the checkpoint is retried and lands, and the
-/// ending, known applied, leaves no decision in doubt behind. Before, the
-/// scope lived in shared registry state, and the checkpoint moved it into
-/// the doubt record under its own timestamp and returned `OutcomeUnknown`.
+/// An acknowledgement whose outcome is not known when its proposal returns
+/// is read back and retried conditioned on the record it read: whichever of
+/// the late copy and the retry applies first moves the record, the other is
+/// refused where the log applies it, and the position lands exactly once.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_concurrent_write_in_doubt_does_not_take_a_decisions_scope() {
+async fn an_acknowledgement_in_doubt_lands_once() {
     let DoubtRegistry {
-        engine,
         oracle,
         node,
-        raft,
         late,
-        ids,
         reg,
         _dir,
+        ..
     } = doubt_registry().await;
-    let reg = Arc::new(reg);
     let at = oracle.next().as_raw();
-    reg.register(registration(
-        "delta",
-        at,
-        bounded(1_000_000_000, 64 << 10, None),
-    ))
-    .expect("register the delta");
-    let other = reg
-        .register(registration(
-            "other",
-            at,
-            bounded(1_000_000_000, 1 << 40, None),
-        ))
-        .expect("register the other");
-    let large = commit_value(&engine, raft.as_ref(), &ids, b"node:value", 1 << 20)
-        .expect("the large value");
-    assert!(
-        engine.await_complete_through(large, Duration::from_secs(10)),
-        "the large value is never known complete"
-    );
-    // Keeps every closed bound below the checkpoint, so its outcome stays
-    // unknown for as long as a decision would wait on it.
-    let (_, low) = engine.pending_commits().obligate(|| oracle.next().as_raw());
-    let checkpointed = Arc::new(Mutex::new(None));
-    *reg.core.before_commit.lock() = Some(Box::new({
-        let (reg, late, checkpointed) = (
-            Arc::clone(&reg),
-            Arc::clone(&late),
-            Arc::clone(&checkpointed),
-        );
-        let seqno = oracle.next().as_raw();
-        move || {
-            // The sweep holds the scope here; the checkpoint is handed to
-            // the log late.
-            late.armed.store(true, Ordering::Release);
-            *checkpointed.lock() = Some(reg.checkpoint(&other, seqno));
-        }
-    }));
-    reg.core.sweep_evictions().expect("sweep");
-    let doubt = reg
-        .core
-        .unresolved
-        .lock()
-        .as_ref()
-        .map(|d| d.consumer_id.clone());
+    let h = reg
+        .register(registration("c", at, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    let to = oracle.next().as_raw();
+    late.armed.store(true, Ordering::Release);
+    let acked = reg.checkpoint(&h, to);
     if let Some(late) = late.late.lock().take() {
-        late.join().expect("the late checkpoint");
+        late.join().expect("the late copy");
     }
-    drop(low);
-    let checkpointed = checkpointed.lock().take().expect("the checkpoint ran");
-    assert!(
-        checkpointed.is_ok(),
-        "a checkpoint is no decision: retried, not reported in doubt: {checkpointed:?}"
-    );
-    assert_eq!(doubt, None, "no decision was left in doubt");
-    assert_eq!(
-        ended_for(&reg, "delta"),
-        Some(TerminalReason::RetainedBytesExceeded),
-        "the ending applied"
-    );
+    acked.expect("an acknowledgement in doubt is retried, not reported");
+    let seen = reg
+        .list_consumers()
+        .into_iter()
+        .find(|c| c.consumer_id == "c")
+        .expect("listed");
+    assert_eq!(seen.checkpoint_seqno, to);
+    assert_eq!(seen.state, RegistrationState::Live);
+    assert_eq!(reg.shard_floor(), to);
     node.shutdown().await.expect("shutdown");
 }

@@ -3,10 +3,11 @@
 //! for them.
 //!
 //! Each consumer registers with an explicit retention policy. A STRICT one
-//! keeps what it needs until it is cancelled; a BOUNDED one until a declared
-//! bound is crossed, when its registration ends with the reason. The store's
-//! journal (for log consumers) and its MVCC history (for the others) are
-//! kept from the lowest position a live registration needs. The registry is
+//! keeps what it needs until it is cancelled; an ordinary one records its
+//! position only, and learns of history the store no longer holds as
+//! `RetentionLost`. The store's journal (for log consumers) and its MVCC
+//! history (for the others) are kept from the lowest position a live STRICT
+//! registration needs. The registry is
 //! the one the server runs; here it runs over the store's own journal, with
 //! its background service on a thread of its own, so a database without an
 //! async runtime has it.

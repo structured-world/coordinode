@@ -75,7 +75,6 @@ pub mod consumer {
         ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot,
         InitialSeqno, PriorIncarnation, RegisteredHandle, RegistrationState, RegistryError,
         RetentionPressure, RetentionSpace, RetentionSummary, TerminalReason, TopologyScope,
-        ValidatedRetentionBounds,
     };
 }
 

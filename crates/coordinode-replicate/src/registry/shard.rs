@@ -2,26 +2,25 @@
 //! [`SeqnoConsumerRegistry`].
 //!
 //! Every transition of a registration (register, checkpoint, heartbeat,
-//! cancel, a BOUNDED bound crossed) is one transaction over its record in
-//! `Partition::Registry`, conditioned on the version of the record it read.
-//! Two transitions racing over one record cannot both land: the second finds
-//! the version moved, reads again and decides against what is there now. An
-//! acknowledgement racing an expiry therefore either advances the live
-//! incarnation before the expiry is judged, or finds it ended.
+//! cancel) is one transaction over its record in `Partition::Registry`,
+//! conditioned on the version of the record it read. Two transitions racing
+//! over one record cannot both land: the second finds the version moved,
+//! reads again and decides against what is there now.
 //!
 //! An ended registration keeps its record. The incarnation it carries is
 //! what refuses a handle of the ended registration, a heartbeat delayed past
 //! the end, and numbers the next registration of the same id.
 //!
 //! The retention floors (MVCC seqno space, oplog index space) are the
-//! minimum checkpoint over live registrations, cached so the downstream
-//! feeds read them without scanning.
+//! minimum checkpoint over live STRICT registrations, cached so the
+//! downstream feeds read them without scanning. Ordinary registrations are
+//! progress only and hold nothing.
 //!
 //! Heartbeats buffer on the node and flush as one coalesced transaction per
-//! window; BOUNDED bounds are judged by a background sweep that runs when the
-//! earliest bound can be crossed and when the registry keyspace changes.
+//! window; the floors are published again whenever the registry keyspace
+//! changes.
 //!
-//! A new registration is refused while the source cannot take on more
+//! A new STRICT registration is refused while the source cannot take on more
 //! retention (the server's source says so under Stop write pressure). Every
 //! other transition passes the write-pressure gate, since it releases or
 //! records retention rather than taking on more.
@@ -44,7 +43,6 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::footprint::ReclaimScope;
 use coordinode_storage::engine::oplog_journal::JournalHold;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::engine::pending::MaterialClaim;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
 use parking_lot::{Condvar, Mutex};
 
@@ -66,20 +64,6 @@ use coordinode_storage::engine::applied::AppliedEvent;
 /// reads afresh, so only writers landing between every read and its commit
 /// exhaust them.
 const TRANSITION_ATTEMPTS: u32 = 16;
-
-/// How long a terminal decision waits for the writes sharing the material
-/// scope to land, and then for the cut to cover them. Those writes are in
-/// flight between their validation and their apply.
-const DECISION_WAIT: Duration = Duration::from_secs(5);
-
-/// How long a terminal decision whose write's outcome is unknown waits for
-/// it on the spot; past it the protection is kept and settled by a later
-/// sweep.
-#[cfg(not(test))]
-const RESOLVE_WAIT: Duration = Duration::from_secs(5);
-/// Shorter in tests, which hold an outcome in doubt on purpose.
-#[cfg(test)]
-const RESOLVE_WAIT: Duration = Duration::from_millis(300);
 
 /// Pause before attempt `attempt` (from 1): a lost attempt usually met a
 /// commit to the same record still in flight, which lands within a write's
@@ -147,6 +131,7 @@ const _: () = assert!(MAX_CONSUMER_ID_BYTES <= MAX_PENDING_HEARTBEAT_BYTES);
 impl PendingHeartbeats {
     /// The latest buffered heartbeat of `consumer_id`'s `incarnation`,
     /// waiting or being written.
+    #[cfg(test)]
     fn get(&self, consumer_id: &str, incarnation: u64) -> Option<u64> {
         let of = |beats: &Beats| {
             beats
@@ -215,25 +200,19 @@ impl PendingHeartbeats {
     }
 }
 
-/// Tuning for the background heartbeat-flush and bound-sweep service.
+/// Tuning for the background heartbeat-flush and floor-publication service.
 #[derive(Debug, Clone, Copy)]
 pub struct BackgroundConfig {
     /// Drain window for buffered heartbeats: the first heartbeat buffered
     /// opens a window, and the heartbeats of the window go in one transaction
     /// regardless of consumer count. Nothing buffered, nothing runs.
     pub heartbeat_window_ms: u64,
-    /// Shortest gap between two sweeps. A sweep runs when the earliest bound
-    /// can be crossed and when the registry keyspace changes; while a BOUNDED
-    /// consumer is behind its source, at this cadence, since the source
-    /// growing is what moves its retained bytes.
-    pub eviction_interval_ms: u64,
 }
 
 impl Default for BackgroundConfig {
     fn default() -> Self {
         Self {
             heartbeat_window_ms: 1_000,
-            eviction_interval_ms: 1_000,
         }
     }
 }
@@ -242,32 +221,13 @@ impl Default for BackgroundConfig {
 enum Step<T> {
     /// Write this record, conditioned on the version read, then answer `T`.
     Write(RegistryEntry, T),
-    /// End the registration with this record, decided again where the log
-    /// applies it: only while the registration, its heartbeat and the
-    /// material basis still hold the bytes this decision read. Answer `T`
-    /// once it is written; read again when it was refused.
-    End(RegistryEntry, T),
     /// Nothing to write; answer `T`.
     Keep(T),
 }
 
-/// The registry key of the logical material basis the MVCC consumers are
-/// measured against. A publication that changes what their checkpoints
-/// require rewrites it, in the registry's own order, so an ending decided
-/// on an earlier basis is refused where it applies.
-pub(crate) const MATERIAL_BASIS_KEY: &[u8] = b"basis:mvcc";
-
 /// A registration as read: the record with its heartbeat's liveness, the
 /// record's version, and its stored bytes.
 type StoredEntry = (RegistryEntry, Option<u64>, Vec<u8>);
-
-/// The registry records a decision read, as their bytes: what an ending
-/// requires to be unchanged where it applies.
-struct ReadBytes {
-    entry: Option<Vec<u8>>,
-    heartbeat: Option<Option<Vec<u8>>>,
-    basis: Option<Vec<u8>>,
-}
 
 /// What holds a new registration's starting position until its floor is
 /// published. Dropping it releases the position to the floor; nothing reads
@@ -301,25 +261,6 @@ impl Wake {
         set(&mut self.reasons.lock());
         self.raised.notify_one();
     }
-}
-
-/// Whether a `kind` consumer ending for `reason` ends on its material, which
-/// writes change: a state delta's lag or retained bytes. Silence, and other
-/// kinds' measures (a log's, a fixed snapshot's), are not changed by them.
-fn ends_on(kind: ConsumerKind, reason: TerminalReason) -> bool {
-    kind == ConsumerKind::LsmStateDelta
-        && matches!(
-            reason,
-            TerminalReason::ProgressLagExceeded | TerminalReason::RetainedBytesExceeded
-        )
-}
-
-/// A terminal decision whose outcome is not known: the claim it was measured
-/// and written under, the timestamp of its write, and whose ending it is.
-struct Unresolved {
-    claim: MaterialClaim,
-    commit_ts: u64,
-    consumer_id: String,
 }
 
 /// Shared registry state, held by the facade and the background tasks.
@@ -362,18 +303,10 @@ struct RegistryCore {
     wake: Wake,
     /// Readers' notices of writes to the records they watch.
     watches: Arc<Watches>,
-    /// A terminal decision whose write was handed to the log with its
-    /// outcome not known: its own claim stays held until a closed bound past
-    /// its timestamp applies here, when the write has applied or never will.
-    unresolved: Mutex<Option<Unresolved>>,
     /// Runs once between a transition's read and its commit: what another
     /// writer does in that window.
     #[cfg(test)]
     before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Runs once between a sweep's first measure of a consumer and the
-    /// attempt that decides on it.
-    #[cfg(test)]
-    before_decide: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once between a floor scan and its publication.
     #[cfg(test)]
     after_floor_scan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -500,26 +433,18 @@ impl RegistryCore {
     }
 
     /// Propose `next` as the record of `consumer_id`, decided where the log
-    /// applies it against the records `read` holds: the registration (so
-    /// every lifecycle transition, an acknowledgement or an ending, is
-    /// decided against whichever applied before it), its heartbeat when the
-    /// decision was on liveness, and the material basis when `on_basis`.
-    /// `Ok(true)` once `next` is the record; `Ok(false)` when it was refused
-    /// (another write moved one of them first) or its outcome is unknown and
-    /// it is not the record: the caller reads again, and a repeat is refused
-    /// once either landed, since the record no longer holds the bytes it
-    /// expects.
-    ///
-    /// `claim` is the material scope this attempt holds, if it is a decision
-    /// measured under it: with an outcome not known it is kept, with this
-    /// attempt's timestamp, until the outcome is.
+    /// applies it against `read`, the record's bytes as this transition read
+    /// them: every lifecycle transition is decided against whichever applied
+    /// before it. `Ok(true)` once `next` is the record; `Ok(false)` when it
+    /// was refused (another write moved the record first) or its outcome is
+    /// unknown and it is not the record: the caller reads again, and a
+    /// repeat is refused once either landed, since the record no longer holds
+    /// the bytes it expects.
     fn write_conditionally(
         &self,
         consumer_id: &str,
         next: &RegistryEntry,
-        read: &ReadBytes,
-        on_basis: bool,
-        claim: &mut Option<MaterialClaim>,
+        read: Option<Vec<u8>>,
     ) -> Result<bool, RegistryError> {
         use coordinode_core::txn::proposal::{MetadataCommand, Mutation, RaftProposal};
         use coordinode_core::txn::timestamp::Timestamp;
@@ -527,13 +452,7 @@ impl RegistryCore {
         let value = next
             .encode()
             .map_err(|e| RegistryError::Replication(format!("encode registry entry: {e}")))?;
-        let mut expect = vec![(key.clone(), read.entry.clone())];
-        if on_basis {
-            expect.push((MATERIAL_BASIS_KEY.to_vec(), read.basis.clone()));
-        }
-        if let Some(heartbeat) = &read.heartbeat {
-            expect.push((encode_heartbeat_key(consumer_id), heartbeat.clone()));
-        }
+        let expect = vec![(key.clone(), read)];
         let oracle = self.engine.oracle().ok_or_else(|| {
             RegistryError::Replication(
                 "the registry needs an engine with a timestamp oracle".into(),
@@ -541,8 +460,6 @@ impl RegistryCore {
         })?;
         let id = self.id_gen.next();
         // Held until the entry is handed over, so no closed bound passes it.
-        // Registry records are no consumer's material: a terminal decision
-        // holding the material scope writes this itself.
         let (commit_ts, held) = self
             .engine
             .pending_commits()
@@ -559,7 +476,7 @@ impl RegistryCore {
             commit_ts: Timestamp::from_raw(commit_ts),
             start_ts: Timestamp::from_raw(0),
             // The store's own work where the thread gives room back (an
-            // ending, an acknowledgement under a sweep), as for any commit.
+            // acknowledgement, a cancellation), as for any commit.
             bypass_rate_limiter: coordinode_storage::engine::footprint::reclaiming(),
         };
         use coordinode_core::txn::proposal::ProposalError;
@@ -580,90 +497,14 @@ impl RegistryCore {
                 | ProposalError::Mismatched(_)
                 | ProposalError::InvalidWriteConcern(_)),
             ) => tracing::warn!(error = %e, consumer_id, "registry: write refused before the log"),
-            // Handed to the log, outcome not known: it may still apply.
+            // Handed to the log, outcome not known: it may still apply. The
+            // caller reads again; a repeat is refused once this one landed.
             Err(e) => {
                 tracing::warn!(error = %e, consumer_id, "registry: write outcome unknown");
-                drop(held);
-                // A terminal decision keeps its protection until the outcome
-                // is known: the write applies or never will once a closed
-                // bound past its timestamp applies here.
-                if claim.is_some() && !self.resolved(commit_ts, RESOLVE_WAIT) {
-                    if let Some(claim) = claim.take() {
-                        *self.unresolved.lock() = Some(Unresolved {
-                            claim,
-                            commit_ts,
-                            consumer_id: consumer_id.to_string(),
-                        });
-                    }
-                    return Err(RegistryError::OutcomeUnknown {
-                        consumer_id: consumer_id.to_string(),
-                    });
-                }
-                return Ok(self.read_raw(&key)?.as_deref() == Some(value.as_slice()));
             }
         }
         drop(held);
         Ok(self.read_raw(&key)?.as_deref() == Some(value.as_slice()))
-    }
-
-    /// Whether the write proposed at `commit_ts` applied here or never will,
-    /// waiting up to `wait` for that to be known. On a store with a
-    /// consensus log it is known once a closed bound past `commit_ts`
-    /// applies here: every entry below that bound is in the log before it.
-    /// A store without one applies a write before its proposal returns.
-    fn resolved(&self, commit_ts: u64, wait: Duration) -> bool {
-        self.engine.raft_fence().is_none() || self.engine.await_complete_through(commit_ts, wait)
-    }
-
-    /// Whether `entry` would end on its material now, measured outside the
-    /// material scope: a state delta's lag or retained bytes. Its other
-    /// endings (silence) and other kinds' (a log's, a fixed snapshot's) are
-    /// not changed by later writes to the material.
-    fn ends_on_material(&self, entry: &RegistryEntry) -> bool {
-        entry
-            .termination(self.clock.now_ms(), self.source.as_ref())
-            .is_some_and(|reason| ends_on(entry.kind, reason))
-    }
-
-    /// Take the material scope for a terminal decision, and wait for the cut
-    /// to cover every write that shared it before; `None` when either is not
-    /// had within [`DECISION_WAIT`], holding nothing then.
-    fn claim_decision(&self) -> Option<MaterialClaim> {
-        let claim = self
-            .engine
-            .pending_commits()
-            .claim_material(DECISION_WAIT)
-            .ok()?;
-        // No write ever shared the scope: there is nothing to wait for.
-        (claim.through() == 0
-            || self
-                .engine
-                .await_complete_through(claim.through(), DECISION_WAIT))
-        .then_some(claim)
-    }
-
-    /// Settle a terminal decision whose outcome was not known: release its
-    /// protection once the outcome is. `true` when none is left in doubt,
-    /// and another decision on the material may be taken.
-    fn settle_unresolved(&self) -> bool {
-        let mut unresolved = self.unresolved.lock();
-        match &*unresolved {
-            None => true,
-            Some(doubt) => {
-                if self.resolved(doubt.commit_ts, Duration::ZERO) {
-                    tracing::info!(
-                        consumer_id = doubt.consumer_id,
-                        commit_ts = doubt.commit_ts,
-                        measured_through = doubt.claim.through(),
-                        "registry: an ending in doubt is settled"
-                    );
-                    *unresolved = None;
-                    true
-                } else {
-                    false
-                }
-            }
-        }
     }
 
     /// The heartbeat record of `consumer_id` and its version, the version
@@ -728,84 +569,28 @@ impl RegistryCore {
 
     /// Run `decide` against the current record of `consumer_id` and commit
     /// what it chose, reading again whenever another writer got there first.
-    /// Heartbeats do not count as another writer: the record's liveness may
-    /// be a heartbeat older than the commit, which only a decision on
-    /// liveness cares about ([`Self::transition_deciding`]).
+    /// Heartbeats do not count as another writer: they write a record of
+    /// their own.
     fn transition<T>(
         &self,
         consumer_id: &str,
-        decide: impl FnMut(Option<RegistryEntry>) -> Result<Step<T>, RegistryError>,
-    ) -> Result<T, RegistryError> {
-        self.transition_with(consumer_id, false, &mut None, decide)
-    }
-
-    /// [`Self::transition`] for a decision that depends on how long ago the
-    /// consumer was last heard from: a heartbeat landing before its commit
-    /// makes it read again, so a consumer alive at the commit is never ended
-    /// as silent. `claim` is the material scope the attempt holds, if any: an
-    /// ending it writes keeps that claim while its outcome is not known.
-    fn transition_deciding<T>(
-        &self,
-        consumer_id: &str,
-        claim: &mut Option<MaterialClaim>,
-        decide: impl FnMut(Option<RegistryEntry>) -> Result<Step<T>, RegistryError>,
-    ) -> Result<T, RegistryError> {
-        self.transition_with(consumer_id, true, claim, decide)
-    }
-
-    fn transition_with<T>(
-        &self,
-        consumer_id: &str,
-        on_liveness: bool,
-        claim: &mut Option<MaterialClaim>,
         mut decide: impl FnMut(Option<RegistryEntry>) -> Result<Step<T>, RegistryError>,
     ) -> Result<T, RegistryError> {
         for attempt in 0..TRANSITION_ATTEMPTS {
             if attempt > 0 {
                 std::thread::sleep(backoff(attempt));
             }
-            // Read before the record, so the heartbeat merged into it is no
-            // older than the bytes the commit then requires.
-            let heartbeat = if on_liveness {
-                Some(self.read_raw(&encode_heartbeat_key(consumer_id))?)
-            } else {
-                None
-            };
-            // The basis first: an ending decided now is conditioned on the
-            // one its measurement was taken against, never a later one.
-            let basis = self.read_raw(MATERIAL_BASIS_KEY)?;
-            let (current, entry_bytes) = match self.read_entry_with_bytes(consumer_id)? {
+            let (current, read) = match self.read_entry_with_bytes(consumer_id)? {
                 Some((entry, _, bytes)) => (Some(entry), Some(bytes)),
                 None => (None, None),
-            };
-            let read = ReadBytes {
-                entry: entry_bytes,
-                heartbeat,
-                basis,
             };
             // What this record holds the floors at now, if anything.
             let held = current
                 .as_ref()
-                .filter(|entry| entry.is_live())
+                .filter(|entry| entry.holds_history())
                 .map(|entry| (entry.kind.is_seqno_space(), entry.checkpoint_seqno));
             match decide(current)? {
                 Step::Keep(answer) => return Ok(answer),
-                Step::End(ended, answer) => {
-                    #[cfg(test)]
-                    {
-                        // Between the measurement and the ordered decision.
-                        let hook = self.before_commit.lock().take();
-                        if let Some(hook) = hook {
-                            hook();
-                        }
-                    }
-                    if self.write_conditionally(consumer_id, &ended, &read, true, claim)? {
-                        if !self.batching_on.load(Ordering::Acquire) {
-                            self.recompute_floor()?;
-                        }
-                        return Ok(answer);
-                    }
-                }
                 Step::Write(entry, answer) => {
                     #[cfg(test)]
                     {
@@ -819,16 +604,15 @@ impl RegistryCore {
                     // returning: history the new position needs must not be
                     // collected meanwhile. One that can only raise it (an
                     // acknowledgement, an end) leaves that to the background
-                    // sweep its applied write triggers; a floor published
+                    // service its applied write wakes; a floor published
                     // late only keeps history longer. Without the background
                     // service nothing else would publish it.
-                    let lowers = entry.is_live()
+                    let lowers = entry.holds_history()
                         && held.is_none_or(|(seqno_space, checkpoint)| {
                             seqno_space != entry.kind.is_seqno_space()
                                 || entry.checkpoint_seqno < checkpoint
                         });
-                    // Not an ending: never under a decision's claim.
-                    if self.write_conditionally(consumer_id, &entry, &read, false, &mut None)? {
+                    if self.write_conditionally(consumer_id, &entry, read)? {
                         if lowers || !self.batching_on.load(Ordering::Acquire) {
                             self.recompute_floor()?;
                         }
@@ -986,11 +770,17 @@ impl RegistryCore {
             .prefix_scan(Partition::Registry, REGISTRY_KEY_PREFIX)
             .map_err(|e| RegistryError::Replication(e.to_string()))?;
         for guard in iter {
-            let (_, value) = guard
+            let (key, value) = guard
                 .into_inner()
                 .map_err(|e| RegistryError::Replication(e.to_string()))?;
-            let entry = RegistryEntry::decode(&value)
-                .map_err(|e| RegistryError::Replication(format!("decode registry entry: {e}")))?;
+            // A record of a policy this version does not offer is refused
+            // by name, never read as one it does.
+            let entry = RegistryEntry::decode(&value).map_err(|e| {
+                RegistryError::Replication(format!(
+                    "decode registry entry {:?}: {e}",
+                    String::from_utf8_lossy(&key)
+                ))
+            })?;
             let heartbeat = heartbeats.get(entry.consumer_id.as_bytes()).copied();
             out.push(entry.with_heartbeat(heartbeat));
         }
@@ -1132,171 +922,6 @@ impl RegistryCore {
             "heartbeat flush kept conflicting under {TRANSITION_ATTEMPTS} attempts"
         )))
     }
-
-    /// End every live BOUNDED registration whose bound is crossed, durably and
-    /// one record at a time, then refresh the floors.
-    fn sweep_evictions(&self) -> Result<Sweep, RegistryError> {
-        let _progress = ReclaimScope::enter();
-        // A buffered heartbeat is a sign of life the stored record does not
-        // show yet: persist it before judging liveness.
-        self.flush_pending_heartbeats()?;
-        // A member that is not the leader decides no transition; it keeps the
-        // deadlines so its sweep acts once it leads, and refreshes its floors.
-        let mut leads = true;
-        let mut evicted = 0usize;
-        let mut next_deadline_ms: Option<u64> = None;
-        let mut behind = false;
-        // An ending whose outcome was not known is settled first: its
-        // protection stays until it is, and no other decision on the material
-        // is taken meanwhile.
-        let may_decide = self.settle_unresolved();
-        for entry in self.scan_entries()? {
-            if !entry.is_live() {
-                continue;
-            }
-            let consumer_id = entry.consumer_id.clone();
-            let incarnation = entry.incarnation;
-            if !leads {
-                if let Some(at) = entry.next_deadline_ms(self.source.as_ref()) {
-                    next_deadline_ms = Some(next_deadline_ms.map_or(at, |n| n.min(at)));
-                }
-                continue;
-            }
-            // An ending on a state delta's material is measured again and
-            // ordered with the material scope held by this attempt, so no
-            // write changes what it measured before its outcome is known. The
-            // measure taken here, outside the scope, only says whether to take
-            // it now; a final measure that ends on the material without it is
-            // not written, and the attempt takes the scope and reads again.
-            let mut claim = None;
-            if self.ends_on_material(&entry) {
-                claim = if may_decide {
-                    self.claim_decision()
-                } else {
-                    None
-                };
-                if claim.is_none() {
-                    // Tried again on the next sweep.
-                    behind = true;
-                    continue;
-                }
-            }
-            #[cfg(test)]
-            {
-                let hook = self.before_decide.lock().take();
-                if let Some(hook) = hook {
-                    hook();
-                }
-            }
-            let transition = loop {
-                let holds = claim.is_some();
-                let mut needs_claim = false;
-                let transition = self.transition_deciding(&consumer_id, &mut claim, |current| {
-                    needs_claim = false;
-                    let Some(mut current) = current else {
-                        return Ok(Step::Keep(None));
-                    };
-                    if current.incarnation != incarnation || !current.is_live() {
-                        return Ok(Step::Keep(None));
-                    }
-                    // A heartbeat buffered while the flush above was writing
-                    // is only in the buffer, and it is a sign of life.
-                    if let Some(ts) = self.pending_hb.lock().get(&consumer_id, incarnation) {
-                        current.last_heartbeat_ts_ms = current.last_heartbeat_ts_ms.max(ts);
-                    }
-                    let now = self.clock.now_ms();
-                    match current.termination(now, self.source.as_ref()) {
-                        Some(reason) if ends_on(current.kind, reason) && !holds => {
-                            needs_claim = true;
-                            Ok(Step::Keep(None))
-                        }
-                        Some(reason) => {
-                            let checkpoint = current.checkpoint_seqno;
-                            Ok(Step::End(
-                                self.terminated(current, reason, now),
-                                Some((reason, checkpoint)),
-                            ))
-                        }
-                        None => Ok(Step::Keep(None)),
-                    }
-                });
-                if !needs_claim {
-                    break transition;
-                }
-                claim = if may_decide {
-                    self.claim_decision()
-                } else {
-                    None
-                };
-                if claim.is_none() {
-                    behind = true;
-                    break transition;
-                }
-            };
-            // Its outcome known, the attempt gives the scope back; one still
-            // in doubt moved its claim to `unresolved`.
-            drop(claim);
-            let ended = match transition {
-                Ok(ended) => ended,
-                Err(RegistryError::NotLeader { .. }) => {
-                    leads = false;
-                    None
-                }
-                Err(RegistryError::OutcomeUnknown { .. }) => {
-                    behind = true;
-                    None
-                }
-                Err(e) => return Err(e),
-            };
-            match ended {
-                Some((reason, checkpoint)) => {
-                    evicted += 1;
-                    tracing::info!(
-                        consumer_id,
-                        incarnation,
-                        ?reason,
-                        checkpoint,
-                        "registry: bounded consumer terminated"
-                    );
-                }
-                None => {
-                    if let Some(at) = entry.next_deadline_ms(self.source.as_ref()) {
-                        next_deadline_ms = Some(next_deadline_ms.map_or(at, |n| n.min(at)));
-                    }
-                    if leads
-                        && matches!(entry.retention, ConsumerRetentionPolicy::Bounded(_))
-                        && entry.checkpoint_seqno < self.source.head(entry.kind)
-                    {
-                        behind = true;
-                    }
-                }
-            }
-        }
-        if evicted > 0 {
-            metrics::counter!("registry_evictions_total").increment(evicted as u64);
-        }
-        // Always refresh: a registration ended or advanced through another
-        // member must reach the engine even when this sweep ended nothing.
-        self.recompute_floor()?;
-        Ok(Sweep {
-            evicted,
-            next_deadline_ms,
-            behind,
-        })
-    }
-}
-
-/// What one sweep did and when the next one is due.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Sweep {
-    /// Registrations ended.
-    evicted: usize,
-    /// When the earliest live bound can be crossed with nothing else
-    /// happening (clock ms), or `None` when none can.
-    next_deadline_ms: Option<u64>,
-    /// Whether a live BOUNDED consumer is behind its source, whose growth
-    /// moves the bytes it requires.
-    behind: bool,
 }
 
 /// Per-shard consumer-retention registry backed by `Partition::Registry`.
@@ -1345,11 +970,8 @@ impl ShardConsumerRegistry {
             flushing: Mutex::new(()),
             wake: Wake::default(),
             watches: Arc::new(Watches::default()),
-            unresolved: Mutex::new(None),
             #[cfg(test)]
             before_commit: Mutex::new(None),
-            #[cfg(test)]
-            before_decide: Mutex::new(None),
             #[cfg(test)]
             after_floor_scan: Mutex::new(None),
         });
@@ -1446,7 +1068,8 @@ impl ShardConsumerRegistry {
     }
 
     /// Start the background service: coalesced heartbeat flush and the
-    /// bound sweep. Switches `heartbeat` to buffered mode. Returns a handle
+    /// floors published again whenever the registry changes. Switches
+    /// `heartbeat` to buffered mode. Returns a handle
     /// whose [`stop`](RegistryBackground::stop) does a final flush.
     ///
     /// The service is one thread of its own, not a task on an async runtime:
@@ -1463,8 +1086,8 @@ impl ShardConsumerRegistry {
         self.core.batching_on.store(true, Ordering::Release);
 
         // A registration another member wrote changes the floor this member
-        // publishes, so a write applied to the registry keyspace asks for a
-        // sweep, and tells the readers watching that record. The feed is a
+        // publishes, so a write applied to the registry keyspace asks for the
+        // floors again, and tells the readers watching that record. The feed is a
         // blocking subscription; one parked thread relays it.
         let applied = self.core.engine.subscribe_applied(Partition::Registry, 16);
         let applied_stop = applied.stopper();
@@ -1516,15 +1139,14 @@ impl ShardConsumerRegistry {
 
 impl RegistryCore {
     /// The background service's loop: flush heartbeats a window after the
-    /// first one buffered, sweep when a bound can be crossed or the registry
+    /// first one buffered, publish the floors again whenever the registry
     /// changed, until stopped; then a final flush.
     fn serve(&self, cfg: BackgroundConfig) {
         let window = Duration::from_millis(cfg.heartbeat_window_ms);
-        let gap = Duration::from_millis(cfg.eviction_interval_ms);
         let mut flush_at: Option<Instant> = None;
-        // The first sweep publishes the floor the stored registrations hold.
-        let mut sweep_at: Option<Instant> = Some(Instant::now());
-        let mut last_sweep: Option<Instant> = None;
+        // The first publication is of the floors the stored registrations
+        // hold.
+        let mut publish_at: Option<Instant> = Some(Instant::now());
         loop {
             let (heartbeat, changed, stop) = {
                 let mut reasons = self.wake.reasons.lock();
@@ -1535,7 +1157,7 @@ impl RegistryCore {
                     if reasons.stop || reasons.registry_changed || opens {
                         break;
                     }
-                    let due = match (flush_at, sweep_at) {
+                    let due = match (flush_at, publish_at) {
                         (Some(a), Some(b)) => Some(a.min(b)),
                         (a, b) => a.or(b),
                     };
@@ -1562,8 +1184,7 @@ impl RegistryCore {
                 flush_at = Some(now + window);
             }
             if changed {
-                let soonest = last_sweep.map_or(now, |at| at + gap);
-                sweep_at = Some(sweep_at.map_or(soonest, |due| due.min(soonest)));
+                publish_at = Some(now);
             }
             if flush_at.is_some_and(|at| at <= now) {
                 flush_at = None;
@@ -1573,26 +1194,15 @@ impl RegistryCore {
                     flush_at = Some(Instant::now() + window);
                 }
             }
-            if sweep_at.is_some_and(|at| at <= now) {
-                last_sweep = Some(now);
-                sweep_at = match self.sweep_evictions() {
-                    Ok(sweep) => {
-                        if sweep.evicted > 0 {
-                            tracing::debug!(evicted = sweep.evicted, "registry bound sweep");
-                        }
-                        let deadline = sweep.next_deadline_ms.map(|at_ms| {
-                            let wait = at_ms.saturating_sub(self.clock.now_ms());
-                            now + Duration::from_millis(wait).max(gap)
-                        });
-                        let periodic = sweep.behind.then_some(now + gap);
-                        match (deadline, periodic) {
-                            (Some(a), Some(b)) => Some(a.min(b)),
-                            (a, b) => a.or(b),
-                        }
-                    }
+            if publish_at.is_some_and(|at| at <= now) {
+                // A registration ended or advanced through another member
+                // must reach the engine; a failed publication is tried again
+                // a window on.
+                publish_at = match self.recompute_floor() {
+                    Ok(_) => None,
                     Err(e) => {
-                        tracing::warn!(error = %e, "registry bound sweep failed");
-                        Some(now + gap)
+                        tracing::warn!(error = %e, "registry floor publication failed");
+                        Some(now + window)
                     }
                 };
             }
@@ -1668,22 +1278,16 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
             });
         }
         self.core.check_scope(&reg.scope)?;
-        if matches!(reg.retention, ConsumerRetentionPolicy::Bounded(_))
-            && !self.core.source.accounts(reg.kind)
-        {
-            return Err(RegistryError::InvalidRetention(format!(
-                "this shard cannot measure progress age and required bytes for {:?} consumers, \
-                 so a BOUNDED limit could not be judged; register it STRICT",
-                reg.kind
-            )));
+        // A STRICT registration is new retention; it is admitted only while
+        // the store has room to keep it beside what it already owes. An
+        // ordinary one holds nothing, and transitions that release or record
+        // retention are never held back.
+        if reg.retention == ConsumerRetentionPolicy::Strict {
+            self.core
+                .source
+                .admits(reg.kind)
+                .map_err(RegistryError::Backpressure)?;
         }
-        // A registration is new retention; it is admitted only while the
-        // store has room to keep it beside what it already owes. Transitions
-        // that release or record retention are never held back.
-        self.core
-            .source
-            .admits(reg.kind)
-            .map_err(RegistryError::Backpressure)?;
         // Dropped once the registration has published its floor (the
         // transition does that before returning): until then the pin is what
         // holds the history the new checkpoint needs.
@@ -1719,7 +1323,6 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                 checkpoint_seqno: checkpoint,
                 last_heartbeat_ts_ms: now,
                 started_at: checkpoint,
-                obligation_since_ms: now,
                 follows,
             };
             Ok(Step::Write(entry, incarnation))
@@ -1736,10 +1339,6 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
             // retention. An acknowledgement is also a sign of life.
             if seqno <= entry.checkpoint_seqno && entry.last_heartbeat_ts_ms >= now {
                 return Ok(Step::Keep(()));
-            }
-            // A pinned snapshot moved is a new view to read, admitted now.
-            if entry.kind == ConsumerKind::MvccSnapshotPin && seqno > entry.checkpoint_seqno {
-                entry.obligation_since_ms = now;
             }
             entry.checkpoint_seqno = entry.checkpoint_seqno.max(seqno);
             entry.last_heartbeat_ts_ms = entry.last_heartbeat_ts_ms.max(now);

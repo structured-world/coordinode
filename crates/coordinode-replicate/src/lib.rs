@@ -41,7 +41,7 @@ pub use registry::{
     ConsumerSnapshot, InitialSeqno, LogRetentionSource, PriorIncarnation, RegisteredHandle,
     RegistrationState, RegistrationWatch, RegistryBackground, RegistryError, RetentionPressure,
     RetentionSource, RetentionSpace, RetentionSummary, SeqnoConsumerRegistry,
-    ShardConsumerRegistry, SystemClock, TerminalReason, TopologyScope, ValidatedRetentionBounds,
+    ShardConsumerRegistry, SystemClock, TerminalReason, TopologyScope,
 };
 #[cfg(feature = "transfer")]
 pub use segment_store::{RepairError, SegmentInstaller};

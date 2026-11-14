@@ -99,72 +99,12 @@ pub enum InitialSeqno {
     At(u64),
 }
 
-/// Finite limits a BOUNDED consumer accepts, validated at construction.
-///
-/// Crossing either limit permits terminating the registration. Both are
-/// required and non-zero: a BOUNDED consumer without a finite bound would be
-/// STRICT under another name. The liveness timeout is an additional,
-/// separately chosen condition; `None` disables it and only it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ValidatedRetentionBounds {
-    max_progress_lag_ms: u64,
-    max_retained_bytes: u64,
-    liveness_timeout_ms: Option<u64>,
-}
-
-impl ValidatedRetentionBounds {
-    /// Bounds of `max_progress_lag_ms` (age of the oldest source work the
-    /// consumer has not acknowledged), `max_retained_bytes` (source material
-    /// its checkpoint requires) and an optional liveness timeout.
-    ///
-    /// # Errors
-    ///
-    /// [`RegistryError::InvalidRetention`] when a limit is zero.
-    pub fn new(
-        max_progress_lag_ms: u64,
-        max_retained_bytes: u64,
-        liveness_timeout_ms: Option<u64>,
-    ) -> Result<Self, RegistryError> {
-        if max_progress_lag_ms == 0 {
-            return Err(RegistryError::InvalidRetention(
-                "a BOUNDED progress-lag limit must be above zero".to_string(),
-            ));
-        }
-        if max_retained_bytes == 0 {
-            return Err(RegistryError::InvalidRetention(
-                "a BOUNDED retained-bytes limit must be above zero".to_string(),
-            ));
-        }
-        if liveness_timeout_ms == Some(0) {
-            return Err(RegistryError::InvalidRetention(
-                "a liveness timeout must be above zero; omit it to disable it".to_string(),
-            ));
-        }
-        Ok(Self {
-            max_progress_lag_ms,
-            max_retained_bytes,
-            liveness_timeout_ms,
-        })
-    }
-
-    /// Most age, in ms, of the oldest unacknowledged source work.
-    pub fn max_progress_lag_ms(&self) -> u64 {
-        self.max_progress_lag_ms
-    }
-
-    /// Most bytes of source material the checkpoint may require.
-    pub fn max_retained_bytes(&self) -> u64 {
-        self.max_retained_bytes
-    }
-
-    /// Longest gap between heartbeats, when the consumer chose one.
-    pub fn liveness_timeout_ms(&self) -> Option<u64> {
-        self.liveness_timeout_ms
-    }
-}
-
 /// How long a consumer's source protection lasts. Every registration names
 /// one; there is no default.
+///
+/// A stored registration of any other policy is refused when the registry
+/// opens: its record does not decode, and the registry reports it rather
+/// than reuse it under a meaning it never had.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsumerRetentionPolicy {
     /// Progress only: the registration records the consumer's position and
@@ -177,9 +117,6 @@ pub enum ConsumerRetentionPolicy {
     /// do not end it; new work that would need retention the shard cannot
     /// give is held back instead.
     Strict,
-    /// Protection ends, durably and with a reason, once a declared bound is
-    /// crossed.
-    Bounded(ValidatedRetentionBounds),
 }
 
 /// Why a registration ended. Recorded with the terminal state, so a late
@@ -188,15 +125,6 @@ pub enum ConsumerRetentionPolicy {
 pub enum TerminalReason {
     /// Cancelled by its owner or an operator.
     Cancelled,
-    /// A BOUNDED consumer went longer than its liveness timeout without a
-    /// heartbeat.
-    LivenessExpired,
-    /// A BOUNDED consumer's oldest unacknowledged work grew older than its
-    /// progress-lag limit.
-    ProgressLagExceeded,
-    /// A BOUNDED consumer's checkpoint required more source material than its
-    /// retained-bytes limit.
-    RetainedBytesExceeded,
 }
 
 /// A consumer's registration request.
@@ -500,11 +428,6 @@ pub enum RegistryError {
         current: u64,
     },
 
-    /// The retention policy cannot be admitted: a bound is not finite, or the
-    /// source cannot measure what a BOUNDED limit needs for this consumer kind.
-    #[error("retention policy refused: {0}")]
-    InvalidRetention(String),
-
     /// The consumer's checkpoint fell behind the shard's retention floor
     /// (operator-forced GC bump). Reads via the consumer's API return this
     /// instead of silently losing data: `(checkpoint, current_floor)`.
@@ -532,16 +455,6 @@ pub enum RegistryError {
     /// timed out). Carries the underlying message.
     #[error("registry replication failed: {0}")]
     Replication(String),
-
-    /// A terminal decision on `consumer_id` was handed to the log and its
-    /// outcome is not known yet: it may still apply. The protection it was
-    /// measured under stays held until the outcome is known; no other
-    /// decision on the material is taken meanwhile.
-    #[error("the ending of {consumer_id:?} was proposed and its outcome is not known yet")]
-    OutcomeUnknown {
-        /// The consumer whose ending is in doubt.
-        consumer_id: String,
-    },
 }
 
 #[cfg(test)]

@@ -1,43 +1,4 @@
 use super::*;
-use crate::registry::types::ValidatedRetentionBounds;
-
-/// A source fixed at construction: head, when the checkpoint's work was
-/// produced, and the bytes it requires.
-struct Fixed {
-    head: u64,
-    produced: Option<u64>,
-    bytes: Option<u64>,
-}
-
-impl RetentionSource for Fixed {
-    fn head(&self, _: ConsumerKind) -> u64 {
-        self.head
-    }
-    fn first_retained(&self, _: ConsumerKind) -> u64 {
-        0
-    }
-    fn accounts(&self, _: ConsumerKind) -> bool {
-        true
-    }
-    fn produced_at_ms(
-        &self,
-        _: ConsumerKind,
-        _: u64,
-    ) -> Result<Option<u64>, crate::registry::types::Unmeasured> {
-        Ok(self.produced)
-    }
-    fn retained_bytes_from(
-        &self,
-        _: ConsumerKind,
-        _: u64,
-    ) -> Result<u64, crate::registry::types::Unmeasured> {
-        self.bytes
-            .ok_or(crate::registry::types::Unmeasured::Unreadable)
-    }
-    fn admits(&self, _: ConsumerKind) -> Result<(), crate::registry::RetentionPressure> {
-        Ok(())
-    }
-}
 
 fn entry(retention: ConsumerRetentionPolicy) -> RegistryEntry {
     RegistryEntry {
@@ -51,161 +12,29 @@ fn entry(retention: ConsumerRetentionPolicy) -> RegistryEntry {
         checkpoint_seqno: 512,
         last_heartbeat_ts_ms: 1_000,
         started_at: 500,
-        obligation_since_ms: 1_000,
         follows: Some(Box::new(crate::registry::PriorIncarnation {
             incarnation: 2,
-            reason: TerminalReason::LivenessExpired,
+            reason: crate::registry::TerminalReason::Cancelled,
             acknowledged: 480,
             retained_from: 400,
         })),
     }
 }
 
-fn bounded(lag: u64, bytes: u64, liveness: Option<u64>) -> ConsumerRetentionPolicy {
-    ConsumerRetentionPolicy::Bounded(
-        ValidatedRetentionBounds::new(lag, bytes, liveness).expect("bounds"),
-    )
-}
-
-const CAUGHT_UP: Fixed = Fixed {
-    head: 512,
-    produced: None,
-    bytes: Some(0),
-};
-
-/// A source whose one observation fails while each measure asked apart
-/// answers, as when a rebuild ends between the calls: the two answers are
-/// of different states.
-struct Torn;
-
-impl RetentionSource for Torn {
-    fn head(&self, _: ConsumerKind) -> u64 {
-        1_000
-    }
-    fn first_retained(&self, _: ConsumerKind) -> u64 {
-        0
-    }
-    fn accounts(&self, _: ConsumerKind) -> bool {
-        true
-    }
-    fn produced_at_ms(
-        &self,
-        _: ConsumerKind,
-        _: u64,
-    ) -> Result<Option<u64>, crate::registry::types::Unmeasured> {
-        Ok(Some(0))
-    }
-    fn retained_bytes_from(
-        &self,
-        _: ConsumerKind,
-        _: u64,
-    ) -> Result<u64, crate::registry::types::Unmeasured> {
-        Ok(u64::MAX)
-    }
-    fn observe(
-        &self,
-        _: ConsumerKind,
-        _: u64,
-    ) -> Result<crate::registry::source::Observed, crate::registry::types::Unmeasured> {
-        Err(crate::registry::types::Unmeasured::Unreadable)
-    }
-    fn admits(&self, _: ConsumerKind) -> Result<(), crate::registry::RetentionPressure> {
-        Ok(())
-    }
-}
-
-/// An MVCC consumer is judged only on one observation: where none can be
-/// taken it is not ended on measures asked apart, which could pair an age
-/// and a size from either side of a rebuild.
+/// Only a live STRICT registration holds the source's history: ordinary
+/// progress never does, and an ended registration holds nothing whatever
+/// its policy was.
 #[test]
-fn an_mvcc_consumer_is_never_judged_on_measures_asked_apart() {
-    let e = RegistryEntry {
-        kind: ConsumerKind::LsmStateDelta,
-        ..entry(bounded(1, 1, None))
+fn only_a_live_strict_registration_holds_history() {
+    assert!(entry(ConsumerRetentionPolicy::Strict).holds_history());
+    assert!(!entry(ConsumerRetentionPolicy::Ordinary).holds_history());
+    let mut ended = entry(ConsumerRetentionPolicy::Strict);
+    ended.state = RegistrationState::Terminated {
+        reason: crate::registry::TerminalReason::Cancelled,
+        at_ms: 0,
+        retained_from: 0,
     };
-    assert_eq!(e.termination(10_000, &Torn), None);
-}
-
-/// A source whose observation is past the bounds, but whose material was
-/// replaced after it (a rebuild began): the observation no longer holds.
-struct Replaced;
-
-impl RetentionSource for Replaced {
-    fn head(&self, _: ConsumerKind) -> u64 {
-        1_000
-    }
-    fn first_retained(&self, _: ConsumerKind) -> u64 {
-        0
-    }
-    fn accounts(&self, _: ConsumerKind) -> bool {
-        true
-    }
-    fn produced_at_ms(
-        &self,
-        _: ConsumerKind,
-        _: u64,
-    ) -> Result<Option<u64>, crate::registry::types::Unmeasured> {
-        Ok(Some(0))
-    }
-    fn retained_bytes_from(
-        &self,
-        _: ConsumerKind,
-        _: u64,
-    ) -> Result<u64, crate::registry::types::Unmeasured> {
-        Ok(u64::MAX)
-    }
-    fn observe(
-        &self,
-        _: ConsumerKind,
-        _: u64,
-    ) -> Result<crate::registry::source::Observed, crate::registry::types::Unmeasured> {
-        Ok(crate::registry::source::Observed {
-            produced_at_ms: Some(0),
-            retained_bytes: u64::MAX,
-            generation: Some(1),
-        })
-    }
-    fn still_current(&self, observed: &crate::registry::source::Observed) -> bool {
-        observed.generation == Some(2)
-    }
-    fn admits(&self, _: ConsumerKind) -> Result<(), crate::registry::RetentionPressure> {
-        Ok(())
-    }
-}
-
-/// An ending is not written on an observation the source has since
-/// replaced: the next sweep observes again.
-#[test]
-fn an_ending_on_a_replaced_observation_is_not_written() {
-    let e = RegistryEntry {
-        kind: ConsumerKind::LsmStateDelta,
-        ..entry(bounded(1, 1, None))
-    };
-    assert_eq!(e.termination(10_000, &Replaced), None);
-}
-
-/// A pinned snapshot owes its read whether or not anything was written
-/// since: with no new writes it still ends once its read has been
-/// outstanding longer than its bound, counted from when it was admitted. A
-/// state reader caught up on an idle source owes nothing.
-#[test]
-fn a_pinned_snapshot_owes_its_read_on_an_idle_source() {
-    let pin = RegistryEntry {
-        kind: ConsumerKind::MvccSnapshotPin,
-        obligation_since_ms: 1_000,
-        ..entry(bounded(5_000, u64::MAX - 1, None))
-    };
-    assert_eq!(pin.termination(6_000, &CAUGHT_UP), None);
-    assert_eq!(
-        pin.termination(6_001, &CAUGHT_UP),
-        Some(TerminalReason::ProgressLagExceeded)
-    );
-    assert_eq!(pin.next_deadline_ms(&CAUGHT_UP), Some(6_001));
-    let reader = RegistryEntry {
-        kind: ConsumerKind::LsmStateDelta,
-        ..pin.clone()
-    };
-    assert_eq!(reader.termination(1_000_000, &CAUGHT_UP), None);
+    assert!(!ended.holds_history());
 }
 
 /// A heartbeat record round-trips through its fixed form, a record of any
@@ -265,14 +94,19 @@ fn only_a_heartbeat_of_the_same_incarnation_counts() {
 
 #[test]
 fn entry_roundtrips_through_msgpack() {
-    let mut e = entry(bounded(10, 20, Some(30)));
-    e.state = RegistrationState::Terminated {
-        reason: TerminalReason::RetainedBytesExceeded,
-        at_ms: 77,
-        retained_from: 12,
-    };
-    let decoded = RegistryEntry::decode(&e.encode().expect("encode")).expect("decode");
-    assert_eq!(e, decoded);
+    for retention in [
+        ConsumerRetentionPolicy::Strict,
+        ConsumerRetentionPolicy::Ordinary,
+    ] {
+        let mut e = entry(retention);
+        e.state = RegistrationState::Terminated {
+            reason: crate::registry::TerminalReason::Cancelled,
+            at_ms: 77,
+            retained_from: 12,
+        };
+        let decoded = RegistryEntry::decode(&e.encode().expect("encode")).expect("decode");
+        assert_eq!(e, decoded);
+    }
 }
 
 #[test]
@@ -280,106 +114,4 @@ fn key_is_prefixed_and_recoverable() {
     let k = encode_registry_key("kafka-eu");
     assert!(k.starts_with(REGISTRY_KEY_PREFIX));
     assert_eq!(&k[REGISTRY_KEY_PREFIX.len()..], b"kafka-eu");
-}
-
-/// STRICT never ends on its own, whatever the clock, lag or size.
-#[test]
-fn strict_never_terminates() {
-    let e = entry(ConsumerRetentionPolicy::Strict);
-    let far_behind = Fixed {
-        head: u64::MAX,
-        produced: Some(0),
-        bytes: Some(u64::MAX),
-    };
-    assert_eq!(e.termination(u64::MAX, &far_behind), None);
-    assert_eq!(e.next_deadline_ms(&far_behind), None);
-}
-
-/// Liveness ends a BOUNDED consumer strictly past its timeout, and only when
-/// one was chosen.
-#[test]
-fn liveness_is_judged_only_when_chosen_and_strictly_past_it() {
-    let e = entry(bounded(u64::MAX, u64::MAX, Some(5_000)));
-    assert_eq!(e.termination(6_000, &CAUGHT_UP), None, "at the boundary");
-    assert_eq!(
-        e.termination(6_001, &CAUGHT_UP),
-        Some(TerminalReason::LivenessExpired)
-    );
-    assert_eq!(e.next_deadline_ms(&CAUGHT_UP), Some(6_001));
-
-    let no_liveness = entry(bounded(u64::MAX, u64::MAX, None));
-    assert_eq!(no_liveness.termination(u64::MAX, &CAUGHT_UP), None);
-    assert_eq!(no_liveness.next_deadline_ms(&CAUGHT_UP), None);
-}
-
-/// A clock behind the stored heartbeat is no evidence of absence.
-#[test]
-fn a_clock_behind_the_heartbeat_does_not_expire_it() {
-    let e = entry(bounded(u64::MAX, u64::MAX, Some(1)));
-    assert_eq!(e.termination(0, &CAUGHT_UP), None);
-}
-
-/// Progress lag is the age of the oldest unacknowledged work, and only while
-/// some is outstanding.
-#[test]
-fn progress_lag_counts_only_outstanding_work() {
-    let e = entry(bounded(1_000, u64::MAX, None));
-    let behind = Fixed {
-        head: 600,
-        produced: Some(10_000),
-        bytes: Some(0),
-    };
-    assert_eq!(e.termination(11_000, &behind), None);
-    assert_eq!(
-        e.termination(11_001, &behind),
-        Some(TerminalReason::ProgressLagExceeded)
-    );
-    assert_eq!(e.next_deadline_ms(&behind), Some(11_001));
-
-    let idle = Fixed {
-        head: 512,
-        produced: Some(0),
-        bytes: Some(0),
-    };
-    assert_eq!(e.termination(u64::MAX, &idle), None, "nothing outstanding");
-    assert_eq!(e.next_deadline_ms(&idle), None);
-}
-
-/// Bytes the checkpoint requires above the limit end the registration.
-#[test]
-fn retained_bytes_above_the_limit_terminate() {
-    let e = entry(bounded(u64::MAX, 4_096, None));
-    let at_limit = Fixed {
-        head: 512,
-        produced: None,
-        bytes: Some(4_096),
-    };
-    let over = Fixed {
-        head: 512,
-        produced: None,
-        bytes: Some(4_097),
-    };
-    assert_eq!(e.termination(0, &at_limit), None);
-    assert_eq!(
-        e.termination(0, &over),
-        Some(TerminalReason::RetainedBytesExceeded)
-    );
-}
-
-/// An ended registration is never judged again.
-#[test]
-fn an_ended_registration_is_not_judged() {
-    let mut e = entry(bounded(1, 1, Some(1)));
-    e.state = RegistrationState::Terminated {
-        reason: TerminalReason::Cancelled,
-        at_ms: 0,
-        retained_from: 0,
-    };
-    let over_everything = Fixed {
-        head: u64::MAX,
-        produced: Some(0),
-        bytes: Some(u64::MAX),
-    };
-    assert_eq!(e.termination(u64::MAX, &over_everything), None);
-    assert_eq!(e.next_deadline_ms(&over_everything), None);
 }

@@ -1,5 +1,5 @@
 //! [`RetentionSource`]: what the registry needs to know about the source a
-//! consumer reads to admit a registration and judge its bounds.
+//! consumer reads to admit a registration and report what it holds.
 //!
 //! The registry does not know how a source stores its history: an oplog
 //! counts Raft indexes in segment files, the MVCC store counts commit
@@ -8,20 +8,6 @@
 use coordinode_storage::engine::oplog_journal::JournalHold;
 
 use super::types::{ConsumerKind, RetentionPressure, Unmeasured};
-
-/// One observation of a checkpoint's work and material
-/// ([`RetentionSource::observe`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Observed {
-    /// Clock ms the oldest unseen work was produced, `None` when none is.
-    pub produced_at_ms: Option<u64>,
-    /// Bytes of source material the checkpoint requires.
-    pub retained_bytes: u64,
-    /// The source state the observation describes, when the source can
-    /// change under it ([`RetentionSource::still_current`]); `None` for a
-    /// source whose answers do not go stale that way.
-    pub generation: Option<u64>,
-}
 
 /// The source behind one consumer position space on a shard.
 #[diagnostic::on_unimplemented(
@@ -37,10 +23,6 @@ pub trait RetentionSource: Send + Sync {
     /// The oldest position the source still holds in `kind`'s space. A
     /// consumer needing anything below it has lost that history.
     fn first_retained(&self, kind: ConsumerKind) -> u64;
-
-    /// Whether the source measures progress age and required bytes for
-    /// `kind`, which a BOUNDED limit needs to be judged at all.
-    fn accounts(&self, kind: ConsumerKind) -> bool;
 
     /// Clock ms at which the first work at or after `position` was produced,
     /// `Ok(None)` when the source has proved there is none up to the head.
@@ -59,30 +41,6 @@ pub trait RetentionSource: Send + Sync {
     ///
     /// [`Unmeasured`] when the source cannot account them: never zero bytes.
     fn retained_bytes_from(&self, kind: ConsumerKind, position: u64) -> Result<u64, Unmeasured>;
-
-    /// The work age and the bytes of a checkpoint at `position`, taken from
-    /// one observation of the source, so a judgement never pairs an age and
-    /// a size of two different states. A source whose two answers are
-    /// always consistent may leave the default, which asks each of them.
-    ///
-    /// # Errors
-    ///
-    /// [`Unmeasured`] when either cannot be taken.
-    fn observe(&self, kind: ConsumerKind, position: u64) -> Result<Observed, Unmeasured> {
-        Ok(Observed {
-            produced_at_ms: self.produced_at_ms(kind, position)?,
-            retained_bytes: self.retained_bytes_from(kind, position)?,
-            generation: None,
-        })
-    }
-
-    /// Whether `observed` still describes the source: checked last before a
-    /// registration is ended on it, so material replaced since (a rebuild,
-    /// a cleared tree) ends nobody on numbers that no longer hold.
-    fn still_current(&self, observed: &Observed) -> bool {
-        let _ = observed;
-        true
-    }
 
     /// Whether the source can take on retention for a new `kind` consumer
     /// now, or why not: the registration is then refused as retryable

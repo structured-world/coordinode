@@ -102,7 +102,6 @@ fn the_source_measures_the_log_it_holds() {
     );
     let kind = ConsumerKind::OplogEvents;
 
-    assert!(source.accounts(kind));
     assert_eq!(source.head(kind), 9);
     assert_eq!(source.first_retained(kind), 3);
     assert_eq!(source.produced_at_ms(kind, 4), Ok(Some(5_000)));
@@ -121,10 +120,9 @@ fn the_source_measures_the_log_it_holds() {
     assert!(from_last_segment > 0, "the open segment is still kept");
 }
 
-/// The registry's bound sweep asks the age of every lagging BOUNDED
-/// consumer's checkpoint twice a sweep, every second. Each ask used to open a
-/// fresh reader that read and decoded the whole segment holding the
-/// checkpoint: tens of MB/s on a busy log with two consumers. Asking the same
+/// The lag gauges ask the age of every listed log consumer's checkpoint on
+/// each listing. An ask that opened a fresh reader would read and decode the
+/// whole segment holding the checkpoint every time. Asking the same
 /// checkpoint again must read nothing, and a moved one only near it.
 #[test]
 fn the_source_answers_an_unmoved_checkpoint_without_reading_the_log() {
@@ -169,9 +167,8 @@ fn the_source_answers_an_unmoved_checkpoint_without_reading_the_log() {
 /// entry of a term, a membership change) is no work a consumer must
 /// acknowledge: the age of what a consumer owes is the write time of the
 /// first committed entry from its checkpoint on, and with none up to the
-/// head it owes nothing. Aging such an entry from timestamp 0 made every
-/// BOUNDED consumer whose checkpoint reached a closing entry exceed any
-/// progress lag at once.
+/// head it owes nothing. Aging such an entry from timestamp 0 would report
+/// every consumer whose checkpoint reached a closing entry as decades behind.
 #[test]
 fn entries_without_a_commit_owe_no_progress() {
     let (engine, _engine_dir) = open_engine();
@@ -225,219 +222,36 @@ fn a_log_without_segments_retains_nothing_below_the_head() {
     );
 }
 
-/// An ephemeral registration has no durable contract and is not accounted;
-/// nor is a pinned snapshot on a store without a commit-time oracle, whose
-/// seqnos are no times: BOUNDED is refused for them rather than enforced on
-/// numbers that do not exist.
+/// The MVCC store keeps no per-commit record of what each write cost or
+/// when, so no consumer of its seqno space is measured: its age and bytes
+/// are reported as not accounted, never as zero, while its head and first
+/// retained position still come from the store.
 #[test]
-fn the_source_does_not_account_ephemeral_or_clockless_snapshots() {
-    let (clocked, _clocked_dir) = open_engine();
-    let clocked = LogRetentionSource::new(clocked, Vec::new(), empty_floor(), Arc::new(|| 0));
-    assert!(!clocked.accounts(ConsumerKind::Ephemeral));
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = Arc::new(StorageEngine::open(&endpoint(dir.path())).expect("open"));
+fn the_mvcc_space_is_not_measured() {
+    let (engine, _dir) = open_engine();
     let source = LogRetentionSource::new(
         Arc::clone(&engine),
         Vec::new(),
         empty_floor(),
         Arc::new(|| 0),
     );
-    for kind in [ConsumerKind::MvccSnapshotPin, ConsumerKind::Ephemeral] {
+    for kind in [
+        ConsumerKind::LsmStateDelta,
+        ConsumerKind::MvccSnapshotPin,
+        ConsumerKind::Ephemeral,
+    ] {
         assert!(kind.is_seqno_space());
-        assert!(!source.accounts(kind));
         assert_eq!(source.head(kind), engine.snapshot());
-        assert_eq!(source.first_retained(kind), engine.gc_watermark());
+        assert_eq!(source.first_retained(kind), engine.oldest_readable_seqno());
         assert_eq!(
             source.retained_bytes_from(kind, 1),
             Err(Unmeasured::NotAccounted)
         );
+        assert_eq!(
+            source.produced_at_ms(kind, 1),
+            Err(Unmeasured::NotAccounted)
+        );
     }
-}
-
-/// A pinned snapshot needs every key with a value at its cut, with its
-/// closure: a key deleted before the cut costs nothing, writes after the cut
-/// change nothing it reads, and its work is not dated by the rows (the
-/// source gives no time; the registration's admission dates it).
-#[test]
-fn a_pinned_snapshot_needs_what_it_sees() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let start = 4_000_000_000_000_000;
-    let oracle = Arc::new(TimestampOracle::resume_from(
-        coordinode_core::txn::timestamp::Timestamp::from_raw(start),
-    ));
-    let engine =
-        Arc::new(StorageEngine::open_with_oracle(&endpoint(dir.path()), oracle).expect("open"));
-    let source = LogRetentionSource::new(
-        Arc::clone(&engine),
-        Vec::new(),
-        empty_floor(),
-        Arc::new(|| 0),
-    );
-    let kind = ConsumerKind::MvccSnapshotPin;
-    assert!(source.accounts(kind));
-    let base = start + 1_000_000;
-    let apply = |mutation, ts: u64| {
-        engine.apply_proposal_at(&[mutation], ts).expect("apply");
-    };
-    let put = |key: &[u8], len: usize| coordinode_core::txn::proposal::Mutation::Put {
-        partition: coordinode_core::txn::proposal::PartitionId::Node,
-        key: key.to_vec(),
-        value: vec![0; len],
-    };
-    // What the store holds before the test's writes is in every snapshot.
-    apply(put(b"node:early", 1), base);
-    let before = source.retained_bytes_from(kind, base).expect("before");
-    apply(put(b"node:kept", 90), base + 10);
-    apply(put(b"node:gone", 500), base + 20);
-    apply(
-        coordinode_core::txn::proposal::Mutation::Delete {
-            partition: coordinode_core::txn::proposal::PartitionId::Node,
-            key: b"node:gone".to_vec(),
-        },
-        base + 30,
-    );
-    // Just past the deletion: a snapshot sees what lies below it.
-    let pinned = base + 31;
-    let at_pin = source
-        .retained_bytes_from(kind, pinned)
-        .expect("at the pin");
-    assert_eq!(
-        at_pin - before,
-        9 + 90 + 11,
-        "kept and early, not the deleted key"
-    );
-    // Writes after the pin change nothing it reads.
-    apply(put(b"node:kept", 5_000), base + 50);
-    apply(put(b"node:later", 5_000), base + 60);
-    assert_eq!(source.retained_bytes_from(kind, pinned), Ok(at_pin));
-    assert_eq!(source.produced_at_ms(kind, pinned), Ok(None));
-}
-
-/// A state reader's work and material from its checkpoint: an idle store
-/// owes it nothing, however long it waits; its first write starts the age at
-/// that write's commit time, not at the checkpoint; a commit applied out of
-/// timestamp order still counts from its own time; and the bytes are the
-/// logical size of every commit from the checkpoint on.
-#[test]
-fn a_state_reader_owes_the_commits_from_its_checkpoint() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let start = 4_000_000_000_000_000;
-    let oracle = Arc::new(TimestampOracle::resume_from(
-        coordinode_core::txn::timestamp::Timestamp::from_raw(start),
-    ));
-    let engine =
-        Arc::new(StorageEngine::open_with_oracle(&endpoint(dir.path()), oracle).expect("open"));
-    let source = LogRetentionSource::new(
-        Arc::clone(&engine),
-        Vec::new(),
-        empty_floor(),
-        Arc::new(|| 0),
-    );
-    let kind = ConsumerKind::LsmStateDelta;
-    assert!(source.accounts(kind));
-    let checkpoint = start + 1_000_000;
-    assert_eq!(source.produced_at_ms(kind, checkpoint), Ok(None), "idle");
-    assert_eq!(source.retained_bytes_from(kind, checkpoint), Ok(0));
-
-    let put = |key: &[u8], len: usize, ts: u64| {
-        engine
-            .apply_proposal_at(
-                &[coordinode_core::txn::proposal::Mutation::Put {
-                    partition: coordinode_core::txn::proposal::PartitionId::Node,
-                    key: key.to_vec(),
-                    value: vec![0; len],
-                }],
-                ts,
-            )
-            .expect("apply");
-    };
-    // An earlier commit holds its timestamp while a later one lands first.
-    let (early, held) = engine
-        .pending_commits()
-        .admit_allocated(
-            || checkpoint + 5_000_000,
-            Vec::new(),
-            Vec::new(),
-            coordinode_storage::engine::pending::Material::Changes,
-            None,
-        )
-        .expect("admit");
-    // The first write lands long after the checkpoint.
-    put(b"node:late", 10, checkpoint + 60_000_000);
-    assert_eq!(
-        source.produced_at_ms(kind, checkpoint),
-        Ok(None),
-        "work above a commit still in flight is not counted yet"
-    );
-    // The earlier commit lands after it: older work.
-    put(b"node:early", 20, early);
-    drop(held);
-    assert_eq!(
-        source.produced_at_ms(kind, checkpoint),
-        Ok(Some((checkpoint + 5_000_000) / 1_000))
-    );
-    assert_eq!(
-        source.retained_bytes_from(kind, checkpoint),
-        Ok((9 + 10) + (10 + 20))
-    );
-    // From between the two, only the later one is owed.
-    assert_eq!(
-        source.retained_bytes_from(kind, checkpoint + 5_000_001),
-        Ok(9 + 10)
-    );
-}
-
-/// A large value replaced by a small one after the accounting was last
-/// folded: the measure a decision takes reads the fold brought to the cut,
-/// so the consumer is charged the small value, not the large one an older
-/// fold still held. Taken on the older fold, the consumer would be ended
-/// for bytes it no longer requires.
-#[test]
-fn a_measure_reads_the_fold_at_the_cut_it_is_taken_at() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let start = 4_000_000_000_000_000;
-    let oracle = Arc::new(TimestampOracle::resume_from(
-        coordinode_core::txn::timestamp::Timestamp::from_raw(start),
-    ));
-    let engine =
-        Arc::new(StorageEngine::open_with_oracle(&endpoint(dir.path()), oracle).expect("open"));
-    let source = LogRetentionSource::new(
-        Arc::clone(&engine),
-        Vec::new(),
-        empty_floor(),
-        Arc::new(|| 0),
-    );
-    let kind = ConsumerKind::LsmStateDelta;
-    let checkpoint = start + 1_000_000;
-    let put = |len: usize, ts: u64| {
-        engine
-            .apply_proposal_at(
-                &[coordinode_core::txn::proposal::Mutation::Put {
-                    partition: coordinode_core::txn::proposal::PartitionId::Node,
-                    key: b"node:value".to_vec(),
-                    value: vec![0; len],
-                }],
-                ts,
-            )
-            .expect("apply");
-    };
-    put(1 << 20, checkpoint + 10);
-    assert_eq!(
-        source.retained_bytes_from(kind, checkpoint),
-        Ok(10 + (1 << 20)),
-        "the large value is required"
-    );
-    put(4, checkpoint + 20);
-    assert_eq!(
-        source.retained_bytes_from(kind, checkpoint),
-        Ok(10 + 4),
-        "the replaced value is no longer required"
-    );
-    assert_eq!(
-        source.produced_at_ms(kind, checkpoint),
-        Ok(Some((checkpoint + 10) / 1_000)),
-        "the replacement does not refresh the oldest work"
-    );
 }
 
 /// Over a store's own journal the source reports the journal's head and

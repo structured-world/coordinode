@@ -197,7 +197,6 @@ pub(crate) async fn serve(
         columnar_encoded_from_level: _,
         node_shard: _,
         registry_heartbeat_ms,
-        registry_eviction_ms,
         cdc_heartbeat_interval_ms,
         cdc_batch_size,
         cdc_buffer_bytes,
@@ -900,11 +899,10 @@ pub(crate) async fn serve(
     // Per-shard consumer-retention registry: every change-stream consumer is
     // registered here with its retention policy, over the history this node
     // holds (the Raft log, the MVCC store). The background service flushes
-    // heartbeats and ends a BOUNDED registration whose bound is crossed. Both
+    // heartbeats and republishes the floors when a registration changes. Both
     // standalone and cluster modes drive it through the same Raft pipeline.
-    // Held for the process lifetime. Operator overrides for the background
-    // cadences arrive from the config file; `None` keeps the built-in
-    // defaults (1 s heartbeat window, 1 s between sweeps).
+    // Held for the process lifetime. The heartbeat window arrives from the
+    // config file; `None` keeps the built-in 1 s.
     let retention_source: Arc<dyn coordinode_replicate::RetentionSource> = {
         let applied_node = Arc::clone(&raft_node);
         Arc::new(coordinode_replicate::LogRetentionSource::new(
@@ -922,7 +920,6 @@ pub(crate) async fn serve(
         retention_source,
         registry::RegistryTuning {
             heartbeat_window_ms: registry_heartbeat_ms,
-            eviction_interval_ms: registry_eviction_ms,
         },
     )
     .map_err(|e| format!("consumer registry: {e}"))?;

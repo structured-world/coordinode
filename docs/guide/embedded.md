@@ -275,61 +275,28 @@ system-wide cap also sets a file-system quota.
 ## Change-stream consumers
 
 A consumer that reads the database's history (an outbox relay, a projection,
-a backup reading state deltas) registers so that history is kept for it. Each
+a backup reading state deltas) registers to record where it stands. Each
 registration chooses its retention policy; there is no default:
 
+- **`Ordinary`** records the consumer's position only and keeps nothing for
+  it: the journal's own retention (and the MVCC retention window) decides how
+  far back history reaches. Between reads the consumer holds back no
+  reclamation and costs the store nothing. A position the store no longer
+  holds is reported as `RetentionLost` with the position and where history
+  starts now, never skipped and never replaced by the newest entry; the
+  registration stays, and the consumer rebuilds its state from a complete
+  read of the store and then acknowledges a position the store holds.
 - **`Strict`** keeps what the consumer has not acknowledged until the
-  consumer is cancelled. Missing heartbeats do not end it. At a hard limit the
-  store refuses new writes rather than drop that history.
-- **`Bounded`** declares a finite progress lag (age of the oldest
-  unacknowledged work, in ms), a finite number of retained bytes, and
-  optionally a liveness timeout. Crossing one ends the registration with that
-  reason, and its history is no longer kept for it. Heartbeats prove liveness
-  only: they never reset the lag.
+  consumer is cancelled. Missing heartbeats do not end it. It is for a
+  consumer that must never miss history (a backup, an exact replica): the
+  history it holds counts toward the store's limits, so at a hard limit the
+  store refuses new writes rather than drop it. A new `Strict` registration
+  is refused while the store has no room for more history.
 
-What a `Bounded` limit measures depends on what the consumer reads:
-
-- a log consumer (`OplogEvents`): the age of the oldest unacknowledged
-  committed entry, and the bytes of the journal segments kept from its
-  position;
-- a state consumer (`LsmStateDelta`): the age of the oldest commit at or
-  after its position (its commit timestamp), and the logical bytes of what
-  it needs to read the keys changed since: for each such key, its last value
-  or deletion and every merge operand applied after it, a range deletion
-  once however many keys it removed. A value overwritten since the position
-  costs nothing, and overwriting a key does not make the oldest work any
-  younger. The bytes are counted before compression; compression, file
-  layout and compaction do not change them. The count is folded from the
-  commits in commit-time order, and a decision to end a consumer reads it
-  brought up to the store's latest complete commit, so a later overwrite
-  that lowered the bytes is counted. While such a decision is measured and
-  written, writes that change the store's data wait for it (commits in
-  flight before it land first, and none arriving after it overtakes it),
-  so no write lands between its measure and its ending; it holds them for
-  its final catch-up and its write only, and until the outcome of that
-  write is known. A commit that waits longer than five seconds is refused
-  as retryable backpressure. It is what the consumer needs, not
-  what cancelling it would free: another consumer, a live read or the
-  retention window can hold the same history. The store's hard limit still
-  applies on its own and can refuse writes while a consumer is below its
-  byte limit. A store without a commit-time oracle refuses `Bounded` for
-  state consumers;
-- a pinned snapshot (`MvccSnapshotPin`): how long its read has been
-  outstanding, counted from when the registration was admitted (moving its
-  checkpoint is a new view to read, admitted then), with or without new
-  writes; and the logical bytes of every key with a value at its position,
-  each key's last value and the merge operands after it, a deleted key
-  costing nothing. Writes after its position do not change it. A store
-  without a commit-time oracle refuses `Bounded` for it too.
-
-A consumer whose measure cannot be read is not ended for it, and its listing
-shows the measure as unavailable rather than as zero.
-
-A log consumer (`ConsumerKind::OplogEvents`) has its position kept in the
-journal; a state or snapshot consumer (`LsmStateDelta`, `MvccSnapshotPin`) in
-the MVCC history. The position is held from the registration on, across
-restarts, and a registration at a position already gone is refused with
-`RetentionLost`:
+A log consumer (`ConsumerKind::OplogEvents`) reads the journal; a state or
+snapshot consumer (`LsmStateDelta`, `MvccSnapshotPin`) the MVCC history. A
+`Strict` position is held from the registration on, across restarts, and a
+registration at a position already gone is refused with `RetentionLost`:
 
 ```rust,no_run
 use coordinode_embed::Database;
@@ -357,8 +324,8 @@ db.acknowledge_consumer(&outbox, from)?;
 
 After a restart the consumer takes its registration up again with
 `resume_consumer(id, incarnation)`; the incarnation is in its handle
-(`RegisteredHandle::incarnation`). An ended registration keeps refusing its
-handle with the reason and last acknowledged position
+(`RegisteredHandle::incarnation`). A cancelled registration keeps refusing
+its handle with the reason and last acknowledged position
 (`RegistryError::Terminated`, with where the history started when it ended),
 and registering the same id again starts a new incarnation: a resync. Its
 listing shows what it followed (`follows`: the ended incarnation, why it
@@ -367,18 +334,24 @@ ended, what it had acknowledged) and where it started (`started_at`);
 given, `None` when the resync started at the last acknowledgement. A resync
 never starts anywhere on its own: the consumer chooses `At`, `FromNow` or
 `FromEarliestRetained`. `cancel_consumer` ends one; `consumers_list` shows every
-registration with its policy, state, position, how long its oldest
-unacknowledged work has waited, the bytes it needs and whether it is the one
-holding the history back. `consumer_retention` sums it up per space (journal,
-MVCC): the lowest position, the bytes kept from it counted once however many
-consumers share them, which registrations hold it, and why a new
-registration would be refused now. A registration is new history to keep, so
-it is refused as `Backpressure` with its reason while compaction is behind
-(`WritePressure`), the volume is below its free-space reserve (`FreeSpace`),
-or an endpoint's hard limit has no room left for client writes, only the
-reserve recovery needs (`Footprint`); retry once it eases. Releasing one
-consumer can free nothing when another, a live reader or recovery still needs
-the same history.
+registration with its policy, state, position, how long the oldest journal
+entry it has not acknowledged has waited and the journal bytes from its
+position (the MVCC history is not measured per consumer, and shows as
+unavailable, never as zero), and whether it is the one holding the history
+back. `consumer_retention` sums it up per space (journal, MVCC): the lowest
+`Strict` position, the journal bytes kept from it counted once however many
+consumers share them, which registrations hold it, and why a new `Strict`
+registration would be refused now. A `Strict` registration is new history to
+keep, so it is refused as `Backpressure` with its reason while compaction is
+behind (`WritePressure`), the volume is below its free-space reserve
+(`FreeSpace`), or an endpoint's hard limit has no room left for client
+writes, only the reserve recovery needs (`Footprint`); retry once it eases.
+Releasing one consumer can free nothing when another, a live reader or
+recovery still needs the same history.
+
+A database opened over registrations of a retention policy this version no
+longer offers refuses to open its registry with an error naming the record,
+rather than reuse them under another meaning.
 
 The registry runs on a thread of the database and stops when it is dropped;
 no async runtime is needed. A database kept in memory, and a member of a

@@ -530,13 +530,9 @@ pub struct ServerConfig {
     pub node_shard: Option<u16>,
     /// Consumer-registry heartbeat coalescing window in ms (`None` = 1000).
     pub registry_heartbeat_ms: Option<u64>,
-    /// Shortest gap between consumer-registry TTL-eviction sweeps in ms
-    /// (`None` = 1000).
-    pub registry_eviction_ms: Option<u64>,
     /// How often a waiting CDC change stream heartbeats its registration, in
-    /// ms (`None` = 10000). A BOUNDED consumer's liveness timeout must exceed
-    /// it, which registration checks. Delivery does not wait on it: a
-    /// caught-up stream wakes when an entry applies.
+    /// ms (`None` = 10000). Delivery does not wait on it: a caught-up stream
+    /// wakes when an entry applies.
     pub cdc_heartbeat_interval_ms: Option<NonZeroU64>,
     /// Most entries a CDC change stream reads and sends per poll (`None` = 256).
     pub cdc_batch_size: Option<NonZeroUsize>,
@@ -764,7 +760,6 @@ impl Default for ServerConfig {
             columnar_encoded_from_level: None,
             node_shard: None,
             registry_heartbeat_ms: None,
-            registry_eviction_ms: None,
             cdc_heartbeat_interval_ms: None,
             cdc_batch_size: None,
             cdc_buffer_bytes: None,

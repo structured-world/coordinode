@@ -30,9 +30,6 @@ pub(crate) struct RegistryTuning {
     /// Heartbeat coalescing window in milliseconds (`registry_heartbeat_ms`).
     /// `None` keeps the default 1000 ms.
     pub heartbeat_window_ms: Option<u64>,
-    /// Shortest gap between TTL-eviction sweeps in milliseconds
-    /// (`registry_eviction_ms`). `None` keeps the default 1000 ms.
-    pub eviction_interval_ms: Option<u64>,
 }
 
 /// Build the per-shard consumer-retention registry and start its
@@ -65,9 +62,6 @@ pub(crate) fn build_consumer_registry(
     let mut bg_cfg = BackgroundConfig::default();
     if let Some(ms) = tuning.heartbeat_window_ms {
         bg_cfg.heartbeat_window_ms = ms;
-    }
-    if let Some(ms) = tuning.eviction_interval_ms {
-        bg_cfg.eviction_interval_ms = ms;
     }
     // start_background borrows &self, so the registry stays owned and is returned
     // for producers to register through (the bg task holds its own Arc to core).

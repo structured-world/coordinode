@@ -125,10 +125,8 @@ async fn cadence_overrides_reach_the_background_service() {
         empty_source(&engine),
         RegistryTuning {
             heartbeat_window_ms: Some(250),
-            eviction_interval_ms: Some(5_000),
         },
     )
     .expect("registry");
     assert_eq!(bg.config().heartbeat_window_ms, 250);
-    assert_eq!(bg.config().eviction_interval_ms, 5_000);
 }

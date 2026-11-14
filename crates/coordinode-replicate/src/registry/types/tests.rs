@@ -6,9 +6,7 @@ fn registration_roundtrips_through_msgpack() {
     // every field, including the scope and the policy.
     for retention in [
         ConsumerRetentionPolicy::Strict,
-        ConsumerRetentionPolicy::Bounded(
-            ValidatedRetentionBounds::new(60_000, 1 << 30, Some(30_000)).expect("bounds"),
-        ),
+        ConsumerRetentionPolicy::Ordinary,
     ] {
         let reg = ConsumerRegistration {
             consumer_id: "kafka-sink-eu".to_string(),
@@ -62,28 +60,17 @@ fn a_handle_addresses_one_incarnation() {
     assert_ne!(h, RegisteredHandle::new("c1", 3));
 }
 
-/// A BOUNDED limit of zero is refused: it would be a consumer that ends at
-/// once, or one with no bound at all where a bound was promised.
+/// A stored policy the registry no longer offers (a byte and age quota) does
+/// not decode as any policy it does offer: the record is refused, never
+/// reused as STRICT or ordinary progress it never was.
 #[test]
-fn zero_bounds_are_refused() {
-    for (lag, bytes, liveness) in [(0, 1, None), (1, 0, None), (1, 1, Some(0))] {
-        assert!(
-            matches!(
-                ValidatedRetentionBounds::new(lag, bytes, liveness),
-                Err(RegistryError::InvalidRetention(_))
-            ),
-            "({lag}, {bytes}, {liveness:?}) was admitted"
-        );
+fn a_withdrawn_quota_policy_does_not_decode() {
+    #[derive(Serialize)]
+    enum Stored {
+        Bounded((u64, u64, Option<u64>)),
     }
-    let b = ValidatedRetentionBounds::new(1, 2, None).expect("finite bounds");
-    assert_eq!(
-        (
-            b.max_progress_lag_ms(),
-            b.max_retained_bytes(),
-            b.liveness_timeout_ms()
-        ),
-        (1, 2, None)
-    );
+    let bytes = rmp_serde::to_vec(&Stored::Bounded((60_000, 1 << 30, None))).expect("encode");
+    assert!(rmp_serde::from_slice::<ConsumerRetentionPolicy>(&bytes).is_err());
 }
 
 #[test]
@@ -101,16 +88,13 @@ fn a_terminated_error_names_its_reason_and_checkpoint() {
     let e = RegistryError::Terminated {
         consumer_id: "c".into(),
         incarnation: 4,
-        reason: TerminalReason::ProgressLagExceeded,
+        reason: TerminalReason::Cancelled,
         checkpoint: 99,
         retained_from: 57,
     };
     let msg = format!("{e}");
     assert!(
-        msg.contains("ProgressLagExceeded")
-            && msg.contains("99")
-            && msg.contains('4')
-            && msg.contains("57"),
+        msg.contains("Cancelled") && msg.contains("99") && msg.contains('4') && msg.contains("57"),
         "msg: {msg}"
     );
 }

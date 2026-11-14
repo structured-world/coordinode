@@ -32,7 +32,7 @@ use coordinode_raft::storage::raft_oplog_dirs;
 use coordinode_replicate::{
     ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, InitialSeqno, RegisteredHandle,
     RegistrationWatch, RegistryError, RetentionPressure, SeqnoConsumerRegistry,
-    ShardConsumerRegistry, TopologyScope, ValidatedRetentionBounds,
+    ShardConsumerRegistry, TopologyScope,
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::error::StorageError;
@@ -155,43 +155,20 @@ impl ChangeEventServiceImpl {
             coordinode_storage::engine::operations::unit_decisions(Arc::clone(engine)),
         ))
     }
+}
 
-    /// The retention policy a registering request chose, refused when it
-    /// chose none or chose bounds its stream could not keep.
-    fn retention(
-        &self,
-        proto: Option<ConsumerRetention>,
-    ) -> Result<ConsumerRetentionPolicy, Status> {
-        let policy = proto.and_then(|r| r.policy).ok_or_else(|| {
-            Status::invalid_argument(
-                "registering a consumer requires a retention policy, strict or bounded",
-            )
-        })?;
-        match policy {
-            consumer_retention::Policy::Strict(_) => Ok(ConsumerRetentionPolicy::Strict),
-            consumer_retention::Policy::Bounded(b) => {
-                if let Some(liveness) = b.liveness_timeout_ms {
-                    // A connected stream proves liveness at the heartbeat
-                    // interval: a timeout no longer than that would end a
-                    // consumer that is connected and reading.
-                    let interval = self.tuning.heartbeat_interval.as_millis();
-                    if u128::from(liveness) <= interval {
-                        return Err(Status::invalid_argument(format!(
-                            "liveness_timeout_ms {liveness} must exceed the server's heartbeat \
-                             interval of {interval} ms"
-                        )));
-                    }
-                }
-                ValidatedRetentionBounds::new(
-                    b.max_progress_lag_ms,
-                    b.max_retained_bytes,
-                    b.liveness_timeout_ms,
-                )
-                .map(ConsumerRetentionPolicy::Bounded)
-                .map_err(registry_status)
-            }
-        }
-    }
+/// The retention policy a registering request chose, refused when it chose
+/// none.
+fn retention(proto: Option<ConsumerRetention>) -> Result<ConsumerRetentionPolicy, Status> {
+    let policy = proto.and_then(|r| r.policy).ok_or_else(|| {
+        Status::invalid_argument(
+            "registering a consumer requires a retention policy, strict or ordinary",
+        )
+    })?;
+    Ok(match policy {
+        consumer_retention::Policy::Strict(_) => ConsumerRetentionPolicy::Strict,
+        consumer_retention::Policy::Ordinary(_) => ConsumerRetentionPolicy::Ordinary,
+    })
 }
 
 /// How a change stream paces its reads (`cdc_heartbeat_interval_ms`,
@@ -234,8 +211,7 @@ fn registry_status(e: RegistryError) -> Status {
     match e {
         RegistryError::EmptyConsumerId
         | RegistryError::ConsumerIdTooLong { .. }
-        | RegistryError::UnsupportedScope(_)
-        | RegistryError::InvalidRetention(_) => Status::invalid_argument(message),
+        | RegistryError::UnsupportedScope(_) => Status::invalid_argument(message),
         RegistryError::AlreadyRegistered { .. } => Status::already_exists(message),
         RegistryError::UnknownConsumer(_) => Status::not_found(message),
         RegistryError::Terminated {
@@ -300,8 +276,6 @@ fn registry_status(e: RegistryError) -> Status {
             leader_id.map(|id| ("leader_id", id.to_string())),
         ),
         RegistryError::Replication(_) => Status::internal(message),
-        // Raised by the registry's own sweep; a retry reads the outcome.
-        RegistryError::OutcomeUnknown { .. } => Status::unavailable(message),
     }
 }
 
@@ -403,7 +377,7 @@ impl ChangeEventServiceImpl {
         let registry = self.registry.clone();
         let consumer_id = req.consumer_id;
         let handle = if req.incarnation == 0 {
-            let retention = self.retention(req.retention)?;
+            let retention = retention(req.retention)?;
             let reg = ConsumerRegistration {
                 consumer_id,
                 kind: ConsumerKind::OplogEvents,
@@ -660,8 +634,9 @@ async fn stream_consumer(mut s: StreamState) {
         }
 
         if caught_up {
-            // Heartbeat so a BOUNDED liveness timeout sees a connected reader,
-            // then sleep until an entry applies, a write to the registration
+            // Heartbeat so the registration shows a connected reader (a
+            // diagnostic: it ends and extends nothing), then sleep until an
+            // entry applies, a write to the registration
             // applies (the relay may notice it after the entry woke us), the
             // client leaves, or the next heartbeat is due.
             if let Err(e) = s.registry.heartbeat(&s.handle) {

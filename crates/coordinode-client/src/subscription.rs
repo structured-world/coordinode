@@ -8,14 +8,13 @@
 //! drains at once when the server says applied events are waiting.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use crate::error::ClientError;
 use crate::proto::replication::{
-    AcknowledgeSubscriptionRequest, BoundedRetention, CancelSubscriptionRequest, CdcFilters,
-    ChangeOpType, ConsumerRetention, ResumeToken, StrictRetention, SubscribeRequest,
+    AcknowledgeSubscriptionRequest, CancelSubscriptionRequest, CdcFilters, ChangeOpType,
+    ConsumerRetention, OrdinaryRetention, ResumeToken, StrictRetention, SubscribeRequest,
     consumer_retention,
 };
 use crate::proto::session::server_frame::Event;
@@ -25,21 +24,16 @@ use crate::session::{SessionLink, error_status};
 /// Events granted to the server at a time unless set otherwise.
 pub const DEFAULT_WINDOW: u32 = 256;
 
-/// How long a consumer's registration protects the history it still needs.
+/// Whether a consumer's registration protects the history it still needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retention {
-    /// Until the registration is cancelled.
+    /// The server keeps every event from the acknowledged position until the
+    /// registration is cancelled.
     Strict,
-    /// Until one of the bounds is crossed.
-    Bounded {
-        /// Most age of the oldest event not yet sent to the consumer.
-        max_progress_lag: Duration,
-        /// Most bytes of log the consumer's position may hold on the server.
-        max_retained_bytes: u64,
-        /// Longest time without the consumer connected; `None` never ends it
-        /// for being absent.
-        liveness_timeout: Option<Duration>,
-    },
+    /// The registration records the acknowledged position only; the server's
+    /// own log retention decides how far back it reaches. A position it no
+    /// longer holds is refused as retention lost, and the consumer rebuilds.
+    Ordinary,
 }
 
 /// Which consumer a subscription reads as and from where.
@@ -100,15 +94,7 @@ impl SubscribeOptions {
         let retention = self.retention.map(|retention| ConsumerRetention {
             policy: Some(match retention {
                 Retention::Strict => consumer_retention::Policy::Strict(StrictRetention {}),
-                Retention::Bounded {
-                    max_progress_lag,
-                    max_retained_bytes,
-                    liveness_timeout,
-                } => consumer_retention::Policy::Bounded(BoundedRetention {
-                    max_progress_lag_ms: millis(max_progress_lag),
-                    max_retained_bytes,
-                    liveness_timeout_ms: liveness_timeout.map(millis),
-                }),
+                Retention::Ordinary => consumer_retention::Policy::Ordinary(OrdinaryRetention {}),
             }),
         });
         SubscribeRequest {
@@ -122,11 +108,6 @@ impl SubscribeOptions {
             retention,
         }
     }
-}
-
-/// Whole milliseconds of `d`; a duration past `u64::MAX` ms is that many.
-fn millis(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Where a stream continues after an event: pass it to

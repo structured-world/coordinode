@@ -23,9 +23,9 @@ use tonic_types::StatusExt;
 use super::{AppliedFrontier, AppliedSignal, ChangeEventServiceImpl, INCARNATION_METADATA};
 use crate::proto::replication::cdc::change_stream_service_server::ChangeStreamService;
 use crate::proto::replication::cdc::{
-    AcknowledgeSubscriptionRequest, BoundedRetention, CancelSubscriptionRequest,
-    CdcFilters as ProtoCdcFilters, ConsumerRetention, ResumeToken as ProtoResumeToken,
-    StrictRetention, SubscribeRequest, consumer_retention,
+    AcknowledgeSubscriptionRequest, CancelSubscriptionRequest, CdcFilters as ProtoCdcFilters,
+    ConsumerRetention, OrdinaryRetention, ResumeToken as ProtoResumeToken, StrictRetention,
+    SubscribeRequest, consumer_retention,
 };
 use crate::registry::{RegistryTuning, build_consumer_registry};
 use coordinode_replicate::LogRetentionSource;
@@ -89,13 +89,9 @@ fn strict() -> Option<ConsumerRetention> {
     })
 }
 
-fn bounded(liveness_ms: Option<u64>) -> Option<ConsumerRetention> {
+fn ordinary() -> Option<ConsumerRetention> {
     Some(ConsumerRetention {
-        policy: Some(consumer_retention::Policy::Bounded(BoundedRetention {
-            max_progress_lag_ms: 3_600_000,
-            max_retained_bytes: 1 << 40,
-            liveness_timeout_ms: liveness_ms,
-        })),
+        policy: Some(consumer_retention::Policy::Ordinary(OrdinaryRetention {})),
     })
 }
 
@@ -189,7 +185,7 @@ async fn a_scrape_shows_each_consumers_lag() {
     );
     let _stream = f
         .service
-        .subscribe(Request::new(register("behind", bounded(None))))
+        .subscribe(Request::new(register("behind", ordinary())))
         .await
         .expect("subscribe");
 
@@ -317,24 +313,12 @@ async fn subscribe_refuses_requests_it_cannot_serve() {
         None,
         RegistryTuning::default(),
     );
-    let zero_bound = Some(ConsumerRetention {
-        policy: Some(consumer_retention::Policy::Bounded(BoundedRetention {
-            max_progress_lag_ms: 0,
-            max_retained_bytes: 1,
-            liveness_timeout_ms: None,
-        })),
-    });
     let cases = [
         (register("", strict()), "no consumer id"),
         (register("c", None), "no retention policy"),
         (
             register("c", Some(ConsumerRetention { policy: None })),
             "an empty policy",
-        ),
-        (register("c", zero_bound), "a zero bound"),
-        (
-            register("c", bounded(Some(10_000))),
-            "a liveness timeout no longer than the heartbeat interval",
         ),
         (
             SubscribeRequest {
@@ -450,52 +434,84 @@ async fn registering_below_the_retained_log_is_refused_with_retention_lost() {
     }
 }
 
-/// A connected reader slower than the log keeps a BOUNDED registration: the
-/// stream heartbeats while it waits on the reader, so liveness ends only
-/// consumers that are gone.
+/// An ordinary consumer that stopped keeps nothing of the log: the log is
+/// purged past its acknowledged position, and resuming it is refused with
+/// RETENTION_LOST naming that position and where the log starts now. It is
+/// never resumed past the gap or moved to the newest entry; its registration
+/// stays live for a rebuild to acknowledge a held position.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_slow_bounded_reader_is_not_ended_for_liveness() {
+async fn a_stopped_ordinary_consumer_learns_its_history_is_gone() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
-    let floor = write_oplog(oplog_dir.path(), 300);
-    let mut f = fixture(
-        vec![oplog_dir.path().to_path_buf()],
-        floor,
-        Arc::new(|| 300),
-        None,
-        RegistryTuning {
-            heartbeat_window_ms: Some(20),
-            eviction_interval_ms: Some(50),
-        },
-    );
-    f.service = f.service.with_tuning(super::CdcStreamTuning {
-        heartbeat_interval: Duration::from_millis(50),
-        batch_size: std::num::NonZeroUsize::new(256).expect("nonzero"),
-        ..super::CdcStreamTuning::default()
-    });
-    // Thirty heartbeat intervals: each heartbeat lands through a commit, and
-    // a loaded test host can stretch one well past its interval.
-    let liveness_ms = 1_500;
-    let mut stream = f
-        .service
-        .subscribe(Request::new(register("slow", bounded(Some(liveness_ms)))))
-        .await
-        .expect("subscribe")
-        .into_inner();
-
-    // The reader takes nothing for two timeouts; the stream fills its buffer
-    // and waits.
-    tokio::time::sleep(Duration::from_millis(2 * liveness_ms)).await;
-    assert_eq!(
-        state_of(&f.registry, "slow"),
-        Some(RegistrationState::Live),
-        "a connected reader was ended while the stream waited on it"
-    );
-    for expected in 0..300 {
-        assert_eq!(
-            next_index(&mut stream, Duration::from_secs(5)).await,
-            Some(expected)
-        );
+    let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog");
+    for index in 0..10u64 {
+        mgr.append(&OplogEntry {
+            ts: 1000 + index,
+            term: 1,
+            index,
+            shard: 0,
+            ops: vec![OplogOp::Insert {
+                partition: 0,
+                key: format!("node:{index}").into_bytes(),
+                value: b"v".to_vec(),
+            }],
+            is_migration: false,
+            pre_images: None,
+        })
+        .expect("append");
+        if index == 4 {
+            mgr.rotate().expect("seal");
+        }
     }
+    mgr.rotate().expect("seal");
+    let f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
+        Arc::new(|| 10),
+        None,
+        RegistryTuning::default(),
+    );
+    let response = f
+        .service
+        .subscribe(Request::new(register("sink", ordinary())))
+        .await
+        .expect("subscribe");
+    let incarnation: u64 = response
+        .metadata()
+        .get(INCARNATION_METADATA)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("incarnation");
+    drop(response);
+    assert_eq!(
+        f.registry.oplog_retention_floor(),
+        u64::MAX,
+        "an ordinary registration holds no log"
+    );
+
+    assert_eq!(mgr.purge_before(5).expect("purge"), 1);
+    let status = match f
+        .service
+        .subscribe(Request::new(resume("sink", incarnation)))
+        .await
+    {
+        Ok(_) => panic!("a stream resumed over a purged position"),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo");
+    assert_eq!(info.reason, "RETENTION_LOST");
+    assert_eq!(info.metadata.get("requested_index"), Some(&"0".to_string()));
+    assert_eq!(
+        info.metadata.get("first_retained_index"),
+        Some(&"5".to_string())
+    );
+    assert_eq!(
+        state_of(&f.registry, "sink"),
+        Some(RegistrationState::Live),
+        "the loss is reported, the registration kept"
+    );
 }
 
 /// A change stream sends an entry only once this node has applied it: the

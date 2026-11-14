@@ -4,15 +4,15 @@
 //! The registry feeds the retention of the history consumers read: the
 //! lsm-tree GC watermark (MVCC seqno space) and oplog segment retention
 //! (oplog index space). Each consumer registers with an explicit retention
-//! policy: STRICT keeps its protection until it is cancelled, BOUNDED until
-//! a declared bound is crossed. A shard's floor in each space is the minimum
-//! checkpoint over its live registrations.
+//! policy: STRICT keeps its protection until it is cancelled, ORDINARY
+//! records progress only and holds nothing. A shard's floor in each space is
+//! the minimum checkpoint over its live STRICT registrations.
 //!
 //! Public surface (types and trait) plus the replicated
 //! [`ShardConsumerRegistry`] implementation, whose every transition is a
 //! transaction conditioned on the record it read, and its background service
-//! ([`RegistryBackground`]): coalesced heartbeats and the sweep that ends a
-//! BOUNDED registration once its bound is crossed.
+//! ([`RegistryBackground`]): coalesced heartbeats and the floors published
+//! again whenever the registry changes.
 
 mod entry;
 mod log_source;
@@ -28,7 +28,6 @@ pub use types::{
     ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot, InitialSeqno,
     Measure, PriorIncarnation, RegisteredHandle, RegistrationState, RegistryError,
     RetentionPressure, RetentionSpace, RetentionSummary, TerminalReason, TopologyScope, Unmeasured,
-    ValidatedRetentionBounds,
 };
 pub use watch::RegistrationWatch;
 
@@ -50,7 +49,6 @@ pub trait SeqnoConsumerRegistry {
     ///
     /// # Errors
     /// [`RegistryError::EmptyConsumerId`], [`RegistryError::UnsupportedScope`],
-    /// [`RegistryError::InvalidRetention`] when the policy cannot be admitted,
     /// [`RegistryError::RetentionLost`] when the starting position is no
     /// longer held, [`RegistryError::AlreadyRegistered`] while another
     /// incarnation of the id is live, and the commit failures.
@@ -79,8 +77,8 @@ pub trait SeqnoConsumerRegistry {
     /// The handle refusals and the commit failures.
     fn unregister(&self, handle: RegisteredHandle) -> Result<(), RegistryError>;
 
-    /// The MVCC-space floor: `min(checkpoint_seqno)` over live MVCC-space
-    /// registrations, or `u64::MAX` when there is none.
+    /// The MVCC-space floor: `min(checkpoint_seqno)` over live STRICT
+    /// MVCC-space registrations, or `u64::MAX` when there is none.
     fn shard_floor(&self) -> u64;
 
     /// Every registration on this shard, live or ended (ops / debugging).
