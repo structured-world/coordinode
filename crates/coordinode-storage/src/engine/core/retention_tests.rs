@@ -219,8 +219,7 @@ fn compaction_keeps_no_history_of_the_system_partitions() {
         engine.force_compaction(part).expect("compact");
     }
 
-    // The data tree holds the data alone: each commit's material records
-    // are in the accounting tree.
+    // The data tree holds the data alone.
     assert_eq!(
         engine.approximate_len(Partition::Node).expect("len"),
         10,
@@ -1570,7 +1569,6 @@ fn commit_in_flight<'e>(
             || oracle.next().as_raw(),
             vec![(Partition::Node, key.to_vec())],
             Vec::new(),
-            crate::engine::pending::Material::Changes,
             None,
         )
         .expect("admit")

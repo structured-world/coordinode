@@ -18,7 +18,6 @@ use coordinode_core::budget::QueryBudget;
 use coordinode_core::graph::node::{
     IdLease, IdLeaseError, IdLeaseReserver, NODE_ID_MAX_SEQUENCE, NODE_LEASE_TOKEN_LEN,
 };
-use coordinode_storage::engine::pending::Refusal;
 
 use super::fields::lock_within;
 use coordinode_core::txn::proposal::{
@@ -102,18 +101,16 @@ impl LogLeaseReserver {
         token: Option<[u8; NODE_LEASE_TOKEN_LEN]>,
         stop: Option<&QueryBudget>,
     ) -> Result<bool, IdLeaseError> {
+        if let Some(stop) = stop {
+            stop.check().map_err(IdLeaseError::Stopped)?;
+        }
         let id = self.proposal_ids.next();
         // Held as not yet logged until the entry is handed over, so no
-        // closed bound passes over it meanwhile. The lease is a Schema
-        // record, which consumers are charged for.
+        // closed bound passes over it meanwhile.
         let (commit_ts, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| self.oracle.next().as_raw(), stop)
-            .map_err(|refusal| match refusal {
-                Refusal::Stopped(stopped) => IdLeaseError::Stopped(stopped),
-                _ => IdLeaseError::Held,
-            })?;
+            .obligate(|| self.oracle.next().as_raw());
         // The proposal below carries the whole grant.
         held.seal(id);
         let commit_ts = Timestamp::from_raw(commit_ts);

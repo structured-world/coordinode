@@ -1224,7 +1224,6 @@ dependencies = [
  "test-log",
  "thiserror 2.0.21",
  "tracing",
- "tracking-allocator",
  "xxhash-rust",
 ]
 

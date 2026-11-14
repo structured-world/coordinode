@@ -148,10 +148,6 @@ pub enum DictionaryError {
     /// A stored id no binding names: data the dictionary cannot interpret.
     #[error("field id {0} is stored but has no binding")]
     Unbound(u32),
-    /// A consumer's ending was being ordered and held the registration's
-    /// write past its wait: nothing was published; retry.
-    #[error("field registration held by a consumer's ending being ordered; retry")]
-    Held,
     /// The statement the registration was made for reached its deadline or
     /// was cancelled while the registration waited; nothing more was
     /// published.

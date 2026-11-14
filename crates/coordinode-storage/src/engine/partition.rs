@@ -66,14 +66,6 @@ pub enum Partition {
     /// and the commit that stated it. Application data, kept past the
     /// time-travel window.
     NodeHistory,
-
-    /// `acct`: this member's accounting of the material the other partitions
-    /// hold, for retention consumers, keyed by source partition. Derived
-    /// storage metadata, written only by the engine beside the writes it
-    /// describes: its commit-ordered keys live apart from the data so they
-    /// never widen a data table's key range. Never replicated, transferred
-    /// or backed up; a member rebuilds it from its own data.
-    Accounting,
 }
 
 impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
@@ -97,7 +89,7 @@ impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
 
 impl Partition {
     /// The proposal partition a mutation of this partition names, or `None`
-    /// for the Raft and accounting partitions, which no proposal writes.
+    /// for the Raft partition, which no proposal writes.
     pub fn proposal_id(self) -> Option<coordinode_core::txn::proposal::PartitionId> {
         use coordinode_core::txn::proposal::PartitionId;
         Some(match self {
@@ -113,27 +105,7 @@ impl Partition {
             Self::VectorF32 => PartitionId::VectorF32,
             Self::Registry => PartitionId::Registry,
             Self::NodeHistory => PartitionId::NodeHistory,
-            Self::Accounting => return None,
         })
-    }
-
-    /// Whether only the engine writes this partition: the material
-    /// accounting. A batch or direct write naming it is refused, so no
-    /// caller can put a record the engine does not derive.
-    pub(crate) fn is_engine_owned(self) -> bool {
-        matches!(self, Self::Accounting)
-    }
-
-    /// Refuse a caller's write into an engine-owned partition.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::error::StorageError::EngineOwnedPartition`] for one.
-    pub(crate) fn writable(self) -> crate::error::StorageResult<Self> {
-        if self.is_engine_owned() {
-            return Err(crate::error::StorageError::EngineOwnedPartition { name: self.name() });
-        }
-        Ok(self)
     }
 
     /// The storage partition name for this logical partition.
@@ -151,7 +123,6 @@ impl Partition {
             Self::VectorF32 => "vec",
             Self::Registry => "registry",
             Self::NodeHistory => "nodehist",
-            Self::Accounting => "acct",
         }
     }
 
@@ -193,7 +164,7 @@ impl Partition {
     /// which decides whether it may join a group that already has data.
     pub fn user_data_prefix(self) -> Option<&'static [u8]> {
         match self {
-            Self::Raft | Self::Registry | Self::Accounting => None,
+            Self::Raft | Self::Registry => None,
             Self::Schema => Some(b"schema:"),
             _ => Some(b""),
         }
@@ -222,12 +193,11 @@ impl Partition {
             Self::VectorF32 => 9,
             Self::Registry => 10,
             Self::NodeHistory => 11,
-            Self::Accounting => 12,
         }
     }
 
     /// The number of partitions.
-    pub(crate) const COUNT: usize = 13;
+    pub(crate) const COUNT: usize = 12;
 
     /// All partitions in creation order.
     pub fn all() -> &'static [Partition] {
@@ -244,7 +214,6 @@ impl Partition {
             Self::VectorF32,
             Self::Registry,
             Self::NodeHistory,
-            Self::Accounting,
         ]
     }
 }

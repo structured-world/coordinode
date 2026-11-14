@@ -1,6 +1,6 @@
 //! The closure ledger is engine protocol metadata kept in the Schema tree's
 //! reserved namespace: application scans, change enumeration, range
-//! deletion, consumers and material accounting never see it, a copy of the
+//! deletion and consumers never see it, a copy of the
 //! partition carries it explicitly, and a store holding it where an earlier
 //! layout kept it is refused.
 
@@ -96,16 +96,13 @@ fn ledger_records_are_not_application_rows() {
 }
 
 /// The ledger's writes owe consumers nothing: a follower of the Schema
-/// partition is handed no keys for them, and they add no logical material.
-/// Written as application rows, each entry handed its keys to the follower
-/// and counted their bytes as material a consumer must read.
+/// partition is handed no keys for them. Written as application rows, each
+/// entry handed its keys to the follower.
 #[test]
 fn ledger_writes_owe_consumers_nothing() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let engine = StorageEngine::open(&config(dir.path())).expect("open");
     let schema = engine.subscribe_applied(Partition::Schema, 64);
-    // The store's own rows (its routing) written when it opened.
-    let material_before = engine.material_between(0, None).expect("material");
     ledger(&engine, 5);
 
     while let Some(event) = schema.try_next() {
@@ -115,11 +112,6 @@ fn ledger_writes_owe_consumers_nothing() {
             panic!("the ledger replaced the partition for its consumers: {event:?}");
         }
     }
-    assert_eq!(
-        engine.material_between(0, None).expect("material"),
-        material_before,
-        "ledger records counted as material"
-    );
 }
 
 /// A copy of the Schema partition carries the ledger from the same cut: the

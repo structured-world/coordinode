@@ -92,14 +92,12 @@ fn data_type_from_partition() {
     );
 }
 
-/// Every partition's wire tag round-trips, except the accounting's: no
-/// segment received installs into it. Unknown tags decode to `None`.
+/// Every partition's wire tag round-trips. Unknown tags decode to `None`.
 #[test]
 fn partition_wire_tag_round_trips() {
     for &p in Partition::all() {
         let tag = partition_wire_tag(p);
-        let expected = (p != Partition::Accounting).then_some(p);
-        assert_eq!(partition_from_wire_tag(tag), expected, "{p:?}");
+        assert_eq!(partition_from_wire_tag(tag), Some(p), "{p:?}");
     }
     assert_eq!(partition_from_wire_tag(250), None);
 }

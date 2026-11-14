@@ -205,13 +205,11 @@ impl Commands {
     /// applied here.
     async fn write(&self, command: MetadataCommand) -> Result<(), String> {
         // Held as not yet logged until it is handed over, so no entry's
-        // bound passes over it meanwhile. A metadata command writes the
-        // Schema, which consumers are charged for.
+        // bound passes over it meanwhile.
         let (at, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| self.oracle.next().as_raw(), None)
-            .map_err(|_| coordinode_storage::error::StorageError::MaterialClaimed.to_string())?;
+            .obligate(|| self.oracle.next().as_raw());
         let mut request = command_request(
             command,
             self.ids.next(),

@@ -481,10 +481,6 @@ impl From<coordinode_core::graph::node::IdLeaseError> for ExecutionError {
             coordinode_core::graph::node::IdLeaseError::NotLeader { leader_id } => {
                 ExecutionError::NotLeader { leader_id }
             }
-            // Held behind a consumer's ending: the store's typed refusal.
-            coordinode_core::graph::node::IdLeaseError::Held => {
-                ExecutionError::Storage(coordinode_storage::error::StorageError::MaterialClaimed)
-            }
             // The statement's own deadline or cancel, met while the grant
             // waited: the answer any other wait of it gives.
             coordinode_core::graph::node::IdLeaseError::Stopped(stop) => {
@@ -515,10 +511,6 @@ impl From<coordinode_core::graph::intern::DictionaryError> for ExecutionError {
             // leader: the statement ran nothing and may be sent again.
             coordinode_core::graph::intern::DictionaryError::NotLeader { leader_id } => {
                 ExecutionError::NotLeader { leader_id }
-            }
-            // Held behind a consumer's ending: the store's typed refusal.
-            coordinode_core::graph::intern::DictionaryError::Held => {
-                ExecutionError::Storage(coordinode_storage::error::StorageError::MaterialClaimed)
             }
             // As a lease's: the statement stopped while the registration waited.
             coordinode_core::graph::intern::DictionaryError::Stopped(stop) => {
@@ -3812,23 +3804,15 @@ impl<'a> ExecutionContext<'a> {
             return Ok(LocalIndexStore::new(self.engine).apply_unreplicated(&mutations)?);
         };
         // Held as not yet logged until the entry is handed over, so no
-        // closed bound passes over it meanwhile. Index definitions and the
-        // entries they clear are material consumers are charged for.
+        // closed bound passes over it meanwhile.
         let (commit_ts, held) = match self.mvcc_oracle {
             Some(oracle) => {
+                // The statement's own deadline or cancellation.
+                self.budget.check().map_err(ExecutionError::Budget)?;
                 let (ts, held) = self
                     .engine
                     .pending_commits()
-                    .obligate_changing(|| oracle.next().as_raw(), Some(&self.budget))
-                    .map_err(|refusal| match refusal {
-                        // The statement's own deadline or cancellation.
-                        coordinode_storage::engine::pending::Refusal::Stopped(stop) => {
-                            ExecutionError::Budget(stop)
-                        }
-                        _ => ExecutionError::Storage(
-                            coordinode_storage::error::StorageError::MaterialClaimed,
-                        ),
-                    })?;
+                    .obligate(|| oracle.next().as_raw());
                 (Timestamp::from_raw(ts), Some(held))
             }
             None => (self.mvcc_read_ts, None),

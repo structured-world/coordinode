@@ -248,8 +248,6 @@ fn partition_to_id(p: Partition) -> PartitionId {
         Partition::Schema => PartitionId::Schema,
         Partition::Idx => PartitionId::Idx,
         Partition::Raft => unreachable!("Raft partition is not exposed to the query layer"),
-        // Refused where an attempt stages a write (`Partition::writable`).
-        Partition::Accounting => unreachable!("an attempt writes no engine-owned partition"),
         Partition::Counter => PartitionId::Counter,
         Partition::VectorF32 => PartitionId::VectorF32,
         Partition::Registry => PartitionId::Registry,
@@ -1008,7 +1006,6 @@ impl<'a> Transaction<'a> {
     /// MVCC-aware write: buffers for atomic flush at commit. Legacy mode writes
     /// straight to the engine.
     pub fn put(&mut self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
-        let part = part.writable()?;
         if self.oracle.is_some() {
             self.admit_staged(STAGED_WRITE + key.len() + value.len())?;
             self.write_buffer
@@ -1038,7 +1035,6 @@ impl<'a> Transaction<'a> {
         prefix: &[u8],
         value: &[u8],
     ) -> StorageResult<()> {
-        let part = part.writable()?;
         if self.oracle.is_none() {
             return Err(StorageError::NoCommitTimestamp);
         }
@@ -1051,7 +1047,6 @@ impl<'a> Transaction<'a> {
     /// MVCC-aware delete: buffers a tombstone for atomic flush. Legacy mode
     /// deletes straight from the engine.
     pub fn delete(&mut self, part: Partition, key: &[u8]) -> StorageResult<()> {
-        let part = part.writable()?;
         if self.oracle.is_some() {
             self.admit_staged(STAGED_WRITE + key.len())?;
             self.write_buffer.insert((part, key.to_vec()), None);
@@ -1069,7 +1064,6 @@ impl<'a> Transaction<'a> {
     /// record that owns it. The attempt neither reads nor writes inside a
     /// range it removes: its reads would still see the range as stored.
     pub fn remove_range(&mut self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<()> {
-        let part = part.writable()?;
         if self.oracle.is_some() {
             self.range_removals
                 .push((part, start.to_vec(), end.to_vec()));
@@ -2275,9 +2269,6 @@ impl<'a> Transaction<'a> {
             .filter(|(part, key, _)| !scope.iter().any(|(p, k)| p == part && k == key))
             .map(|(part, key, _)| (*part, key.clone()))
             .collect();
-        // A commit that changes the material shares its scope: a terminal
-        // decision on that measure waits for it, and it waits behind one.
-        let material = self.changes_material(!counts.is_empty());
         let pending = self.engine.pending_commits();
         // A statement's commit waits no longer than the statement may.
         let stop = self.write_budget.as_deref();
@@ -2287,16 +2278,9 @@ impl<'a> Transaction<'a> {
                 scope.clone(),
                 guards,
                 wait,
-                material,
                 stop,
             ),
-            None => pending.admit_allocated(
-                || oracle.next().as_raw(),
-                scope.clone(),
-                guards,
-                material,
-                stop,
-            ),
+            None => pending.admit_allocated(|| oracle.next().as_raw(), scope.clone(), guards, stop),
         };
         let (commit_ts_raw, admission) = admitted.map_err(|refusal| match refusal {
             crate::engine::pending::Refusal::Overlap {
@@ -2316,17 +2300,14 @@ impl<'a> Transaction<'a> {
                      transaction, which then runs after it."
                 ))
             }
+            // The statement's own deadline or cancellation, met while it
+            // waited: what any other wait of it would answer.
+            crate::engine::pending::Refusal::Stopped(stop) => CommitError::Budget(stop),
             // Not a conflict with anyone in particular: the node is
             // holding more unfinished commits than it admits, and the
             // answer is the same one backpressure gives, a retry after a
             // delay rather than an immediate one that bounces off the
             // same ceiling.
-            // A terminal decision on the material held its scope past the
-            // wait: retried once it is ordered.
-            crate::engine::pending::Refusal::MaterialClaimed => CommitError::Backpressure,
-            // The statement's own deadline or cancellation, met while it
-            // waited: what any other wait of it would answer.
-            crate::engine::pending::Refusal::Stopped(stop) => CommitError::Budget(stop),
             crate::engine::pending::Refusal::AtCapacity { limit } => {
                 tracing::warn!(
                     limit,
@@ -2650,17 +2631,15 @@ impl<'a> Transaction<'a> {
         let mutations = vec![Mutation::Command(MetadataCommand::RecordDeployment {
             id: founding_candidate(self.engine)?,
         })];
+        if let Some(stop) = self.write_budget.as_deref() {
+            stop.check().map_err(CommitError::Budget)?;
+        }
         // Held as not yet logged until the unit is handed over, so no closed
-        // bound passes over it. Its record is in the Schema, which consumers
-        // are charged for.
+        // bound passes over it.
         let (ts, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| oracle.next().as_raw(), self.write_budget.as_deref())
-            .map_err(|refusal| match refusal {
-                crate::engine::pending::Refusal::Stopped(stop) => CommitError::Budget(stop),
-                _ => CommitError::Backpressure,
-            })?;
+            .obligate(|| oracle.next().as_raw());
         if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
             let proposal = RaftProposal {
                 id: id_gen.next(),
@@ -2688,32 +2667,6 @@ impl<'a> Transaction<'a> {
             ));
         }
         Ok(())
-    }
-
-    /// Whether this attempt's unit, as staged, writes anything a coalesced
-    /// state-delta consumer is charged for: anything but writes into
-    /// partitions none is charged for (the registry's own transactions).
-    /// `counts`: whether it changes kept counts, which it merges into the
-    /// counter partition.
-    fn changes_material(&self, counts: bool) -> crate::engine::pending::Material {
-        use crate::engine::material::accounted;
-        let untouched = !counts
-            && self.merge_adj_ops.is_empty()
-            && self.merge_node_deltas.is_empty()
-            && self.merge_counter_deltas.is_empty()
-            && self.derived.is_empty()
-            && self.operation.is_none()
-            && self.write_buffer.keys().all(|(part, _)| !accounted(*part))
-            && self
-                .range_removals
-                .iter()
-                .all(|(part, ..)| !accounted(*part))
-            && self.stamped.keys().all(|(part, _)| !accounted(*part));
-        if untouched {
-            crate::engine::pending::Material::Untouched
-        } else {
-            crate::engine::pending::Material::Changes
-        }
     }
 
     fn seal_unit(&mut self, wb: WriteBuffer) -> Vec<Mutation> {

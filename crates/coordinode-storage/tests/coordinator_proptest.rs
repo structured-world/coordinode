@@ -46,9 +46,8 @@ proptest! {
         value in prop::collection::vec(any::<u8>(), 0..256),
     ) {
         // Skip the Raft partition, reserved for openraft framework bytes,
-        // not arbitrary user payloads, and the accounting one, which only
-        // the engine writes.
-        prop_assume!(part != Partition::Raft && part != Partition::Accounting);
+        // not arbitrary user payloads.
+        prop_assume!(part != Partition::Raft);
         // An index entry key under a generation tag is addressed through
         // its generation's installation and must carry the whole prefix;
         // the engine refuses a shorter one rather than store it.

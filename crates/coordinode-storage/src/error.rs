@@ -16,11 +16,6 @@ pub enum StorageError {
     #[error("partition not found: {name}")]
     PartitionNotFound { name: String },
 
-    /// A write named a partition only the engine writes: its records are
-    /// derived from the other partitions' writes. Nothing was written.
-    #[error("partition {name} is written by the storage engine only")]
-    EngineOwnedPartition { name: &'static str },
-
     /// Invalid configuration.
     #[error("invalid storage config: {0}")]
     InvalidConfig(String),
@@ -316,11 +311,6 @@ pub enum StorageError {
     /// checkpoints and its journal are left as they are.
     #[error("the Schema partition cannot be qualified for the open: {0}")]
     SchemaRecoveryRefused(crate::engine::rebuild::RebuildRefusal),
-
-    /// A decision ending a state consumer held the store's writes past the
-    /// wait: nothing was written; retry once it is ordered.
-    #[error("a consumer's ending is being ordered and held this write past its wait; retry")]
-    MaterialClaimed,
 }
 
 /// `key` as text for a message: printable ASCII as it is, every other byte

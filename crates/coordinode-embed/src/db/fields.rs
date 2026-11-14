@@ -25,7 +25,6 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::metadata::{field_bindings_above, load_field_dictionary};
-use coordinode_storage::engine::pending::Refusal;
 use coordinode_storage::error::StorageError;
 
 /// Schema key the dictionary was kept under by releases that wrote it as one
@@ -205,17 +204,15 @@ impl FieldDictionary {
         command: MetadataCommand,
         stop: Option<&QueryBudget>,
     ) -> Result<(), DictionaryError> {
+        if let Some(stop) = stop {
+            stop.check().map_err(DictionaryError::Stopped)?;
+        }
         // Held as not yet logged until the entry is handed over, so no
-        // closed bound passes over it meanwhile. The dictionary is Schema
-        // records, which consumers are charged for.
+        // closed bound passes over it meanwhile.
         let (commit_ts, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| self.oracle.next().as_raw(), stop)
-            .map_err(|refusal| match refusal {
-                Refusal::Stopped(stopped) => DictionaryError::Stopped(stopped),
-                _ => DictionaryError::Held,
-            })?;
+            .obligate(|| self.oracle.next().as_raw());
         let proposal = RaftProposal {
             id: self.proposal_ids.next(),
             mutations: vec![Mutation::Command(command)],

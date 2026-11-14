@@ -135,8 +135,6 @@ fn partition_tag(p: Partition) -> u8 {
         Partition::VectorF32 => 9,
         Partition::Registry => 10,
         Partition::NodeHistory => 11,
-        // Never in a snapshot (`snapshot_partitions`), never decoded.
-        Partition::Accounting => 12,
     }
 }
 
@@ -162,14 +160,12 @@ fn tag_to_partition(tag: u8) -> Option<Partition> {
 /// Partitions included in data snapshots.
 ///
 /// `Partition::Raft` is excluded: its contents (log entries, votes) are
-/// managed by openraft's own snapshot mechanism, not as user data. So is
-/// `Partition::Accounting`: each member counts its own data, and the
-/// receiver counts what it installs.
+/// managed by openraft's own snapshot mechanism, not as user data.
 fn snapshot_partitions() -> impl Iterator<Item = Partition> {
     Partition::all()
         .iter()
         .copied()
-        .filter(|&p| p != Partition::Raft && p != Partition::Accounting)
+        .filter(|&p| p != Partition::Raft)
 }
 
 /// Write a full snapshot of every user-data partition (all but
@@ -373,10 +369,9 @@ struct ParsedSnapshot {
 }
 
 /// Whether a receiver installs `key` of `partition` from a snapshot. Raft
-/// state is openraft's, the accounting and routing (`meta:`) are per node.
+/// state is openraft's, routing (`meta:`) is per node.
 fn installable(partition: Partition, key: &[u8]) -> bool {
     partition != Partition::Raft
-        && partition != Partition::Accounting
         && !(partition == Partition::Schema
             && (key.starts_with(b"raft:") || key.starts_with(b"meta:")))
 }

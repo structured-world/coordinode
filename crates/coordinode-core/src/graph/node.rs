@@ -241,10 +241,6 @@ pub enum IdLeaseError {
     /// The log did not grant a lease for another reason.
     #[error("no NodeId lease was granted: {0}")]
     NotGranted(String),
-    /// A consumer's ending was being ordered and held the grant's write past
-    /// its wait: nothing was granted; retry.
-    #[error("no NodeId lease was granted: held by a consumer's ending being ordered; retry")]
-    Held,
     /// The statement the lease was taken for reached its deadline or was
     /// cancelled while the grant waited; no lease was installed for it.
     #[error("no NodeId lease was granted: {0}")]

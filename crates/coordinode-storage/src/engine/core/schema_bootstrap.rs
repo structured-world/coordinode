@@ -20,7 +20,7 @@ use lsm_tree::{AbstractTree as _, AnyTree, Guard as _, ScanSinceEvent};
 
 use super::{
     OpenRepair, RebuildIntents, RebuildTarget, Rows, encode_kept_rows, read_kept_rows,
-    read_rebuild_intents, remove_rebuild_intent, write_rebuild_intent, write_rebuild_intent_with,
+    read_rebuild_intents, remove_rebuild_intent, write_rebuild_intent_with,
 };
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use crate::engine::coverage::{self, Domain, TreeCoverage};
@@ -141,9 +141,7 @@ impl Bootstrap<'_> {
 
         let kept = self.kept_records(data_dir, pending, lossy)?;
         if pending {
-            // The clear took them; read as the tree's from here on. The scope's
-            // accounting is counted again once the open can.
-            write_rebuild_intent(data_dir, RebuildTarget::Recount(Partition::Schema))?;
+            // The clear took them; read as the tree's from here on.
             let at = self.seqno.next();
             for (key, value) in &kept {
                 self.schema.insert(key.as_slice(), value.as_slice(), at);
@@ -269,8 +267,7 @@ impl SchemaRebuild {
         }
         let source_floor = source.retention_floor();
 
-        // 2. Clear, the intent and the scope's recount owed already.
-        write_rebuild_intent(data_dir, RebuildTarget::Recount(Partition::Schema))?;
+        // 2. Clear, the intent owed already.
         for tree in [schema, &source] {
             if let Some(max) = tree.get_highest_seqno() {
                 seqno.fetch_max(max + 1);

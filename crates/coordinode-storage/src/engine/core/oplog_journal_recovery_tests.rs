@@ -19,8 +19,6 @@ use tempfile::TempDir;
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
 
-/// The accounting tree beside the data trees across crash cuts.
-mod accounting;
 mod schema_transfer;
 
 /// A persistent (oplog-eligible) single-endpoint config rooted at `dir`.
@@ -569,57 +567,6 @@ fn a_conditional_registry_write_keeps_its_outcome_across_a_crash() {
             "the replayed write decided as it first did, once"
         );
         engine.persist().expect("persist");
-        rig.cut(engine);
-    }
-}
-
-/// The material each commit added comes back exactly after a power cut: a
-/// commit already on disk keeps its record, one lost with its memtable is
-/// replayed from the journal with its record, and nothing is counted twice,
-/// also after a second recovery.
-#[test]
-fn material_records_survive_a_crash_exactly_once() {
-    let rig = PowerRig::new();
-    let put = |key: &[u8], len: usize| Mutation::Put {
-        partition: PartitionId::Node,
-        key: key.to_vec(),
-        value: vec![5; len],
-    };
-    let (t100, t200);
-    {
-        let (engine, oracle) = rig.open();
-        t100 = oracle.next().as_raw();
-        t200 = oracle.next().as_raw();
-        write_batch_at(&engine, &[put(b"node:00:0200", 20)], t200);
-        engine.persist().expect("persist t200");
-        write_batch_at(
-            &engine,
-            &[
-                put(b"node:00:0100", 10),
-                Mutation::Merge {
-                    partition: PartitionId::Counter,
-                    key: b"counter:c".to_vec(),
-                    operand: crate::engine::merge::encode_counter_delta(1),
-                },
-            ],
-            t100,
-        );
-        rig.cut(engine);
-    }
-    let at = |engine: &StorageEngine, ts: u64| {
-        engine
-            .material_between(ts, Some(ts + 1))
-            .expect("material")
-            .bytes
-    };
-    for _ in 0..2 {
-        let (engine, _) = rig.open();
-        assert_eq!(at(&engine, t200), 12 + 20, "the flushed commit");
-        assert_eq!(
-            at(&engine, t100),
-            (12 + 10) + (9 + 8),
-            "the replayed commit, in both partitions, once"
-        );
         rig.cut(engine);
     }
 }
@@ -1184,7 +1131,7 @@ fn entries_replayed_at_open_stay_in_the_journal() {
 }
 
 /// Writes that land in two partitions make a persist write tables for those
-/// two trees and the accounting tree their material records went to only:
+/// two trees only: no derived record of the writes lands anywhere else, and
 /// coverage bookkeeping for the journal entries is no reason to write a
 /// table for every other partition.
 #[test]
@@ -1219,7 +1166,7 @@ fn a_persist_writes_tables_only_for_trees_that_took_writes() {
         .collect();
     assert_eq!(
         which,
-        vec!["node", "adj", "acct"],
+        vec!["node", "adj"],
         "trees that got a table: {written} of {}",
         after.len()
     );
@@ -1258,9 +1205,8 @@ fn a_routine_fold_writes_only_the_trees_its_entries_reached() {
     engine.persist().expect("persist");
     let after = tables(&engine);
     let written = before.iter().zip(&after).filter(|(b, a)| a > b).count();
-    // The two data trees the commits wrote, and the accounting tree their
-    // material records went to.
-    assert_eq!(written, 3, "a fold wrote tables for untouched trees");
+    // The two data trees the commits wrote, nothing else.
+    assert_eq!(written, 2, "a fold wrote tables for untouched trees");
 
     let purged = engine
         .oplog_purge_expired(4_000_000_000, u64::MAX)

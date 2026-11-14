@@ -20,7 +20,7 @@ fn admit_at(
     scope: Vec<(Partition, Vec<u8>)>,
 ) -> Result<Admission<'_>, Refusal> {
     pending
-        .admit_allocated(|| ts, scope, Vec::new(), Material::Changes, None)
+        .admit_allocated(|| ts, scope, Vec::new(), None)
         .map(|(_, a)| a)
 }
 
@@ -32,12 +32,11 @@ fn admit_guarded(
     guards: Vec<(Partition, Vec<u8>)>,
 ) -> Result<Admission<'_>, Refusal> {
     pending
-        .admit_allocated(|| ts, scope, guards, Material::Changes, None)
+        .admit_allocated(|| ts, scope, guards, None)
         .map(|(_, a)| a)
 }
 
-/// Hold `ts` as not yet logged, for an entry no consumer's material is in:
-/// what the closed-bound tests hold.
+/// Hold `ts` as not yet logged: what the closed-bound tests hold.
 fn unlogged(pending: &Arc<PendingCommits>, ts: u64) -> (u64, Unlogged) {
     pending.obligate(|| ts)
 }
@@ -262,13 +261,7 @@ fn a_named_timestamp_waits_for_the_commits_it_covers() {
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let admitted = holder
-            .admit_allocated(
-                || 50,
-                key(Partition::Node, b"a"),
-                Vec::new(),
-                Material::Changes,
-                None,
-            )
+            .admit_allocated(|| 50, key(Partition::Node, b"a"), Vec::new(), None)
             .map(|(_, a)| a)
             .expect("admit");
         started_tx.send(()).expect("signal");
@@ -446,13 +439,7 @@ fn a_wait_dropped_as_its_commit_finishes_leaves_nothing_behind() {
         let waker = Waker::from(Arc::clone(&by));
         let mut wait = pending.complete_at(1_000_000);
         let (ts, admission) = pending
-            .admit_allocated(
-                || round + 1,
-                Vec::new(),
-                Vec::new(),
-                Material::Changes,
-                None,
-            )
+            .admit_allocated(|| round + 1, Vec::new(), Vec::new(), None)
             .expect("admit");
         assert_eq!(ts, round + 1);
         assert!(
@@ -488,7 +475,6 @@ fn the_table_refuses_rather_than_growing_without_bound() {
             },
             key(Partition::Node, b"c"),
             Vec::new(),
-            Material::Changes,
             None,
         )
         .map(|(_, a)| a)
@@ -532,7 +518,6 @@ fn a_waiter_is_admitted_once_the_holder_lands() {
                     key(Partition::Schema, b"def"),
                     Vec::new(),
                     Duration::from_secs(10),
-                    Material::Changes,
                     None,
                 )
                 .map(|(ts, _)| ts)
@@ -560,7 +545,6 @@ fn a_waiter_reserves_its_keys_against_later_commits() {
                     key(Partition::Schema, b"def"),
                     Vec::new(),
                     Duration::from_secs(10),
-                    Material::Changes,
                     None,
                 )
                 .map(|(ts, _)| ts)
@@ -591,7 +575,6 @@ fn a_waiter_reserves_its_keys_against_later_commits() {
             key(Partition::Schema, b"def"),
             Vec::new(),
             Duration::from_secs(10),
-            Material::Changes,
             None,
         );
         assert!(
@@ -619,7 +602,6 @@ fn a_waiter_gives_up_at_its_deadline_and_releases_its_keys() {
             key(Partition::Schema, b"def"),
             Vec::new(),
             Duration::from_millis(50),
-            Material::Changes,
             None,
         )
         .map(|(ts, _)| ts)
@@ -807,189 +789,6 @@ fn a_withdrawal_wakes_its_waiter() {
     assert_eq!(waiter.join().expect("waiter"), 1);
 }
 
-/// A terminal decision takes the material scope only once every write
-/// sharing it has landed, and reports the highest timestamp they took. While
-/// it waits, a later write that changes the material waits behind it rather
-/// than overtaking it; a write that changes none goes on. The waiting write
-/// registers once the decision is released.
-#[test]
-fn a_material_claim_waits_for_sharers_and_is_not_overtaken() {
-    let pending = Arc::new(table());
-    let first = admit_at(&pending, 10, key(Partition::Node, b"a")).expect("a sharer");
-    std::thread::scope(|s| {
-        let claimer = s.spawn(|| pending.claim_material(Duration::from_secs(10)));
-        // The claim waits for the sharer in flight.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pending.inner.lock().material_claim != Claim::Waiting {
-            assert!(Instant::now() < deadline, "the claim never waited");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        // A later write that changes the material waits behind it.
-        let later = s.spawn(|| {
-            pending
-                .admit_allocated(
-                    || 30,
-                    key(Partition::Node, b"b"),
-                    Vec::new(),
-                    Material::Changes,
-                    None,
-                )
-                .map(|(ts, _)| ts)
-        });
-        // One that changes none is not held up.
-        let (_, registry) = pending
-            .admit_allocated(
-                || 20,
-                key(Partition::Registry, b"r"),
-                Vec::new(),
-                Material::Untouched,
-                None,
-            )
-            .expect("an untouched write goes on");
-        drop(registry);
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !claimer.is_finished(),
-            "the claim passed a sharer in flight"
-        );
-        assert!(!later.is_finished(), "a later sharer overtook the claim");
-        drop(first);
-        let claim = claimer.join().expect("claimer").expect("the claim");
-        assert_eq!(claim.through(), 10, "the sharers' highest timestamp");
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!later.is_finished(), "a sharer registered under the claim");
-        drop(claim);
-        assert_eq!(later.join().expect("later"), Ok(30));
-    });
-}
-
-/// A decision that keeps the material scope (an ending whose outcome is not
-/// known) holds a new write that changes the material only for that write's
-/// own bound: past [`MATERIAL_WAIT`] each admission path refuses it with
-/// `MaterialClaimed` and holds nothing, and a write that changes no material
-/// is admitted at once. Before, the logged and the direct paths waited for
-/// the decision with no deadline.
-#[test]
-fn a_held_decision_refuses_a_changing_write_at_its_deadline() {
-    let pending = Arc::new(table());
-    let held = pending
-        .claim_material(Duration::from_secs(5))
-        .expect("nothing shares the material");
-    let bounded = |what: &str, refused: Result<u64, Refusal>, started: Instant| {
-        let waited = started.elapsed();
-        assert_eq!(refused, Err(Refusal::MaterialClaimed), "{what}");
-        assert!(
-            waited >= MATERIAL_WAIT && waited < MATERIAL_WAIT + Duration::from_secs(3),
-            "{what} waited {waited:?}"
-        );
-    };
-    std::thread::scope(|s| {
-        let logged = s.spawn(|| {
-            let started = Instant::now();
-            let refused = pending.obligate_changing(|| 40, None).map(|(ts, _)| ts);
-            (refused, started)
-        });
-        let direct = s.spawn(|| {
-            let started = Instant::now();
-            let refused = pending
-                .admit_direct(|| 41, Material::Changes)
-                .map(|(ts, _)| ts);
-            (refused, started)
-        });
-        let untouched_at = Instant::now();
-        let (ts, untouched) = pending.obligate(|| 42);
-        assert_eq!(ts, 42);
-        assert!(
-            untouched_at.elapsed() < Duration::from_secs(1),
-            "a write that changes no material waited for the decision"
-        );
-        drop(untouched);
-        let (refused, started) = logged.join().expect("logged");
-        bounded("the logged write", refused, started);
-        let (refused, started) = direct.join().expect("direct");
-        bounded("the direct write", refused, started);
-    });
-    assert!(
-        pending.inner.lock().admitted.is_empty(),
-        "a refused write holds nothing"
-    );
-    drop(held);
-    let (ts, after) = pending
-        .obligate_changing(|| 43, None)
-        .expect("admitted once the decision is released");
-    assert_eq!(ts, 43);
-    drop(after);
-}
-
-/// A command's write held behind a decision ends with the command: its own
-/// deadline, or its cancellation, refuses it with that reason long before
-/// the material wait would, and it holds nothing. The decision keeps its
-/// scope meanwhile. Before, the wait ran its full bound whatever the
-/// command's own.
-#[test]
-fn a_held_decision_refuses_a_command_at_its_own_deadline_or_cancel() {
-    use coordinode_core::budget::{BudgetStop, CancelFlag, QueryBudget};
-    fn now() -> u64 {
-        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        let epoch = *EPOCH.get_or_init(Instant::now);
-        u64::try_from(epoch.elapsed().as_nanos()).expect("nanoseconds fit")
-    }
-    let pending = Arc::new(table());
-    let held = pending
-        .claim_material(Duration::from_secs(5))
-        .expect("nothing shares the material");
-    // A deadline 200 ms ahead.
-    let budget = QueryBudget::new(1 << 20).with_deadline(now() + 200_000_000, now);
-    let started = Instant::now();
-    let refused = pending
-        .obligate_changing(|| 50, Some(&budget))
-        .map(|(ts, _)| ts);
-    assert_eq!(refused, Err(Refusal::Stopped(BudgetStop::Deadline)));
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "the command waited {:?} past its deadline",
-        started.elapsed()
-    );
-    // Cancelled 100 ms into the wait, a statement's commit included.
-    let cancel = CancelFlag::new();
-    let budget = QueryBudget::new(1 << 20).with_cancel(cancel.clone());
-    std::thread::scope(|s| {
-        let waiter = s.spawn(|| {
-            let started = Instant::now();
-            let refused = pending
-                .admit_allocated(
-                    || 51,
-                    key(Partition::Node, b"a"),
-                    Vec::new(),
-                    Material::Changes,
-                    Some(&budget),
-                )
-                .map(|(ts, _)| ts);
-            (refused, started.elapsed())
-        });
-        std::thread::sleep(Duration::from_millis(100));
-        cancel.cancel();
-        let (refused, waited) = waiter.join().expect("waiter");
-        assert_eq!(refused, Err(Refusal::Stopped(BudgetStop::Cancelled)));
-        assert!(
-            waited < Duration::from_secs(1),
-            "the cancelled command waited {waited:?}"
-        );
-    });
-    assert!(
-        pending.inner.lock().admitted.is_empty(),
-        "a stopped command holds nothing"
-    );
-    assert_eq!(
-        pending
-            .claim_material(Duration::from_millis(10))
-            .map(|c| c.through()),
-        Err(Refusal::MaterialClaimed),
-        "the decision still holds its scope"
-    );
-    drop(held);
-}
-
 /// A budget ending `millis` from now, on a clock local to the test.
 fn ending_in(millis: u64) -> coordinode_core::budget::QueryBudget {
     fn now() -> u64 {
@@ -1001,14 +800,9 @@ fn ending_in(millis: u64) -> coordinode_core::budget::QueryBudget {
         .with_deadline(now() + millis * 1_000_000, now)
 }
 
-/// A command already stopped is not admitted when the scope is open, and
-/// one whose cancellation lands with the decision's release (between its
-/// wake and its admission, set up deterministically) is refused with the
-/// cancellation, not admitted on the open scope. Nothing is held after
-/// either, and a command not stopped is admitted after. Before, the stop
-/// was only looked at while the scope was still held.
+/// A command already stopped is not admitted, and holds nothing.
 #[test]
-fn a_stopped_command_is_not_admitted_as_the_scope_opens() {
+fn a_stopped_command_is_not_admitted() {
     use coordinode_core::budget::{BudgetStop, CancelFlag, QueryBudget};
     let pending = Arc::new(table());
     let cancel = CancelFlag::new();
@@ -1016,62 +810,23 @@ fn a_stopped_command_is_not_admitted_as_the_scope_opens() {
     let cancelled = QueryBudget::new(1 << 20).with_cancel(cancel);
     assert_eq!(
         pending
-            .obligate_changing(|| 40, Some(&cancelled))
+            .admit_allocated(
+                || 40,
+                key(Partition::Node, b"a"),
+                Vec::new(),
+                Some(&cancelled)
+            )
             .map(|(ts, _)| ts),
         Err(Refusal::Stopped(BudgetStop::Cancelled)),
-        "already cancelled with the scope open"
+        "already cancelled"
     );
     assert!(pending.inner.lock().admitted.is_empty(), "nothing held");
 }
 
-/// The race part of the above, on its own: the cancellation lands with the
-/// decision's release, between the wait's wake and its admission (set up
-/// deterministically after the wake), and the command is refused with it.
-#[test]
-fn a_command_cancelled_as_the_scope_opens_is_not_admitted() {
-    use coordinode_core::budget::{BudgetStop, CancelFlag, QueryBudget};
-    let pending = Arc::new(table());
-    let held = pending
-        .claim_material(Duration::from_secs(5))
-        .expect("nothing shares the material");
-    let cancel = CancelFlag::new();
-    let budget = QueryBudget::new(1 << 20).with_cancel(cancel.clone());
-    let refused = std::thread::scope(|s| {
-        s.spawn(|| {
-            let thrower = cancel.clone();
-            AFTER_WAKE.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move |table: &mut Table| {
-                    // The release and the cancellation land together.
-                    table.material_claim = Claim::Open;
-                    thrower.cancel();
-                }));
-            });
-            pending
-                .obligate_changing(|| 41, Some(&budget))
-                .map(|(ts, _)| ts)
-        })
-        .join()
-        .expect("waiter")
-    });
-    assert_eq!(refused, Err(Refusal::Stopped(BudgetStop::Cancelled)));
-    drop(held);
-    assert!(
-        pending.inner.lock().admitted.is_empty(),
-        "a stopped command holds nothing"
-    );
-    let (ts, after) = pending
-        .obligate_changing(|| 42, Some(&QueryBudget::new(1 << 20)))
-        .expect("a command not stopped is admitted");
-    assert_eq!(ts, 42);
-    drop(after);
-}
-
 /// A command resumed after both its own stop and the wait's own bound (set
 /// up deterministically: its wait is 50 ms, and it is cancelled right after
-/// it wakes at that bound, the decision still held) ends with its own
-/// reason, not the wait's: on the decision's wait and on an overlap alike,
-/// its reservation given back. Before, the wait's timeout was decided
-/// first and answered `MaterialClaimed` or the overlap.
+/// it wakes at that bound, the overlap still standing) ends with its own
+/// reason, not the overlap, its reservation given back.
 #[test]
 fn a_command_resumed_past_both_bounds_ends_with_its_own_stop() {
     use coordinode_core::budget::{BudgetStop, CancelFlag, QueryBudget};
@@ -1083,44 +838,8 @@ fn a_command_resumed_past_both_bounds_ends_with_its_own_stop() {
     };
 
     let pending = Arc::new(table());
-    let held = pending
-        .claim_material(Duration::from_secs(5))
-        .expect("nothing shares the material");
-    let cancel = CancelFlag::new();
-    let budget = QueryBudget::new(1 << 20).with_cancel(cancel.clone());
-    let refused = std::thread::scope(|s| {
-        s.spawn(|| {
-            cancelled_on_wake(&cancel);
-            pending
-                .admit_allocated_waiting(
-                    || 20,
-                    key(Partition::Node, b"a"),
-                    Vec::new(),
-                    Duration::from_millis(50),
-                    Material::Changes,
-                    Some(&budget),
-                )
-                .map(|(ts, _)| ts)
-        })
-        .join()
-        .expect("waiter")
-    });
-    assert_eq!(
-        refused,
-        Err(Refusal::Stopped(BudgetStop::Cancelled)),
-        "on the decision's wait"
-    );
-    assert!(pending.inner.lock().reserved.is_empty());
-    drop(held);
-
     let holder = pending
-        .admit_allocated(
-            || 10,
-            Vec::new(),
-            key(Partition::Schema, b"def"),
-            Material::Untouched,
-            None,
-        )
+        .admit_allocated(|| 10, Vec::new(), key(Partition::Schema, b"def"), None)
         .expect("a writer conditioned on the record");
     let cancel = CancelFlag::new();
     let budget = QueryBudget::new(1 << 20).with_cancel(cancel.clone());
@@ -1133,7 +852,6 @@ fn a_command_resumed_past_both_bounds_ends_with_its_own_stop() {
                     key(Partition::Schema, b"def"),
                     Vec::new(),
                     Duration::from_millis(50),
-                    Material::Untouched,
                     Some(&budget),
                 )
                 .map(|(ts, _)| ts)
@@ -1153,11 +871,9 @@ fn a_command_resumed_past_both_bounds_ends_with_its_own_stop() {
     drop(holder);
 }
 
-/// A commit waiting for overlapping commits ends with its command too: held
-/// on an overlap, or moved from the decision's wait onto an overlap once the
-/// decision is released, its deadline or cancellation refuses it with that
-/// reason long before its own wait would, and its reservation goes with it.
-/// Before, the overlap wait ran to its own bound.
+/// A commit waiting for overlapping commits ends with its command: its
+/// deadline or cancellation refuses it with that reason long before its own
+/// wait would, and its reservation goes with it.
 #[test]
 fn a_command_waiting_on_an_overlap_ends_with_its_budget() {
     use coordinode_core::budget::{BudgetStop, CancelFlag, QueryBudget};
@@ -1172,7 +888,6 @@ fn a_command_waiting_on_an_overlap_ends_with_its_budget() {
                 key(Partition::Schema, b"def"),
                 Vec::new(),
                 Duration::from_secs(10),
-                Material::Changes,
                 Some(budget),
             )
             .map(|(ts, _)| ts);
@@ -1202,88 +917,4 @@ fn a_command_waiting_on_an_overlap_ends_with_its_budget() {
         "its reservation goes"
     );
     drop(holder);
-}
-
-/// The move from the decision's wait onto an overlap: the decision is
-/// released while the commit it held overlaps one still in flight, and the
-/// command's deadline ends that second wait as it ended the first.
-#[test]
-fn a_command_moved_from_a_decision_onto_an_overlap_ends_with_its_budget() {
-    use coordinode_core::budget::BudgetStop;
-    let pending = Arc::new(table());
-    let held = pending
-        .claim_material(Duration::from_secs(5))
-        .expect("nothing shares the material");
-    // Overlapping on its key without sharing the material, so it neither
-    // waits for the decision nor holds it up.
-    let holder = pending
-        .admit_allocated(
-            || 10,
-            Vec::new(),
-            key(Partition::Schema, b"def"),
-            Material::Untouched,
-            None,
-        )
-        .expect("a writer conditioned on the record");
-    let budget = ending_in(600);
-    let (refused, waited) = std::thread::scope(|s| {
-        s.spawn(|| {
-            std::thread::sleep(Duration::from_millis(200));
-            drop(held);
-        });
-        let started = Instant::now();
-        let refused = pending
-            .admit_allocated_waiting(
-                || 20,
-                key(Partition::Schema, b"def"),
-                Vec::new(),
-                Duration::from_secs(10),
-                Material::Changes,
-                Some(&budget),
-            )
-            .map(|(ts, _)| ts);
-        (refused, started.elapsed())
-    });
-    assert_eq!(refused, Err(Refusal::Stopped(BudgetStop::Deadline)));
-    assert!(
-        waited >= Duration::from_millis(200) && waited < Duration::from_secs(2),
-        "waited {waited:?}"
-    );
-    assert!(
-        pending.inner.lock().reserved.is_empty(),
-        "its reservation goes"
-    );
-    drop(holder);
-}
-
-/// A claim whose sharers outlast its wait is refused and holds nothing: the
-/// writes that waited behind it go on. A second claim beside a held one is
-/// refused at once.
-#[test]
-fn a_material_claim_that_cannot_be_taken_holds_nothing() {
-    let pending = Arc::new(table());
-    let sharer = admit_at(&pending, 10, key(Partition::Node, b"a")).expect("a sharer");
-    assert_eq!(
-        pending
-            .claim_material(Duration::from_millis(30))
-            .map(|c| c.through()),
-        Err(Refusal::MaterialClaimed)
-    );
-    admit_at(&pending, 11, key(Partition::Node, b"b")).expect("nothing is held");
-    drop(sharer);
-    let held = pending
-        .claim_material(Duration::from_secs(5))
-        .expect("taken once the sharers landed");
-    assert_eq!(
-        pending
-            .claim_material(Duration::from_secs(5))
-            .map(|c| c.through()),
-        Err(Refusal::MaterialClaimed),
-        "one decision at a time"
-    );
-    drop(held);
-    let again = pending
-        .claim_material(Duration::from_secs(5))
-        .expect("free again once released");
-    drop(again);
 }

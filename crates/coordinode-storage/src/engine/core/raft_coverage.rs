@@ -31,47 +31,6 @@ const FLOOR_SLOTS: usize = 16;
 /// it changes. The cleared tree holds no other version for the row to hide.
 pub const INSTALLED_ROW_SEQNO: lsm_tree::SeqNo = 0;
 
-/// Installed rows whose unit records are made at once.
-const UNIT_CHUNK: usize = 1024;
-
-/// The key bytes those copies may hold at once.
-const UNIT_CHUNK_BYTES: usize = 8 << 20;
-
-/// Hand the unit records of installed `rows` to `emit` a bounded portion at
-/// a time: the rows are already in memory, their copies for the index are
-/// not all made at once. A portion holds at most [`UNIT_CHUNK`] units and
-/// [`UNIT_CHUNK_BYTES`] of key copies, checked before each copy is made, in
-/// a list sized once for a portion.
-fn installed_units(
-    rows: &Rows,
-    mut emit: impl FnMut(&[crate::engine::material::OwnedUnit]) -> StorageResult<()>,
-) -> StorageResult<()> {
-    let mut units = Vec::with_capacity(UNIT_CHUNK);
-    let mut held = 0usize;
-    for (key, value) in rows {
-        let bytes = crate::engine::material::unit_bytes(key, value);
-        if bytes == 0 {
-            continue;
-        }
-        if units.len() == UNIT_CHUNK || held + key.len() > UNIT_CHUNK_BYTES {
-            emit(&units)?;
-            units.clear();
-            held = 0;
-        }
-        held += key.len();
-        units.push((
-            crate::engine::material::UnitKind::Value,
-            key.clone(),
-            Vec::new(),
-            bytes,
-        ));
-    }
-    if !units.is_empty() {
-        emit(&units)?;
-    }
-    Ok(())
-}
-
 /// Directory under the data dir where partitions are captured for a copy to
 /// another node. Nothing under it outlives the copy; the engine clears what
 /// a crash left behind when it opens.
@@ -214,15 +173,13 @@ pub struct PartitionCopy {
 }
 
 /// Keys that belong to this node rather than to the replicated data: the
-/// Raft partition (vote, log metadata), the accounting partition (this
-/// member's count of its own data) and, in Schema, the per-node routing
+/// Raft partition (vote, log metadata) and, in Schema, the per-node routing
 /// (`meta:`) and the state machine's own records (`raft:`). They never
 /// travel between nodes and survive a partition's replacement.
 #[must_use]
 pub fn is_node_local(partition: Partition, key: &[u8]) -> bool {
     match partition {
-        // The accounting counts this member's own data.
-        Partition::Raft | Partition::Accounting => true,
+        Partition::Raft => true,
         _ => node_local_prefixes(partition)
             .iter()
             .any(|prefix| key.starts_with(prefix)),
@@ -374,53 +331,24 @@ impl StorageEngine {
             Mutation::Derive(_) => Partition::Idx,
         };
         if mutations.iter().any(|m| skip(partition_of(m))) {
-            let (held, kept): (Vec<&Mutation>, Vec<&Mutation>) =
-                mutations.iter().partition(|m| skip(partition_of(m)));
-            let kept: Vec<Mutation> = kept.into_iter().cloned().collect();
-            // The accounting tree holds the unit's accounting or none of it:
-            // without it, it is derived from the whole unit, the data the
-            // held trees already have included, and never by applying a held
-            // operand again. A held metadata command's effects were decided
-            // against a state that already holds them and cannot be derived
-            // again: its source's scope is counted from the tree instead.
-            let held: Vec<Mutation> = held.into_iter().cloned().collect();
-            let recount: Vec<Partition> = if skip(Partition::Accounting) {
-                Vec::new()
-            } else {
-                held.iter()
-                    .filter_map(|m| match m {
-                        Mutation::Command(command) => Some(Partition::from(command.partition())),
-                        _ => None,
-                    })
-                    .collect()
-            };
-            let accounting = if skip(Partition::Accounting) {
-                crate::engine::material::Accounting::Skip
-            } else {
-                crate::engine::material::Accounting::OwnWritesAnd(&held)
-            };
+            // A partition that already holds the entry takes none of it.
+            let kept: Vec<Mutation> = mutations
+                .iter()
+                .filter(|m| !skip(partition_of(m)))
+                .cloned()
+                .collect();
             let staged = self.applied_feed.stage(index, commit_ts, &kept);
-            if kept.is_empty() {
-                self.apply_accounting_only(commit_ts, mark, accounting)?;
-            } else {
-                self.apply_proposal_covered(&kept, commit_ts, Some(mark), accounting)?;
-            }
-            for source in recount {
-                self.reconstruct_accounting(source)?;
+            if !kept.is_empty() {
+                self.apply_proposal_covered(&kept, commit_ts, Some(mark))?;
             }
             staged.publish();
             self.note_raft_applied(index, commit_ts);
             Ok(kept.len())
         } else {
-            let accounting = if skip(Partition::Accounting) {
-                crate::engine::material::Accounting::Skip
-            } else {
-                crate::engine::material::Accounting::OwnWrites
-            };
             // Staged before the write lands: a reader that sees it is told
             // the derived indexes may not hold it yet.
             let staged = self.applied_feed.stage(index, commit_ts, mutations);
-            self.apply_proposal_covered(mutations, commit_ts, Some(mark), accounting)?;
+            self.apply_proposal_covered(mutations, commit_ts, Some(mark))?;
             #[cfg(test)]
             self.applied_feed.pause_after_write();
             staged.publish();
@@ -493,8 +421,8 @@ impl StorageEngine {
     /// The replicated rows of `partition` in this engine: every key but the
     /// node-local ones ([`is_node_local`]), and, of the reserved records,
     /// only the Schema tree's closure ledger, read at the same cut: the
-    /// position authority a copy of the same history carries. Coverage,
-    /// installation and accounting records keep their own rules.
+    /// position authority a copy of the same history carries. Coverage and
+    /// installation records keep their own rules.
     ///
     /// # Errors
     ///
@@ -556,13 +484,6 @@ impl StorageEngine {
                     .into(),
             ));
         }
-        if partition == Partition::Accounting {
-            return Err(StorageError::InvalidConfig(
-                "the accounting partition is this member's count of its own data; \
-                 it is never rebuilt from another copy"
-                    .into(),
-            ));
-        }
         // The repair is taken before anything changes: a second repair of the
         // partition is refused with the index transfer status and the tree
         // as they were.
@@ -608,18 +529,6 @@ impl StorageEngine {
                 value,
                 INSTALLED_ROW_SEQNO,
             )?;
-        }
-        // Each installed row is its key's whole closure, below every commit:
-        // the fold takes it as the base later units build on. The clear
-        // renewed the scope, and the repair keeps any other clear of it off,
-        // so the head copied here stays its own.
-        if crate::engine::material::accounted(partition) {
-            let at = self.next_seqno();
-            let heads = *self.material_heads();
-            let scope = self.material_scope(&heads, partition)?;
-            installed_units(rows, |units| {
-                crate::engine::material::add_units(&scope, INSTALLED_ROW_SEQNO, units, at)
-            })?;
         }
         Ok(repair)
     }
@@ -673,9 +582,6 @@ impl StorageEngine {
                 self.flush_memtables(tree)?;
             }
         }
-        // The replaced scopes' accounting carries no marker of its own: it is
-        // on disk before any intent goes.
-        self.flush_memtables(self.tree(Partition::Accounting)?)?;
         // The index's inventory is taken, and the Schema tree's ledger
         // installed, while its repair still holds it.
         for repair in repairs {
@@ -707,9 +613,6 @@ impl StorageEngine {
         // Written after the rebuilt data, so a persisted record implies the
         // data it covers is persisted.
         coverage::write_fold(tree, Domain::Raft, 0, next, payload, self.next_seqno());
-        // The rebuilt scope's accounting carries no marker of its own: it is
-        // on disk before the intent goes.
-        self.flush_memtables(self.tree(Partition::Accounting)?)?;
         // A partition copy carries no inventory: every index copy in it is
         // unknown until checked here, under the repair, so no next repair's
         // transfer is taken for this one's. The Schema tree's ledger is
@@ -737,13 +640,6 @@ impl StorageEngine {
         if partition == Partition::Raft {
             return Err(StorageError::InvalidConfig(
                 "the Raft partition holds this node's vote and log metadata; \
-                 it is never copied to another node"
-                    .into(),
-            ));
-        }
-        if partition == Partition::Accounting {
-            return Err(StorageError::InvalidConfig(
-                "the accounting partition is this member's count of its own data; \
                  it is never copied to another node"
                     .into(),
             ));

@@ -1,10 +1,9 @@
 use super::*;
 
 /// The default recovery reserve holds the room one recovery record of the
-/// store's own may need (the memtables it starts in its tree and in the
-/// accounting tree) and the margin beside it at the smallest supported limit:
-/// the margin a sixteenth of that limit keeps beside one start. A large limit
-/// keeps a sixteenth.
+/// store's own may need (the memtable it starts in its tree) and the margin
+/// beside it at the smallest supported limit: the margin a sixteenth of that
+/// limit keeps beside one start. A large limit keeps a sixteenth.
 #[test]
 fn the_default_recovery_reserve_holds_one_recovery_record() {
     let floor = RECOVERY_RECORD_ROOM + RECOVERY_MARGIN;

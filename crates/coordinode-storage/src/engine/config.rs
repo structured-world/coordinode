@@ -251,9 +251,8 @@ impl PageEccPolicy {
 pub const DEFAULT_RECOVERY_RESERVE_DIVISOR: u64 = 16;
 
 /// The least room one recovery record of the store's own may need beyond
-/// its bytes: the flush owed for the memtable it starts in its tree, and for
-/// the one its accounting starts in the accounting tree.
-pub const RECOVERY_RECORD_ROOM: u64 = 2 * crate::engine::footprint::MEMTABLE_START_DEBT;
+/// its bytes: the flush owed for the memtable it starts in its tree.
+pub const RECOVERY_RECORD_ROOM: u64 = crate::engine::footprint::MEMTABLE_START_DEBT;
 
 /// The room a reserve keeps beside the starts of [`RECOVERY_RECORD_ROOM`]:
 /// the record's own bytes, and the growth past their admission that client

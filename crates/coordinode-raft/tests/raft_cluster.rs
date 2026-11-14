@@ -8470,10 +8470,7 @@ fn try_propose_held_at(
     oracle: &coordinode_core::txn::timestamp::TimestampOracle,
     key: &[u8],
 ) -> Result<(u64, u64), ProposalError> {
-    let (ts, held) = engine
-        .pending_commits()
-        .obligate_changing(|| oracle.next().as_raw(), None)
-        .expect("no ending holds the writes");
+    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
     // A fresh base per write: ids from a new generator repeat, and the log
     // takes a repeated id for a retry it already applied.
     let id =
@@ -8661,8 +8658,7 @@ fn spawn_writes(
             let (ts, held) = leader
                 .engine
                 .pending_commits()
-                .obligate_changing(|| leader.oracle.next().as_raw(), None)
-                .expect("no ending holds the writes");
+                .obligate(|| leader.oracle.next().as_raw());
             let key = format!("node:{prefix}-{i}").into_bytes();
             let pipeline = Arc::clone(&pipeline);
             let id = ids.next();
@@ -9223,8 +9219,7 @@ async fn a_closed_position_read_after_a_restart_waits_on_no_later_commit() {
         let (open, held) = members[leader]
             .engine
             .pending_commits()
-            .obligate_changing(|| members[leader].oracle.next().as_raw(), None)
-            .expect("no ending holds the writes");
+            .obligate(|| members[leader].oracle.next().as_raw());
         let later = propose_held(
             &members[leader].node,
             &members[leader].engine,

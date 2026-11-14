@@ -59,8 +59,7 @@ impl SegmentDataType {
             | Partition::Raft
             | Partition::Counter
             | Partition::Registry
-            | Partition::NodeHistory
-            | Partition::Accounting => Self::PropertyDoc,
+            | Partition::NodeHistory => Self::PropertyDoc,
         }
     }
 }
@@ -87,9 +86,6 @@ pub fn partition_wire_tag(partition: Partition) -> u8 {
         Partition::VectorF32 => 9,
         Partition::Registry => 10,
         Partition::NodeHistory => 11,
-        // Named, never decoded: the accounting is this member's own, so no
-        // segment received from another node installs into it.
-        Partition::Accounting => 12,
     }
 }
 

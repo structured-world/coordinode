@@ -6,16 +6,12 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use tempfile::TempDir;
 
-/// A timestamp for a data write, held as not yet logged; no consumer's
-/// ending holds the writes in these tests.
+/// A timestamp for a data write, held as not yet logged.
 fn held_write(
     engine: &StorageEngine,
     oracle: &coordinode_core::txn::timestamp::TimestampOracle,
 ) -> (u64, coordinode_storage::engine::pending::Unlogged) {
-    engine
-        .pending_commits()
-        .obligate_changing(|| oracle.next().as_raw(), None)
-        .expect("no ending holds the writes")
+    engine.pending_commits().obligate(|| oracle.next().as_raw())
 }
 
 fn test_engine() -> (TempDir, Arc<StorageEngine>) {
@@ -94,8 +90,7 @@ async fn closed_by_its_own_entry(
 #[test]
 fn partition_roundtrip() {
     // Verify to_partition / to_partition_id are inverse.
-    // Partition::Raft and Partition::Accounting are internal-only and have no
-    // PartitionId mapping.
+    // Partition::Raft is internal-only and has no PartitionId mapping.
     for p in Partition::all() {
         if p.proposal_id().is_none() {
             continue;

@@ -108,7 +108,6 @@ impl LocalJournal {
                 coverage.note_touched(part, last);
             }
         }
-        let heads = crate::engine::material::Heads::read(tree_of(trees, Partition::Accounting)?)?;
         for entry in &entries {
             let grouped = by_partition(&entry.ops);
             for (&part, ops) in &grouped {
@@ -128,14 +127,6 @@ impl LocalJournal {
                     entry.index,
                     Domain::Local,
                 )?;
-            }
-            // The entry's accounting, from all of it, unless the accounting
-            // tree holds it.
-            if !covered
-                .get(&Partition::Accounting)
-                .is_some_and(|c| c.contains(entry.index, 0))
-            {
-                account(trees, &heads, &grouped, entry.ts, entry.index, &coverage)?;
             }
         }
         if !entries.is_empty() {
@@ -175,7 +166,6 @@ impl LocalJournal {
         let Targets {
             trees,
             installations,
-            heads,
         } = into;
         let ops: Vec<OplogOp> = writes.into_iter().map(into_op).collect();
         let bytes = ops.iter().map(op_bytes).sum();
@@ -205,7 +195,6 @@ impl LocalJournal {
                 Domain::Local,
             )?;
         }
-        account(trees, heads, &grouped, seqno, index, &self.coverage)?;
         if self.coverage.mark_applied(index)
             && let Some(mut folded) = self.coverage.try_lock_folded()
         {
@@ -323,38 +312,12 @@ fn into_op(write: LocalWrite) -> OplogOp {
     }
 }
 
-/// What a local entry is applied to: the partition trees, the index tree's
-/// installations, and the accounting scopes' heads, held by the caller from
-/// the entry's first data effect through its accounting.
+/// What a local entry is applied to: the partition trees and the index
+/// tree's installations.
 #[derive(Clone, Copy)]
 pub(crate) struct Targets<'a> {
     pub(crate) trees: &'a HashMap<Partition, AnyTree>,
     pub(crate) installations: &'a Installations,
-    pub(crate) heads: &'a crate::engine::material::Heads,
-}
-
-/// Apply the accounting of one local entry `index`, its ops `grouped` by
-/// source, at `seqno` under `heads`, with its marker; the accounting tree is
-/// noted touched when it took any.
-fn account(
-    trees: &HashMap<Partition, AnyTree>,
-    heads: &crate::engine::material::Heads,
-    grouped: &HashMap<Partition, Vec<&OplogOp>>,
-    seqno: u64,
-    index: u64,
-    coverage: &Coverage,
-) -> StorageResult<()> {
-    let wrote = crate::engine::oplog_journal::account_oplog_ops(
-        tree_of(trees, Partition::Accounting)?,
-        heads,
-        grouped.iter().map(|(&part, ops)| (part, ops.as_slice())),
-        seqno,
-        Some(Domain::Local.marker_key(index, 0)),
-    )?;
-    if wrote {
-        coverage.note_touched(Partition::Accounting, index);
-    }
-    Ok(())
 }
 
 /// The ops of one entry, grouped by the tree each lands in.

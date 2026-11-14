@@ -491,13 +491,11 @@ impl Database {
         }
         // A timestamp of its own, held as not yet logged until the entry is
         // handed over: the queue's changes are ordered with every other
-        // commit, and no closed bound passes over them meanwhile. They are
-        // Schema records, which consumers are charged for.
+        // commit, and no closed bound passes over them meanwhile.
         let (commit_ts, held) = self
             .engine
             .pending_commits()
-            .obligate_changing(|| self.oracle.next().as_raw(), None)
-            .map_err(|_| coordinode_storage::error::StorageError::MaterialClaimed)?;
+            .obligate(|| self.oracle.next().as_raw());
         let proposal = RaftProposal {
             id: self.proposal_id_gen.next(),
             mutations,
