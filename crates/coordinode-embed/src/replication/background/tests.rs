@@ -286,6 +286,16 @@ async fn every_new_leader_finishes_the_build_the_old_one_held() {
     assert_eq!(rows.len(), 1);
 }
 
+/// Wait until `tx` has ended, at most a deadline far past any reaper pass:
+/// the reaper runs on a busy host's schedule, so a fixed sleep would measure
+/// the host rather than the reaper.
+async fn until_ended(db: &Arc<parking_lot::RwLock<Database>>, tx: crate::TransactionId) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while db.read().interactive_end_of(&tx).is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Whether `tx` was ended by the idle timeout: its commit is refused as such.
 fn idle_expired(db: &Arc<parking_lot::RwLock<Database>>, tx: crate::TransactionId) -> bool {
     matches!(
@@ -318,7 +328,7 @@ async fn an_abandoned_transaction_is_rolled_back_without_further_traffic() {
         Duration::from_millis(20),
         stop.subscribe(),
     );
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    until_ended(&database, tx).await;
     stop.send_replace(true);
     tokio::time::timeout(Duration::from_secs(5), reaper)
         .await
@@ -358,7 +368,7 @@ async fn a_transaction_begun_while_the_reaper_sleeps_is_reaped() {
     // The reaper has found nothing open and is waiting for a begin.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let tx = database.read().begin_transaction().unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    until_ended(&database, tx).await;
     stop.send_replace(true);
     reaper.await.unwrap();
 

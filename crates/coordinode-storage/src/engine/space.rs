@@ -232,7 +232,7 @@ impl SpaceGuard {
         self.admit_free_space_recovery_as_read()
     }
 
-    /// [`Self::admit_free_space_recovery`] by the last reading: for a caller
+    /// [`Self::admit_recovery_as_read`] by free space alone: for a caller
     /// that checks free space before it learns whether the store's own work
     /// also needs the hard limits' room ([`Self::has_recovery_room`]).
     ///

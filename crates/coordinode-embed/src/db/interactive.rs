@@ -729,6 +729,13 @@ impl Database {
         Ok(())
     }
 
+    /// How transaction `id` ended, while the registry remembers it; `None`
+    /// while it is open or unknown. Unlike a commit, asking ends nothing.
+    #[cfg(test)]
+    pub(crate) fn interactive_end_of(&self, id: &TransactionId) -> Option<TransactionEnd> {
+        self.interactive.ended_with(id)
+    }
+
     /// Call `begun` after every interactive transaction opens. A member's
     /// idle reaper uses it to sleep while no transaction is open.
     pub fn set_interactive_begun_hook(&mut self, begun: std::sync::Arc<dyn Fn() + Send + Sync>) {
