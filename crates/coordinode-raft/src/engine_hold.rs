@@ -4,7 +4,7 @@
 //! [`EngineHold`]. After a node's shutdown returns, the caller must be able to
 //! reopen the directory, so nothing here may still hold the engine. With the
 //! `engine-holders` feature every hold records its name while it lives, and
-//! [`engine_holders`] lists the ones still alive, which turns "something still
+//! `engine_holders` lists the ones still alive, which turns "something still
 //! holds the engine" into the name of what does. Without it a hold is the
 //! `Arc` alone.
 
