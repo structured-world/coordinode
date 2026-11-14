@@ -2,6 +2,35 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-08
+
+### Added
+
+- *(replicate)* record what a consumer's resync followed
+- *(replicate)* admit new retention only where there is room for it
+- *(replicate)* say who holds retained history and how much
+- *(replicate)* record where history started when a consumer ends
+- *(embed)* consumer registrations with retention in the database
+- *(storage)* keep a store's own journal for its log consumers
+- *(wire)* probe idle client and peer connections with keepalive
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+
+### Fixed
+
+- *(replicate)* hold a new consumer's position while it registers
+
+### Refactored
+
+- *(replicate)* run the registry service on its own thread
+
+### Testing
+
+- *(embed)* consumer retention across kills, backups and readers
+
 ## v0.9.0 - 2026-10-24
 
 ### Testing

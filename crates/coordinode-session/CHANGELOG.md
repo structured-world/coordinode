@@ -2,6 +2,34 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-08
+
+### Added
+
+- *(session)* admit a statement before it takes a thread
+- *(server)* one admission for every command a member runs
+- *(replication)* typed causal bounds and receipts
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+
+### Fixed
+
+- *(session)* reserve a command's last answer before its slot is freed
+- *(session)* pass a cancelled command's place on in its lane
+- *(session)* end a command's wait for its turn with its cancel
+- *(session)* let a start's cancel and wait span its whole begin
+- *(routing)* run a rollback on a member out of slots
+- *(session)* open a commit's own transaction in the commit's slot
+- *(session)* stop an autonomous statement when its stream closes
+- *(session)* give a command's slot back before its last answer
+
+### Testing
+
+- *(session)* open the gate however an unread-session setup ends
+- *(session)* drive the unread-session cases by observed state
+
 ## v0.9.0 - 2026-10-24
 
 ### Added

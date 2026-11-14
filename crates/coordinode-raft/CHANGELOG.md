@@ -2,6 +2,90 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-08
+
+### Added
+
+- *(replication)* typed causal bounds and receipts
+- *(raft)* measure log syncs and entry applies
+- *(wire)* probe idle client and peer connections with keepalive
+- *(raft)* carry the history domain with every database image
+- *(storage)* bind history to the store's deployment before it lands
+- *(storage)* keep node history and write records keyed by their commit
+- *(index)* key unique entries by their owner
+- *(schema)* give labels a catalog identity records store
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+
+### Fixed
+
+- *(raft)* end a leadership transfer once another member leads
+- *(raft)* wait longer for a leadership transfer on a loaded host
+- *(storage)* keep each log prefix's commit ceiling exactly
+- *(raft)* hand over again a sealed commit its own entry closed
+- *(raft)* meet a causal position at its applied prefix
+- *(raft)* let an entry close the commits it carries
+- *(query)* read only views every commit below is applied at
+- *(raft)* close the commits a lost leader left uncovered
+- *(raft)* end a member's append stream when it stops
+- *(storage)* keep member records from making closing entries due
+- *(storage)* stop the log at its first failed write
+- *(storage)* never found a new domain over retained history
+- *(index)* refuse keys past the store's limit, bound entry fan-out
+- *(cluster)* take a replacement's membership only once committed
+- *(cluster)* check both members of a replacement in one view
+- *(cluster)* fence a replacement on the membership it checked
+- *(cluster)* apply each change to a joint config left behind
+- *(cluster)* start every membership change from a single config
+- *(cluster)* resume a change left in its joint configuration
+- *(cluster)* refuse a joiner on another member's store as a join
+- *(raft)* bind promises to a member, write copy durably
+- *(raft)* keep the purge point and a loss with the vote; replace a member
+- *(raft)* refuse a member without its vote with a typed error
+- *(raft)* keep a second copy of the member's vote
+- *(replication)* wait for the leader's address, not pauses
+
+### Performance
+
+- *(storage)* search a batch entry's seals, not scan them
+- *(raft)* record the committed index off the raft core
+- *(raft)* write the log from its sync thread, not the raft core
+- *(storage)* leave a journaled tree's flush syncs to a barrier
+
+### Testing
+
+- *(raft)* start a clocked group's test once every member follows
+- *(raft)* show each member's state when a stalled sync moves a term
+- *(raft)* purge only entries the log has written
+- *(raft)* sealed closure tests stand apart from local records
+- *(raft)* measure stamping a batch entry's closed bound
+- *(raft)* seal the cluster tests' writes as commits are
+- *(raft)* retry a sealed write after an unknown outcome
+- cover complete views without a bound, standalone and index reads
+- *(raft)* wait for the member to apply before losing its tree
+- *(raft)* a stalled log sync keeps the leader
+- *(raft)* a failed log write stops consensus and the node restarts
+- *(raft)* let the refused bound lie above the read one
+- *(raft)* finish a conversion cut short at the marker
+- *(raft)* count journal syncs for an unchanged vote
+- *(raft)* catch an unchanged vote appended to the journal
+- *(raft)* resume a replacement on another leader, refuse old votes
+- *(raft)* run the lost-answer case around the actual leader
+
+### Bench
+
+- *(raft)* observe the copy's footprint inside a write
+- *(raft)* wait for a leader that confirms its lease
+- *(raft)* give the recovery image a promised term above 1
+- *(raft)* measure recovery, the copy's peak footprint and reads
+- *(raft)* trace each commit against the device's I/O
+- *(raft)* separate leadership seen from confirmed
+- *(raft)* bound each promise cost to its own span
+- *(raft)* measure what keeping consensus promises costs
+
 ## v0.9.0 - 2026-10-24
 
 ### Fixed

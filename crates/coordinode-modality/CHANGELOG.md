@@ -2,6 +2,67 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-08
+
+### Added
+
+- *(query)* answer AS OF past the retention from temporal history
+- *(modality)* read temporal node versions as known at a system time
+- *(modality)* assert temporal node versions in their history
+- *(index)* bound the bytes of implication placement and folding
+- *(index)* key unique entries by their owner
+- *(index)* keep label counts exact across an implication change
+- *(index)* answer a text search with its view's interpretation
+- *(index)* keep a B-tree index's moved carriers apart under ALTER IMPLIES
+- *(schema)* give labels a catalog identity records store
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(vector)* exact scores and domain errors end to end
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+
+### Fixed
+
+- *(query)* charge every tuple expansion of index checks and conflicts
+- *(query)* reserve a vector index read's memory before allocating it
+- *(index)* charge catalog changes to the statement and check skipped fields
+- *(index)* walk the catalog by head when publishing or concluding parts
+- *(index)* read a check's reason stored as bytes as the record does
+- *(index)* check every field of an integrity record read for its state
+- *(index)* charge unique claims and checks for as long as they live
+- *(index)* bound the fan-out everywhere and type every index refusal
+- *(index)* refuse keys past the store's limit, bound entry fan-out
+- *(index)* charge implication placement memory before taking it
+- *(index)* keep a value's ownership revision while it is held
+- *(index)* claim a unique value across the parts of a change
+- *(index)* place every changed label and conclude the record read
+- *(index)* bind a text read to the interpretation its index holds
+- *(index)* reap expired members kept in selection parts
+- *(schema)* bind a label's first use through the ordered log
+
+### Performance
+
+- *(index)* refresh the integrity view without reading the evidence
+- *(index)* record a batch of reports without copying it
+- *(index)* keep no per-node or per-page scratch in reconciliation
+- *(query)* look the keys of a correlated index join up in batches
+
+### Testing
+
+- *(index)* pass over a catalog of unrelated definitions in a small budget
+- *(index)* state what the shape agreement test catches
+- *(index)* fail the shape agreement test on a variant it lacks
+- *(index)* leaving a unique value too long to hold writes nothing
+- *(index)* a fold never brings back a posting a writer removed
+
+### Wip
+
+- keep only a label change's difference apart in the lookup
+- ALTER NODE TYPE SET IMPLIES with per-label lookup generations
+
 ## v0.8.0 - 2026-10-23
 
 ### Added

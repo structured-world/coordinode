@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-08
+
+### Added
+
+- *(wire)* probe idle client and peer connections with keepalive
+
+### Testing
+
+- *(embed)* kill crash-test children with SIGKILL, not abort
+
 ## v0.9.0 - 2026-10-24
 
 ### Fixed
