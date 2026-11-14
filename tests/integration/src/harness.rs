@@ -1152,12 +1152,14 @@ pub fn binary_path() -> PathBuf {
     let name = format!("coordinode{}", std::env::consts::EXE_SUFFIX);
     let exe = std::env::current_exe().expect("test binary path");
     let above = || exe.ancestors().skip(1);
-    if let Some(bin) = above().map(|dir| dir.join(&name)).find(|bin| bin.exists()) {
+    // A file, not a directory: a checkout named after the binary sits above
+    // the target directory too.
+    if let Some(bin) = above().map(|dir| dir.join(&name)).find(|bin| bin.is_file()) {
         return bin;
     }
     if let Some(bin) = above()
         .map(|dir| dir.join("release").join(&name))
-        .find(|bin| bin.exists())
+        .find(|bin| bin.is_file())
     {
         return bin;
     }

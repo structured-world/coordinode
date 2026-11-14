@@ -558,15 +558,47 @@ async fn client_writes_stop_at_the_members_grants_and_own_work_still_commits() {
             matches!(refused, ProposalError::MembersFull),
             "refused before the log once the grants are spent: {refused:?}"
         );
+        // What each follower holds or owes once the grants are spent. The
+        // flush debt counts memtable bytes above what a flush writes, so a
+        // follower that flushes from here on frees room and grants it.
+        let held_when_spent: Vec<u64> = [&n2, &n3]
+            .iter()
+            .map(|node| {
+                node.engine
+                    .footprints()
+                    .get("default")
+                    .expect("a limit")
+                    .committed()
+            })
+            .collect();
         propose(proposal(b"node:1:own".to_vec(), 1, true))
             .await
             .expect("the group's own work commits");
-        // The same size again: what is left of the grants is less.
+        // The same size again: what is left of the grants is less, so it is
+        // refused unless a follower has freed room since.
         let again = propose(proposal(b"node:1:again".to_vec(), 256 << 10, false)).await;
         assert!(
-            matches!(again, Err(ProposalError::MembersFull)),
-            "a new client write is refused: {again:?}"
+            matches!(again, Ok(_) | Err(ProposalError::MembersFull)),
+            "a new client write is refused for want of room: {again:?}"
         );
+        if again.is_ok() {
+            let freed = [&n2, &n3]
+                .iter()
+                .zip(&held_when_spent)
+                .any(|(node, &held)| {
+                    node.engine
+                        .footprints()
+                        .get("default")
+                        .expect("a limit")
+                        .committed()
+                        < held
+                });
+            assert!(
+                freed,
+                "a client write past the spent grants was accepted with no follower \
+                 freeing room"
+            );
+        }
         for node in [&n1, &n2, &n3] {
             assert!(await_replicated(&node.engine, b"node:1:own", &[7u8]).await);
             assert!(await_replicated(&node.engine, b"node:1:before", &[7u8]).await);
