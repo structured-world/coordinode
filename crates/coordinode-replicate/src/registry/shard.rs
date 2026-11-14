@@ -916,6 +916,11 @@ impl RegistryCore {
             if let Some(slot) = ConsumerKind::ALL.iter().position(|k| *k == entry.kind) {
                 counts[slot] += 1;
             }
+            // Ordinary progress holds nothing: the source's own retention
+            // decides, and a position it passed is reported as lost.
+            if !entry.holds_history() {
+                continue;
+            }
             if entry.kind.is_seqno_space() {
                 seqno_floor = seqno_floor.min(entry.checkpoint_seqno);
             } else {
@@ -1853,7 +1858,8 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
     }
 }
 
-/// The lowest live checkpoint of each space.
+/// The lowest checkpoint of each space among the registrations that hold
+/// history; ordinary progress holds none.
 #[derive(Debug, Clone, Copy, Default)]
 struct Floors {
     log: Option<u64>,
@@ -1863,7 +1869,7 @@ struct Floors {
 impl Floors {
     fn of(entries: &[RegistryEntry]) -> Self {
         let mut floors = Self::default();
-        for e in entries.iter().filter(|e| e.is_live()) {
+        for e in entries.iter().filter(|e| e.holds_history()) {
             let floor = floors.slot(RetentionSpace::of(e.kind));
             *floor = Some(floor.map_or(e.checkpoint_seqno, |f| f.min(e.checkpoint_seqno)));
         }
@@ -1884,9 +1890,9 @@ impl Floors {
         }
     }
 
-    /// Whether `e` is live and at the floor of its space.
+    /// Whether `e` holds history and is at the floor of its space.
     fn held_by(&self, e: &RegistryEntry) -> bool {
-        e.is_live() && self.get(RetentionSpace::of(e.kind)) == Some(e.checkpoint_seqno)
+        e.holds_history() && self.get(RetentionSpace::of(e.kind)) == Some(e.checkpoint_seqno)
     }
 }
 

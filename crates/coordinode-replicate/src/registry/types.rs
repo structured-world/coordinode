@@ -167,6 +167,12 @@ impl ValidatedRetentionBounds {
 /// one; there is no default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsumerRetentionPolicy {
+    /// Progress only: the registration records the consumer's position and
+    /// holds none of the source. The source's own retention decides how far
+    /// back it goes; a position it no longer holds is reported as
+    /// [`RegistryError::RetentionLost`], and the consumer recovers through a
+    /// rebuild of its own choosing.
+    Ordinary,
     /// Protection lasts until the consumer is cancelled. Missing heartbeats
     /// do not end it; new work that would need retention the shard cannot
     /// give is held back instead.

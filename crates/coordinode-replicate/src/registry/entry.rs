@@ -67,6 +67,12 @@ impl RegistryEntry {
         matches!(self.state, RegistrationState::Live)
     }
 
+    /// Whether this registration keeps source history from its checkpoint:
+    /// a live one that is not ordinary progress.
+    pub(crate) fn holds_history(&self) -> bool {
+        self.is_live() && !matches!(self.retention, ConsumerRetentionPolicy::Ordinary)
+    }
+
     /// What a registration of the same id following this ended one takes
     /// over from; `None` while this one is live.
     pub(crate) fn as_prior(&self) -> Option<PriorIncarnation> {

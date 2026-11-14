@@ -83,6 +83,72 @@ fn a_strict_consumer_keeps_the_journal_until_it_acknowledges() {
     assert_eq!(db.consumer_position(&h).expect("position"), head);
 }
 
+/// An ordinary log consumer is progress only: it holds none of the journal,
+/// so reclamation passes its position, and asking for its position then
+/// reports the loss with where the journal starts now, never its old
+/// position as if nothing were missing nor the head as if it had caught up.
+#[test]
+fn an_ordinary_consumer_left_behind_learns_its_history_is_gone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    let h = db
+        .register_consumer(log_consumer(
+            "dashboard",
+            InitialSeqno::FromNow,
+            ConsumerRetentionPolicy::Ordinary,
+        ))
+        .expect("register");
+    let from = db.consumer_position(&h).expect("position");
+    write(&mut db, 5, "unread");
+    reclaim_journal(&db);
+    let start = journal_start(&db);
+    assert!(
+        start > from,
+        "an ordinary consumer held the journal from {from}: it starts at {start}"
+    );
+    let position = db.consumer_position(&h);
+    assert!(
+        matches!(
+            position,
+            Err(DatabaseError::Consumer(RegistryError::RetentionLost { checkpoint, floor }))
+                if checkpoint == from && floor > from
+        ),
+        "a consumer whose history is gone must learn it, naming its own position {from} \
+         and where the journal starts now, got {position:?}"
+    );
+    // Its registration is not ended by the loss: it is the consumer's to
+    // rebuild and acknowledge a position the journal holds again.
+    let head = db
+        .engine()
+        .journal_next_index()
+        .expect("head")
+        .expect("journal");
+    db.acknowledge_consumer(&h, head)
+        .expect("acknowledge a held position");
+    assert_eq!(db.consumer_position(&h).expect("position"), head);
+}
+
+/// An ordinary consumer's registration keeps no floor: the store reports no
+/// held history for it, whatever its position.
+#[test]
+fn an_ordinary_consumer_holds_no_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    write(&mut db, 2, "before");
+    db.register_consumer(log_consumer(
+        "metrics",
+        InitialSeqno::FromEarliestRetained,
+        ConsumerRetentionPolicy::Ordinary,
+    ))
+    .expect("register");
+    for summary in db.consumer_retention().expect("summary") {
+        assert!(
+            summary.floor.is_none() && summary.held_by.is_empty(),
+            "an ordinary registration holds history: {summary:?}"
+        );
+    }
+}
+
 /// A registration and the journal it keeps survive a restart: the reopened
 /// database takes the consumer up again by its incarnation, before any
 /// reclamation can pass its position.
