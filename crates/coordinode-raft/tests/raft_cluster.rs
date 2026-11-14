@@ -3931,14 +3931,15 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
         // term, a candidate that ranks lower; leader ids order by term, then
         // node), with a log at least as long, is not granted: a member reset
         // to the engine's initial vote would grant it. It is sent as a
-        // leadership transfer so a lease cannot be why it is refused.
+        // leadership transfer authorized by the vote the member restored, so
+        // a lease cannot be why it is refused.
         let mut ahead = last;
         ahead.index += 1_000;
-        let delayed = openraft::raft::VoteRequest {
-            vote: coordinode_raft::storage::Vote::new(given.leader_id().term, 0),
-            last_log_id: Some(ahead),
-            leadership_transfer: true,
-        };
+        let mut delayed = openraft::raft::VoteRequest::new(
+            coordinode_raft::storage::Vote::new(given.leader_id().term, 0),
+            Some(ahead),
+        );
+        delayed.leadership_transfer_from = Some(restored);
         let answer = n3.raft().vote(delayed).await.expect("an answer");
         assert!(
             !answer.vote_granted,
@@ -9283,7 +9284,7 @@ async fn a_member_cut_off_from_its_leader_does_not_depose_it_on_return() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_stream_with_a_later_commit_does_not_apply_an_overwritten_entry() {
     use coordinode_raft::storage::{Entry, LogId, Request};
-    use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse};
+    use openraft::raft::AppendEntriesRequest;
 
     let result = tokio::time::timeout(Duration::from_secs(120), async {
         let dirs: Vec<_> = (0..3)
@@ -9404,7 +9405,11 @@ async fn a_stale_stream_with_a_later_commit_does_not_apply_an_overwritten_entry(
             })
             .await
             .expect("an answer");
-        assert_eq!(answer, AppendEntriesResponse::Success);
+        let stale_id = LogId {
+            leader_id: prefix_end.leader_id,
+            index: replaced_at,
+        };
+        assert_eq!(answer, Ok(Some(stale_id)), "the whole request is taken");
         members[behind]
             .node
             .raft()

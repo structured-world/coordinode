@@ -327,11 +327,10 @@ fn call<T>(
 }
 
 fn vote_for(candidate: u64) -> RaftPayload {
-    let request = openraft::raft::VoteRequest::<TypeConfig> {
-        vote: openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, candidate),
-        last_log_id: None,
-        leadership_transfer: false,
-    };
+    let request = openraft::raft::VoteRequest::<TypeConfig>::new(
+        openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, candidate),
+        None,
+    );
     RaftPayload {
         data: rmp_serde::to_vec(&request).expect("encode"),
         group: 0,

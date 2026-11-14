@@ -16,7 +16,7 @@ use openraft::error::{RPCError, Unreachable};
 use openraft::network::{
     Backoff, NetBackoff, NetSnapshot, NetStreamAppend, NetTransferLeader, NetVote, RPCOption,
 };
-use openraft::raft::StreamAppendResult;
+use openraft::raft::AppendResult;
 use openraft::raft::TransferLeaderError;
 use openraft::{OptionalSend, RaftNetworkFactory};
 
@@ -29,6 +29,7 @@ use coordinode_wire::peer::PeerTarget;
 use coordinode_wire::peer::PeerConnections;
 
 use super::admission::{DeploymentView, member_target, write_deployment};
+use super::append_reply::AppendReply;
 use super::version::{VersionGate, read_handshake, write_handshake};
 use crate::member::MemberNode;
 use crate::proto::internode::HandshakeRecord;
@@ -457,7 +458,7 @@ impl NetStreamAppend<C> for GrpcNetwork {
         _option: RPCOption,
     ) -> futures_util::future::BoxFuture<
         's,
-        Result<BoxStream<'s, Result<StreamAppendResult<C>, RPCError<C>>>, RPCError<C>>,
+        Result<BoxStream<'s, Result<AppendResult<C>, RPCError<C>>>, RPCError<C>>,
     >
     where
         S: futures_util::Stream<Item = openraft::raft::AppendEntriesRequest<C>>
@@ -510,7 +511,7 @@ impl NetStreamAppend<C> for GrpcNetwork {
             .await?;
             learn(&gate, response.metadata());
 
-            // Map response stream: RaftPayload → deserialize → StreamAppendResult.
+            // Map response stream: RaftPayload → AppendReply → AppendResult.
             // A reply across a blocked link is lost, as it would be on the wire.
             let output = response.into_inner().map(move |result| {
                 // The request this reply answers, whatever the reply says.
@@ -524,11 +525,11 @@ impl NetStreamAppend<C> for GrpcNetwork {
                     )));
                 }
                 let payload = result.map_err(tonic_to_rpc_error)?;
-                let stream_result: StreamAppendResult<C> = deserialize(&payload.data)?;
+                let reply: AppendReply = deserialize(&payload.data)?;
                 if let Some(term) = term {
                     grants.report(term, target, payload.grant);
                 }
-                Ok(stream_result)
+                Ok(AppendResult::from(reply))
             });
 
             // A shutdown cuts the replies short with an error, not a clean
@@ -791,7 +792,7 @@ impl NetStreamAppend<C> for StubNetwork {
         _option: RPCOption,
     ) -> futures_util::future::BoxFuture<
         's,
-        Result<BoxStream<'s, Result<StreamAppendResult<C>, RPCError<C>>>, RPCError<C>>,
+        Result<BoxStream<'s, Result<AppendResult<C>, RPCError<C>>>, RPCError<C>>,
     >
     where
         S: futures_util::Stream<Item = openraft::raft::AppendEntriesRequest<C>>

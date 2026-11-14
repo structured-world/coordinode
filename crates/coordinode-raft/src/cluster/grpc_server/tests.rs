@@ -1,6 +1,5 @@
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Tier};
 use coordinode_storage::engine::footprint::{Admit, Footprints};
-use openraft::raft::AppendEntriesResponse;
 
 use super::*;
 
@@ -30,9 +29,17 @@ fn a_refused_append_gives_its_own_work_room_back() {
     let f = footprints(dir.path());
     for _ in 0..10 {
         let room = OwnWorkRoom::new(&f, 1_000, f.admit(4 * UNIT, Admit::Recovery).unwrap());
-        let resp = AppendEntriesResponse::<TypeConfig>::Conflict;
-        let matched = OwnWorkRoom::matched(&resp, room.last);
-        room.settle(matched);
+        let reply = AppendReply::Conflict {
+            log_id: crate::storage::LogId::new(
+                crate::storage::CommittedLeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                999,
+            ),
+            hint: None,
+        };
+        room.settle(reply.matched());
         assert_eq!(admitted(&f), 0, "a refused request holds nothing");
     }
 }
@@ -49,8 +56,14 @@ fn an_unanswered_or_taken_append_keeps_its_room_until_applied() {
     assert_eq!(admitted(&f), 4 * UNIT, "held: the core may append it");
 
     let taken = OwnWorkRoom::new(&f, 9, f.admit(2 * UNIT, Admit::Recovery).unwrap());
-    let matched = OwnWorkRoom::matched(&AppendEntriesResponse::<TypeConfig>::Success, taken.last);
-    taken.settle(matched);
+    let accepted = AppendReply::Accepted(Some(crate::storage::LogId::new(
+        crate::storage::CommittedLeaderId {
+            term: 1,
+            node_id: 1,
+        },
+        taken.last,
+    )));
+    taken.settle(accepted.matched());
     assert_eq!(admitted(&f), 6 * UNIT);
 
     f.applied(5, 0, 0);

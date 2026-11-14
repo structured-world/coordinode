@@ -27,6 +27,7 @@
 //! group forms, and a joining node is provisioned with it.
 
 pub mod admission;
+mod append_reply;
 mod catch_up;
 pub(crate) mod grants;
 pub mod grpc_server;

@@ -25,6 +25,7 @@ use tonic::{Extensions, Request, Response, Status, Streaming};
 use tonic_types::{ErrorDetails, StatusExt};
 
 use super::admission::{Admission, MembersReply, Operation};
+use super::append_reply::AppendReply;
 use super::version::{
     HandshakeService, VersionGate, read_handshake, refusal_status, write_handshake,
 };
@@ -273,17 +274,6 @@ impl OwnWorkRoom {
                 .hold_until_applied(through.min(self.last), room),
             // Given back by its drop.
             None => drop(room),
-        }
-    }
-
-    /// The matched index an append answer proves, `None` when it proves
-    /// nothing was taken.
-    fn matched(resp: &openraft::raft::AppendEntriesResponse<TypeConfig>, last: u64) -> Option<u64> {
-        use openraft::raft::AppendEntriesResponse;
-        match resp {
-            AppendEntriesResponse::Success => Some(last),
-            AppendEntriesResponse::PartialSuccess(matched) => matched.map(|id| id.index),
-            AppendEntriesResponse::Conflict | AppendEntriesResponse::HigherVote(_) => None,
         }
     }
 }
@@ -668,17 +658,18 @@ impl RaftService for RaftGrpcHandler {
         };
         replica.catch_up.note(&req);
 
-        let resp = replica
-            .raft
-            .append_entries(req)
-            .await
-            .map_err(|e| Status::internal(format!("append_entries: {e}")))?;
+        let reply = AppendReply::from(
+            replica
+                .raft
+                .append_entries(req)
+                .await
+                .map_err(|e| Status::internal(format!("append_entries: {e}")))?,
+        );
         if let Some(room) = room {
-            let matched = OwnWorkRoom::matched(&resp, room.last);
-            room.settle(matched);
+            room.settle(reply.matched());
         }
 
-        Ok(replica.answer(replica.append_payload(ser(&resp)?)))
+        Ok(replica.answer(replica.append_payload(ser(&reply)?)))
     }
 
     type StreamAppendStream = Pin<Box<dyn Stream<Item = Result<RaftPayload, Status>> + Send>>;
@@ -831,20 +822,20 @@ impl RaftService for RaftGrpcHandler {
         // Feed to openraft's stream_append — it handles everything
         let output = replica.raft.stream_append(input_stream);
 
-        // Serialize output stream: StreamAppendResult → RaftPayload
+        // Serialize output stream: AppendResult → AppendReply → RaftPayload
         let (grant_space, grant_engine, grant_raft) = (
             Arc::clone(&replica.space),
             replica.engine.clone(),
             Arc::clone(&replica.raft),
         );
         let output_stream = output.map(move |result| match result {
-            Ok(stream_result) => {
+            Ok(result) => {
+                let reply = AppendReply::from(result);
                 // The oldest request is answered.
                 if let Some(Some(room)) = owed.lock().pop_front() {
-                    let matched = stream_result.as_ref().ok().copied().flatten();
-                    room.settle(matched.map(|id| id.index));
+                    room.settle(reply.matched());
                 }
-                let data = rmp_serde::to_vec(&stream_result)
+                let data = rmp_serde::to_vec(&reply)
                     .map_err(|e| Status::internal(format!("serialize: {e}")))?;
                 Ok(RaftPayload {
                     data,

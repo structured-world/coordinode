@@ -421,11 +421,10 @@ async fn groups_led_from_one_server_share_its_connection_to_each_peer() {
 }
 
 fn vote_request() -> Vec<u8> {
-    let request = openraft::raft::VoteRequest::<TypeConfig> {
-        vote: openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, 9),
-        last_log_id: None,
-        leadership_transfer: false,
-    };
+    let request = openraft::raft::VoteRequest::<TypeConfig>::new(
+        openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, 9),
+        None,
+    );
     rmp_serde::to_vec(&request).expect("encode")
 }
 

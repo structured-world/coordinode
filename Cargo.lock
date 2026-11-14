@@ -3650,8 +3650,9 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.37"
-source = "git+https://github.com/structured-world/openraft?rev=458643adbe93f0abce70675da8d683beae9515a8#458643adbe93f0abce70675da8d683beae9515a8"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2628033834a66c7c5bf54c49673a5bbba7192fbcf529314449a0393cb15f7ad0"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -3679,8 +3680,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.37"
-source = "git+https://github.com/structured-world/openraft?rev=458643adbe93f0abce70675da8d683beae9515a8#458643adbe93f0abce70675da8d683beae9515a8"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb0e4b4a60803c9e1be56f6d68a3792b55575800e12632702b4917462dfcbe3a"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -3691,8 +3693,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.37"
-source = "git+https://github.com/structured-world/openraft?rev=458643adbe93f0abce70675da8d683beae9515a8#458643adbe93f0abce70675da8d683beae9515a8"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1089aaaeca4e4e3a1381492d7d0e2fddff5a25120f692c6398376070ae7746f9"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -3703,8 +3706,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.37"
-source = "git+https://github.com/structured-world/openraft?rev=458643adbe93f0abce70675da8d683beae9515a8#458643adbe93f0abce70675da8d683beae9515a8"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad2945155051eadf1c7dd4c8626192fc63203d6178c49658c15db945b93bb1a4"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -4396,9 +4400,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quorum-set"
-version = "0.2.3"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2997139e85a09987e5b6b2b44e4ce0844c1573263ae7799d3806012a48313a95"
+checksum = "cb2d258d9ae363883cddb09272af10aa6e1a5404fc64551fea20f3dc02091132"
 dependencies = [
  "sha2 0.10.9",
  "validit",

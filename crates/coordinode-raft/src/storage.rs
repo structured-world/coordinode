@@ -150,13 +150,12 @@ pub type CommittedLeaderId = openraft::vote::leader_id_adv::CommittedLeaderId<u6
 pub type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
 pub type LogId = openraft::LogId<CommittedLeaderId>;
 pub type Vote = openraft::impls::Vote<LeaderId>;
-pub type Entry = openraft::impls::Entry<
-    CommittedLeaderId,
-    openraft::impls::EntryPayload<Request, u64, MemberNode>,
->;
-pub type SnapshotMeta = openraft::storage::SnapshotMeta<CommittedLeaderId, u64, MemberNode>;
-pub type Snapshot = openraft::storage::Snapshot<CommittedLeaderId, u64, MemberNode, SnapshotData>;
-pub type StoredMembership = openraft::StoredMembership<CommittedLeaderId, u64, MemberNode>;
+pub type Membership = openraft::impls::Membership<u64, MemberNode>;
+pub type Entry =
+    openraft::impls::Entry<CommittedLeaderId, openraft::impls::EntryPayload<Request, Membership>>;
+pub type SnapshotMeta = openraft::storage::SnapshotMeta<CommittedLeaderId, Membership>;
+pub type Snapshot = openraft::storage::Snapshot<CommittedLeaderId, Membership, SnapshotData>;
+pub type StoredMembership = openraft::StoredMembership<CommittedLeaderId, Membership>;
 
 // ── Key Prefixes ────────────────────────────────────────────────────
 
