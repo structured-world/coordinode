@@ -74,6 +74,10 @@ harness = false
 name = "closure_ledger"
 harness = false
 
+[[bench]]
+name = "group_reserve"
+harness = false
+
 [build-dependencies]
 tonic-prost-build = "0.14"
 
