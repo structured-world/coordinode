@@ -79,8 +79,9 @@ pub struct PagedCypherResult {
     pub advice: Option<CursorAdvice>,
 }
 
-/// A cursor's identity and the plan its pages run with, taken from its first
-/// page, for the one advisor record of the whole cursor.
+/// A cursor's identity and the plan its first page ran with, for the one
+/// advisor record of the whole cursor. Later pages are planned again as they
+/// run; this is the first page's plan, not a statement about theirs.
 #[derive(Debug, Clone)]
 pub struct CursorAdvice {
     fingerprint: u64,
@@ -2641,7 +2642,7 @@ impl Database {
 
     /// Record a cursor read through [`Self::execute_cypher_paged`] for the
     /// advisor, once it was read to the end, as its first page's `advice`
-    /// names it: the plan its pages ran with, `busy` the time they spent in
+    /// names it: the plan its first page ran with, `busy` the time its pages spent in
     /// the engine without the client's pauses between them, and `source` the
     /// call site the client named. A cursor abandoned before its end is not
     /// an execution and is not recorded.
@@ -3237,8 +3238,8 @@ impl Database {
                 );
             }
         }
-        // The plan the cursor's pages run with, moved out once its first
-        // page has run: no copy beyond the one taken before binding.
+        // The plan the cursor's first page ran with, moved out once the page
+        // has run: no copy beyond the one taken before binding.
         if let Some(slot) = kept {
             *slot = Some(CursorAdvice {
                 fingerprint: fp,

@@ -1593,7 +1593,7 @@ fn the_recorded_plan_follows_an_index_created_and_dropped() {
 /// statement pushed out of the plan cache, change neither the recorded plan
 /// nor require parsing it again.
 #[test]
-fn a_cursor_is_recorded_with_the_plan_its_pages_ran_with() {
+fn a_cursor_is_recorded_with_the_plan_its_first_page_ran_with() {
     let mut db = Database::open_in_memory().expect("open");
     db.execute_cypher("UNWIND range(0, 9) AS i CREATE (:User {email: 'u' + toString(i)})")
         .unwrap();
