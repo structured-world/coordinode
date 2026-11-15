@@ -2470,6 +2470,68 @@ fn a_checkpoint_removed_partway_keeps_charging_what_is_left() {
     );
 }
 
+/// A compaction the limit stops partway gives back everything it took: its
+/// unfinished outputs are removed and the room charged ahead of their writers
+/// with them, so the endpoint holds what it held before the compaction began.
+/// Room for the inputs' bytes is left, enough for the compaction to start, too
+/// little for its outputs together with the allocation charged ahead of them.
+#[test]
+fn a_compaction_stopped_by_the_limit_holds_nothing_after() {
+    use lsm_tree::AbstractTree;
+    const LIMIT: u64 = 64 << 20;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let endpoint = EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(LIMIT);
+    let mut config = StorageConfig::with_endpoints(vec![endpoint]);
+    // Only the compaction this test runs.
+    config.compaction_workers = 0;
+    let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+    let node = engine.tree(Partition::Node).expect("node tree");
+    let mut index = 0;
+    for _ in 0..4 {
+        for _ in 0..32 {
+            index += 1;
+            assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+        }
+        engine.persist().expect("flush a table");
+    }
+    assert!(node.table_count() >= 4, "four tables to compact");
+    let inputs = node.disk_space();
+
+    let footprints = engine.footprints().clone();
+    let footprint = Arc::clone(footprints.get("default").expect("a limit"));
+    let scratch = dir.path().join("scratch");
+    let output = footprints.file(&scratch).expect("a charge");
+    let leave = inputs + inputs / 4;
+    output
+        .grow_to(footprint.limit() - footprint.charged() - leave)
+        .expect("the scratch file takes all but the room left");
+    let before = footprint.charged();
+
+    let compacted = engine.major_compact(Partition::Node);
+    // Refused as a file grew, not by the room check before the run: the
+    // outputs were being written.
+    let refusal = compacted.expect_err("the compaction was stopped by the limit");
+    assert!(
+        refusal.to_string().contains("more asked"),
+        "refused while its outputs grew: {refusal}"
+    );
+    assert_eq!(
+        footprint.charged(),
+        before,
+        "the stopped compaction holds no room after it returns"
+    );
+    footprints.removed(&scratch);
+    drop(output);
+}
+
 /// Take everything the endpoint may still hold with a file at `scratch`.
 fn fill_with_scratch(
     footprints: &crate::engine::footprint::Footprints,
