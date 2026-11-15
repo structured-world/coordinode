@@ -2,50 +2,57 @@
 //! scope of the cut's view into a new generation of its destination, reads
 //! the continuation until it joins, and publishes the replacement and its
 //! progress in one destination write. Rows deleted at the source, and rows
-//! the destination held before, are absent from the replacement; a crash
-//! on either side of the publication leaves one complete projection.
+//! the destination held before, are absent from the replacement; power
+//! lost on either side of the publication leaves one complete projection.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
+use coordinode_core::txn::timestamp::TimestampOracle;
+use coordinode_core::txn::write_concern::Journal;
 use coordinode_embed::Database;
-use coordinode_embed::consumer::StateCut;
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_embed::consumer::{CutScope, StateCut};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_test_fixtures::PowerRig;
 
 const NODES: &[u8] = b"node:";
 const CURRENT: &[u8] = b"projection:current";
 
 type Rows = BTreeMap<Vec<u8>, Vec<u8>>;
 
+fn scope(prefix: &[u8]) -> CutScope {
+    CutScope::rows(Partition::Node, prefix.to_vec()).expect("a row scope")
+}
+
 /// A destination keeping each generation of its projection under its own
 /// prefix and naming the published one, with its progress, in one record:
-/// publishing a generation is one write.
+/// publishing a generation is one journalled write.
 struct Destination {
-    engine: StorageEngine,
+    engine: Arc<StorageEngine>,
 }
 
 impl Destination {
-    fn open(dir: &std::path::Path) -> Self {
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            dir,
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
+    fn open(rig: &PowerRig) -> Self {
         Self {
-            engine: StorageEngine::open(&config).expect("destination"),
+            engine: Arc::new(
+                StorageEngine::open_embedded(&rig.config(), Arc::new(TimestampOracle::new()))
+                    .expect("destination"),
+            ),
         }
+    }
+
+    fn write(&self, mutations: &[Mutation]) {
+        commit(&self.engine, mutations);
     }
 
     /// The published generation and progress, if any.
     fn current(&self) -> Option<(u64, u64)> {
-        let record = self.engine.get(Partition::Schema, CURRENT).expect("read")?;
+        let record = self.engine.get(Partition::Node, CURRENT).expect("read")?;
         let generation = u64::from_be_bytes(record[..8].try_into().expect("generation"));
         let progress = u64::from_be_bytes(record[8..16].try_into().expect("progress"));
         Some((generation, progress))
@@ -72,44 +79,60 @@ impl Destination {
     /// Write `rows` as `generation`, unpublished.
     fn stage(&self, generation: u64, rows: &Rows) {
         let prefix = Self::prefix(generation);
-        for (key, value) in rows {
-            let mut stored = prefix.clone();
-            stored.extend_from_slice(key);
-            self.engine
-                .put(Partition::Node, &stored, value)
-                .expect("stage");
+        let puts: Vec<Mutation> = rows
+            .iter()
+            .map(|(key, value)| {
+                let mut stored = prefix.clone();
+                stored.extend_from_slice(key);
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: stored,
+                    value: value.clone(),
+                }
+            })
+            .collect();
+        if !puts.is_empty() {
+            self.write(&puts);
         }
-        self.engine.persist().expect("persist");
     }
 
     /// Publish `generation` with `progress`: one write.
     fn publish(&self, generation: u64, progress: u64) {
         let mut record = generation.to_be_bytes().to_vec();
         record.extend_from_slice(&progress.to_be_bytes());
-        self.engine
-            .put(Partition::Schema, CURRENT, &record)
-            .expect("publish");
-        self.engine.persist().expect("persist");
+        self.write(&[Mutation::Put {
+            partition: PartitionId::Node,
+            key: CURRENT.to_vec(),
+            value: record,
+        }]);
     }
 }
 
-fn source_rows(db: &Database, scope: &[u8]) -> Rows {
+/// Commit `mutations` to `engine`'s own journal at its clock's next stamp.
+fn commit(engine: &StorageEngine, mutations: &[Mutation]) {
+    let ts = engine.oracle().expect("an embedded engine").next().as_raw();
+    engine
+        .commit_logged(mutations, ts, Journal::Journal)
+        .expect("commit");
+}
+
+fn source_rows(db: &Database, prefix: &[u8]) -> Rows {
     let engine = db.engine();
     engine
-        .snapshot_prefix_scan(&engine.snapshot(), Partition::Node, scope)
+        .snapshot_prefix_scan(&engine.snapshot(), Partition::Node, prefix)
         .expect("source")
         .into_iter()
         .map(|(key, value)| (key, value.to_vec()))
         .collect()
 }
 
-/// Copy `scope` of the cut's view, two keys a page.
-fn copy_view(db: &Database, cut: &StateCut, scope: &[u8]) -> Rows {
+/// Copy the cut's view, two keys a page.
+fn copy_view(db: &Database, cut: &StateCut) -> Rows {
     let mut rows = Rows::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
         let page = db
-            .state_cut_scan(cut, Partition::Node, scope, after.as_deref(), 2)
+            .state_cut_scan(cut, after.as_deref(), 2, u64::MAX)
             .expect("page");
         let Some((last, _)) = page.last() else {
             return rows;
@@ -119,29 +142,22 @@ fn copy_view(db: &Database, cut: &StateCut, scope: &[u8]) -> Rows {
     }
 }
 
-/// Apply the continuation's node changes under `scope` to `rows`, reading
-/// until the join is complete and the journal holds nothing more.
-fn read_continuation(db: &Database, cut: &mut StateCut, scope: &[u8], rows: &mut Rows) {
+/// Apply the continuation to `rows`, reading until the join is complete
+/// and the log holds nothing more.
+fn read_continuation(db: &Database, cut: &mut StateCut, rows: &mut Rows) {
     loop {
         let before = cut.next();
-        let batch = db.state_cut_tail(cut, 4).expect("tail");
+        let batch = db.state_cut_tail(cut, 4, u64::MAX).expect("tail");
         for unit in &batch.units {
             for m in &unit.mutations {
                 match m {
-                    Mutation::Put {
-                        partition: PartitionId::Node,
-                        key,
-                        value,
-                    } if key.starts_with(scope) => {
+                    Mutation::Put { key, value, .. } => {
                         rows.insert(key.clone(), value.clone());
                     }
-                    Mutation::Delete {
-                        partition: PartitionId::Node,
-                        key,
-                    } if key.starts_with(scope) => {
+                    Mutation::Delete { key, .. } => {
                         rows.remove(key);
                     }
-                    _ => {}
+                    other => panic!("a node scope carries no {other:?}"),
                 }
             }
         }
@@ -160,66 +176,95 @@ fn open_source(dir: &std::path::Path) -> Database {
     db
 }
 
-/// A rebuild through a cut, with a create and a delete racing the copy:
-/// the published replacement equals the source, holds neither the deleted
-/// row nor the destination's earlier rows, and is published only once the
-/// join is complete.
-#[test]
-fn a_rebuild_through_a_cut_replaces_the_destination_with_the_source() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = open_source(&dir.path().join("source"));
-    let destination = Destination::open(&dir.path().join("destination"));
+/// A write inside the join while the next cut of `db` is taken.
+fn write_inside_the_join(db: &Database, key: &'static [u8]) {
+    let engine = db.engine_shared();
+    let mut once = true;
+    db.engine().set_cut_bound_hook(Some(Box::new(move || {
+        if std::mem::take(&mut once) {
+            commit(
+                &engine,
+                &[Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: key.to_vec(),
+                    value: b"joined".to_vec(),
+                }],
+            );
+        }
+    })));
+}
+
+fn rig_with_stale_projection() -> (PowerRig, Destination) {
+    let rig = PowerRig::new();
+    let destination = Destination::open(&rig);
     let mut stale = Rows::new();
     stale.insert(b"node:stale".to_vec(), b"old".to_vec());
     destination.stage(1, &stale);
     destination.publish(1, 0);
+    (rig, destination)
+}
 
-    let mut cut = db.state_cut(Duration::from_secs(10)).expect("cut");
+/// A rebuild through a cut with a write inside the join and a create and a
+/// delete after the cut: nothing is publishable before the join completes,
+/// and the published replacement equals the source, holding neither the
+/// deleted row nor the destination's earlier rows.
+#[test]
+fn a_rebuild_through_a_cut_replaces_the_destination_with_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = open_source(&dir.path().join("source"));
+    let (_rig, destination) = rig_with_stale_projection();
+
+    write_inside_the_join(&db, b"node:joined");
+    let mut cut = db
+        .state_cut(scope(NODES), Duration::from_secs(10))
+        .expect("cut");
+    db.engine().set_cut_bound_hook(None);
+    assert!(cut.join_end() > cut.first(), "the join holds a position");
+    assert!(cut.joined().is_none(), "no publication before the join");
     db.execute_cypher("CREATE (:User {id: 4})").expect("create");
     db.execute_cypher("MATCH (u:User {id: 1}) DETACH DELETE u")
         .expect("delete");
-    if cut.join_end() > cut.first() {
-        assert!(cut.joined().is_none(), "no publication before the join");
-    }
-    let mut rows = copy_view(&db, &cut, NODES);
-    read_continuation(&db, &mut cut, NODES, &mut rows);
+    let mut rows = copy_view(&db, &cut);
+    assert!(
+        !rows.contains_key(b"node:joined".as_slice()),
+        "the write inside the join is above the view"
+    );
+    read_continuation(&db, &mut cut, &mut rows);
     let progress = cut.joined().expect("joined");
 
     destination.stage(2, &rows);
     destination.publish(2, progress);
     assert_eq!(destination.rows(), source_rows(&db, NODES));
+    assert!(destination.rows().contains_key(b"node:joined".as_slice()));
     assert!(!destination.rows().contains_key(b"node:stale".as_slice()));
     assert_eq!(destination.current(), Some((2, progress)));
 }
 
-/// A destination closed before the publication keeps its previous complete
-/// projection and progress; closed after it, the new one.
+/// Power lost after the replacement is staged and before it is published
+/// leaves the previous projection and progress; lost after the publication,
+/// the new one, complete.
 #[test]
-fn a_destination_closed_on_either_side_of_the_publication_holds_one_projection() {
+fn power_lost_on_either_side_of_the_publication_leaves_one_projection() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_source(&dir.path().join("source"));
-    let at = dir.path().join("destination");
-    let mut stale = Rows::new();
-    stale.insert(b"node:stale".to_vec(), b"old".to_vec());
-    {
-        let destination = Destination::open(&at);
-        destination.stage(1, &stale);
-        destination.publish(1, 0);
-    }
-    let mut cut = db.state_cut(Duration::from_secs(10)).expect("cut");
-    let mut rows = copy_view(&db, &cut, NODES);
-    read_continuation(&db, &mut cut, NODES, &mut rows);
+    let (rig, destination) = rig_with_stale_projection();
+    let stale = destination.rows();
+    let mut cut = db
+        .state_cut(scope(NODES), Duration::from_secs(10))
+        .expect("cut");
+    let mut rows = copy_view(&db, &cut);
+    read_continuation(&db, &mut cut, &mut rows);
     let progress = cut.joined().expect("joined");
-    {
-        let destination = Destination::open(&at);
-        destination.stage(2, &rows);
-    }
-    let destination = Destination::open(&at);
-    assert_eq!(destination.current(), Some((1, 0)), "not yet published");
+
+    destination.stage(2, &rows);
+    rig.cut(destination.engine);
+    let destination = Destination::open(&rig);
+    assert_eq!(destination.current(), Some((1, 0)), "not published");
     assert_eq!(destination.rows(), stale);
+
     destination.publish(2, progress);
-    drop(destination);
-    let destination = Destination::open(&at);
+    rig.cut(destination.engine);
+    let destination = Destination::open(&rig);
     assert_eq!(destination.current(), Some((2, progress)));
     assert_eq!(destination.rows(), source_rows(&db, NODES));
 }
@@ -229,15 +274,17 @@ fn a_destination_closed_on_either_side_of_the_publication_holds_one_projection()
 fn an_empty_scope_rebuilds_to_absence() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_source(&dir.path().join("source"));
-    let destination = Destination::open(&dir.path().join("destination"));
+    let rig = PowerRig::new();
+    let destination = Destination::open(&rig);
     let mut stale = Rows::new();
     stale.insert(b"node:none:stale".to_vec(), b"old".to_vec());
     destination.stage(1, &stale);
     destination.publish(1, 0);
-    let scope = b"node:none:";
-    let mut cut = db.state_cut(Duration::from_secs(10)).expect("cut");
-    let mut rows = copy_view(&db, &cut, scope);
-    read_continuation(&db, &mut cut, scope, &mut rows);
+    let mut cut = db
+        .state_cut(scope(b"node:none:"), Duration::from_secs(10))
+        .expect("cut");
+    let mut rows = copy_view(&db, &cut);
+    read_continuation(&db, &mut cut, &mut rows);
     destination.stage(2, &rows);
     destination.publish(2, cut.joined().expect("joined"));
     assert!(
@@ -246,30 +293,39 @@ fn an_empty_scope_rebuilds_to_absence() {
     );
 }
 
+/// A scope a row copy cannot recover is refused before any cut is taken:
+/// an index is not recovered as rows.
+#[test]
+fn a_scope_a_row_copy_cannot_recover_is_refused() {
+    assert!(CutScope::rows(Partition::Idx, Vec::new()).is_err());
+    assert!(CutScope::rows(Partition::Schema, Vec::new()).is_err());
+}
+
 /// A view does not survive its database: the database reopens while a cut
-/// taken of it is still held, and the reopened one gives a new cut with a
-/// bound of its own, never the lost view again under old positions.
+/// taken of it is still held, and the reopened one refuses the old cut and
+/// gives a new one with a bound of its own.
 #[test]
 fn a_view_is_lost_with_its_database_and_a_new_cut_is_taken() {
     let dir = tempfile::tempdir().unwrap();
     let at = dir.path().join("source");
     let db = open_source(&at);
-    let old = db.state_cut(Duration::from_secs(10)).expect("cut");
+    let mut old = db
+        .state_cut(scope(NODES), Duration::from_secs(10))
+        .expect("cut");
     drop(db);
     let mut db = Database::open(&at).expect("reopen while the old cut is held");
     db.execute_cypher("CREATE (:User {id: 5})").expect("create");
-    let new = db.state_cut(Duration::from_secs(10)).expect("new cut");
+    let new = db
+        .state_cut(scope(NODES), Duration::from_secs(10))
+        .expect("new cut");
     assert!(new.bound() > old.bound(), "a view of its own");
-    let rows = copy_view(&db, &new, NODES);
-    assert_eq!(rows, source_rows(&db, NODES));
-    let mut old = old;
+    assert_eq!(copy_view(&db, &new), source_rows(&db, NODES));
     assert!(
-        db.state_cut_scan(&old, Partition::Node, NODES, None, 2)
-            .is_err(),
+        db.state_cut_scan(&old, None, 2, u64::MAX).is_err(),
         "the lost view is not served from the reopened database"
     );
     assert!(
-        db.state_cut_tail(&mut old, 4).is_err(),
+        db.state_cut_tail(&mut old, 4, u64::MAX).is_err(),
         "nor is its continuation"
     );
 }
@@ -281,8 +337,13 @@ fn a_cut_read_against_another_history_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let a = open_source(&dir.path().join("a"));
     let b = open_source(&dir.path().join("b"));
-    let mut cut = a.state_cut(Duration::from_secs(10)).expect("cut");
-    b.state_cut(Duration::from_secs(10))
+    let mut cut = a
+        .state_cut(scope(NODES), Duration::from_secs(10))
+        .expect("cut");
+    b.state_cut(scope(NODES), Duration::from_secs(10))
         .expect("b founds its history");
-    assert!(b.state_cut_tail(&mut cut, 4).is_err(), "another history");
+    assert!(
+        b.state_cut_tail(&mut cut, 4, u64::MAX).is_err(),
+        "another history"
+    );
 }

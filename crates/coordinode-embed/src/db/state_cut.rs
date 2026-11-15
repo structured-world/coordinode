@@ -1,34 +1,34 @@
 //! State recovery for a change-stream consumer that lost its journal
-//! window: a fixed cut of one history.
+//! window: a fixed cut of one history, over one row scope.
 //!
-//! [`Database::state_cut`] pins a read view below a bound and starts the
-//! continuation that joins it. The consumer copies the selected scope of the
-//! view ([`Database::state_cut_scan`]) into a replacement of its destination,
+//! [`Database::state_cut`] pins a read view of a scope below a bound and
+//! starts the continuation that joins it. The consumer copies the view
+//! ([`Database::state_cut_scan`]) into a replacement of its destination,
 //! then reads the continuation ([`Database::state_cut_tail`]) and applies
 //! the units it hands over, with the existing committed-effect semantics:
 //! units the view already holds are left out, so a non-idempotent effect is
 //! applied once. The replacement, the absence of every key the view lacks
 //! and the consumer's progress are published together, in one destination
 //! transaction, and only once the join is complete ([`StateCut::joined`]).
-//! From there the consumer reads the journal as any reader does.
+//!
+//! A cut recovers the rows of its scope only: not the whole database, a
+//! columnar table or an index. An effect inside the scope it cannot carry
+//! is refused, and the continuation does not move past it.
 
 use std::time::Duration;
 
 use coordinode_storage::engine::fixed_cut::{CutRead, CutUnit, FixedCut};
-use coordinode_storage::engine::partition::Partition;
 
 use super::{Database, DatabaseError};
+
+pub use coordinode_storage::engine::fixed_cut::CutScope;
 
 /// A key of the view and its value.
 pub type CutRow = (Vec<u8>, Vec<u8>);
 
-/// The log of a group this database is a member of: its shard.
-#[cfg(feature = "replication")]
-const GROUP_LOG_SHARD: u32 = 0;
-
-/// A pinned read view below [`Self::bound`] and the position its
+/// A pinned read view of a scope below [`Self::bound`] and the position its
 /// continuation has reached. Dropping it releases the view; a view lost
-/// with the database cannot be taken again from its positions alone.
+/// with the database is refused, not served again.
 #[derive(Debug)]
 pub struct StateCut {
     cut: FixedCut,
@@ -43,7 +43,7 @@ impl StateCut {
         self.cut.bound()
     }
 
-    /// The first journal position of the continuation.
+    /// The first log position of the continuation.
     #[must_use]
     pub fn first(&self) -> u64 {
         self.cut.first()
@@ -61,9 +61,16 @@ impl StateCut {
         self.next
     }
 
-    /// Where ordinary change reading resumes, once the join is complete;
+    /// The rows the cut hands over.
+    #[must_use]
+    pub fn scope(&self) -> &CutScope {
+        self.cut.scope()
+    }
+
+    /// Where reading this database's log resumes, once the join is complete;
     /// `None` before. Publishing the replacement earlier would certify a
-    /// prefix the view already passed.
+    /// prefix the view already passed. A position in this database's log as
+    /// it runs now: it does not carry over a restore or another log.
     #[must_use]
     pub fn joined(&self) -> Option<u64> {
         (self.next >= self.cut.join_end()).then_some(self.next)
@@ -73,140 +80,114 @@ impl StateCut {
 /// One read of a cut's continuation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CutBatch {
-    /// The units to apply, in log order: those the view does not hold and
-    /// that took effect.
+    /// The units to apply, in log order: those the view does not hold, that
+    /// took effect and change something in the scope, each with only its
+    /// changes in the scope.
     pub units: Vec<CutUnit>,
     /// See [`StateCut::joined`], after this read.
     pub joined: Option<u64>,
 }
 
 impl Database {
-    /// Take a fixed cut of this database's history: a view pinned below a
-    /// fresh bound, and the continuation that joins it. Gives the database
-    /// its deployment identity first when it has none, so the cut names its
-    /// history.
+    /// Take a fixed cut of this database's history over `scope`: a view
+    /// pinned below a fresh bound, and the continuation that joins it.
+    /// Gives the database its deployment identity first when it has none,
+    /// so the cut names its history.
     ///
     /// # Errors
     ///
     /// [`DatabaseError::Storage`] carrying `CutNotReady` when a commit below
     /// the cut is still in flight or not durable after `timeout`; a database
     /// with neither a journal of its own nor its group's log.
-    pub fn state_cut(&self, timeout: Duration) -> Result<StateCut, DatabaseError> {
+    pub fn state_cut(&self, scope: CutScope, timeout: Duration) -> Result<StateCut, DatabaseError> {
         self.found_deployment()?;
-        let cut = self.engine.fixed_cut(timeout)?;
+        let cut = self.engine.fixed_cut(scope, timeout)?;
         Ok(StateCut {
             next: cut.first(),
             cut,
         })
     }
 
-    /// Up to `limit` keys of `partition` under `prefix` in the cut's view,
-    /// in key order, after `after` when given: one page of the copy.
+    /// One page of the cut's view: the scope's rows in key order, after
+    /// `after` when given, at most `max_rows` of them and `max_bytes` of
+    /// keys and values. A page reads from `after` on, so a late page costs
+    /// what an early one does.
     ///
     /// # Errors
     ///
     /// `CutLost` for a cut of a database closed since: its view is gone and
-    /// a new cut is taken. A read that fails.
+    /// a new cut is taken. `Budget` for a row past `max_bytes` on its own. A
+    /// read that fails.
     pub fn state_cut_scan(
         &self,
         cut: &StateCut,
-        partition: Partition,
-        prefix: &[u8],
         after: Option<&[u8]>,
-        limit: usize,
+        max_rows: usize,
+        max_bytes: u64,
     ) -> Result<Vec<CutRow>, DatabaseError> {
-        self.engine.held_cut(&cut.cut)?;
-        let mut page = Vec::new();
-        for guard in self
-            .engine
-            .snapshot_prefix_iter(&cut.bound(), partition, prefix)?
-        {
-            if page.len() >= limit {
-                break;
-            }
-            let (key, value) = guard
-                .into_owned()
-                .map_err(coordinode_storage::error::StorageError::from)?;
-            if after.is_some_and(|after| key.as_slice() <= after) {
-                continue;
-            }
-            page.push((key, value.to_vec()));
-        }
-        Ok(page)
+        Ok(self.engine.cut_page(&cut.cut, after, max_rows, max_bytes)?)
     }
 
-    /// Read up to `entries` entries of the cut's continuation, from where
-    /// the last read ended.
+    /// Read up to `max_entries` log entries, of at most `max_bytes`, of the
+    /// cut's continuation, from where the last read ended. Only entries this
+    /// database applied and made durable are read: one still undecided is
+    /// not handed over until it is.
     ///
     /// # Errors
     ///
-    /// [`DatabaseError::Storage`] carrying `RetentionLost` when the journal
-    /// no longer holds the next position: the copy has to start again from a
-    /// new cut; `CutLost` for a cut of a database closed since. A unit that
-    /// cannot be read, or a cut of another history.
+    /// [`DatabaseError::Storage`] carrying `RetentionLost` when the log no
+    /// longer holds the next position: the copy has to start again from a
+    /// new cut; `CutLost` for a cut of a database closed since;
+    /// `CutUnsupported` for an effect inside the scope the cut cannot carry;
+    /// `Budget` for an entry past `max_bytes` on its own. On each of them the
+    /// position stays where it was. A cut of another history.
     pub fn state_cut_tail(
         &self,
         cut: &mut StateCut,
-        entries: u64,
+        max_entries: usize,
+        max_bytes: u64,
     ) -> Result<CutBatch, DatabaseError> {
-        // Before reading: a lost view would otherwise surface as a lost
-        // position or not at all.
-        self.engine.held_cut(&cut.cut)?;
         let read = if self.engine.has_journal() {
-            self.engine.fixed_cut_units(&cut.cut, cut.next, entries)?
+            self.engine
+                .cut_read(&cut.cut, cut.next, max_entries, max_bytes)?
         } else {
-            self.group_cut_read(&cut.cut, cut.next, entries)?
+            self.group_cut_read(&cut.cut, cut.next, max_entries, max_bytes)?
         };
         cut.next = read.next;
         Ok(CutBatch {
             units: read
                 .units
                 .into_iter()
-                .filter(|unit| !unit.in_view && !unit.refused)
+                .filter(|unit| !unit.in_view && !unit.refused && !unit.mutations.is_empty())
                 .collect(),
             joined: cut.joined(),
         })
     }
 
     /// [`Self::state_cut_tail`] over the log of the group this database
-    /// applies, read in place with each unit frame as recorded.
+    /// applies, up to the last entry it applied: an entry past it may never
+    /// commit.
     #[cfg(feature = "replication")]
     fn group_cut_read(
         &self,
         cut: &FixedCut,
         from: u64,
-        entries: u64,
+        max_entries: usize,
+        max_bytes: u64,
     ) -> Result<CutRead, DatabaseError> {
-        use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
+        // The log of the group this database is a member of: its shard.
+        const GROUP_LOG_SHARD: u32 = 0;
         let dirs = coordinode_raft::storage::raft_oplog_dirs(&self.engine, GROUP_LOG_SHARD)
             .map_err(|e| DatabaseError::Other(format!("the group's log: {e}")))?
             .all;
-        let mut tailer = OplogTailer::new(
-            &dirs,
-            ResumeToken {
-                shard_id: 0,
-                segment_id: from,
-                entry_offset: 0,
-            },
-        )?
-        .with_unit_frames();
-        // A count past the address space reads as much as there is.
-        let max = usize::try_from(entries).unwrap_or(usize::MAX);
-        // Only what this member applied: an entry past it may never commit.
         let until = self
             .engine
             .group_applied_through()
             .checked_add(1)
             .ok_or_else(|| DatabaseError::Other("the applied log index overflowed".into()))?;
-        let read: Vec<_> = tailer
-            .read_next(max, &CdcFilters::default(), until)?
-            .into_iter()
-            .map(|(entry, _)| entry)
-            .collect();
-        Ok(CutRead {
-            units: self.engine.cut_units_of(cut, &read)?,
-            next: tailer.next_index(),
-        })
+        Ok(self
+            .engine
+            .cut_read_log(cut, &dirs, from, until, max_entries, max_bytes)?)
     }
 
     /// Without replication a database applies no group's log.
@@ -215,7 +196,8 @@ impl Database {
         &self,
         _cut: &FixedCut,
         _from: u64,
-        _entries: u64,
+        _max_entries: usize,
+        _max_bytes: u64,
     ) -> Result<CutRead, DatabaseError> {
         Err(DatabaseError::Unsupported(
             "reading a group's log needs the replication feature".into(),

@@ -361,15 +361,24 @@ own), refuse registrations as `Unsupported`.
 ### Rebuilding after `RetentionLost`
 
 A consumer whose position is gone rebuilds its projection from a fixed cut
-of the database: a read view pinned below a bound, and the journal
-continuation that joins it. `state_cut` takes the cut, waiting up to its
-timeout for the commits below the bound to finish and be durable
-(`CutNotReady` otherwise). `state_cut_scan` pages through a key range of
-the view; `state_cut_tail` reads the continuation from where the last read
-ended and hands over only the units the view does not already hold, each
-with its own commit timestamp and data changes, so a non-idempotent change
-(a counter increment) is applied once. A position the journal no longer
-holds while the copy runs is `RetentionLost`: take a new cut.
+of the database over one row scope (`CutScope::rows`: a partition and a key
+prefix): a read view of the scope pinned below a bound, and the log
+continuation that joins it. A cut recovers rows only, not the whole
+database, a columnar table or an index; the index and schema partitions are
+refused as scopes. `state_cut` takes the cut, waiting up to its timeout for
+the commits below the bound to finish and be durable (`CutNotReady`
+otherwise). `state_cut_scan` pages through the view, each page starting
+where the last ended; `state_cut_tail` reads the continuation from where the
+last read ended and hands over only the units the view does not already
+hold, each with its own commit timestamp and its changes inside the scope,
+so a non-idempotent change (a counter increment) is applied once. It reads
+only entries the database applied and made durable, so a write whose
+outcome is still open is not handed over. Both take a row or entry count
+and a byte limit; one row or entry larger than the byte limit alone is
+refused as `Budget`. A position the log no longer holds while the copy runs
+is `RetentionLost`: take a new cut. An effect inside the scope the cut
+cannot carry is `CutUnsupported`, and the continuation does not move past
+it.
 
 Copy the view into a new generation of the destination, apply the
 continuation, and publish the generation together with the consumer's
@@ -377,27 +386,30 @@ progress in one destination write, only once `StateCut::joined` returns the
 position: publishing earlier would certify a prefix the view already
 passed. Building a new generation rather than updating the old one in place
 is what removes the rows deleted at the source. From the joined position on,
-the consumer reads the journal as before. The cut pins its view until it is
-dropped, and a cut is bound to its database's history: read against another
-database it is refused.
+the consumer reads the log as before; the position belongs to the
+database's log as it runs now, not to a restored copy of it. The cut pins
+its view until it is dropped. A cut of a database closed since is
+`CutLost`, and a cut read against another database is refused.
 
 ```rust,no_run
 use std::time::Duration;
 use coordinode_embed::Database;
+use coordinode_embed::consumer::CutScope;
 use coordinode_storage::engine::partition::Partition;
 
 # fn main() -> Result<(), coordinode_embed::DatabaseError> {
 let db = Database::open("/var/lib/myapp/graph")?;
-let mut cut = db.state_cut(Duration::from_secs(10))?;
+let scope = CutScope::rows(Partition::Node, b"node:".to_vec())?;
+let mut cut = db.state_cut(scope, Duration::from_secs(10))?;
 let mut after: Option<Vec<u8>> = None;
 loop {
-    let page = db.state_cut_scan(&cut, Partition::Node, b"node:", after.as_deref(), 1024)?;
+    let page = db.state_cut_scan(&cut, after.as_deref(), 1024, 4 << 20)?;
     let Some((last, _)) = page.last() else { break };
     after = Some(last.clone());
     // ...write `page` into the destination's new generation.
 }
 let progress = loop {
-    let batch = db.state_cut_tail(&mut cut, 256)?;
+    let batch = db.state_cut_tail(&mut cut, 256, 4 << 20)?;
     // ...apply `batch.units` to the new generation.
     if let Some(position) = batch.joined {
         break position;

@@ -400,6 +400,11 @@ impl EmbeddedOplog {
         self.next_index
     }
 
+    /// Every entry below this index is durable.
+    pub(crate) fn durable_below(&self) -> u64 {
+        self.durable_below
+    }
+
     /// The first index the journal still holds: its oldest segment's first
     /// entry, or the next index when no segment holds anything.
     pub(crate) fn first_index(&self) -> u64 {
@@ -537,15 +542,6 @@ impl EmbeddedOplog {
     /// the journal forward from a checkpoint's cursor.
     pub(crate) fn read_since(&mut self, from_index: u64) -> StorageResult<Vec<OplogEntry>> {
         self.manager.read_range(from_index, u64::MAX)
-    }
-
-    /// Entries with `index` in `[from_index, to_index)`, ascending.
-    pub(crate) fn read_range(
-        &mut self,
-        from_index: u64,
-        to_index: u64,
-    ) -> StorageResult<Vec<OplogEntry>> {
-        self.manager.read_range(from_index, to_index)
     }
 
     /// Delete the sealed segments whose every entry is below `below`.

@@ -211,6 +211,15 @@ pub enum StorageError {
         bound: u64,
     },
 
+    /// A cut cannot hand over what was asked: a scope it does not recover,
+    /// or an effect inside its scope it cannot carry. Nothing is handed over
+    /// and the continuation stays where it was.
+    #[error("the cut cannot hand this over: {reason}")]
+    CutUnsupported {
+        /// What is not supported.
+        reason: String,
+    },
+
     /// No cut of the store can be shown complete for a whole-store capture;
     /// nothing is captured.
     #[error("the store cannot be captured: {reason}")]

@@ -560,10 +560,16 @@ async fn a_fixed_cut_of_a_group_member_joins_its_log_once() {
     propose(1);
     propose(10);
     let cutting = Arc::clone(&engine);
-    let cut = tokio::task::spawn_blocking(move || cutting.fixed_cut(Duration::from_secs(10)))
-        .await
-        .expect("join")
-        .expect("cut");
+    let scope = coordinode_storage::engine::fixed_cut::CutScope::rows(
+        Partition::Counter,
+        b"counter:".to_vec(),
+    )
+    .expect("scope");
+    let cut =
+        tokio::task::spawn_blocking(move || cutting.fixed_cut(scope, Duration::from_secs(10)))
+            .await
+            .expect("join")
+            .expect("cut");
     propose(100);
 
     let mut destination = counter(
@@ -572,34 +578,15 @@ async fn a_fixed_cut_of_a_group_member_joins_its_log_once() {
             .expect("view"),
     );
     assert_eq!(destination, 11, "the view holds the commits before the cut");
-    let applied = node.applied_through();
+    // Read as far as this member applied: the end its state cut reader
+    // stops at.
+    let until = engine.group_applied_through() + 1;
     let dirs = raft_oplog_dirs(&engine, 0).expect("oplog dirs").all;
-    let mut tailer = OplogTailer::new(
-        &dirs,
-        ResumeToken {
-            shard_id: 0,
-            segment_id: cut.first(),
-            entry_offset: 0,
-        },
-    )
-    .expect("tailer")
-    .with_unit_frames();
-    let entries: Vec<OplogEntry> = tailer
-        .read_next(1000, &CdcFilters::default(), applied + 1)
-        .expect("log")
-        .into_iter()
-        .map(|(entry, _)| entry)
-        .collect();
-    assert!(
-        entries.iter().any(|e| e.index >= cut.join_end()),
-        "the log reaches past the join"
-    );
-    for unit in engine
-        .cut_units_of(&cut, &entries)
-        .expect("units")
-        .iter()
-        .filter(|u| !u.in_view)
-    {
+    let read = engine
+        .cut_read_log(&cut, &dirs, cut.first(), until, 1000, u64::MAX)
+        .expect("log");
+    assert!(read.next > cut.join_end(), "the log reaches past the join");
+    for unit in read.units.iter().filter(|u| !u.in_view) {
         for m in &unit.mutations {
             if let Mutation::Merge { operand, .. } = m {
                 destination +=

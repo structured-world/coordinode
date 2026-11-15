@@ -154,6 +154,8 @@ pub struct OplogTailer {
     /// Hand entries over with their unit frames as recorded: see
     /// [`OplogTailer::with_unit_frames`].
     frames: bool,
+    /// See [`OplogTailer::with_byte_limit`].
+    byte_limit: Option<u64>,
 }
 
 /// See [`OplogTailer::with_unit_decisions`].
@@ -189,7 +191,18 @@ impl OplogTailer {
             cursor: None,
             decisions: None,
             frames: false,
+            byte_limit: None,
         })
+    }
+
+    /// Hand over at most `bytes` of encoded entries a read: a read stops
+    /// before the entry that would pass it. An entry larger than the whole
+    /// limit is refused rather than handed over, and the position stays
+    /// before it.
+    #[must_use]
+    pub fn with_byte_limit(mut self, bytes: u64) -> Self {
+        self.byte_limit = Some(bytes);
+        self
     }
 
     /// Hand each entry over with its unit frames as recorded, each with its
@@ -231,7 +244,8 @@ impl OplogTailer {
     ///
     /// # Errors
     ///
-    /// The oplog directory cannot be listed.
+    /// The oplog directory cannot be listed; [`StorageError::Budget`] for an
+    /// entry past [`Self::with_byte_limit`] on its own.
     pub fn read_next(
         &mut self,
         max_entries: usize,
@@ -239,6 +253,8 @@ impl OplogTailer {
         until: u64,
     ) -> StorageResult<Vec<(OplogEntry, ResumeToken)>> {
         let mut result = Vec::new();
+        // Encoded bytes of the entries handed over so far.
+        let mut taken = 0u64;
         // A cursor that reaches nothing is located afresh, once per call.
         let mut located = false;
         while result.len() < max_entries && self.next < until {
@@ -287,6 +303,25 @@ impl OplogTailer {
                 if entry.index >= until || result.len() >= max_entries {
                     full = true;
                     break;
+                }
+                if let Some(limit) = self.byte_limit {
+                    // Frames follow one another, so the frame ends past where
+                    // it starts.
+                    let size = end - cursor.offset;
+                    if taken + size > limit {
+                        if taken == 0 {
+                            return Err(StorageError::Budget(
+                                coordinode_core::budget::BudgetStop::Memory {
+                                    requested: size,
+                                    used: 0,
+                                    limit,
+                                },
+                            ));
+                        }
+                        full = true;
+                        break;
+                    }
+                    taken += size;
                 }
                 cursor.offset = end;
                 self.next = entry.index + 1;
