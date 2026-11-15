@@ -1588,6 +1588,44 @@ fn the_recorded_plan_follows_an_index_created_and_dropped() {
     );
 }
 
+/// A cursor is recorded with the plan its first page ran with, not one
+/// chosen again at its end: an index created between its pages, and its
+/// statement pushed out of the plan cache, change neither the recorded plan
+/// nor require parsing it again.
+#[test]
+fn a_cursor_is_recorded_with_the_plan_its_pages_ran_with() {
+    let mut db = Database::open_in_memory().expect("open");
+    db.execute_cypher("UNWIND range(0, 9) AS i CREATE (:User {email: 'u' + toString(i)})")
+        .unwrap();
+    let query = "MATCH (n:User) WHERE n.email = 'u3' RETURN n.email";
+    let first = db
+        .execute_cypher_paged(query, None, None, None, 2)
+        .expect("first page");
+    let advice = first
+        .advice
+        .expect("the first page names the cursor's record");
+
+    db.execute_cypher("CREATE INDEX user_email ON :User(email)")
+        .unwrap();
+    // Distinct texts past the plan cache's bound push the cursor's out.
+    for i in 0..1100 {
+        db.execute_cypher(&format!("RETURN {i} AS x{i}")).unwrap();
+    }
+    db.record_cursor(advice, std::time::Duration::from_millis(1), None);
+
+    let plan = db
+        .query_registry()
+        .top_by_count(2000)
+        .into_iter()
+        .find(|s| s.canonical_query.contains("email") && s.canonical_query.contains("RETURN"))
+        .and_then(|s| s.last_plan)
+        .expect("the cursor was recorded");
+    assert!(
+        plan.contains("NodeScan") && !plan.contains("IndexScan"),
+        "the cursor was recorded with a plan it did not run: {plan}"
+    );
+}
+
 /// With auto-advisory off a statement runs without advisor work: nothing
 /// is counted, no call site and no N+1 pattern is kept, and EXPLAIN SUGGEST
 /// still advises on the statement it is given. On again, statements are

@@ -73,6 +73,19 @@ pub struct PagedCypherResult {
     /// Mutation counters for this page. Zero for a read-only cursor; populated
     /// only if the paged statement also wrote (uncommon for a cursor).
     pub write_stats: WriteStats,
+    /// On the first page, when the database records statements for the
+    /// advisor: what the cursor is recorded as once read to its end, with
+    /// [`Database::record_cursor`].
+    pub advice: Option<CursorAdvice>,
+}
+
+/// A cursor's identity and the plan its pages run with, taken from its first
+/// page, for the one advisor record of the whole cursor.
+#[derive(Debug, Clone)]
+pub struct CursorAdvice {
+    fingerprint: u64,
+    canonical: String,
+    plan: planner::logical::LogicalPlan,
 }
 
 /// `StorageStats` adapter that augments graph-level statistics (label
@@ -483,12 +496,14 @@ fn apply_session_vector_consistency(
 }
 
 /// Whether a statement's run is recorded for the advisor.
-#[derive(Clone, Copy)]
 pub(crate) enum Advice<'s> {
     /// Recorded, with the call site the client named, when the database
     /// records every statement.
     Record(Option<&'s SourceContext>),
-    /// Not recorded: a later page of a cursor whose first page was.
+    /// A cursor's first page: not recorded, but what the cursor is recorded
+    /// as at its end is kept here, when the database records statements.
+    Keep(&'s mut Option<CursorAdvice>),
+    /// Not recorded: a later page of a cursor.
     Skip,
 }
 
@@ -2585,9 +2600,17 @@ impl Database {
             last_key: None,
             exhausted: false,
         });
+        // The first page keeps what the cursor is recorded as; later pages
+        // run with the same plan and are not recorded.
+        let first = paging.as_ref().is_some_and(|p| p.resume.is_none());
+        let mut advice = None;
         let (rows, write_stats, _) = self.execute_cypher_impl(
             query,
-            Advice::Skip,
+            if first {
+                Advice::Keep(&mut advice)
+            } else {
+                Advice::Skip
+            },
             params,
             &session,
             TxnMode::AutoCommit,
@@ -2612,51 +2635,42 @@ impl Database {
             exhausted,
             read_ts: pinned,
             write_stats,
+            advice,
         })
     }
 
     /// Record a cursor read through [`Self::execute_cypher_paged`] for the
-    /// advisor, once it was read to the end: `busy` is the time its pages
-    /// spent in the engine, without the client's pauses between them, and
-    /// `source` the call site the client named. The caller decides whether
-    /// the cursor is recorded when it opens it, by [`Self::auto_advisory`]
-    /// then; a cursor abandoned before its end is not an execution.
-    ///
-    /// # Errors
-    ///
-    /// The query no longer parses: nothing is recorded then.
+    /// advisor, once it was read to the end, as its first page's `advice`
+    /// names it: the plan its pages ran with, `busy` the time they spent in
+    /// the engine without the client's pauses between them, and `source` the
+    /// call site the client named. A cursor abandoned before its end is not
+    /// an execution and is not recorded.
     pub fn record_cursor(
         &self,
-        query: &str,
+        advice: CursorAdvice,
         busy: Duration,
         source: Option<&SourceContext>,
-    ) -> Result<(), DatabaseError> {
-        let cached = self.cached_plan(query)?;
-        // Planned again once per cursor, not per page: the plan its pages ran
-        // with, without parameters bound.
-        let plan = self.explain_plan(query, self.compute_stats().as_ref())?;
+    ) {
+        let CursorAdvice {
+            fingerprint,
+            canonical,
+            plan,
+        } = advice;
+        // A cursor running for longer than u64 microseconds stays at the most.
         let duration_us = u64::try_from(busy.as_micros()).unwrap_or(u64::MAX);
-        self.query_registry.record_run(
-            cached.fingerprint,
-            &cached.canonical,
-            duration_us,
-            &plan,
-            source,
-        );
+        self.query_registry
+            .record_run(fingerprint, &canonical, duration_us, &plan, source);
         if let Some(src) = source
-            && let Some(alert) =
-                self.nplus1_detector
-                    .record(cached.fingerprint, &cached.canonical, src)
+            && let Some(alert) = self.nplus1_detector.record(fingerprint, &canonical, src)
         {
             tracing::warn!(
-                fingerprint = cached.fingerprint,
+                fingerprint,
                 count = alert.call_count,
                 file = %alert.source_file,
                 line = alert.source_line,
                 "N+1 query pattern detected"
             );
         }
-        Ok(())
     }
 
     /// Classify whether `query` can be served by a keyset-resumable cursor via
@@ -2855,9 +2869,12 @@ impl Database {
         // The call site a recorded statement is counted at; `None` when the
         // run is not recorded at all. Off unless the database records every
         // statement: EXPLAIN SUGGEST advises from its own plan.
-        let recorded = match advice {
-            Advice::Record(source) if self.auto_advisory.load(Ordering::Relaxed) => Some(source),
-            Advice::Record(_) | Advice::Skip => None,
+        // A cursor's first page keeps the cursor's record for its end instead.
+        let advisory = self.auto_advisory.load(Ordering::Relaxed);
+        let (recorded, kept) = match advice {
+            Advice::Record(source) if advisory => (Some(source), None),
+            Advice::Keep(slot) if advisory => (None, Some(slot)),
+            Advice::Record(_) | Advice::Keep(_) | Advice::Skip => (None, None),
         };
         // Bind parameters: replace $name references with literal values,
         // once their vectors are checked. A recorded statement keeps the plan
@@ -2866,7 +2883,7 @@ impl Database {
         let mut advised = None;
         if let Some(ref p) = params {
             coordinode_query::executor::runner::check_parameters(p)?;
-            if recorded.is_some() {
+            if recorded.is_some() || kept.is_some() {
                 advised = Some(plan.clone());
             }
             plan.substitute_params(p);
@@ -3219,6 +3236,15 @@ impl Database {
                     "N+1 query pattern detected"
                 );
             }
+        }
+        // The plan the cursor's pages run with, moved out once its first
+        // page has run: no copy beyond the one taken before binding.
+        if let Some(slot) = kept {
+            *slot = Some(CursorAdvice {
+                fingerprint: fp,
+                canonical: canonical.to_string(),
+                plan: advised.unwrap_or(plan),
+            });
         }
 
         // Invalidate cached storage statistics after any mutation so that

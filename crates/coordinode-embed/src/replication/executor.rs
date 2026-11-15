@@ -131,9 +131,9 @@ pub fn write_paged(
     let mut resume = None;
     let mut columns: Option<Vec<String>> = None;
     let mut values = Vec::new();
-    // Recorded for the advisor once, at its end, if the database recorded
-    // statements when the read began; `busy` is the pages' engine time.
-    let advised = database.read().auto_advisory();
+    // Recorded for the advisor once, at its end, as its first page names it;
+    // `busy` is the pages' engine time.
+    let mut advice = None;
     let mut busy = std::time::Duration::ZERO;
     loop {
         if admitted
@@ -151,7 +151,7 @@ pub fn write_paged(
         }
         // The paging call takes the parameters by value for every page.
         let started = std::time::Instant::now();
-        let page = database.read().execute_cypher_paged(
+        let mut page = database.read().execute_cypher_paged(
             query,
             params.clone(),
             read_ts,
@@ -160,6 +160,9 @@ pub fn write_paged(
         )?;
         busy += started.elapsed();
         read_ts = Some(page.read_ts);
+        if page.advice.is_some() {
+            advice = page.advice.take();
+        }
         if columns.is_none()
             && let Some(first) = page.rows.first()
         {
@@ -183,8 +186,8 @@ pub fn write_paged(
             }
         }
         if page.exhausted {
-            if advised && let Err(e) = database.read().record_cursor(query, busy, source) {
-                tracing::debug!(error = %e, "a paged read was not recorded for the advisor");
+            if let Some(advice) = advice {
+                database.read().record_cursor(advice, busy, source);
             }
             return Ok(stats(&page.write_stats, admitted));
         }

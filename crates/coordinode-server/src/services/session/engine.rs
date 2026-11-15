@@ -860,10 +860,11 @@ struct KeysetCursor {
     database: Arc<RwLock<Database>>,
     query: String,
     params: Option<HashMap<String, Value>>,
-    /// `Some` with the client's call site while the cursor is still to be
-    /// recorded for the advisor, once read to its end: set when it opens,
-    /// if the database recorded statements then.
-    advised: Option<Option<SourceContext>>,
+    /// The client's call site, for the advisor record of the cursor.
+    source: Option<SourceContext>,
+    /// What the cursor is recorded as once read to its end, from its first
+    /// page; `None` when the database recorded nothing then, or recorded.
+    advice: Option<coordinode_embed::db::CursorAdvice>,
     columns: Vec<String>,
     /// Pinned snapshot timestamp, set from the first page.
     read_ts: Option<u64>,
@@ -893,12 +894,12 @@ impl KeysetCursor {
         at: Option<u64>,
         fenced: SessionStats,
     ) -> Result<Self, EngineError> {
-        let advised = database.read().auto_advisory().then_some(source);
         let mut cursor = Self {
             database,
             query,
             params,
-            advised,
+            source,
+            advice: None,
             columns: Vec::new(),
             read_ts: at,
             resume: None,
@@ -921,7 +922,7 @@ impl KeysetCursor {
     /// token + exhaustion flag. Establishes `columns` from the first row seen.
     fn fetch_page(&mut self) -> Result<(), EngineError> {
         let started = Instant::now();
-        let page = self
+        let mut page = self
             .database
             .read()
             .execute_cypher_paged(
@@ -936,16 +937,18 @@ impl KeysetCursor {
         self.read_ts = Some(page.read_ts);
         self.resume = page.last_key;
         self.exhausted = page.exhausted;
-        // Read to its end: one execution for the advisor, its pages' engine
-        // time without the client's pauses.
+        // The first page names what the cursor is recorded as; read to its
+        // end, it is one execution for the advisor, with its pages' engine
+        // time and not the client's pauses.
+        if page.advice.is_some() {
+            self.advice = page.advice.take();
+        }
         if self.exhausted
-            && let Some(source) = self.advised.take()
-            && let Err(e) =
-                self.database
-                    .read()
-                    .record_cursor(&self.query, self.busy, source.as_ref())
+            && let Some(advice) = self.advice.take()
         {
-            tracing::debug!(error = %e, "a cursor was not recorded for the advisor");
+            self.database
+                .read()
+                .record_cursor(advice, self.busy, self.source.as_ref());
         }
         // The page's view is the cursor's pinned snapshot, the same for every
         // page, so its receipt holds for the whole scan.
