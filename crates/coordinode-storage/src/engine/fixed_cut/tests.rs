@@ -510,11 +510,8 @@ fn a_page_charges_its_blocks_and_stops_where_the_budget_ends() {
         page.held() as u64,
         "a page keeps charged exactly the blocks and index it holds"
     );
-    assert!(
-        page.held() >= 64 * 1024,
-        "ten rows of a kilobyte share one block: {} bytes held",
-        page.held()
-    );
+    assert_eq!(page.blocks.len(), 1, "ten rows share one block");
+    assert_eq!(page.blocks[0].capacity(), super::ROW_BLOCK);
     drop((page, charge));
 
     // Room for the scan and a few blocks, not for 400 kilobytes of rows.
