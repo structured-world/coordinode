@@ -456,16 +456,20 @@ fn a_cursor_over_pages_is_recorded_once_when_read_to_its_end() {
     );
 
     // Three pages, with a pause between batches the client takes.
+    // Timed from before the open, which reads the first page.
+    let started = std::time::Instant::now();
     let mut cursor = open("MATCH (n:Page) RETURN n.k");
     let mut rows = 0;
-    let started = std::time::Instant::now();
+    let mut paused = std::time::Duration::ZERO;
     loop {
         let batch = cursor.next_batch(1000).expect("batch");
         if batch.is_empty() {
             break;
         }
         rows += batch.len();
+        let pause = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(20));
+        paused += pause.elapsed();
     }
     let elapsed = started.elapsed();
     assert_eq!(rows, 3000);
@@ -474,11 +478,13 @@ fn a_cursor_over_pages_is_recorded_once_when_read_to_its_end() {
     assert_eq!(entry.sources.len(), 1);
     assert_eq!(entry.sources[0].file, "src/report.rs");
     assert!(entry.max_time_us > 0, "the pages' engine time");
+    // The engine time fits in what the client did not spend pausing.
     assert!(
-        u128::from(entry.max_time_us) < elapsed.as_micros() - 50_000,
-        "the client's pauses were counted: {} us of {} us",
+        u128::from(entry.max_time_us) <= (elapsed - paused).as_micros(),
+        "the client's pauses were counted: {} us recorded, {} us outside {} us of pauses",
         entry.max_time_us,
-        elapsed.as_micros()
+        (elapsed - paused).as_micros(),
+        paused.as_micros()
     );
 
     // Off: a cursor read to its end is not recorded either.
