@@ -42,6 +42,7 @@ impl TableMetrics {
     }
 
     /// Remove `table`'s series. Called by its drop under the life it ends.
+    #[cfg(feature = "columnar")]
     pub(crate) fn remove(&self, table: &str) {
         self.series.lock().remove(table);
     }

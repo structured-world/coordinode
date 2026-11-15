@@ -8,13 +8,19 @@
 
 use std::path::{Path, PathBuf};
 
-use lsm_tree::{AbstractTree as _, AnyTree, ScanSinceEvent};
+#[cfg(feature = "columnar")]
+use lsm_tree::AbstractTree as _;
+use lsm_tree::{AnyTree, ScanSinceEvent};
 
 use crate::engine::coverage::TreeCoverage;
+#[cfg(feature = "columnar")]
 use crate::engine::oplog_journal::op_partition;
+#[cfg(feature = "columnar")]
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
-use crate::oplog::entry::{OplogEntry, OplogOp};
+use crate::oplog::entry::OplogEntry;
+#[cfg(feature = "columnar")]
+use crate::oplog::entry::OplogOp;
 
 /// The name of a checkpoint directory is its index behind this prefix,
 /// zero-padded, so name order is age order.
@@ -174,6 +180,7 @@ pub(crate) fn uncovered_entry(
 /// # Errors
 ///
 /// An entry's ops do not decode.
+#[cfg(feature = "columnar")]
 pub(crate) fn catalog_change(
     catalog_held: &TreeCoverage,
     suffix: &[OplogEntry],
@@ -221,6 +228,7 @@ pub(crate) fn tree_history(
 
 /// Write one event of a tree's history into `tree` at its original seqno.
 /// Returns the bytes the write added and the memtable's size after it.
+#[cfg(feature = "columnar")]
 pub(crate) fn replay_event(tree: &AnyTree, event: ScanSinceEvent) -> (u64, u64) {
     match event {
         ScanSinceEvent::Insert { key, value, seqno } => tree.insert(key, value, seqno),

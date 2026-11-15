@@ -2,6 +2,7 @@ use super::*;
 
 /// A live table renders one sample per family; a removed one renders none,
 /// and with no table left nothing at all, so no family header is orphaned.
+#[cfg(feature = "columnar")]
 #[test]
 fn a_removed_table_leaves_no_series() {
     let metrics = TableMetrics::default();

@@ -286,6 +286,7 @@ impl EmbeddedOplog {
     /// a partition discriminant. Like [`append`](Self::append), must be called
     /// BEFORE the row is applied to the columnar tree's memtable so a write that
     /// reached the journal survives a crash and is replayed.
+    #[cfg(feature = "columnar")]
     pub(crate) fn append_columnar(
         &mut self,
         table_id: &str,

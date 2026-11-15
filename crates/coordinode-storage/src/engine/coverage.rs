@@ -25,7 +25,9 @@
 //! marker exists.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+#[cfg(feature = "columnar")]
+use std::collections::HashMap;
 
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 
@@ -283,6 +285,7 @@ pub(crate) struct Coverage {
     folded_hint: AtomicU64,
     /// Per `STORAGE COLUMNAR` table, the indices marked in its tree and not
     /// folded yet: a table fold removes them by name.
+    #[cfg(feature = "columnar")]
     table_markers: parking_lot::Mutex<HashMap<String, Vec<u64>>>,
     /// Per partition ([`Partition::position`]), one past the highest index
     /// applied to it in this process; 0 when none was. A fold writes only the
@@ -315,6 +318,7 @@ impl Coverage {
             // first fold removes markers from index 0.
             folded: parking_lot::Mutex::new(0),
             folded_hint: AtomicU64::new(0),
+            #[cfg(feature = "columnar")]
             table_markers: parking_lot::Mutex::new(HashMap::new()),
             touched: core::array::from_fn(|_| AtomicU64::new(0)),
             based: core::array::from_fn(|_| AtomicU64::new(0)),
@@ -345,6 +349,7 @@ impl Coverage {
     }
 
     /// Record that `table`'s tree now holds the marker for `index`.
+    #[cfg(feature = "columnar")]
     pub(crate) fn note_table_marker(&self, table: &str, index: u64) {
         let mut markers = self.table_markers.lock();
         match markers.get_mut(table) {
@@ -357,6 +362,7 @@ impl Coverage {
 
     /// Take, per table, the unfolded markers below `next`; the ones at or
     /// above it stay for a later fold.
+    #[cfg(feature = "columnar")]
     pub(crate) fn take_table_markers_below(&self, next: u64) -> Vec<(String, Vec<u64>)> {
         let mut markers = self.table_markers.lock();
         let mut taken = Vec::new();
@@ -459,6 +465,7 @@ pub(crate) fn write_fold(
 /// written only by its own rows, so its markers are few and known, and each
 /// is removed by a point tombstone rather than a range one: `markers` are the
 /// indices below `next` marked in this table since its last fold.
+#[cfg(feature = "columnar")]
 pub(crate) fn write_table_fold(
     tree: &AnyTree,
     domain: Domain,
