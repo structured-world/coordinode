@@ -151,6 +151,9 @@ pub struct OplogTailer {
     /// member that applied them recorded. Without it a bound unit fails the
     /// read instead of being delivered on a guess.
     decisions: Option<UnitDecisionSource>,
+    /// Hand entries over with their unit frames as recorded: see
+    /// [`OplogTailer::with_unit_frames`].
+    frames: bool,
 }
 
 /// See [`OplogTailer::with_unit_decisions`].
@@ -185,7 +188,18 @@ impl OplogTailer {
             held: !token.is_start(),
             cursor: None,
             decisions: None,
+            frames: false,
         })
+    }
+
+    /// Hand each entry over with its unit frames as recorded, each with its
+    /// own commit timestamp, for a reader that decides per unit (the join of
+    /// a fixed cut, [`crate::engine::core::StorageEngine::cut_units_of`]).
+    /// Filters do not apply: a filter judges expanded operations.
+    #[must_use]
+    pub fn with_unit_frames(mut self) -> Self {
+        self.frames = true;
+        self
     }
 
     /// Read a Raft log whose units may be bound to client operations: a unit
@@ -278,16 +292,20 @@ impl OplogTailer {
                 self.next = entry.index + 1;
                 self.held = true;
                 reached = true;
+                let token = ResumeToken {
+                    shard_id: self.shard_id,
+                    segment_id: cursor.first_index,
+                    entry_offset: self.next - cursor.first_index,
+                };
+                if self.frames {
+                    result.push((entry, token));
+                    continue;
+                }
                 // A reader sees the operations a unit frame encodes, and
                 // none of a unit that took no effect.
                 let ops = expand_units_decided(&entry.ops, entry.index, self.decisions.as_deref())?
                     .into_owned();
                 if passes_filter(&entry, &ops, filters) {
-                    let token = ResumeToken {
-                        shard_id: self.shard_id,
-                        segment_id: cursor.first_index,
-                        entry_offset: self.next - cursor.first_index,
-                    };
                     result.push((OplogEntry { ops, ..entry }, token));
                 }
             }

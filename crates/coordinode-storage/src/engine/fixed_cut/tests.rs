@@ -29,6 +29,57 @@ fn open_with(config: &StorageConfig) -> Arc<StorageEngine> {
     Arc::new(StorageEngine::open_embedded(config, Arc::new(TimestampOracle::new())).expect("open"))
 }
 
+/// One consensus log entry batching two units, one stamped below the cut
+/// and one above it: each is decided by its own commit timestamp, not by
+/// its entry's highest one, so the first is in the view and the second is
+/// applied.
+#[test]
+fn units_of_one_entry_on_both_sides_of_the_cut_are_decided_apart() {
+    use coordinode_core::txn::timestamp::Timestamp;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open(&dir);
+    let during = Arc::clone(&engine);
+    let mut once = true;
+    // One entry inside the join, so `[L, H)` holds a position.
+    *engine.on_cut_bound.lock() = Some(Box::new(move || {
+        if std::mem::take(&mut once) {
+            during
+                .commit_logged(&add(1), during.next_seqno(), Journal::Journal)
+                .expect("inside the join");
+        }
+    }));
+    let cut = engine.fixed_cut(Duration::from_secs(10)).expect("cut");
+    *engine.on_cut_bound.lock() = None;
+    assert!(cut.join_end() > cut.first(), "the join holds a position");
+    let below = cut.bound() - 1;
+    let above = cut.bound() + 1;
+    let frame = |delta, ts| {
+        coordinode_core::txn::frame::encode_unit(&add(delta), Timestamp::from_raw(ts))
+            .expect("frame")
+    };
+    let entry = crate::oplog::OplogEntry {
+        ts: above,
+        term: 1,
+        index: cut.first(),
+        shard: 0,
+        ops: vec![
+            crate::oplog::OplogOp::Unit {
+                frame: frame(5, below),
+            },
+            crate::oplog::OplogOp::Unit {
+                frame: frame(7, above),
+            },
+        ],
+        is_migration: false,
+        pre_images: None,
+    };
+    let units = engine.cut_units_of(&cut, &[entry]).expect("units");
+    assert_eq!(units.len(), 2);
+    assert_eq!((units[0].commit_ts, units[0].in_view), (below, true));
+    assert_eq!((units[1].commit_ts, units[1].in_view), (above, false));
+    assert_eq!(units[1].position.sub, 1, "its place in the entry is kept");
+}
+
 /// A commit below the cut journalled without a sync is made durable before
 /// the cut is handed off: the view holds no effect a crash can take back.
 #[test]

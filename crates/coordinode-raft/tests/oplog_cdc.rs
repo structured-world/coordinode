@@ -504,3 +504,111 @@ async fn cdc_filter_edge_type_through_raft() {
     });
     assert!(!has_likes, "LIKES edges should be filtered out");
 }
+
+/// A fixed cut of a member applying its group's log: the view below the
+/// cut's bound, then the log from `L` read unit by unit, the units the view
+/// holds left out, give the member's state with every commit counted once,
+/// a non-idempotent merge included. The cut's bound is above the commit
+/// ceiling of the applied prefix it starts after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fixed_cut_of_a_group_member_joins_its_log_once() {
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use coordinode_storage::engine::partition::Partition;
+    const KEY: &[u8] = b"counter:degree:9";
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The store's own clock: the leader stamps closed bounds from it.
+    let clock = Arc::new(TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            Arc::clone(&clock),
+        )
+        .expect("open engine"),
+    );
+    let node = RaftNode::single_node(Arc::clone(&engine))
+        .await
+        .expect("bootstrap");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let pipeline = node.pipeline();
+    let id_gen = ProposalIdGenerator::new();
+    let propose = |delta: i64| {
+        let ts = clock.next();
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Merge {
+                partition: PartitionId::Counter,
+                key: KEY.to_vec(),
+                operand: coordinode_storage::engine::merge::encode_counter_delta(delta),
+            }],
+            commit_ts: ts,
+            start_ts: ts,
+            bypass_rate_limiter: false,
+        };
+        pipeline.propose_and_wait(&proposal).expect("propose");
+    };
+    let counter = |value: Option<bytes::Bytes>| {
+        value.map_or(0, |v| {
+            coordinode_storage::engine::merge::decode_counter(&v).expect("counter")
+        })
+    };
+    propose(1);
+    propose(10);
+    let cutting = Arc::clone(&engine);
+    let cut = tokio::task::spawn_blocking(move || cutting.fixed_cut(Duration::from_secs(10)))
+        .await
+        .expect("join")
+        .expect("cut");
+    propose(100);
+
+    let mut destination = counter(
+        engine
+            .snapshot_get(&cut.bound(), Partition::Counter, KEY)
+            .expect("view"),
+    );
+    assert_eq!(destination, 11, "the view holds the commits before the cut");
+    let applied = node.applied_through();
+    let dirs = raft_oplog_dirs(&engine, 0).expect("oplog dirs").all;
+    let mut tailer = OplogTailer::new(
+        &dirs,
+        ResumeToken {
+            shard_id: 0,
+            segment_id: cut.first(),
+            entry_offset: 0,
+        },
+    )
+    .expect("tailer")
+    .with_unit_frames();
+    let entries: Vec<OplogEntry> = tailer
+        .read_next(1000, &CdcFilters::default(), applied + 1)
+        .expect("log")
+        .into_iter()
+        .map(|(entry, _)| entry)
+        .collect();
+    assert!(
+        entries.iter().any(|e| e.index >= cut.join_end()),
+        "the log reaches past the join"
+    );
+    for unit in engine
+        .cut_units_of(&cut, &entries)
+        .expect("units")
+        .iter()
+        .filter(|u| !u.in_view)
+    {
+        for m in &unit.mutations {
+            if let Mutation::Merge { operand, .. } = m {
+                destination +=
+                    coordinode_storage::engine::merge::decode_counter(operand).expect("delta");
+            }
+        }
+    }
+    let source = counter(engine.get(Partition::Counter, KEY).expect("source"));
+    assert_eq!(source, 111);
+    assert_eq!(destination, source, "every commit counted once");
+    node.shutdown().await.expect("shutdown");
+}

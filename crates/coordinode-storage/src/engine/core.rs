@@ -4247,8 +4247,12 @@ impl StorageEngine {
         timeout: std::time::Duration,
     ) -> StorageResult<crate::engine::fixed_cut::FixedCut> {
         let Some(oplog) = &self.oplog else {
+            if self.raft_fence().is_some() || self.group_history {
+                return self.fixed_cut_of_group(timeout);
+            }
             return Err(StorageError::InvalidConfig(
-                "a fixed cut follows the store's own journal, which this store does not keep"
+                "a fixed cut follows the store's own journal or its group's log, and this \
+                 store has neither"
                     .into(),
             ));
         };
@@ -4300,6 +4304,59 @@ impl StorageEngine {
         })
     }
 
+    /// [`Self::fixed_cut`] of a member applying its group's log. `L` is the
+    /// applied prefix, and the commit ceiling of that prefix is the lowest
+    /// bound the view may take. The bound and the join end come from one
+    /// reading of the applied closure: every commit below its closed bound
+    /// is in an entry up to the last one it accounts for. A member that
+    /// applies only what the group made durable needs no sync.
+    fn fixed_cut_of_group(
+        &self,
+        timeout: std::time::Duration,
+    ) -> StorageResult<crate::engine::fixed_cut::FixedCut> {
+        let not_ready = |reason: String| StorageError::CutNotReady { reason };
+        let applied = self.closure.lock().ledger.last_index();
+        let first = applied
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Io("the applied log index overflowed".into()))?;
+        let lower = if applied == 0 {
+            0
+        } else {
+            self.commit_ceiling_through(applied)?
+        };
+        if !self.await_complete_through(lower, timeout) {
+            return Err(not_ready(format!(
+                "the group's closed bound has not passed {lower}"
+            )));
+        }
+        // One reading: the bound and the entry it was closed by.
+        let (bound, last) = {
+            let state = self.closure.lock();
+            (state.ledger.below(), state.ledger.last_index())
+        };
+        if bound <= lower {
+            // A bound of none proves no empty history.
+            return Err(not_ready(format!(
+                "the group's closed bound {bound} is not above {lower}"
+            )));
+        }
+        let pin = self.pin_readable_snapshot_at(bound).map_err(|oldest| {
+            not_ready(format!(
+                "the view at {bound} is no longer served; the oldest is {oldest}"
+            ))
+        })?;
+        let join_end = last
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Io("the applied log index overflowed".into()))?;
+        Ok(crate::engine::fixed_cut::FixedCut {
+            first,
+            bound,
+            join_end,
+            history: self.journal_history()?,
+            _pin: pin,
+        })
+    }
+
     /// The units of journal entries `[from, from + entries)`, each with its
     /// own commit timestamp and whether `cut`'s view already holds it. The
     /// entries read are held for the read only.
@@ -4315,12 +4372,6 @@ impl StorageEngine {
         from: u64,
         entries: u64,
     ) -> StorageResult<Vec<crate::engine::fixed_cut::CutUnit>> {
-        use coordinode_core::txn::operation::LogPosition;
-        if cut.history != self.journal_history()? {
-            return Err(StorageError::InvalidConfig(
-                "the cut was taken of another history".into(),
-            ));
-        }
         let Some(oplog) = &self.oplog else {
             return Err(StorageError::InvalidConfig(
                 "the store keeps no journal".into(),
@@ -4338,11 +4389,35 @@ impl StorageEngine {
                 });
             }
             let hold = crate::engine::oplog_journal::JournalHold::take(&self.journal_holds, from);
+            // A count past the end of the index space reads to the end.
             let read = journal.read_range(from, from.saturating_add(entries))?;
             (hold, read)
         };
+        self.cut_units_of(cut, &read)
+    }
+
+    /// The units `entries` carry, entries of this store's own journal or of
+    /// the consensus log it applies, read in log order: each unit with its
+    /// own commit timestamp and whether `cut`'s view already holds it. A
+    /// unit its operation binding refused carries no data changes.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a cut of another history; a frame
+    /// or decision that cannot be read.
+    pub fn cut_units_of(
+        &self,
+        cut: &crate::engine::fixed_cut::FixedCut,
+        entries: &[crate::oplog::OplogEntry],
+    ) -> StorageResult<Vec<crate::engine::fixed_cut::CutUnit>> {
+        use coordinode_core::txn::operation::LogPosition;
+        if cut.history != self.journal_history()? {
+            return Err(StorageError::InvalidConfig(
+                "the cut was taken of another history".into(),
+            ));
+        }
         let mut units = Vec::new();
-        for entry in read {
+        for entry in entries {
             let mut sub = 0u32;
             for op in &entry.ops {
                 let crate::oplog::OplogOp::Unit { frame } = op else {
