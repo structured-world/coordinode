@@ -53,6 +53,10 @@ const MAGIC: [u8; 4] = *b"CNST";
 const VERSION: u8 = 1;
 /// The name prefix of a `STORAGE COLUMNAR` table's tree.
 const TABLE_PREFIX: &str = "tables/";
+/// How long a checkpoint of a store no Raft log orders waits for the commits
+/// below its cut to land before it is refused as not ready: they are
+/// already applying, and a commit takes milliseconds, not seconds.
+pub(crate) const CHECKPOINT_CUT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Which folder of its tree a pinned file belongs in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,24 +443,73 @@ impl StorageEngine {
             Some(fence) => {
                 let mut pinned = None;
                 fence.with_applies_paused(&mut |applies, _| {
-                    pinned = Some(self.pin_trees(Some(applies), scope)?);
+                    pinned = Some(self.pin_trees(Some(applies), scope, self.table_trees())?);
                     Ok(())
                 })?;
                 pinned.ok_or_else(|| {
                     StorageError::InvalidConfig("the Raft apply fence never ran the pin".into())
                 })
             }
-            None => self.pin_trees(None, scope),
+            None => self.pin_trees(None, scope, self.table_trees()),
         }
     }
 
-    /// Pin the trees of `scope`, with the applies at `applies` when a Raft
-    /// state machine runs, and for a transfer take the sealed index
-    /// inventory.
+    /// Every `STORAGE COLUMNAR` table's tree with its id; none without
+    /// columnar support.
+    fn table_trees(&self) -> Vec<(String, lsm_tree::AnyTree)> {
+        #[cfg(feature = "columnar")]
+        return self.columnar_table_trees();
+        #[cfg(not(feature = "columnar"))]
+        Vec::new()
+    }
+
+    /// Pin every tree at one cut of a store no Raft log orders: a commit is
+    /// in the pinned trees whole or not at all. The trees are pinned in
+    /// turn, so a commit landing between two pins would be in one tree and
+    /// not the other. So the cut is a timestamp `bound` drawn from the clock
+    /// every commit takes its own from: each commit below it is waited for
+    /// until it has landed in every tree it writes, and each one at or above
+    /// it is left out of the copy. No tree installs a table from the moment
+    /// `bound` is drawn until it is pinned (its flush lock is held), so a
+    /// commit at or above `bound` is only in the pinned memtables, which the
+    /// copy is built from below `bound`. Returns the trees and `bound`.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::CutNotReady`] when a commit below the cut is still in
+    /// flight after [`CHECKPOINT_CUT_WAIT`]; a tree cannot be read.
+    fn pin_at_cut(&self) -> StorageResult<(Vec<PinnedTree>, u64)> {
+        let mut parts = Vec::with_capacity(Partition::all().len());
+        for &part in Partition::all() {
+            parts.push(self.tree(part)?);
+        }
+        let tables = self.table_trees();
+        let _no_flush: Vec<_> = parts
+            .iter()
+            .map(|tree| tree.get_flush_lock())
+            .chain(tables.iter().map(|(_, tree)| tree.get_flush_lock()))
+            .collect();
+        let bound = self.next_seqno();
+        let below = bound
+            .checked_sub(1)
+            .ok_or_else(|| StorageError::Io("the commit clock drew 0".into()))?;
+        self.pending_commits()
+            .await_complete_at(below, CHECKPOINT_CUT_WAIT)
+            .map_err(|ts| StorageError::CutNotReady {
+                reason: format!("a commit at {ts} below the checkpoint is in flight"),
+            })?;
+        let (trees, _) = self.pin_trees(None, PinScope::Whole, tables.clone())?;
+        Ok((trees, bound))
+    }
+
+    /// Pin the trees of `scope` and the `tables`, with the applies at
+    /// `applies` when a Raft state machine runs, and for a transfer take the
+    /// sealed index inventory.
     fn pin_trees(
         &self,
         applies: Option<&RaftApplyState>,
         scope: PinScope,
+        tables: Vec<(String, lsm_tree::AnyTree)>,
     ) -> StorageResult<(Vec<PinnedTree>, Option<Vec<u8>>)> {
         let mut trees = Vec::with_capacity(Partition::all().len());
         for &part in Partition::all() {
@@ -485,9 +538,12 @@ impl StorageEngine {
                 pin: tree.pin(),
                 _held: None,
             });
+            #[cfg(test)]
+            if let Some(hook) = self.on_tree_pinned.lock().as_mut() {
+                hook(part);
+            }
         }
-        #[cfg(feature = "columnar")]
-        for (table_id, tree) in self.columnar_table_trees() {
+        for (table_id, tree) in tables {
             trees.push(PinnedTree {
                 name: TreeName::Table(table_id),
                 position: None,
@@ -513,22 +569,31 @@ impl StorageEngine {
     /// where a link cannot be made), each tree's memtable contents are written
     /// there, and the pins are released once every tree stands. On a store a
     /// Raft state machine runs over, the trees are pinned with the applies
-    /// paused; otherwise each tree is pinned in turn, and the journal copied
-    /// beside the trees replays what one holds and another does not.
+    /// paused; otherwise at one cut every commit is in whole or not at all
+    /// ([`Self::pin_at_cut`]), and a journal copied beside the trees replays
+    /// the commits past it.
     ///
     /// # Errors
     ///
-    /// A tree cannot be read, a file cannot be linked or copied, or a tree
-    /// cannot be rebuilt in `target`.
+    /// [`StorageError::CutNotReady`] when a commit below the cut does not
+    /// land in time; a tree cannot be read, a file cannot be linked or
+    /// copied, or a tree cannot be rebuilt in `target`.
     pub(crate) fn checkpoint_pinned(
         &self,
         target: &Path,
         summary: &mut crate::engine::core::CheckpointSummary,
     ) -> StorageResult<()> {
-        let (trees, _) = self.pin_fenced(PinScope::Whole)?;
+        let (trees, bound) = match self.raft_fence() {
+            Some(_) => (self.pin_fenced(PinScope::Whole)?.0, None),
+            None => {
+                let (trees, bound) = self.pin_at_cut()?;
+                (trees, Some(bound))
+            }
+        };
         for tree in &trees {
-            summary.total_bytes += self.materialize(tree, target)?;
-            summary.max_seqno = summary.max_seqno.max(tree.pin.seqno());
+            summary.total_bytes += self.materialize(tree, target, bound)?;
+            let held = bound.map_or(tree.pin.seqno(), |bound| tree.pin.seqno().min(bound));
+            summary.max_seqno = summary.max_seqno.max(held);
             if matches!(tree.name, TreeName::Partition(_)) {
                 summary.partitions += 1;
             }
@@ -537,9 +602,14 @@ impl StorageEngine {
     }
 
     /// Lay `tree`'s pinned files into its folder under `root` and rebuild it
-    /// there with its memtable contents. Returns the bytes copied: none for
-    /// files hard-linked.
-    fn materialize(&self, tree: &PinnedTree, root: &Path) -> StorageResult<u64> {
+    /// there with its memtable contents, those below `bound` when one is
+    /// given. Returns the bytes copied: none for files hard-linked.
+    fn materialize(
+        &self,
+        tree: &PinnedTree,
+        root: &Path,
+        bound: Option<u64>,
+    ) -> StorageResult<u64> {
         let dir = tree.name.dir(root);
         let mut copied = 0;
         for (kind, file) in tree.files() {
@@ -587,10 +657,16 @@ impl StorageEngine {
         let config = config.table_file_pool(0);
         // The engine error as it is, so a rebuild refused for room stays a
         // refusal for room.
+        let below = |seqno: u64| bound.is_none_or(|bound| seqno < bound);
         let rebuilt = config.restore_pinned(
             &tree.pin.layout()?,
-            tree.pin.memtable_entries(),
-            tree.pin.memtable_range_tombstones(),
+            tree.pin
+                .memtable_entries()
+                .filter(|entry| below(entry.seqno)),
+            tree.pin
+                .memtable_range_tombstones()
+                .into_iter()
+                .filter(|tombstone| below(tombstone.seqno)),
         )?;
         // Closed before the checkpoint is opened as a store of its own.
         drop(rebuilt);

@@ -75,6 +75,10 @@ impl lsm_tree::SequenceNumberGenerator for OracleSeqnoGenerator {
     }
 }
 
+/// A test hook run with a partition once a checkpoint has pinned its tree.
+#[cfg(test)]
+pub(crate) type TreePinnedHook = Box<dyn FnMut(Partition) + Send>;
+
 /// The CoordiNode storage engine.
 ///
 /// Owns 8 `lsm_tree::AnyTree` instances (one per [`Partition`]), a shared
@@ -361,6 +365,10 @@ pub struct StorageEngine {
     /// Test hook: run in [`Self::fixed_cut`] once `L` is read and `B` pinned.
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) on_cut_bound: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test hook: run with a partition once a checkpoint has pinned its tree,
+    /// before the next tree is pinned.
+    #[cfg(test)]
+    pub(crate) on_tree_pinned: parking_lot::Mutex<Option<TreePinnedHook>>,
     /// Test hook: run with an entry's index once it is journalled, before
     /// it is applied.
     #[cfg(test)]
@@ -1812,6 +1820,8 @@ impl StorageEngine {
             #[cfg(any(test, feature = "test-faults"))]
             on_cut_bound: parking_lot::Mutex::new(None),
             #[cfg(test)]
+            on_tree_pinned: parking_lot::Mutex::new(None),
+            #[cfg(test)]
             on_journalled: parking_lot::Mutex::new(None),
             #[cfg(test)]
             on_segment_found: parking_lot::Mutex::new(None),
@@ -3023,7 +3033,10 @@ impl StorageEngine {
     /// own endpoints for a `target` outside them.
     ///
     /// Blocks: call it off the async runtime. On a store a Raft state
-    /// machine runs over, the trees are captured with the applies paused.
+    /// machine runs over, the trees are captured with the applies paused;
+    /// otherwise at one cut of the commit clock, each commit below it waited
+    /// for and each one past it left out, so every commit is in the trees
+    /// whole or not at all (a copied journal replays the ones past it).
     ///
     /// The field interner and schema metadata live in the Schema partition
     /// tree, so they are captured by that tree's checkpoint — no separate
@@ -3032,7 +3045,9 @@ impl StorageEngine {
     /// # Errors
     ///
     /// - `target` already exists, or its parent cannot be created
-    /// - any partition tree's checkpoint fails (see lsm `create_checkpoint`)
+    /// - a tree cannot be captured or rebuilt in `target`
+    /// - [`StorageError::CutNotReady`]: a commit below the cut did not land
+    ///   in time; the same checkpoint can be taken again
     /// - the oplog directory cannot be copied
     pub fn create_checkpoint(&self, target: &Path) -> StorageResult<CheckpointSummary> {
         claim_checkpoint_dir(target)?;

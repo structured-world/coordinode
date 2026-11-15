@@ -2446,6 +2446,95 @@ fn a_backup_elsewhere_at_the_limit_takes_no_room_and_keeps_the_memtables() {
     }
 }
 
+/// A checkpoint of a store with neither a journal nor a Raft log holds a
+/// commit in every tree it wrote or in none: a commit writing the Node and
+/// the Adj trees lands after the Node tree is captured and before the Adj
+/// tree is, and the copy holds neither of its writes. With nothing to replay
+/// from, a checkpoint holding the Adj half only would open as a state no
+/// commit left.
+#[test]
+fn a_checkpoint_holds_a_commit_across_trees_whole_or_not_at_all() {
+    use crate::engine::transaction::{CommitContext, Transaction};
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("tempdir");
+    let backups = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(&test_config(dir.path()), Arc::clone(&oracle))
+            .expect("open"),
+    );
+    assert!(!engine.has_journal(), "a store with no journal to replay");
+    assert!(engine.raft_fence().is_none(), "and no Raft log");
+
+    let (pinned, node_pinned) = mpsc::channel();
+    let (written, commit_done) = mpsc::channel::<()>();
+    *engine.on_tree_pinned.lock() = Some(Box::new(move |part| {
+        // A test that stopped listening has nothing more to say.
+        if part != Partition::Node || pinned.send(()).is_err() {
+            return;
+        }
+        // Waits for the commit, or goes on without it once it is plainly not
+        // coming: a hang here would be the test's, not the store's; the
+        // writer's own expectations then fail.
+        let landed = commit_done.recv_timeout(Duration::from_secs(10));
+        assert!(landed.is_ok(), "the commit never came: {landed:?}");
+    }));
+
+    let writer = {
+        let (engine, oracle) = (Arc::clone(&engine), Arc::clone(&oracle));
+        std::thread::spawn(move || {
+            node_pinned
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the Node tree was pinned");
+            let snap = engine.snapshot();
+            let mut txn = Transaction::new(
+                &engine,
+                Some(&oracle),
+                Timestamp::from_raw(snap),
+                Some(snap),
+            );
+            txn.put(Partition::Node, b"node:1:both", b"node half")
+                .expect("put");
+            txn.put(Partition::Adj, b"adj:R:out:both", b"adj half")
+                .expect("put");
+            let wc = WriteConcern::default();
+            txn.commit(&CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+            })
+            .expect("commit across two trees");
+            written.send(()).expect("tell the checkpoint");
+        })
+    };
+
+    let target = backups.path().join("ckpt");
+    engine.create_checkpoint(&target).expect("checkpoint");
+    writer.join().expect("writer");
+    *engine.on_tree_pinned.lock() = None;
+    assert!(
+        engine
+            .get(Partition::Adj, b"adj:R:out:both")
+            .expect("read")
+            .is_some(),
+        "the commit landed in the live store"
+    );
+    drop(engine);
+
+    let copy = StorageEngine::open_checkpoint(&target).expect("the checkpoint opens");
+    let node = copy.get(Partition::Node, b"node:1:both").expect("read");
+    let adj = copy.get(Partition::Adj, b"adj:R:out:both").expect("read");
+    assert_eq!(
+        node.is_some(),
+        adj.is_some(),
+        "the checkpoint holds part of a commit: node {node:?}, adj {adj:?}"
+    );
+}
+
 /// A checkpoint step refused for room on one endpoint is reported as that
 /// refusal with the step added, never as the endpoint with the least room
 /// left: there, `hot` is nearly full and the growth was refused on `cold`.
