@@ -1546,6 +1546,81 @@ fn read_below_the_physical_floor_is_refused_not_panicked() {
     assert_eq!(read_at(&engine, key, horizon).expect("served"), None);
 }
 
+/// Clearing one partition does not refuse reads of another at a snapshot
+/// that one still serves: a pinned snapshot of the node partition is read,
+/// point, borrowed, batched and by prefix, after the edge-property
+/// partition dropped its history past it. Before, every snapshot read was
+/// bounded by the highest floor of every tree and was refused.
+#[test]
+fn clearing_another_partition_leaves_a_pinned_read_served() {
+    let base = future_base();
+    let (engine, _oracle, _dir) = oracle_engine(base);
+    engine.set_retention_window(Duration::from_secs(7 * 24 * 3600));
+
+    let key = b"node:00:00000001";
+    put_at(&engine, key, b"v1", base + 1_000);
+    flush(&engine);
+    put_at(&engine, key, b"v2", base + 3_000);
+    flush(&engine);
+    put_in(
+        &engine,
+        PartitionId::EdgeProp,
+        b"ep:other",
+        b"x",
+        base + 2_000,
+    );
+    flush_in(&engine, Partition::EdgeProp);
+    let old_snapshot = base + 1_500;
+    let pin = engine
+        .pin_snapshot_at(old_snapshot)
+        .expect("the snapshot is still readable");
+
+    engine
+        .clear_partition(Partition::EdgeProp)
+        .expect("clear the other partition");
+    assert!(
+        engine.oldest_readable_seqno() > old_snapshot,
+        "the store-wide horizon now lies past the snapshot"
+    );
+
+    assert_eq!(
+        read_at(&engine, key, old_snapshot).expect("point read"),
+        Some(b"v1".to_vec())
+    );
+    let borrowed = engine
+        .with_snapshot_value(&old_snapshot, Partition::Node, key, |v| {
+            v.map(<[u8]>::to_vec)
+        })
+        .expect("borrowed read");
+    assert_eq!(borrowed, Some(b"v1".to_vec()));
+    let mut batched = Vec::new();
+    engine
+        .snapshot_multi_get_each::<StorageError>(
+            &old_snapshot,
+            Partition::Node,
+            &[key],
+            None,
+            |_, v| {
+                batched.push(v.map(|v| v.as_bytes().to_vec()));
+                Ok(())
+            },
+        )
+        .expect("batched read");
+    assert_eq!(batched, [Some(b"v1".to_vec())]);
+    let scanned = engine
+        .snapshot_prefix_scan(&old_snapshot, Partition::Node, b"node:00:")
+        .expect("prefix read");
+    assert_eq!(scanned.len(), 1);
+    assert_eq!(&scanned[0].1[..], b"v1");
+
+    // The cleared partition itself refuses the snapshot.
+    assert!(matches!(
+        read_in(&engine, Partition::EdgeProp, b"ep:other", old_snapshot),
+        Err(StorageError::SnapshotOutsideRetention { .. })
+    ));
+    drop(pin);
+}
+
 /// An oracle engine configured with no time-travel window, the setting in
 /// which nothing but the pins and the snapshot rule hold the watermark back,
 /// and whose snapshots step behind an unapplied commit at once.

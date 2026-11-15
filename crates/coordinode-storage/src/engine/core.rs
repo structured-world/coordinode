@@ -4717,7 +4717,7 @@ impl StorageEngine {
         use std::ops::Bound;
         self.held_cut(cut)?;
         self.scope_view_intact(cut)?;
-        self.check_snapshot_retained(cut.bound)?;
+        self.check_snapshot_retained(cut.scope.partition(), cut.bound)?;
         let prefix = cut.scope.prefix();
         let lo = match after {
             // A key at or past the prefix's start: the page goes on after it.
@@ -5670,34 +5670,58 @@ impl StorageEngine {
     /// [`Partition::is_system`]), so their floors run ahead of the window and
     /// do not bound a time-travel read of data.
     pub fn oldest_readable_seqno(&self) -> lsm_tree::SeqNo {
-        use lsm_tree::AbstractTree as _;
         let mut horizon = self.coordinator.gc_watermark_value();
         for part in Partition::all().iter().filter(|part| !part.is_system()) {
-            if let Ok(tree) = self.tree(*part) {
-                // A tree serves strictly above its floor, so the first
-                // readable seqno is one past it. Plain arithmetic: the floor
-                // is a watermark or an install seqno, both from the seqno
-                // generator (HLC microseconds or a counter), and is never
-                // `SeqNo::MAX`, the read-latest sentinel a caller passes to a
-                // read. The `debug_assert` fails loudly if that ever stops
-                // holding, which is where it would need fixing.
-                let oldest_retained = tree.oldest_retained_seqno();
-                debug_assert!(
-                    oldest_retained < lsm_tree::SeqNo::MAX,
-                    "retention floor at the read-latest sentinel"
-                );
-                horizon = horizon.max(oldest_retained + 1);
-            }
+            horizon = horizon.max(self.first_readable_in(*part));
         }
         horizon
     }
 
-    /// Refuse a snapshot read below the retention horizon. Version history
-    /// there may already be collected; answering from what survived would
-    /// return a wrong (newer or missing) version, and once the history is
-    /// pruned the tree has no retained version to serve it from at all.
-    fn check_snapshot_retained(&self, snapshot: lsm_tree::SeqNo) -> StorageResult<()> {
-        let watermark = self.oldest_readable_seqno();
+    /// The first seqno `part`'s tree still serves: one past its persisted
+    /// retention floor; `0` for a partition that has no tree.
+    fn first_readable_in(&self, part: Partition) -> lsm_tree::SeqNo {
+        use lsm_tree::AbstractTree as _;
+        let Ok(tree) = self.tree(part) else {
+            return 0;
+        };
+        // A tree serves strictly above its floor, so the first readable
+        // seqno is one past it. Plain arithmetic: the floor is a watermark or
+        // an install seqno, both from the seqno generator (HLC microseconds
+        // or a counter), and is never `SeqNo::MAX`, the read-latest sentinel
+        // a caller passes to a read. The `debug_assert` fails loudly if that
+        // ever stops holding, which is where it would need fixing.
+        let oldest_retained = tree.oldest_retained_seqno();
+        debug_assert!(
+            oldest_retained < lsm_tree::SeqNo::MAX,
+            "retention floor at the read-latest sentinel"
+        );
+        oldest_retained + 1
+    }
+
+    /// Refuse a snapshot read of `part` below the retention horizon: the GC
+    /// watermark, or `part`'s own retention floor where it is higher. Version
+    /// history there may already be collected; answering from what survived
+    /// would return a wrong (newer or missing) version, and once the history
+    /// is pruned the tree has no retained version to serve it from at all.
+    ///
+    /// Only the tree read takes part: another partition's floor says nothing
+    /// about this one's history, and reading every tree's floor on each read
+    /// takes each tree's version lock for nothing. The check stands before
+    /// the read because a key whose index installation is gone is answered
+    /// "absent" without reaching the tree, and that answer must hold at the
+    /// snapshot too. The tree checks its own floor again as it reads, which
+    /// covers a floor that rises in between. A system partition keeps no
+    /// history of its own (see [`Partition::is_system`]), so only the
+    /// watermark bounds a read of it, as for [`Self::oldest_readable_seqno`].
+    fn check_snapshot_retained(
+        &self,
+        part: Partition,
+        snapshot: lsm_tree::SeqNo,
+    ) -> StorageResult<()> {
+        let mut watermark = self.coordinator.gc_watermark_value();
+        if !part.is_system() {
+            watermark = watermark.max(self.first_readable_in(part));
+        }
         if snapshot < watermark {
             return Err(StorageError::SnapshotOutsideRetention {
                 snapshot,
@@ -7431,7 +7455,7 @@ impl StorageEngine {
         prefix: &[u8],
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<StorageIter> {
-        self.check_snapshot_retained(seqno)?;
+        self.check_snapshot_retained(part, seqno)?;
         self.scan_prefix_at(part, prefix, seqno)
     }
 
@@ -7490,7 +7514,7 @@ impl StorageEngine {
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<SeekableStorageIter> {
         use std::ops::Bound;
-        self.check_snapshot_retained(seqno)?;
+        self.check_snapshot_retained(part, seqno)?;
         let tree = self.tree(part)?;
         let bindings = (part == Partition::Idx).then(|| self.installations.current());
         if let Some(bindings) = &bindings {
@@ -8110,7 +8134,7 @@ impl StorageEngine {
         key: &[u8],
         inspect: impl FnOnce(Option<&[u8]>) -> R,
     ) -> StorageResult<R> {
-        self.check_snapshot_retained(*snapshot)?;
+        self.check_snapshot_retained(part, *snapshot)?;
         self.check_history_of(part, key, *snapshot)?;
         let mut buf = Vec::new();
         let Some(stored) = self.stored_key(part, key, &mut buf) else {
@@ -8144,7 +8168,7 @@ impl StorageEngine {
         part: Partition,
         key: &[u8],
     ) -> StorageResult<Option<bytes::Bytes>> {
-        self.check_snapshot_retained(*snapshot)?;
+        self.check_snapshot_retained(part, *snapshot)?;
         self.snapshot_get_unchecked(snapshot, part, key)
     }
 
@@ -8205,7 +8229,7 @@ impl StorageEngine {
         _budget: Option<&coordinode_core::budget::QueryBudget>,
         mut each: impl FnMut(usize, Option<StoredValue<'_>>) -> Result<(), E>,
     ) -> Result<(), E> {
-        self.check_snapshot_retained(*snapshot)?;
+        self.check_snapshot_retained(part, *snapshot)?;
         for key in keys {
             self.check_history_of(part, key, *snapshot)?;
         }
@@ -8242,7 +8266,7 @@ impl StorageEngine {
         part: Partition,
         prefix: &[u8],
     ) -> StorageResult<StorageIter> {
-        self.check_snapshot_retained(*snapshot)?;
+        self.check_snapshot_retained(part, *snapshot)?;
         self.scan_prefix_at(part, prefix, *snapshot)
     }
 
