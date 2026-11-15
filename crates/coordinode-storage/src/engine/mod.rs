@@ -11,6 +11,7 @@ pub mod config;
 pub mod coordinator;
 pub mod core;
 pub(crate) mod coverage;
+pub mod fixed_cut;
 pub(crate) mod flush;
 pub mod footprint;
 pub mod index_copies;

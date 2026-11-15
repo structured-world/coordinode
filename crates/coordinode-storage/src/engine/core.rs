@@ -351,6 +351,9 @@ pub struct StorageEngine {
     /// Test hook: reclamation fails after its flushes, before any removal.
     #[cfg(test)]
     pub(crate) fail_journal_purge: std::sync::atomic::AtomicBool,
+    /// Test hook: run in [`Self::fixed_cut`] once `L` is read and `B` pinned.
+    #[cfg(test)]
+    pub(crate) on_cut_bound: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// The lowest journal index a rebuild from the latest local checkpoint
     /// replays from; reclamation keeps it. `u64::MAX` when no checkpoint
     /// needs any.
@@ -1783,6 +1786,8 @@ impl StorageEngine {
             table_landed,
             #[cfg(test)]
             fail_journal_purge: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            on_cut_bound: parking_lot::Mutex::new(None),
             journal_keep_from: AtomicU64::new(u64::MAX),
             consumer_journal_floor: AtomicU64::new(if protections_pending { 0 } else { u64::MAX }),
             protections_pending: std::sync::atomic::AtomicBool::new(protections_pending),
@@ -4219,6 +4224,182 @@ impl StorageEngine {
             .lock()
             .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
         Ok(Some(journal.next_index()))
+    }
+
+    /// Take a fixed cut of this store's history: a view pinned below a fresh
+    /// bound `B`, the first journal position `L` its continuation replays,
+    /// and the join end `H` (see [`crate::engine::fixed_cut`]). Cold work:
+    /// nothing is added to writes, and the journal is not searched.
+    ///
+    /// `L` is read first; `B` is then drawn from the commit clock, above
+    /// every commit journalled before `L`. The view is qualified once every
+    /// commit below `B` has finished and is durable. `H` is read after that,
+    /// and every entry before it is then waited for and made durable: a late
+    /// entry below `B` falls inside the join, not after it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a store without a journal of its
+    /// own; [`StorageError::CutNotReady`] when a commit is still in flight or
+    /// not durable after `timeout`; a journal sync failure.
+    pub fn fixed_cut(
+        &self,
+        timeout: std::time::Duration,
+    ) -> StorageResult<crate::engine::fixed_cut::FixedCut> {
+        let Some(oplog) = &self.oplog else {
+            return Err(StorageError::InvalidConfig(
+                "a fixed cut follows the store's own journal, which this store does not keep"
+                    .into(),
+            ));
+        };
+        let journal = || {
+            oplog
+                .lock()
+                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))
+        };
+        let not_ready = |reason: String| StorageError::CutNotReady { reason };
+        let first = journal()?.next_index();
+        // Drawn after `first` from the clock every commit takes its timestamp
+        // from, and pinned in the same step: above every journalled commit
+        // before `first`.
+        let (bound, pin) = self.pin_new_snapshot(|| self.next_seqno());
+        let pin = pin.ok_or_else(|| not_ready("the view could not be pinned".into()))?;
+        #[cfg(test)]
+        if let Some(hook) = self.on_cut_bound.lock().as_mut() {
+            hook();
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        // A deadline already passed leaves no time: none, not an error.
+        let left = || deadline.saturating_duration_since(std::time::Instant::now());
+        // A drawn timestamp is above the clock's zero.
+        let below = |ts: u64| {
+            ts.checked_sub(1)
+                .ok_or_else(|| StorageError::Io("the commit clock drew 0".into()))
+        };
+        // Kept at `bound`, never lowered: the commits below it finish.
+        self.pending_commits
+            .await_complete_at(below(bound)?, left())
+            .map_err(|ts| not_ready(format!("a commit at {ts} below the cut is in flight")))?;
+        crate::engine::oplog_journal::sync_journal(oplog)?;
+        if self.pending_commits.durable_floor(bound) < bound {
+            return Err(not_ready("a commit below the cut is not durable".into()));
+        }
+        let join_end = journal()?.next_index();
+        // Every entry before `join_end` drew its timestamp before this one.
+        let after = self.next_seqno();
+        self.pending_commits
+            .await_complete_at(below(after)?, left())
+            .map_err(|ts| not_ready(format!("a commit at {ts} of the join is in flight")))?;
+        crate::engine::oplog_journal::sync_journal(oplog)?;
+        Ok(crate::engine::fixed_cut::FixedCut {
+            first,
+            bound,
+            join_end,
+            history: self.journal_history()?,
+            _pin: pin,
+        })
+    }
+
+    /// The units of journal entries `[from, from + entries)`, each with its
+    /// own commit timestamp and whether `cut`'s view already holds it. The
+    /// entries read are held for the read only.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::RetentionLost`] when `from` is no longer held;
+    /// [`StorageError::InvalidConfig`] for a cut of another history or a
+    /// store without a journal; a frame or decision that cannot be read.
+    pub fn fixed_cut_units(
+        &self,
+        cut: &crate::engine::fixed_cut::FixedCut,
+        from: u64,
+        entries: u64,
+    ) -> StorageResult<Vec<crate::engine::fixed_cut::CutUnit>> {
+        use coordinode_core::txn::operation::LogPosition;
+        if cut.history != self.journal_history()? {
+            return Err(StorageError::InvalidConfig(
+                "the cut was taken of another history".into(),
+            ));
+        }
+        let Some(oplog) = &self.oplog else {
+            return Err(StorageError::InvalidConfig(
+                "the store keeps no journal".into(),
+            ));
+        };
+        let (_hold, read) = {
+            let mut journal = oplog
+                .lock()
+                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+            let first_retained = journal.first_index();
+            if from < first_retained {
+                return Err(StorageError::RetentionLost {
+                    requested: from,
+                    first_retained,
+                });
+            }
+            let hold = crate::engine::oplog_journal::JournalHold::take(&self.journal_holds, from);
+            let read = journal.read_range(from, from.saturating_add(entries))?;
+            (hold, read)
+        };
+        let mut units = Vec::new();
+        for entry in read {
+            let mut sub = 0u32;
+            for op in &entry.ops {
+                let crate::oplog::OplogOp::Unit { frame } = op else {
+                    continue;
+                };
+                let position = LogPosition {
+                    index: entry.index,
+                    sub,
+                };
+                sub = sub.checked_add(1).ok_or_else(|| {
+                    StorageError::Serialization(format!(
+                        "entry {} carries over 2^32 units",
+                        entry.index
+                    ))
+                })?;
+                let unit = coordinode_core::txn::frame::decode_proposal(
+                    frame,
+                    &coordinode_core::txn::frame::DecodeLimits::DEFAULT,
+                )?;
+                let commit_ts = unit.commit_ts.as_raw();
+                let bound = unit
+                    .mutations
+                    .iter()
+                    .any(|m| matches!(m, coordinode_core::txn::proposal::Mutation::Operation(_)));
+                let refused = bound && crate::engine::operations::unit_skipped(self, position)?;
+                let mutations = if refused {
+                    Vec::new()
+                } else {
+                    unit.mutations
+                        .into_iter()
+                        .filter(|m| {
+                            !matches!(
+                                m,
+                                coordinode_core::txn::proposal::Mutation::Command(_)
+                                    | coordinode_core::txn::proposal::Mutation::Operation(_)
+                            )
+                        })
+                        .collect()
+                };
+                units.push(crate::engine::fixed_cut::CutUnit {
+                    position,
+                    commit_ts,
+                    mutations,
+                    refused,
+                    in_view: cut.in_view(position, commit_ts),
+                });
+            }
+        }
+        Ok(units)
+    }
+
+    /// The identity of the history this store's journal records.
+    fn journal_history(&self) -> StorageResult<u64> {
+        let tag = deployment_tag(crate::engine::metadata::bound_deployment(self)?);
+        let mut history = [0u8; 8];
+        history.copy_from_slice(&tag[1..9]);
+        Ok(u64::from_be_bytes(history))
     }
 
     /// Keep the journal from `index` on for a rebuild from the latest local

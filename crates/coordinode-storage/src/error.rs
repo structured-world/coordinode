@@ -194,6 +194,15 @@ pub enum StorageError {
         image: u64,
     },
 
+    /// A fixed-cut handoff could not qualify its view or join in time: a
+    /// commit below the cut is still in flight, or not yet durable. Nothing
+    /// is handed off; the caller may try again.
+    #[error("the cut is not ready: {reason}")]
+    CutNotReady {
+        /// What the cut is waiting for.
+        reason: String,
+    },
+
     /// No cut of the store can be shown complete for a whole-store capture;
     /// nothing is captured.
     #[error("the store cannot be captured: {reason}")]
