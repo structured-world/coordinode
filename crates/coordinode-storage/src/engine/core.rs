@@ -4413,6 +4413,20 @@ impl StorageEngine {
         })
     }
 
+    /// Refuse a cut whose view this store does not hold: one taken of a
+    /// store closed since. Its bound may still be readable here, but nothing
+    /// kept it, so serving it would hide that the view was lost.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::CutLost`].
+    pub fn held_cut(&self, cut: &crate::engine::fixed_cut::FixedCut) -> StorageResult<()> {
+        if self.coordinator.holds(&cut._pin) {
+            return Ok(());
+        }
+        Err(StorageError::CutLost { bound: cut.bound })
+    }
+
     /// The units `entries` carry, entries of this store's own journal or of
     /// the consensus log it applies, read in log order: each unit with its
     /// own commit timestamp and whether `cut`'s view already holds it. A
@@ -4420,6 +4434,7 @@ impl StorageEngine {
     ///
     /// # Errors
     ///
+    /// [`StorageError::CutLost`] for a cut this store does not hold;
     /// [`StorageError::InvalidConfig`] for a cut of another history; a frame
     /// or decision that cannot be read.
     pub fn cut_units_of(
@@ -4428,6 +4443,7 @@ impl StorageEngine {
         entries: &[crate::oplog::OplogEntry],
     ) -> StorageResult<Vec<crate::engine::fixed_cut::CutUnit>> {
         use coordinode_core::txn::operation::LogPosition;
+        self.held_cut(cut)?;
         if cut.history != self.journal_history()? {
             return Err(StorageError::InvalidConfig(
                 "the cut was taken of another history".into(),

@@ -203,6 +203,14 @@ pub enum StorageError {
         reason: String,
     },
 
+    /// The cut's view is not held by this store: the store it was taken of
+    /// was closed since. The view is gone; a new cut is taken.
+    #[error("the view of the cut below {bound} is no longer held; take a new cut")]
+    CutLost {
+        /// The cut's exclusive bound.
+        bound: u64,
+    },
+
     /// No cut of the store can be shown complete for a whole-store capture;
     /// nothing is captured.
     #[error("the store cannot be captured: {reason}")]

@@ -105,7 +105,8 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// The view is no longer readable, or a read fails.
+    /// `CutLost` for a cut of a database closed since: its view is gone and
+    /// a new cut is taken. A read that fails.
     pub fn state_cut_scan(
         &self,
         cut: &StateCut,
@@ -114,6 +115,7 @@ impl Database {
         after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<CutRow>, DatabaseError> {
+        self.engine.held_cut(&cut.cut)?;
         let mut page = Vec::new();
         for guard in self
             .engine
@@ -140,12 +142,16 @@ impl Database {
     ///
     /// [`DatabaseError::Storage`] carrying `RetentionLost` when the journal
     /// no longer holds the next position: the copy has to start again from a
-    /// new cut. A unit that cannot be read, or a cut of another history.
+    /// new cut; `CutLost` for a cut of a database closed since. A unit that
+    /// cannot be read, or a cut of another history.
     pub fn state_cut_tail(
         &self,
         cut: &mut StateCut,
         entries: u64,
     ) -> Result<CutBatch, DatabaseError> {
+        // Before reading: a lost view would otherwise surface as a lost
+        // position or not at all.
+        self.engine.held_cut(&cut.cut)?;
         let read = if self.engine.has_journal() {
             self.engine.fixed_cut_units(&cut.cut, cut.next, entries)?
         } else {

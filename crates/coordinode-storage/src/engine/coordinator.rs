@@ -897,6 +897,12 @@ impl LocalMultiModalCoordinator {
         self.gc_controller.pin_at(seqno)
     }
 
+    /// Whether `pin` holds this store's history back: a pin of a store
+    /// closed since holds nothing here, whatever its seqno.
+    pub(crate) fn holds(&self, pin: &SnapshotPin) -> bool {
+        Arc::ptr_eq(&pin.controller, &self.gc_controller)
+    }
+
     /// Hold the GC watermark where it stands until the guard drops. See
     /// [`GcWatermarkController::hold_watermark`].
     pub(crate) fn hold_watermark(&self) -> WatermarkHold {

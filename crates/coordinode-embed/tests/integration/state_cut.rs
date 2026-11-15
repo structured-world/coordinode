@@ -262,6 +262,16 @@ fn a_view_is_lost_with_its_database_and_a_new_cut_is_taken() {
     assert!(new.bound() > old.bound(), "a view of its own");
     let rows = copy_view(&db, &new, NODES);
     assert_eq!(rows, source_rows(&db, NODES));
+    let mut old = old;
+    assert!(
+        db.state_cut_scan(&old, Partition::Node, NODES, None, 2)
+            .is_err(),
+        "the lost view is not served from the reopened database"
+    );
+    assert!(
+        db.state_cut_tail(&mut old, 4).is_err(),
+        "nor is its continuation"
+    );
 }
 
 /// A cut belongs to its history: read against another database, its
