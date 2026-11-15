@@ -2322,6 +2322,48 @@ fn room_freed_while_a_failed_flush_registers_still_wakes_it() {
     );
 }
 
+/// A checkpoint refused for room leaves no partial checkpoint behind: its
+/// links would keep tables a compaction replaced, and its journal copy would
+/// keep its bytes, charged to a store that is already short of room.
+#[test]
+fn a_checkpoint_refused_for_room_leaves_nothing_behind() {
+    const LIMIT: u64 = 64 << 20;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    for index in 1..=8 {
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+    }
+    engine.persist().expect("persist");
+    engine
+        .put(Partition::Node, b"node:1:unflushed", &vec![7u8; 64 << 10])
+        .expect("put");
+    let footprints = engine.footprints().clone();
+    let footprint = Arc::clone(footprints.get("default").expect("a limit"));
+    let scratch = dir.path().join("scratch");
+    let output = fill_with_scratch(&footprints, &footprint, &scratch);
+    let charged = footprint.charged();
+
+    let target = dir.path().join("checkpoints").join("ckpt");
+    let refused = engine.create_checkpoint(&target);
+    assert!(
+        refused.is_err(),
+        "the checkpoint found no room: {refused:?}"
+    );
+    assert!(!target.exists(), "the refused checkpoint left {target:?}");
+    assert!(
+        footprint.charged() <= charged,
+        "the refused checkpoint holds {} bytes",
+        footprint.charged() - charged
+    );
+
+    // With the room back, the same checkpoint is taken.
+    footprints.removed(&scratch);
+    drop(output);
+    engine
+        .create_checkpoint(&target)
+        .expect("checkpoint with room");
+}
+
 /// Take everything the endpoint may still hold with a file at `scratch`.
 fn fill_with_scratch(
     footprints: &crate::engine::footprint::Footprints,

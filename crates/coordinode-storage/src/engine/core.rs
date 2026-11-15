@@ -2985,6 +2985,21 @@ impl StorageEngine {
     /// - the oplog directory cannot be copied
     pub fn create_checkpoint(&self, target: &Path) -> StorageResult<CheckpointSummary> {
         claim_checkpoint_dir(target)?;
+        let taken = self.take_checkpoint(target);
+        if taken.is_err() {
+            // Unsealed, the directory is no checkpoint: its links would keep
+            // tables a compaction replaced and its journal copy its bytes.
+            // The checkpoint's error stays the outcome.
+            if let Err(e) = std::fs::remove_dir_all(target) {
+                tracing::warn!(?target, error = %e, "removing a failed checkpoint");
+            }
+            self.footprints.removed_tree(target);
+        }
+        taken
+    }
+
+    /// The steps of [`Self::create_checkpoint`] after `target` is claimed.
+    fn take_checkpoint(&self, target: &Path) -> StorageResult<CheckpointSummary> {
         let mut summary = CheckpointSummary::default();
         // No reclamation removes journal segments while the checkpoint is
         // taken: the floor its rebuild replays from is kept once it exists.
