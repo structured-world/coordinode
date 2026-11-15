@@ -286,6 +286,8 @@ impl FlushManager {
     /// of the write-pressure verdict the monitor latches on every pass.
     /// `tables` lists the trees created and dropped at run time, which the
     /// monitor flushes under the same triggers as the partition trees.
+    /// `landed` is notified each time a flush writes a table: the journal it
+    /// covers may then go ([`crate::engine::journal_reclaim`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         trees: &HashMap<Partition, lsm_tree::AnyTree>,
@@ -300,6 +302,7 @@ impl FlushManager {
         pressure: MemtablePressure,
         tables: Option<TableSource>,
         footprints: crate::engine::footprint::Footprints,
+        landed: Arc<Wake>,
     ) -> StorageResult<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         footprints.set_flush_wake(Arc::clone(&wake));
@@ -316,10 +319,20 @@ impl FlushManager {
             let compaction = Arc::clone(&compaction_wake);
             let journal = journal.clone();
             let footprints = footprints.clone();
+            let landed = Arc::clone(&landed);
             let handle = std::thread::Builder::new()
                 .name(format!("coord-flush-worker-{i}"))
                 .spawn(move || {
-                    flush_worker_loop(rx, &flushed, &compaction, journal.as_deref(), &footprints);
+                    flush_worker_loop(
+                        rx,
+                        Wakes {
+                            flushed: &flushed,
+                            compaction: &compaction,
+                            landed: &landed,
+                        },
+                        journal.as_deref(),
+                        &footprints,
+                    );
                 })
                 .map_err(|e| StorageError::InvalidConfig(format!("flush worker spawn: {e}")))?;
             workers.push(handle);
@@ -572,14 +585,27 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
     }
 }
 
+/// Who a flush worker tells what happened.
+struct Wakes<'a> {
+    /// The monitor: the sealed backlog moved.
+    flushed: &'a Wake,
+    /// The compaction monitor: a new table may need compacting.
+    compaction: &'a Wake,
+    /// The journal reclaimer: a table landed.
+    landed: &'a Wake,
+}
+
 /// Worker loop: receives flush requests and flushes sealed memtables to SST.
 ///
 /// Blocks on the channel with no timeout: the manager's drop closes the
 /// channel, which is what ends the loop.
 fn flush_worker_loop(
     receiver: flume::Receiver<FlushRequest>,
-    flushed: &Wake,
-    compaction: &Wake,
+    Wakes {
+        flushed,
+        compaction,
+        landed,
+    }: Wakes<'_>,
     journal: Option<&Mutex<EmbeddedOplog>>,
     footprints: &crate::engine::footprint::Footprints,
 ) {
@@ -620,8 +646,10 @@ fn flush_worker_loop(
                     flushed_bytes = bytes,
                     "memtable flushed to SST"
                 );
-                // A new table may need compacting.
+                // A new table may need compacting, and the journal it covers
+                // may go.
                 compaction.notify();
+                landed.notify();
             }
             Ok(None) => {
                 // Nothing to flush: another worker or the monitor already did it.

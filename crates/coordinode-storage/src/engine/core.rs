@@ -345,6 +345,9 @@ pub struct StorageEngine {
     /// One reclamation of the footprint at a time: refusals arriving while
     /// one runs wait for its outcome rather than start another.
     footprint_reclaim: parking_lot::Mutex<()>,
+    /// Notified by the flush workers each time a table lands: the journal it
+    /// covers may go ([`Self::start_journal_reclaim`]).
+    table_landed: Arc<coordinode_core::txn::wake::Wake>,
     /// The lowest journal index a rebuild from the latest local checkpoint
     /// replays from; reclamation keeps it. `u64::MAX` when no checkpoint
     /// needs any.
@@ -1485,6 +1488,7 @@ impl StorageEngine {
         #[cfg(not(feature = "columnar"))]
         let _ = &capacity_pool;
         let flushed_tables = table_source();
+        let table_landed = Arc::new(coordinode_core::txn::wake::Wake::default());
 
         let flush_manager = FlushManager::start(
             &trees,
@@ -1503,6 +1507,7 @@ impl StorageEngine {
             },
             flushed_tables,
             footprints.clone(),
+            Arc::clone(&table_landed),
         )?;
 
         // Feed the backpressure thresholds to every partition tree so the
@@ -1772,6 +1777,7 @@ impl StorageEngine {
             ),
             footprints,
             footprint_reclaim: parking_lot::Mutex::new(()),
+            table_landed,
             journal_keep_from: AtomicU64::new(u64::MAX),
             consumer_journal_floor: AtomicU64::new(if protections_pending { 0 } else { u64::MAX }),
             protections_pending: std::sync::atomic::AtomicBool::new(protections_pending),
@@ -4223,16 +4229,79 @@ impl StorageEngine {
     /// not an obligation the limit may be broken for.
     ///
     /// One runs at a time; a call arriving while one runs waits for it and
-    /// returns, its outcome being the room there is.
-    pub fn reclaim_footprint(&self) {
+    /// returns, its outcome being the room there is. Returns whether this
+    /// call's reclamation failed: a flush or a removal refused.
+    pub fn reclaim_footprint(&self) -> bool {
         let Some(_one) = self.footprint_reclaim.try_lock() else {
             drop(self.footprint_reclaim.lock());
-            return;
+            return false;
         };
         metrics::counter!("coordinode_footprint_reclamations_total").increment(1);
-        if let Err(e) = self.reclaim_journal() {
-            tracing::warn!(error = %e, "footprint reclamation failed");
+        match self.reclaim_journal() {
+            Ok(()) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "footprint reclamation failed");
+                true
+            }
         }
+    }
+
+    /// Start reclaiming, in the background, the journal segments the trees
+    /// cover as flushes land, rather than first when a write is refused for
+    /// room. Only a store with its own journal and a hard limit has any; a
+    /// consensus log keeps its own bounds. Runs until the returned handle
+    /// drops.
+    ///
+    /// # Errors
+    ///
+    /// The thread cannot be spawned.
+    pub fn start_journal_reclaim(
+        self: &Arc<Self>,
+    ) -> StorageResult<Option<crate::engine::journal_reclaim::JournalReclaimer>> {
+        if self.oplog.is_none() || self.footprints.is_empty() {
+            return Ok(None);
+        }
+        crate::engine::journal_reclaim::JournalReclaimer::start(
+            Arc::downgrade(self),
+            Arc::clone(&self.table_landed),
+        )
+        .map(Some)
+    }
+
+    /// One background reclamation, run only when it may remove something it
+    /// could not before: a segment sealed since `last`, or, after a round
+    /// that failed, room come back. A round left with nothing new to do does
+    /// not run again by itself.
+    pub(crate) fn journal_reclaim_round(
+        &self,
+        last: &mut Option<crate::engine::journal_reclaim::Round>,
+    ) {
+        use crate::engine::journal_reclaim::Round;
+        let Some(oplog) = &self.oplog else {
+            return;
+        };
+        let journal = || {
+            oplog
+                .lock()
+                .ok()
+                .map(|log| (log.first_index(), log.sealed_segments()))
+        };
+        let Some(segments) = journal() else {
+            return;
+        };
+        let charged: u64 = self.footprints.iter().map(|f| f.charged()).sum();
+        if segments.1 == 0 || last.is_some_and(|round| !round.due(segments, charged)) {
+            return;
+        }
+        let failed = self.reclaim_footprint();
+        let Some(segments) = journal() else {
+            return;
+        };
+        *last = Some(Round {
+            segments,
+            charged: self.footprints.iter().map(|f| f.charged()).sum(),
+            failed,
+        });
     }
 
     fn reclaim_journal(&self) -> StorageResult<()> {

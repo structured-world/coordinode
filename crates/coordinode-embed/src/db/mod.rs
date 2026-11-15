@@ -400,6 +400,9 @@ pub struct Database {
     /// schemas for TTL properties and deletes expired nodes/fields/subtrees.
     /// Dropped on Database::drop (graceful shutdown).
     _ttl_reaper_handle: Option<coordinode_query::index::ttl_reaper::TtlReaperHandle>,
+    /// Removes, as flushes land, the journal segments the trees cover on a
+    /// store with a hard limit. Stopped first on drop.
+    journal_reclaim: Option<coordinode_storage::engine::journal_reclaim::JournalReclaimer>,
     /// `true` in cluster mode (writes applied by the Raft state machine), where
     /// the AFTER COMMIT trigger queue is drained by a leader-gated background
     /// worker. `false` in embedded single-node mode, where the queue is drained
@@ -744,6 +747,8 @@ fn statement_budget(
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // Joined before anything closes: a round in flight holds the engine.
+        drop(self.journal_reclaim.take());
         // Index builds are the one background task a Database can leave
         // behind: each holds an `Arc` on the engine and would go on inserting
         // into an index nobody can reach any more, against storage that is
@@ -1174,6 +1179,8 @@ impl Database {
         // Registrations recorded in an earlier run hold their history again
         // from here, before anything this open starts purges the journal.
         let consumers = consumers::Consumers::open(&engine, &pipeline)?;
+        // After the registrations above hold their history again.
+        let journal_reclaim = engine.start_journal_reclaim()?;
 
         let db = Self {
             engine,
@@ -1210,6 +1217,7 @@ impl Database {
             adaptive_config: AdaptiveConfig::default(),
             feedback_cache: FeedbackCache::default(),
             _ttl_reaper_handle: ttl_reaper_handle,
+            journal_reclaim,
             cluster_mode: follow_raft_applies,
             trigger_dispatch_config: after_commit::TriggerDispatchConfig::default(),
             // 1024 entries is plenty for the workloads we benchmark

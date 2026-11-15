@@ -657,3 +657,88 @@ fn a_limit_changed_at_runtime_takes_effect_without_a_restart() {
         .is_err()
     );
 }
+
+/// The first index of each journal segment under `root`, oldest first.
+fn journal_segments(root: &Path) -> Vec<u64> {
+    let mut starts: Vec<u64> = std::fs::read_dir(root.join("oplog").join("0"))
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.strip_prefix("oplog-")?
+                .strip_suffix(".bin")?
+                .parse()
+                .ok()
+        })
+        .collect();
+    starts.sort_unstable();
+    starts
+}
+
+/// Rows written well below the cap, none refused: the journal segments
+/// their tables cover go in the background as flushes land, without a
+/// write refused for room to start it. The segment still being written
+/// stays, and every acknowledged row is there after a reopen.
+#[test]
+fn covered_journal_goes_as_flushes_land_without_a_refused_write() {
+    const ROWS: u64 = 40;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open_with_config(capped(dir.path())).unwrap();
+    for key in 0..ROWS {
+        db.execute_cypher(&create(key))
+            .unwrap_or_else(|e| panic!("row {key} under the cap: {e:?}"));
+    }
+    // The rows fill more than one segment: the first, sealed and covered,
+    // goes; the writes alone never met the cap.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while journal_segments(dir.path()).first() == Some(&0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the covered first segment stayed: {:?}",
+            journal_segments(dir.path())
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !journal_segments(dir.path()).is_empty(),
+        "the segment being written stays"
+    );
+    assert_within(dir.path(), "after the background reclamation");
+
+    drop(db);
+    let mut db = Database::open_with_config(capped(dir.path())).unwrap();
+    let rows = db
+        .execute_cypher("MATCH (n:Footprint) RETURN count(n) AS n")
+        .unwrap();
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&coordinode_core::graph::types::Value::Int(ROWS as i64)),
+        "every acknowledged row after the reopen"
+    );
+}
+
+/// A segment the latest checkpoint's rebuild replays from is kept by the
+/// reclamation however much of it the tables cover.
+#[test]
+fn reclamation_keeps_the_journal_a_checkpoint_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open_with_config(capped(dir.path())).unwrap();
+    db.execute_cypher(&create(0)).unwrap();
+    let checkpoint = db.checkpoint(1).expect("checkpoint");
+    let floor = db
+        .engine()
+        .checkpoint_replay_floor(&checkpoint)
+        .expect("the checkpoint's replay floor");
+    // Fewer rows than the cap holds with the journal and the checkpoint
+    // both kept, and enough to seal segments past the floor.
+    for key in 1..20 {
+        db.execute_cypher(&create(key)).unwrap();
+    }
+    assert!(journal_segments(dir.path()).len() > 1, "segments sealed");
+    db.engine().reclaim_footprint();
+    let first = *journal_segments(dir.path()).first().expect("segments");
+    assert!(
+        first <= floor,
+        "the journal from the checkpoint's floor {floor} stays, first kept {first}"
+    );
+}

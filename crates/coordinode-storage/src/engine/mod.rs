@@ -15,6 +15,7 @@ pub(crate) mod flush;
 pub mod footprint;
 pub mod index_copies;
 pub mod installation;
+pub mod journal_reclaim;
 pub(crate) mod local_journal;
 pub mod local_pipeline;
 pub mod merge;

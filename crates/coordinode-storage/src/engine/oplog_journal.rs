@@ -409,6 +409,11 @@ impl EmbeddedOplog {
             .unwrap_or(self.next_index)
     }
 
+    /// How many segments are sealed: complete, and removable once covered.
+    pub(crate) fn sealed_segments(&self) -> usize {
+        self.manager.sealed_segment_count()
+    }
+
     /// Where the journal's segments start, kept current as they change.
     pub(crate) fn retained_floor(&self) -> RetainedFloor {
         self.manager.retained_floor()

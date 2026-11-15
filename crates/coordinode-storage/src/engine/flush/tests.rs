@@ -54,6 +54,7 @@ fn start(
         },
         None,
         crate::engine::footprint::Footprints::default(),
+        Arc::new(Wake::default()),
     )
     .expect("start FlushManager");
     (mgr, wake)
@@ -108,6 +109,7 @@ fn unflushed_memtable_bytes_past_the_stop_level_stop_writes_until_flushed() {
         },
         None,
         crate::engine::footprint::Footprints::default(),
+        Arc::new(Wake::default()),
     )
     .expect("start FlushManager");
 
