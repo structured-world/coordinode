@@ -981,13 +981,14 @@ impl Database {
         // the store's own work: bounded, and allowed past a limit the
         // database no longer fits, so it opens to be read.
         let _opening = engine.footprints().open_phase();
-        // Auto-repair on open. For an embedded engine with a retained
-        // oplog journal, if a checkpoint exists, scrub and rebuild any corrupt
-        // partition from that checkpoint + oplog replay BEFORE any state is read
-        // below. Cluster engines (no journal) and journal-less in-memory engines
-        // skip this; deployments that never checkpoint pay no scrub cost. A
-        // repair failure is logged, not fatal — the caller can re-run
-        // `verify_and_repair()` to inspect.
+        // Repair on open, for an engine with its own journal: what the store
+        // already knows it owes (a rebuild a crash cut short, a salvage that
+        // lost data) is rebuilt from the latest checkpoint and the journal
+        // BEFORE any state is read below, or reported when it cannot be. The
+        // open reads nothing to look for more: a checkpoint on disk does not
+        // make it scrub the store, which is the background scrub's or an
+        // operator's `verify_and_repair()`. Cluster engines (no journal)
+        // skip this. A repair failure is logged, not fatal.
         if engine.has_journal() {
             let root = crate::repair::checkpoint_root(engine.data_dir());
             // The journal keeps what a rebuild from the newest checkpoint
@@ -1000,13 +1001,10 @@ impl Database {
                 });
                 engine.set_journal_keep_from(floor);
             }
-            // An interrupted rebuild is repaired, or reported, even when its
-            // checkpoint has gone since.
-            if latest.is_some()
-                || !engine.pending_rebuilds()?.is_empty()
-                || !engine.pending_table_rebuilds()?.is_empty()
+            // An interrupted rebuild or a lossy salvage is repaired, or
+            // reported, whether or not a checkpoint is there to rebuild from.
             {
-                match crate::repair::verify_and_repair(&engine, &root) {
+                match crate::repair::repair_owed_on_open(&engine, &root) {
                     Ok(report) => {
                         if !report.repaired.is_empty() || !report.repaired_tables.is_empty() {
                             tracing::warn!(

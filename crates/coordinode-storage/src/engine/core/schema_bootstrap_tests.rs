@@ -544,17 +544,17 @@ fn a_salvage_with_an_unknown_loss_refuses_the_open() {
     }
 }
 
-/// A Schema tree with a corrupt block, found by the open's verification
-/// where a checkpoint backs the trees, is rebuilt before anything reads it.
-/// A clean one is verified once: the repair pass after the open reuses it.
+/// A Schema tree whose tables the open finds damaged is rebuilt from the
+/// checkpoint and the journal before anything reads it. A clean one is not
+/// read in full at the open, checkpoint or not: a full pass is the scrub's.
 #[test]
-fn a_corrupt_schema_tree_is_rebuilt_and_a_clean_one_verified_once() {
+fn a_corrupt_schema_tree_is_rebuilt_and_a_clean_one_is_not_read_in_full() {
     let store = Checkpointed::new(false);
     {
         let engine = open_journaled(&store.config).expect("open");
         assert!(
-            engine.verified_at_open(Partition::Schema),
-            "a clean tree verified at the open"
+            !engine.verified_at_open(Partition::Schema),
+            "a clean tree was verified in full at the open"
         );
         let after_checkpoint = &schema_table_ids(&engine)
             - &std::fs::read_dir(

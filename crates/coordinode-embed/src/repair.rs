@@ -101,14 +101,34 @@ pub struct RepairReport {
     pub scoped: Vec<Partition>,
     /// The checkpoint used as the rebuild base, if repair ran.
     pub checkpoint_used: Option<PathBuf>,
-    /// `true` if a re-scrub after repair found no remaining corruption.
-    /// Trivially `true` when no corruption was found in the first place.
+    /// `true` if nothing is left to rebuild within [`checked`](Self::checked):
+    /// the check after the repair found no corruption there and no rebuild
+    /// was refused. Trivially `true` when nothing was owed in the first
+    /// place.
     pub clean_after: bool,
+    /// What the pass read in full to find corruption and to check its
+    /// repairs: the whole store, or only what it rebuilt.
+    pub checked: CheckedScope,
+}
+
+/// What a repair pass read in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckedScope {
+    /// Every partition, before the repair to find corruption and after it to
+    /// check it: [`verify_and_repair`].
+    #[default]
+    Store,
+    /// Only the partitions the pass rebuilt, after it rebuilt them: the
+    /// repair an open runs for what it knows it owes
+    /// ([`repair_owed_on_open`]). A clean report then says nothing about
+    /// the partitions it did not rebuild.
+    Repaired,
 }
 
 impl RepairReport {
-    /// `true` if the engine is corruption-free (either it was clean, or repair
-    /// rebuilt every corrupt partition and the re-scrub passed).
+    /// `true` if nothing is left to rebuild within
+    /// [`checked`](Self::checked): either nothing was owed, or every rebuild
+    /// ran and the check after it passed.
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.clean_after
@@ -116,10 +136,11 @@ impl RepairReport {
 }
 
 /// Scrub every partition; rebuild each corrupt one from the latest checkpoint
-/// plus oplog replay. A partition whose tree was structurally repaired at
-/// engine open with data loss counts as corrupt too, even though it now
-/// scrubs clean, and so does one whose previous rebuild a crash interrupted.
-/// A no-op (clean report) when no source flags anything.
+/// plus oplog replay, along with everything [`repair_owed_on_open`] rebuilds.
+/// A partition whose tree was structurally repaired at engine open with data
+/// loss counts as corrupt too, even though it now scrubs clean, and so does
+/// one whose previous rebuild a crash interrupted. A no-op (clean report)
+/// when no source flags anything.
 ///
 /// If corruption is found but no checkpoint exists, the report lists the
 /// corrupt partitions with `clean_after = false` and an empty `repaired` set —
@@ -132,7 +153,39 @@ pub fn verify_and_repair(
     // not changed since is not verified again.
     let verified = |part: Partition| engine.verified_at_open(part);
     let scrub = scrub_all_except(engine, &ScrubConfig::default(), verified)?;
-    let mut full: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
+    let found: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
+    repair(engine, checkpoint_root, found, CheckedScope::Store)
+}
+
+/// Rebuild what the store already knows it owes, without reading the store
+/// to find more: a rebuild a crash cut short (partition or table), and what
+/// the open's structural repair salvaged with loss (the dropped key ranges
+/// when it could scope them, the partition otherwise, and lossy tables).
+/// Each rebuild is checked by a scrub of the partition it rebuilt only. A
+/// store with nothing owed reads nothing. The open runs this; a full check
+/// is [`verify_and_repair`], which the background scrub or an operator asks
+/// for.
+///
+/// What is owed and cannot be rebuilt (no checkpoint, or one the journal
+/// cannot carry forward) is reported, with `clean_after = false`.
+pub fn repair_owed_on_open(
+    engine: &StorageEngine,
+    checkpoint_root: &Path,
+) -> StorageResult<RepairReport> {
+    repair(engine, checkpoint_root, Vec::new(), CheckedScope::Repaired)
+}
+
+/// The rebuild both passes share: the partitions `found` corrupt, with what
+/// the store knows it owes, from the latest checkpoint and the journal; then
+/// the check `checked` names.
+fn repair(
+    engine: &StorageEngine,
+    checkpoint_root: &Path,
+    found: Vec<Partition>,
+    checked: CheckedScope,
+) -> StorageResult<RepairReport> {
+    let verified = |part: Partition| engine.verified_at_open(part);
+    let mut full = found;
     // A rebuild cut short by a crash left its tree holding an unknown part of
     // its data; the tree scrubs clean, so only its intent says so.
     full.extend(engine.pending_rebuilds()?);
@@ -175,6 +228,7 @@ pub fn verify_and_repair(
     if corrupt.is_empty() && corrupt_tables.is_empty() {
         return Ok(RepairReport {
             clean_after: true,
+            checked,
             ..RepairReport::default()
         });
     }
@@ -189,6 +243,7 @@ pub fn verify_and_repair(
             corrupt_partitions: corrupt,
             corrupt_tables,
             clean_after: false,
+            checked,
             ..RepairReport::default()
         });
     };
@@ -254,19 +309,27 @@ pub fn verify_and_repair(
         }
     }
 
-    let after = scrub_all_except(engine, &ScrubConfig::default(), verified)?;
+    // The check after the repair: the whole store for a full pass; for the
+    // open's, the partitions it rebuilt and nothing else.
+    let unchecked = |part: Partition| match checked {
+        CheckedScope::Store => verified(part),
+        CheckedScope::Repaired => !repaired.contains(&part) || verified(part),
+    };
+    let after_clean = match checked {
+        CheckedScope::Repaired if repaired.is_empty() => true,
+        _ => !scrub_all_except(engine, &ScrubConfig::default(), unchecked)?.has_errors(),
+    };
     Ok(RepairReport {
         corrupt_partitions: corrupt,
         repaired,
         corrupt_tables,
         repaired_tables,
-        clean_after: !after.has_errors()
-            && refused_partitions.is_empty()
-            && refused_tables.is_empty(),
+        clean_after: after_clean && refused_partitions.is_empty() && refused_tables.is_empty(),
         refused_partitions,
         refused_tables,
         scoped,
         checkpoint_used: Some(checkpoint),
+        checked,
     })
 }
 

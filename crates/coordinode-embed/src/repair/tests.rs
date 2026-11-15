@@ -559,6 +559,86 @@ fn database_open_auto_repairs_corrupt_partition() {
     );
 }
 
+/// A healthy store with a checkpoint opens without reading itself in full:
+/// the Schema tree is not verified block by block, and the open's repair
+/// rebuilds and reads nothing when nothing is owed. Before, a checkpoint on
+/// disk made every open scrub the whole store.
+#[test]
+fn a_healthy_open_with_a_checkpoint_reads_nothing_in_full() {
+    use crate::Database;
+    let dir = TempDir::new().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        for i in 0..50u32 {
+            db.execute_cypher(&format!("CREATE (n:Healthy {{k: {i}}})"))
+                .expect("create");
+        }
+        db.checkpoint(3).expect("checkpoint");
+        db.persist().expect("persist");
+    }
+    let db = Database::open(dir.path()).expect("reopen");
+    assert!(
+        !db.engine().verified_at_open(Partition::Schema),
+        "the open verified the Schema tree in full"
+    );
+    let report = repair_owed_on_open(db.engine(), &checkpoint_root(dir.path())).expect("repair");
+    assert!(report.is_clean());
+    assert_eq!(report.checked, CheckedScope::Repaired);
+    assert!(report.corrupt_partitions.is_empty() && report.repaired.is_empty());
+}
+
+/// Damage in a block nothing has read is not owed: the open's repair leaves
+/// it, saying it checked only what it rebuilt, and a full check finds and
+/// rebuilds it from the checkpoint and the journal.
+#[test]
+fn only_a_full_check_finds_damage_nothing_has_read() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    {
+        let engine = open(&dir);
+        for i in 0..100u32 {
+            put(
+                &engine,
+                u64::from(i) + 1,
+                PartitionId::Node,
+                format!("node:0:{i:08}").as_bytes(),
+                b"base",
+            );
+        }
+        create_checkpoint(&engine, &root).expect("checkpoint");
+        for i in 100..150u32 {
+            put(
+                &engine,
+                u64::from(i) + 1,
+                PartitionId::Node,
+                format!("node:0:{i:08}").as_bytes(),
+                b"later",
+            );
+        }
+        engine
+            .persist()
+            .expect("flush the later rows to their own tables");
+    }
+    // Damaged once the store is open, so the open read none of it.
+    let engine = open(&dir);
+    let corrupted = corrupt_post_checkpoint_tables(
+        &dir.path().join(Partition::Node.name()).join("tables"),
+        &root,
+    );
+    assert!(corrupted > 0, "a post-checkpoint Node table is damaged");
+
+    let owed = repair_owed_on_open(&engine, &root).expect("repair owed");
+    assert_eq!(owed.checked, CheckedScope::Repaired);
+    assert!(
+        owed.repaired.is_empty() && owed.corrupt_partitions.is_empty(),
+        "nothing was owed: {owed:?}"
+    );
+    let full = verify_and_repair(&engine, &root).expect("full check");
+    assert_eq!(full.checked, CheckedScope::Store);
+    assert_eq!(full.repaired, vec![Partition::Node], "{full:?}");
+    assert!(full.is_clean(), "{full:?}");
+}
+
 /// The operation records are rebuilt with the rest of the Schema partition:
 /// a repair from the checkpoint base plus the journal keeps every outcome and
 /// fence, those written after the checkpoint included, so a retry after the

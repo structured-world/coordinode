@@ -3,8 +3,8 @@
 //! The Schema tree holds what the rest of the open depends on: the routes of
 //! every other tree, the closure ledger, this member's own records, the
 //! apply coverage the journal replay trusts. A tree the open salvaged with
-//! loss, whose rebuild a crash cut short, or (where the open verifies the
-//! trees a checkpoint backs) that fails its checksums is settled in two
+//! loss, whose rebuild a crash cut short, or (where the open finishes a
+//! rebuild a crash cut short) that fails its checksums is settled in two
 //! steps. Before anything reads it, its own records are proved (from the
 //! intent of the rebuild cut short, or from the tree when nothing it lost can
 //! be one of them) and the open is refused otherwise: an absent key in such a
@@ -103,12 +103,13 @@ impl Bootstrap<'_> {
             None
         };
 
-        // Where the open goes on to verify the trees a checkpoint backs, the
-        // Schema tree is verified first, here, and only once.
-        let verifies = self.journaled
-            && (checkpoint.is_some()
-                || !intents.partitions.is_empty()
-                || !intents.tables.is_empty());
+        // Where the open goes on to finish a rebuild a crash cut short, the
+        // Schema tree that rebuild reads is verified first, here, and only
+        // once. A checkpoint on disk alone verifies nothing: a healthy open
+        // reads every block's checksum as it reads the block, and a full
+        // pass is the scrub's, which is off unless asked for.
+        let verifies =
+            self.journaled && (!intents.partitions.is_empty() || !intents.tables.is_empty());
         let mut verified = None;
         let mut corrupt = false;
         if verifies && !pending && lossy.is_none() {
