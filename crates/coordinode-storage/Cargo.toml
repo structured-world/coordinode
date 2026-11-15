@@ -57,6 +57,10 @@ parking_lot = { workspace = true }
 # Key sets of the write taps: internal keys, no attacker-chosen hash input.
 rustc-hash = { workspace = true }
 
+# A write's per-endpoint admissions, held inline: one or two endpoints carry
+# a hard limit, so a write allocates nothing for them.
+smallvec = "1"
+
 # LSM engine: coordinode-lsm-tree from crates.io
 lsm-tree = { workspace = true }
 

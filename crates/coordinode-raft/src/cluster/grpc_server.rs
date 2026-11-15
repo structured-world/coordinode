@@ -104,21 +104,6 @@ struct EntryRooms {
     client: u64,
 }
 
-/// Read free space where waiting on the filesystem holds up nothing (a
-/// blocking thread) when the last reading is too old to admit by: the
-/// reservation that follows admits by the reading and never reads it.
-async fn read_free_space(
-    space: &Arc<coordinode_storage::engine::space::SpaceGuard>,
-) -> Result<(), Status> {
-    if !space.needs_reading() {
-        return Ok(());
-    }
-    let space = Arc::clone(space);
-    tokio::task::spawn_blocking(move || space.refresh())
-        .await
-        .map_err(|e| Status::internal(format!("read free space: {e}")))
-}
-
 /// Reserve the room the entries of `req` take: the client entries not
 /// committed yet as client writes, the group's own work and the entries
 /// already committed from the recovery reserve.
@@ -130,13 +115,12 @@ fn reserve_entries(
 }
 
 /// [`reserve_entries`] for the rooms [`entries_footprint`] took apart. By
-/// the last free-space reading only: it never reads the filesystem, which
-/// [`read_free_space`] did beforehand.
+/// the free-space monitor's last reading: it never reads the filesystem.
 fn reserve_rooms(
     space: &coordinode_storage::engine::space::SpaceGuard,
     rooms: &EntryRooms,
 ) -> Reserved {
-    use coordinode_storage::engine::footprint::Admitted;
+    use coordinode_storage::engine::footprint::{Admit, Admitted};
     // Client entries are client writes to the disk: below its free-space
     // reserve or at its hard limit it takes none, and the leader sends them
     // again once room comes back.
@@ -144,7 +128,7 @@ fn reserve_rooms(
         Admitted::default()
     } else {
         space
-            .reserve_as_read(rooms.client)
+            .reserve(rooms.client, Admit::Client)
             .map_err(|e| Status::unavailable(e.to_string()))?
     };
     // Committed entries are acknowledged history the member takes as its own
@@ -153,7 +137,7 @@ fn reserve_rooms(
         Admitted::default()
     } else {
         space
-            .reserve_recovery_as_read(rooms.recovery)
+            .reserve(rooms.recovery, Admit::Recovery)
             .map_err(|e| Status::unavailable(e.to_string()))?
     };
     Ok(Rooms {
@@ -535,7 +519,6 @@ impl RaftService for RaftGrpcHandler {
         let _room = if req.entries.is_empty() {
             Rooms::default()
         } else {
-            read_free_space(&replica.space).await?;
             replica.reserve_entries(&req)?
         };
         replica.catch_up.note(&req);
@@ -647,11 +630,7 @@ impl RaftService for RaftGrpcHandler {
                     owed_in.lock().push_back(Rooms::default());
                     return true;
                 };
-                let room = match read_free_space(&space).await {
-                    Ok(()) => reserve_rooms(&space, &rooms),
-                    Err(e) => Err(e),
-                };
-                match room {
+                match reserve_rooms(&space, &rooms) {
                     Ok(room) => {
                         owed_in.lock().push_back(room);
                         true

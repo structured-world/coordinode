@@ -508,6 +508,9 @@ pub struct ServerConfig {
     /// Free disk space, in bytes, needed before refused writes are admitted
     /// again (`None` = 2 GiB; at least `min_free_bytes`).
     pub resume_free_bytes: Option<u64>,
+    /// How often, in ms, the background monitor reads free disk space when
+    /// nothing makes it read sooner (`None` = 10000).
+    pub free_space_check_ms: Option<std::num::NonZeroU64>,
     /// MiB per second every compaction and the scrub read and write at most,
     /// together (`None` or 0 = unthrottled).
     pub maintenance_mb_per_sec: Option<u64>,
@@ -751,6 +754,7 @@ impl Default for ServerConfig {
             text_index_batch: None,
             text_index_retry_ms: None,
             resume_free_bytes: None,
+            free_space_check_ms: None,
             maintenance_mb_per_sec: None,
             maintenance_backoff_ms: None,
             compaction_strategy: None,
@@ -1184,6 +1188,9 @@ impl ServerConfig {
         }
         if let Some(bytes) = self.resume_free_bytes {
             cfg.resume_free_bytes = bytes;
+        }
+        if let Some(ms) = self.free_space_check_ms {
+            cfg.free_space_check_ms = ms.get();
         }
         // The maintenance rate is converted to bytes with the other MiB
         // settings (`byte_sizes`); its backoff needs no conversion.

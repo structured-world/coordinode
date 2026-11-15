@@ -233,6 +233,9 @@ pub struct StorageEngine {
     /// before `trees` (declared earlier in the struct) so the thread
     /// stops accessing tree handles before they are released.
     capacity_scanner: Option<crate::engine::capacity::CapacityScanner>,
+    /// The thread that reads free space for `space`; dropped with the
+    /// scanner, first on close.
+    space_monitor: Option<crate::engine::space::SpaceMonitor>,
     /// Optional embedded oplog journal (oracle-backed, no-Raft mode).
     ///
     /// `Some` when opened via [`StorageEngine::open_with_oracle`] against a
@@ -1627,6 +1630,11 @@ impl StorageEngine {
                 .map_err(|e| StorageError::InvalidConfig(format!("spawn capacity scanner: {e}")))?,
             )
         };
+        // Free space is read here, never on a write: see `SpaceGuard`.
+        let space = Arc::new(
+            crate::engine::space::SpaceGuard::new(config).with_footprints(footprints.clone()),
+        );
+        let space_monitor = Some(space.start_monitor()?);
 
         // Restore the shared seqno past any persisted columnar write (the
         // partition-only restore above misses a columnar-only seqno line), then
@@ -1765,6 +1773,7 @@ impl StorageEngine {
             endpoints: config.endpoints.clone(),
             capacity: capacity_arc,
             capacity_scanner,
+            space_monitor,
             oplog,
             journal_flusher,
             local_journal,
@@ -1794,9 +1803,7 @@ impl StorageEngine {
             text_index_batch: config.text_index_batch.max(1),
             text_index_retry: std::time::Duration::from_millis(config.text_index_retry_ms.max(1)),
             open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
-            space: Arc::new(
-                crate::engine::space::SpaceGuard::new(config).with_footprints(footprints.clone()),
-            ),
+            space,
             footprints,
             footprint_reclaim: parking_lot::Mutex::new(()),
             table_landed,
@@ -2044,7 +2051,10 @@ impl StorageEngine {
         if self.footprints.is_empty() {
             return Ok(crate::engine::footprint::Admitted::default());
         }
+        // Sized only under a hard limit, which needs it anyway: the size
+        // also spends the free-space headroom then.
         let bytes = crate::engine::footprint::write_footprint(mutations);
+        self.space.spend(bytes);
         self.admit_footprint(bytes, class)
     }
 
@@ -8899,6 +8909,7 @@ impl Drop for StorageEngine {
         // scanner only reads tree handles, but ordering is cheap
         // and keeps the shutdown sequence symmetric.
         drop(self.capacity_scanner.take());
+        drop(self.space_monitor.take());
 
         // Step 1: stop background flush workers before touching trees.
         drop(self.flush_manager.take());

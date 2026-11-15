@@ -188,6 +188,7 @@ pub(crate) async fn serve(
         text_index_batch: _,
         text_index_retry_ms: _,
         resume_free_bytes: _,
+        free_space_check_ms: _,
         maintenance_mb_per_sec: _,
         maintenance_backoff_ms: _,
         compaction_strategy: _,

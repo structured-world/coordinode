@@ -353,6 +353,28 @@ fn text_index_worker_settings_reach_the_storage_config() {
     }
 }
 
+/// The free-space monitor's interval reaches the storage configuration:
+/// unset it keeps the 10 s default, set it carries the ms given, and zero
+/// is refused, as a monitor that never sleeps would spin.
+#[test]
+fn free_space_check_interval_reaches_the_storage_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let default = ServerConfig {
+        data_dir: dir.path().to_str().unwrap().into(),
+        ..ServerConfig::default()
+    };
+    let storage = default.resolve_storage_config().expect("valid topology");
+    assert_eq!(storage.free_space_check_ms, 10_000);
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "free_space_check_ms: 2500\n").unwrap();
+    let mut c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    c.data_dir = dir.path().to_str().unwrap().into();
+    let storage = c.resolve_storage_config().expect("valid topology");
+    assert_eq!(storage.free_space_check_ms, 2_500);
+    std::fs::write(&path, "free_space_check_ms: 0\n").unwrap();
+    assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
+}
+
 /// The slow-statement bound is a config-file setting: unset it leaves the
 /// built-in 100 ms, set it carries the milliseconds given, 0 included.
 #[test]

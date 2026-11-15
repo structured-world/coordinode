@@ -1027,8 +1027,9 @@ pub fn footprint_of(data: u64, count: usize) -> u64 {
 #[derive(Debug, Default)]
 #[must_use = "an admission holds its bytes until it drops"]
 pub struct Admitted {
-    /// Held for their drop, which gives the bytes back.
-    held: Vec<Admission>,
+    /// Held for their drop, which gives the bytes back. Inline for the one
+    /// or two capped endpoints a store has: a write allocates nothing here.
+    held: smallvec::SmallVec<[Admission; 2]>,
 }
 
 impl Admitted {
@@ -1319,7 +1320,7 @@ impl Footprints {
             .endpoints
             .iter()
             .map(|footprint| footprint.admit(bytes, class))
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<smallvec::SmallVec<_>, _>>()
             .map(|held| Admitted { held });
         if admitted.is_err() {
             self.squeeze();

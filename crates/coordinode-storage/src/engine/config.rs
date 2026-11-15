@@ -887,6 +887,13 @@ pub struct StorageConfig {
     /// Default 2 GiB.
     pub resume_free_bytes: u64,
 
+    /// How often, in ms, the background monitor reads free space when
+    /// nothing else makes it read sooner: other programs fill the disk too.
+    /// It also reads once writes sized for a hard limit have spent half the
+    /// room the last reading left above `min_free_bytes`, and every 250 ms
+    /// while writes are paused. Writes never read it. Default 10000.
+    pub free_space_check_ms: u64,
+
     /// Bytes per second the background maintenance of this engine (every
     /// compaction and scrub, over every tree together) reads and writes at
     /// most, so it cannot saturate the disk the foreground needs. `0`
@@ -1106,6 +1113,7 @@ impl StorageConfig {
             relocated: false,
             min_free_bytes: crate::engine::space::DEFAULT_MIN_FREE_BYTES,
             resume_free_bytes: crate::engine::space::DEFAULT_RESUME_FREE_BYTES,
+            free_space_check_ms: crate::engine::space::DEFAULT_FREE_SPACE_CHECK_MS,
             maintenance_bytes_per_sec: 0,
             maintenance_backoff_ms: 0,
             compaction_strategy: crate::engine::CompactionStrategyKind::Leveled,

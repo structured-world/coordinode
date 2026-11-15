@@ -80,6 +80,96 @@ fn the_resume_level_is_at_least_the_reserve() {
     assert_eq!(guard.resume_free_bytes(), 10);
 }
 
+/// How many times `guard` read free space.
+fn readings(guard: &SpaceGuard) -> u64 {
+    guard.readings.load(Ordering::Relaxed)
+}
+
+/// Wait up to 5 s for `guard` to read free space more than `seen` times.
+fn read_again(guard: &SpaceGuard, seen: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if readings(guard) > seen {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// A write never reads free space: admissions, reservations and the
+/// paused checks answer from the monitor's last reading. Before, a write
+/// read the filesystem itself whenever the reading was 250 ms old.
+#[test]
+fn admitting_writes_never_reads_free_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = guard_over(dir.path());
+    guard.set_reserve(0, 0);
+    let seen = readings(&guard);
+    let until = std::time::Instant::now() + Duration::from_millis(400);
+    while std::time::Instant::now() < until {
+        guard.admit().unwrap();
+        guard.admit_free_space().unwrap();
+        guard.admit_free_space_recovery().unwrap();
+        drop(guard.reserve(1, Admit::Client).unwrap());
+        assert!(!guard.is_paused());
+        assert!(!guard.is_paused_by_free_space());
+    }
+    assert_eq!(readings(&guard), seen, "a write read free space");
+}
+
+/// Writes that spend the headroom the last reading left wake the monitor
+/// at once, long before its interval.
+#[test]
+fn spending_the_headroom_wakes_the_monitor() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = Arc::new(guard_over(dir.path()));
+    guard.set_reserve(0, 0);
+    guard.set_check_interval_ms(3_600_000);
+    let _monitor = guard.start_monitor().unwrap();
+    // The interval change woke the monitor before it ran: let it take that
+    // reading first.
+    std::thread::sleep(Duration::from_millis(100));
+    let seen = readings(&guard);
+    let headroom = u64::try_from(guard.headroom.load(Ordering::Relaxed)).unwrap();
+    assert!(headroom > 0, "an empty reserve leaves headroom");
+    guard.spend(headroom / 2);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(readings(&guard), seen, "half the headroom wakes nothing");
+    guard.spend(headroom);
+    assert!(
+        read_again(&guard, seen),
+        "the spent headroom woke no reading"
+    );
+}
+
+/// With nothing waking it, the monitor reads free space on its interval:
+/// other programs fill the disk too.
+#[test]
+fn the_monitor_reads_on_its_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = Arc::new(guard_over(dir.path()));
+    guard.set_reserve(0, 0);
+    guard.set_check_interval_ms(50);
+    let _monitor = guard.start_monitor().unwrap();
+    let seen = readings(&guard);
+    assert!(read_again(&guard, seen + 2), "no readings on the interval");
+}
+
+/// While writes are paused the monitor reads every 250 ms, whatever its
+/// interval, so space freed by anyone admits them again promptly.
+#[test]
+fn a_paused_guard_is_read_often() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = Arc::new(guard_over(dir.path()));
+    guard.set_check_interval_ms(3_600_000);
+    guard.set_reserve(u64::MAX, u64::MAX);
+    assert!(guard.is_paused());
+    let _monitor = guard.start_monitor().unwrap();
+    let seen = readings(&guard);
+    assert!(read_again(&guard, seen + 2), "a paused guard was not read");
+}
+
 /// Volatile endpoints hold no durable writes to protect: an all-volatile
 /// store never pauses on their account.
 #[test]
