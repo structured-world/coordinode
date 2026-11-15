@@ -4354,6 +4354,12 @@ impl StorageEngine {
         timeout: std::time::Duration,
     ) -> StorageResult<crate::engine::fixed_cut::FixedCut> {
         let not_ready = |reason: String| StorageError::CutNotReady { reason };
+        // With no applies running nothing moves the closed bound: it is the
+        // one the Schema tree records, read as a state machine opening over
+        // the store reads it.
+        if self.raft_fence().is_none() {
+            self.reload_closure_frontier()?;
+        }
         let applied = self.closure.lock().ledger.last_index();
         let first = applied
             .checked_add(1)
@@ -7138,6 +7144,20 @@ impl StorageEngine {
             let failed = guard.note_sync(through, Err(StorageError::Io("injected".into())));
             debug_assert!(failed.is_err());
         }
+    }
+
+    /// Show `partition`'s tree holding its group's log only below `next`,
+    /// its rows left as they are: what a power cut that lost the tree's
+    /// newer applies and kept another tree's leaves. For fault tests.
+    ///
+    /// # Errors
+    ///
+    /// The tree is not open, or the record cannot be made durable.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn lose_raft_coverage(&self, partition: Partition, next: u64) -> StorageResult<()> {
+        let tree = self.tree(partition)?;
+        coverage::write_fold(tree, Domain::Raft, 0, next, &[], self.next_seqno());
+        self.flush_memtables(tree)
     }
 
     /// Run `hook` in the next fixed cuts of this store's own journal once the

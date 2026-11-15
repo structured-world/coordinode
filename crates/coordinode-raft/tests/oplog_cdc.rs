@@ -714,3 +714,85 @@ async fn a_cut_of_a_partition_installed_ahead_or_replaced_is_refused() {
     );
     node.shutdown().await.expect("shutdown");
 }
+
+/// A member's store opened with no applies running is qualified by its
+/// trees' durable coverage alone: its Schema tree's closed bound accounts
+/// for entries another tree is no longer shown to hold, so no cut of that
+/// tree is given, while a cut of the store as it was is.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offline_cut_of_a_tree_behind_the_closure_is_refused() {
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use coordinode_storage::engine::fixed_cut::CutScope;
+    use coordinode_storage::engine::partition::Partition;
+    use coordinode_storage::error::StorageError;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    {
+        let clock = Arc::new(TimestampOracle::new());
+        let engine = Arc::new(
+            StorageEngine::open_with_oracle(&config, Arc::clone(&clock)).expect("open engine"),
+        );
+        let node = RaftNode::single_node(Arc::clone(&engine))
+            .await
+            .expect("bootstrap");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let pipeline = node.pipeline();
+        let ids = ProposalIdGenerator::new();
+        for delta in [1, 10, 100] {
+            let ts = clock.next();
+            pipeline
+                .propose_and_wait(&RaftProposal {
+                    id: ids.next(),
+                    mutations: vec![Mutation::Merge {
+                        partition: PartitionId::Counter,
+                        key: b"counter:degree:9".to_vec(),
+                        operand: coordinode_storage::engine::merge::encode_counter_delta(delta),
+                    }],
+                    commit_ts: ts,
+                    start_ts: ts,
+                    bypass_rate_limiter: false,
+                })
+                .expect("propose");
+        }
+        node.shutdown().await.expect("shutdown");
+    }
+    let offline = |engine: Arc<StorageEngine>| async move {
+        tokio::task::spawn_blocking(move || {
+            // An offline reader that knows the group the store's log is of.
+            engine.set_log_group(coordinode_core::group::GroupId(1));
+            let scope = CutScope::rows(Partition::Counter, b"counter:".to_vec()).expect("scope");
+            engine.fixed_cut(scope, Duration::from_secs(10)).map(drop)
+        })
+        .await
+        .expect("join")
+    };
+    let open = || {
+        Arc::new(
+            StorageEngine::open_with_oracle(&config, Arc::new(TimestampOracle::new()))
+                .expect("reopen"),
+        )
+    };
+
+    let engine = open();
+    assert!(engine.raft_fence().is_none(), "no applies running");
+    offline(Arc::clone(&engine))
+        .await
+        .expect("a cut of the store as it was");
+
+    // The counter tree shown to hold the log only from its start, below what
+    // the Schema tree's closure accounts for, its rows as they were.
+    engine
+        .lose_raft_coverage(Partition::Counter, 1)
+        .expect("behind the closure");
+    let refused = offline(engine).await;
+    assert!(
+        matches!(refused, Err(StorageError::CutNotReady { .. })),
+        "no cut of a tree behind the closure: {refused:?}"
+    );
+}
