@@ -1412,10 +1412,51 @@ pub(crate) async fn serve(
     let mut fatal_watch = fatal_rx.clone();
     // Set once the stop starts: the drain window counts from it.
     let (stopping_tx, stopping_rx) = tokio::sync::watch::channel(false);
-    // The member leaves consensus once, whichever way the serving ends.
-    let consensus_stop = ConsensusStop::new(Arc::clone(&raft_node));
-    let stopping_consensus = consensus_stop.clone();
-    let command_slots = member.command_slots().clone();
+    // The member stops taking work once, on the stop request or when the
+    // serving ends otherwise: /ready turns a balancer away, and new commands,
+    // from clients or routed by peers, are refused while those running end
+    // as they do.
+    let stop_taking_work = {
+        let (readiness, slots) = (shutdown_readiness, member.command_slots().clone());
+        move || {
+            readiness.set(false);
+            slots.close();
+        }
+    };
+    let stop_taking_work_on_signal = stop_taking_work.clone();
+    // The member's consensus stops in a task of its own, started by the stop
+    // request or by the serving's end, whichever comes first, and run to its
+    // end once: the serving can be cut off at the drain window without
+    // cutting off the stop.
+    let (stop_consensus, mut consensus_asked) = tokio::sync::watch::channel(false);
+    let (consensus_done, consensus_stopped) = tokio::sync::watch::channel(false);
+    // The node connections of the shared port, once it accepts them: after
+    // the consensus stops they carry nothing this member serves, and the
+    // peers, still running, would hold them open through the drain.
+    let node_connections: Arc<std::sync::OnceLock<coordinode_wire::peer::NodeConnections>> =
+        Arc::default();
+    let consensus_stop = {
+        let node = Arc::clone(&raft_node);
+        let node_connections = Arc::clone(&node_connections);
+        tokio::spawn(async move {
+            if consensus_asked.wait_for(|asked| *asked).await.is_err() {
+                // The sender dropped with the serving: stop then too.
+                tracing::debug!("the serving ended without a stop request");
+            }
+            info!("stopping consensus before closing connections");
+            #[cfg(feature = "test-faults")]
+            consensus_stop_fault(&node, "start");
+            let stopped = node.shutdown().await;
+            #[cfg(feature = "test-faults")]
+            consensus_stop_fault(&node, "end");
+            if let Some(connections) = node_connections.get() {
+                connections.close();
+            }
+            consensus_done.send_replace(true);
+            stopped
+        })
+    };
+    let stop_consensus_on_signal = stop_consensus.clone();
     let shutdown = async move {
         tokio::select! {
             () = signals => {}
@@ -1423,17 +1464,18 @@ pub(crate) async fn serve(
                 info!("shutting down after a fatal consensus error");
             }
         }
-        // First, so /ready turns a balancer away while in-flight RPCs drain.
-        shutdown_readiness.set(false);
+        stop_taking_work_on_signal();
         stopping_tx.send_replace(true);
-        // No new commands, from clients or routed by peers; those running
-        // end as they do.
-        command_slots.close();
         // Consensus stops while the server still serves: a leader hands its
         // leadership over through the peers' connections, which only close
         // after this. Waiting for them first would keep a member that no
         // longer takes connections in the group, leading, until they did.
-        stopping_consensus.stop().await;
+        stop_consensus_on_signal.send_replace(true);
+        let mut stopped = consensus_stopped;
+        if stopped.wait_for(|done| *done).await.is_err() {
+            // The stop task ended without reporting: it is over either way.
+            tracing::debug!("the consensus stop task ended");
+        }
     };
     let grace = std::time::Duration::from_secs(shutdown_grace_secs.map_or(15, |s| s.get()));
 
@@ -1678,13 +1720,19 @@ pub(crate) async fn serve(
     let served = match shared_port {
         Some((context, accept)) => {
             match coordinode_wire::peer::incoming(grpc_listener, &context, accept) {
-                Ok(incoming) => drain_within(
-                    router.serve_with_incoming_shutdown(incoming, shutdown),
-                    stopping_rx,
-                    grace,
-                )
-                .await
-                .map_err(|e| e.to_string()),
+                Ok(incoming) => {
+                    // Set before serving, which is what starts a stop.
+                    if node_connections.set(incoming.node_connections()).is_err() {
+                        tracing::error!("the shared port's node connections were set twice");
+                    }
+                    drain_within(
+                        router.serve_with_incoming_shutdown(incoming, shutdown),
+                        stopping_rx,
+                        grace,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                }
                 Err(e) => Err(format!("gRPC port TLS configuration: {e}")),
             }
         }
@@ -1700,16 +1748,23 @@ pub(crate) async fn serve(
             .map_err(|e| e.to_string())
         }
     };
-    // A serving that ended without a stop request, or failed, still leaves
-    // consensus before the member closes.
-    consensus_stop.stop().await;
-    served?;
+    // However the serving ended, the member stops taking work and leaves
+    // consensus (the stop started on the request, or now), and the cleanup
+    // below runs before a serving error is returned.
+    stop_taking_work();
+    stop_consensus.send_replace(true);
+    match consensus_stop.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(%e, "consensus did not stop cleanly"),
+        Err(e) => tracing::error!(%e, "the consensus stop task failed"),
+    }
     // The member's background work finishes the pass it is in, then the
     // member closes off the async runtime: closing joins its threads.
     member.stop_background().await;
     if let Err(e) = tokio::task::spawn_blocking(move || drop(member)).await {
         tracing::error!(%e, "closing the database failed");
     }
+    served?;
 
     if let Some(fatal) = fatal_rx.borrow().clone() {
         return Err(format!("consensus stopped on a fatal error: {fatal}").into());
@@ -1747,34 +1802,32 @@ async fn drain_within<E>(
     }
 }
 
-/// Stopping the member's consensus, at most once: on the stop request while
-/// the server still serves, or after the serving ended when it ended
-/// otherwise. A stopped consensus hands leadership over when it leads and
-/// keeps the member's membership.
-#[derive(Clone)]
-struct ConsensusStop {
-    node: Arc<coordinode_raft::cluster::RaftNode>,
-    stopped: Arc<tokio::sync::OnceCell<()>>,
-}
+/// Test builds only: `COORDINODE_TEST_CONSENSUS_STOP_MARKS` names a file
+/// that gets a line with `mark` each time the member's consensus stop starts
+/// and ends, so a test counts the stops; at the start,
+/// `COORDINODE_TEST_CONSENSUS_STOP_DELAY_MS` holds the stop that long before
+/// the consensus goes down, so a test drives it past the drain window.
+#[cfg(feature = "test-faults")]
+fn consensus_stop_fault(node: &coordinode_raft::cluster::RaftNode, mark: &str) {
+    use std::io::Write;
 
-impl ConsensusStop {
-    fn new(node: Arc<coordinode_raft::cluster::RaftNode>) -> Self {
-        Self {
-            node,
-            stopped: Arc::new(tokio::sync::OnceCell::new()),
+    if let Some(path) = std::env::var_os("COORDINODE_TEST_CONSENSUS_STOP_MARKS") {
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut marks| writeln!(marks, "{mark}"));
+        if let Err(e) = written {
+            tracing::error!(%e, "test fault: writing a consensus stop mark");
         }
     }
-
-    /// Stop the consensus, or wait for the stop already under way.
-    async fn stop(&self) {
-        self.stopped
-            .get_or_init(|| async {
-                info!("stopping consensus before closing connections");
-                if let Err(e) = self.node.shutdown().await {
-                    tracing::warn!(%e, "consensus did not stop cleanly");
-                }
-            })
-            .await;
+    if mark == "start"
+        && let Some(ms) = std::env::var("COORDINODE_TEST_CONSENSUS_STOP_DELAY_MS")
+            .ok()
+            .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        tracing::warn!(ms, "test fault: the consensus stop is held");
+        node.before_consensus_stop(tokio::time::sleep(std::time::Duration::from_millis(ms)));
     }
 }
 

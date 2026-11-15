@@ -518,6 +518,165 @@ async fn a_stalled_handshake_is_dropped_at_its_bound() {
     );
 }
 
+/// Node `from` dialed into `server` at `addr`, expecting the listener to be
+/// `spiffe://td.test/a`, with one byte sent: the dialer's end and the
+/// listener's, which has read the byte.
+async fn node_pair(
+    from: &Arc<SecurityContext>,
+    addr: &str,
+    server: &mut Incoming,
+) -> (
+    Guarded<tokio_rustls::client::TlsStream<TcpStream>>,
+    InboundStream,
+) {
+    let config = Arc::new(
+        from.client_config(sid("spiffe://td.test/a"))
+            .expect("client"),
+    );
+    let mut dialer = connect_tls(Arc::clone(from), config, addr, Keepalive::default())
+        .await
+        .expect("dialed");
+    dialer.write_all(&[7]).await.expect("write");
+    dialer.flush().await.expect("flush");
+    let mut accepted = tokio::time::timeout(Duration::from_secs(5), server.next())
+        .await
+        .expect("accepted in time")
+        .expect("a connection")
+        .expect("accepted");
+    assert!(matches!(accepted, InboundStream::Node(..)));
+    let mut byte = [0u8; 1];
+    accepted.read_exact(&mut byte).await.expect("the byte");
+    (dialer, accepted)
+}
+
+/// Whether `stream` is ended within 2 s: a read returns end of stream or an
+/// error rather than waiting for data.
+async fn ends<S: AsyncRead + Unpin>(stream: &mut S) -> bool {
+    let mut byte = [0u8; 1];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
+/// Closing a listener's node connections ends an idle one: a read already
+/// waiting on it returns, and the peer sees its connection end. Before, a
+/// stopped member's peers held these open through the whole drain window.
+#[tokio::test]
+async fn closing_the_node_connections_ends_an_idle_one() {
+    let ca = ca();
+    let a = node(&ca, "spiffe://td.test/a");
+    let b = node(&ca, "spiffe://td.test/b");
+    let (listener, addr) = bind().await;
+    let mut server = incoming(listener, &a, node_only()).expect("incoming");
+    let (mut dialer, mut accepted) = node_pair(&b, &addr, &mut server).await;
+    let waiting = tokio::spawn(async move { ends(&mut accepted).await });
+    // The read is waiting before the close.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.node_connections().close();
+    assert!(
+        waiting.await.expect("the reader"),
+        "the waiting read returns"
+    );
+    assert!(ends(&mut dialer).await, "the peer's end is closed");
+}
+
+/// Closing the node connections leaves a client's connection on the same
+/// port to drain as the server drains it: it keeps carrying traffic both
+/// ways.
+#[tokio::test]
+async fn closing_the_node_connections_leaves_clients_be() {
+    let ca = ca();
+    let a = node(&ca, "spiffe://td.test/a");
+    let b = node(&ca, "spiffe://td.test/b");
+    let (listener, addr) = bind().await;
+    let shared = Accept {
+        inbound: InboundAuth::Shared { clients: None },
+        plaintext_clients: true,
+        handshake_timeout: PeerTimeouts::default().handshake,
+        keepalive: PeerTimeouts::default().keepalive,
+    };
+    let mut server = incoming(listener, &a, shared).expect("incoming");
+    let mut client = TcpStream::connect(&addr).await.expect("connect");
+    client.write_all(b"P").await.expect("write");
+    let mut accepted_client = tokio::time::timeout(Duration::from_secs(5), server.next())
+        .await
+        .expect("accepted in time")
+        .expect("a connection")
+        .expect("accepted");
+    assert!(matches!(accepted_client, InboundStream::ClientPlain(..)));
+    let (_dialer, mut accepted_node) = node_pair(&b, &addr, &mut server).await;
+
+    server.node_connections().close();
+    assert!(ends(&mut accepted_node).await, "the node connection ends");
+    let mut byte = [0u8; 1];
+    accepted_client.read_exact(&mut byte).await.expect("read");
+    assert_eq!(&byte, b"P");
+    client
+        .write_all(b"Q")
+        .await
+        .expect("the client still writes");
+    accepted_client.read_exact(&mut byte).await.expect("read");
+    assert_eq!(&byte, b"Q");
+    accepted_client
+        .write_all(b"R")
+        .await
+        .expect("the server still answers");
+    accepted_client.flush().await.expect("flush");
+    client.read_exact(&mut byte).await.expect("the answer");
+    assert_eq!(&byte, b"R");
+}
+
+/// A node connection whose handshake completes after the node connections
+/// were closed is closed too, and never handed to the server.
+#[tokio::test]
+async fn a_node_connection_after_the_close_is_not_served() {
+    let ca = ca();
+    let a = node(&ca, "spiffe://td.test/a");
+    let b = node(&ca, "spiffe://td.test/b");
+    let (listener, addr) = bind().await;
+    let mut server = incoming(listener, &a, node_only()).expect("incoming");
+    server.node_connections().close();
+
+    let config = Arc::new(b.client_config(sid("spiffe://td.test/a")).expect("client"));
+    // The dialer's side may finish its handshake before the listener's
+    // closes the connection; either way it ends without being served.
+    if let Ok(mut dialer) = connect_tls(Arc::clone(&b), config, &addr, Keepalive::default()).await {
+        // A write may still land in the socket's buffer before the close.
+        if dialer.write_all(&[7]).await.is_ok() {
+            assert!(ends(&mut dialer).await, "the late connection is closed");
+        }
+    }
+    let served = tokio::time::timeout(Duration::from_millis(500), server.next()).await;
+    assert!(served.is_err(), "nothing reaches the server");
+}
+
+/// A dropped node connection gives up only its own place: a connection
+/// still open beside it keeps carrying traffic, and the close still finds
+/// and ends it.
+#[tokio::test]
+async fn a_dropped_node_connection_leaves_the_others_registered() {
+    let ca = ca();
+    let a = node(&ca, "spiffe://td.test/a");
+    let b = node(&ca, "spiffe://td.test/b");
+    let (listener, addr) = bind().await;
+    let mut server = incoming(listener, &a, node_only()).expect("incoming");
+    let (_old_dialer, old) = node_pair(&b, &addr, &mut server).await;
+    let (mut dialer, mut kept) = node_pair(&b, &addr, &mut server).await;
+    drop(old);
+
+    dialer.write_all(&[8]).await.expect("write");
+    dialer.flush().await.expect("flush");
+    let mut byte = [0u8; 1];
+    kept.read_exact(&mut byte)
+        .await
+        .expect("the kept connection carries traffic");
+    assert_eq!(byte, [8]);
+
+    server.node_connections().close();
+    assert!(ends(&mut kept).await, "the close ends the kept connection");
+}
+
 fn bundles(domains: &[(&str, &Ca)]) -> PeerProfile {
     PeerProfile::Spiffe {
         bundles: domains

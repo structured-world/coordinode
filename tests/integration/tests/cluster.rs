@@ -1148,10 +1148,19 @@ async fn constraints_held_before_the_cluster_bind_every_member_after_a_leader_ch
 
 /// A group of three members formed around the first, which leads.
 async fn three_member_group() -> (CoordinodeProcess, CoordinodeProcess, CoordinodeProcess) {
+    three_member_group_with_third(&[], "").await
+}
+
+/// [`three_member_group`] with `env` set on node 3 and `settings` added to
+/// its config file.
+async fn three_member_group_with_third(
+    env: &[(&str, &str)],
+    settings: &str,
+) -> (CoordinodeProcess, CoordinodeProcess, CoordinodeProcess) {
     let (p1, p2, p3) = (free_port(), free_port(), free_port());
     let n1 = CoordinodeProcess::start_cluster_member(1, p1, &[p2, p3]).await;
     let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[p1, p3]).await;
-    let n3 = CoordinodeProcess::start_cluster_member(3, p3, &[p1, p2]).await;
+    let n3 = CoordinodeProcess::start_cluster_member_with(3, p3, &[p1, p2], env, settings).await;
     let mut leader = n1.cluster_client().await;
     for (id, member) in [(2, &n2), (3, &n3)] {
         leader
@@ -1417,9 +1426,10 @@ async fn a_group_stopped_at_once_exits() {
 /// connections. A leader hands its leadership over while the connections its
 /// peers and a client hold to it stay open: another member leads well inside
 /// the drain window (15 s), writes go on there, what the old leader
-/// acknowledged is read there, and the old leader exits on its own once its
-/// client's connection is drained. Before, its consensus ran on, leading,
-/// until every connection had closed or the process was killed.
+/// acknowledged is read there, and the old leader exits on its own within
+/// 8 s of the request while its client's connection is still open. Before,
+/// its consensus ran on, leading, until every connection had closed or the
+/// process was killed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_leader_hands_over_before_the_drain_window() {
     let (mut n1, n2, n3) = three_member_group().await;
@@ -1465,12 +1475,19 @@ async fn a_stopped_leader_hands_over_before_the_drain_window() {
         .await
         .expect("the acknowledged write is read after the hand-over");
     assert_eq!(rows.len(), 1, "the acknowledged write after the hand-over");
-    drop(client);
+    // With its client's connection still open, the old leader exits on its
+    // own before a supervisor's 10 s grace would kill it.
     assert!(
-        n1.exits_within(Duration::from_secs(20)).await,
+        n1.exits_within(Duration::from_secs(8).saturating_sub(asked.elapsed()))
+            .await,
         "the old leader was still running {:?} after it was asked to stop",
         asked.elapsed()
     );
+    eprintln!(
+        "the old leader exited {:?} after the stop request",
+        asked.elapsed()
+    );
+    drop(client);
 }
 
 /// A follower asked to stop leaves consensus first as well: it exits well
@@ -1490,6 +1507,52 @@ async fn a_stopped_follower_exits_before_the_drain_window() {
         "the follower was still running {:?} after it was asked to stop",
         asked.elapsed()
     );
+    let after = cypher_write_on(&n1, "CREATE (:After {k: 1})")
+        .await
+        .expect("the group writes with two members");
+    let rows = cypher_after_on(&n2, "MATCH (n:After) RETURN n.k", after)
+        .await
+        .expect("the other follower reads it");
+    assert_eq!(rows.len(), 1);
+}
+
+/// A member whose consensus stop outlasts the drain window (1 s here, the
+/// stop held 3 s) stops its consensus once: the serving is cut off at the
+/// window, the stop already under way runs to its end, and only then does
+/// the member close and exit. Before, cutting off the serving also cut off
+/// the stop, and the member started it again from the beginning.
+#[cfg(feature = "test-faults")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consensus_stop_past_the_drain_window_runs_once() {
+    let marks = tempfile::NamedTempFile::new().expect("marks file");
+    let marks_path = marks.path().to_str().expect("utf-8 path").to_owned();
+    let (n1, n2, mut n3) = three_member_group_with_third(
+        &[
+            ("COORDINODE_TEST_CONSENSUS_STOP_DELAY_MS", "3000"),
+            ("COORDINODE_TEST_CONSENSUS_STOP_MARKS", &marks_path),
+        ],
+        "shutdown_grace_secs: 1\n",
+    )
+    .await;
+    cypher_write_on(&n1, "CREATE (:Before {k: 1})")
+        .await
+        .expect("the leader writes");
+
+    let asked = std::time::Instant::now();
+    n3.request_stop();
+    assert!(
+        n3.exits_within(Duration::from_secs(9)).await,
+        "the member was still running {:?} after it was asked to stop",
+        asked.elapsed()
+    );
+    let exited = asked.elapsed();
+    assert!(
+        exited >= Duration::from_secs(3),
+        "the member closed after {exited:?}, before its held consensus stop ended"
+    );
+    let stops = std::fs::read_to_string(marks.path()).expect("the marks");
+    assert_eq!(stops, "start\nend\n", "one consensus stop, run to its end");
+
     let after = cypher_write_on(&n1, "CREATE (:After {k: 1})")
         .await
         .expect("the group writes with two members");

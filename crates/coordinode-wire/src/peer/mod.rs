@@ -18,8 +18,8 @@ pub use der::DerError;
 pub use spiffe::{SpiffeId, SpiffeIdError};
 pub use transport::{
     Accept, AuthenticatedPeer, DialError, Guarded, InboundStream, Incoming, Keepalive,
-    PeerAdmission, PeerConnectInfo, PeerConnections, PeerTarget, PeerTimeouts, incoming,
-    session_options,
+    NodeConnections, NodeRegistration, PeerAdmission, PeerConnectInfo, PeerConnections, PeerTarget,
+    PeerTimeouts, incoming, session_options,
 };
 pub use verify::{
     HostIdentity, HostIdentityAdapter, PeerError, PeerIdentity, PeerProfile, PeerRole,

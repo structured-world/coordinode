@@ -191,6 +191,20 @@ impl CoordinodeProcess {
         Self::start_member(node_id, port, peer_ports, data_dir, &[], settings, None).await
     }
 
+    /// [`start_cluster_member`](Self::start_cluster_member) with `env` set on
+    /// the process and `settings` added to its config file, for this start
+    /// and every restart.
+    pub async fn start_cluster_member_with(
+        node_id: u64,
+        port: u16,
+        peer_ports: &[u16],
+        env: &[(&str, &str)],
+        settings: &str,
+    ) -> Self {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        Self::start_member(node_id, port, peer_ports, data_dir, env, settings, None).await
+    }
+
     /// [`start_cluster_member`](Self::start_cluster_member) with a
     /// certificate valid until `not_after`; a restart issues a lasting one.
     pub async fn start_cluster_member_until(

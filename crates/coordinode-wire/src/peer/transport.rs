@@ -490,12 +490,89 @@ pub struct PeerConnectInfo {
     pub node: Option<Arc<AuthenticatedPeer>>,
 }
 
+/// The node connections a listener has accepted and that are still open,
+/// which its owner can close at once when the member's consensus stops: a
+/// node's connection then carries nothing the member still serves, and its
+/// peer, still running, would keep it open. Client connections are not
+/// here; they drain as the server drains them.
+#[derive(Clone, Default)]
+pub struct NodeConnections {
+    inner: Arc<parking_lot::Mutex<NodeSet>>,
+}
+
+#[derive(Default)]
+struct NodeSet {
+    /// Set once by [`NodeConnections::close`]: a connection accepted later
+    /// is closed instead of served.
+    closed: bool,
+    next: u64,
+    /// A control handle of each open node connection's socket.
+    live: std::collections::HashMap<u64, socket2::Socket>,
+}
+
+impl NodeConnections {
+    /// Close every open node connection, and every one accepted after this:
+    /// their reads and writes end, pending ones included. Once only; later
+    /// calls find nothing to close.
+    pub fn close(&self) {
+        let live = {
+            let mut set = self.inner.lock();
+            set.closed = true;
+            core::mem::take(&mut set.live)
+        };
+        for (_, socket) in live {
+            // A socket the peer closed already refuses; nothing is left then.
+            if let Err(e) = socket.shutdown(std::net::Shutdown::Both) {
+                tracing::debug!(error = %e, "closing a node connection");
+            }
+        }
+    }
+
+    /// Register `tcp`, the socket of a node connection just authenticated;
+    /// `None`, with the socket closed, once the connections are closed.
+    fn register(&self, tcp: &TcpStream) -> io::Result<Option<NodeRegistration>> {
+        let control = socket2::SockRef::from(tcp).try_clone()?;
+        let mut set = self.inner.lock();
+        if set.closed {
+            drop(set);
+            if let Err(e) = control.shutdown(std::net::Shutdown::Both) {
+                tracing::debug!(error = %e, "closing a node connection accepted late");
+            }
+            return Ok(None);
+        }
+        let id = set.next;
+        set.next += 1;
+        set.live.insert(id, control);
+        Ok(Some(NodeRegistration {
+            set: self.clone(),
+            id,
+        }))
+    }
+}
+
+/// A node connection's place in its listener's [`NodeConnections`], given
+/// up when the connection is dropped.
+pub struct NodeRegistration {
+    set: NodeConnections,
+    id: u64,
+}
+
+impl Drop for NodeRegistration {
+    fn drop(&mut self) {
+        // The control handle closes with it; the connection is closed by its
+        // own stream, which is being dropped.
+        self.set.inner.lock().live.remove(&self.id);
+    }
+}
+
 /// One accepted connection.
 pub enum InboundStream {
-    /// A node, authenticated by its node identity.
+    /// A node, authenticated by its node identity, with its place among the
+    /// listener's node connections.
     Node(
         Guarded<tokio_rustls::server::TlsStream<TcpStream>>,
         Option<SocketAddr>,
+        NodeRegistration,
     ),
     /// A client over TLS, with an ordinary certificate or none.
     ClientTls(
@@ -511,7 +588,7 @@ impl tonic::transport::server::Connected for InboundStream {
 
     fn connect_info(&self) -> PeerConnectInfo {
         match self {
-            Self::Node(stream, remote) => PeerConnectInfo {
+            Self::Node(stream, remote, _) => PeerConnectInfo {
                 remote: *remote,
                 node: Some(Arc::clone(&stream.peer)),
             },
@@ -530,7 +607,7 @@ impl AsyncRead for InboundStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Node(s, _) => Pin::new(s).poll_read(cx, buf),
+            Self::Node(s, _, _) => Pin::new(s).poll_read(cx, buf),
             Self::ClientTls(s, _) => Pin::new(s).poll_read(cx, buf),
             Self::ClientPlain(s, _) => Pin::new(s).poll_read(cx, buf),
         }
@@ -544,7 +621,7 @@ impl AsyncWrite for InboundStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
-            Self::Node(s, _) => Pin::new(s).poll_write(cx, buf),
+            Self::Node(s, _, _) => Pin::new(s).poll_write(cx, buf),
             Self::ClientTls(s, _) => Pin::new(s).poll_write(cx, buf),
             Self::ClientPlain(s, _) => Pin::new(s).poll_write(cx, buf),
         }
@@ -552,7 +629,7 @@ impl AsyncWrite for InboundStream {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Node(s, _) => Pin::new(s).poll_flush(cx),
+            Self::Node(s, _, _) => Pin::new(s).poll_flush(cx),
             Self::ClientTls(s, _) => Pin::new(s).poll_flush(cx),
             Self::ClientPlain(s, _) => Pin::new(s).poll_flush(cx),
         }
@@ -560,7 +637,7 @@ impl AsyncWrite for InboundStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Node(s, _) => Pin::new(s).poll_shutdown(cx),
+            Self::Node(s, _, _) => Pin::new(s).poll_shutdown(cx),
             Self::ClientTls(s, _) => Pin::new(s).poll_shutdown(cx),
             Self::ClientPlain(s, _) => Pin::new(s).poll_shutdown(cx),
         }
@@ -635,6 +712,8 @@ pub fn incoming(
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
     let (tx, rx) = tokio::sync::mpsc::channel(ACCEPT_QUEUE);
     let context = Arc::clone(context);
+    let nodes = NodeConnections::default();
+    let accepted_nodes = nodes.clone();
     let task = tokio::spawn(async move {
         loop {
             let accepted = tokio::select! {
@@ -657,14 +736,23 @@ pub fn incoming(
             let plaintext = accept.plaintext_clients;
             let bound = accept.handshake_timeout;
             let keepalive = accept.keepalive;
+            let nodes = accepted_nodes.clone();
             tokio::spawn(async move {
-                let handshake =
-                    authenticate(tcp, (remote, keepalive), &acceptor, context, plaintext);
+                let handshake = authenticate(
+                    tcp,
+                    (remote, keepalive),
+                    &acceptor,
+                    context,
+                    (plaintext, &nodes),
+                );
                 match tokio::time::timeout(bound, handshake).await {
-                    Ok(Ok(stream)) => {
+                    Ok(Ok(Some(stream))) => {
                         // A closed queue means the server stopped.
                         let _ = tx.send(stream).await;
                     }
+                    // A node connection that arrived after the node
+                    // connections were closed: closed too, not served.
+                    Ok(Ok(None)) => tracing::debug!(%remote, "node connection after close"),
                     Ok(Err(e)) => {
                         metrics::counter!("coordinode_peer_connections_refused_total").increment(1);
                         tracing::warn!(%remote, error = %e, "connection refused");
@@ -674,17 +762,18 @@ pub fn incoming(
             });
         }
     });
-    Ok(Incoming { rx, task })
+    Ok(Incoming { rx, task, nodes })
 }
 
-/// Authenticate one accepted connection.
+/// Authenticate one accepted connection; `None` for a node connection that
+/// arrived once `nodes` were closed, which is closed rather than served.
 async fn authenticate(
     tcp: TcpStream,
     (remote, keepalive): (SocketAddr, Keepalive),
     acceptor: &tokio_rustls::TlsAcceptor,
     context: Arc<SecurityContext>,
-    plaintext_clients: bool,
-) -> io::Result<InboundStream> {
+    (plaintext_clients, nodes): (bool, &NodeConnections),
+) -> io::Result<Option<InboundStream>> {
     session_options(&tcp, keepalive)?;
     if plaintext_clients {
         let mut first = [0u8; 1];
@@ -693,7 +782,7 @@ async fn authenticate(
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         if first[0] != TLS_HANDSHAKE {
-            return Ok(InboundStream::ClientPlain(tcp, Some(remote)));
+            return Ok(Some(InboundStream::ClientPlain(tcp, Some(remote))));
         }
     }
     let tls = acceptor.accept(tcp).await?;
@@ -708,12 +797,16 @@ async fn authenticate(
         Some(chain) if is_node => {
             let peer = AuthenticatedPeer::establish(context, chain, PeerRole::Client)
                 .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
-            Ok(InboundStream::Node(
+            let Some(registration) = nodes.register(tls.get_ref().0)? else {
+                return Ok(None);
+            };
+            Ok(Some(InboundStream::Node(
                 Guarded { inner: tls, peer },
                 Some(remote),
-            ))
+                registration,
+            )))
         }
-        _ => Ok(InboundStream::ClientTls(tls, Some(remote))),
+        _ => Ok(Some(InboundStream::ClientTls(tls, Some(remote)))),
     }
 }
 
@@ -721,6 +814,16 @@ async fn authenticate(
 pub struct Incoming {
     rx: tokio::sync::mpsc::Receiver<InboundStream>,
     task: tokio::task::JoinHandle<()>,
+    nodes: NodeConnections,
+}
+
+impl Incoming {
+    /// The node connections this listener accepted, for closing them when
+    /// the member's consensus stops. Cheap to clone; valid after the stream
+    /// is handed to the server.
+    pub fn node_connections(&self) -> NodeConnections {
+        self.nodes.clone()
+    }
 }
 
 impl futures_util::Stream for Incoming {
