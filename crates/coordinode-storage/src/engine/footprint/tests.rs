@@ -115,6 +115,37 @@ fn the_room_is_what_charged_and_admitted_leave() {
     assert_eq!(footprint.room(), 70 * UNIT);
 }
 
+/// A failed flush's own output, given back on its thread while it ran, does
+/// not count as room coming back, so a flush that cannot fit is not tried
+/// again in a loop; an admission given back is no room for a flush either.
+/// A file another thread gives back afterwards wakes it.
+#[test]
+fn a_failed_flush_waits_for_room_others_give_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let footprints = Footprints::open(&[endpoint(dir.path(), 100 * UNIT)]).unwrap();
+    let other = footprints.file(&dir.path().join("other")).unwrap();
+    other.grow_to(UNIT).unwrap();
+    let held = footprints.admit(10 * UNIT, Admit::Client).unwrap();
+
+    let attempt = footprints.flush_attempt();
+    let own = footprints.file(&dir.path().join("own")).unwrap();
+    own.grow_to(UNIT).unwrap();
+    drop(own);
+    footprints.removed(&dir.path().join("own"));
+    attempt.failed();
+    assert!(footprints.flush_stalled(), "its own cleanup woke nothing");
+    drop(held);
+    assert!(footprints.flush_stalled(), "an admission woke nothing");
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            drop(other);
+            footprints.removed(&dir.path().join("other"));
+        });
+    });
+    assert!(!footprints.flush_stalled(), "room given back woke it");
+}
+
 /// Racing admissions never admit more than fits.
 #[test]
 fn concurrent_admissions_never_overcommit() {

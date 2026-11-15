@@ -590,6 +590,9 @@ fn flush_worker_loop(
         queued,
     }) = receiver.recv()
     {
+        // Started before the flush: a change of room while it runs is seen
+        // if it then fails.
+        let attempt = footprints.flush_attempt();
         let result = tree.with_live(|tree| {
             // get_flush_lock() is not Send: it is acquired and used in this
             // thread.
@@ -603,8 +606,9 @@ fn flush_worker_loop(
                 ))),
             }
         });
-        // Before the wake below, so the pass it starts may ask again.
-        queued.store(false, Ordering::Release);
+        // Before the wake below, and before a failure is registered, so the
+        // pass either starts may ask again.
+        queued.store(false, Ordering::SeqCst);
         // A table dropped since the request was queued has nothing to flush.
         let Some(result) = result else {
             continue;
@@ -630,9 +634,10 @@ fn flush_worker_loop(
                 );
                 // Retried on the monitor's next pass, which the next write or
                 // flush starts, or room coming back on a capped endpoint
-                // ([`Footprints::flush_stalled`]); waking it now would retry
-                // a failing disk in a loop.
-                footprints.flush_stalled();
+                // since the flush started ([`FlushAttempt::failed`], after
+                // `queued` is clear); waking it now would retry a failing
+                // disk in a loop.
+                attempt.failed();
                 continue;
             }
         }

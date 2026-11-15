@@ -1024,23 +1024,99 @@ pub struct Footprints {
 /// lets the journal segments it covers go, which hands room back. Whoever
 /// met the limit raises it, so room comes back without that caller owning
 /// a flush.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Squeeze {
     requested: AtomicBool,
     wake: parking_lot::RwLock<Option<Arc<coordinode_core::txn::wake::Wake>>>,
     /// A flush failed; the monitor is woken to try it again once room comes
     /// back on an endpoint or a limit changes, not before.
     stalled: AtomicBool,
+    /// Flushes running now, whose failure must see a change of room that
+    /// happened while they ran ([`FlushAttempt`]).
+    attempts: AtomicU32,
+    /// Counts the changes of room seen while a flush ran or one was stalled.
+    epoch: AtomicU64,
+    /// Run when a flush failed, before it is registered as stalled.
+    #[cfg(test)]
+    on_failed: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
+}
+
+impl std::fmt::Debug for Squeeze {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Squeeze")
+            .field("stalled", &self.stalled.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+std::thread_local! {
+    /// Whether this thread runs a flush attempt ([`FlushAttempt`]): room its
+    /// own output gives back is no reason to try it again.
+    static ATTEMPTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Squeeze {
     /// Room came back or a limit changed: wake the monitor for a flush that
-    /// failed, once.
+    /// failed, once. Nothing to do, two loads, while no flush runs or waits.
+    /// An admission given back is not room for a flush, which is held to
+    /// what is charged only ([`Footprint::take`]), and wakes nothing.
     fn room_changed(&self) {
-        if self.stalled.swap(false, Ordering::AcqRel)
-            && let Some(wake) = self.wake.read().as_ref()
+        if ATTEMPTING.get()
+            || (self.attempts.load(Ordering::SeqCst) == 0 && !self.stalled.load(Ordering::SeqCst))
         {
+            return;
+        }
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        if self.stalled.swap(false, Ordering::SeqCst) {
+            self.wake();
+        }
+    }
+
+    fn wake(&self) {
+        if let Some(wake) = self.wake.read().as_ref() {
             wake.notify();
+        }
+    }
+}
+
+/// One flush run under the footprints: started before the flush, so a
+/// change of room while it runs is not lost if it then fails.
+#[must_use = "an attempt ends when it fails or drops"]
+pub(crate) struct FlushAttempt {
+    squeeze: Option<Arc<Squeeze>>,
+    /// The room changes counted when it started.
+    started_at: u64,
+    was: bool,
+}
+
+impl FlushAttempt {
+    /// The flush failed. Called once whoever asks for flushes can see it is
+    /// not queued: registers it as stalled, so the next change of room wakes
+    /// the monitor, and wakes it at once if room changed while it ran.
+    pub(crate) fn failed(mut self) {
+        ATTEMPTING.set(self.was);
+        let Some(squeeze) = self.squeeze.take() else {
+            return;
+        };
+        #[cfg(test)]
+        if let Some(hook) = squeeze.on_failed.lock().as_mut() {
+            hook();
+        }
+        squeeze.stalled.store(true, Ordering::SeqCst);
+        squeeze.attempts.fetch_sub(1, Ordering::SeqCst);
+        if squeeze.epoch.load(Ordering::SeqCst) != self.started_at
+            && squeeze.stalled.swap(false, Ordering::SeqCst)
+        {
+            squeeze.wake();
+        }
+    }
+}
+
+impl Drop for FlushAttempt {
+    fn drop(&mut self) {
+        if let Some(squeeze) = self.squeeze.take() {
+            ATTEMPTING.set(self.was);
+            squeeze.attempts.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -1076,10 +1152,34 @@ impl Footprints {
         *self.squeeze.wake.write() = Some(wake);
     }
 
-    /// A flush failed: try it again once room comes back on an endpoint or a
-    /// limit changes.
-    pub(crate) fn flush_stalled(&self) {
-        self.squeeze.stalled.store(true, Ordering::Release);
+    /// Start a flush; see [`FlushAttempt`]. Without a hard limit nothing is
+    /// tracked.
+    pub(crate) fn flush_attempt(&self) -> FlushAttempt {
+        if self.endpoints.is_empty() {
+            return FlushAttempt {
+                squeeze: None,
+                started_at: 0,
+                was: false,
+            };
+        }
+        self.squeeze.attempts.fetch_add(1, Ordering::SeqCst);
+        FlushAttempt {
+            squeeze: Some(Arc::clone(&self.squeeze)),
+            started_at: self.squeeze.epoch.load(Ordering::SeqCst),
+            was: ATTEMPTING.replace(true),
+        }
+    }
+
+    /// Whether a failed flush waits for room to come back.
+    #[cfg(test)]
+    pub(crate) fn flush_stalled(&self) -> bool {
+        self.squeeze.stalled.load(Ordering::SeqCst)
+    }
+
+    /// Run `hook` when a flush failed, before it is registered as stalled.
+    #[cfg(test)]
+    pub(crate) fn on_flush_failed(&self, hook: impl FnMut() + Send + 'static) {
+        *self.squeeze.on_failed.lock() = Some(Box::new(hook));
     }
 
     /// Ask for every memtable holding data to be flushed: a write met a hard

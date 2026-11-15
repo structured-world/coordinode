@@ -2243,33 +2243,117 @@ fn a_flush_short_of_room_runs_again_once_room_comes_back() {
     }
     let footprints = engine.footprints().clone();
     let footprint = Arc::clone(footprints.get("default").expect("a limit"));
-    // Everything the endpoint may still hold, taken by another file.
     let scratch = dir.path().join("scratch");
-    let output = footprints.file(&scratch).expect("a charge");
+    let output = fill_with_scratch(&footprints, &footprint, &scratch);
+    let (failed, failures) = std::sync::mpsc::channel();
+    footprints.on_flush_failed(move || {
+        // A failure after the test stopped listening tells nobody.
+        if failed.send(()).is_err() {}
+    });
+
+    let node = engine.tree(Partition::Node).expect("node tree");
+    node.rotate_memtable();
+    footprints.squeeze();
+    failures
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the flush failed");
+    await_stalled(&footprints);
+    assert_eq!(node.sealed_memtable_count(), 1, "the failed flush kept it");
+    assert_eq!(footprint.limit(), LIMIT, "the limit stays");
+
+    footprints.removed(&scratch);
+    drop(output);
+    await_flushed(node, "the flush never ran again once room came back");
+}
+
+/// Room freed in the moment between a flush's failure and its registration
+/// as stalled still wakes it: the change is not lost to the registration
+/// coming after it. Before, the release saw no stalled flush and woke
+/// nobody, then the failure registered and waited for a change already past.
+#[test]
+fn room_freed_while_a_failed_flush_registers_still_wakes_it() {
+    use lsm_tree::AbstractTree;
+    const LIMIT: u64 = 64 << 20;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    for index in 1..=8 {
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+    }
+    // Every other tree flushed: the node tree's flush is the only one, so no
+    // other flush finishing wakes the monitor.
+    engine.persist().expect("persist");
+    for index in 0..8u32 {
+        engine
+            .put(
+                Partition::Node,
+                format!("node:1:only{index}").as_bytes(),
+                &vec![u8::try_from(index).expect("small"); 16 << 10],
+            )
+            .expect("put");
+    }
+    let footprints = engine.footprints().clone();
+    let footprint = Arc::clone(footprints.get("default").expect("a limit"));
+    let scratch = dir.path().join("scratch");
+    let output = fill_with_scratch(&footprints, &footprint, &scratch);
+    // The room comes back on another thread exactly between the failure and
+    // its registration, and is waited for there.
+    let release = std::sync::Mutex::new(Some((footprints.clone(), scratch, output)));
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&released);
+    footprints.on_flush_failed(move || {
+        if let Some((footprints, scratch, output)) = release.lock().expect("lock").take() {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                footprints.removed(&scratch);
+                drop(output);
+            })
+            .join()
+            .expect("release");
+        }
+    });
+
+    let node = engine.tree(Partition::Node).expect("node tree");
+    node.rotate_memtable();
+    footprints.squeeze();
+    await_flushed(node, "room freed before the failure registered was lost");
+    assert!(
+        released.load(std::sync::atomic::Ordering::SeqCst),
+        "the flush failed and the room came back inside its failure"
+    );
+}
+
+/// Take everything the endpoint may still hold with a file at `scratch`.
+fn fill_with_scratch(
+    footprints: &crate::engine::footprint::Footprints,
+    footprint: &crate::engine::footprint::Footprint,
+    scratch: &std::path::Path,
+) -> Arc<crate::engine::footprint::FileCharge> {
+    let output = footprints.file(scratch).expect("a charge");
     let grown = (0..100).any(|_| {
         let room = footprint.enforced_limit() - footprint.charged();
         output.grow_to(output.bytes() + room - room % 4096).is_ok()
     });
     assert!(grown, "the scratch file takes the room");
+    output
+}
 
-    let node = engine.tree(Partition::Node).expect("node tree");
-    node.rotate_memtable();
-    footprints.squeeze();
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    assert_eq!(node.sealed_memtable_count(), 1, "the flush did not fit");
-    assert_eq!(footprint.limit(), LIMIT, "the limit stays");
-
-    footprints.removed(&scratch);
-    drop(output);
+/// Wait until a failed flush is registered as stalled.
+fn await_stalled(footprints: &crate::engine::footprint::Footprints) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while node.sealed_memtable_count() > 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the flush never ran again once room came back"
-        );
+    while !footprints.flush_stalled() {
+        assert!(std::time::Instant::now() < deadline, "never registered");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Wait until `tree` holds no sealed memtable and a table.
+fn await_flushed(tree: &impl lsm_tree::AbstractTree, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tree.sealed_memtable_count() > 0 {
+        assert!(std::time::Instant::now() < deadline, "{what}");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(node.table_count() > 0, "the memtable became a table");
+    assert!(tree.table_count() > 0, "the memtable became a table");
 }
 
 /// Persist `engine` as an operator of a full store does: a barrier short of

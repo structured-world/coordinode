@@ -523,13 +523,12 @@ fn a_restore_past_the_cap_is_refused_without_passing_it() {
     assert_eq!(count(&mut db), 20);
 }
 
-/// A compaction in progress takes every byte the account shows free, and a
-/// barrier then runs: it may be refused for want of room, but nothing
-/// acknowledged is lost or undone. Once the compaction's output goes, the
-/// barrier lands, and every row reads back after the store reopens.
+/// Another file takes every byte the endpoint may still hold and a barrier
+/// then runs: it is refused for want of room, and nothing acknowledged is
+/// lost or undone. Closed that way and reopened once the file is gone, the
+/// store reads every row back from its journal and the barrier lands.
 #[test]
 fn a_barrier_short_of_room_loses_nothing_and_lands_once_room_comes_back() {
-    use coordinode_storage::engine::footprint::MaintenanceScope;
     let dir = tempfile::tempdir().unwrap();
     {
         let mut db = Database::open_with_config(capped(dir.path())).unwrap();
@@ -540,39 +539,38 @@ fn a_barrier_short_of_room_loses_nothing_and_lands_once_room_comes_back() {
         let footprints = db.engine().footprints().clone();
         let footprint =
             std::sync::Arc::clone(footprints.iter().next().expect("the capped endpoint"));
-        // A compaction in progress growing its output into every byte it may
-        // take, held while the barrier runs.
+        // Another file growing into every byte the endpoint may still hold,
+        // held while the barrier runs: the barrier has no room at all.
         let scratch = dir.path().join("compaction-output");
         let output = footprints
             .file(&scratch)
             .expect("a charge under the endpoint");
-        {
-            let _compaction = MaintenanceScope::enter();
-            // Background work may move the room between the read and the growth.
-            let grown = (0..100).any(|_| {
-                let room = footprint.room();
-                output.grow_to(output.bytes() + room - room % 4096).is_ok()
-            });
-            assert!(grown, "a compaction takes the room it is shown");
-        }
+        // Background work may move the room between the read and the growth.
+        let grown = (0..100).any(|_| {
+            let room = footprint.enforced_limit() - footprint.charged();
+            output.grow_to(output.bytes() + room - room % 4096).is_ok()
+        });
+        assert!(grown, "the file takes the room");
         let short = db.engine().persist();
         assert!(
-            short.is_ok()
-                || short
-                    .as_ref()
-                    .is_err_and(|e| e.to_string().contains("limit")),
-            "a barrier short of room fails as a capacity refusal: {short:?}"
+            short
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("limit")),
+            "a barrier with no room is refused as the limit: {short:?}"
         );
         assert_eq!(count(&mut db), 8, "nothing acknowledged is lost");
+        // Closed with the barrier refused: what it was to write is only in
+        // the journal.
+        drop(db);
         footprints.removed(&scratch);
         drop(output);
-        db.engine()
-            .persist()
-            .expect("the barrier lands once room comes back");
-        assert_within(dir.path(), "after the barrier");
     }
     let mut db = Database::open_with_config(capped(dir.path())).unwrap();
     assert_eq!(count(&mut db), 8, "every row after the store reopened");
+    db.engine()
+        .persist()
+        .expect("the barrier lands once room comes back");
+    assert_within(dir.path(), "after the barrier");
 }
 
 /// Run `statement`, which a raised limit admits: a compaction the full
