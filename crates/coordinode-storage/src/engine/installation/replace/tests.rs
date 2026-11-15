@@ -190,6 +190,29 @@ fn a_read_below_the_replacement_history_is_refused() {
         engine.snapshot_get(&early, Partition::Idx, &a),
         Err(StorageError::SnapshotOutsideRetention { .. })
     ));
+    // A transaction reading at either snapshot is answered the same way,
+    // through both its tracked and its untracked read.
+    let ts = coordinode_core::txn::timestamp::Timestamp::from_raw;
+    let mut at_from =
+        crate::engine::transaction::Transaction::new(&engine, None, ts(from), Some(from));
+    assert_eq!(
+        at_from.get(Partition::Idx, &a).expect("read"),
+        Some(b"a2".to_vec())
+    );
+    assert_eq!(
+        at_from.read_untracked(Partition::Idx, &a).expect("read"),
+        Some(b"a2".to_vec())
+    );
+    let mut at_early =
+        crate::engine::transaction::Transaction::new(&engine, None, ts(early), Some(early));
+    assert!(matches!(
+        at_early.get(Partition::Idx, &a),
+        Err(StorageError::SnapshotOutsideRetention { .. })
+    ));
+    assert!(matches!(
+        at_early.read_untracked(Partition::Idx, &a),
+        Err(StorageError::SnapshotOutsideRetention { .. })
+    ));
 }
 
 /// A history that ends before the point the replacement was registered at

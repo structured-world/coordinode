@@ -994,10 +994,10 @@ impl<'a> Transaction<'a> {
         // conflicts are the opt-in serializable level's and FOR UPDATE's job,
         // which re-introduce tracking selectively through `ensure_occ_scope`.
         match self.snapshot {
-            Some(snap) => Ok(self
+            // One copy, straight from the tree's value into the owned result.
+            Some(snap) => self
                 .engine
-                .snapshot_get(&snap, part, key)?
-                .map(|b| b.to_vec())),
+                .with_snapshot_value(&snap, part, key, |v| v.map(<[u8]>::to_vec)),
             None => Ok(self.engine.get(part, key)?.map(|b| b.to_vec())),
         }
     }
@@ -1097,10 +1097,10 @@ impl<'a> Transaction<'a> {
             return Ok(buffered.clone());
         }
         match self.snapshot {
-            Some(snap) => Ok(self
+            // One copy, straight from the tree's value into the owned result.
+            Some(snap) => self
                 .engine
-                .snapshot_get(&snap, part, key)?
-                .map(|b| b.to_vec())),
+                .with_snapshot_value(&snap, part, key, |v| v.map(<[u8]>::to_vec)),
             None => Ok(self.engine.get(part, key)?.map(|b| b.to_vec())),
         }
     }

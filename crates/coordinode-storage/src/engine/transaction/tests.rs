@@ -1048,6 +1048,76 @@ fn delete_buffers_tombstone_visible_to_own_read() {
     assert_eq!(txn.get(Partition::Node, b"k").unwrap(), None);
 }
 
+/// A transaction's snapshot reads, tracked and untracked, answer from what
+/// was committed before the snapshot: a value, a delete, nothing written
+/// after; its own writes shadow them; and a snapshot whose history the
+/// engine no longer retains is refused rather than answered.
+#[test]
+fn snapshot_reads_answer_committed_state_and_refuse_collected_history() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    let mut setup = mvcc_txn(&engine, &oracle);
+    setup.put(Partition::Node, b"kept", b"v1").unwrap();
+    setup.put(Partition::Node, b"gone", b"v1").unwrap();
+    setup.commit(&ctx).expect("commit");
+    let mut removal = mvcc_txn(&engine, &oracle);
+    removal.delete(Partition::Node, b"gone").unwrap();
+    removal.commit(&ctx).expect("commit");
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    let mut later = mvcc_txn(&engine, &oracle);
+    later.put(Partition::Node, b"kept", b"after").unwrap();
+    later.commit(&ctx).expect("commit");
+
+    for read in [
+        txn.get(Partition::Node, b"kept").unwrap(),
+        txn.read_untracked(Partition::Node, b"kept").unwrap(),
+    ] {
+        assert_eq!(read.as_deref(), Some(&b"v1"[..]), "the snapshot's value");
+    }
+    assert_eq!(txn.get(Partition::Node, b"gone").unwrap(), None);
+    assert_eq!(txn.read_untracked(Partition::Node, b"gone").unwrap(), None);
+    txn.put(Partition::Node, b"kept", b"mine").unwrap();
+    txn.put(Partition::Node, b"gone", b"back").unwrap();
+    assert_eq!(
+        txn.read_untracked(Partition::Node, b"kept")
+            .unwrap()
+            .as_deref(),
+        Some(&b"mine"[..])
+    );
+    assert_eq!(
+        txn.get(Partition::Node, b"gone").unwrap().as_deref(),
+        Some(&b"back"[..])
+    );
+    txn.delete(Partition::Node, b"kept").unwrap();
+    assert_eq!(txn.get(Partition::Node, b"kept").unwrap(), None);
+    assert_eq!(txn.read_untracked(Partition::Node, b"kept").unwrap(), None);
+
+    // A snapshot below the retention watermark: nothing retains its history.
+    engine.set_retention_window(std::time::Duration::ZERO);
+    engine.advance_gc_watermark();
+    let collected = 1;
+    let mut old = Transaction::new(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(collected),
+        Some(collected),
+    );
+    assert!(matches!(
+        old.get(Partition::Node, b"kept"),
+        Err(StorageError::SnapshotOutsideRetention { .. })
+    ));
+    assert!(matches!(
+        old.read_untracked(Partition::Node, b"kept"),
+        Err(StorageError::SnapshotOutsideRetention { .. })
+    ));
+}
+
 #[test]
 fn get_absent_key_returns_none() {
     let (engine, oracle, _d) = test_engine();
