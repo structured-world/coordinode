@@ -646,7 +646,7 @@ pub fn decode_proposal_sized(
     frame: &[u8],
     limits: &DecodeLimits,
 ) -> Result<(RaftProposal, usize), FrameError> {
-    decode_with(frame, limits, Objects::Decode)
+    decode_with::<true>(frame, limits)
 }
 
 /// [`decode_proposal_sized`] for a reader that keeps only the row changes
@@ -662,20 +662,14 @@ pub fn decode_proposal_rows(
     frame: &[u8],
     limits: &DecodeLimits,
 ) -> Result<(RaftProposal, usize), FrameError> {
-    decode_with(frame, limits, Objects::Skip)
+    decode_with::<false>(frame, limits)
 }
 
-/// Whether a decoder builds the objects of commands and DERIVED work.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Objects {
-    Decode,
-    Skip,
-}
-
-fn decode_with(
+// The caller chooses its projection once; decoding ordinary proposals has
+// no runtime projection mode to inspect for each operation.
+fn decode_with<const OBJECTS: bool>(
     frame: &[u8],
     limits: &DecodeLimits,
-    objects: Objects,
 ) -> Result<(RaftProposal, usize), FrameError> {
     if frame.len() > limits.max_frame_bytes {
         return Err(FrameError::OverLimit {
@@ -711,13 +705,12 @@ fn decode_with(
         return Err(FrameError::Truncated { at: r.at });
     }
 
-    let mut decoder = Decoder {
+    let mut decoder = Decoder::<OBJECTS> {
         reader: r,
         last_key: Default::default(),
         literals: Vec::new(),
         expanded: 0,
         limit: limits.max_expanded_bytes,
-        objects,
     };
     let mut mutations = Vec::with_capacity(op_count);
     for _ in 0..op_count {
@@ -797,16 +790,15 @@ impl<'a> Reader<'a> {
     }
 }
 
-struct Decoder<'a> {
+struct Decoder<'a, const OBJECTS: bool> {
     reader: Reader<'a>,
     last_key: [Vec<u8>; PARTITIONS.len()],
     literals: Vec<&'a [u8]>,
     expanded: usize,
     limit: usize,
-    objects: Objects,
 }
 
-impl<'a> Decoder<'a> {
+impl<'a, const OBJECTS: bool> Decoder<'a, OBJECTS> {
     /// Count `n` more expanded bytes against the budget, before they are
     /// allocated.
     fn spend(&mut self, n: usize) -> Result<(), FrameError> {
@@ -830,7 +822,7 @@ impl<'a> Decoder<'a> {
             if tag != KIND_DERIVE {
                 return Err(FrameError::UnknownTag(tag));
             }
-            if self.objects == Objects::Skip {
+            if !OBJECTS {
                 self.skip_derive()?;
                 return Ok(None);
             }
@@ -844,7 +836,7 @@ impl<'a> Decoder<'a> {
             }
             let len = self.reader.len_at_most(self.limit, "command size")?;
             let bytes = self.reader.take(len)?;
-            if self.objects == Objects::Skip {
+            if !OBJECTS {
                 return Ok(None);
             }
             self.spend(len)?;
