@@ -1413,6 +1413,92 @@ async fn a_group_stopped_at_once_exits() {
     assert!(a && b && c, "exited: n1 {a}, n2 {b}, n3 {c}");
 }
 
+/// A member asked to stop leaves consensus first, then closes its
+/// connections. A leader hands its leadership over while the connections its
+/// peers and a client hold to it stay open: another member leads well inside
+/// the drain window (15 s), writes go on there, what the old leader
+/// acknowledged is read there, and the old leader exits on its own once its
+/// client's connection is drained. Before, its consensus ran on, leading,
+/// until every connection had closed or the process was killed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_leader_hands_over_before_the_drain_window() {
+    let (mut n1, n2, n3) = three_member_group().await;
+    // Peers' streams in use: a write a follower passes on to the leader.
+    let acknowledged = cypher_write_on(&n2, "CREATE (:Handed {k: 1})")
+        .await
+        .expect("a write through a follower");
+    // A client connection held open on the leader across its stop.
+    let mut client = n1.cypher_client().await;
+    client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:Handed) RETURN n.k".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("a read on the leader");
+
+    let asked = std::time::Instant::now();
+    n1.request_stop();
+    let mut status = n2.cluster_client().await;
+    let handed_over = loop {
+        let leader = status
+            .get_cluster_status(GetClusterStatusRequest {})
+            .await
+            .map(|s| s.into_inner().leader_id)
+            .unwrap_or_default();
+        if leader == "2" || leader == "3" {
+            break asked.elapsed();
+        }
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "node 1 still led {:?} after it was asked to stop (leader {leader:?})",
+            asked.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    eprintln!("another member led {handed_over:?} after the stop request");
+
+    let after = cypher_write_on(&n2, "CREATE (:AfterHandOver {k: 1})")
+        .await
+        .expect("writes go on after the hand-over");
+    let rows = cypher_after_on(&n3, "MATCH (n:Handed) RETURN n.k", after.max(acknowledged))
+        .await
+        .expect("the acknowledged write is read after the hand-over");
+    assert_eq!(rows.len(), 1, "the acknowledged write after the hand-over");
+    drop(client);
+    assert!(
+        n1.exits_within(Duration::from_secs(20)).await,
+        "the old leader was still running {:?} after it was asked to stop",
+        asked.elapsed()
+    );
+}
+
+/// A follower asked to stop leaves consensus first as well: it exits well
+/// inside the drain window while the leader's streams to it stay open, and
+/// the group goes on writing with the two members left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_follower_exits_before_the_drain_window() {
+    let (n1, n2, mut n3) = three_member_group().await;
+    cypher_write_on(&n1, "CREATE (:Before {k: 1})")
+        .await
+        .expect("the leader writes");
+
+    let asked = std::time::Instant::now();
+    n3.request_stop();
+    assert!(
+        n3.exits_within(Duration::from_secs(8)).await,
+        "the follower was still running {:?} after it was asked to stop",
+        asked.elapsed()
+    );
+    let after = cypher_write_on(&n1, "CREATE (:After {k: 1})")
+        .await
+        .expect("the group writes with two members");
+    let rows = cypher_after_on(&n2, "MATCH (n:After) RETURN n.k", after)
+        .await
+        .expect("the other follower reads it");
+    assert_eq!(rows.len(), 1);
+}
+
 /// A client works through whichever member it reached: a session on a
 /// follower opens and fills a transaction held by the leader, a second
 /// session on another member continues the transaction the first one began

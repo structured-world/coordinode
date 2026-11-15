@@ -79,6 +79,15 @@ impl CommandSlots {
     pub fn available(&self) -> usize {
         self.member.available_permits()
     }
+
+    /// Take no more commands: every later [`Self::take`] and session take
+    /// is refused, from every way commands reach the member, while the
+    /// commands holding a slot run to their end. A member that stops closes
+    /// its slots before it stops its consensus. Rollbacks, which hold no
+    /// member slot, still run.
+    pub fn close(&self) {
+        self.member.close();
+    }
 }
 
 /// The slots of one session: at most its own number of commands at once, and

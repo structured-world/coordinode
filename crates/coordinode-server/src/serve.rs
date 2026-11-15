@@ -1412,6 +1412,10 @@ pub(crate) async fn serve(
     let mut fatal_watch = fatal_rx.clone();
     // Set once the stop starts: the drain window counts from it.
     let (stopping_tx, stopping_rx) = tokio::sync::watch::channel(false);
+    // The member leaves consensus once, whichever way the serving ends.
+    let consensus_stop = ConsensusStop::new(Arc::clone(&raft_node));
+    let stopping_consensus = consensus_stop.clone();
+    let command_slots = member.command_slots().clone();
     let shutdown = async move {
         tokio::select! {
             () = signals => {}
@@ -1422,6 +1426,14 @@ pub(crate) async fn serve(
         // First, so /ready turns a balancer away while in-flight RPCs drain.
         shutdown_readiness.set(false);
         stopping_tx.send_replace(true);
+        // No new commands, from clients or routed by peers; those running
+        // end as they do.
+        command_slots.close();
+        // Consensus stops while the server still serves: a leader hands its
+        // leadership over through the peers' connections, which only close
+        // after this. Waiting for them first would keep a member that no
+        // longer takes connections in the group, leading, until they did.
+        stopping_consensus.stop().await;
     };
     let grace = std::time::Duration::from_secs(shutdown_grace_secs.map_or(15, |s| s.get()));
 
@@ -1663,16 +1675,18 @@ pub(crate) async fn serve(
     // arrive now are accepted as soon as the server below starts polling.
     tracing::debug!(target: "coordinode::startup", "serving");
     readiness.set(true);
-    match shared_port {
+    let served = match shared_port {
         Some((context, accept)) => {
-            let incoming = coordinode_wire::peer::incoming(grpc_listener, &context, accept)
-                .map_err(|e| format!("gRPC port TLS configuration: {e}"))?;
-            drain_within(
-                router.serve_with_incoming_shutdown(incoming, shutdown),
-                stopping_rx,
-                grace,
-            )
-            .await?;
+            match coordinode_wire::peer::incoming(grpc_listener, &context, accept) {
+                Ok(incoming) => drain_within(
+                    router.serve_with_incoming_shutdown(incoming, shutdown),
+                    stopping_rx,
+                    grace,
+                )
+                .await
+                .map_err(|e| e.to_string()),
+                Err(e) => Err(format!("gRPC port TLS configuration: {e}")),
+            }
         }
         None => {
             let incoming =
@@ -1682,9 +1696,14 @@ pub(crate) async fn serve(
                 stopping_rx,
                 grace,
             )
-            .await?;
+            .await
+            .map_err(|e| e.to_string())
         }
-    }
+    };
+    // A serving that ended without a stop request, or failed, still leaves
+    // consensus before the member closes.
+    consensus_stop.stop().await;
+    served?;
     // The member's background work finishes the pass it is in, then the
     // member closes off the async runtime: closing joins its threads.
     member.stop_background().await;
@@ -1725,6 +1744,37 @@ async fn drain_within<E>(
             );
             Ok(())
         }
+    }
+}
+
+/// Stopping the member's consensus, at most once: on the stop request while
+/// the server still serves, or after the serving ended when it ended
+/// otherwise. A stopped consensus hands leadership over when it leads and
+/// keeps the member's membership.
+#[derive(Clone)]
+struct ConsensusStop {
+    node: Arc<coordinode_raft::cluster::RaftNode>,
+    stopped: Arc<tokio::sync::OnceCell<()>>,
+}
+
+impl ConsensusStop {
+    fn new(node: Arc<coordinode_raft::cluster::RaftNode>) -> Self {
+        Self {
+            node,
+            stopped: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    /// Stop the consensus, or wait for the stop already under way.
+    async fn stop(&self) {
+        self.stopped
+            .get_or_init(|| async {
+                info!("stopping consensus before closing connections");
+                if let Err(e) = self.node.shutdown().await {
+                    tracing::warn!(%e, "consensus did not stop cleanly");
+                }
+            })
+            .await;
     }
 }
 
