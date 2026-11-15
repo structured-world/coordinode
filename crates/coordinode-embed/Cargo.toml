@@ -191,6 +191,11 @@ harness = false
 name = "schema_package"
 harness = false
 
+# What ordinary writes cost, through to a store at rest.
+[[bench]]
+name = "write_cost"
+harness = false
+
 # A command routed to the leader against the same command run there.
 [[bench]]
 name = "routing"
