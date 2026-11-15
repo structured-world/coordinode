@@ -5,6 +5,8 @@
 //! `statement_cost_alloc`.
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
+use std::time::{Duration, Instant};
+
 #[path = "support/statement_cost.rs"]
 mod statement_cost;
 
@@ -18,38 +20,49 @@ fn cpu() -> Option<f64> {
     Some(ticks as f64 / 100.0)
 }
 
-fn main() {
-    let advisory = std::env::var("STATEMENT_COST_ADVISORY").as_deref() != Ok("off");
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = statement_cost::open(dir.path(), advisory);
-    let mode = if advisory { "on" } else { "off" };
-    let mut run = |label: &str,
-                   times: &mut dyn FnMut(
-        &mut dyn FnMut(&mut dyn FnMut()),
-    ) -> Vec<std::time::Duration>| {
-        let mut wall = std::time::Duration::ZERO;
-        let (mut cpu0, mut cpu1) = (None, None);
-        let times = times(&mut |f| {
-            cpu0 = cpu();
-            let started = std::time::Instant::now();
-            f();
-            wall = started.elapsed();
-            cpu1 = cpu();
-        });
+/// The wall time and process CPU of the measured part, around which a
+/// scenario calls this.
+#[derive(Default)]
+struct Spent {
+    wall: Duration,
+    cpu: Option<f64>,
+}
+
+impl Spent {
+    fn measure(&mut self, f: &mut dyn FnMut()) {
+        let cpu0 = cpu();
+        let started = Instant::now();
+        f();
+        self.wall = started.elapsed();
+        self.cpu = cpu0.zip(cpu()).map(|(a, b)| b - a);
+    }
+
+    fn report(&self, mode: &str, label: &str, times: Vec<Duration>) {
         let ops = times.len() as f64;
-        let cpu = match (cpu0, cpu1) {
-            (Some(a), Some(b)) => format!("{:.1} us cpu/op", (b - a) * 1e6 / ops),
-            _ => "cpu n/a".to_string(),
-        };
+        let cpu = self.cpu.map_or_else(
+            || "cpu n/a".to_string(),
+            |c| format!("{:.1} us cpu/op", c * 1e6 / ops),
+        );
         println!(
             "advisory={mode} {label}: n={} {:.1} us/op {cpu} {}",
             times.len(),
-            wall.as_secs_f64() * 1e6 / ops,
+            self.wall.as_secs_f64() * 1e6 / ops,
             statement_cost::percentiles(times)
         );
-    };
-    run("read", &mut |around| statement_cost::reads(&mut db, around));
-    run("create/update/delete", &mut |around| {
-        statement_cost::writes(&mut db, around)
-    });
+    }
+}
+
+fn main() {
+    let advisory = std::env::var("STATEMENT_COST_ADVISORY").as_deref() != Ok("off");
+    let mode = if advisory { "on" } else { "off" };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = statement_cost::open(dir.path(), advisory);
+
+    let mut spent = Spent::default();
+    let times = statement_cost::reads(&mut db, &mut |f| spent.measure(f));
+    spent.report(mode, "read", times);
+
+    let mut spent = Spent::default();
+    let times = statement_cost::writes(&mut db, &mut |f| spent.measure(f));
+    spent.report(mode, "create/update/delete", times);
 }
