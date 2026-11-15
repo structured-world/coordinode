@@ -51,16 +51,6 @@ impl From<AppendReply> for AppendResult<TypeConfig> {
     }
 }
 
-impl AppendReply {
-    /// The index of the last entry the follower accepted, if it accepted any.
-    pub(crate) fn matched(&self) -> Option<u64> {
-        match self {
-            Self::Accepted(accepted) => accepted.map(|id| id.index),
-            Self::Conflict { .. } | Self::HigherVote(_) => None,
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;

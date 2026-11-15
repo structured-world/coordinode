@@ -181,8 +181,6 @@ pub struct GrpcNetworkFactory {
     pub(crate) connections: Arc<PeerConnections>,
     /// The members as the membership in effect records them.
     pub(crate) book: Arc<MemberBook>,
-    /// Where each peer's reported client grant is recorded.
-    pub(crate) grants: Arc<super::grants::LeaderGrants>,
 }
 
 impl RaftNetworkFactory<C> for GrpcNetworkFactory {
@@ -200,7 +198,6 @@ impl RaftNetworkFactory<C> for GrpcNetworkFactory {
             gate: Arc::clone(&self.gate),
             deployment: self.deployment.clone(),
             connections: Arc::clone(&self.connections),
-            grants: Arc::clone(&self.grants),
         }
     }
 }
@@ -244,8 +241,6 @@ pub struct GrpcNetwork {
     deployment: DeploymentView,
     /// The connections calls travel over.
     connections: Arc<PeerConnections>,
-    /// Where the peer's reported client grant is recorded.
-    grants: Arc<super::grants::LeaderGrants>,
 }
 
 impl GrpcNetwork {
@@ -403,7 +398,6 @@ impl NetVote<C> for GrpcNetwork {
                 RaftPayload {
                     data: serialize(&rpc)?,
                     group: self.group,
-                    grant: None,
                 },
             );
             let client = self.get_client().await?;
@@ -436,7 +430,6 @@ impl NetVote<C> for GrpcNetwork {
                 RaftPayload {
                     data: serialize(&rpc)?,
                     group: self.group,
-                    grant: None,
                 },
             );
             let client = self.get_client().await?;
@@ -472,12 +465,6 @@ impl NetStreamAppend<C> for GrpcNetwork {
         let closing = self.closing.clone();
         let gate = Arc::clone(&self.gate);
         let deployment = self.deployment.clone();
-        let grants = Arc::clone(&self.grants);
-        // The term each request of the stream was sent in, oldest first: the
-        // peer answers the requests in order, one reply each, and a reply's
-        // grant belongs to the leadership its request was sent under.
-        let sent_terms: Arc<parking_lot::Mutex<std::collections::VecDeque<u64>>> = Arc::default();
-        let terms_in = Arc::clone(&sent_terms);
         Box::pin(async move {
             // The first request before anything else: openraft sleeps out the
             // replication backoff inside the request stream, so a stream that
@@ -501,13 +488,8 @@ impl NetStreamAppend<C> for GrpcNetwork {
                     futures_util::future::ready(!super::nemesis::is_blocked(local, target))
                 })
                 .map(move |req| {
-                    terms_in.lock().push_back(req.vote.leader_id().term);
                     let data = rmp_serde::to_vec(&req).unwrap_or_default();
-                    RaftPayload {
-                        data,
-                        group,
-                        grant: None,
-                    }
+                    RaftPayload { data, group }
                 });
 
             // Call bidi streaming RPC
@@ -523,8 +505,6 @@ impl NetStreamAppend<C> for GrpcNetwork {
             // Map response stream: RaftPayload → AppendReply → AppendResult.
             // A reply across a blocked link is lost, as it would be on the wire.
             let output = response.into_inner().map(move |result| {
-                // The request this reply answers, whatever the reply says.
-                let term = sent_terms.lock().pop_front();
                 if super::nemesis::is_blocked(target, local) {
                     return Err(RPCError::Unreachable(Unreachable::new(
                         &std::io::Error::new(
@@ -535,9 +515,6 @@ impl NetStreamAppend<C> for GrpcNetwork {
                 }
                 let payload = result.map_err(tonic_to_rpc_error)?;
                 let reply: AppendReply = deserialize(&payload.data)?;
-                if let Some(term) = term {
-                    grants.report(term, target, payload.grant);
-                }
                 Ok(AppendResult::from(reply))
             });
 
@@ -654,11 +631,7 @@ impl NetSnapshot<C> for GrpcNetwork {
             move |chunk| async move {
                 let message = crate::snapshot::SnapshotChunkMessage::DataChunk(chunk);
                 match rmp_serde::to_vec(&message) {
-                    Ok(data) => Some(RaftPayload {
-                        data,
-                        group,
-                        grant: None,
-                    }),
+                    Ok(data) => Some(RaftPayload { data, group }),
                     Err(e) => {
                         tracing::warn!(%e, "encoding a snapshot chunk");
                         None
@@ -670,7 +643,6 @@ impl NetSnapshot<C> for GrpcNetwork {
             RaftPayload {
                 data: header_bytes,
                 group,
-                grant: None,
             }
         })
         .chain(chunks);
@@ -743,7 +715,6 @@ impl NetTransferLeader<C> for GrpcNetwork {
                 RaftPayload {
                     data: serialize(&req)?,
                     group: self.group,
-                    grant: None,
                 },
             );
             let client = self.get_client().await?;

@@ -21,6 +21,11 @@ fn make_test_trees() -> (HashMap<Partition, lsm_tree::AnyTree>, tempfile::TempDi
     (trees, dir)
 }
 
+/// `threshold` for every partition, none on a capped endpoint.
+fn uniform(threshold: u64) -> Arc<FlushThresholds> {
+    Arc::new(FlushThresholds::new(threshold, |_| None))
+}
+
 /// Start a manager with fresh wakes; returns the monitor's wake so a test can
 /// act as the write path.
 fn start(
@@ -35,7 +40,7 @@ fn start(
     let mgr = FlushManager::start(
         trees,
         GcWatermarks::uniform(gc_watermark),
-        threshold,
+        uniform(threshold),
         max_sealed,
         workers,
         max_age_secs,
@@ -89,7 +94,7 @@ fn unflushed_memtable_bytes_past_the_stop_level_stop_writes_until_flushed() {
     let mgr = FlushManager::start(
         &trees,
         GcWatermarks::uniform(&gc_watermark),
-        u64::MAX,
+        uniform(u64::MAX),
         usize::MAX,
         1,
         0,
@@ -130,6 +135,45 @@ fn unflushed_memtable_bytes_past_the_stop_level_stop_writes_until_flushed() {
         std::thread::sleep(Duration::from_millis(5));
     }
     drop(mgr);
+}
+
+/// A partition whose flushes land on an endpoint with a hard limit flushes
+/// its memtable at half that endpoint's recovery reserve, so the table fits
+/// where flushes run; a partition landing elsewhere keeps the configured
+/// size. With no reserve the configured size stays, never one that would
+/// flush every write, and a changed reserve is taken at the next refresh.
+#[test]
+fn a_capped_endpoint_brings_the_flush_threshold_of_its_partitions_down() {
+    use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let footprints = crate::engine::footprint::Footprints::open(&[EndpointConfig::new(
+        "capped",
+        dir.path(),
+        Media::Ssd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(64 << 20)
+    .with_recovery_reserve_bytes(4 << 20)])
+    .expect("footprints");
+    let capped = Arc::clone(footprints.get("capped").expect("a limit"));
+    let thresholds = FlushThresholds::new(64 << 20, |part| {
+        (part == Partition::Node).then(|| Arc::clone(&capped))
+    });
+    assert_eq!(thresholds.of(Partition::Node), 2 << 20);
+    assert_eq!(thresholds.of(Partition::Adj), 64 << 20, "another endpoint");
+
+    capped.set_limit(64 << 20, 0);
+    thresholds.refresh();
+    assert_eq!(thresholds.of(Partition::Node), 64 << 20, "no reserve");
+
+    capped.set_limit(64 << 20, 4096);
+    thresholds.refresh();
+    assert_eq!(
+        thresholds.of(Partition::Node),
+        MIN_LIMITED_FLUSH_BYTES,
+        "a tiny reserve does not flush every write"
+    );
 }
 
 #[test]
@@ -231,12 +275,12 @@ fn a_write_through_the_trigger_wakes_the_sleeping_monitor() {
     let tree = trees.get(&Partition::Node).expect("node tree").clone();
 
     let (mgr, wake) = start(&trees, &gc_watermark, 8, 100, 1, 0);
-    let trigger = FlushTrigger::new(wake, 8);
+    let trigger = FlushTrigger::new(wake, uniform(8));
     // Let the monitor find nothing and park with no deadline.
     std::thread::sleep(Duration::from_millis(100));
 
     let (added, memtable) = tree.insert(b"key1", b"a value longer than eight bytes", seqno.next());
-    trigger.wrote(added, memtable);
+    trigger.wrote(Partition::Node, added, memtable);
 
     let mut flushed = false;
     for _ in 0..50 {

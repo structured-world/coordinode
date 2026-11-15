@@ -1012,7 +1012,7 @@ impl LocalMultiModalCoordinator {
     ) -> StorageResult<()> {
         let tree = self.tree(part)?;
         let (added, memtable) = tree.insert(key, value, seqno);
-        self.flush_trigger.wrote(added, memtable);
+        self.flush_trigger.wrote(part, added, memtable);
         Ok(())
     }
 }

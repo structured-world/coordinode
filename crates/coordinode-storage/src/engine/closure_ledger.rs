@@ -56,10 +56,6 @@ const FORMAT: u8 = 2;
 /// The head record's length: the format byte and six fields.
 pub(crate) const HEAD_LEN: usize = 1 + 6 * 8;
 
-/// The room the removal of one breakpoint record takes once written: a
-/// tombstone for its key. Owed from the record's write until its removal.
-pub(crate) const BREAKPOINT_KEY_LEN: usize = BREAKPOINT_PREFIX.len() + 8;
-
 /// A log position where the commit ceiling rose, and the ceiling there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Breakpoint {

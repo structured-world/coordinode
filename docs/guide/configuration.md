@@ -154,7 +154,6 @@ the key is unset.
 | `scrub_throttle_ms` | `50` | restart | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
 | `maintenance_mb_per_sec` | unset (unthrottled) | live (`StorageEngine::set_maintenance_rate`, bytes per second) | MiB per second the node's background maintenance reads and writes at most: every compaction of every partition and `STORAGE COLUMNAR` table, and the scrub, draw from this one budget, so together they cannot saturate the disk the foreground needs. A budget too low for the write rate lets compaction fall behind until write backpressure engages. Unset or `0` leaves maintenance unthrottled. |
 | `maintenance_backoff_ms` | unset (off) | live (`StorageEngine::set_maintenance_backoff`) | Smoothed read latency, in ms, above which the maintenance budget backs off, down to 5% of its rate, until the device answers faster again; it climbs back once the latency is 20% under this. Applies only while `maintenance_mb_per_sec` sets a rate. Unset or `0` keeps the budget at its rate. |
-| `client_grant_mb` | `4` | live (`StorageEngine::set_client_grant`, bytes) | MiB a member of a replicated group keeps admitted ahead under its hard limit for the client writes its leader sends, and reports on every reply to the leader. The leader appends a client write only while, in every voter set, a majority (itself included) holds room for it next to the writes already in flight, so no member meets its hard limit with the write in its log and the group's own work behind it still commits. A write no majority has room for is refused before it is written with `RESOURCE_EXHAUSTED` / `MEMBERS_FULL` and a retry delay (SQLSTATE `53100` over the PostgreSQL wire). Larger lets more client writes be in flight at once. The member refills in batches: once its free grant drops below this value it admits up to twice it, and writes spend the batch down before the next one, so it stores a further grant (a synced write of its local journal) once per batch rather than once per write. It therefore holds between this value and twice it free, plus what its unapplied entries hold, whether or not writes come; a member short of room grants what fits. A smaller value takes back nothing already granted; 0 grants nothing. Only an endpoint with a hard limit holds it. |
 | `compaction_strategy` | `leveled` | restart | How every partition's and `STORAGE COLUMNAR` table's compactions are chosen. `leveled` keeps each level a fixed size ratio over the one above. `planned` plans merges for query throughput over a round of compactions, from the share of point reads and scans each tree has served, and sizes them to the maintenance budget (`maintenance_mb_per_sec`), so set a budget with it. |
 | `write_slowdown_mb_per_sec` | unset (off) | live (`StorageEngine::set_write_slowdown_rate`, bytes per second) | MiB per second client writes are held to while a partition is past its slowdown threshold (`backpressure`): each commit waits its turn at this rate, so writes slow down well before the stop threshold refuses them. Unset or `0` lets writes run at full speed until the stop. |
 | `vector_locality_depth` | unset (off) | restart | How far the vector truth tier's values may interleave across blob files before a compaction rewrites them in key order, so a scan over the vectors (an index build, a quantizer calibration) reads runs of adjacent values. A relocation costs at most half again what the compaction writes anyway. Unset or `0` never relocates for locality. |
@@ -876,7 +875,7 @@ Each endpoint has these keys:
 | `tier` | yes | `memory` `hot_cache` `hot` `warm` `cold` | Placement preference (fastest first). Hot LSM levels prefer hotter tiers. |
 | `capacity_bytes` | no | integer | Physical capacity. `0` or omitted = untracked. |
 | `hard_limit_bytes` | no | integer | Ceiling on the space every file of the database under `path` takes on disk, as the file system allocates it (see [Hard limit](#hard-limit-total-database-footprint)). `0` or omitted = no limit; otherwise at least 8 MiB (8388608). Must be `<= capacity_bytes` when both are set. |
-| `recovery_reserve_bytes` | no | integer | The part of `hard_limit_bytes` client writes leave for flushes, space-reclaiming compactions and the store's own records; inside the limit, not added to it. Omitted = a sixteenth of the limit, and at least 512 KiB: the room one of the store's own records may need for the memtable it starts in its tree (384 KiB) and 128 KiB beside it for the record itself and for what client flushes take past their admission; never more than the limit. Needs `hard_limit_bytes`, and must not exceed it. |
+| `recovery_reserve_bytes` | no | integer | The part of `hard_limit_bytes` client writes leave for flushes, space-reclaiming compactions and the store's own records; inside the limit, not added to it. Omitted = a sixteenth of the limit (512 KiB at the smallest limit). Needs `hard_limit_bytes`, and must not exceed it. |
 | `page_ecc` | no | `auto` `force_on` `force_off` | Per-block Reed-Solomon ECC policy. `auto` (default) turns ECC **on** for `degraded` endpoints and **off** for `durable` / `volatile`. See the note below. |
 | `hard_limit_strategy` | no | `reject` `cascade_evict` | What to do when client writes reach `hard_limit_bytes`. `reject` (default) refuses them; `cascade_evict` also has the capacity refresh demote data to a cooler endpoint, after which refused writes are admitted again. |
 
@@ -932,11 +931,10 @@ compactions, not from the minimum.
 
 Room is reserved before anything grows, under one account per endpoint:
 
-- **Client writes are admitted before they land.** Each write reserves what it
-  will add (its journal record and the table it will be flushed into) against
-  the limit less `recovery_reserve_bytes`, together with every write already
-  admitted and what the memtables will write when they are flushed. A write that
-  does not fit is refused before it reaches the journal, with
+- **Client writes are admitted before they land.** Each write reserves its
+  journal record against the limit less `recovery_reserve_bytes`, together with
+  what is charged and every write already admitted. A write that does not fit is
+  refused before it reaches the journal, with
   `CapacityExhausted` naming the endpoint, the bytes in use and the limit
   (gRPC `RESOURCE_EXHAUSTED`, embedded `DatabaseError::CapacityExhausted`).
   Concurrent writers cannot overcommit: admission is one atomic reservation.
@@ -946,23 +944,28 @@ Room is reserved before anything grows, under one account per endpoint:
   write if that made room. Covered segments go even inside the journal's
   retention window; segments a rebuild from the newest local checkpoint needs are
   kept. Any refusal also asks the background flusher to flush every memtable
-  holding data, so the room they were promised comes back without waiting for
-  their size or age. On an endpoint with a limit, journal segments (the
+  holding data, so the journal they hold comes back without waiting for their
+  size or age. On an endpoint with a limit, journal segments (the
   consensus log's too) are at most a sixteenth of the limit (at least 1 MiB), so
   space comes back a segment at a time.
 - **The store's own work uses the reserve.** Flushes and the store's recovery
   records (schema, consensus vote, commit and log bounds) may use the whole
-  limit; client writes stop at the limit less the reserve, so they always find
-  room. Compactions take only the room admitted writes and the memtables'
-  flushes leave, the manifest versions flushes installed and have still to
-  write included: a compaction that would need more stops, keeps its inputs
-  and runs again later.
+  limit; client writes stop at the limit less the reserve. The reserve is a
+  margin, not a promise: a flush that still meets the limit fails, keeps the
+  journal it covers and runs again by itself once room comes back on the
+  endpoint or its limit changes, and an acknowledged write is never lost or
+  undone by it. A partition whose flushes land on an endpoint with a limit
+  flushes its memtable once it holds half that endpoint's reserve (at least
+  64 KiB) rather than `write_buffer_mb`, so its table fits where flushes run. Compactions take only the room admitted
+  writes leave: a compaction that would need more stops, keeps its inputs and
+  runs again later.
 - **Replicated groups.** The consensus log is counted like the journal. A leader
   admits a write before it proposes it; a follower reserves the room of the
-  entries it receives until it has applied them, and refuses entries that do not
-  fit as unavailable, so the leader sends them again later. Entries the group has
-  already committed may use a follower's reserve: they are acknowledged history,
-  and refusing them would only leave the member behind. The consensus state
+  entries it receives until it has answered them, and refuses entries that do
+  not fit as unavailable, so the leader sends them again later and the write
+  waits. Entries the group has already committed may use a follower's reserve:
+  they are acknowledged history, and refusing them would only leave the member
+  behind. The consensus state
   (vote, commit point, log bounds) is never refused by the limit, which would
   stop the group; its journal growth still counts.
 - **Sharing.** A file with several names (a hard link) is counted once. A copy,
@@ -976,9 +979,8 @@ A limit lowered below what the database already holds deletes nothing. The
 database opens (or keeps running), serves reads and refuses client writes until
 reclamation, compaction or the operator brings it under the limit; meanwhile its
 own work may grow at most the reserve (or 1 MiB, when the reserve of a small
-limit is less) past what it holds and has promised (memtables waiting to be
-flushed, writes already admitted), so those flushes still land and hand back
-their journal. Opening a database also writes a little (the
+limit is less) past what it holds and has admitted, so its flushes can land
+and hand back their journal. Opening a database also writes a little (the
 first journal segment of an empty store, replay): that work may grow up to 1 MiB
 past what the endpoint holds, whatever the limit, so a database that does not
 fit its limit still opens to be read.
@@ -1004,8 +1006,8 @@ group receives from its leader, which is written beside its own store and
 counted once opened.
 
 `coordinode_footprint_charged_bytes`, `coordinode_footprint_admitted_bytes`,
-`coordinode_footprint_flush_debt_bytes`, `coordinode_footprint_reserve_bytes` and
-`coordinode_footprint_limit_bytes` report the account per endpoint;
+`coordinode_footprint_reserve_bytes` and `coordinode_footprint_limit_bytes`
+report the account per endpoint;
 `coordinode_footprint_refusals_total` counts refused writes.
 
 **Page ECC is a build-time feature.** The Reed-Solomon page-ECC codec is compiled

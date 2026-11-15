@@ -246,37 +246,14 @@ impl PageEccPolicy {
 }
 
 /// The recovery reserve an endpoint without a configured one keeps: this
-/// fraction of its hard limit, and at least [`RECOVERY_RECORD_ROOM`] with
-/// [`RECOVERY_MARGIN`] beside it.
+/// fraction of its hard limit.
 pub const DEFAULT_RECOVERY_RESERVE_DIVISOR: u64 = 16;
 
-/// The least room one recovery record of the store's own may need beyond
-/// its bytes: the flush owed for the memtable it starts in its tree.
-pub const RECOVERY_RECORD_ROOM: u64 = crate::engine::footprint::MEMTABLE_START_DEBT;
-
-/// The room a reserve keeps beside the starts of [`RECOVERY_RECORD_ROOM`]:
-/// the record's own bytes, and the growth past their admission that client
-/// writes' flushes can still take before it (a flush debt is bounded from
-/// totals, not per memtable). It is what a sixteenth of the smallest limit
-/// leaves beside one memtable start.
-pub const RECOVERY_MARGIN: u64 = MIN_HARD_LIMIT_BYTES / DEFAULT_RECOVERY_RESERVE_DIVISOR
-    - crate::engine::footprint::MEMTABLE_START_DEBT;
-
-// The floor leaves the smallest supported limit most of its room for data.
-const _: () = assert!(RECOVERY_RECORD_ROOM + RECOVERY_MARGIN < MIN_HARD_LIMIT_BYTES / 2);
-
 /// The recovery reserve of an endpoint with hard limit `limit` and no
-/// configured reserve: a [`DEFAULT_RECOVERY_RESERVE_DIVISOR`]th of it, and
-/// at a supported limit ([`MIN_HARD_LIMIT_BYTES`] and up) never less than
-/// [`RECOVERY_RECORD_ROOM`] and [`RECOVERY_MARGIN`] together.
+/// configured reserve: a [`DEFAULT_RECOVERY_RESERVE_DIVISOR`]th of it.
 #[must_use]
 pub fn default_recovery_reserve(limit: u64) -> u64 {
-    let share = limit / DEFAULT_RECOVERY_RESERVE_DIVISOR;
-    if limit >= MIN_HARD_LIMIT_BYTES {
-        share.max(RECOVERY_RECORD_ROOM + RECOVERY_MARGIN)
-    } else {
-        share
-    }
+    limit / DEFAULT_RECOVERY_RESERVE_DIVISOR
 }
 
 /// The smallest hard limit an endpoint is configured with: 8 MiB. Below it
@@ -286,9 +263,8 @@ pub fn default_recovery_reserve(limit: u64) -> u64 {
 /// awaiting removal until its tables are flushed (1 MiB), the flush of the
 /// memtable it covers (its data, an eighth more and 128 KiB, charged ahead
 /// the same way), the room a store may grow while it opens (1 MiB) and the
-/// recovery reserve ([`default_recovery_reserve`]: 896 KiB here). An empty
-/// store takes about
-/// 160 KiB. A limit the operator lowers below what the store already holds
+/// recovery reserve ([`default_recovery_reserve`]: 512 KiB here). An empty
+/// store takes about 160 KiB. A limit the operator lowers below what the store already holds
 /// stays valid down to this minimum and is pending, not refused.
 pub const MIN_HARD_LIMIT_BYTES: u64 = 8 << 20;
 
@@ -911,20 +887,6 @@ pub struct StorageConfig {
     /// Default 2 GiB.
     pub resume_free_bytes: u64,
 
-    /// Room, in bytes, a member of a replicated group keeps admitted ahead
-    /// from its client capacity for the client writes its leader sends, and
-    /// reports to the leader: the leader appends a client write only while
-    /// a majority holds room for it, so no member meets its hard limit with
-    /// it in its log. The member refills in batches: once below this much
-    /// free, it admits up to twice this much, which entries spend down
-    /// before the next batch, so it stores a further grant once per batch
-    /// rather than once per write. It holds between this and twice this
-    /// free (plus what unapplied entries hold), whether or not writes come;
-    /// a member short of room grants what fits. Only an endpoint with a hard
-    /// limit holds it. Default 4 MiB. Retunable at runtime through
-    /// `StorageEngine::set_client_grant`.
-    pub client_grant_bytes: u64,
-
     /// Bytes per second the background maintenance of this engine (every
     /// compaction and scrub, over every tree together) reads and writes at
     /// most, so it cannot saturate the disk the foreground needs. `0`
@@ -1144,7 +1106,6 @@ impl StorageConfig {
             relocated: false,
             min_free_bytes: crate::engine::space::DEFAULT_MIN_FREE_BYTES,
             resume_free_bytes: crate::engine::space::DEFAULT_RESUME_FREE_BYTES,
-            client_grant_bytes: crate::engine::footprint::grants::DEFAULT_CLIENT_GRANT_BYTES,
             maintenance_bytes_per_sec: 0,
             maintenance_backoff_ms: 0,
             compaction_strategy: crate::engine::CompactionStrategyKind::Leveled,

@@ -167,9 +167,13 @@ pub struct StorageEngine {
     /// tree's reserved namespace; see [`Self::commit_ceiling_through`].
     // no-std: spin::Mutex; held for one update or one search.
     closure: parking_lot::Mutex<ClosureState>,
-    /// The ledger's breakpoint records, read by the footprint's debt: each
-    /// owes its removal. Mirrors the ledger in `closure`.
-    closure_held: Arc<AtomicU64>,
+    /// Each partition's memtable flush threshold, taken again when a hard
+    /// limit or reserve changes.
+    flush_thresholds: Arc<crate::engine::flush::FlushThresholds>,
+    /// How many breakpoint records the ledger holds, readable without the
+    /// `closure` lock; `NO_CLOSURE_LEDGER` while the store holds none.
+    /// Mirrors the ledger in `closure`.
+    closure_held: AtomicU64,
     /// How long a snapshot waits for those commits before stepping behind
     /// them. Runtime-settable: it trades read latency against freshness, and
     /// which side a deployment wants is not known at compile time.
@@ -431,21 +435,6 @@ fn mutation_partition(mutation: &Mutation) -> Option<Partition> {
         | Mutation::RemoveRange { partition, .. } => Some(Partition::from(*partition)),
         Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => None,
     }
-}
-
-/// The trees a mutation writes once it is applied: its own partition, or
-/// for one decided at apply, where its decision lands (a metadata command in
-/// [the partition it names](coordinode_core::txn::proposal::MetadataCommand::partition),
-/// an operation record in Schema, derived index work in the indexes and
-/// their counters).
-fn written_partitions(mutation: &Mutation) -> impl Iterator<Item = Partition> {
-    let parts = match mutation {
-        Mutation::Command(command) => [Some(Partition::from(command.partition())), None],
-        Mutation::Operation(_) => [Some(Partition::Schema), None],
-        Mutation::Derive(_) => [Some(Partition::Idx), Some(Partition::Counter)],
-        resolved => [mutation_partition(resolved), None],
-    };
-    parts.into_iter().flatten()
 }
 
 /// One write to a node-local record ([`StorageEngine::commit_local`]).
@@ -851,7 +840,6 @@ impl StorageEngine {
         // with what the endpoints already hold.
         let footprints = crate::engine::footprint::Footprints::open(&config.endpoints)
             .map_err(|e| StorageError::Io(format!("measure the endpoints' footprint: {e}")))?;
-        footprints.set_grant_target(config.client_grant_bytes);
         // A store that does not fit its limit still opens; what it grows
         // while opening is bounded by the phase, held until this returns.
         let _opening = footprints.open_phase();
@@ -904,52 +892,8 @@ impl StorageEngine {
         // One write buffer for every partition tree: the memtable axis of the
         // write-pressure verdict bounds their unflushed bytes together.
         let write_buffer = Arc::new(lsm_tree::WriteBufferBudget::default());
-        // How many breakpoint records the closure ledger holds, each owing
-        // its removal to the footprint; NO_CLOSURE_LEDGER until a consensus
-        // log's ledger is loaded or written here.
-        let closure_held = Arc::new(AtomicU64::new(NO_CLOSURE_LEDGER));
-        // The Schema tree, once open, without keeping it open.
-        let schema_probe: Arc<std::sync::OnceLock<lsm_tree::WeakTree>> =
-            Arc::new(std::sync::OnceLock::new());
-        // What the memtables will write when they are flushed is owed to the
-        // footprint from the moment it is in them.
-        if !footprints.is_empty() {
-            footprints.set_flushes_deferred(
-                config.tree_flush_durability() == lsm_tree::config::FlushDurability::Deferred,
-            );
-            let unflushed = Arc::clone(&write_buffer);
-            let unpersisted = footprints.unpersisted_debt();
-            let closure_held = Arc::clone(&closure_held);
-            let schema_probe = Arc::clone(&schema_probe);
-            footprints.set_debt(move || {
-                // Each memtable is a flush of its own, with its own fixed cost;
-                // a deferred flush done owes the version it is still to write.
-                // The closure ledger owes the removal of its breakpoints, and
-                // the Schema memtable its next entry starts while none is.
-                let waiting = unflushed.unflushed();
-                crate::engine::footprint::flush_debt(waiting.bytes, waiting.memtables)
-                    + unpersisted.bytes()
-                    + match closure_held.load(std::sync::atomic::Ordering::Acquire) {
-                        NO_CLOSURE_LEDGER => 0,
-                        held => {
-                            use lsm_tree::AbstractTree;
-                            // Lock-free: the tree's mirror of its latest
-                            // version. A tree not open yet, or closing, has
-                            // nothing in its memtable.
-                            let started = schema_probe
-                                .get()
-                                .and_then(lsm_tree::WeakTree::upgrade)
-                                .is_some_and(|tree| !tree.active_memtable_is_empty());
-                            crate::engine::footprint::closure_debt(held)
-                                + if started {
-                                    0
-                                } else {
-                                    crate::engine::footprint::memtable_start()
-                                }
-                        }
-                    }
-            });
-        }
+        // See `StorageEngine::closure_held`.
+        let closure_held = AtomicU64::new(NO_CLOSURE_LEDGER);
         // One maintenance budget for every tree's compaction and the scrub:
         // the trees share the disks the foreground needs.
         let maintenance = new_maintenance_budget(
@@ -984,9 +928,6 @@ impl StorageEngine {
             }
         });
         trees.insert(Partition::Schema, schema_tree.clone());
-        schema_probe
-            .set(schema_tree.downgrade())
-            .map_err(|_| StorageError::Io("the Schema tree was opened twice".to_string()))?;
 
         // Restore seqno from Schema BEFORE reading routing — the routing
         // get() needs a fresh seqno bound so it observes prior persisted
@@ -1025,8 +966,6 @@ impl StorageEngine {
             // A store of the layout that kept the ledger among the Schema
             // rows is refused before anything here writes to it.
             refuse_earlier_closure_layout(&schema_tree, seqno.get())?;
-            // The cleanup a stored closure ledger owes is owed from the open
-            // on, before any other tree opens or maintenance runs.
             let head = schema_tree
                 .get(crate::engine::closure_ledger::HEAD_KEY, seqno.get())
                 .map_err(|e| StorageError::Io(format!("schema get closed bound: {e}")))?;
@@ -1048,6 +987,10 @@ impl StorageEngine {
         // routing also places the columnar tables' levels.
         #[cfg(feature = "columnar")]
         let mut node_routing = None;
+        // Where each partition's flushes land: the endpoint of its level 0.
+        // The Schema tree stays on the primary endpoint.
+        let mut flush_landing: HashMap<Partition, std::path::PathBuf> = HashMap::new();
+        flush_landing.insert(Partition::Schema, config.data_dir().to_path_buf());
         // Intents live as files of the data directory itself: a store whose
         // directory is not one on disk (a memory filesystem) keeps none.
         let durable_intents = config.data_dir().is_dir();
@@ -1062,6 +1005,13 @@ impl StorageEngine {
                 part,
                 config.relocated,
             )?;
+            if let Some(endpoint) = routing
+                .levels
+                .get(&0)
+                .and_then(|id| config.endpoints.iter().find(|e| &e.id == id))
+            {
+                flush_landing.insert(part, endpoint.path.clone());
+            }
             let tree_config = config
                 .to_tree_config_with_routing(part, Arc::clone(&seqno), Some(&routing))
                 .use_cache(Arc::clone(&cache))
@@ -1462,9 +1412,18 @@ impl StorageEngine {
         // compaction monitor sleeps until a flush or a compaction wakes it.
         let flush_wake = Arc::new(coordinode_core::txn::wake::Wake::default());
         let compaction_wake = Arc::new(coordinode_core::txn::wake::Wake::default());
+        let flush_thresholds = Arc::new(crate::engine::flush::FlushThresholds::new(
+            config.max_write_buffer_bytes,
+            |part| {
+                flush_landing
+                    .get(&part)
+                    .and_then(|path| footprints.for_path(path))
+                    .cloned()
+            },
+        ));
         let flush_trigger = Arc::new(crate::engine::flush::FlushTrigger::new(
             Arc::clone(&flush_wake),
-            config.max_write_buffer_bytes,
+            Arc::clone(&flush_thresholds),
         ));
         // The memtable axis of the write-pressure verdict, latched by the
         // flush monitor, which writes and finished flushes wake.
@@ -1530,7 +1489,7 @@ impl StorageEngine {
         let flush_manager = FlushManager::start(
             &trees,
             gc_controller.watermarks(),
-            config.max_write_buffer_bytes,
+            Arc::clone(&flush_thresholds),
             config.max_sealed_memtables,
             config.flush_workers,
             config.max_memtable_age_secs,
@@ -1761,6 +1720,7 @@ impl StorageEngine {
             closure_frontier: AtomicU64::new(0),
             raft_applied_ts: AtomicU64::new(0),
             closure: parking_lot::Mutex::new(ClosureState::default()),
+            flush_thresholds,
             closure_held,
             snapshot_wait: std::sync::atomic::AtomicU64::new(config.snapshot_wait_ms),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
@@ -1988,6 +1948,10 @@ impl StorageEngine {
         })?;
         let reserve = reserve.unwrap_or(crate::engine::config::default_recovery_reserve(limit));
         footprint.set_limit(limit, reserve);
+        // The flushes that land on it fit a new reserve; the monitor judges
+        // the memtables against it at once.
+        self.flush_thresholds.refresh();
+        self.coordinator.flush_trigger().wrote_unmeasured();
         tracing::info!(
             endpoint = endpoint_id,
             hard_limit_bytes = limit,
@@ -2000,8 +1964,8 @@ impl StorageEngine {
 
     /// Admit a client write of `mutations` before anything of it is written:
     /// the free-space reserve of the volumes, then the owned footprint of
-    /// every endpoint with a hard limit, which must hold its journal entry and
-    /// its share of the flush that follows. A refusal on the footprint starts
+    /// every endpoint with a hard limit, which must hold its journal entry. A
+    /// refusal on the footprint starts
     /// the reclamation that can make room: a flush of the memtables and the
     /// removal of journal segments the trees then cover.
     ///
@@ -2044,42 +2008,8 @@ impl StorageEngine {
         if self.footprints.is_empty() {
             return Ok(crate::engine::footprint::Admitted::default());
         }
-        // A proposal applies from the consensus log, with its entry's
-        // closure records; the Schema memtable they may start is owed by the
-        // ledger itself.
-        let bytes = crate::engine::footprint::write_footprint(mutations)
-            + crate::engine::footprint::closure_footprint()
-            + self.memtable_starts(mutations.iter().flat_map(written_partitions));
+        let bytes = crate::engine::footprint::write_footprint(mutations);
         self.admit_footprint(bytes, class)
-    }
-
-    /// The growth of the flush debt a write into `parts` may cause: one
-    /// [`MEMTABLE_START_DEBT`](crate::engine::footprint::MEMTABLE_START_DEBT)
-    /// for each distinct tree among them whose active memtable is empty,
-    /// which the write makes one more flush owed. Read without a tree's
-    /// lock.
-    fn memtable_starts(&self, parts: impl IntoIterator<Item = Partition>) -> u64 {
-        use lsm_tree::AbstractTree;
-        let all = Partition::all();
-        // One bit per partition: a handful of them.
-        let mut seen = 0u64;
-        let mut starts = 0u64;
-        for part in parts {
-            let Some(bit) = all.iter().position(|p| *p == part) else {
-                continue;
-            };
-            if seen & (1 << bit) != 0 {
-                continue;
-            }
-            seen |= 1 << bit;
-            if self
-                .tree(part)
-                .is_ok_and(|tree| tree.active_memtable_is_empty())
-            {
-                starts += crate::engine::footprint::MEMTABLE_START_DEBT;
-            }
-        }
-        starts
     }
 
     /// Admit, on the owned footprint, a write of the partitions `parts` that
@@ -2099,16 +2029,14 @@ impl StorageEngine {
         if self.footprints.is_empty() {
             return Ok(crate::engine::footprint::Admitted::default());
         }
-        let parts = parts.into_iter();
         let class = if parts
-            .clone()
+            .into_iter()
             .all(|part| matches!(part, Partition::Schema | Partition::Raft))
         {
             Admit::Recovery
         } else {
             Admit::Client.on_this_thread()
         };
-        let bytes = bytes + self.memtable_starts(parts);
         self.admit_footprint(bytes, class)
     }
 
@@ -2285,7 +2213,10 @@ impl StorageEngine {
             None => None,
         };
         let (added, memtable) = apply_columnar_row(&tree, key, value, seqno, index)?;
-        self.coordinator.flush_trigger().wrote(added, memtable);
+        // A table's tree lands where the node partition's does.
+        self.coordinator
+            .flush_trigger()
+            .wrote(Partition::Node, added, memtable);
         if let (Some(index), Some(coverage)) = (index, &self.coverage) {
             coverage.note_table_marker(table_id, index);
             self.note_applied(coverage, index);
@@ -2453,96 +2384,6 @@ impl StorageEngine {
     /// Work already waiting on it is held to the new rate at once.
     pub fn set_maintenance_rate(&self, bytes_per_sec: u64) {
         self.maintenance.set_rate(bytes_per_sec);
-    }
-
-    /// Retune the room this member keeps granted for its leader's client
-    /// writes ([`StorageConfig::client_grant_bytes`]): refilled in batches
-    /// of up to twice `bytes` once below it. A larger grant is taken as room
-    /// allows; a smaller one takes back nothing already granted, which the
-    /// leader may count on.
-    pub fn set_client_grant(&self, bytes: u64) {
-        self.footprints.set_grant_target(bytes);
-    }
-
-    /// The stored client grant record of this member; the default before
-    /// the first opening.
-    ///
-    /// # Errors
-    ///
-    /// The record could not be read or has the wrong shape.
-    pub fn client_grant_record(
-        &self,
-    ) -> StorageResult<crate::engine::footprint::grants::GrantRecord> {
-        use crate::engine::footprint::grants::GrantRecord;
-        match self.get(Partition::Raft, CLIENT_GRANT_KEY)? {
-            Some(bytes) if bytes.len() == 16 => {
-                let field = |n: usize| {
-                    let mut word = [0u8; 8];
-                    word.copy_from_slice(&bytes[n * 8..n * 8 + 8]);
-                    u64::from_be_bytes(word)
-                };
-                Ok(GrantRecord {
-                    horizon: field(0),
-                    epoch: field(1),
-                })
-            }
-            Some(_) => Err(StorageError::Serialization(
-                "the client grant record has the wrong length".to_string(),
-            )),
-            None => Ok(GrantRecord::default()),
-        }
-    }
-
-    /// Start opening this member's client grant, before anything else is
-    /// admitted: count this opening in the stored epoch, with the log
-    /// applied through `applied` and the group's applied client bytes
-    /// `total` through `through`. The member then hands the pool its
-    /// unapplied client entries and what the reports reach past them
-    /// ([`crate::engine::footprint::Footprints::recover_granted`]). Returns the
-    /// epoch this process reports under.
-    ///
-    /// # Errors
-    ///
-    /// The record could not be read or stored.
-    pub fn open_client_grant(&self, applied: u64, through: u64, total: u64) -> StorageResult<u64> {
-        let stored = self.client_grant_record()?;
-        let opened = crate::engine::footprint::grants::GrantRecord {
-            epoch: stored
-                .epoch
-                .checked_add(1)
-                .ok_or_else(|| StorageError::Serialization("client grant epoch overflow".into()))?,
-            ..stored
-        };
-        self.store_client_grant(opened)?;
-        self.footprints
-            .recover_granted_start(opened, applied, through, total);
-        Ok(opened.epoch)
-    }
-
-    /// Store `record` as this member's client grant record, synced before it
-    /// returns: the store a raised horizon
-    /// ([`crate::engine::footprint::Footprints::grant_report`]) reaches the
-    /// disk through before any report reaches it. Blocking: callers on the
-    /// async runtime run it on a blocking thread.
-    ///
-    /// # Errors
-    ///
-    /// The record could not be written.
-    pub fn store_client_grant(
-        &self,
-        record: crate::engine::footprint::grants::GrantRecord,
-    ) -> StorageResult<()> {
-        let mut value = Vec::with_capacity(16);
-        value.extend_from_slice(&record.horizon.to_be_bytes());
-        value.extend_from_slice(&record.epoch.to_be_bytes());
-        self.commit_local(
-            vec![LocalWrite::Put {
-                partition: Partition::Raft,
-                key: CLIENT_GRANT_KEY.to_vec(),
-                value,
-            }],
-            LocalSync::BeforeUse,
-        )
     }
 
     /// Back the maintenance budget off, down to 5% of its rate, while the
@@ -3566,7 +3407,9 @@ impl StorageEngine {
         let Some((added, memtable)) = written else {
             return Ok(false);
         };
-        self.coordinator.flush_trigger().wrote(added, memtable);
+        self.coordinator
+            .flush_trigger()
+            .wrote(partition, added, memtable);
         Ok(true)
     }
 
@@ -3680,7 +3523,9 @@ impl StorageEngine {
         let mut versions = 0;
         for event in rebuild::tree_history(&source)? {
             let (added, memtable) = rebuild::replay_event(&tree, event);
-            self.coordinator.flush_trigger().wrote(added, memtable);
+            self.coordinator
+                .flush_trigger()
+                .wrote(Partition::Node, added, memtable);
             versions += 1;
         }
         drop(source);
@@ -3708,7 +3553,9 @@ impl StorageEngine {
                         entry.ts,
                         Some(entry.index),
                     )?;
-                    self.coordinator.flush_trigger().wrote(added, memtable);
+                    self.coordinator
+                        .flush_trigger()
+                        .wrote(Partition::Node, added, memtable);
                     replayed += 1;
                 }
             }
@@ -5102,7 +4949,9 @@ impl StorageEngine {
         // seqno before.
         let (seqno, _landing) = self.pending_commits.admit_direct(|| self.next_seqno());
         let (added, memtable) = tree.apply_batch(batch, seqno)?;
-        self.coordinator.flush_trigger().wrote(added, memtable);
+        self.coordinator
+            .flush_trigger()
+            .wrote(part, added, memtable);
         Ok(())
     }
 
@@ -5537,13 +5386,7 @@ impl StorageEngine {
                 })
                 .sum();
             self.admit_footprint(
-                crate::engine::footprint::footprint_of(data, writes.len())
-                    // With the flush owed for each memtable they start.
-                    + self.memtable_starts(writes.iter().map(|write| match write {
-                        LocalWrite::Put { partition, .. } | LocalWrite::Delete { partition, .. } => {
-                            *partition
-                        }
-                    })),
+                crate::engine::footprint::footprint_of(data, writes.len()),
                 crate::engine::footprint::Admit::Recovery,
             )?
         };
@@ -6197,8 +6040,6 @@ impl StorageEngine {
         if let Some(local) = &self.local_journal {
             local.sync()?;
         }
-        // Owed before the flush: its memtable stops owing when it installs.
-        self.footprints.flushing(tree.id());
         if tree.flush(&lock, 0)?.is_some() {
             // A new table may need compacting.
             self.compaction_wake.notify();
@@ -6208,7 +6049,6 @@ impl StorageEngine {
         // hold or promises a write. A tree whose flushes are synced has
         // nothing pending.
         tree.persist_flushes()?;
-        self.footprints.persisted(tree.id());
         Ok(())
     }
 
@@ -8283,11 +8123,6 @@ fn closure_writes(
     let at = bound.checked_sub(1).map_or(ceiling, |b| b.max(ceiling));
     Some((mutations, at))
 }
-
-/// This member's client grant record in the Raft partition: the horizon its
-/// reports reached and the count of its openings, two big-endian u64s.
-/// Member-local, written through the member's own journal.
-const CLIENT_GRANT_KEY: &[u8] = b"storage:client_grant";
 
 /// The closure ledger's held count while the store keeps no ledger: a store
 /// that applies no consensus log owes it nothing.

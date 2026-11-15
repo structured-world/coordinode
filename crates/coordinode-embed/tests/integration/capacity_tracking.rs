@@ -83,9 +83,24 @@ fn quiet_capped(id: &str, dir: &std::path::Path, limit: u64) -> StorageConfig {
     config
 }
 
-/// Put incompressible rows into `part`, numbered from `from`, until the
-/// footprint refuses one; returns how many were accepted. Any other error
-/// fails the test.
+/// Rows put between the flushes that carry a fill to disk.
+const FILL_BATCH: u32 = 512;
+
+/// Whether `persisted` failed for want of room on a capped endpoint.
+fn refused_for_room(persisted: &Result<(), StorageError>) -> bool {
+    match persisted {
+        Ok(()) => false,
+        Err(StorageError::CapacityExhausted { .. }) => true,
+        Err(other) if other.to_string().contains("limit") => true,
+        Err(other) => panic!("unexpected flush failure: {other:?}"),
+    }
+}
+
+/// Put incompressible rows into `part`, numbered from `from`, flushing them
+/// to disk every [`FILL_BATCH`] rows, until the footprint refuses a row or
+/// the files reach the limit and a flush is refused; returns how many were
+/// accepted. A row a memtable holds takes no disk until it is flushed, so
+/// the flushes are what fill the endpoint. Any other error fails the test.
 fn fill_from(engine: &StorageEngine, part: Partition, prefix: &str, from: u32) -> u32 {
     for i in from..from + 1_000_000 {
         let key = format!("{prefix}{i:010}");
@@ -93,6 +108,9 @@ fn fill_from(engine: &StorageEngine, part: Partition, prefix: &str, from: u32) -
             Ok(()) => {}
             Err(StorageError::CapacityExhausted { .. }) => return i - from,
             Err(other) => panic!("unexpected refusal: {other:?}"),
+        }
+        if (i - from + 1).is_multiple_of(FILL_BATCH) && refused_for_room(&engine.persist()) {
+            return i - from + 1;
         }
     }
     panic!("the footprint never refused a write");
@@ -110,15 +128,19 @@ fn fill(engine: &StorageEngine, part: Partition, prefix: &str) -> u32 {
 /// gives room back after the last refusal.
 fn saturate(engine: &StorageEngine, part: Partition, prefix: &str) -> u32 {
     let mut total = 0;
+    let mut short = false;
     loop {
         let accepted = fill_from(engine, part, prefix, total);
         total += accepted;
         if accepted == 0 {
             return total;
         }
-        engine
-            .persist()
-            .expect("a filled store flushes into its reserve");
+        // A flush short of room twice running: the files are at the limit.
+        let refused = refused_for_room(&engine.persist());
+        if refused && short {
+            return total;
+        }
+        short = refused;
     }
 }
 
@@ -295,10 +317,8 @@ fn schema_writes_use_the_recovery_reserve_client_writes_leave() {
 }
 
 /// A store filled to the client ceiling under the default reserve closes and
-/// reopens within its limit, and each time its own record lands: a Schema
-/// write starts its own memtable and its accounting's, both after the flush
-/// a close or an open leaves them empty in, and the reserve holds the room
-/// both owe. Client writes stay refused across the reopen.
+/// reopens within its limit, and each time its own record lands in the room
+/// the reserve keeps.
 #[test]
 fn a_store_at_the_client_ceiling_closes_and_reopens_with_room_for_its_own_record() {
     let dir = TempDir::new().expect("tempdir");
@@ -332,12 +352,13 @@ fn a_store_at_the_client_ceiling_closes_and_reopens_with_room_for_its_own_record
     engine
         .put(Partition::Schema, b"schema:label:AfterReopen", b"{}")
         .expect("the store's own record lands after the reopen");
+    // The close flushed the memtables and let the journal they covered go:
+    // a client write finds what room that freed, or is refused, and either
+    // way the files stay within the limit.
+    let client = engine.put(Partition::Node, b"node:0:after", &incompressible(1));
     assert!(
-        matches!(
-            engine.put(Partition::Node, b"node:0:denied", &incompressible(1)),
-            Err(StorageError::CapacityExhausted { .. })
-        ),
-        "a client write took the room the reserve holds"
+        matches!(client, Ok(()) | Err(StorageError::CapacityExhausted { .. })),
+        "a client write lands or is refused for room: {client:?}"
     );
     engine.persist().expect("persist");
     assert!(allocated_under(dir.path()) <= ROOMY);
@@ -724,10 +745,10 @@ fn capacity_gauges_emitted_on_refresh() {
     assert_eq!(
         seen["coordinode_footprint_reserve_bytes"],
         coordinode_storage::engine::config::default_recovery_reserve(ROOMY) as f64,
-        "the default reserve is a sixteenth of the limit, at least one recovery record's room"
+        "the default reserve is a sixteenth of the limit"
     );
     assert!(seen.contains_key("coordinode_footprint_admitted_bytes"));
-    assert!(seen.contains_key("coordinode_footprint_flush_debt_bytes"));
+    assert!(!seen.contains_key("coordinode_footprint_flush_debt_bytes"));
 }
 
 /// Concurrent put + refresh: writers and the capacity scanner must

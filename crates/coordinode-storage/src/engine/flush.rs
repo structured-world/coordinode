@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -33,31 +33,92 @@ use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 use coordinode_core::txn::wake::Wake;
 
-/// How the write path tells the flush monitor that a memtable may be due.
-///
-/// Held by every writer of a partition tree. A write that leaves its memtable
-/// above the size threshold, or that is the memtable's first entry (which
-/// starts its age), wakes the monitor; any other write does nothing beyond one
-/// comparison.
+/// The smallest memtable size an endpoint's recovery reserve brings the
+/// flush threshold down to: below it a store would flush almost every write.
+const MIN_LIMITED_FLUSH_BYTES: u64 = 64 * 1024;
+
+/// The memtable size past which each partition's memtable is flushed: the
+/// configured size, brought down for a partition whose flushes land on an
+/// endpoint with a hard limit to half that endpoint's recovery reserve, so
+/// a memtable becomes a table while the reserve, where flushes run, still
+/// has room for it. Scheduling only: nothing is held for the flush. The
+/// write path's trigger and the monitor read the same value.
 #[derive(Debug)]
-pub(crate) struct FlushTrigger {
-    wake: Arc<Wake>,
-    threshold_bytes: u64,
+pub(crate) struct FlushThresholds {
+    configured: u64,
+    /// Per partition, by [`Partition::position`]; a columnar table's tree
+    /// lands where the node partition's does.
+    by_partition: Vec<AtomicU64>,
+    /// The footprint of the endpoint each partition's flushes land on, when
+    /// it has a hard limit.
+    landing: Vec<Option<Arc<crate::engine::footprint::Footprint>>>,
 }
 
-impl FlushTrigger {
-    /// A trigger waking `wake` for memtables above `threshold_bytes`.
-    pub(crate) fn new(wake: Arc<Wake>, threshold_bytes: u64) -> Self {
-        Self {
-            wake,
-            threshold_bytes,
+impl FlushThresholds {
+    /// `configured` for every partition, each brought down by the reserve of
+    /// the limited endpoint `landing` names for it.
+    pub(crate) fn new(
+        configured: u64,
+        landing: impl Fn(Partition) -> Option<Arc<crate::engine::footprint::Footprint>>,
+    ) -> Self {
+        let landing: Vec<_> = Partition::all().iter().map(|&p| landing(p)).collect();
+        let thresholds = Self {
+            configured,
+            by_partition: Partition::all()
+                .iter()
+                .map(|_| AtomicU64::new(configured))
+                .collect(),
+            landing,
+        };
+        thresholds.refresh();
+        thresholds
+    }
+
+    /// Take the endpoints' reserves again, after a limit or reserve changed.
+    pub(crate) fn refresh(&self) {
+        for (threshold, landing) in self.by_partition.iter().zip(&self.landing) {
+            let value = match landing.as_ref().map(|f| f.reserve()) {
+                // No limit, or no reserve to fit a flush into: the configured
+                // size, never one that would flush every write.
+                None | Some(0) => self.configured,
+                Some(reserve) => self
+                    .configured
+                    .min((reserve / 2).max(MIN_LIMITED_FLUSH_BYTES)),
+            };
+            threshold.store(value, Ordering::Release);
         }
     }
 
-    /// A write of `added` bytes left its memtable at `memtable_bytes`.
+    /// The threshold of `partition`'s memtable.
     #[inline]
-    pub(crate) fn wrote(&self, added: u64, memtable_bytes: u64) {
-        if memtable_bytes > self.threshold_bytes || memtable_bytes == added {
+    pub(crate) fn of(&self, partition: Partition) -> u64 {
+        self.by_partition[partition.position()].load(Ordering::Acquire)
+    }
+}
+
+/// How the write path tells the flush monitor that a memtable may be due.
+///
+/// Held by every writer of a partition tree. A write that leaves its memtable
+/// above its partition's threshold, or that is the memtable's first entry
+/// (which starts its age), wakes the monitor; any other write does nothing
+/// beyond one comparison.
+#[derive(Debug)]
+pub(crate) struct FlushTrigger {
+    wake: Arc<Wake>,
+    thresholds: Arc<FlushThresholds>,
+}
+
+impl FlushTrigger {
+    /// A trigger waking `wake` for memtables above their `thresholds`.
+    pub(crate) fn new(wake: Arc<Wake>, thresholds: Arc<FlushThresholds>) -> Self {
+        Self { wake, thresholds }
+    }
+
+    /// A write of `added` bytes left `partition`'s memtable at
+    /// `memtable_bytes`.
+    #[inline]
+    pub(crate) fn wrote(&self, partition: Partition, added: u64, memtable_bytes: u64) {
+        if memtable_bytes > self.thresholds.of(partition) || memtable_bytes == added {
             self.wake.notify();
         }
     }
@@ -229,7 +290,7 @@ impl FlushManager {
     pub(crate) fn start(
         trees: &HashMap<Partition, lsm_tree::AnyTree>,
         gc_watermarks: GcWatermarks,
-        flush_threshold_bytes: u64,
+        thresholds: Arc<FlushThresholds>,
         max_sealed: usize,
         num_workers: usize,
         max_memtable_age_secs: u64,
@@ -254,11 +315,11 @@ impl FlushManager {
             let flushed = Arc::clone(&wake);
             let compaction = Arc::clone(&compaction_wake);
             let journal = journal.clone();
-            let owed = footprints.clone();
+            let footprints = footprints.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("coord-flush-worker-{i}"))
                 .spawn(move || {
-                    flush_worker_loop(rx, &flushed, &compaction, journal.as_deref(), &owed);
+                    flush_worker_loop(rx, &flushed, &compaction, journal.as_deref(), &footprints);
                 })
                 .map_err(|e| StorageError::InvalidConfig(format!("flush worker spawn: {e}")))?;
             workers.push(handle);
@@ -280,7 +341,7 @@ impl FlushManager {
                     FlushMonitorConfig {
                         sender: tx,
                         gc_watermarks,
-                        flush_threshold_bytes,
+                        thresholds,
                         max_sealed,
                         max_memtable_age_secs,
                         shutdown: shutdown_m,
@@ -330,7 +391,8 @@ impl Drop for FlushManager {
 struct FlushMonitorConfig {
     sender: flume::Sender<FlushRequest>,
     gc_watermarks: GcWatermarks,
-    flush_threshold_bytes: u64,
+    /// Each partition's memtable size threshold; see [`FlushThresholds`].
+    thresholds: Arc<FlushThresholds>,
     max_sealed: usize,
     max_memtable_age_secs: u64,
     shutdown: Arc<AtomicBool>,
@@ -362,8 +424,10 @@ impl TreeState {
 /// One tree's turn in a monitor pass: rotate its memtable when a trigger
 /// fires, queue a flush of its sealed memtables, and lower `next_due` to when
 /// its memtable comes due by age.
+#[allow(clippy::too_many_arguments)]
 fn consider_tree(
     tree: &lsm_tree::AnyTree,
+    lands_as: Partition,
     state: &mut TreeState,
     source: impl FnOnce() -> (FlushSource, u64),
     now: Instant,
@@ -376,7 +440,7 @@ fn consider_tree(
     let age = now.saturating_duration_since(state.last_rotate);
     let age_triggered = cfg.max_memtable_age_secs > 0 && active_bytes > 0 && age >= max_age;
 
-    let rotate = active_bytes > cfg.flush_threshold_bytes
+    let rotate = active_bytes > cfg.thresholds.of(lands_as)
         || tree.sealed_memtable_count() > cfg.max_sealed
         || age_triggered
         || (squeezed && active_bytes > 0);
@@ -454,7 +518,16 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                     cfg.gc_watermarks.for_partition(*partition),
                 )
             };
-            consider_tree(tree, state, source, now, &cfg, squeezed, &mut next_due);
+            consider_tree(
+                tree,
+                *partition,
+                state,
+                source,
+                now,
+                &cfg,
+                squeezed,
+                &mut next_due,
+            );
         }
         if let Some(tables) = &cfg.tables {
             let listed = tables();
@@ -478,7 +551,16 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                         cfg.gc_watermarks.for_partition(Partition::Node),
                     )
                 };
-                consider_tree(&tree, state, source, now, &cfg, squeezed, &mut next_due);
+                consider_tree(
+                    &tree,
+                    Partition::Node,
+                    state,
+                    source,
+                    now,
+                    &cfg,
+                    squeezed,
+                    &mut next_due,
+                );
             }
         }
 
@@ -515,15 +597,7 @@ fn flush_worker_loop(
             // Every entry a sealed memtable holds was journaled before it was
             // applied, so a sync now covers them all.
             match journal.map_or(Ok(()), sync_journal) {
-                Ok(()) => {
-                    // A partition tree's flush is deferred: its version is
-                    // owed from before the flush until a barrier writes it.
-                    // A table's flush is synced and writes it itself.
-                    if matches!(source, FlushSource::Partition(_)) {
-                        footprints.flushing(tree.id());
-                    }
-                    tree.flush(&flush_lock, gc_watermark)
-                }
+                Ok(()) => tree.flush(&flush_lock, gc_watermark),
                 Err(e) => Err(lsm_tree::Error::Io(lsm_tree::io::Error::other(
                     e.to_string(),
                 ))),
@@ -555,8 +629,10 @@ fn flush_worker_loop(
                     "memtable flush failed"
                 );
                 // Retried on the monitor's next pass, which the next write or
-                // flush starts; waking it now would retry a failing disk in a
-                // loop.
+                // flush starts, or room coming back on a capped endpoint
+                // ([`Footprints::flush_stalled`]); waking it now would retry
+                // a failing disk in a loop.
+                footprints.flush_stalled();
                 continue;
             }
         }

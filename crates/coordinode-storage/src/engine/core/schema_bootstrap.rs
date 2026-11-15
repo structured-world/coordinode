@@ -320,7 +320,7 @@ impl SchemaRebuild {
         );
 
         // 5. On disk, then served from the copy's floor, then no longer owed.
-        flush(config, schema, footprints)?;
+        flush(config, schema)?;
         if source_floor < schema.retention_floor() {
             schema.lower_retention_floor(source_floor)?;
         }
@@ -414,13 +414,11 @@ fn open_source(
 
 /// Write `tree`'s memtables to tables, durable when this returns. No journal
 /// entry is appended while the open runs, so none is owed a sync first.
-fn flush(config: &StorageConfig, tree: &AnyTree, footprints: &Footprints) -> StorageResult<()> {
+fn flush(config: &StorageConfig, tree: &AnyTree) -> StorageResult<()> {
     let lock = tree.get_flush_lock();
     tree.rotate_memtable();
-    footprints.flushing(tree.id());
     tree.flush(&lock, 0)?;
     tree.persist_flushes()?;
-    footprints.persisted(tree.id());
     if config.oplog_sync_method.tree_sync_mode() == lsm_tree::fs::SyncMode::Barrier {
         tree.sync_devices()?;
     }

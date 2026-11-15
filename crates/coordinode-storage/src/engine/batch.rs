@@ -456,7 +456,10 @@ fn apply_group(
         batch.insert(mark.key().as_slice(), &[][..]);
     }
     let (added, memtable) = tree.apply_batch(batch, seqno)?;
-    engine.coordinator().flush_trigger().wrote(added, memtable);
+    engine
+        .coordinator()
+        .flush_trigger()
+        .wrote(part, added, memtable);
     engine.write_taps().applied(part, group);
     Ok(())
 }

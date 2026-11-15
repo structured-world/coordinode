@@ -452,13 +452,6 @@ pub enum DatabaseError {
         hard_limit_bytes: u64,
     },
 
-    /// No majority of the replicated group's members holds room for this
-    /// write next to the writes already in flight to them. Nothing was
-    /// written; the write may be retried once the members apply what they
-    /// hold.
-    #[error("no majority of the group's members holds room for this write")]
-    MembersFull,
-
     /// The filesystem under a durable endpoint is below its free-space
     /// reserve, so writes are refused before any reaches the disk; reads go
     /// on. Writes are admitted again once space is freed.
@@ -759,7 +752,6 @@ impl From<StorageError> for DatabaseError {
                 used_bytes,
                 hard_limit_bytes,
             },
-            StorageError::MembersFull => Self::MembersFull,
             StorageError::OutOfSpace {
                 path,
                 available_bytes,

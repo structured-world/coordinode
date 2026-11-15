@@ -161,10 +161,6 @@ pub struct RaftProposalPipeline {
     /// from (see [`crate::closure`]). Without it entries carry no bound, and
     /// a member applying them can vouch for no cut of the log.
     closure: Option<crate::engine_hold::EngineHold>,
-    /// The room this leader's followers granted for client entries: a client
-    /// write reaches the log only while a majority can pay for it. Without
-    /// it (a group of one) the leader's own admission is the whole check.
-    grants: Option<Arc<crate::cluster::grants::LeaderGrants>>,
 }
 
 impl RaftProposalPipeline {
@@ -178,26 +174,6 @@ impl RaftProposalPipeline {
             version: None,
             space: None,
             closure: None,
-            grants: None,
-        }
-    }
-
-    /// Admit client writes against the room `grants` records the followers
-    /// granted.
-    pub(crate) fn with_grants(mut self, grants: Arc<crate::cluster::grants::LeaderGrants>) -> Self {
-        self.grants = Some(grants);
-        self
-    }
-
-    /// Claim, for one hand-over of a client `proposal`, room on a majority
-    /// of each voter set, right before the hand-over; the claim lasts until
-    /// the log takes it or the leadership ends: every caller hands over right
-    /// after, with nothing between that could refuse. The group's own work
-    /// and a pipeline without grants claim nothing.
-    fn claim_grant(&self, proposal: &RaftProposal) -> Result<(), ProposalError> {
-        match &self.grants {
-            Some(grants) => crate::cluster::grants::claim(grants, &self.raft, proposal).map(drop),
-            None => Ok(()),
         }
     }
 
@@ -295,11 +271,7 @@ impl RaftProposalPipeline {
                 .admit_proposal(&proposal.mutations, class)
                 .map_err(storage_to_proposal_err),
             (None, Some(space)) => space
-                .reserve(
-                    write_footprint(&proposal.mutations)
-                        + coordinode_storage::engine::footprint::closure_footprint(),
-                    class,
-                )
+                .reserve(write_footprint(&proposal.mutations), class)
                 .map_err(storage_to_proposal_err),
             (None, None) => Ok(Admitted::default()),
         }
@@ -378,8 +350,6 @@ impl RaftProposalPipeline {
         let (request, hold) = self.entry(proposal, 0).await?;
         let id = proposal.id;
         let spawn = self.spawn_handle()?;
-        // Right before the hand-over: nothing between them fails.
-        self.claim_grant(proposal)?;
         spawn.spawn(async move {
             let written = raft.client_write(request).await;
             // Handed to the log (or refused) by now.
@@ -437,8 +407,6 @@ impl RaftProposalPipeline {
         let raft = Arc::clone(&self.raft);
         let (request, hold) = self.entry(proposal, 0).await?;
         let spawn = self.spawn_handle()?;
-        // Right before the hand-over: nothing between them fails.
-        self.claim_grant(proposal)?;
         let mut commit = spawn.spawn(async move {
             let written = raft.client_write(request).await;
             // Handed to the log (or refused) by now.
@@ -556,14 +524,6 @@ impl RaftProposalPipeline {
             // Stamped per attempt: a retry is a new hand-over. The caller's
             // own hold covers the timestamp until this returns.
             let (request, _hold) = self.entry(proposal, attempt).await?;
-            // Each hand-over is an entry the members pay for. A retry's
-            // refusal says only that it wrote nothing: an earlier attempt is
-            // in the log, where it may commit.
-            match self.claim_grant(proposal) {
-                Ok(()) => {}
-                Err(_) if attempt > 0 => return Err(ProposalError::Timeout { retries: attempt }),
-                Err(e) => return Err(e),
-            }
             let leading = crate::authority::leading_term(&self.raft);
             let write = tokio::time::timeout(timeout, self.raft.client_write(request));
             let result = match leading {

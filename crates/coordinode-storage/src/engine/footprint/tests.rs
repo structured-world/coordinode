@@ -96,78 +96,23 @@ fn client_admission_leaves_the_recovery_reserve() {
     assert!(footprint.admit(80 * UNIT, Admit::Client).is_ok());
 }
 
-/// What the memtables owe their flushes counts against admission and
-/// against the room maintenance sees.
+/// The room maintenance sees is the limit less what is charged and what
+/// admitted writes hold, and nothing more: the memtables' future flushes
+/// are not held against it, so a store with unflushed data but free space
+/// still compacts.
 #[test]
-fn flush_debt_counts_against_admission_and_room() {
+fn the_room_is_what_charged_and_admitted_leave() {
     let dir = tempfile::tempdir().unwrap();
     let footprint = opened(dir.path(), 100 * UNIT);
-    footprint.set_debt(Box::new(|| 60 * UNIT));
-    assert_eq!(footprint.room(), 40 * UNIT);
-    assert!(footprint.admit(41 * UNIT, Admit::Client).is_err());
-    let _held = footprint.admit(40 * UNIT, Admit::Client).unwrap();
-    assert_eq!(footprint.room(), 0);
-}
-
-/// The debt of several memtables covers each one's flush, however their
-/// bytes are split: each flush writes a table of its own, with its own fixed
-/// cost and its own allocation ahead. With one allowance for all of them, a
-/// backup that flushes each tree in turn on a store at its limit found no
-/// room for the last flush.
-#[test]
-fn flush_debt_covers_each_flush_of_a_split() {
-    // What one flush of `bytes` takes, as the single-flush bound gives it.
-    let one = |bytes: u64| {
-        let table = bytes + bytes / 8 + FLUSH_ALLOWANCE;
-        table + allocation_ahead(table)
-    };
-    for split in [
-        vec![1u64, 1, 1],
-        vec![100, 200_000, 3],
-        vec![5 << 20, 1, 7 << 20],
-        vec![64 << 10; 12],
-    ] {
-        let total: u64 = split.iter().sum();
-        let each: u64 = split.iter().map(|&bytes| one(bytes)).sum();
-        assert!(
-            flush_debt(total, split.len() as u64) >= each,
-            "{split:?}: {} < {each}",
-            flush_debt(total, split.len() as u64)
-        );
-    }
-    assert_eq!(flush_debt(0, 0), 0);
-    // Bytes read with no flush counted still owe one.
-    assert_eq!(flush_debt(10, 0), one(10));
-}
-
-/// Parts split off an admission and absorbed back keep the endpoint's
-/// admitted total exact: nothing is admitted twice or given back early, and
-/// dropping every part gives all of it back once.
-#[test]
-fn split_and_absorbed_admissions_keep_the_total() {
-    let dir = tempfile::tempdir().unwrap();
-    let footprints = Footprints::open(&[endpoint(dir.path(), 100 * UNIT)]).unwrap();
-    let footprint = Arc::clone(footprints.get("ep").unwrap());
-    let mut pool = footprints.admit(10 * UNIT, Admit::Client).unwrap();
-    assert_eq!(pool.bytes(), 10 * UNIT);
-    let part = pool.split_off(3 * UNIT).expect("held");
-    assert!(pool.split_off(8 * UNIT).is_none(), "more than is held");
-    assert_eq!((pool.bytes(), part.bytes()), (7 * UNIT, 3 * UNIT));
-    assert_eq!(footprint.admitted(), 10 * UNIT, "a split admits nothing");
-    drop(part);
-    assert_eq!(footprint.admitted(), 7 * UNIT);
-    pool.absorb(footprints.admit(2 * UNIT, Admit::Client).unwrap());
-    assert_eq!(pool.bytes(), 9 * UNIT);
-    assert_eq!(
-        footprint.admitted(),
-        9 * UNIT,
-        "absorbed, not counted twice"
-    );
-    let mut empty = Admitted::default();
-    empty.absorb(pool);
-    assert_eq!(empty.bytes(), 9 * UNIT);
-    drop(empty);
-    assert_eq!(footprint.admitted(), 0);
+    footprint
+        .file(&dir.path().join("a"))
+        .grow_to(30 * UNIT)
+        .unwrap();
+    let held = footprint.admit(20 * UNIT, Admit::Client).unwrap();
+    assert_eq!(footprint.committed(), 50 * UNIT);
+    assert_eq!(footprint.room(), 50 * UNIT);
+    drop(held);
+    assert_eq!(footprint.room(), 70 * UNIT);
 }
 
 /// Racing admissions never admit more than fits.

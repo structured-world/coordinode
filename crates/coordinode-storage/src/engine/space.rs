@@ -199,6 +199,17 @@ impl SpaceGuard {
         self.has_room(Admit::Recovery)
     }
 
+    /// [`Self::reserve`] of a client write by the last reading, never reading
+    /// the filesystem (see [`Self::admit_free_space_as_read`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reserve`].
+    pub fn reserve_as_read(&self, bytes: u64) -> StorageResult<Admitted> {
+        self.admit_free_space_as_read()?;
+        self.footprints.admit(bytes, Admit::Client.on_this_thread())
+    }
+
     /// [`Self::reserve`] of the store's own work by the last reading, never
     /// reading the filesystem (see [`Self::admit_free_space_as_read`]).
     ///

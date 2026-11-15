@@ -2160,10 +2160,21 @@ fn admitted_write(
     value_len: usize,
 ) -> bool {
     use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    // Incompressible, so the tables take what the values hold: a store
+    // fills at its limit by the data written, not by what compresses away.
+    let mut state = index.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let value = (0..value_len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect();
     let write = [Mutation::Put {
         partition: PartitionId::Node,
         key: format!("node:1:w{index}").into_bytes(),
-        value: vec![7u8; value_len],
+        value,
     }];
     let Ok(admitted) = engine.admit_proposal(&write, crate::engine::footprint::Admit::Client)
     else {
@@ -2186,151 +2197,117 @@ fn admitted_write(
     true
 }
 
-/// A report of `engine`'s grant after `last_index` as a member sends it,
-/// once the raise it asked for (if any) is stored: the pool topped up.
-fn grant_report(
-    engine: &StorageEngine,
-    last_index: u64,
-) -> crate::engine::footprint::grants::GrantReport {
-    let footprints = engine.footprints();
-    footprints.top_up_grant();
-    let (report, raise) = footprints.grant_report(last_index);
-    let Some(raised) = raise else {
-        return report;
-    };
-    let stored = engine.store_client_grant(raised).is_ok();
-    footprints.grant_horizon_stored(raised, stored);
-    footprints.grant_report(last_index).0
-}
-
-/// Open `engine`'s client grant as a member does: the log applied through
-/// `applied`, the group's applied client bytes `counted` (through, total),
-/// and `entries` the client entries the log holds past `applied`.
-fn open_grant(
-    engine: &StorageEngine,
-    applied: u64,
-    counted: (u64, u64),
-    entries: &[crate::engine::footprint::grants::GrantedEntry],
-) -> u64 {
-    let epoch = engine
-        .open_client_grant(applied, counted.0, counted.1)
-        .expect("open the grant");
-    engine
-        .footprints()
-        .recover_granted(entries)
-        .expect("hold the entries");
-    engine
-        .footprints()
-        .recover_granted_owed()
-        .expect("hold what is owed");
-    epoch
-}
-
-/// What a member promised its leader is what it reported, not what it is
-/// configured to grant: near its limit, a grant larger than the room left
-/// promises only what it reported, and a restart holds that again (it fits:
-/// the restart freed the pool that held it). Before, the open stored the
-/// configured grant as the promise and the next open demanded all of it,
-/// more than the endpoint could hold.
+/// At a small hard limit the node memtable is flushed once it holds half the
+/// recovery reserve, long before the configured write buffer, so its table
+/// lands while the reserve still has room for it. Before, it flushed only at
+/// the configured size, which a small limit never reaches.
 #[test]
-fn a_restart_holds_what_was_reported_not_what_was_configured() {
-    const LIMIT: u64 = crate::engine::config::MIN_HARD_LIMIT_BYTES * 2;
+fn a_small_limit_flushes_memtables_at_half_its_reserve() {
+    use lsm_tree::AbstractTree;
+    const LIMIT: u64 = crate::engine::config::MIN_HARD_LIMIT_BYTES;
     let dir = tempfile::TempDir::new().expect("tempdir");
-    let reported = {
-        let (engine, _) = clocked_capped(dir.path(), LIMIT, None);
-        engine.set_client_grant(64 << 20);
-        assert_eq!(open_grant(&engine, 0, (0, 0), &[]), 1);
-        let report = grant_report(&engine, 0);
-        assert!(report.available > 0 && report.available < 64 << 20);
-        assert_eq!(engine.footprints().grant_record().horizon, report.available);
-        report.available
-    };
-    let (engine, _) = clocked_capped(dir.path(), LIMIT, None);
-    engine.set_client_grant(64 << 20);
-    let footprint = engine.footprints().get("default").expect("a limit");
-    let before = footprint.admitted();
-    assert_eq!(
-        open_grant(&engine, 0, (0, 0), &[]),
-        2,
-        "reopens near the limit"
-    );
-    assert_eq!(
-        footprint.admitted() - before,
-        reported,
-        "the room reported is held again before anything else, no more"
-    );
-}
-
-/// A grant reported and spent on an entry applied before a crash (or held
-/// by a snapshot installed in its place), with no report after it, owes
-/// nothing on reopen: the group's applied total counts the entry. Before,
-/// the reopen read only unapplied entries and held the whole report again.
-#[test]
-fn a_spent_grant_owes_nothing_after_a_restart() {
-    use crate::engine::footprint::grants::GrantedEntry;
-    const LIMIT: u64 = 64 << 20;
-    let spent = GrantedEntry {
-        index: 1,
-        term: 1,
-        bytes: 1 << 20,
-    };
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    {
-        let (engine, _) = clocked_capped(dir.path(), LIMIT, None);
-        // A batch of twice the target: 1 MiB, spent by the entry below.
-        engine.set_client_grant(1 << 19);
-        open_grant(&engine, 0, (0, 0), &[]);
-        assert_eq!(grant_report(&engine, 0).available, 1 << 20);
-        engine.footprints().stage_granted(&[spent]).expect("stage");
-        engine.footprints().granted_appended(1, 1, 1 << 20);
-        engine.footprints().applied(1, 1, 1 << 20);
-        // Crash: no report after the entry.
+    let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    let threshold = crate::engine::config::default_recovery_reserve(LIMIT) / 2;
+    let node = engine.tree(Partition::Node).expect("node tree");
+    let mut index = 0;
+    while index * (16 << 10) < 3 * threshold {
+        index += 1;
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
     }
-    let (engine, _) = clocked_capped(dir.path(), LIMIT, None);
-    engine.set_client_grant(0);
-    let footprint = engine.footprints().get("default").expect("a limit");
-    let before = footprint.admitted();
-    open_grant(&engine, 1, (1, 1 << 20), &[]);
-    assert_eq!(
-        footprint.admitted(),
-        before,
-        "a spent promise holds nothing"
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while node.table_count() == 0 || node.sealed_memtable_count() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no flush at the reserve's threshold"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        node.active_memtable().size() <= threshold + (32 << 10),
+        "the active memtable stays near the threshold: {}",
+        node.active_memtable().size()
     );
 }
 
-/// Breakpoints held past the cache owe their removal to the footprint once
-/// their writes' admissions are given back; a restart owes it from the
-/// open, before the ledger is loaded and before any other write is
-/// admitted. At a limit where client writes are already refused, entries
-/// that only close (admitted for nothing) retire bounded batches and
-/// persist without the store passing its limit, with the default recovery
-/// reserve and with none. Before, a commit's admission covered one removal
-/// and was given back at its apply: held breakpoints owed nothing, and a
-/// closing entry's cleanup and the Schema memtable it opened came out of
-/// room nobody reserved.
+/// A flush that does not fit fails, keeping its sealed memtable and the
+/// limit; once room comes back on the endpoint it runs again by itself, with
+/// no write to start it.
+#[test]
+fn a_flush_short_of_room_runs_again_once_room_comes_back() {
+    use lsm_tree::AbstractTree;
+    const LIMIT: u64 = 64 << 20;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    for index in 1..=8 {
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+    }
+    let footprints = engine.footprints().clone();
+    let footprint = Arc::clone(footprints.get("default").expect("a limit"));
+    // Everything the endpoint may still hold, taken by another file.
+    let scratch = dir.path().join("scratch");
+    let output = footprints.file(&scratch).expect("a charge");
+    let grown = (0..100).any(|_| {
+        let room = footprint.enforced_limit() - footprint.charged();
+        output.grow_to(output.bytes() + room - room % 4096).is_ok()
+    });
+    assert!(grown, "the scratch file takes the room");
+
+    let node = engine.tree(Partition::Node).expect("node tree");
+    node.rotate_memtable();
+    footprints.squeeze();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(node.sealed_memtable_count(), 1, "the flush did not fit");
+    assert_eq!(footprint.limit(), LIMIT, "the limit stays");
+
+    footprints.removed(&scratch);
+    drop(output);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while node.sealed_memtable_count() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the flush never ran again once room came back"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(node.table_count() > 0, "the memtable became a table");
+}
+
+/// Persist `engine` as an operator of a full store does: a barrier short of
+/// room is refused as the limit, losing nothing it was to write; the limit
+/// is then raised, the barrier lands, and the limit goes back.
+fn persist_making_room(engine: &StorageEngine, limit: u64) {
+    if let Err(short) = engine.persist() {
+        assert!(
+            short.to_string().contains("limit"),
+            "a barrier fails only for want of room: {short}"
+        );
+        engine
+            .set_hard_limit("default", 4 * limit, None)
+            .expect("raise the limit");
+        engine.persist().expect("the barrier lands with room");
+        engine
+            .set_hard_limit("default", limit, None)
+            .expect("restore the limit");
+    }
+}
+
+/// At the smallest limit, with client writes already refused, entries that
+/// only close retire the ledger's breakpoints in bounded batches, the files
+/// never passing what the endpoint may hold, and a restart reads every
+/// breakpoint back. A barrier the full store has no room for may be refused
+/// and lands once room is made: nothing it was to write is lost.
 #[test]
 fn closing_entries_clean_up_within_the_limit_client_writes_are_refused_at() {
-    closing_entries_clean_up_within_the_limit(None);
-}
-
-/// As above with no recovery reserve: the ledger's cleanup, its Schema
-/// memtable included, is owed in full, not taken from a reserve.
-#[test]
-fn closing_entries_clean_up_within_the_limit_with_no_recovery_reserve() {
-    closing_entries_clean_up_within_the_limit(Some(0));
-}
-
-fn closing_entries_clean_up_within_the_limit(reserve: Option<u64>) {
     use crate::engine::closure_ledger::RETIRE_BATCH;
-    use crate::engine::footprint::{Admit, closure_debt};
+    use crate::engine::footprint::Admit;
     use coordinode_core::txn::proposal::{Mutation, PartitionId};
 
     // The smallest limit a store takes.
     const LIMIT: u64 = crate::engine::config::MIN_HARD_LIMIT_BYTES;
     let dir = tempfile::TempDir::new().expect("tempdir");
     let mut index = 0;
-    {
-        let (engine, oracle) = clocked_capped(dir.path(), LIMIT, reserve);
+    let held = {
+        let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
         engine.set_retention_window(std::time::Duration::from_secs(3_600));
         // More breakpoints than the cache keeps, then writes until the store
         // refuses the next one.
@@ -2341,28 +2318,24 @@ fn closing_entries_clean_up_within_the_limit(reserve: Option<u64>) {
         while admitted_write(&engine, &oracle, index + 1, 16 << 10) {
             index += 1;
         }
-        engine.persist().expect("persist");
-    }
-    let (engine, oracle) = clocked_capped(dir.path(), LIMIT, reserve);
-    // Owed from the open, before the ledger is loaded.
-    let held = stored_breakpoints(&engine);
+        let held = ledger_held(&engine);
+        persist_making_room(&engine, LIMIT);
+        held
+    };
+    let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    assert_eq!(
+        stored_breakpoints(&engine),
+        held,
+        "every breakpoint read back"
+    );
     assert!(held > crate::engine::closure_ledger::CACHED_BREAKPOINTS as u64);
     let footprint = engine.footprints().get("default").expect("a limit");
-    assert!(
-        footprint.debt() >= closure_debt(held),
-        "an open owes {} for {held} breakpoints before the ledger loads, not their cleanup {}",
-        footprint.debt(),
-        closure_debt(held)
-    );
     engine.set_retention_window(std::time::Duration::from_secs(3_600));
     engine.reload_closure_frontier().expect("reload");
     assert_eq!(ledger_held(&engine), held);
-    // What the flush gave back is taken by writes until clients are refused.
     while admitted_write(&engine, &oracle, index + 1, 16 << 10) {
         index += 1;
     }
-    let held = ledger_held(&engine);
-    let limit = footprint.limit();
     let probe = [Mutation::Put {
         partition: PartitionId::Node,
         key: b"node:1:probe".to_vec(),
@@ -2373,53 +2346,40 @@ fn closing_entries_clean_up_within_the_limit(reserve: Option<u64>) {
         "client writes are refused at the limit"
     );
     assert!(
-        footprint.committed() <= footprint.limit(),
-        "client writes passed the limit: {} over {} (charged, admitted, debt {:?})",
-        footprint.committed(),
-        footprint.limit(),
-        (footprint.charged(), footprint.admitted(), footprint.debt())
+        footprint.charged() <= footprint.enforced_limit(),
+        "the files passed what the endpoint may hold: {} over {}",
+        footprint.charged(),
+        footprint.enforced_limit()
     );
 
     engine.set_retention_window(std::time::Duration::ZERO);
     let mut index = index + 1;
     while ledger_held(&engine) > 0 {
         let before = ledger_held(&engine);
-        let parts = (footprint.charged(), footprint.admitted(), footprint.debt());
         apply_closure_entry(&engine, index, &[], oracle.next().as_raw() + 1);
         let retired = before - ledger_held(&engine);
         assert!(retired > 0 && retired <= RETIRE_BATCH as u64);
         assert_eq!(stored_breakpoints(&engine), ledger_held(&engine));
         assert!(
-            footprint.committed() <= footprint.limit(),
-            "the store passed its limit: {} over {} (charged, admitted, debt before {parts:?}, after {:?})",
-            footprint.committed(),
-            footprint.limit(),
-            (footprint.charged(), footprint.admitted(), footprint.debt())
+            footprint.charged() <= footprint.enforced_limit(),
+            "the files passed what the endpoint may hold: {} over {}",
+            footprint.charged(),
+            footprint.enforced_limit()
         );
         index += 1;
     }
-    // The cleanup's memtable is written out within the limit too.
-    engine
-        .persist()
-        .expect("the cleanup persists within the limit");
-    assert!(
-        footprint.committed() <= footprint.limit(),
-        "the store passed its limit once persisted: {} over {}",
-        footprint.committed(),
-        footprint.limit()
-    );
+    persist_making_room(&engine, LIMIT);
     assert_eq!(
         footprint.limit(),
-        limit,
+        LIMIT,
         "the limit stayed where it was set"
     );
-    // Persisted and cleaned up, the ledger owes only its next head and the
-    // Schema memtable that starts.
+    drop(engine);
+    let (engine, _) = clocked_capped(dir.path(), LIMIT, None);
     assert_eq!(
-        footprint.debt(),
-        closure_debt(0) + crate::engine::footprint::memtable_start(),
-        "the debt fell with the cleanup from {}",
-        closure_debt(held)
+        stored_breakpoints(&engine),
+        0,
+        "the cleanup survived a restart"
     );
 }
 

@@ -123,25 +123,13 @@ impl WaitForMajorityService {
     }
 
     /// [`Self::spawn`], stamping every batched entry with the closed bound
-    /// of `closure`'s commits when given (see [`crate::closure`]).
+    /// of `closure`'s commits when given (see [`crate::closure`]) and
+    /// admitting each proposal against the hard limits of its store.
     pub fn spawn_stamping(
         raft: Arc<RaftInstance>,
         rate_limiter: RateLimiter,
         config: BatchConfig,
         closure: Option<Arc<coordinode_storage::engine::core::StorageEngine>>,
-    ) -> Self {
-        Self::spawn_granted(raft, rate_limiter, config, closure, None)
-    }
-
-    /// [`Self::spawn_stamping`], admitting each proposal against the hard
-    /// limits of `closure`'s store and, as leader, each client proposal
-    /// against the room `grants` records its followers granted.
-    pub(crate) fn spawn_granted(
-        raft: Arc<RaftInstance>,
-        rate_limiter: RateLimiter,
-        config: BatchConfig,
-        closure: Option<Arc<coordinode_storage::engine::core::StorageEngine>>,
-        grants: Option<Arc<crate::cluster::grants::LeaderGrants>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
         let closure =
@@ -150,7 +138,7 @@ impl WaitForMajorityService {
             .as_ref()
             .map(|engine| engine.share("batch pipeline admission"));
 
-        let handle = tokio::spawn(drain_loop(raft, rate_limiter, rx, config, closure, grants));
+        let handle = tokio::spawn(drain_loop(raft, rate_limiter, rx, config, closure));
 
         Self {
             tx,
@@ -253,7 +241,6 @@ async fn drain_loop(
     mut rx: mpsc::Receiver<BatchEntry>,
     config: BatchConfig,
     closure: Option<crate::engine_hold::EngineHold>,
-    grants: Option<Arc<crate::cluster::grants::LeaderGrants>>,
 ) {
     loop {
         // Step 1: Wait for the first proposal (blocks until work arrives).
@@ -301,7 +288,7 @@ async fn drain_loop(
 
         // Submit bypass batch (if any) — no rate limiter.
         if !bypass.is_empty() {
-            submit_batch(&raft, closure.as_deref(), None, bypass, "bypass").await;
+            submit_batch(&raft, closure.as_deref(), bypass, "bypass").await;
         }
 
         // Submit normal batch (if any) — with rate limiter.
@@ -316,7 +303,7 @@ async fn drain_loop(
                     return;
                 }
             };
-            submit_batch(&raft, closure.as_deref(), grants.as_ref(), normal, "normal").await;
+            submit_batch(&raft, closure.as_deref(), normal, "normal").await;
         }
     }
 }
@@ -340,8 +327,7 @@ const BATCH_MAX_RETRIES: u32 = 3;
 async fn submit_batch(
     raft: &RaftInstance,
     closure: Option<&coordinode_storage::engine::core::StorageEngine>,
-    grants: Option<&Arc<crate::cluster::grants::LeaderGrants>>,
-    mut batch: Vec<BatchEntry>,
+    batch: Vec<BatchEntry>,
     kind: &str,
 ) {
     let batch_size = batch.len();
@@ -355,42 +341,6 @@ async fn submit_batch(
 
     for attempt in 0..BATCH_MAX_RETRIES {
         let timeout = BATCH_BASE_TIMEOUT * (1 << attempt);
-        // Every hand-over is an entry the members pay for: each client
-        // proposal claims its room again, and one refused leaves the batch.
-        // A retry's refusal says only that it wrote nothing; an earlier
-        // attempt is in the log, where it may commit. A claim whose
-        // hand-over is then not made (a refused stamp) is withdrawn.
-        let mut claims = Vec::new();
-        if let Some(grants) = grants {
-            let mut kept = Vec::with_capacity(batch.len());
-            for entry in batch {
-                match crate::cluster::grants::claim(grants, raft, &entry.proposal) {
-                    Ok(claim) => {
-                        claims.extend(claim);
-                        kept.push(entry);
-                    }
-                    Err(e) => {
-                        let e = if attempt > 0 {
-                            ProposalError::Timeout { retries: attempt }
-                        } else {
-                            e
-                        };
-                        let _ = entry.response_tx.send(Err(e));
-                    }
-                }
-            }
-            batch = kept;
-            if batch.is_empty() {
-                return;
-            }
-        }
-        let withdraw = |claims: Vec<crate::cluster::grants::Claim>| {
-            if let Some(grants) = grants {
-                for claim in claims {
-                    claim.withdraw(grants);
-                }
-            }
-        };
         let proposals: Vec<RaftProposal> = batch.iter().map(|e| e.proposal.clone()).collect();
         let mut request = Request::batch(proposals);
         // Each submitter holds its timestamp until its submission returns,
@@ -398,9 +348,6 @@ async fn submit_batch(
         if let Some(engine) = closure
             && let Err(e) = crate::closure::stamp(raft, engine, &mut request).await
         {
-            // Refused before the hand-over: nothing of this attempt is in
-            // flight to any member.
-            withdraw(claims);
             // An earlier attempt is in the log, where it may commit or
             // has: these refusals mean nothing was written only for a
             // first one.

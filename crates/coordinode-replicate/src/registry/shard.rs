@@ -491,7 +491,6 @@ impl RegistryCore {
                 e @ (ProposalError::BelowClosedBound { .. }
                 | ProposalError::LeaderNotReady { .. }
                 | ProposalError::Unencodable(_)
-                | ProposalError::MembersFull
                 | ProposalError::OutOfSpace { .. }
                 | ProposalError::CapacityExhausted { .. }
                 | ProposalError::Mismatched(_)

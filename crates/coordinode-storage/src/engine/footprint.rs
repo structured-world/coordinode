@@ -12,15 +12,14 @@
 //! - A file growing is checked and charged in one atomic step: it lands only
 //!   if the charged total stays within the limit, whoever writes it.
 //! - A client write is admitted before it is journaled, against the limit
-//!   less the recovery reserve: what it adds to the journal, and what its
-//!   data will take when its memtable is flushed, must fit beside what is
-//!   charged, what other admitted writes hold and what the memtables already
-//!   owe. So a write is refused at the door rather than acknowledged and
-//!   left with no room to flush.
+//!   less the recovery reserve: what it adds to the journal must fit beside
+//!   what is charged and what other admitted writes hold.
 //!
 //! The recovery reserve is the part of the limit client writes never take:
 //! flushes, compactions that reclaim space, and the store's own recovery
-//! records run in it. It is inside the limit, not beside it.
+//! records run in it. It is inside the limit, not beside it, and it is a
+//! margin rather than a promise: a flush that still meets the limit fails
+//! with its journal kept and runs again once room comes back.
 //!
 //! Bytes other processes write to the same file system are outside this
 //! account; the free-space reserve ([`crate::engine::space`]) guards the
@@ -60,59 +59,6 @@ impl Admit {
         }
     }
 }
-
-/// What the memtables owe the footprint: the bytes their flushes will write.
-pub type FlushDebt = Box<dyn Fn() -> u64 + Send + Sync>;
-
-/// Room a flush of any size is held to need past its data: the table's
-/// index, filter, footer and the manifest version it installs, each rounded
-/// up to whole allocation units.
-pub const FLUSH_ALLOWANCE: u64 = 128 * 1024;
-
-/// The room `flushes` flushes of `unflushed` memtable bytes in all take while
-/// they run, bounded from above: the data, an eighth more for block and
-/// filter overhead, and for each flush the fixed [`FLUSH_ALLOWANCE`] and what
-/// the file system may allocate ahead of its table ([`allocation_ahead`]).
-/// Each memtable is its own flush with its own table, so each needs its own
-/// allowance. Nothing when nothing is unflushed. Held for every admitted
-/// write until its memtable is flushed, so a flush always finds the room it
-/// needs and reclamation, which flushes before it removes covered journal
-/// segments, never stalls.
-#[must_use]
-pub fn flush_debt(unflushed: u64, flushes: u64) -> u64 {
-    if unflushed == 0 && flushes == 0 {
-        return 0;
-    }
-    // Bytes in memtables count at least one flush, whatever the count read.
-    let flushes = flushes.max(1);
-    // Memtable bytes are bounded by memory and the flush count by the trees:
-    // no overflow.
-    let tables = unflushed + unflushed / 8 + flushes * FLUSH_ALLOWANCE;
-    // One table's allocation ahead is known from its size. Of several, each
-    // is at most MAX_AHEAD and at most its own size plus MIN_AHEAD, so the
-    // sum is bounded by both totals.
-    let ahead = if flushes == 1 {
-        allocation_ahead(tables)
-    } else {
-        (flushes * MAX_AHEAD).min(tables + flushes * MIN_AHEAD)
-    };
-    tables + ahead
-}
-
-/// Room a tree whose flushes installed their tables in memory only
-/// ([`lsm_tree::config::FlushDurability::Deferred`]) owes until a barrier
-/// writes its version to the manifest: the version edit, or the snapshot a
-/// rotation writes beside the one it replaces, with what the file system
-/// allocates ahead of it. The bound [`FLUSH_ALLOWANCE`] holds for the
-/// version a flush installs; deferred, it outlives the memtable that owed it.
-pub const PERSIST_ALLOWANCE: u64 = FLUSH_ALLOWANCE;
-
-/// The most the flush debt grows when an empty memtable takes its first
-/// write and becomes one more flush: [`FLUSH_ALLOWANCE`] in its table and as
-/// much again, with [`MIN_AHEAD`] twice, in the allocation ahead the sum of
-/// the tables bounds. A write into a tree whose active memtable is empty is
-/// admitted for this as well as its own bytes.
-pub(crate) const MEMTABLE_START_DEBT: u64 = 2 * (FLUSH_ALLOWANCE + MIN_AHEAD);
 
 /// The smallest journal segment a hard limit brings the configured size down
 /// to: below it the per-segment header, footer and file cost outweigh the
@@ -184,12 +130,9 @@ impl Drop for ReclaimScope {
 }
 
 /// Held while the thread runs a compaction: the files it grows may take only
-/// the room admitted writes and the memtables' flushes leave
-/// ([`Footprint::room`]). A compaction's output is estimated before it
-/// starts, and the file system allocates ahead of what it writes; without
-/// the scope it could take the room a flush was promised, and a flush that
-/// fails holds its journal, so nothing would come back. A compaction refused
-/// this way leaves its inputs in place and is tried again.
+/// the room admitted writes leave ([`Footprint::room`]), so a compaction
+/// does not take the journal room of a write already let in. A compaction
+/// refused this way leaves its inputs in place and is tried again.
 #[must_use = "the scope lasts until it drops"]
 pub struct MaintenanceScope {
     was: bool,
@@ -234,12 +177,13 @@ pub struct Footprint {
     charged: AtomicU64,
     /// What admitted client writes hold until they land.
     admitted: AtomicU64,
-    /// See [`FlushDebt`]; none until the engine's trees are open.
-    debt: parking_lot::RwLock<Option<FlushDebt>>,
     /// The charge of every file under `root`, by every name it has.
     files: parking_lot::Mutex<HashMap<PathBuf, Arc<FileCharge>>>,
     /// Handed to file charges, which give their bytes back when they go.
     this: Weak<Footprint>,
+    /// The flush requests of the footprints this one belongs to, told when
+    /// room comes back or the limit changes.
+    squeeze: std::sync::OnceLock<Arc<Squeeze>>,
 }
 
 impl std::fmt::Debug for Footprint {
@@ -275,9 +219,9 @@ impl Footprint {
             unit,
             charged: AtomicU64::new(0),
             admitted: AtomicU64::new(0),
-            debt: parking_lot::RwLock::new(None),
             files: parking_lot::Mutex::new(HashMap::new()),
             this: this.clone(),
+            squeeze: std::sync::OnceLock::new(),
         });
         footprint.charge_existing()?;
         footprint.pend_if_over();
@@ -342,9 +286,8 @@ impl Footprint {
             return;
         }
         let limit = self.limit();
-        // What the flushes owe and admitted writes hold is promised already:
-        // the ceiling leaves it room to land, so a flush still gives back
-        // its journal.
+        // What admitted writes hold is promised already: the ceiling leaves
+        // it room to land.
         let committed = self.committed();
         if limit == 0 || committed <= limit {
             self.pending.store(0, Ordering::Release);
@@ -427,15 +370,9 @@ impl Footprint {
         self.admitted.load(Ordering::Acquire)
     }
 
-    /// What the memtables will write when they are flushed.
-    pub fn debt(&self) -> u64 {
-        self.debt.read().as_ref().map_or(0, |debt| debt())
-    }
-
-    /// Everything the endpoint holds or has promised: charged, admitted and
-    /// owed to flushes.
+    /// Everything the endpoint holds or has let in: charged and admitted.
     pub fn committed(&self) -> u64 {
-        self.charged() + self.admitted() + self.debt()
+        self.charged() + self.admitted()
     }
 
     /// Change the limit and the reserve without a restart. A limit below what
@@ -445,16 +382,19 @@ impl Footprint {
         self.limit.store(limit, Ordering::Release);
         self.reserve.store(reserve.min(limit), Ordering::Release);
         self.pend_if_over();
+        self.room_changed();
     }
 
-    /// Install what the memtables owe, once the trees are open.
-    pub fn set_debt(&self, debt: FlushDebt) {
-        *self.debt.write() = Some(debt);
+    /// Wake a flush that failed for want of room, if any.
+    fn room_changed(&self) {
+        if let Some(squeeze) = self.squeeze.get() {
+            squeeze.room_changed();
+        }
     }
 
-    /// The room growth that keeps the flush debt and admitted writes covered
-    /// may still take: what compactions and other maintenance see as free.
-    /// `u64::MAX` without a limit.
+    /// The room growth that leaves admitted writes theirs may still take:
+    /// what compactions and other maintenance see as free. `u64::MAX`
+    /// without a limit.
     pub fn room(&self) -> u64 {
         match self.enforced_limit() {
             0 => u64::MAX,
@@ -469,9 +409,9 @@ impl Footprint {
     }
 
     /// Admit a write that adds about `bytes` to the footprint, or refuse it
-    /// while it does not fit beside what is charged, admitted and owed. The
+    /// while it does not fit beside what is charged and admitted. The
     /// admission holds its bytes until it is dropped, by when what it wrote
-    /// is charged to its files and owed by its memtable.
+    /// is charged to its files.
     ///
     /// # Errors
     ///
@@ -485,12 +425,11 @@ impl Footprint {
             Admit::Client => self.client_ceiling(),
             Admit::Recovery => self.enforced_limit(),
         };
-        let debt = self.debt();
         let mut admitted = self.admitted.load(Ordering::Acquire);
         loop {
             // Each term is bounded by the bytes the endpoint can hold.
             let charged = self.charged();
-            let need = charged + admitted + debt + bytes;
+            let need = charged + admitted + bytes;
             if need > ceiling {
                 metrics::counter!("coordinode_footprint_refusals_total").increment(1);
                 // What the refusal was judged on, at the moment it was taken:
@@ -501,7 +440,6 @@ impl Footprint {
                     bytes,
                     charged,
                     admitted,
-                    debt,
                     ceiling,
                     limit,
                     "footprint refused a write"
@@ -524,9 +462,9 @@ impl Footprint {
         }
     }
 
-    /// Whether a write of `class` would find any room now: what is charged,
-    /// admitted and owed is below the ceiling the class may use. Always
-    /// without a limit.
+    /// Whether a write of `class` would find any room now: what is charged
+    /// and admitted is below the ceiling the class may use. Always without a
+    /// limit.
     pub fn has_room(&self, class: Admit) -> bool {
         if self.limit() == 0 {
             return true;
@@ -557,11 +495,12 @@ impl Footprint {
     /// Charge `bytes` of growth, or refuse it when the charged total would
     /// pass the limit. Checked and charged in one step, so concurrent growth
     /// cannot pass the limit together. Growth inside a [`MaintenanceScope`]
-    /// is held to [`Self::room`] instead: what admitted writes and the
-    /// memtables' flushes were promised stays theirs.
+    /// is held to [`Self::room`] instead: what admitted writes were let in
+    /// for stays theirs.
     fn take(&self, bytes: u64) -> io::Result<()> {
         if self.pending.load(Ordering::Acquire) != 0 {
-            // Flushes lower what is promised without giving bytes back.
+            // Admissions landing lower what is promised without giving
+            // bytes back.
             self.follow_pending();
         }
         let limit = self.enforced_limit();
@@ -570,8 +509,7 @@ impl Footprint {
             return Ok(());
         }
         let promised = if MAINTENANCE.get() {
-            // Bounded by the bytes the endpoint can hold.
-            self.admitted() + self.debt()
+            self.admitted()
         } else {
             0
         };
@@ -616,6 +554,9 @@ impl Footprint {
             "a footprint gives back only what it charged"
         );
         self.follow_pending();
+        if bytes > 0 {
+            self.room_changed();
+        }
     }
 
     /// The charge of the file at `path`, made at none when the file is new.
@@ -998,12 +939,12 @@ impl Drop for Admission {
 /// a derived index change, an operation record) is taken to write.
 const DECIDED_MUTATION_BYTES: u64 = 1024;
 
-/// Bytes each mutation adds past its key and value: journal framing and the
-/// sequence number, type and node overhead it takes in a memtable.
+/// Bytes each mutation adds past its key and value in the journal: framing,
+/// sequence number and type.
 const MUTATION_OVERHEAD: u64 = 64;
 
 /// The room a client write is admitted for, bounded from above: its journal
-/// entry, and its data's share of the flush that writes its memtable out.
+/// entry.
 #[must_use]
 pub fn write_footprint(mutations: &[coordinode_core::txn::proposal::Mutation]) -> u64 {
     use coordinode_core::txn::proposal::Mutation;
@@ -1023,66 +964,17 @@ pub fn write_footprint(mutations: &[coordinode_core::txn::proposal::Mutation]) -
     footprint_of(data, mutations.len())
 }
 
-/// The room a commit applied from a consensus log is admitted for beside its
-/// own writes: the breakpoint record its commit may add to the closure
-/// ledger, and that record's later removal. The admission holds both until
-/// the entry is applied, by when the ledger owes the removal
-/// ([`closure_debt`]): the debt is covered from the commit's admission on.
-#[must_use]
-pub fn closure_footprint() -> u64 {
-    use crate::engine::closure_ledger::BREAKPOINT_KEY_LEN;
-    footprint_of(BREAKPOINT_KEY_LEN as u64 + 8, 1) + breakpoint_removal()
-}
-
-/// The room the removal of one breakpoint record takes.
-fn breakpoint_removal() -> u64 {
-    use crate::engine::closure_ledger::BREAKPOINT_KEY_LEN;
-    footprint_of(BREAKPOINT_KEY_LEN as u64, 1)
-}
-
-/// What the closure ledger of a consensus log owes while it holds `held`
-/// breakpoint records: the removal of each, and the head record the next
-/// entry rewrites whether it commits anything or only closes. Owed to the
-/// footprint like the memtables' flushes, so client writes leave the room
-/// its cleanup needs whatever recovery reserve the endpoint has, none
-/// included. While the Schema memtable is empty, the one those writes
-/// start is owed too ([`memtable_start`]).
-///
-/// Called from the footprint's debt, under locks of the trees a compaction
-/// holds: it reads no tree.
-#[must_use]
-pub fn closure_debt(held: u64) -> u64 {
-    use crate::engine::closure_ledger::{HEAD_KEY, HEAD_LEN};
-    // One removal per record held: bounded by the records, no overflow.
-    footprint_of((HEAD_KEY.len() + HEAD_LEN) as u64, 1) + held * breakpoint_removal()
-}
-
-/// What [`flush_debt`] can grow by when a memtable starts beside those
-/// waiting, past its records' own share (which their footprint covers): one
-/// more flush's fixed cost, and at most one more table's allocation ahead.
-/// Owed by whoever is bound to start one; once it has started, the flush
-/// debt counts it instead.
-#[must_use]
-pub const fn memtable_start() -> u64 {
-    FLUSH_ALLOWANCE + MAX_AHEAD
-}
-
 /// The room `count` writes of `data` key and value bytes in all are admitted
-/// for, bounded from above: each into the journal, then into a table an
-/// eighth larger than what it holds, and as much again for what the file
-/// system allocates ahead of that table, which grows with it
-/// ([`flush_debt`]).
+/// for, bounded from above: their journal entries.
 #[must_use]
 pub fn footprint_of(data: u64, count: usize) -> u64 {
     // Bounded by the bytes the writes hold in memory: no overflow.
-    let data = data + count as u64 * MUTATION_OVERHEAD;
-    let table = data + data / 8;
-    data + table + table
+    data + count as u64 * MUTATION_OVERHEAD
 }
 
 /// A write's admissions on every capped endpoint, given back when it drops:
-/// held across the journal append and the apply, by when what the write
-/// added is charged to the journal and owed by the memtables.
+/// held across the journal append, by when what the write added is charged
+/// to the journal.
 #[derive(Debug, Default)]
 #[must_use = "an admission holds its bytes until it drops"]
 pub struct Admitted {
@@ -1091,11 +983,6 @@ pub struct Admitted {
 }
 
 impl Admitted {
-    /// Whether the admission holds nothing: no endpoint has a limit.
-    fn is_empty(&self) -> bool {
-        self.held.iter().all(|admission| admission.bytes == 0)
-    }
-
     /// The bytes held on each capped endpoint (the same on every one); `0`
     /// with no limit.
     #[must_use]
@@ -1105,44 +992,6 @@ impl Admitted {
             .map(|admission| admission.bytes)
             .max()
             .unwrap_or(0)
-    }
-
-    /// Take `bytes` of this admission into one of its own, holding them on
-    /// every endpoint this one does: nothing is given back or admitted anew.
-    /// `None` when this one holds less on some endpoint.
-    #[must_use]
-    pub fn split_off(&mut self, bytes: u64) -> Option<Self> {
-        if self.held.iter().any(|admission| admission.bytes < bytes) {
-            return None;
-        }
-        let held = self
-            .held
-            .iter_mut()
-            .map(|admission| {
-                admission.bytes -= bytes;
-                Admission {
-                    footprint: admission.footprint.clone(),
-                    bytes,
-                }
-            })
-            .collect();
-        Some(Self { held })
-    }
-
-    /// Hold what `other` holds as part of this admission. Both come from the
-    /// same footprints, which admit on their endpoints in one order.
-    pub fn absorb(&mut self, mut other: Self) {
-        if self.held.is_empty() {
-            self.held = std::mem::take(&mut other.held);
-            return;
-        }
-        debug_assert_eq!(self.held.len(), other.held.len(), "the same footprints");
-        for (mine, theirs) in self.held.iter_mut().zip(other.held.iter_mut()) {
-            debug_assert!(Weak::ptr_eq(&mine.footprint, &theirs.footprint));
-            // Both bounded by what one endpoint can hold.
-            mine.bytes += theirs.bytes;
-            theirs.bytes = 0;
-        }
     }
 }
 
@@ -1168,56 +1017,32 @@ pub struct Footprints {
     endpoints: Arc<Vec<Arc<Footprint>>>,
     /// Asks the flush monitor to flush every memtable holding data.
     squeeze: Arc<Squeeze>,
-    /// Room held for consensus log entries this member took until they are
-    /// applied.
-    unapplied: Arc<parking_lot::Mutex<Unapplied>>,
-    /// See [`Footprints::flushing`].
-    unpersisted: Arc<Unpersisted>,
-    /// Room held for a leader's client entries; see [`grants`].
-    grants: Arc<parking_lot::Mutex<grants::Grants>>,
-}
-
-/// The trees whose flushes installed their tables in memory only, by tree
-/// id, each owing [`PERSIST_ALLOWANCE`] until a barrier writes its version.
-#[derive(Debug, Default)]
-struct Unpersisted {
-    /// Whether the trees' flushes are deferred at all; with synced flushes a
-    /// flush writes its version before its memtable stops owing.
-    deferred: AtomicBool,
-    trees: parking_lot::Mutex<rustc_hash::FxHashSet<u64>>,
-}
-
-/// See [`Footprints::unpersisted_debt`].
-#[derive(Clone)]
-pub(crate) struct UnpersistedDebt(Arc<Unpersisted>);
-
-impl UnpersistedDebt {
-    /// The bytes owed now.
-    pub(crate) fn bytes(&self) -> u64 {
-        // A tree count times a fixed allowance: far below u64::MAX.
-        self.0.trees.lock().len() as u64 * PERSIST_ALLOWANCE
-    }
-}
-
-/// See [`Footprints::hold_until_applied`].
-#[derive(Debug, Default)]
-struct Unapplied {
-    /// The highest index the log was applied through.
-    applied: u64,
-    /// Each hold by the index of the last entry it covers.
-    held: Vec<(u64, Admitted)>,
 }
 
 /// A request, raised by a write a hard limit refused, that the memtables be
-/// flushed now rather than when their size or age makes them due: what they
-/// owe is reserved at a bound above what their tables take, so a flush hands
-/// room back. Whoever met the limit (a client write, a member taking its
-/// leader's entries) raises it, so room comes back without that caller
-/// owning a flush.
+/// flushed now rather than when their size or age makes them due: a flush
+/// lets the journal segments it covers go, which hands room back. Whoever
+/// met the limit raises it, so room comes back without that caller owning
+/// a flush.
 #[derive(Debug, Default)]
 struct Squeeze {
     requested: AtomicBool,
     wake: parking_lot::RwLock<Option<Arc<coordinode_core::txn::wake::Wake>>>,
+    /// A flush failed; the monitor is woken to try it again once room comes
+    /// back on an endpoint or a limit changes, not before.
+    stalled: AtomicBool,
+}
+
+impl Squeeze {
+    /// Room came back or a limit changed: wake the monitor for a flush that
+    /// failed, once.
+    fn room_changed(&self) {
+        if self.stalled.swap(false, Ordering::AcqRel)
+            && let Some(wake) = self.wake.read().as_ref()
+        {
+            wake.notify();
+        }
+    }
 }
 
 impl Footprints {
@@ -1235,83 +1060,15 @@ impl Footprints {
             }
         }
         capped.sort_by_key(|footprint| std::cmp::Reverse(footprint.root.components().count()));
+        let squeeze: Arc<Squeeze> = Arc::default();
+        for footprint in &capped {
+            // Each footprint is new here: nothing set it before.
+            drop(footprint.squeeze.set(Arc::clone(&squeeze)));
+        }
         Ok(Self {
             endpoints: Arc::new(capped),
-            squeeze: Arc::default(),
-            unapplied: Arc::default(),
-            unpersisted: Arc::default(),
-            grants: Arc::default(),
+            squeeze,
         })
-    }
-
-    /// Whether the partition trees' flushes install their tables in memory
-    /// only, written to the manifest at the next barrier.
-    pub(crate) fn set_flushes_deferred(&self, deferred: bool) {
-        self.unpersisted.deferred.store(deferred, Ordering::Release);
-    }
-
-    /// A flush of the partition tree `tree` is about to run. Deferred, it
-    /// installs its tables in memory and its memtable stops owing, while the
-    /// version it installed is still to be written: the tree owes
-    /// [`PERSIST_ALLOWANCE`] from now until [`Self::persisted`]. Called
-    /// before the flush, so no moment is left where neither owes the room.
-    pub(crate) fn flushing(&self, tree: u64) {
-        if self.endpoints.is_empty() || !self.unpersisted.deferred.load(Ordering::Acquire) {
-            return;
-        }
-        self.unpersisted.trees.lock().insert(tree);
-    }
-
-    /// A barrier wrote the version of tree `tree` to the manifest: what its
-    /// flushes owed for it comes back.
-    pub(crate) fn persisted(&self, tree: u64) {
-        if self.endpoints.is_empty() {
-            return;
-        }
-        if self.unpersisted.trees.lock().remove(&tree) {
-            for footprint in self.endpoints.iter() {
-                footprint.follow_pending();
-            }
-        }
-    }
-
-    /// What the trees owe for the versions their flushes installed in memory
-    /// only, readable without the footprints: the debt each footprint holds
-    /// reads it, and holding the footprints there would keep them alive.
-    pub(crate) fn unpersisted_debt(&self) -> UnpersistedDebt {
-        UnpersistedDebt(Arc::clone(&self.unpersisted))
-    }
-
-    /// Keep `room` until the consensus log is applied through `index`: what
-    /// entries a member took will be owed by its memtables only once they
-    /// are applied, and the room stays theirs until then.
-    pub fn hold_until_applied(&self, index: u64, room: Admitted) {
-        if room.is_empty() {
-            return;
-        }
-        let mut unapplied = self.unapplied.lock();
-        // Under the lock [`Self::applied`] moves it: an apply that ran ahead
-        // of the hold has already passed it.
-        if index > unapplied.applied {
-            unapplied.held.push((index, room));
-        }
-    }
-
-    /// The consensus log is applied through `index` (or a snapshot installed
-    /// at it), with `granted_total` client bytes applied through
-    /// `granted_through` as the group's applied state records them: the room
-    /// held for the entries up to it goes back.
-    pub fn applied(&self, index: u64, granted_through: u64, granted_total: u64) {
-        {
-            let mut unapplied = self.unapplied.lock();
-            unapplied.applied = unapplied.applied.max(index);
-            if !unapplied.held.is_empty() {
-                unapplied.held.retain(|(last, _)| *last > index);
-            }
-        }
-        self.grants
-            .lock()
-            .applied(index, granted_through, granted_total);
     }
 
     /// The flush monitor's wake, which a squeeze notifies.
@@ -1319,11 +1076,16 @@ impl Footprints {
         *self.squeeze.wake.write() = Some(wake);
     }
 
-    /// Ask for every memtable holding data to be flushed, when some endpoint
-    /// owes flushes: a write met a hard limit, and the room the flushes owe
-    /// beyond their tables comes back once they run.
+    /// A flush failed: try it again once room comes back on an endpoint or a
+    /// limit changes.
+    pub(crate) fn flush_stalled(&self) {
+        self.squeeze.stalled.store(true, Ordering::Release);
+    }
+
+    /// Ask for every memtable holding data to be flushed: a write met a hard
+    /// limit, and the journal the memtables hold comes back once they are.
     pub fn squeeze(&self) {
-        if self.endpoints.iter().all(|f| f.debt() == 0) {
+        if self.endpoints.is_empty() {
             return;
         }
         self.squeeze.requested.store(true, Ordering::Release);
@@ -1372,13 +1134,6 @@ impl Footprints {
     /// Every footprint.
     pub fn iter(&self) -> impl Iterator<Item = &Arc<Footprint>> {
         self.endpoints.iter()
-    }
-
-    /// Install what the memtables owe on every footprint.
-    pub fn set_debt(&self, debt: impl Fn() -> u64 + Send + Sync + Clone + 'static) {
-        for footprint in self.endpoints.iter() {
-            footprint.set_debt(Box::new(debt.clone()));
-        }
     }
 
     /// Admit a write of about `bytes` on every capped endpoint it may grow:
@@ -1493,8 +1248,6 @@ impl Footprints {
         }
     }
 }
-
-pub mod grants;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

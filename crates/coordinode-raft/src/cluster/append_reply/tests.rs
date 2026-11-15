@@ -35,20 +35,3 @@ fn every_append_outcome_survives_the_wire() {
         assert_eq!(over_the_wire(outcome.clone()), outcome);
     }
 }
-
-/// Only an accepted answer proves entries were taken, and through the last
-/// one it names.
-#[test]
-fn only_an_accepted_answer_matches_entries() {
-    assert_eq!(AppendReply::Accepted(Some(log_id(2, 8))).matched(), Some(8));
-    assert_eq!(AppendReply::Accepted(None).matched(), None);
-    let conflict = AppendReply::Conflict {
-        log_id: log_id(2, 8),
-        hint: Some(vec![log_id(1, 2)]),
-    };
-    assert_eq!(conflict.matched(), None);
-    assert_eq!(
-        AppendReply::HigherVote(Vote::new_committed(3, 1)).matched(),
-        None
-    );
-}

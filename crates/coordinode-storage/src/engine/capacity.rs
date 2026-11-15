@@ -266,14 +266,13 @@ impl CapacityTracker {
     }
 }
 
-/// Publish what endpoint `id`'s footprint holds, has admitted and owes, and
-/// the reserve it keeps.
+/// Publish what endpoint `id`'s footprint holds and has admitted, and the
+/// reserve it keeps.
 fn publish_footprint(id: &str, footprint: &crate::engine::footprint::Footprint) {
     let id = id.to_owned();
     for (name, value) in [
         ("coordinode_footprint_charged_bytes", footprint.charged()),
         ("coordinode_footprint_admitted_bytes", footprint.admitted()),
-        ("coordinode_footprint_flush_debt_bytes", footprint.debt()),
         ("coordinode_footprint_reserve_bytes", footprint.reserve()),
         ("coordinode_footprint_limit_bytes", footprint.limit()),
     ] {

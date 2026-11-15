@@ -334,7 +334,6 @@ fn vote_for(candidate: u64) -> RaftPayload {
     RaftPayload {
         data: rmp_serde::to_vec(&request).expect("encode"),
         group: 0,
-        grant: None,
     }
 }
 
@@ -342,7 +341,6 @@ fn members_query() -> RaftPayload {
     RaftPayload {
         data: Vec::new(),
         group: 0,
-        grant: None,
     }
 }
 
@@ -618,7 +616,6 @@ async fn a_removed_member_is_refused(fx: Fixture, renamed: PeerIdentity) {
         RaftPayload {
             data: rmp_serde::to_vec(&request).expect("encode"),
             group: 0,
-            grant: None,
         }
     };
     let as_three = fx.connections(3);
