@@ -201,6 +201,16 @@ harness = false
 name = "state_cut_scan_alloc"
 harness = false
 
+# What a statement costs with the advisor recording it and without.
+[[bench]]
+name = "statement_cost"
+harness = false
+
+# The allocations of the same statements.
+[[bench]]
+name = "statement_cost_alloc"
+harness = false
+
 # What ordinary writes cost, through to a store at rest.
 [[bench]]
 name = "write_cost"
