@@ -1148,17 +1148,18 @@ async fn constraints_held_before_the_cluster_bind_every_member_after_a_leader_ch
 
 /// A group of three members formed around the first, which leads.
 async fn three_member_group() -> (CoordinodeProcess, CoordinodeProcess, CoordinodeProcess) {
-    three_member_group_with_third(&[], "").await
+    three_member_group_with(&[], &[], "").await
 }
 
-/// [`three_member_group`] with `env` set on node 3 and `settings` added to
-/// its config file.
-async fn three_member_group_with_third(
+/// [`three_member_group`] with `first_env` set on node 1, the first leader,
+/// and `env` set on node 3 with `settings` added to its config file.
+async fn three_member_group_with(
+    first_env: &[(&str, &str)],
     env: &[(&str, &str)],
     settings: &str,
 ) -> (CoordinodeProcess, CoordinodeProcess, CoordinodeProcess) {
     let (p1, p2, p3) = (free_port(), free_port(), free_port());
-    let n1 = CoordinodeProcess::start_cluster_member(1, p1, &[p2, p3]).await;
+    let n1 = CoordinodeProcess::start_cluster_member_with(1, p1, &[p2, p3], first_env, "").await;
     let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[p1, p3]).await;
     let n3 = CoordinodeProcess::start_cluster_member_with(3, p3, &[p1, p2], env, settings).await;
     let mut leader = n1.cluster_client().await;
@@ -1526,7 +1527,8 @@ async fn a_stopped_follower_exits_before_the_drain_window() {
 async fn a_consensus_stop_past_the_drain_window_runs_once() {
     let marks = tempfile::NamedTempFile::new().expect("marks file");
     let marks_path = marks.path().to_str().expect("utf-8 path").to_owned();
-    let (n1, n2, mut n3) = three_member_group_with_third(
+    let (n1, n2, mut n3) = three_member_group_with(
+        &[],
         &[
             ("COORDINODE_TEST_CONSENSUS_STOP_DELAY_MS", "3000"),
             ("COORDINODE_TEST_CONSENSUS_STOP_MARKS", &marks_path),
@@ -1683,6 +1685,304 @@ async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
             .len(),
         2
     );
+}
+
+/// Commits of interactive transactions held by a leader that is stopped
+/// while they arrive, sent through a follower and on the leader itself, are
+/// told the truth: each transaction's operation, resolved afterwards with
+/// the exclusion on a connection opened again, is committed exactly when its
+/// write is there, a commit answered Committed is there, and a commit
+/// answered with a definite refusal (aborted, not found, a failed
+/// precondition) is not. A commit cut off by the stop is answered with an
+/// error, or not at all, and the operation then resolves it; never a false
+/// success or a false rollback.
+#[tokio::test(flavor = "multi_thread")]
+async fn interactive_commits_across_a_leader_stop_resolve_truthfully() {
+    commits_across_a_leader_stop(false).await;
+}
+
+/// [`interactive_commits_across_a_leader_stop_resolve_truthfully`] with each
+/// of the leader's Raft log syncs held 1.5 s from just before its stop: the
+/// commits it proposed are still on their way when it stops, and are
+/// answered with an outcome to resolve, or committed through the other
+/// members; never a false success or a false rollback.
+#[cfg(all(unix, feature = "test-faults"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn interactive_commits_in_flight_at_a_leader_stop_resolve_truthfully() {
+    commits_across_a_leader_stop(true).await;
+}
+
+/// The commits of transactions held by node 1, the leader, sent through
+/// node 2 while node 1 is asked to stop; with `stall_leader_log`, node 1's
+/// own log syncs are held from just before the stop.
+async fn commits_across_a_leader_stop(stall_leader_log: bool) {
+    use coordinode_integration::proto::operation::{
+        self, operation_service_client::OperationServiceClient,
+    };
+    use coordinode_integration::proto::session::server_frame::Event;
+    use coordinode_integration::proto::session::session_service_client::SessionServiceClient;
+    use coordinode_integration::proto::session::{
+        Begin, ClientFrame, Commit, Execute, client_frame,
+    };
+    use tokio_stream::wrappers::ReceiverStream;
+
+    const TRANSACTIONS: u64 = 16;
+    const SPACING: Duration = Duration::from_millis(25);
+
+    let first_env: &[(&str, &str)] = if stall_leader_log {
+        &[("COORDINODE_TEST_DISK_STALL_OWN_MS", "1500")]
+    } else {
+        &[]
+    };
+    let (n1, n2, n3) = three_member_group_with(first_env, &[], "").await;
+    let channel = tonic::transport::Endpoint::from_shared(n2.endpoint())
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut operations = OperationServiceClient::new(channel.clone());
+    let issuer = draw_transaction_id();
+    let enrolled = operations
+        .enroll_issuer(operation::EnrollIssuerRequest {
+            issuer: issuer.clone(),
+        })
+        .await
+        .expect("enrolled through the follower")
+        .into_inner();
+    let reference = |i: u64| operation::OperationRef {
+        issuer: issuer.clone(),
+        incarnation: enrolled.incarnation,
+        sequence: enrolled.next_sequence + i,
+        deployment: enrolled.deployment.clone(),
+    };
+
+    // Two sessions: one through node 2, whose commits node 2 passes on to the
+    // leader, and one on the leader itself, whose connection the stop ends.
+    // Transactions 0..TRANSACTIONS go through the first, the next
+    // TRANSACTIONS through the second; every one open at the leader, its
+    // write run, before the stop.
+    let direct = tonic::transport::Endpoint::from_shared(n1.endpoint())
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut sessions = Vec::new();
+    for (side, channel) in [channel, direct].into_iter().enumerate() {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut inbound = SessionServiceClient::new(channel)
+            .session(ReceiverStream::new(rx))
+            .await
+            .expect("open session")
+            .into_inner();
+        let first = side as u64 * TRANSACTIONS;
+        let mut commits = Vec::new();
+        for i in first..first + TRANSACTIONS {
+            let txid = draw_transaction_id();
+            tx.send(ClientFrame {
+                request_id: 2 * i + 1,
+                op: Some(client_frame::Op::Begin(Begin {
+                    txid: txid.clone(),
+                    operation: Some(reference(i)),
+                })),
+            })
+            .await
+            .expect("begin");
+            tx.send(ClientFrame {
+                request_id: 2 * i + 2,
+                op: Some(client_frame::Op::Execute(Execute {
+                    query: format!("CREATE (:AtStop {{k: {i}}})"),
+                    txid: txid.clone(),
+                    ..Default::default()
+                })),
+            })
+            .await
+            .expect("write");
+            commits.push(ClientFrame {
+                request_id: 1000 + i,
+                op: Some(client_frame::Op::Commit(Commit {
+                    txid,
+                    operation: None,
+                    expect: Vec::new(),
+                })),
+            });
+        }
+        let mut writes_done = 0;
+        while writes_done < TRANSACTIONS {
+            let frame = inbound.message().await.expect("frame").expect("not end");
+            match frame.event {
+                Some(Event::CursorEnd(_)) => writes_done += 1,
+                Some(Event::Error(e)) => panic!("a write before the stop failed: {e:?}"),
+                _ => {}
+            }
+        }
+        sessions.push((tx, inbound, commits));
+    }
+
+    // The commits of both sessions, spaced out; the leader is asked to stop
+    // a quarter in.
+    let mut senders = Vec::new();
+    let mut streams = Vec::new();
+    for (tx, inbound, commits) in sessions {
+        streams.push(inbound);
+        senders.push(tokio::spawn(async move {
+            for commit in commits {
+                // A send into a session whose connection ended is a commit
+                // never sent; it is resolved like one whose answer was lost.
+                if tx.send(commit).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(SPACING).await;
+            }
+        }));
+    }
+    tokio::time::sleep(SPACING * u32::try_from(TRANSACTIONS / 4).expect("small")).await;
+    #[cfg(all(unix, feature = "test-faults"))]
+    if stall_leader_log {
+        // Held from here on: the stop finds commits proposed and unsynced.
+        n1.toggle_disk_stall();
+        tokio::time::sleep(SPACING * 2).await;
+    }
+    n1.request_stop();
+
+    // Each commit's answer: Committed, an error, or none when its session's
+    // connection ended first. The session through node 2 answers every one.
+    let mut replies = std::collections::HashMap::<u64, Option<_>>::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let [mut routed, mut on_leader]: [_; 2] = streams.try_into().expect("two sessions");
+    let mut leader_open = true;
+    let routed_done = |replies: &std::collections::HashMap<u64, Option<_>>| {
+        (0..TRANSACTIONS).all(|i| replies.contains_key(&i))
+    };
+    while replies.len() < 2 * TRANSACTIONS as usize && (leader_open || !routed_done(&replies)) {
+        let frame = tokio::select! {
+            f = routed.message() => f.expect("frame").expect("not end"),
+            f = on_leader.message(), if leader_open => match f {
+                Ok(Some(f)) => f,
+                Ok(None) | Err(_) => {
+                    leader_open = false;
+                    continue;
+                }
+            },
+            () = tokio::time::sleep_until(deadline.into()) => {
+                panic!("commits unanswered after 60 s: {} of {}", replies.len(), 2 * TRANSACTIONS)
+            }
+        };
+        if !(1000..1000 + 2 * TRANSACTIONS).contains(&frame.request_id) {
+            continue;
+        }
+        match frame.event {
+            Some(Event::Committed(_)) => {
+                replies.insert(frame.request_id - 1000, None);
+            }
+            Some(Event::Error(e)) => {
+                replies.insert(frame.request_id - 1000, Some(e));
+            }
+            _ => {}
+        }
+    }
+    for sender in senders {
+        sender.await.expect("the commits were sent");
+    }
+
+    // After the hand-over, on a connection opened again to node 2: each
+    // operation resolved, excluded if it never committed, and its write
+    // looked for at another member.
+    let mut operations = OperationServiceClient::new(
+        tonic::transport::Endpoint::from_shared(n2.endpoint())
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect again"),
+    );
+    let fence = loop {
+        match cypher_write_on(&n2, "CREATE (:AfterStop {k: 1})").await {
+            Ok(at) => break at,
+            Err(e) if Instant::now() < deadline => {
+                eprintln!("waiting for a new leader: {e}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("no new leader: {e}"),
+        }
+    };
+    let mut outcomes = std::collections::BTreeMap::<String, u32>::new();
+    for i in 0..2 * TRANSACTIONS {
+        let state = loop {
+            match operations
+                .resolve_operation(operation::ResolveOperationRequest {
+                    operation: Some(reference(i)),
+                    exclude: true,
+                })
+                .await
+            {
+                Ok(r) => break r.into_inner().state(),
+                Err(e) if Instant::now() < deadline => {
+                    eprintln!("resolving operation {i}: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("operation {i} not resolved: {e}"),
+            }
+        };
+        let rows = cypher_after_on(
+            &n3,
+            &format!("MATCH (n:AtStop {{k: {i}}}) RETURN n.k"),
+            fence,
+        )
+        .await
+        .expect("read at another member");
+        let present = rows.len() == 1;
+        let side = if i < TRANSACTIONS {
+            "routed"
+        } else {
+            "on the leader"
+        };
+        let Some(reply) = replies.get(&i) else {
+            // The connection ended before an answer: only the resolution
+            // tells, and it was checked against the data above.
+            *outcomes
+                .entry(format!("{side}: no answer, resolved {state:?}"))
+                .or_default() += 1;
+            assert_eq!(
+                present,
+                state == operation::OperationState::Committed,
+                "transaction {i}: resolved {state:?}, write present {present}, no answer"
+            );
+            continue;
+        };
+        let label = match reply {
+            None => "Committed".to_owned(),
+            Some(e) => format!("error code {}", e.code),
+        };
+        *outcomes
+            .entry(format!("{side}: {label}, resolved {state:?}"))
+            .or_default() += 1;
+        assert!(
+            matches!(
+                state,
+                operation::OperationState::Committed | operation::OperationState::Aborted
+            ),
+            "operation {i} resolved to {state:?}"
+        );
+        assert_eq!(
+            present,
+            state == operation::OperationState::Committed,
+            "transaction {i}: resolved {state:?}, write present {present}, reply {reply:?}"
+        );
+        match reply {
+            None => assert!(present, "transaction {i} answered Committed is missing"),
+            Some(e)
+                if [
+                    tonic::Code::Aborted,
+                    tonic::Code::NotFound,
+                    tonic::Code::FailedPrecondition,
+                ]
+                .contains(&tonic::Code::from(i32::try_from(e.code).expect("code"))) =>
+            {
+                assert!(!present, "transaction {i} refused ({e:?}) committed");
+            }
+            Some(_) => {}
+        }
+    }
+    eprintln!("commit outcomes across the stop: {outcomes:?}");
 }
 
 /// Poll `GetClusterStatus` on `client` until it reports exactly `expected`

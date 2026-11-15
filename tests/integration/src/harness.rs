@@ -559,6 +559,14 @@ impl CoordinodeProcess {
         signal(&self.child, "USR2");
     }
 
+    /// Start the disk stall [`stall_disk_for`](Self::stall_disk_for) makes,
+    /// or end one started here, without waiting. Needs a server built with
+    /// `test-faults`.
+    #[cfg(unix)]
+    pub fn toggle_disk_stall(&self) {
+        signal(&self.child, "USR2");
+    }
+
     /// Freeze the process for `pause` and let it go on, as a process the
     /// operating system does not schedule: it holds its sockets and files
     /// and runs nothing meanwhile.
