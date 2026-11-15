@@ -14,21 +14,36 @@ use coordinode_core::txn::wake::Wake;
 use crate::engine::core::StorageEngine;
 use crate::error::{StorageError, StorageResult};
 
-/// What the last round left: the journal's first index and sealed segment
-/// count, the bytes charged on the capped endpoints, and whether it failed.
+/// What a round may remove, read before it: the newest sealed segment and
+/// the floor below which the journal is not kept for a checkpoint or a
+/// consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Grounds {
+    pub(crate) newest_sealed: Option<u64>,
+    pub(crate) floor: u64,
+}
+
+/// What the last round checked, and whether it failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Round {
-    pub(crate) segments: (u64, usize),
-    pub(crate) charged: u64,
+    /// Read before the round, so a segment sealed or a floor moved while it
+    /// ran is a ground the next one still sees.
+    pub(crate) checked: Grounds,
     pub(crate) failed: bool,
 }
 
 impl Round {
-    /// Whether another round may remove something this one could not: the
-    /// journal moved (a segment sealed or went), or this one failed and
-    /// room came back since.
-    pub(crate) fn due(&self, segments: (u64, usize), charged: u64) -> bool {
-        segments != self.segments || (self.failed && charged < self.charged)
+    /// Whether another round may remove something this one could not: a
+    /// segment sealed since it began, a floor raised since, or, after a
+    /// failure, any wake. A failed round registers as a failed flush does
+    /// ([`crate::engine::footprint::FlushAttempt::failed`]): room coming
+    /// back on any endpoint or a raised limit wakes the flush monitor, whose
+    /// landed table wakes the reclaimer. Without such an event nothing wakes
+    /// it, so an unchanged failure does not repeat.
+    pub(crate) fn due(&self, now: Grounds) -> bool {
+        self.failed
+            || now.newest_sealed > self.checked.newest_sealed
+            || now.floor > self.checked.floor
     }
 }
 

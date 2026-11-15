@@ -2346,8 +2346,8 @@ fn a_checkpoint_refused_for_room_leaves_nothing_behind() {
     let target = dir.path().join("checkpoints").join("ckpt");
     let refused = engine.create_checkpoint(&target);
     assert!(
-        matches!(refused, Err(StorageError::CapacityExhausted { .. })),
-        "the checkpoint is refused for room, typed: {refused:?}"
+        refused.as_ref().is_err_and(StorageError::is_out_of_room),
+        "the checkpoint is refused for room, retryably: {refused:?}"
     );
     assert!(!target.exists(), "the refused checkpoint left {target:?}");
     assert!(
@@ -2362,6 +2362,58 @@ fn a_checkpoint_refused_for_room_leaves_nothing_behind() {
     engine
         .create_checkpoint(&target)
         .expect("checkpoint with room");
+}
+
+/// A checkpoint step refused for room on one endpoint is reported as that
+/// refusal with the step added, never as the endpoint with the least room
+/// left: there, `hot` is nearly full and the growth was refused on `cold`.
+#[test]
+fn a_checkpoint_refusal_names_where_the_growth_was_refused() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let endpoint = |id: &str| {
+        EndpointConfig::new(
+            id,
+            dir.path().join(id),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(64 << 20)
+    };
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(
+        &StorageConfig::with_endpoints(vec![endpoint("hot"), endpoint("cold")]),
+        oracle,
+    )
+    .expect("open");
+    let footprints = engine.footprints().clone();
+    let hot = Arc::clone(footprints.get("hot").expect("hot"));
+    let scratch = dir.path().join("hot").join("scratch");
+    let _held = fill_with_scratch(&footprints, &hot, &scratch);
+    let cold = footprints.get("cold").expect("cold");
+    assert!(hot.room() < cold.room(), "hot has the least room");
+
+    let refused = StorageError::Engine(lsm_tree::Error::Io(lsm_tree::io::Error::new(
+        lsm_tree::io::ErrorKind::StorageFull,
+        "endpoint \"cold\" footprint limit reached",
+    )));
+    let reported =
+        StorageEngine::checkpoint_failure(refused, || "flush before checkpoint node".into());
+    assert!(reported.is_out_of_room(), "retryable: {reported:?}");
+    assert!(
+        !matches!(reported, StorageError::CapacityExhausted { .. }),
+        "no endpoint inferred: {reported:?}"
+    );
+    let text = reported.to_string();
+    assert!(text.contains("cold"), "where it was refused: {text}");
+    assert!(
+        !text.contains("hot"),
+        "not the endpoint with least room: {text}"
+    );
+    assert!(
+        text.contains("flush before checkpoint node"),
+        "the step: {text}"
+    );
 }
 
 /// A failed checkpoint whose removal stops partway gives back only what is

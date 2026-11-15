@@ -399,9 +399,12 @@ fn a_checkpoint_under_the_cap_is_charged_and_keeps_its_history() {
     let settle = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut taken = db.checkpoint(1);
     // Only a refusal for room is retried: any other error stays the outcome.
-    while matches!(taken, Err(DatabaseError::CapacityExhausted { .. }))
-        && std::time::Instant::now() < settle
-    {
+    let for_room = |e: &DatabaseError| {
+        matches!(e, DatabaseError::CapacityExhausted { .. })
+            || e.storage_cause()
+                .is_some_and(coordinode_storage::error::StorageError::is_out_of_room)
+    };
+    while taken.as_ref().is_err_and(for_room) && std::time::Instant::now() < settle {
         std::thread::sleep(std::time::Duration::from_millis(50));
         taken = db.checkpoint(1);
     }
@@ -714,6 +717,34 @@ fn covered_journal_goes_as_flushes_land_without_a_refused_write() {
         rows[0].get("n"),
         Some(&coordinode_core::graph::types::Value::Int(ROWS as i64)),
         "every acknowledged row after the reopen"
+    );
+}
+
+/// Filled until the cap refuses a write, then given a higher limit with no
+/// write after it: the journal the tables cover goes by itself, down to the
+/// segment being written, and every acknowledged row stays.
+#[test]
+fn a_raised_limit_lets_the_covered_journal_go_without_a_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open_with_config(capped(dir.path())).unwrap();
+    let accepted = fill(&mut db, dir.path(), 0);
+    db.set_hard_limit("owned", 2 * LIMIT, None).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while journal_segments(dir.path()).len() > 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "covered segments stayed after the limit was raised: {:?}",
+            journal_segments(dir.path())
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let rows = db
+        .execute_cypher("MATCH (n:Footprint) RETURN count(n) AS n")
+        .unwrap();
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&coordinode_core::graph::types::Value::Int(accepted as i64)),
+        "every acknowledged row"
     );
 }
 

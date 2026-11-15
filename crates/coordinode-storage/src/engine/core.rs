@@ -3059,21 +3059,25 @@ impl StorageEngine {
         Ok(summary)
     }
 
-    /// The error a checkpoint step `e` ends the checkpoint with: a refusal
-    /// for room stays the typed refusal of the endpoint without room, which a
-    /// caller may retry once room comes back; anything else names the step.
-    fn checkpoint_failure(&self, e: StorageError, step: impl FnOnce() -> String) -> StorageError {
-        if !e.is_out_of_room() {
-            return StorageError::Io(format!("{}: {e}", step()));
+    /// The error a checkpoint step `e` ends the checkpoint with, naming the
+    /// step. A refusal for room keeps its kind, so a caller can retry it
+    /// once room comes back ([`StorageError::is_out_of_room`]): the typed
+    /// refusal as it came, a refused file growth as the same storage-full
+    /// error with the step added. Where it was refused is only what the
+    /// error itself says; no endpoint is inferred from current counters.
+    fn checkpoint_failure(e: StorageError, step: impl FnOnce() -> String) -> StorageError {
+        match e {
+            StorageError::CapacityExhausted { .. } => e,
+            StorageError::Engine(lsm_tree::Error::Io(io))
+                if io.kind() == lsm_tree::io::ErrorKind::StorageFull =>
+            {
+                StorageError::Engine(lsm_tree::Error::Io(lsm_tree::io::Error::new(
+                    lsm_tree::io::ErrorKind::StorageFull,
+                    format!("{}: {io}", step()),
+                )))
+            }
+            other => StorageError::Io(format!("{}: {other}", step())),
         }
-        if matches!(e, StorageError::CapacityExhausted { .. }) {
-            return e;
-        }
-        // The growth refused was on the endpoint with the least room left.
-        self.footprints
-            .iter()
-            .min_by_key(|footprint| footprint.room())
-            .map_or(e, |footprint| footprint.refusal())
     }
 
     /// Flush and hard-link every partition tree and columnar table into
@@ -3094,12 +3098,12 @@ impl StorageEngine {
             // deterministically (previously it depended on whether a
             // background flush happened to have run before the checkpoint).
             self.flush_memtables_in_order(tree).map_err(|e| {
-                self.checkpoint_failure(e, || format!("flush before checkpoint {}", part.name()))
+                Self::checkpoint_failure(e, || format!("flush before checkpoint {}", part.name()))
             })?;
             let info = tree
                 .create_checkpoint(&target.join(part.name()))
                 .map_err(|e| {
-                    self.checkpoint_failure(e.into(), || {
+                    Self::checkpoint_failure(e.into(), || {
                         format!("checkpoint partition {}", part.name())
                     })
                 })?;
@@ -3123,7 +3127,7 @@ impl StorageEngine {
                     self.flush_memtables_in_order(tree)?;
                     tree.create_checkpoint(&tables.join(&table_id))
                         .map_err(|e| {
-                            self.checkpoint_failure(e.into(), || {
+                            Self::checkpoint_failure(e.into(), || {
                                 format!("checkpoint columnar table {table_id}")
                             })
                         })
@@ -4229,13 +4233,17 @@ impl StorageEngine {
     /// not an obligation the limit may be broken for.
     ///
     /// One runs at a time; a call arriving while one runs waits for it and
-    /// returns, its outcome being the room there is. Returns whether this
-    /// call's reclamation failed: a flush or a removal refused.
-    pub fn reclaim_footprint(&self) -> bool {
+    /// returns, its outcome being the room there is.
+    pub fn reclaim_footprint(&self) {
         let Some(_one) = self.footprint_reclaim.try_lock() else {
             drop(self.footprint_reclaim.lock());
-            return false;
+            return;
         };
+        self.reclaim_counted();
+    }
+
+    /// One reclamation under the held lock; whether it failed.
+    fn reclaim_counted(&self) -> bool {
         metrics::counter!("coordinode_footprint_reclamations_total").increment(1);
         match self.reclaim_journal() {
             Ok(()) => false,
@@ -4268,40 +4276,48 @@ impl StorageEngine {
         .map(Some)
     }
 
-    /// One background reclamation, run only when it may remove something it
-    /// could not before: a segment sealed since `last`, or, after a round
-    /// that failed, room come back. A round left with nothing new to do does
-    /// not run again by itself.
+    /// One background reclamation, run only when it may remove something the
+    /// last could not ([`crate::engine::journal_reclaim::Round::due`]). It
+    /// takes its own turn after any reclamation running, and records what it
+    /// read before it ran, so grounds that arrive meanwhile are not taken as
+    /// checked. A round left with nothing new to do does not run again.
     pub(crate) fn journal_reclaim_round(
         &self,
         last: &mut Option<crate::engine::journal_reclaim::Round>,
     ) {
-        use crate::engine::journal_reclaim::Round;
+        use crate::engine::journal_reclaim::{Grounds, Round};
         let Some(oplog) = &self.oplog else {
             return;
         };
-        let journal = || {
-            oplog
-                .lock()
-                .ok()
-                .map(|log| (log.first_index(), log.sealed_segments()))
+        let grounds = || {
+            oplog.lock().ok().map(|log| Grounds {
+                newest_sealed: log.newest_sealed(),
+                floor: self
+                    .journal_keep_from
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .min(self.consumer_journal_needs()),
+            })
         };
-        let Some(segments) = journal() else {
+        let _one = self.footprint_reclaim.lock();
+        let Some(checked) = grounds() else {
             return;
         };
-        let charged: u64 = self.footprints.iter().map(|f| f.charged()).sum();
-        if segments.1 == 0 || last.is_some_and(|round| !round.due(segments, charged)) {
+        if checked.newest_sealed.is_none() || last.is_some_and(|round| !round.due(checked)) {
             return;
         }
-        let failed = self.reclaim_footprint();
-        let Some(segments) = journal() else {
-            return;
-        };
-        *last = Some(Round {
-            segments,
-            charged: self.footprints.iter().map(|f| f.charged()).sum(),
-            failed,
-        });
+        // Begun before the round: room coming back while it runs is seen if
+        // it then fails, and its own failed output wakes nothing.
+        let attempt = self.footprints.flush_attempt();
+        let failed = self.reclaim_counted();
+        if failed {
+            attempt.failed();
+        } else {
+            // The segments it removed are room a stalled flush waits for,
+            // which the attempt kept from counting as its own cleanup.
+            drop(attempt);
+            self.footprints.room_given_back();
+        }
+        *last = Some(Round { checked, failed });
     }
 
     fn reclaim_journal(&self) -> StorageResult<()> {

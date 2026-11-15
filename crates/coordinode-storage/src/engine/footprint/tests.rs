@@ -15,6 +15,57 @@ fn opened(dir: &Path, limit: u64) -> Arc<Footprint> {
     Footprint::open(&endpoint(dir, limit)).unwrap()
 }
 
+/// A removal that stopped partway gives back only the files that are gone,
+/// reads the disk without the file table locked, and leaves a name charged
+/// again meanwhile with its new charge.
+#[test]
+fn a_partial_removal_reads_the_disk_unlocked_and_keeps_a_recharged_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let footprint = opened(dir.path(), 64 * UNIT);
+    let under = dir.path().join("ckpt");
+    std::fs::create_dir_all(&under).unwrap();
+    let charge = |name: &str| {
+        let path = under.join(name);
+        std::fs::write(&path, b"x").unwrap();
+        footprint.file(&path).grow_to(UNIT).unwrap();
+        path
+    };
+    let gone = charge("gone");
+    let kept = charge("kept");
+    let reused = charge("reused");
+    std::fs::remove_file(&gone).unwrap();
+    std::fs::remove_file(&reused).unwrap();
+    assert_eq!(footprint.charged(), 3 * UNIT);
+
+    let during = Arc::clone(&footprint);
+    let other = dir.path().join("other");
+    let renamed = reused.clone();
+    footprint.on_removed_partly_checking(move || {
+        // The table is free while the disk is read: another thread charges
+        // a file, and the reused name is charged anew.
+        let (done, waited) = std::sync::mpsc::channel();
+        let elsewhere = Arc::clone(&during);
+        let path = other.clone();
+        std::thread::spawn(move || {
+            elsewhere.file(&path).grow_to(UNIT).unwrap();
+            done.send(()).unwrap();
+        });
+        waited
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the file table was free");
+        // Charged anew under the same name before its file is created: the
+        // disk still shows no file, but the charge is not the one read.
+        during.removed(&renamed);
+        during.file(&renamed).grow_to(2 * UNIT).unwrap();
+    });
+    footprint.removed_partly(&under);
+    assert!(kept.exists(), "the kept file is still on disk");
+
+    // gone: given back; kept: still charged; reused: its new 2 units; other:
+    // the unit charged meanwhile.
+    assert_eq!(footprint.charged(), UNIT + 2 * UNIT + UNIT);
+}
+
 /// A file cannot grow past the limit: the growth that would pass it is
 /// refused with StorageFull and charges nothing.
 #[test]

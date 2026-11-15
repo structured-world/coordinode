@@ -184,6 +184,9 @@ pub struct Footprint {
     /// The flush requests of the footprints this one belongs to, told when
     /// room comes back or the limit changes.
     squeeze: std::sync::OnceLock<Arc<Squeeze>>,
+    /// Test hook: see [`Footprint::on_removed_partly_checking`].
+    #[cfg(test)]
+    on_checking: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl std::fmt::Debug for Footprint {
@@ -222,6 +225,8 @@ impl Footprint {
             files: parking_lot::Mutex::new(HashMap::new()),
             this: this.clone(),
             squeeze: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            on_checking: parking_lot::Mutex::new(None),
         });
         footprint.charge_existing()?;
         footprint.pend_if_over();
@@ -601,25 +606,47 @@ impl Footprint {
     }
 
     /// A removal of the directory `dir` stopped partway: give back the files
-    /// under it that are gone, and keep charging those still on disk.
+    /// under it that are gone, and keep charging those still on disk or
+    /// whose state cannot be read. The disk is read without the file table
+    /// locked; a name charged again meanwhile keeps its new charge.
     pub fn removed_partly(&self, dir: &Path) {
-        let gone: Vec<Arc<FileCharge>> = {
+        let under: Vec<(PathBuf, Arc<FileCharge>)> = self
+            .files
+            .lock()
+            .iter()
+            .filter(|(name, _)| name.starts_with(dir))
+            .map(|(name, charge)| (name.clone(), Arc::clone(charge)))
+            .collect();
+        #[cfg(test)]
+        if let Some(hook) = self.on_checking.lock().as_mut() {
+            hook();
+        }
+        let gone: Vec<(PathBuf, Arc<FileCharge>)> = under
+            .into_iter()
+            .filter(|(name, _)| {
+                std::fs::symlink_metadata(name).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+            })
+            .collect();
+        let released: Vec<Arc<FileCharge>> = {
             let mut files = self.files.lock();
-            let names: Vec<PathBuf> = files
-                .keys()
-                .filter(|name| {
-                    name.starts_with(dir)
-                        && std::fs::symlink_metadata(name)
-                            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+            gone.into_iter()
+                .filter_map(|(name, charge)| {
+                    files
+                        .get(&name)
+                        .is_some_and(|now| Arc::ptr_eq(now, &charge))
+                        .then(|| files.remove(&name))
+                        .flatten()
                 })
-                .cloned()
-                .collect();
-            names
-                .into_iter()
-                .filter_map(|name| files.remove(&name))
                 .collect()
         };
-        drop(gone);
+        drop(released);
+    }
+
+    /// Run `hook` in [`Self::removed_partly`] between reading the file table
+    /// and reading the disk.
+    #[cfg(test)]
+    pub(crate) fn on_removed_partly_checking(&self, hook: impl FnMut() + Send + 'static) {
+        *self.on_checking.lock() = Some(Box::new(hook));
     }
 
     /// The file `from` is now named `to`, replacing whatever `to` named.
@@ -1189,6 +1216,14 @@ impl Footprints {
             squeeze: Some(Arc::clone(&self.squeeze)),
             started_at: self.squeeze.epoch.load(Ordering::SeqCst),
             was: ATTEMPTING.replace(true),
+        }
+    }
+
+    /// Room came back on this thread through work that is not a flush
+    /// attempt's own cleanup: wake a flush waiting for it.
+    pub(crate) fn room_given_back(&self) {
+        if !self.endpoints.is_empty() {
+            self.squeeze.room_changed();
         }
     }
 

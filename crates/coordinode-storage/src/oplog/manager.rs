@@ -850,6 +850,12 @@ impl OplogManager {
         self.sealed.len()
     }
 
+    /// The first index of the newest sealed segment: it moves up only when a
+    /// segment is sealed, never when old ones are removed.
+    pub fn newest_sealed(&self) -> Option<u64> {
+        self.sealed.last().map(|&(first, _)| first)
+    }
+
     /// Paths of all sealed segments in ascending index order.
     pub fn sealed_segment_paths(&self) -> Vec<&std::path::Path> {
         self.sealed.iter().map(|(_, p)| p.as_path()).collect()

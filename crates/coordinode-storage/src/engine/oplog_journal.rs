@@ -409,9 +409,10 @@ impl EmbeddedOplog {
             .unwrap_or(self.next_index)
     }
 
-    /// How many segments are sealed: complete, and removable once covered.
-    pub(crate) fn sealed_segments(&self) -> usize {
-        self.manager.sealed_segment_count()
+    /// The first index of the newest sealed segment, if any: see
+    /// [`crate::oplog::manager::OplogManager::newest_sealed`].
+    pub(crate) fn newest_sealed(&self) -> Option<u64> {
+        self.manager.newest_sealed()
     }
 
     /// Where the journal's segments start, kept current as they change.
