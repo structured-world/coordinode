@@ -352,6 +352,89 @@ fn a_far_page_reads_only_from_where_the_last_ended() {
     assert_eq!(seen, 64, "every row once");
 }
 
+/// A range delete reaching past the scope on both sides is handed over
+/// only for the part inside it: applied by the consumer, it removes the
+/// scope's rows in range and nothing outside the prefix.
+#[test]
+fn a_range_delete_is_clipped_to_the_scope() {
+    use coordinode_core::txn::timestamp::Timestamp;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open(&dir);
+    let scope = super::CutScope::rows(Partition::Counter, b"counter:m".to_vec()).expect("scope");
+    let cut = engine
+        .fixed_cut(scope, Duration::from_secs(10))
+        .expect("cut");
+    let delete = vec![Mutation::RemoveRange {
+        partition: PartitionId::Counter,
+        start: b"counter:a".to_vec(),
+        end: b"counter:z".to_vec(),
+    }];
+    let entry = crate::oplog::OplogEntry {
+        ts: cut.bound() + 1,
+        term: 0,
+        index: cut.join_end(),
+        shard: 0,
+        ops: vec![crate::oplog::OplogOp::Unit {
+            frame: coordinode_core::txn::frame::encode_unit(
+                &delete,
+                Timestamp::from_raw(cut.bound() + 1),
+            )
+            .expect("frame"),
+        }],
+        is_migration: false,
+        pre_images: None,
+    };
+    let units = engine.cut_units_of(&cut, &[entry]).expect("units");
+    let [unit] = units.as_slice() else {
+        panic!("one unit: {units:?}")
+    };
+    let [Mutation::RemoveRange { start, end, .. }] = unit.mutations.as_slice() else {
+        panic!("one range delete: {:?}", unit.mutations)
+    };
+    assert_eq!(
+        (start.as_slice(), end.as_slice()),
+        (b"counter:m".as_slice(), b"counter:n".as_slice())
+    );
+    // Applied to a destination holding rows on both sides of the prefix.
+    let rows = [
+        b"counter:b".as_slice(),
+        b"counter:m1",
+        b"counter:mz",
+        b"counter:y",
+    ];
+    let left: Vec<&[u8]> = rows
+        .iter()
+        .copied()
+        .filter(|k| !(*k >= start.as_slice() && *k < end.as_slice()))
+        .collect();
+    assert_eq!(
+        left,
+        [b"counter:b".as_slice(), b"counter:y"],
+        "nothing outside is deleted"
+    );
+}
+
+/// Clipping keeps an open top for a prefix with no successor: the empty
+/// prefix and an all-`0xFF` one reach the end of the key space.
+#[test]
+fn a_scope_without_a_successor_clips_to_the_end_of_the_key_space() {
+    let all = super::CutScope::rows(Partition::Counter, Vec::new()).expect("scope");
+    assert_eq!(
+        all.clip_range(b"a", b"z"),
+        Some((b"a".to_vec(), b"z".to_vec()))
+    );
+    let top = super::CutScope::rows(Partition::Counter, vec![0xFF]).expect("scope");
+    assert_eq!(
+        top.clip_range(&[0x00], &[0xFF, 0x01]),
+        Some((vec![0xFF], vec![0xFF, 0x01]))
+    );
+    assert_eq!(
+        top.clip_range(&[0x00], &[0xFE]),
+        None,
+        "nothing of it is inside"
+    );
+}
+
 fn add(delta: i64) -> Vec<Mutation> {
     vec![Mutation::Merge {
         partition: PartitionId::Counter,

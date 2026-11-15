@@ -71,13 +71,20 @@ impl CutScope {
 
     /// Whether some key of `[start, end)` is in it.
     pub(crate) fn meets_range(&self, start: &[u8], end: &[u8]) -> bool {
-        // Keys under the prefix sort from the prefix up to its successor.
-        let below_end = self.prefix.as_slice() < end;
-        let above_start = match prefix_successor(&self.prefix) {
-            Some(after) => start < after.as_slice(),
-            None => true,
+        self.clip_range(start, end).is_some()
+    }
+
+    /// The part of `[start, end)` inside the scope, `None` when nothing of
+    /// it is. Keys under the prefix sort from the prefix up to its
+    /// successor, or to the end of the key space when it has none.
+    pub(crate) fn clip_range(&self, start: &[u8], end: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let lo = start.max(self.prefix.as_slice());
+        let successor = prefix_successor(&self.prefix);
+        let hi = match &successor {
+            Some(after) => end.min(after.as_slice()),
+            None => end,
         };
-        below_end && above_start
+        (lo < hi).then(|| (lo.to_vec(), hi.to_vec()))
     }
 }
 

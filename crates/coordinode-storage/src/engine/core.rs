@@ -4721,28 +4721,39 @@ impl StorageEngine {
                 if !refused {
                     use coordinode_core::txn::proposal::Mutation;
                     for m in unit.mutations {
-                        let inside = match &m {
-                            Mutation::Put { partition, key, .. }
-                            | Mutation::Delete { partition, key }
-                            | Mutation::Merge { partition, key, .. } => {
-                                scope.holds_partition(*partition) && scope.holds_key(key)
+                        let inside = match m {
+                            Mutation::Put {
+                                partition, ref key, ..
                             }
+                            | Mutation::Delete { partition, ref key }
+                            | Mutation::Merge {
+                                partition, ref key, ..
+                            } => (scope.holds_partition(partition) && scope.holds_key(key))
+                                .then_some(m),
+                            // Only the part inside the scope: the rest deletes
+                            // rows the consumer does not hold.
                             Mutation::RemoveRange {
                                 partition,
                                 start,
                                 end,
-                            } => scope.holds_partition(*partition) && scope.meets_range(start, end),
+                            } => scope
+                                .holds_partition(partition)
+                                .then(|| scope.clip_range(&start, &end))
+                                .flatten()
+                                .map(|(start, end)| Mutation::RemoveRange {
+                                    partition,
+                                    start,
+                                    end,
+                                }),
                             // Its effects land in the schema partition, which
                             // no row scope is.
-                            Mutation::Command(_) => false,
+                            Mutation::Command(_) => None,
                             // Index entries, in the index partition.
-                            Mutation::Derive(_) => false,
+                            Mutation::Derive(_) => None,
                             // Decides the unit, already read as `refused`.
-                            Mutation::Operation(_) => false,
+                            Mutation::Operation(_) => None,
                         };
-                        if inside {
-                            mutations.push(m);
-                        }
+                        mutations.extend(inside);
                     }
                 }
                 units.push(crate::engine::fixed_cut::CutUnit {
