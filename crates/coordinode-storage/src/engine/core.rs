@@ -4725,7 +4725,7 @@ impl StorageEngine {
             _ => Bound::Included(prefix),
         };
         let hi = cut.scope.end().map_or(Bound::Unbounded, Bound::Excluded);
-        let mut page: crate::engine::fixed_cut::CutRows = Vec::new();
+        let mut page = crate::engine::fixed_cut::CutRows::default();
         let mut charge = budget.empty_charge();
         let refused = || {
             StorageError::Budget(coordinode_core::budget::BudgetStop::Memory {
@@ -4743,7 +4743,6 @@ impl StorageEngine {
             return Err(refused());
         };
         charge.grow(scan).map_err(StorageError::Budget)?;
-        let row_slot = core::mem::size_of::<(Vec<u8>, Vec<u8>)>();
         for guard in self.scan_range_at(cut.scope.partition(), lo, hi, cut.bound)? {
             if page.len() >= max_rows {
                 break;
@@ -4760,21 +4759,14 @@ impl StorageEngine {
                 }
                 break;
             }
-            // The row's copies, and the page's room for it when the page is
-            // full: it grows before the row is copied.
-            let more = if page.len() == page.capacity() {
-                page.capacity().max(4)
-            } else {
-                0
-            };
-            if let Err(stop) = charge.grow(row + (more * row_slot) as u64) {
+            // Copied into the page's blocks; the budget is asked only when a
+            // block or the index has to grow.
+            if let Err(stop) = page.push(&key, &value, &mut charge, budget) {
                 if page.is_empty() {
                     return Err(StorageError::Budget(stop));
                 }
                 break;
             }
-            page.reserve_exact(more);
-            page.push((key.to_vec(), value.to_vec()));
         }
         charge.shrink(scan);
         // A repair that replaced the tree while the page was read leaves

@@ -3162,7 +3162,7 @@ async fn a_member_rebuilds_a_counter_through_a_state_cut() {
         let mut rebuilt = view
             .rows()
             .iter()
-            .find(|(key, _)| key.as_slice() == KEY)
+            .find(|(key, _)| *key == KEY)
             .map_or(0, |(_, value)| decode_counter(value).expect("counter"));
         assert_eq!(rebuilt, 11, "the view holds the commits before the cut");
         let resume = loop {

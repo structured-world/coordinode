@@ -285,11 +285,7 @@ fn a_small_page_holds_no_more_than_its_budget() {
         "held {peak} bytes at once within a {limit}-byte budget"
     );
     // The page's room, not only its rows, is charged while it is held.
-    let held = rows.capacity() * std::mem::size_of::<(Vec<u8>, Vec<u8>)>()
-        + rows
-            .iter()
-            .map(|(k, v)| k.capacity() + v.capacity())
-            .sum::<usize>();
+    let held = rows.held();
     assert!(
         charge.bytes() >= held as u64,
         "charged {} for a page holding {held}",

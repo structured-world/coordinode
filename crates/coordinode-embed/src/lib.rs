@@ -71,7 +71,7 @@ pub use repair::RepairReport;
 /// What a change-stream consumer registers with
 /// ([`Database::register_consumer`]) and what the registry reports of it.
 pub mod consumer {
-    pub use crate::db::{CutBatch, CutHistory, CutPage, CutResume, CutRow, CutScope, StateCut};
+    pub use crate::db::{CutBatch, CutHistory, CutPage, CutResume, CutRows, CutScope, StateCut};
     pub use coordinode_replicate::{
         ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot,
         InitialSeqno, PriorIncarnation, RegisteredHandle, RegistrationState, RegistryError,

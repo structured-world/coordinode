@@ -481,6 +481,72 @@ fn a_page_keeps_to_its_budget() {
     assert_eq!(page.len(), 1);
 }
 
+/// A page's rows are paid for by the block they are copied into, not one by
+/// one: what the page holds is exactly what it keeps charged. A budget too
+/// small for the whole scope ends the page early, and the next page goes
+/// on from its last key with no row lost or repeated.
+#[test]
+fn a_page_charges_its_blocks_and_stops_where_the_budget_ends() {
+    use coordinode_core::budget::QueryBudget;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open(&dir);
+    let rows: Vec<Mutation> = (0..400u32)
+        .map(|i| Mutation::Put {
+            partition: PartitionId::Counter,
+            key: format!("counter:{i:04}").into_bytes(),
+            value: vec![7; 1000],
+        })
+        .collect();
+    engine
+        .commit_logged(&rows, engine.next_seqno(), Journal::Journal)
+        .expect("rows");
+    let cut = cut(&engine);
+
+    let budget = unlimited();
+    let (page, charge) = engine.cut_page(&cut, None, 10, &budget).expect("page");
+    assert_eq!(page.len(), 10);
+    assert_eq!(
+        charge.bytes(),
+        page.held() as u64,
+        "a page keeps charged exactly the blocks and index it holds"
+    );
+    assert!(
+        page.held() >= 64 * 1024,
+        "ten rows of a kilobyte share one block: {} bytes held",
+        page.held()
+    );
+    drop((page, charge));
+
+    // Room for the scan and a few blocks, not for 400 kilobytes of rows.
+    let budget = QueryBudget::new(256 << 10);
+    let mut seen = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    let mut pages = 0;
+    loop {
+        let (page, _charge) = engine
+            .cut_page(&cut, after.as_deref(), 1000, &budget)
+            .expect("a page within the budget");
+        let Some(last) = page.last_key() else { break };
+        assert!(budget.memory_used() <= budget.memory_limit());
+        // Near the limit the page takes one last block of what is left,
+        // not one block per row.
+        let short = page
+            .blocks
+            .iter()
+            .filter(|b| b.capacity() < super::ROW_BLOCK)
+            .count();
+        assert!(short <= 1, "{short} blocks below a whole one");
+        pages += 1;
+        seen.extend(page.iter().map(|(k, _)| k.to_vec()));
+        after = Some(last.to_vec());
+    }
+    assert!(pages > 1, "the budget ended a page early");
+    let expected: Vec<Vec<u8>> = (0..400u32)
+        .map(|i| format!("counter:{i:04}").into_bytes())
+        .collect();
+    assert_eq!(seen, expected, "every row once, in key order");
+}
+
 /// Units carry only their changes inside the scope; an effect outside it
 /// is dropped, and a raw row write inside it, which carries no commit
 /// timestamp of its own, is refused rather than skipped.
@@ -569,7 +635,7 @@ fn a_far_page_reads_only_from_where_the_last_ended() {
     let (page, _) = engine
         .cut_page(&cut, Some(b"counter:0059"), 2, &budget)
         .expect("page");
-    let keys: Vec<&[u8]> = page.iter().map(|(k, _)| k.as_slice()).collect();
+    let keys: Vec<&[u8]> = page.iter().map(|(k, _)| k).collect();
     assert_eq!(
         keys,
         [b"counter:0060".as_slice(), b"counter:0061".as_slice()]
@@ -580,9 +646,9 @@ fn a_far_page_reads_only_from_where_the_last_ended() {
         let (page, _) = engine
             .cut_page(&cut, after.as_deref(), 5, &budget)
             .expect("page");
-        let Some((last, _)) = page.last() else { break };
+        let Some(last) = page.last_key() else { break };
         seen += page.len();
-        after = Some(last.clone());
+        after = Some(last.to_vec());
     }
     assert_eq!(seen, 64, "every row once");
 }

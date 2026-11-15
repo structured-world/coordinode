@@ -24,10 +24,7 @@ use coordinode_storage::engine::fixed_cut::{CutRead, CutUnit, FixedCut};
 
 use super::{Database, DatabaseError};
 
-pub use coordinode_storage::engine::fixed_cut::{CutHistory, CutResume, CutScope};
-
-/// A key of the view and its value.
-pub type CutRow = (Vec<u8>, Vec<u8>);
+pub use coordinode_storage::engine::fixed_cut::{CutHistory, CutResume, CutRows, CutScope};
 
 /// A pinned read view of a scope below [`Self::bound`] and the position its
 /// continuation has reached. Dropping it releases the view; a view lost
@@ -91,21 +88,21 @@ impl StateCut {
 /// was read within until it is dropped.
 #[derive(Debug)]
 pub struct CutPage<'b> {
-    rows: Vec<CutRow>,
+    rows: CutRows,
     _charge: MemoryCharge<'b>,
 }
 
 impl CutPage<'_> {
     /// The rows, in key order.
     #[must_use]
-    pub fn rows(&self) -> &[CutRow] {
+    pub fn rows(&self) -> &CutRows {
         &self.rows
     }
 
     /// The last key handed over: where the next page goes on from.
     #[must_use]
     pub fn last_key(&self) -> Option<&[u8]> {
-        self.rows.last().map(|(key, _)| key.as_slice())
+        self.rows.last_key()
     }
 }
 

@@ -10,6 +10,7 @@
 //! physical journal entry may carry units on both sides of `B`, so the
 //! decision is per unit, by the unit's own commit timestamp.
 
+use coordinode_core::budget::{BudgetStop, MemoryCharge, QueryBudget};
 use coordinode_core::txn::operation::LogPosition;
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
 
@@ -118,8 +119,135 @@ pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Keys and values of a cut's view, in key order.
-pub type CutRows = Vec<(Vec<u8>, Vec<u8>)>;
+/// Bytes of a block a page's rows are copied into, unless one row is longer.
+const ROW_BLOCK: usize = 64 * 1024;
+
+/// Keys and values of a cut's view, in key order, copied into blocks that
+/// stay charged to the read's budget while they are owned. The budget is
+/// asked when a block or the row index grows, not for every row.
+#[derive(Debug, Default)]
+pub struct CutRows {
+    /// Each holds rows back to back, never past its first capacity: a block
+    /// is not moved once rows are in it.
+    blocks: Vec<Vec<u8>>,
+    rows: Vec<RowAt>,
+}
+
+/// Where a row lies: its key, then its value, in one block.
+#[derive(Debug, Clone, Copy)]
+struct RowAt {
+    block: usize,
+    start: usize,
+    key: usize,
+    value: usize,
+}
+
+impl CutRows {
+    /// The number of rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the page holds no row.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn row(&self, at: &RowAt) -> (&[u8], &[u8]) {
+        let block = &self.blocks[at.block];
+        let value = at.start + at.key;
+        (&block[at.start..value], &block[value..value + at.value])
+    }
+
+    /// The key and value of row `i`.
+    #[must_use]
+    pub fn get(&self, i: usize) -> Option<(&[u8], &[u8])> {
+        self.rows.get(i).map(|at| self.row(at))
+    }
+
+    /// The rows, in key order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> + '_ {
+        self.rows.iter().map(|at| self.row(at))
+    }
+
+    /// The last key: where the next page goes on from.
+    #[must_use]
+    pub fn last_key(&self) -> Option<&[u8]> {
+        self.rows.last().map(|at| self.row(at).0)
+    }
+
+    /// Bytes the page's blocks and row index hold, all charged to the
+    /// budget it was read within.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.blocks.iter().map(Vec::capacity).sum::<usize>()
+            + self.blocks.capacity() * core::mem::size_of::<Vec<u8>>()
+            + self.rows.capacity() * core::mem::size_of::<RowAt>()
+    }
+
+    /// Copy a row in, growing a block or the index first under `charge`, a
+    /// charge on `budget`, when they are full.
+    ///
+    /// # Errors
+    ///
+    /// The budget refused the growth; the rows held stay as they were.
+    pub(crate) fn push(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        charge: &mut MemoryCharge<'_>,
+        budget: &QueryBudget,
+    ) -> Result<(), BudgetStop> {
+        let len = key.len() + value.len();
+        if self.rows.len() == self.rows.capacity() {
+            grow_exact(&mut self.rows, charge)?;
+        }
+        let fits = self
+            .blocks
+            .last()
+            .is_some_and(|block| block.capacity() - block.len() >= len);
+        if !fits {
+            if self.blocks.len() == self.blocks.capacity() {
+                grow_exact(&mut self.blocks, charge)?;
+            }
+            // A whole block, or the budget's last room when a block does not
+            // fit: one more block, not one per row, near the limit.
+            // A budget refuses every reservation past its limit.
+            let room = budget.memory_limit() - budget.memory_used();
+            // Slices of memory that exist: their lengths fit in u64.
+            let size = (len.max(ROW_BLOCK) as u64).min(room).max(len as u64);
+            charge.grow(size)?;
+            self.blocks.push(Vec::with_capacity(size as usize));
+        }
+        let block = self.blocks.len() - 1;
+        let bytes = &mut self.blocks[block];
+        let start = bytes.len();
+        // Within the capacity checked above: the block does not move.
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(value);
+        self.rows.push(RowAt {
+            block,
+            start,
+            key: key.len(),
+            value: value.len(),
+        });
+        Ok(())
+    }
+}
+
+/// Double `v`'s capacity under `charge`, which holds the old and the new
+/// buffer while the elements move and then only the new one.
+fn grow_exact<T>(v: &mut Vec<T>, charge: &mut MemoryCharge<'_>) -> Result<(), BudgetStop> {
+    let slot = core::mem::size_of::<T>() as u64;
+    let old = v.capacity();
+    let new = old.max(2) * 2;
+    charge.grow(new as u64 * slot)?;
+    v.reserve_exact(new - v.len());
+    charge.shrink(old as u64 * slot);
+    Ok(())
+}
 
 /// The working memory one log entry's reading was given, already charged
 /// to the read's budget: the units decoding takes are spent from it, and

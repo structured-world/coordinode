@@ -145,7 +145,11 @@ fn copy_view(db: &Database, cut: &StateCut) -> Rows {
             return rows;
         };
         after = Some(last.to_vec());
-        rows.extend(page.rows().iter().cloned());
+        rows.extend(
+            page.rows()
+                .iter()
+                .map(|(key, value)| (key.to_vec(), value.to_vec())),
+        );
     }
 }
 

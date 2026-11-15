@@ -191,6 +191,16 @@ harness = false
 name = "schema_package"
 harness = false
 
+# Copying a state cut's view page by page.
+[[bench]]
+name = "state_cut_scan"
+harness = false
+
+# The allocations of the same copies.
+[[bench]]
+name = "state_cut_scan_alloc"
+harness = false
+
 # What ordinary writes cost, through to a store at rest.
 [[bench]]
 name = "write_cost"
