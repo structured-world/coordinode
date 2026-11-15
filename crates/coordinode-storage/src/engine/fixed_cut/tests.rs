@@ -11,15 +11,72 @@ use crate::engine::partition::Partition;
 
 const COUNTER: &[u8] = b"counter:degree:7";
 
-fn open(dir: &tempfile::TempDir) -> Arc<StorageEngine> {
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+fn config(dir: &tempfile::TempDir) -> StorageConfig {
+    StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
         dir.path(),
         Media::Hdd,
         Durability::Durable,
         Tier::Warm,
-    )]);
-    Arc::new(StorageEngine::open_embedded(&config, Arc::new(TimestampOracle::new())).expect("open"))
+    )])
+}
+
+fn open(dir: &tempfile::TempDir) -> Arc<StorageEngine> {
+    open_with(&config(dir))
+}
+
+fn open_with(config: &StorageConfig) -> Arc<StorageEngine> {
+    Arc::new(StorageEngine::open_embedded(config, Arc::new(TimestampOracle::new())).expect("open"))
+}
+
+/// A commit below the cut journalled without a sync is made durable before
+/// the cut is handed off: the view holds no effect a crash can take back.
+#[test]
+fn a_deferred_commit_below_the_cut_is_durable_before_the_handoff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open(&dir);
+    engine
+        .commit_logged(&add(1), engine.next_seqno(), Journal::Memory)
+        .expect("deferred commit");
+    let cut = engine.fixed_cut(Duration::from_secs(10)).expect("cut");
+    assert!(
+        engine.pending_commits().durable_floor(cut.bound()) >= cut.bound(),
+        "every commit below the cut is durable"
+    );
+}
+
+/// The continuation is not held for the whole copy: journal removed past
+/// `L` while the view is copied is RetentionLost, never a partial join.
+#[test]
+fn a_continuation_pruned_during_the_copy_is_retention_lost() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = config(&dir);
+    config.oplog_segment_max_entries = 2;
+    config.oplog_retention_secs = 1;
+    let engine = open_with(&config);
+    for _ in 0..2 {
+        engine
+            .commit_logged(&add(1), engine.next_seqno(), Journal::Journal)
+            .expect("commit");
+    }
+    let cut = engine.fixed_cut(Duration::from_secs(10)).expect("cut");
+    for _ in 0..6 {
+        engine
+            .commit_logged(&add(1), engine.next_seqno(), Journal::Journal)
+            .expect("commit");
+    }
+    let later = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        + 3600;
+    let removed = engine.oplog_purge_expired(later, u64::MAX).expect("purge");
+    assert!(removed > 0, "the copy outlived the journal");
+    let lost = engine.fixed_cut_units(&cut, cut.first(), 16);
+    assert!(
+        matches!(lost, Err(crate::error::StorageError::RetentionLost { .. })),
+        "the join is lost, not partial: {lost:?}"
+    );
 }
 
 fn add(delta: i64) -> Vec<Mutation> {

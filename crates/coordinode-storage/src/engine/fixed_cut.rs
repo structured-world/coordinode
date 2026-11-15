@@ -21,7 +21,7 @@ pub struct FixedCut {
     pub(crate) first: u64,
     pub(crate) bound: u64,
     pub(crate) join_end: u64,
-    pub(crate) history: u64,
+    pub(crate) history: Option<coordinode_core::group::DeploymentId>,
     pub(crate) _pin: SnapshotPin,
 }
 
@@ -56,10 +56,11 @@ impl FixedCut {
         self.join_end
     }
 
-    /// The history the cut belongs to: a continuation read from another
-    /// history is refused.
+    /// The history the cut belongs to, the store's deployment: a
+    /// continuation read from another history is refused. `None` for a store
+    /// that has founded none.
     #[must_use]
-    pub fn history(&self) -> u64 {
+    pub fn history(&self) -> Option<coordinode_core::group::DeploymentId> {
         self.history
     }
 

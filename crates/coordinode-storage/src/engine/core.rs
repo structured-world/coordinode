@@ -4395,11 +4395,8 @@ impl StorageEngine {
     }
 
     /// The identity of the history this store's journal records.
-    fn journal_history(&self) -> StorageResult<u64> {
-        let tag = deployment_tag(crate::engine::metadata::bound_deployment(self)?);
-        let mut history = [0u8; 8];
-        history.copy_from_slice(&tag[1..9]);
-        Ok(u64::from_be_bytes(history))
+    fn journal_history(&self) -> StorageResult<Option<coordinode_core::group::DeploymentId>> {
+        crate::engine::metadata::bound_deployment(self)
     }
 
     /// Keep the journal from `index` on for a rebuild from the latest local
