@@ -731,7 +731,7 @@ impl Database {
 
     /// How transaction `id` ended, while the registry remembers it; `None`
     /// while it is open or unknown. Unlike a commit, asking ends nothing.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "replication"))]
     pub(crate) fn interactive_end_of(&self, id: &TransactionId) -> Option<TransactionEnd> {
         self.interactive.ended_with(id)
     }
