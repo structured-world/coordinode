@@ -3194,11 +3194,18 @@ impl Database {
         let mut backoff = self.autocommit_backoff;
         let (results, write_stats, out_state, duration_us) = loop {
             let mode = txn_mode.take().unwrap_or(TxnMode::AutoCommit);
-            match attempt_once(mode) {
+            #[cfg(feature = "stage-timing")]
+            let attempting = Instant::now();
+            let outcome = attempt_once(mode);
+            #[cfg(feature = "stage-timing")]
+            coordinode_storage::stage_timing::record("embed.attempt", attempting);
+            match outcome {
                 Err(DatabaseError::TransactionConflict {
                     transaction: None,
                     message: reason,
                 }) if reexecutable && attempt < self.autocommit_attempts.get() => {
+                    #[cfg(feature = "stage-timing")]
+                    let retrying = Instant::now();
                     tracing::debug!(attempt, %reason, "auto-commit statement refused at commit; running it again");
                     // The holder was admitted before this refusal, so its
                     // timestamp is at or below the clock now: run again once
@@ -3213,6 +3220,8 @@ impl Database {
                         tracing::debug!(attempt, holder, "a commit in flight outlasted the wait");
                     }
                     std::thread::sleep(backoff);
+                    #[cfg(feature = "stage-timing")]
+                    coordinode_storage::stage_timing::record("embed.retry", retrying);
                     backoff *= 2;
                     attempt += 1;
                 }
