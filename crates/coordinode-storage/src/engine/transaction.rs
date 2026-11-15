@@ -409,6 +409,10 @@ pub struct Transaction<'a> {
     /// to them outside its commit until its last state drops
     /// ([`Self::hold_tree_set`]).
     tree_set: Option<crate::engine::tree_set::TreeSetHold>,
+    /// `STORAGE COLUMNAR` tables this transaction created
+    /// ([`Self::note_table_created`]): their trees are newer than its
+    /// snapshot, and its own.
+    created_tables: Vec<String>,
     /// DERIVED index work: entries staged in the write buffer that the unit
     /// logs as sealed work rather than as mutations.
     derived: derived::DerivedLedger,
@@ -478,6 +482,8 @@ pub struct TransactionState {
     /// Parked: a table one statement created or dropped commits with the
     /// last, and the set stays held until then.
     tree_set: Option<crate::engine::tree_set::TreeSetHold>,
+    /// Parked: a later statement writes the tables an earlier one created.
+    created_tables: Vec<String>,
     /// Parked with the write buffer whose index entries it describes.
     derived: derived::DerivedLedger,
     /// Parked with the write buffer: the removals commit with its writes.
@@ -673,6 +679,7 @@ impl<'a> Transaction<'a> {
             validate_from: snapshot.map(|s| Self::first_unseen(engine, s)),
             open: Some(engine.open_transaction()),
             tree_set: None,
+            created_tables: Vec::new(),
             derived: derived::DerivedLedger::default(),
             range_removals: Vec::new(),
             stamped: HashMap::new(),
@@ -877,6 +884,7 @@ impl<'a> Transaction<'a> {
             validate_from: self.validate_from,
             open: self.open,
             tree_set: self.tree_set,
+            created_tables: self.created_tables,
             derived: self.derived,
             range_removals: self.range_removals,
             stamped: self.stamped,
@@ -911,6 +919,7 @@ impl<'a> Transaction<'a> {
             validate_from: self.validate_from,
             open: self.open.take(),
             tree_set: self.tree_set.take(),
+            created_tables: std::mem::take(&mut self.created_tables),
             derived: std::mem::take(&mut self.derived),
             range_removals: std::mem::take(&mut self.range_removals),
             stamped: std::mem::take(&mut self.stamped),
@@ -953,6 +962,7 @@ impl<'a> Transaction<'a> {
             validate_from: state.validate_from,
             open: state.open,
             tree_set: state.tree_set,
+            created_tables: state.created_tables,
             derived: state.derived,
             range_removals: state.range_removals,
             stamped: state.stamped,
@@ -973,6 +983,23 @@ impl<'a> Transaction<'a> {
     pub fn hold_tree_set(&mut self) -> &crate::engine::tree_set::TreeSetHold {
         let engine = self.engine;
         self.tree_set.get_or_insert_with(|| engine.hold_tree_set())
+    }
+
+    /// Record that this transaction created the `STORAGE COLUMNAR` table
+    /// `table`: its later rows go into the tree it made, newer than its
+    /// snapshot.
+    pub fn note_table_created(&mut self, table: &str) {
+        self.created_tables.push(table.to_owned());
+    }
+
+    /// The snapshot a row this transaction writes to `table` is checked
+    /// against: its own, or `None` for a table it created itself
+    /// ([`StorageEngine::columnar_insert_existing`]).
+    pub fn table_read_at(&self, table: &str) -> Option<lsm_tree::SeqNo> {
+        if self.created_tables.iter().any(|created| created == table) {
+            return None;
+        }
+        Some(self.read_ts.as_raw())
     }
 
     /// The read timestamp this transaction is pinned at.

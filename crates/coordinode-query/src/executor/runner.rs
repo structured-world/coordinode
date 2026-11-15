@@ -4363,9 +4363,12 @@ impl<'a> ExecutionContext<'a> {
             .oracle()
             .map(|o| o.next().as_raw())
             .unwrap_or_else(|| self.engine.snapshot().saturating_add(1));
+        // A table created again under the name since this transaction read it
+        // is not the one the row was made for.
+        let read_at = self.txn.table_read_at(label);
         let held = self.txn.hold_tree_set();
         self.engine
-            .columnar_insert_existing(held, label, key, bytes, seqno)?;
+            .columnar_insert_existing(held, read_at, label, key, bytes, seqno)?;
         Ok(())
     }
 
@@ -22096,6 +22099,7 @@ fn execute_create_table(
     if columnar {
         let held = ctx.txn.hold_tree_set();
         ctx.engine.create_columnar_table_held(name, held)?;
+        ctx.txn.note_table_created(name);
     }
 
     let mut row = Row::new();

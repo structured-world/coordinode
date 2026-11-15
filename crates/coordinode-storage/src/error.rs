@@ -230,6 +230,16 @@ pub enum StorageError {
         table: String,
     },
 
+    /// A `STORAGE COLUMNAR` table was dropped and created again under its
+    /// name after the transaction writing a row to it read its definition:
+    /// the row belongs to the table that was dropped, and is refused before
+    /// it is written. The transaction is run again, against the new table.
+    #[error("table {table} was created again since this transaction read it: run it again")]
+    TableCreatedSinceRead {
+        /// The table.
+        table: String,
+    },
+
     /// The set of trees stayed held by operations for longer than a capture
     /// or a repair waits for it alone. Nothing was done; it is tried again.
     #[error("the set of trees is busy: {operation} waited {waited_ms} ms")]

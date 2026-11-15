@@ -583,14 +583,23 @@ impl StorageEngine {
     ///
     /// # Errors
     ///
+    /// With the trees pinned, and the set of trees still held, it reads where
+    /// the journal under `journal` ends and returns it: the copy of the
+    /// journal stops there, so no operation that starts after the pins
+    /// reaches the copy through the journal, while every commit the pins hold
+    /// or cover was journalled before it.
+    ///
+    /// # Errors
+    ///
     /// [`StorageError::CutNotReady`] when a commit below the cut does not
     /// land in time; a tree cannot be read, a file cannot be linked or
     /// copied, or a tree cannot be rebuilt in `target`.
     pub(crate) fn checkpoint_pinned(
         &self,
         target: &Path,
+        journal: Option<&Path>,
         summary: &mut crate::engine::core::CheckpointSummary,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Option<crate::engine::core::JournalEnd>> {
         // Held alone until every tree is pinned: no table's rows, creation or
         // drop and no repair is half done in what the pins hold. The copy is
         // built from the pins after it is released.
@@ -611,7 +620,12 @@ impl StorageEngine {
                 (trees, Some(bound))
             }
         };
+        let end = journal.map(|src| self.journal_end(src)).transpose()?;
         drop(alone);
+        #[cfg(any(test, feature = "test-faults"))]
+        if let Some(hook) = self.on_trees_pinned.lock().as_mut() {
+            hook();
+        }
         for tree in &trees {
             summary.total_bytes += self.materialize(tree, target, bound)?;
             let held = bound.map_or(tree.pin.seqno(), |bound| tree.pin.seqno().min(bound));
@@ -620,7 +634,7 @@ impl StorageEngine {
                 summary.partitions += 1;
             }
         }
-        Ok(())
+        Ok(end)
     }
 
     /// Refuse a capture while a repair has not installed its result: its

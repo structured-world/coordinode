@@ -518,12 +518,14 @@ fn the_tail_capture_brings_the_journal_copy_up_to_the_journal() {
         log.append(&entry(index)).expect("append");
     }
     log.flush().expect("flush");
-    capture_journal_tail(&src, &dst, &footprints).expect("tail capture");
+    let end = journal_lengths(&src).expect("the journal's end");
+    capture_journal_tail(&src, &dst, &end, &footprints).expect("tail capture");
     // Grown again: the active segment's copy is replaced, not appended to.
     log.append(&entry(13)).expect("append");
     log.flush().expect("flush");
     drop(log);
-    capture_journal_tail(&src, &dst, &footprints).expect("second tail capture");
+    let end = journal_lengths(&src).expect("the journal's end");
+    capture_journal_tail(&src, &dst, &end, &footprints).expect("second tail capture");
 
     let mut copy = crate::oplog::OplogManager::open(&dst, 0, 64 * 1024 * 1024, 1000, 3600)
         .expect("open the copy");

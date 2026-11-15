@@ -394,6 +394,10 @@ pub struct StorageEngine {
     /// Test hook: run once a `STORAGE COLUMNAR` row has landed in its tree.
     #[cfg(any(test, feature = "test-faults"))]
     on_columnar_row: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test hook: run once a checkpoint has pinned its trees and given the
+    /// set of trees back, before it copies anything.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) on_trees_pinned: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// Test hook: run with an entry's index once it is journalled, before
     /// it is applied.
     #[cfg(test)]
@@ -1854,6 +1858,8 @@ impl StorageEngine {
             on_table_dropped: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-faults"))]
             on_columnar_row: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-faults"))]
+            on_trees_pinned: parking_lot::Mutex::new(None),
             #[cfg(test)]
             on_journalled: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -2234,27 +2240,31 @@ impl StorageEngine {
     /// at the journal's next index, made durable before any row can reach it.
     #[cfg(feature = "columnar")]
     fn open_columnar_table(&self, table_id: &str) -> StorageResult<(lsm_tree::AnyTree, u8)> {
-        self.columnar_tables.open_judged(table_id, |tree| {
-            let Some(oplog) = &self.oplog else {
-                return Ok(());
-            };
-            // Every row for this table is journalled only after its writer got
-            // the tree, which the registry lock held here prevents, so each of
-            // them gets an index at or above `next`. Other commits appending
-            // meanwhile touch other trees.
-            let next = oplog
-                .lock()
-                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?
-                .next_index();
-            tree.insert(
-                Domain::Journal.base_key(),
-                coverage::encode_base(next, &[]),
-                self.next_seqno(),
-            );
-            tree.flush_active_memtable(0)?;
-            tree.persist_flushes()?;
-            Ok(())
-        })
+        self.columnar_tables.open_judged(
+            table_id,
+            || self.next_seqno(),
+            |tree| {
+                let Some(oplog) = &self.oplog else {
+                    return Ok(());
+                };
+                // Every row for this table is journalled only after its writer got
+                // the tree, which the registry lock held here prevents, so each of
+                // them gets an index at or above `next`. Other commits appending
+                // meanwhile touch other trees.
+                let next = oplog
+                    .lock()
+                    .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?
+                    .next_index();
+                tree.insert(
+                    Domain::Journal.base_key(),
+                    coverage::encode_base(next, &[]),
+                    self.next_seqno(),
+                );
+                tree.flush_active_memtable(0)?;
+                tree.persist_flushes()?;
+                Ok(())
+            },
+        )
     }
 
     /// Handle to an existing `STORAGE COLUMNAR` table tree, or `None` if no such
@@ -2340,28 +2350,38 @@ impl StorageEngine {
     /// [`Self::columnar_insert_held`] into a table whose tree exists: a statement
     /// writes rows into the tree its table's creation made, never into a new
     /// one standing in for a tree a drop removed, so a tree under a table's
-    /// name is the one that table was created with.
+    /// name is the one that table was created with. `read_at` is the
+    /// snapshot the statement read the table's definition at, `None` when
+    /// its own transaction created the table: a tree created after that
+    /// snapshot belongs to a table created again under the name since, and
+    /// the statement's row is refused before it is written.
     ///
     /// # Errors
     ///
-    /// [`StorageError::TableTreeMissing`] when the table has no tree; as
-    /// [`Self::columnar_insert`] otherwise.
+    /// [`StorageError::TableTreeMissing`] when the table has no tree;
+    /// [`StorageError::TableCreatedSinceRead`] when its tree is newer than
+    /// `read_at`; as [`Self::columnar_insert`] otherwise.
     #[cfg(feature = "columnar")]
     pub fn columnar_insert_existing(
         &self,
         _held: &crate::engine::tree_set::TreeSetHold,
+        read_at: Option<lsm_tree::SeqNo>,
         table_id: &str,
         key: Vec<u8>,
         value: Vec<u8>,
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
-        let tree =
-            self.columnar_tables
-                .get(table_id)
-                .ok_or_else(|| StorageError::TableTreeMissing {
-                    table: table_id.to_owned(),
-                })?;
-        let table_tier = self.columnar_tables.pressure(table_id);
+        let (tree, table_tier, created_at) = self
+            .columnar_tables
+            .get_stamped(table_id)
+            .ok_or_else(|| StorageError::TableTreeMissing {
+                table: table_id.to_owned(),
+            })?;
+        if read_at.is_some_and(|read_at| created_at > read_at) {
+            return Err(StorageError::TableCreatedSinceRead {
+                table: table_id.to_owned(),
+            });
+        }
         self.insert_columnar_row(table_id, &tree, table_tier, key, value, seqno)
     }
 
@@ -3240,14 +3260,17 @@ impl StorageEngine {
             summary.oplog_bytes = capture_journal(src, &target.join("oplog"), &self.footprints)?;
         }
 
-        self.checkpoint_trees(target, &mut summary)?;
-        // And once more after the trees: entries written meanwhile reached
-        // the trees of the partitions they touch, but not the first copy of
-        // the journal. Without them the copy's next entry would follow a gap
-        // the other trees do not cover, and the copy would not open again.
-        if let Some(src) = &src_oplog {
+        let end = self.checkpoint_trees(target, src_oplog.as_deref(), &mut summary)?;
+        // And once more after the trees, up to where the journal ended when
+        // they were pinned: entries written before reached the trees of the
+        // partitions they touch, but not the first copy of the journal.
+        // Without them the copy's next entry would follow a gap the other
+        // trees do not cover, and the copy would not open again. Entries
+        // written after are past the trees and stay out: replayed, they
+        // would bring part of an operation that started after the pins.
+        if let (Some(src), Some(end)) = (&src_oplog, &end) {
             summary.oplog_bytes +=
-                capture_journal_tail(src, &target.join("oplog"), &self.footprints)?;
+                capture_journal_tail(src, &target.join("oplog"), end, &self.footprints)?;
         }
         self.seal_checkpoint(target, replay_floor.unwrap_or(0))?;
         // The newest checkpoint is the one a rebuild starts from: its trees
@@ -3286,10 +3309,36 @@ impl StorageEngine {
     fn checkpoint_trees(
         &self,
         target: &Path,
+        journal: Option<&Path>,
         summary: &mut CheckpointSummary,
-    ) -> StorageResult<()> {
-        self.checkpoint_pinned(target, summary)
-            .map_err(|e| Self::checkpoint_failure(e, || "checkpoint the trees".into()))
+    ) -> StorageResult<Option<JournalEnd>> {
+        self.checkpoint_pinned(target, journal, summary)
+            .map_err(|e| match e {
+                // Refusals the caller acts on keep their kind.
+                StorageError::TreeSetBusy { .. }
+                | StorageError::CutNotReady { .. }
+                | StorageError::CatalogMismatch { .. } => e,
+                other => Self::checkpoint_failure(other, || "checkpoint the trees".into()),
+            })
+    }
+
+    /// Where the journal under `src` ends now, read under its append lock so
+    /// every file ends at a whole entry. A checkpoint reads it with its trees
+    /// pinned and copies the journal up to it, never past.
+    ///
+    /// # Errors
+    ///
+    /// The journal's lock is poisoned, or its files cannot be measured.
+    pub(crate) fn journal_end(&self, src: &Path) -> StorageResult<JournalEnd> {
+        let _appends = match &self.oplog {
+            Some(oplog) => Some(
+                oplog
+                    .lock()
+                    .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?,
+            ),
+            None => None,
+        };
+        journal_lengths(src)
     }
 
     /// The file system every tree writes through.
@@ -7403,6 +7452,14 @@ impl StorageEngine {
         *self.on_columnar_row.lock() = hook;
     }
 
+    /// Run `hook` once a checkpoint has pinned its trees and given the set
+    /// of trees back, before it copies anything. For tests of what a
+    /// checkpoint takes of an operation that starts after its pins.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn set_trees_pinned_hook(&self, hook: Option<Box<dyn FnMut() + Send>>) {
+        *self.on_trees_pinned.lock() = hook;
+    }
+
     /// Stop the journal, as a disk that does not answer would: every write
     /// and sync of it waits until the returned hold is dropped. `None` for a
     /// store kept in memory. For fault tests.
@@ -9221,42 +9278,105 @@ fn capture_journal(
     Ok(bytes)
 }
 
-/// Bring the journal copy in `dst`, taken by [`capture_journal`], up to the
-/// journal in `src`: a segment it lacks is linked or copied as there, and a
-/// segment that grew since its copy (the active one, sealed or still
-/// active) is captured again. A segment the copy holds whole is left as it
+/// Where a journal ended: the length of each of its files, by path under
+/// the journal's directory. A file not listed did not exist yet.
+#[derive(Debug, Default)]
+pub(crate) struct JournalEnd(std::collections::HashMap<PathBuf, u64>);
+
+impl JournalEnd {
+    /// The length of the file at `rel`, under the journal's directory, when
+    /// it existed.
+    fn len_of(&self, rel: &Path) -> Option<u64> {
+        self.0.get(rel).copied()
+    }
+}
+
+/// The length of every file under the journal directory `src` now. Read
+/// under the journal's append lock ([`StorageEngine::journal_end`]), each
+/// ends at a whole entry.
+///
+/// # Errors
+///
+/// A directory or a file's length cannot be read.
+pub(crate) fn journal_lengths(src: &Path) -> StorageResult<JournalEnd> {
+    let mut end = JournalEnd::default();
+    let mut pending = vec![PathBuf::new()];
+    while let Some(rel) = pending.pop() {
+        let dir = src.join(&rel);
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| StorageError::Io(format!("read dir {dir:?}: {e}")))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| StorageError::Io(format!("dir entry in {dir:?}: {e}")))?;
+            let meta = entry
+                .metadata()
+                .map_err(|e| StorageError::Io(format!("measure {:?}: {e}", entry.path())))?;
+            let name = rel.join(entry.file_name());
+            if meta.is_dir() {
+                pending.push(name);
+            } else {
+                end.0.insert(name, meta.len());
+            }
+        }
+    }
+    Ok(end)
+}
+
+/// Bring the journal copy in `dst`, taken by [`capture_journal`], up to
+/// where the journal in `src` ended at `end`, never past it: a segment the
+/// copy lacks is linked or copied as it was then, a segment that grew since
+/// its copy is captured again up to its length then, and a segment made
+/// after `end` is left out. A segment the copy holds whole is left as it
 /// is, and one the purge removed since stays in the copy. Returns the bytes
 /// copied.
 fn capture_journal_tail(
     src: &Path,
     dst: &Path,
+    end: &JournalEnd,
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<u64> {
+    capture_journal_tail_at(src, dst, Path::new(""), end, footprints)
+}
+
+/// [`capture_journal_tail`] of the directory `rel` under the journal's.
+fn capture_journal_tail_at(
+    src: &Path,
+    dst: &Path,
+    rel: &Path,
+    end: &JournalEnd,
     footprints: &crate::engine::footprint::Footprints,
 ) -> StorageResult<u64> {
     let mut bytes = 0u64;
-    let entries =
-        std::fs::read_dir(src).map_err(|e| StorageError::Io(format!("read dir {src:?}: {e}")))?;
+    let from_dir = src.join(rel);
+    let entries = std::fs::read_dir(&from_dir)
+        .map_err(|e| StorageError::Io(format!("read dir {from_dir:?}: {e}")))?;
     for entry in entries {
-        let entry = entry.map_err(|e| StorageError::Io(format!("dir entry in {src:?}: {e}")))?;
+        let entry =
+            entry.map_err(|e| StorageError::Io(format!("dir entry in {from_dir:?}: {e}")))?;
         let file_type = entry
             .file_type()
             .map_err(|e| StorageError::Io(format!("file type {:?}: {e}", entry.path())))?;
-        let to = dst.join(entry.file_name());
+        let name = rel.join(entry.file_name());
+        let to = dst.join(&name);
         let from = entry.path();
         if file_type.is_dir() {
-            if to.exists() {
-                bytes += capture_journal_tail(&from, &to, footprints)?;
-            } else {
-                bytes += capture_journal(&from, &to, footprints)?;
+            if !to.exists() {
+                create_dir_new(&to)?;
             }
+            bytes += capture_journal_tail_at(src, dst, &name, end, footprints)?;
             continue;
         }
+        // Made after the journal's end: what it holds came after the trees.
+        let Some(ended) = end.len_of(&name) else {
+            continue;
+        };
         let len = |path: &Path| std::fs::metadata(path).map(|m| m.len());
         match (len(&from), len(&to)) {
             // Removed by the purge since the listing: it held only entries
             // the trees already carry.
             (Err(_), _) => continue,
-            // A segment never shrinks: one as long as its copy is the copy.
-            (Ok(now), Ok(copied)) if now == copied => continue,
+            // A segment never shrinks: a copy as long as the end is the copy.
+            (Ok(_), Ok(copied)) if copied == ended => continue,
             (Ok(_), Ok(_)) => {
                 // The copy is a stale copy of the active segment, never a
                 // link: a linked segment is sealed and keeps its length.
@@ -9266,7 +9386,8 @@ fn capture_journal_tail(
             }
             (Ok(_), Err(_)) => {}
         }
-        if crate::oplog::segment::is_sealed(&from).unwrap_or(false)
+        if len(&from).is_ok_and(|now| now == ended)
+            && crate::oplog::segment::is_sealed(&from).unwrap_or(false)
             && std::fs::hard_link(&from, &to).is_ok()
         {
             footprints
@@ -9274,7 +9395,7 @@ fn capture_journal_tail(
                 .map_err(|e| StorageError::Io(format!("link {to:?}: {e}")))?;
             continue;
         }
-        match copy_new(&from, &to, footprints) {
+        match copy_prefix(&from, &to, Some(ended), footprints) {
             Ok(copied) => bytes += copied,
             Err(StorageError::Io(_)) if !from.exists() => {}
             Err(e) => return Err(e),
@@ -9292,14 +9413,26 @@ fn copy_new(
     to: &Path,
     footprints: &crate::engine::footprint::Footprints,
 ) -> StorageResult<u64> {
+    copy_prefix(from, to, None, footprints)
+}
+
+/// [`copy_new`] of the first `limit` bytes of `from` at most, all of it
+/// without one.
+fn copy_prefix(
+    from: &Path,
+    to: &Path,
+    limit: Option<u64>,
+    footprints: &crate::engine::footprint::Footprints,
+) -> StorageResult<u64> {
     // The source first: one the purge removed leaves no empty copy behind.
     let mut source =
         std::fs::File::open(from).map_err(|e| StorageError::Io(format!("open {from:?}: {e}")))?;
     if let Some(charge) = footprints.file(to) {
-        let len = source
+        let now = source
             .metadata()
             .map_err(|e| StorageError::Io(format!("measure {from:?}: {e}")))?
             .len();
+        let len = limit.map_or(now, |limit| limit.min(now));
         // An active segment may grow while it is copied; the copy is held to
         // what was charged for it.
         charge.charge_to(len)?;
@@ -9325,8 +9458,11 @@ fn copy_new(
             StorageError::Io(format!("create {to:?}: {e}"))
         }
     })?;
-    std::io::copy(&mut source, &mut target)
-        .map_err(|e| StorageError::Io(format!("copy {from:?} to {to:?}: {e}")))
+    let copied = match limit {
+        Some(limit) => std::io::copy(&mut std::io::Read::take(&mut source, limit), &mut target),
+        None => std::io::copy(&mut source, &mut target),
+    };
+    copied.map_err(|e| StorageError::Io(format!("copy {from:?} to {to:?}: {e}")))
 }
 
 /// Create directory `dir`, whose parent exists, refusing one that already

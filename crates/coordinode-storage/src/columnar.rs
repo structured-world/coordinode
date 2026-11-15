@@ -170,6 +170,9 @@ enum Retirement {
 struct TableEntry {
     tree: AnyTree,
     pressure: Arc<AtomicU8>,
+    /// The commit timestamp the table was created at in this process; 0 for
+    /// one the store held when it opened.
+    created_at: u64,
 }
 
 /// A table tree repaired while the registry opened it: its open failed
@@ -289,7 +292,7 @@ impl ColumnarTableRegistry {
                     report,
                 });
             }
-            trees.insert(entry.file_name, TableEntry::new(tree));
+            trees.insert(entry.file_name, TableEntry::new(tree, 0));
         }
         registry.lock().live = trees;
         Ok((registry, repairs))
@@ -379,15 +382,19 @@ impl ColumnarTableRegistry {
         table_id: &str,
         on_create: impl FnOnce(&AnyTree) -> StorageResult<()>,
     ) -> StorageResult<AnyTree> {
-        self.open_judged(table_id, on_create).map(|(tree, _)| tree)
+        // A tree made in its table's place (a rebuild) is the same table.
+        self.open_judged(table_id, || 0, on_create)
+            .map(|(tree, _)| tree)
     }
 
     /// [`Self::create_or_open_with`], with the table's write-pressure tier
     /// (see [`Self::pressure`]) read under the same lock: what a write to
-    /// the table needs, for one lookup.
+    /// the table needs, for one lookup. A table created here is stamped with
+    /// `created_at()`, asked only then ([`Self::get_stamped`]).
     pub(crate) fn open_judged(
         &self,
         table_id: &str,
+        created_at: impl FnOnce() -> u64,
         on_create: impl FnOnce(&AnyTree) -> StorageResult<()>,
     ) -> StorageResult<(AnyTree, u8)> {
         let mut tables = self.lock();
@@ -412,10 +419,25 @@ impl ColumnarTableRegistry {
         // has not judged it.
         let (tree, _) = self.open_tree(table_id)?;
         on_create(&tree)?;
-        tables
-            .live
-            .insert(table_id.to_owned(), TableEntry::new(tree.clone()));
+        tables.live.insert(
+            table_id.to_owned(),
+            TableEntry::new(tree.clone(), created_at()),
+        );
         Ok((tree, 0))
+    }
+
+    /// The tree of `table_id`, its write-pressure tier and the timestamp it
+    /// was created at in this process (0 for a table the store held when it
+    /// opened, older than every snapshot read since); `None` when there is no
+    /// such table.
+    pub(crate) fn get_stamped(&self, table_id: &str) -> Option<(AnyTree, u8, u64)> {
+        self.lock().live.get(table_id).map(|entry| {
+            (
+                entry.tree.clone(),
+                entry.pressure.load(Ordering::Relaxed),
+                entry.created_at,
+            )
+        })
     }
 
     /// Run `work` on the tree of `table_id` while the table lives, as its
@@ -579,11 +601,13 @@ impl ColumnarTableRegistry {
 }
 
 impl TableEntry {
-    /// A live table the compaction monitor has not judged yet.
-    fn new(tree: AnyTree) -> Self {
+    /// A live table the compaction monitor has not judged yet, created at
+    /// `created_at`.
+    fn new(tree: AnyTree, created_at: u64) -> Self {
         Self {
             tree,
             pressure: Arc::new(AtomicU8::new(0)),
+            created_at,
         }
     }
 }
