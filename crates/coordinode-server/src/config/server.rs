@@ -409,6 +409,10 @@ pub struct ServerConfig {
     /// Statements running at least this long, in milliseconds, are logged
     /// with their text (`None` = 100; 0 logs every statement).
     pub slow_query_ms: Option<u64>,
+    /// Whether every statement's run is recorded for the query advisor
+    /// (statistics, last plan, N+1 detection). Off, statements run without
+    /// advisor work and only an explicit EXPLAIN SUGGEST advises.
+    pub auto_advisory: bool,
     /// How long a query waits for a vector index still being built, under
     /// the `block` policy, when it names no bound of its own, in milliseconds
     /// (`None` = 30000). A query's `vector_build_wait` hint overrides it.
@@ -715,6 +719,7 @@ impl Default for ServerConfig {
             election_preference: ElectionStanding::Ordinary,
             planner_stats_ttl_secs: None,
             slow_query_ms: None,
+            auto_advisory: true,
             vector_build_wait_ms: None,
             query_memory_limit_mb: None,
             vector_retired_bytes_budget: None,

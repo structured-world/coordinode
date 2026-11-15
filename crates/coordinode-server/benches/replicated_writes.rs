@@ -92,12 +92,7 @@ async fn open_node(
     let db = Arc::new(RwLock::new(
         Database::from_engine(dir.path(), engine, oracle, pipeline).expect("database"),
     ));
-    let cypher = CypherServiceImpl::new(
-        Arc::clone(&db),
-        Arc::new(coordinode_query::advisor::QueryRegistry::new()),
-        Arc::new(coordinode_query::advisor::nplus1::NPlus1Detector::new()),
-    )
-    .with_raft_node(Arc::clone(&raft));
+    let cypher = CypherServiceImpl::new(Arc::clone(&db)).with_raft_node(Arc::clone(&raft));
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let context = Arc::clone(raft.connections().expect("peers").context());
     serve_member_port(

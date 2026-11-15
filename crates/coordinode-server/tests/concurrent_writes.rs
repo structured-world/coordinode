@@ -60,12 +60,7 @@ async fn more_writes_than_workers_all_commit() {
     let db = Arc::new(RwLock::new(
         Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap(),
     ));
-    let cypher = CypherServiceImpl::new(
-        Arc::clone(&db),
-        Arc::new(coordinode_query::advisor::QueryRegistry::new()),
-        Arc::new(coordinode_query::advisor::nplus1::NPlus1Detector::new()),
-    )
-    .with_raft_node(Arc::clone(&raft));
+    let cypher = CypherServiceImpl::new(Arc::clone(&db)).with_raft_node(Arc::clone(&raft));
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let context = Arc::clone(raft.connections().unwrap().context());
     coordinode_test_fixtures::serve_member_port(

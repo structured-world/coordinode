@@ -237,7 +237,8 @@ impl PreparedRouted for Started {
 }
 
 /// Run an autonomous statement this member fenced, on the path its own
-/// clients' statements take: recorded for the advisor and the query metrics.
+/// clients' statements take: counted in the query metrics, and recorded for
+/// the advisor by the database that runs it, at the client's call site.
 fn run_fenced(
     executor: &StatementExecutor,
     statement: RoutedStatement,
@@ -255,7 +256,14 @@ fn run_fenced(
     // A read that pages is answered page by page, as a session here pages
     // it: one page of memory whatever the result size.
     if executor.database().read().keyset_pageable(&query) {
-        let stats = executor::write_paged(executor.database(), &query, params, fenced, answer);
+        let stats = executor::write_paged(
+            executor.database(),
+            &query,
+            params,
+            source.as_ref(),
+            fenced,
+            answer,
+        );
         crate::services::statement::observe_query(
             if stats.is_ok() {
                 crate::services::statement::QueryKind::Read
@@ -264,11 +272,9 @@ fn run_fenced(
             },
             start,
         );
-        executor.record(&query, source.as_ref(), start);
         return stats;
     }
     let result = executor.execute(&query, params, source.as_ref(), fenced)?;
-    executor.record(&query, source.as_ref(), start);
     executor::write_rows(&result.rows, answer);
     Ok(executor::stats(&result.write_stats, fenced))
 }

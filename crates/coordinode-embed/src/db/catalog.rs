@@ -362,11 +362,11 @@ impl Database {
         self.run_plan(
             Statement {
                 plan,
-                canonical,
+                canonical: &canonical,
                 fingerprint,
                 build_wait: None,
             },
-            None,
+            super::Advice::Record(None),
             None,
             &session,
             TxnMode::AutoCommit,

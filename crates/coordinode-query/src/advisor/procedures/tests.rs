@@ -74,24 +74,37 @@ fn query_stats_with_data() {
     );
 }
 
-/// queryStats() includes plan when recorded with record_with_plan.
+/// queryStats() returns the EXPLAIN text of the plan a statement last ran
+/// with, and the text follows a changed plan.
 #[test]
 fn query_stats_includes_plan() {
+    use crate::frontend::QueryFrontend as _;
+    let plan_of = |query: &str| {
+        crate::frontend::CypherFrontend::new()
+            .parse(query)
+            .expect("parse")
+            .plan
+    };
     let ctx = make_ctx();
-    ctx.registry.record_with_plan(
-        0x111,
-        "MATCH (n:User) RETURN n",
-        100,
-        "NodeScan (User)".to_string(),
-        None,
-    );
+    let first = plan_of("MATCH (n:User) RETURN n");
+    ctx.registry
+        .record_run(0x111, "MATCH (n:User) RETURN n", 100, &first, None);
 
     let rows = query_stats(&ctx);
     assert_eq!(rows.len(), 1);
     assert_eq!(
         column(Kind::QueryStats, &rows[0], "plan"),
-        Value::String("NodeScan (User)".to_string()),
+        Value::String(first.explain()),
         "plan should be stored and returned"
+    );
+
+    let changed = plan_of("MATCH (n:User) WHERE n.age > 1 RETURN n");
+    ctx.registry
+        .record_run(0x111, "MATCH (n:User) RETURN n", 100, &changed, None);
+    assert_eq!(
+        column(Kind::QueryStats, &query_stats(&ctx)[0], "plan"),
+        Value::String(changed.explain()),
+        "a changed plan replaces the text"
     );
 }
 

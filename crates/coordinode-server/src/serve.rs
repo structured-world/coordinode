@@ -228,6 +228,7 @@ pub(crate) async fn serve(
         election_preference: _,
         planner_stats_ttl_secs,
         slow_query_ms,
+        auto_advisory,
         vector_build_wait_ms,
         query_memory_limit_mb,
         vector_retired_bytes_budget,
@@ -776,6 +777,7 @@ pub(crate) async fn serve(
         if let Some(ms) = vector_build_wait_ms {
             database.set_vector_build_wait(std::time::Duration::from_millis(ms));
         }
+        database.set_auto_advisory(auto_advisory);
         if let Some(mib) = query_memory_limit_mb {
             // Refused at start rather than clamped: an operator who wrote a
             // limit past the ceiling meant something the server cannot honour.
@@ -1063,17 +1065,13 @@ pub(crate) async fn serve(
     // dispatch, passes at least `trigger_dispatch_interval` apart.
     member.start_background(trigger_dispatch_interval);
 
-    let query_registry = Arc::new(coordinode_query::advisor::QueryRegistry::new());
-    let nplus1_detector = Arc::new(coordinode_query::advisor::nplus1::NPlus1Detector::new());
-
     let graph_service = services::graph::GraphServiceImpl::new(Arc::clone(&database));
     let schema_service = services::schema::SchemaServiceImpl::new(Arc::clone(&database));
     // One path for every Cypher statement, whichever transport carries it:
-    // the unary service and the session share the settings, fence,
-    // forwarding and advisor.
+    // the unary service and the session share the settings, fence and
+    // forwarding; the database records each statement for the advisor.
     let statement_executor = {
         let executor = services::statement::StatementExecutor::new(Arc::clone(&database))
-            .with_advisor(Arc::clone(&query_registry), Arc::clone(&nplus1_detector))
             .with_statement_defaults(statement_defaults)
             // The member's slots: its clients' commands and the ones its
             // peers route here run in the same ones.

@@ -95,9 +95,7 @@ fn test_service() -> (CypherServiceImpl, tempfile::TempDir) {
     let database = Arc::new(RwLock::new(
         Database::open(dir.path()).expect("open database"),
     ));
-    let registry = Arc::new(QueryRegistry::new());
-    let detector = Arc::new(NPlus1Detector::new());
-    let svc = CypherServiceImpl::new(database, registry, detector);
+    let svc = CypherServiceImpl::new(database);
     (svc, dir)
 }
 
@@ -885,27 +883,20 @@ async fn grpc_execute_parse_error() {
 }
 
 /// End-to-end: CoordinodeClient with debug_source_tracking injects
-/// x-source-* metadata that CypherServiceImpl extracts and records in
-/// the QueryRegistry. Covers the full path:
+/// x-source-* metadata that CypherServiceImpl extracts and the database
+/// records in its advisor once. Covers the full path:
 ///   client (#[track_caller]) → gRPC transport → extract_source_context()
-///   → query_registry.record_with_source()
+///   → the database's query registry
 #[tokio::test]
 async fn grpc_source_tracking_round_trip() {
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
-    // Shared registry so we can inspect it after the query executes.
     let dir = tempfile::tempdir().expect("tempdir");
     let database = Arc::new(RwLock::new(
         Database::open(dir.path()).expect("open database"),
     ));
-    let registry = Arc::new(QueryRegistry::new());
-    let detector = Arc::new(NPlus1Detector::new());
-    let svc = CypherServiceImpl::new(
-        Arc::clone(&database),
-        Arc::clone(&registry),
-        Arc::clone(&detector),
-    );
+    let svc = CypherServiceImpl::new(Arc::clone(&database));
 
     // Bind to OS-assigned port to avoid conflicts.
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -940,11 +931,13 @@ async fn grpc_source_tracking_round_trip() {
         .await
         .expect("execute_cypher");
 
-    // Verify the registry captured the source location.
-    let top = registry.top_by_count(10);
+    // Verify the registry captured the source location, and the statement
+    // once.
+    let top = database.read().query_registry().top_by_count(10);
     assert_eq!(top.len(), 1, "one fingerprint should be recorded");
 
     let entry = &top[0];
+    assert_eq!(entry.count, 1, "one run, recorded once");
     assert_eq!(entry.sources.len(), 1, "one source location expected");
 
     let src = &entry.sources[0];
@@ -973,10 +966,7 @@ async fn session_source_tracking_with_params_round_trip() {
     let database = Arc::new(RwLock::new(
         Database::open(dir.path()).expect("open database"),
     ));
-    let registry = Arc::new(QueryRegistry::new());
-    let detector = Arc::new(NPlus1Detector::new());
-    let executor = StatementExecutor::new(Arc::clone(&database))
-        .with_advisor(Arc::clone(&registry), Arc::clone(&detector));
+    let executor = StatementExecutor::new(Arc::clone(&database));
     let sessions = crate::services::session::SessionSvc::new(
         executor,
         Arc::new(coordinode_session::SessionRegistry::new()),
@@ -1016,8 +1006,9 @@ async fn session_source_tracking_with_params_round_trip() {
         .await
         .expect("execute_cypher_with_params");
 
-    let top = registry.top_by_count(10);
+    let top = database.read().query_registry().top_by_count(10);
     assert_eq!(top.len(), 1, "one fingerprint should be recorded");
+    assert_eq!(top[0].count, 1, "one run, recorded once");
     let src = &top[0].sources[0];
     assert!(
         src.file.contains("cypher/tests.rs"),
@@ -1854,12 +1845,7 @@ async fn test_service_raft() -> (CypherServiceImpl, Arc<RaftNode>, tempfile::Tem
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(node.pipeline());
     let db = Database::from_engine(dir.path(), engine, oracle, pipeline).expect("from_engine");
-    let svc = CypherServiceImpl::new(
-        Arc::new(RwLock::new(db)),
-        Arc::new(QueryRegistry::new()),
-        Arc::new(NPlus1Detector::new()),
-    )
-    .with_raft_node(Arc::clone(&node));
+    let svc = CypherServiceImpl::new(Arc::new(RwLock::new(db))).with_raft_node(Arc::clone(&node));
     (svc, node, dir)
 }
 
@@ -2675,10 +2661,7 @@ async fn grpc_alter_label_bumps_schema_revision_visible_via_list_labels() {
     let database = Arc::new(RwLock::new(
         Database::open(dir.path()).expect("open database"),
     ));
-    let registry = Arc::new(QueryRegistry::new());
-    let detector = Arc::new(NPlus1Detector::new());
-
-    let cypher_svc = CypherServiceImpl::new(database.clone(), registry, detector);
+    let cypher_svc = CypherServiceImpl::new(database.clone());
     let schema_svc = SchemaServiceImpl::new(database);
 
     // Seed a node so the label exists in the catalog scan path.
@@ -3379,8 +3362,6 @@ async fn grpc_write_concern_cache_accepted() {
 /// end-to-end at the handler boundary.
 #[tokio::test]
 async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler() {
-    use coordinode_query::advisor::QueryRegistry;
-    use coordinode_query::advisor::nplus1::NPlus1Detector;
     use coordinode_storage::engine::config::{
         Durability as Dur, EndpointConfig, Media, StorageConfig, Tier,
     };
@@ -3467,13 +3448,7 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
     // reader: fill the room that frees too.
     fill(db.engine(), &mut next);
     let database = std::sync::Arc::new(parking_lot::RwLock::new(db));
-    let registry = std::sync::Arc::new(QueryRegistry::new());
-    let detector = std::sync::Arc::new(NPlus1Detector::new());
-    let svc = CypherServiceImpl::new(
-        std::sync::Arc::clone(&database),
-        std::sync::Arc::clone(&registry),
-        std::sync::Arc::clone(&detector),
-    );
+    let svc = CypherServiceImpl::new(std::sync::Arc::clone(&database));
 
     // Step 3: send a CREATE through the handler. Must surface as
     // ResourceExhausted with structured metadata.

@@ -809,7 +809,7 @@ impl Database {
         let (rows, _stats, out_state) = self
             .execute_cypher_impl(
                 query,
-                None,
+                super::Advice::Record(None),
                 params,
                 &session,
                 TxnMode::Interactive(Box::new(checked.state)),

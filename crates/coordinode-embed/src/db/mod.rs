@@ -307,6 +307,9 @@ pub struct Database {
     nplus1_detector: Arc<NPlus1Detector>,
     /// Dismissed suggestion fingerprints for `db.advisor.dismiss()`.
     dismissed: Arc<DismissedSet>,
+    /// Whether every statement's run is recorded for the advisor; when off,
+    /// only an explicit EXPLAIN SUGGEST advises.
+    auto_advisory: std::sync::atomic::AtomicBool,
     /// MVCC timestamp oracle — allocates monotonic timestamps for
     /// snapshot isolation reads and commit ordering.
     oracle: Arc<TimestampOracle>,
@@ -479,11 +482,21 @@ fn apply_session_vector_consistency(
     }
 }
 
+/// Whether a statement's run is recorded for the advisor.
+#[derive(Clone, Copy)]
+pub(crate) enum Advice<'s> {
+    /// Recorded, with the call site the client named, when the database
+    /// records every statement.
+    Record(Option<&'s SourceContext>),
+    /// Not recorded: a later page of a cursor whose first page was.
+    Skip,
+}
+
 /// A lowered plan ready to run, with the identity the advisor records it by.
-struct Statement {
+struct Statement<'q> {
     plan: planner::logical::LogicalPlan,
     /// Canonical form of the statement, literals scrubbed.
-    canonical: String,
+    canonical: &'q str,
     /// Fingerprint over the canonical form.
     fingerprint: u64,
     /// The bound a `vector_build_wait` hint named, if any.
@@ -1191,6 +1204,7 @@ impl Database {
             query_registry: Arc::new(QueryRegistry::new()),
             nplus1_detector: Arc::new(NPlus1Detector::new()),
             dismissed: Arc::new(DismissedSet::new()),
+            auto_advisory: std::sync::atomic::AtomicBool::new(true),
             oracle,
             proposal_id_gen,
             pipeline,
@@ -1693,7 +1707,7 @@ impl Database {
         let session = self.capture_session();
         self.execute_cypher_impl(
             query,
-            Some(source),
+            Advice::Record(Some(source)),
             None,
             &session,
             TxnMode::AutoCommit,
@@ -1723,7 +1737,7 @@ impl Database {
         let session = self.capture_session();
         self.execute_cypher_impl(
             query,
-            Some(source),
+            Advice::Record(Some(source)),
             params,
             &session,
             TxnMode::AutoCommit,
@@ -1773,8 +1787,15 @@ impl Database {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit, &mut None)
-            .map(|(rows, _, _)| rows)
+        self.execute_cypher_impl(
+            query,
+            Advice::Record(None),
+            None,
+            &session,
+            TxnMode::AutoCommit,
+            &mut None,
+        )
+        .map(|(rows, _, _)| rows)
     }
 
     /// Execute a SQL statement (`SELECT` / `INSERT`) against the relational
@@ -1787,12 +1808,22 @@ impl Database {
     /// instead of cypher-parsing the text.
     pub fn execute_sql(&mut self, query: &str) -> Result<Vec<Row>, DatabaseError> {
         use coordinode_query::frontend::QueryFrontend;
-        let parsed = coordinode_query::sql::SqlFrontend::new().parse(query)?;
-        self.plan_cache
-            .put(query.to_string(), Arc::new(CachedPlan::from(parsed)));
+        // Parsed once per text: a repeat finds the lowered plan cached.
+        if self.plan_cache.get(query).is_none() {
+            let parsed = coordinode_query::sql::SqlFrontend::new().parse(query)?;
+            self.plan_cache
+                .put(query.to_string(), Arc::new(CachedPlan::from(parsed)));
+        }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit, &mut None)
-            .map(|(rows, _, _)| rows)
+        self.execute_cypher_impl(
+            query,
+            Advice::Record(None),
+            None,
+            &session,
+            TxnMode::AutoCommit,
+            &mut None,
+        )
+        .map(|(rows, _, _)| rows)
     }
 
     /// Execute a Cypher query with bound parameters.
@@ -1815,7 +1846,7 @@ impl Database {
         let session = self.capture_session();
         self.execute_cypher_impl(
             query,
-            None,
+            Advice::Record(None),
             params,
             &session,
             TxnMode::AutoCommit,
@@ -1860,7 +1891,7 @@ impl Database {
         let params = params.filter(|p| !p.is_empty());
         self.execute_cypher_impl(
             query,
-            source,
+            Advice::Record(source),
             params,
             &session,
             TxnMode::AutoCommit,
@@ -2480,7 +2511,7 @@ impl Database {
         }
         self.execute_cypher_impl(
             query,
-            source,
+            Advice::Record(source),
             params,
             &session,
             TxnMode::AutoCommit,
@@ -2508,6 +2539,10 @@ impl Database {
     /// scan would emit only one page's worth of rows and the operator above
     /// would compute over a partial set. A plan with no scan at all (e.g. a
     /// bare `RETURN`) reports a single exhausted page.
+    ///
+    /// A page is not recorded for the advisor: the cursor is one execution,
+    /// which its owner records once it has read to the end, with
+    /// [`Self::record_cursor`].
     pub fn execute_cypher_paged(
         &self,
         query: &str,
@@ -2552,7 +2587,7 @@ impl Database {
         });
         let (rows, write_stats, _) = self.execute_cypher_impl(
             query,
-            None,
+            Advice::Skip,
             params,
             &session,
             TxnMode::AutoCommit,
@@ -2578,6 +2613,50 @@ impl Database {
             read_ts: pinned,
             write_stats,
         })
+    }
+
+    /// Record a cursor read through [`Self::execute_cypher_paged`] for the
+    /// advisor, once it was read to the end: `busy` is the time its pages
+    /// spent in the engine, without the client's pauses between them, and
+    /// `source` the call site the client named. The caller decides whether
+    /// the cursor is recorded when it opens it, by [`Self::auto_advisory`]
+    /// then; a cursor abandoned before its end is not an execution.
+    ///
+    /// # Errors
+    ///
+    /// The query no longer parses: nothing is recorded then.
+    pub fn record_cursor(
+        &self,
+        query: &str,
+        busy: Duration,
+        source: Option<&SourceContext>,
+    ) -> Result<(), DatabaseError> {
+        let cached = self.cached_plan(query)?;
+        // Planned again once per cursor, not per page: the plan its pages ran
+        // with, without parameters bound.
+        let plan = self.explain_plan(query, self.compute_stats().as_ref())?;
+        let duration_us = u64::try_from(busy.as_micros()).unwrap_or(u64::MAX);
+        self.query_registry.record_run(
+            cached.fingerprint,
+            &cached.canonical,
+            duration_us,
+            &plan,
+            source,
+        );
+        if let Some(src) = source
+            && let Some(alert) =
+                self.nplus1_detector
+                    .record(cached.fingerprint, &cached.canonical, src)
+        {
+            tracing::warn!(
+                fingerprint = cached.fingerprint,
+                count = alert.call_count,
+                file = %alert.source_file,
+                line = alert.source_line,
+                "N+1 query pattern detected"
+            );
+        }
+        Ok(())
     }
 
     /// Classify whether `query` can be served by a keyset-resumable cursor via
@@ -2665,14 +2744,21 @@ impl Database {
         let mut session = self.capture_session();
         session.apply_read_concern(&read_concern)?;
 
-        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit, &mut None)
-            .map(|(r, _, _)| r)
+        self.execute_cypher_impl(
+            query,
+            Advice::Record(None),
+            None,
+            &session,
+            TxnMode::AutoCommit,
+            &mut None,
+        )
+        .map(|(r, _, _)| r)
     }
 
     fn execute_cypher_impl(
         &self,
         query: &str,
-        source: Option<&SourceContext>,
+        advice: Advice<'_>,
         params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
         session: &QuerySession,
         txn_mode: TxnMode,
@@ -2698,22 +2784,20 @@ impl Database {
         // Optimizer passes below still run on the cloned plan so they
         // observe the current index registry / stats.
         let cached = self.cached_plan(query)?;
-        let (canonical, fp, mut plan, hinted, hinted_build_wait) = (
-            cached.canonical.clone(),
-            cached.fingerprint,
-            cached.plan.clone(),
+        let mut plan = cached.plan.clone();
+        apply_session_vector_consistency(
+            &mut plan,
             cached.vector_consistency_hinted,
-            cached.vector_build_wait,
+            session.vector_consistency,
         );
-        apply_session_vector_consistency(&mut plan, hinted, session.vector_consistency);
         self.run_plan(
             Statement {
                 plan,
-                canonical,
-                fingerprint: fp,
-                build_wait: hinted_build_wait,
+                canonical: &cached.canonical,
+                fingerprint: cached.fingerprint,
+                build_wait: cached.vector_build_wait,
             },
-            source,
+            advice,
             params,
             session,
             txn_mode,
@@ -2726,8 +2810,8 @@ impl Database {
     /// statement goes through here, whatever produced its plan.
     fn run_plan(
         &self,
-        statement: Statement,
-        source: Option<&SourceContext>,
+        statement: Statement<'_>,
+        advice: Advice<'_>,
         params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
         session: &QuerySession,
         txn_mode: TxnMode,
@@ -2768,10 +2852,23 @@ impl Database {
         };
         let mut plan = self.plan_for_execution(plan, &stats);
 
+        // The call site a recorded statement is counted at; `None` when the
+        // run is not recorded at all. Off unless the database records every
+        // statement: EXPLAIN SUGGEST advises from its own plan.
+        let recorded = match advice {
+            Advice::Record(source) if self.auto_advisory.load(Ordering::Relaxed) => Some(source),
+            Advice::Record(_) | Advice::Skip => None,
+        };
         // Bind parameters: replace $name references with literal values,
-        // once their vectors are checked.
+        // once their vectors are checked. A recorded statement keeps the plan
+        // before binding for the advisor, the one it runs with whatever
+        // values it is given; only then is the bound plan a copy.
+        let mut advised = None;
         if let Some(ref p) = params {
             coordinode_query::executor::runner::check_parameters(p)?;
+            if recorded.is_some() {
+                advised = Some(plan.clone());
+            }
             plan.substitute_params(p);
         }
 
@@ -3102,22 +3199,26 @@ impl Database {
         };
         let had_mutations = write_stats.has_mutations();
 
-        // Record execution in advisor registry with plan + optional source
-        let plan_str = plan.explain();
-        self.query_registry
-            .record_with_plan(fp, &canonical, duration_us, plan_str, source);
-
-        // N+1 detection: check if this (fingerprint, source) exceeds threshold
-        if let Some(src) = source
-            && let Some(alert) = self.nplus1_detector.record(fp, &canonical, src)
-        {
-            tracing::warn!(
-                fingerprint = fp,
-                count = alert.call_count,
-                file = %alert.source_file,
-                line = alert.source_line,
-                "N+1 query pattern detected"
+        if let Some(source) = recorded {
+            self.query_registry.record_run(
+                fp,
+                canonical,
+                duration_us,
+                advised.as_ref().unwrap_or(&plan),
+                source,
             );
+            // N+1 detection: this (fingerprint, call site) past its threshold.
+            if let Some(src) = source
+                && let Some(alert) = self.nplus1_detector.record(fp, canonical, src)
+            {
+                tracing::warn!(
+                    fingerprint = fp,
+                    count = alert.call_count,
+                    file = %alert.source_file,
+                    line = alert.source_line,
+                    "N+1 query pattern detected"
+                );
+            }
         }
 
         // Invalidate cached storage statistics after any mutation so that
@@ -3208,11 +3309,12 @@ impl Database {
         query: &str,
         stats: Option<&coordinode_storage::engine::stats::StorageStatsComputer>,
     ) -> Result<planner::logical::LogicalPlan, DatabaseError> {
-        let parsed = CypherFrontend::new().parse(query)?;
-        let mut plan = parsed.plan;
+        // The statement's cached parse, the one its execution uses.
+        let cached = self.cached_plan(query)?;
+        let mut plan = cached.plan.clone();
         apply_session_vector_consistency(
             &mut plan,
-            parsed.vector_consistency_hinted,
+            cached.vector_consistency_hinted,
             self.vector_consistency,
         );
         let combined = stats.map(|g| CombinedStats {
@@ -4011,6 +4113,20 @@ impl Database {
     /// Get the query advisor registry for performance analysis.
     pub fn query_registry(&self) -> &QueryRegistry {
         &self.query_registry
+    }
+
+    /// Record every statement's run for the advisor (`true`, the default),
+    /// or none (`false`): then statements run without advisor work and only
+    /// an explicit EXPLAIN SUGGEST advises. Takes effect for statements
+    /// started after the call; statistics already recorded are kept.
+    pub fn set_auto_advisory(&self, enabled: bool) {
+        self.auto_advisory.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether every statement's run is recorded for the advisor.
+    #[must_use]
+    pub fn auto_advisory(&self) -> bool {
+        self.auto_advisory.load(Ordering::Relaxed)
     }
 
     /// Get the N+1 pattern detector.

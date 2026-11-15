@@ -1544,3 +1544,101 @@ fn statistics_counters_follow_writes_end_to_end() {
         assert_eq!(stats.node_count_for_label("Ghost"), None);
     }
 }
+
+/// The plan a statement last ran with follows the indexes: after CREATE
+/// INDEX the same statement is recorded with the index scan, after DROP
+/// INDEX with the label scan again. Parameter values are not in it.
+#[test]
+fn the_recorded_plan_follows_an_index_created_and_dropped() {
+    let mut db = Database::open_in_memory().expect("open");
+    db.execute_cypher("CREATE (:User {email: 'a@x'})").unwrap();
+    let query = "MATCH (n:User) WHERE n.email = $email RETURN n";
+    let run = |db: &mut Database| {
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "email".to_string(),
+            coordinode_core::graph::types::Value::String("a@x".into()),
+        );
+        db.execute_cypher_with_params(query, params).unwrap();
+        db.query_registry()
+            .top_by_count(10)
+            .into_iter()
+            // The MATCH, not the seeding CREATE that names the same property.
+            .find(|s| s.canonical_query.contains("email") && s.canonical_query.contains("RETURN"))
+            .and_then(|s| s.last_plan)
+            .expect("a recorded plan")
+    };
+    let scanned = run(&mut db);
+    assert!(scanned.contains("NodeScan"), "{scanned}");
+    assert!(
+        !scanned.contains("a@x"),
+        "a parameter value in the plan: {scanned}"
+    );
+
+    db.execute_cypher("CREATE INDEX user_email ON :User(email)")
+        .unwrap();
+    let indexed = run(&mut db);
+    assert!(indexed.contains("IndexScan"), "{indexed}");
+
+    db.execute_cypher("DROP INDEX user_email").unwrap();
+    let again = run(&mut db);
+    assert!(
+        again.contains("NodeScan") && !again.contains("IndexScan"),
+        "{again}"
+    );
+}
+
+/// With auto-advisory off a statement runs without advisor work: nothing
+/// is counted, no call site and no N+1 pattern is kept, and EXPLAIN SUGGEST
+/// still advises on the statement it is given. On again, statements are
+/// counted from there, beside what was kept.
+#[test]
+fn auto_advisory_off_records_nothing_and_explain_suggest_still_advises() {
+    let mut db = Database::open_in_memory().expect("open");
+    db.execute_cypher("CREATE (:User {email: 'a@x'})").unwrap();
+    let recorded = db.query_registry().total_queries_recorded();
+    assert!(db.auto_advisory(), "on by default");
+
+    db.set_auto_advisory(false);
+    let source = SourceContext {
+        file: "app.rs".into(),
+        line: 9,
+        function: "load".into(),
+        app: "app".into(),
+        version: "1".into(),
+    };
+    for _ in 0..20 {
+        db.execute_cypher_with_source("MATCH (n:User) WHERE n.email = 'a@x' RETURN n", &source)
+            .unwrap();
+    }
+    assert_eq!(
+        db.query_registry().total_queries_recorded(),
+        recorded,
+        "statements were recorded while auto-advisory was off"
+    );
+    assert!(
+        db.nplus1_detector().active_alerts().is_empty(),
+        "an N+1 pattern was kept while auto-advisory was off"
+    );
+    let advised = db
+        .explain_suggest("MATCH (n:User) WHERE n.email = 'a@x' RETURN n")
+        .expect("explain_suggest");
+    assert!(
+        advised
+            .suggestions
+            .iter()
+            .any(|s| s.kind == coordinode_query::advisor::SuggestionKind::CreateIndex),
+        "{:?}",
+        advised.suggestions
+    );
+    assert_eq!(
+        db.query_registry().total_queries_recorded(),
+        recorded,
+        "EXPLAIN SUGGEST counted as an execution"
+    );
+
+    db.set_auto_advisory(true);
+    db.execute_cypher_with_source("MATCH (n:User) WHERE n.email = 'a@x' RETURN n", &source)
+        .unwrap();
+    assert_eq!(db.query_registry().total_queries_recorded(), recorded + 1);
+}

@@ -4,9 +4,8 @@
 //! A statement names some of its consistency settings and leaves the rest to
 //! its session, then to the server's defaults. Resolving them, checking them,
 //! fencing the read, waiting for a causal position, passing a statement this
-//! node cannot serve to the leader, executing it and recording it for the
-//! advisor all happen here, so a client gets the same answer over either
-//! transport.
+//! node cannot serve to the leader and executing it all happen here, so a
+//! client gets the same answer over either transport.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,28 +24,24 @@ use coordinode_embed::replication::routing::{
     CheckedRoutingLimits, CommandRouter, CommandSlots, RoutedAnswer, RoutedRows, RoutedStatement,
 };
 use coordinode_embed::{Database, DatabaseError};
-use coordinode_query::advisor::QueryRegistry;
-use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::source::SourceContext;
-use coordinode_query::frontend::QueryFrontend;
 use coordinode_raft::cluster::RaftNode;
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
 
 use crate::config::StatementDefaults;
 
-/// Resolves, checks, fences, runs and records Cypher statements.
+/// Resolves, checks, fences and runs Cypher statements. The database that
+/// runs a statement records it for the advisor, at the client's call site.
 ///
 /// Cheap to clone: every part is shared, so the unary service and the session
-/// hold the same database, consensus node, defaults and advisor. A statement
+/// hold the same database, consensus node and defaults. A statement
 /// passed to the leader goes over the consensus node's peer connections. The
 /// checks and the fence are the library's, the ones an embedded member runs.
 #[derive(Clone)]
 pub struct StatementExecutor {
     writer: Arc<ReplicatedWriter>,
     admitter: Admitter,
-    query_registry: Arc<QueryRegistry>,
-    nplus1_detector: Arc<NPlus1Detector>,
     /// Statements running at least this long are logged; `None` logs none.
     slow_query: Option<Duration>,
     /// The member's slots every command runs in, whichever way it arrives.
@@ -54,14 +49,11 @@ pub struct StatementExecutor {
 }
 
 impl StatementExecutor {
-    /// An executor over `database`, standalone, with the built-in defaults and
-    /// an advisor of its own.
+    /// An executor over `database`, standalone, with the built-in defaults.
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
         Self {
             admitter: Admitter::new(Arc::clone(&database)),
             writer: Arc::new(ReplicatedWriter::new(database)),
-            query_registry: Arc::new(QueryRegistry::new()),
-            nplus1_detector: Arc::new(NPlus1Detector::new()),
             slow_query: Some(DEFAULT_SLOW_QUERY),
             slots: CheckedRoutingLimits::default().command_slots(),
         }
@@ -97,17 +89,6 @@ impl StatementExecutor {
             read_concern: defaults.read_concern,
             read_preference: defaults.read_preference,
         });
-        self
-    }
-
-    /// Record statements into this advisor.
-    pub fn with_advisor(
-        mut self,
-        query_registry: Arc<QueryRegistry>,
-        nplus1_detector: Arc<NPlus1Detector>,
-    ) -> Self {
-        self.query_registry = query_registry;
-        self.nplus1_detector = nplus1_detector;
         self
     }
 
@@ -211,33 +192,6 @@ impl StatementExecutor {
             result.as_ref().ok().map(|r| r.rows.len()),
         );
         result
-    }
-
-    /// Record a finished statement for the advisor: its fingerprint, timing,
-    /// and with a source location, the N+1 pattern it may be part of.
-    pub(crate) fn record(&self, query: &str, source: Option<&SourceContext>, start: Instant) {
-        let Ok((canonical, fp)) =
-            coordinode_query::frontend::CypherFrontend::new().fingerprint(query)
-        else {
-            return;
-        };
-        let duration_us = start.elapsed().as_micros() as u64;
-        match source {
-            Some(src) => {
-                self.query_registry
-                    .record_with_source(fp, &canonical, duration_us, src);
-                if let Some(alert) = self.nplus1_detector.record(fp, &canonical, src) {
-                    tracing::warn!(
-                        fingerprint = fp,
-                        count = alert.call_count,
-                        file = %alert.source_file,
-                        line = alert.source_line,
-                        "N+1 query pattern detected"
-                    );
-                }
-            }
-            None => self.query_registry.record(fp, &canonical, duration_us),
-        }
     }
 
     /// Run `statement` at `member` and return its answer.

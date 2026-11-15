@@ -11,8 +11,6 @@ use coordinode_core::graph::types::{PathRel, PathValue, Value, VectorConsistency
 use coordinode_core::txn::read_concern::ReadConcernLevel as ExecutorReadConcernLevel;
 use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 use coordinode_embed::{Database, DatabaseError};
-use coordinode_query::advisor::QueryRegistry;
-use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::ReadPreference;
@@ -1071,14 +1069,8 @@ pub struct CypherServiceImpl {
 }
 
 impl CypherServiceImpl {
-    pub fn new(
-        database: Arc<RwLock<Database>>,
-        query_registry: Arc<QueryRegistry>,
-        nplus1_detector: Arc<NPlus1Detector>,
-    ) -> Self {
-        Self::from_executor(
-            StatementExecutor::new(database).with_advisor(query_registry, nplus1_detector),
-        )
+    pub fn new(database: Arc<RwLock<Database>>) -> Self {
+        Self::from_executor(StatementExecutor::new(database))
     }
 
     /// Serve statements through `executor`, the one the session shares.
@@ -1348,7 +1340,6 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         );
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        self.executor.record(&req.query, source_ctx.as_ref(), start);
 
         // Convert executor rows → proto rows.
         // Determine columns from the first row (all rows share the same keys).

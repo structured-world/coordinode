@@ -1,7 +1,7 @@
 //! Query fingerprint registry: tracks query execution statistics.
 //!
-//! Thread-safe, lock-free on the hot path (recording stats for known fingerprints).
-//! Uses LFU eviction when capacity is reached (CE: 1,000 entries).
+//! Thread-safe; a record takes the registry's mutex briefly. Uses LFU
+//! eviction when capacity is reached (CE: 1,000 entries).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::source::{SourceContext, SourceLocationSnapshot, SourceTracker};
 use super::stats::LatencyHistogram;
+use crate::planner::logical::LogicalPlan;
 
 /// Default capacity for CE tier: 1,000 unique query fingerprints.
 const DEFAULT_CAPACITY: usize = 1_000;
@@ -27,7 +28,7 @@ pub struct QueryStats {
     pub p50_time_us: u64,
     pub p99_time_us: u64,
     pub last_seen: i64,
-    /// Last execution plan (EXPLAIN output). Updated on each execution.
+    /// EXPLAIN text of the plan the statement last ran with.
     pub last_plan: Option<String>,
     /// Top call sites by frequency (when debug source tracking is enabled).
     pub sources: Vec<SourceLocationSnapshot>,
@@ -40,9 +41,9 @@ struct RegistryEntry {
     canonical_query: String,
     histogram: LatencyHistogram,
     last_seen: AtomicI64,
-    /// Last execution plan (EXPLAIN output). Updated on each execution
-    /// when a plan string is provided.
-    last_plan: Option<String>,
+    /// The plan the statement last ran with, and its EXPLAIN text, rendered
+    /// only when the plan changed.
+    last_plan: Option<(LogicalPlan, String)>,
     /// Top-5 call sites by frequency. Updated under the registry mutex.
     source_tracker: SourceTracker,
 }
@@ -59,6 +60,19 @@ impl RegistryEntry {
         }
     }
 
+    /// Keep `plan` as the one the statement runs with, rendering its text
+    /// only when it differs from the plan kept.
+    fn note_plan(&mut self, plan: &LogicalPlan) {
+        if self
+            .last_plan
+            .as_ref()
+            .is_some_and(|(kept, _)| kept == plan)
+        {
+            return;
+        }
+        self.last_plan = Some((plan.clone(), plan.explain()));
+    }
+
     /// Record a query execution. Lock-free (latency tracking only).
     fn record(&self, duration_us: u64) {
         self.histogram.record(duration_us);
@@ -70,26 +84,6 @@ impl RegistryEntry {
     fn record_with_source(&mut self, duration_us: u64, source: &SourceContext) {
         self.histogram.record(duration_us);
         self.last_seen.store(now_micros(), Ordering::Relaxed);
-        self.source_tracker.record(source);
-    }
-
-    /// Record with plan string. Requires mutable access (called under mutex).
-    fn record_with_plan(&mut self, duration_us: u64, plan: String) {
-        self.histogram.record(duration_us);
-        self.last_seen.store(now_micros(), Ordering::Relaxed);
-        self.last_plan = Some(plan);
-    }
-
-    /// Record with both source and plan. Requires mutable access.
-    fn record_with_source_and_plan(
-        &mut self,
-        duration_us: u64,
-        source: &SourceContext,
-        plan: String,
-    ) {
-        self.histogram.record(duration_us);
-        self.last_seen.store(now_micros(), Ordering::Relaxed);
-        self.last_plan = Some(plan);
         self.source_tracker.record(source);
     }
 
@@ -105,7 +99,7 @@ impl RegistryEntry {
             p50_time_us: self.histogram.percentile(0.50),
             p99_time_us: self.histogram.percentile(0.99),
             last_seen: self.last_seen.load(Ordering::Relaxed),
-            last_plan: self.last_plan.clone(),
+            last_plan: self.last_plan.as_ref().map(|(_, text)| text.clone()),
             sources: self.source_tracker.snapshot(),
         }
     }
@@ -152,12 +146,8 @@ impl QueryRegistry {
 
     /// Record a query execution with its fingerprint and duration.
     ///
-    /// If the fingerprint is already known, updates its stats (lock-free fast path
-    /// when no source context or plan is provided).
-    /// If new, registers it (may evict LFU entry if at capacity).
-    ///
-    /// `canonical_query` is only used on first registration; subsequent calls
-    /// with the same fingerprint ignore it.
+    /// If new, the fingerprint is registered (evicting the least-used entry
+    /// at capacity). `canonical_query` is only used on first registration.
     pub fn record(&self, fingerprint: u64, canonical_query: &str, duration_us: u64) {
         self.record_inner(fingerprint, canonical_query, duration_us, None, None);
     }
@@ -165,7 +155,6 @@ impl QueryRegistry {
     /// Record a query execution with source location context.
     ///
     /// Same as `record()` but also tracks the source call site.
-    /// Source tracking requires mutable access, so this always takes the mutex.
     pub fn record_with_source(
         &self,
         fingerprint: u64,
@@ -182,16 +171,17 @@ impl QueryRegistry {
         );
     }
 
-    /// Record a query execution with plan and optional source context.
-    ///
-    /// Stores the EXPLAIN plan string in the registry entry so it can be
-    /// returned by `db.advisor.queryStats()` and `db.advisor.slowQueries()`.
-    pub fn record_with_plan(
+    /// Record a statement's run with the plan it ran with, for
+    /// `db.advisor.queryStats()` and `db.advisor.slowQueries()`, and its call
+    /// site when the client named one. The plan's EXPLAIN text is rendered
+    /// only when it differs from the plan kept, so a statement run again with
+    /// the same plan pays one comparison.
+    pub fn record_run(
         &self,
         fingerprint: u64,
         canonical_query: &str,
         duration_us: u64,
-        plan: String,
+        plan: &LogicalPlan,
         source: Option<&SourceContext>,
     ) {
         self.record_inner(
@@ -209,58 +199,34 @@ impl QueryRegistry {
         canonical_query: &str,
         duration_us: u64,
         source: Option<&SourceContext>,
-        plan: Option<String>,
+        plan: Option<&LogicalPlan>,
     ) {
         self.queries_recorded.fetch_add(1, Ordering::Relaxed);
-
-        if source.is_none() && plan.is_none() {
-            // Fast path: no source tracking or plan, try lock-free read
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = inner.entries.get(&fingerprint) {
-                entry.record(duration_us);
-                return;
-            }
-            drop(inner);
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = Self::entry(&mut inner, fingerprint, canonical_query);
+        if let Some(plan) = plan {
+            entry.note_plan(plan);
         }
-
-        // Slow path: need mutable access (new entry, source tracking, or plan update)
-        self.record_slow(fingerprint, canonical_query, duration_us, source, plan);
+        match source {
+            Some(src) => entry.record_with_source(duration_us, src),
+            None => entry.record(duration_us),
+        }
     }
 
-    /// Slow path: registers new fingerprint or updates with source/plan.
-    fn record_slow(
-        &self,
+    /// The entry of `fingerprint`, registered first when new, evicting the
+    /// least-used one at capacity.
+    fn entry<'i>(
+        inner: &'i mut RegistryInner,
         fingerprint: u64,
         canonical_query: &str,
-        duration_us: u64,
-        source: Option<&SourceContext>,
-        plan: Option<String>,
-    ) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-
-        if let Some(entry) = inner.entries.get_mut(&fingerprint) {
-            match (source, plan) {
-                (Some(src), Some(p)) => entry.record_with_source_and_plan(duration_us, src, p),
-                (Some(src), None) => entry.record_with_source(duration_us, src),
-                (None, Some(p)) => entry.record_with_plan(duration_us, p),
-                (None, None) => entry.record(duration_us),
-            }
-            return;
-        }
-
-        // Evict LFU if at capacity
-        if inner.entries.len() >= inner.capacity {
+    ) -> &'i mut RegistryEntry {
+        if !inner.entries.contains_key(&fingerprint) && inner.entries.len() >= inner.capacity {
             Self::evict_lfu(&mut inner.entries);
         }
-
-        let mut entry = RegistryEntry::new(fingerprint, canonical_query.to_string());
-        match (source, plan) {
-            (Some(src), Some(p)) => entry.record_with_source_and_plan(duration_us, src, p),
-            (Some(src), None) => entry.record_with_source(duration_us, src),
-            (None, Some(p)) => entry.record_with_plan(duration_us, p),
-            (None, None) => entry.record(duration_us),
-        }
-        inner.entries.insert(fingerprint, entry);
+        inner
+            .entries
+            .entry(fingerprint)
+            .or_insert_with(|| RegistryEntry::new(fingerprint, canonical_query.to_string()))
     }
 
     /// Evict the least-frequently-used entry.

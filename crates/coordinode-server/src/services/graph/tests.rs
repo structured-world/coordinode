@@ -371,8 +371,6 @@ async fn create_edge_returns_nonzero_id() {
 async fn create_node_visible_via_cypher_service() {
     use crate::proto::query;
     use crate::services::cypher::CypherServiceImpl;
-    use coordinode_query::advisor::QueryRegistry;
-    use coordinode_query::advisor::nplus1::NPlus1Detector;
     use query::cypher_service_server::CypherService as _;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -382,11 +380,7 @@ async fn create_node_visible_via_cypher_service() {
 
     // Both services share the same Arc — exactly as main.rs wires them.
     let graph_svc = GraphServiceImpl::new(Arc::clone(&database));
-    let cypher_svc = CypherServiceImpl::new(
-        Arc::clone(&database),
-        Arc::new(QueryRegistry::new()),
-        Arc::new(NPlus1Detector::new()),
-    );
+    let cypher_svc = CypherServiceImpl::new(Arc::clone(&database));
 
     // Create node via GraphService RPC.
     let created = graph_svc

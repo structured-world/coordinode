@@ -353,14 +353,8 @@ async fn session_core_surfaces_a_query_error() {
 /// written with `/`. Before, the session recorded nothing for the advisor.
 #[test]
 fn a_session_statement_is_counted_where_it_was_issued() {
-    use coordinode_query::advisor::QueryRegistry;
-    use coordinode_query::advisor::nplus1::NPlus1Detector;
-
-    let registry = Arc::new(QueryRegistry::new());
-    let engine = DatabaseCursorEngine::from_executor(
-        StatementExecutor::new(seeded_db(1))
-            .with_advisor(Arc::clone(&registry), Arc::new(NPlus1Detector::new())),
-    );
+    let database = seeded_db(1);
+    let engine = DatabaseCursorEngine::new(Arc::clone(&database));
     let source = StatementSource {
         file: "src\\pay.rs".to_string(),
         line: 12,
@@ -383,19 +377,118 @@ fn a_session_statement_is_counted_where_it_was_issued() {
         drain(cursor.as_mut(), 8);
     }
 
-    let top = registry.top_by_count(10);
+    // The seeding statements are recorded too, without a call site.
+    let top: Vec<_> = database
+        .read()
+        .query_registry()
+        .top_by_count(10)
+        .into_iter()
+        .filter(|e| !e.sources.is_empty())
+        .collect();
     assert_eq!(
         top.len(),
         2,
         "the keyset and the materialized path both count"
     );
     for entry in &top {
+        assert_eq!(
+            entry.count, 1,
+            "{}: one run, recorded once",
+            entry.canonical_query
+        );
         let src = &entry.sources[0];
         assert_eq!(src.file, "src/pay.rs");
         assert_eq!(src.line, 12);
         assert_eq!(src.function, "charge");
         assert_eq!(src.app, "billing");
     }
+}
+
+/// A cursor read over several pages is one execution for the advisor: it is
+/// recorded once, when read to its end, at the client's call site, with the
+/// engine time of all its pages and not the client's pauses between them. A
+/// cursor dropped before its end is not recorded, nor any cursor opened
+/// while the database records nothing.
+#[test]
+fn a_cursor_over_pages_is_recorded_once_when_read_to_its_end() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("UNWIND range(0, 2999) AS k CREATE (:Page {k: k})")
+        .expect("seed");
+    let database = Arc::new(RwLock::new(db));
+    let engine = DatabaseCursorEngine::new(Arc::clone(&database));
+    let source = StatementSource {
+        file: "src/report.rs".to_string(),
+        line: 7,
+        function: "export".to_string(),
+        app: "reports".to_string(),
+        version: "1".to_string(),
+    };
+    let open = |query: &str| {
+        engine
+            .open_cursor(
+                query,
+                HashMap::new(),
+                None,
+                &unset(),
+                Some(&source),
+                None,
+                &CancelFlag::new(),
+            )
+            .expect("open")
+    };
+    let recorded = |canonical_has: &str| {
+        database
+            .read()
+            .query_registry()
+            .top_by_count(10)
+            .into_iter()
+            .find(|e| e.canonical_query.contains(canonical_has))
+    };
+
+    // Dropped after its first batch: not an execution.
+    let mut cursor = open("MATCH (n:Page) WHERE n.k >= 0 RETURN n.k");
+    assert!(!cursor.next_batch(10).expect("batch").is_empty());
+    drop(cursor);
+    assert!(
+        recorded(">=").is_none(),
+        "a cursor abandoned before its end was recorded"
+    );
+
+    // Three pages, with a pause between batches the client takes.
+    let mut cursor = open("MATCH (n:Page) RETURN n.k");
+    let mut rows = 0;
+    let started = std::time::Instant::now();
+    loop {
+        let batch = cursor.next_batch(1000).expect("batch");
+        if batch.is_empty() {
+            break;
+        }
+        rows += batch.len();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(rows, 3000);
+    let entry = recorded("RETURN n.k").expect("the cursor was recorded");
+    assert_eq!(entry.count, 1, "three pages are one execution");
+    assert_eq!(entry.sources.len(), 1);
+    assert_eq!(entry.sources[0].file, "src/report.rs");
+    assert!(entry.max_time_us > 0, "the pages' engine time");
+    assert!(
+        u128::from(entry.max_time_us) < elapsed.as_micros() - 50_000,
+        "the client's pauses were counted: {} us of {} us",
+        entry.max_time_us,
+        elapsed.as_micros()
+    );
+
+    // Off: a cursor read to its end is not recorded either.
+    database.read().set_auto_advisory(false);
+    drain(open("MATCH (n:Page) RETURN n.k").as_mut(), 1000);
+    let entry = recorded("RETURN n.k").expect("kept");
+    assert_eq!(
+        entry.count, 1,
+        "recorded while the database records nothing"
+    );
 }
 
 /// A Cypher SET on a session changes that session's settings: the session

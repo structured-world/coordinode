@@ -13,6 +13,7 @@ use coordinode_core::budget::CancelFlag;
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::command::{ActingContext, AdmissionSignal};
 use coordinode_core::txn::transaction::CommitReceipt;
+use coordinode_query::advisor::source::SourceContext;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::WriteStats;
 use coordinode_raft::read_fence::ReadPreference;
@@ -108,7 +109,9 @@ const ANSWER_PAGE: usize = 1024;
 /// [`Database::keyset_pageable`] accepts, page by page into `answer`: every
 /// page reads the snapshot the first one pinned, and the database is locked
 /// only while a page is read, never while a page waits for the ingress, so a
-/// result of any size takes one page of memory here.
+/// result of any size takes one page of memory here. A read answered to its
+/// end is recorded for the advisor once, at `source`; one the client stopped
+/// taking is not.
 ///
 /// # Errors
 ///
@@ -118,6 +121,7 @@ pub fn write_paged(
     database: &RwLock<Database>,
     query: &str,
     params: Option<HashMap<String, Value>>,
+    source: Option<&SourceContext>,
     admitted: &Admitted,
     answer: &mut AnswerWriter,
 ) -> Result<RoutedStats, DatabaseError> {
@@ -127,6 +131,10 @@ pub fn write_paged(
     let mut resume = None;
     let mut columns: Option<Vec<String>> = None;
     let mut values = Vec::new();
+    // Recorded for the advisor once, at its end, if the database recorded
+    // statements when the read began; `busy` is the pages' engine time.
+    let advised = database.read().auto_advisory();
+    let mut busy = std::time::Duration::ZERO;
     loop {
         if admitted
             .cancel
@@ -142,6 +150,7 @@ pub fn write_paged(
             return Err(DatabaseError::Budget(BudgetStop::Deadline));
         }
         // The paging call takes the parameters by value for every page.
+        let started = std::time::Instant::now();
         let page = database.read().execute_cypher_paged(
             query,
             params.clone(),
@@ -149,6 +158,7 @@ pub fn write_paged(
             resume.take(),
             ANSWER_PAGE,
         )?;
+        busy += started.elapsed();
         read_ts = Some(page.read_ts);
         if columns.is_none()
             && let Some(first) = page.rows.first()
@@ -173,6 +183,9 @@ pub fn write_paged(
             }
         }
         if page.exhausted {
+            if advised && let Err(e) = database.read().record_cursor(query, busy, source) {
+                tracing::debug!(error = %e, "a paged read was not recorded for the advisor");
+            }
             return Ok(stats(&page.write_stats, admitted));
         }
         resume = page.last_key;
@@ -434,7 +447,7 @@ pub fn write_admitted(
 ) -> Result<RoutedStats, DatabaseError> {
     let params = (!params.is_empty()).then_some(params);
     if database.read().keyset_pageable(query) {
-        return write_paged(database, query, params, admitted, answer);
+        return write_paged(database, query, params, source, admitted, answer);
     }
     let result =
         database

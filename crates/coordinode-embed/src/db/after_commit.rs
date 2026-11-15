@@ -395,8 +395,15 @@ impl Database {
         } else {
             Some(params)
         };
-        self.execute_cypher_impl(body, None, params, &session, TxnMode::AutoCommit, &mut None)
-            .map(|_| ())
+        self.execute_cypher_impl(
+            body,
+            super::Advice::Record(None),
+            params,
+            &session,
+            TxnMode::AutoCommit,
+            &mut None,
+        )
+        .map(|_| ())
     }
 
     // ── Queue bookkeeping (raw schema-partition mutations through the pipeline) ──
