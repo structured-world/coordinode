@@ -2987,15 +2987,22 @@ impl StorageEngine {
         claim_checkpoint_dir(target)?;
         let taken = self.take_checkpoint(target);
         if taken.is_err() {
-            // Unsealed, the directory is no checkpoint: its links would keep
-            // tables a compaction replaced and its journal copy its bytes.
-            // The checkpoint's error stays the outcome.
-            if let Err(e) = std::fs::remove_dir_all(target) {
-                tracing::warn!(?target, error = %e, "removing a failed checkpoint");
-            }
-            self.footprints.removed_tree(target);
+            self.discard_checkpoint(target);
         }
         taken
+    }
+
+    /// Remove the unsealed checkpoint in `target`: it is no checkpoint, and
+    /// its links would keep tables a compaction replaced and its journal copy
+    /// its bytes. What the removal leaves on disk stays charged.
+    fn discard_checkpoint(&self, target: &Path) {
+        match std::fs::remove_dir_all(target) {
+            Ok(()) => self.footprints.removed_tree(target),
+            Err(e) => {
+                tracing::warn!(?target, error = %e, "removing a failed checkpoint");
+                self.footprints.removed_partly(target);
+            }
+        }
     }
 
     /// The steps of [`Self::create_checkpoint`] after `target` is claimed.
@@ -3046,6 +3053,23 @@ impl StorageEngine {
         Ok(summary)
     }
 
+    /// The error a checkpoint step `e` ends the checkpoint with: a refusal
+    /// for room stays the typed refusal of the endpoint without room, which a
+    /// caller may retry once room comes back; anything else names the step.
+    fn checkpoint_failure(&self, e: StorageError, step: impl FnOnce() -> String) -> StorageError {
+        if !e.is_out_of_room() {
+            return StorageError::Io(format!("{}: {e}", step()));
+        }
+        if matches!(e, StorageError::CapacityExhausted { .. }) {
+            return e;
+        }
+        // The growth refused was on the endpoint with the least room left.
+        self.footprints
+            .iter()
+            .min_by_key(|footprint| footprint.room())
+            .map_or(e, |footprint| footprint.refusal())
+    }
+
     /// Flush and hard-link every partition tree and columnar table into
     /// `target`.
     fn checkpoint_trees(
@@ -3064,12 +3088,14 @@ impl StorageEngine {
             // deterministically (previously it depended on whether a
             // background flush happened to have run before the checkpoint).
             self.flush_memtables_in_order(tree).map_err(|e| {
-                StorageError::Io(format!("flush before checkpoint {}: {e}", part.name()))
+                self.checkpoint_failure(e, || format!("flush before checkpoint {}", part.name()))
             })?;
             let info = tree
                 .create_checkpoint(&target.join(part.name()))
                 .map_err(|e| {
-                    StorageError::Io(format!("checkpoint partition {}: {e}", part.name()))
+                    self.checkpoint_failure(e.into(), || {
+                        format!("checkpoint partition {}", part.name())
+                    })
                 })?;
             summary.partitions += 1;
             summary.total_bytes += info.total_bytes;
@@ -3091,7 +3117,9 @@ impl StorageEngine {
                     self.flush_memtables_in_order(tree)?;
                     tree.create_checkpoint(&tables.join(&table_id))
                         .map_err(|e| {
-                            StorageError::Io(format!("checkpoint columnar table {table_id}: {e}"))
+                            self.checkpoint_failure(e.into(), || {
+                                format!("checkpoint columnar table {table_id}")
+                            })
                         })
                 });
                 let Some(info) = captured.transpose()? else {

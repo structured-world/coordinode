@@ -600,6 +600,28 @@ impl Footprint {
         drop(gone);
     }
 
+    /// A removal of the directory `dir` stopped partway: give back the files
+    /// under it that are gone, and keep charging those still on disk.
+    pub fn removed_partly(&self, dir: &Path) {
+        let gone: Vec<Arc<FileCharge>> = {
+            let mut files = self.files.lock();
+            let names: Vec<PathBuf> = files
+                .keys()
+                .filter(|name| {
+                    name.starts_with(dir)
+                        && std::fs::symlink_metadata(name)
+                            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+                })
+                .cloned()
+                .collect();
+            names
+                .into_iter()
+                .filter_map(|name| files.remove(&name))
+                .collect()
+        };
+        drop(gone);
+    }
+
     /// The file `from` is now named `to`, replacing whatever `to` named.
     pub fn renamed(&self, from: &Path, to: &Path) {
         let replaced = {
@@ -1299,6 +1321,15 @@ impl Footprints {
         for footprint in self.endpoints.iter() {
             if footprint.root.starts_with(dir) || dir.starts_with(&footprint.root) {
                 footprint.removed_tree(dir);
+            }
+        }
+    }
+
+    /// See [`Footprint::removed_partly`].
+    pub fn removed_partly(&self, dir: &Path) {
+        for footprint in self.endpoints.iter() {
+            if footprint.root.starts_with(dir) || dir.starts_with(&footprint.root) {
+                footprint.removed_partly(dir);
             }
         }
     }

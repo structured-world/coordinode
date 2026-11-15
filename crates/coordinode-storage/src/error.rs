@@ -345,6 +345,20 @@ impl From<lsm_tree::Error> for StorageError {
 }
 
 impl StorageError {
+    /// Whether this is a refusal for room under a hard limit: either the
+    /// typed refusal or a file's growth refused inside the engine. A retry
+    /// once room comes back can succeed; nothing else in the error changed.
+    #[must_use]
+    pub fn is_out_of_room(&self) -> bool {
+        match self {
+            Self::CapacityExhausted { .. } => true,
+            Self::Engine(lsm_tree::Error::Io(e)) => {
+                e.kind() == lsm_tree::io::ErrorKind::StorageFull
+            }
+            _ => false,
+        }
+    }
+
     /// Whether this is damage to bytes a tree stored (a block that fails its
     /// checksum or does not decode), as opposed to the environment, the
     /// configuration or a missing capability: the reading tree needs a

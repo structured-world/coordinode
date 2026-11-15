@@ -2346,8 +2346,8 @@ fn a_checkpoint_refused_for_room_leaves_nothing_behind() {
     let target = dir.path().join("checkpoints").join("ckpt");
     let refused = engine.create_checkpoint(&target);
     assert!(
-        refused.is_err(),
-        "the checkpoint found no room: {refused:?}"
+        matches!(refused, Err(StorageError::CapacityExhausted { .. })),
+        "the checkpoint is refused for room, typed: {refused:?}"
     );
     assert!(!target.exists(), "the refused checkpoint left {target:?}");
     assert!(
@@ -2362,6 +2362,60 @@ fn a_checkpoint_refused_for_room_leaves_nothing_behind() {
     engine
         .create_checkpoint(&target)
         .expect("checkpoint with room");
+}
+
+/// A failed checkpoint whose removal stops partway gives back only what is
+/// gone: a file still on disk stays charged, so the next write cannot take
+/// its room; once the removal finishes, its charge comes back too.
+#[cfg(unix)]
+#[test]
+fn a_checkpoint_removed_partway_keeps_charging_what_is_left() {
+    use std::os::unix::fs::PermissionsExt;
+    const LIMIT: u64 = 64 << 20;
+    const FILE: u64 = 64 << 10;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (engine, _oracle) = clocked_capped(dir.path(), LIMIT, None);
+    let footprints = engine.footprints().clone();
+    let footprint = Arc::clone(footprints.get("default").expect("a limit"));
+
+    let target = dir.path().join("checkpoints").join("ckpt");
+    let locked = target.join("locked");
+    std::fs::create_dir_all(&locked).expect("dirs");
+    let charge = |path: &std::path::Path| {
+        std::fs::write(path, vec![1u8; usize::try_from(FILE).expect("small")]).expect("write");
+        let file = footprints.file(path).expect("a charge");
+        file.grow_to(FILE).expect("room");
+        file
+    };
+    let loose = charge(&target.join("loose"));
+    let kept = charge(&locked.join("kept"));
+    drop((loose, kept));
+    let before = footprint.charged();
+
+    // The file under `locked` cannot be unlinked: the removal stops there.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
+    engine.discard_checkpoint(&target);
+    assert!(locked.join("kept").exists(), "the removal stopped partway");
+    // Whether the loose file went first depends on the walk's order.
+    let gone = if target.join("loose").exists() {
+        0
+    } else {
+        FILE
+    };
+    assert_eq!(
+        footprint.charged(),
+        before - gone,
+        "only a file that is gone was given back"
+    );
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+    engine.discard_checkpoint(&target);
+    assert!(!target.exists(), "the removal finished");
+    assert_eq!(
+        footprint.charged(),
+        before - 2 * FILE,
+        "and gave everything back"
+    );
 }
 
 /// Take everything the endpoint may still hold with a file at `scratch`.

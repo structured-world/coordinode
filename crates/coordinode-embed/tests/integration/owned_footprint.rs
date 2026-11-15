@@ -398,7 +398,10 @@ fn a_checkpoint_under_the_cap_is_charged_and_keeps_its_history() {
     // checkpoint leaves nothing behind and is taken again.
     let settle = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut taken = db.checkpoint(1);
-    while taken.is_err() && std::time::Instant::now() < settle {
+    // Only a refusal for room is retried: any other error stays the outcome.
+    while matches!(taken, Err(DatabaseError::CapacityExhausted { .. }))
+        && std::time::Instant::now() < settle
+    {
         std::thread::sleep(std::time::Duration::from_millis(50));
         taken = db.checkpoint(1);
     }
