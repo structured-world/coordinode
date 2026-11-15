@@ -149,6 +149,8 @@ pub fn verify_and_repair(
     engine: &StorageEngine,
     checkpoint_root: &Path,
 ) -> StorageResult<RepairReport> {
+    #[cfg(test)]
+    FULL_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The open verified the Schema tree before it read it; a version it has
     // not changed since is not verified again.
     let verified = |part: Partition| engine.verified_at_open(part);
@@ -156,6 +158,11 @@ pub fn verify_and_repair(
     let found: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
     repair(engine, checkpoint_root, found, CheckedScope::Store)
 }
+
+/// Test builds only: how many full checks ([`verify_and_repair`]) this
+/// process ran, so a test can tell whether an open ran one.
+#[cfg(test)]
+pub(crate) static FULL_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Rebuild what the store already knows it owes, without reading the store
 /// to find more: a rebuild a crash cut short (partition or table), and what

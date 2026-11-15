@@ -576,10 +576,16 @@ fn a_healthy_open_with_a_checkpoint_reads_nothing_in_full() {
         db.checkpoint(3).expect("checkpoint");
         db.persist().expect("persist");
     }
+    let full_checks = FULL_CHECKS.load(std::sync::atomic::Ordering::Relaxed);
     let db = Database::open(dir.path()).expect("reopen");
     assert!(
         !db.engine().verified_at_open(Partition::Schema),
         "the open verified the Schema tree in full"
+    );
+    assert_eq!(
+        FULL_CHECKS.load(std::sync::atomic::Ordering::Relaxed),
+        full_checks,
+        "the open scrubbed the store in full"
     );
     let report = repair_owed_on_open(db.engine(), &checkpoint_root(dir.path())).expect("repair");
     assert!(report.is_clean());
