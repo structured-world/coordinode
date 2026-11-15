@@ -39,6 +39,7 @@ pub mod tap;
 #[cfg(test)]
 pub(crate) mod test_labels;
 pub mod transaction;
+pub mod tree_set;
 pub mod vector_keys;
 
 pub use compaction::CompactionStrategyKind;

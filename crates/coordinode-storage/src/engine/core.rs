@@ -79,6 +79,14 @@ impl lsm_tree::SequenceNumberGenerator for OracleSeqnoGenerator {
 #[cfg(test)]
 pub(crate) type TreePinnedHook = Box<dyn FnMut(Partition) + Send>;
 
+/// How long a rebuild from a checkpoint waits, in milliseconds, for the
+/// operations holding the set of trees to finish before it is refused and
+/// tried again later.
+const REBUILD_TREE_SET_WAIT_MS: u64 = 30_000;
+/// [`REBUILD_TREE_SET_WAIT_MS`] as a duration.
+const REBUILD_TREE_SET_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(REBUILD_TREE_SET_WAIT_MS);
+
 /// The CoordiNode storage engine.
 ///
 /// Owns 8 `lsm_tree::AnyTree` instances (one per [`Partition`]), a shared
@@ -345,6 +353,12 @@ pub struct StorageEngine {
     text_index_retry: std::time::Duration,
     /// The transactions open here (see [`Self::await_transactions_through`]).
     open_transactions: Arc<crate::engine::open_txns::OpenTransactions>,
+    /// Held by operations that change the trees outside one commit, alone by
+    /// a capture or a repair (see [`crate::engine::tree_set`]).
+    tree_set: Arc<crate::engine::tree_set::TreeSetGate>,
+    /// The catalog's list of tables, set by the layer that owns the catalog;
+    /// `None` until it is, and then no capture checks its trees against it.
+    catalog: parking_lot::Mutex<Option<Arc<dyn crate::engine::tree_set::CatalogInventory>>>,
     /// Refuses new writes while the disk under a durable endpoint is below
     /// its free-space reserve; shared with the consensus layer, which checks
     /// it before anything reaches its log.
@@ -369,10 +383,17 @@ pub struct StorageEngine {
     /// before the next tree is pinned.
     #[cfg(test)]
     pub(crate) on_tree_pinned: parking_lot::Mutex<Option<TreePinnedHook>>,
-    /// Test hook: run once a checkpoint has listed the tables it captures,
-    /// before it draws its cut.
-    #[cfg(test)]
-    pub(crate) on_tables_listed: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test hook: run once a table's rebuild from a checkpoint has cleared
+    /// the live tree, before its history goes back in.
+    #[cfg(any(test, feature = "test-faults"))]
+    on_rebuild_cleared: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test hook: run once a drop within an operation has removed a table's
+    /// tree, before the operation goes on to its catalog change.
+    #[cfg(any(test, feature = "test-faults"))]
+    on_table_dropped: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test hook: run once a `STORAGE COLUMNAR` row has landed in its tree.
+    #[cfg(any(test, feature = "test-faults"))]
+    on_columnar_row: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// Test hook: run with an entry's index once it is journalled, before
     /// it is applied.
     #[cfg(test)]
@@ -1815,6 +1836,8 @@ impl StorageEngine {
             text_index_batch: config.text_index_batch.max(1),
             text_index_retry: std::time::Duration::from_millis(config.text_index_retry_ms.max(1)),
             open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
+            tree_set: Arc::new(crate::engine::tree_set::TreeSetGate::default()),
+            catalog: parking_lot::Mutex::new(None),
             space,
             footprints,
             footprint_reclaim: parking_lot::Mutex::new(()),
@@ -1825,8 +1848,12 @@ impl StorageEngine {
             on_cut_bound: parking_lot::Mutex::new(None),
             #[cfg(test)]
             on_tree_pinned: parking_lot::Mutex::new(None),
-            #[cfg(test)]
-            on_tables_listed: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-faults"))]
+            on_rebuild_cleared: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-faults"))]
+            on_table_dropped: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-faults"))]
+            on_columnar_row: parking_lot::Mutex::new(None),
             #[cfg(test)]
             on_journalled: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -2180,6 +2207,23 @@ impl StorageEngine {
     /// Returns [`StorageError::Engine`] if the tree cannot be opened.
     #[cfg(feature = "columnar")]
     pub fn create_columnar_table(&self, table_id: &str) -> StorageResult<lsm_tree::AnyTree> {
+        let held = self.hold_tree_set();
+        self.create_columnar_table_held(table_id, &held)
+    }
+
+    /// [`Self::create_columnar_table`] within an operation that holds the
+    /// set of trees as `_held` from before the tree is made until its
+    /// catalog change commits.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_columnar_table`].
+    #[cfg(feature = "columnar")]
+    pub fn create_columnar_table_held(
+        &self,
+        table_id: &str,
+        _held: &crate::engine::tree_set::TreeSetHold,
+    ) -> StorageResult<lsm_tree::AnyTree> {
         self.open_columnar_table(table_id).map(|(tree, _)| tree)
     }
 
@@ -2228,12 +2272,36 @@ impl StorageEngine {
     /// Returns [`StorageError::Engine`] if the directory removal fails.
     #[cfg(feature = "columnar")]
     pub fn drop_columnar_table(&self, table_id: &str) -> StorageResult<()> {
-        self.columnar_tables.drop_table(table_id)
+        let held = self.hold_tree_set();
+        self.drop_columnar_table_held(table_id, &held)
+    }
+
+    /// [`Self::drop_columnar_table`] within an operation that holds the set
+    /// of trees as `_held` from before the tree is removed until its catalog
+    /// change commits.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::drop_columnar_table`].
+    #[cfg(feature = "columnar")]
+    pub fn drop_columnar_table_held(
+        &self,
+        table_id: &str,
+        _held: &crate::engine::tree_set::TreeSetHold,
+    ) -> StorageResult<()> {
+        self.columnar_tables.drop_table(table_id)?;
+        #[cfg(any(test, feature = "test-faults"))]
+        if let Some(hook) = self.on_table_dropped.lock().as_mut() {
+            hook();
+        }
+        Ok(())
     }
 
     /// Insert a row `(key, value)` into a `STORAGE COLUMNAR` table's tree at
     /// `seqno`, creating the tree on first use. The engine transposes rows to
-    /// columnar blocks at flush and reconstructs them on read.
+    /// columnar blocks at flush and reconstructs them on read. The call is
+    /// one operation on the set of trees; an operation writing many rows
+    /// holds the set once and writes them with [`Self::columnar_insert_held`].
     ///
     /// # Errors
     ///
@@ -2246,7 +2314,54 @@ impl StorageEngine {
         value: Vec<u8>,
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
+        let held = self.hold_tree_set();
+        self.columnar_insert_held(&held, table_id, key, value, seqno)
+    }
+
+    /// [`Self::columnar_insert`] within an operation that holds the set of
+    /// trees as `_held` from its first row until its last.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::columnar_insert`].
+    #[cfg(feature = "columnar")]
+    pub fn columnar_insert_held(
+        &self,
+        _held: &crate::engine::tree_set::TreeSetHold,
+        table_id: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<()> {
         let (tree, table_tier) = self.open_columnar_table(table_id)?;
+        self.insert_columnar_row(table_id, &tree, table_tier, key, value, seqno)
+    }
+
+    /// [`Self::columnar_insert_held`] into a table whose tree exists: a statement
+    /// writes rows into the tree its table's creation made, never into a new
+    /// one standing in for a tree a drop removed, so a tree under a table's
+    /// name is the one that table was created with.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::TableTreeMissing`] when the table has no tree; as
+    /// [`Self::columnar_insert`] otherwise.
+    #[cfg(feature = "columnar")]
+    pub fn columnar_insert_existing(
+        &self,
+        _held: &crate::engine::tree_set::TreeSetHold,
+        table_id: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<()> {
+        let tree =
+            self.columnar_tables
+                .get(table_id)
+                .ok_or_else(|| StorageError::TableTreeMissing {
+                    table: table_id.to_owned(),
+                })?;
+        let table_tier = self.columnar_tables.pressure(table_id);
         self.insert_columnar_row(table_id, &tree, table_tier, key, value, seqno)
     }
 
@@ -2298,31 +2413,11 @@ impl StorageEngine {
             coverage.note_table_marker(table_id, index);
             self.note_applied(coverage, index);
         }
+        #[cfg(any(test, feature = "test-faults"))]
+        if let Some(hook) = self.on_columnar_row.lock().as_mut() {
+            hook();
+        }
         Ok(())
-    }
-
-    /// [`Self::columnar_insert`] at a fresh timestamp, drawn as every direct
-    /// write draws its own: registered as in flight until the row has landed,
-    /// so a reader or a checkpoint that waits for the writes below a
-    /// timestamp waits for this one too. Returns the row's timestamp.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::columnar_insert`].
-    #[cfg(feature = "columnar")]
-    pub fn columnar_insert_next(
-        &self,
-        table_id: &str,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    ) -> StorageResult<lsm_tree::SeqNo> {
-        // The tree first: the registry is not taken while the row is in
-        // flight, so whoever holds the registry never waits on a row that
-        // waits on it.
-        let (tree, table_tier) = self.open_columnar_table(table_id)?;
-        let (seqno, _landing) = self.pending_commits.admit_direct(|| self.next_seqno());
-        self.insert_columnar_row(table_id, &tree, table_tier, key, value, seqno)?;
-        Ok(seqno)
     }
 
     /// End a write statement on a `STORAGE COLUMNAR` table: its rows are
@@ -2508,17 +2603,6 @@ impl StorageEngine {
             return std::time::Duration::ZERO;
         }
         self.write_slowdown.reserve(bytes)
-    }
-
-    /// Run `work` with every `STORAGE COLUMNAR` table's tree, in id order,
-    /// while no table is opened, created or dropped and no row gets its
-    /// table's tree. `work` must not use the table registry.
-    #[cfg(feature = "columnar")]
-    pub(crate) fn with_columnar_tables_held<T>(
-        &self,
-        work: impl FnOnce(Vec<(String, lsm_tree::AnyTree)>) -> T,
-    ) -> T {
-        self.columnar_tables.with_tables_held(work)
     }
 
     /// Every `STORAGE COLUMNAR` table's tree with its id, in id order.
@@ -3643,12 +3727,19 @@ impl StorageEngine {
         //    the history goes in: its floor then refuses every older snapshot
         //    until the whole history is back.
         let target = RebuildTarget::Table(table_id);
+        // Held alone until the rebuilt table is installed (the end of this
+        // call): no capture pins it dropped or half filled.
+        let _alone = self.rebuild_alone()?;
         write_rebuild_intent(&self.data_dir, target)?;
         self.columnar_tables.drop_table(table_id)?;
         let tree = self
             .columnar_tables
             .create_or_open_with(table_id, |_| Ok(()))?;
         tree.clear()?;
+        #[cfg(any(test, feature = "test-faults"))]
+        if let Some(hook) = self.on_rebuild_cleared.lock().as_mut() {
+            hook();
+        }
         let mut versions = 0;
         for event in rebuild::tree_history(&source)? {
             let (added, memtable) = rebuild::replay_event(&tree, event);
@@ -3785,11 +3876,30 @@ impl StorageEngine {
     /// before the tree is cleared and removed by [`Self::finish_rebuild`]
     /// once the rebuilt tree is on disk.
     fn begin_rebuild(&self, partition: Partition) -> StorageResult<PartitionRepair<'_>> {
+        let alone = self.rebuild_alone()?;
         // Published before the intent lands and before any tree is touched:
         // an observation from here on sees the repair, whatever step it is at.
-        let active = self.enter_repair(partition)?;
+        let mut active = self.enter_repair(partition)?;
+        active._alone = Some(alone);
         write_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))?;
         Ok(active)
+    }
+
+    /// The set of trees alone, for a rebuild from a checkpoint: from its
+    /// first destructive step until its result is installed no capture pins
+    /// its tree. Its intent keeps a capture away after a failure too.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::TreeSetBusy`] when operations hold the set for longer
+    /// than [`REBUILD_TREE_SET_WAIT`].
+    fn rebuild_alone(&self) -> StorageResult<crate::engine::tree_set::TreeSetExclusive<'_>> {
+        self.tree_set
+            .exclusive(REBUILD_TREE_SET_WAIT)
+            .ok_or(StorageError::TreeSetBusy {
+                operation: "repair",
+                waited_ms: REBUILD_TREE_SET_WAIT_MS,
+            })
     }
 
     /// [`Self::begin_rebuild`] for a rebuild that puts `kept`, the tree's own
@@ -3800,7 +3910,9 @@ impl StorageEngine {
         partition: Partition,
         kept: &Rows,
     ) -> StorageResult<PartitionRepair<'_>> {
-        let active = self.enter_repair(partition)?;
+        let alone = self.rebuild_alone()?;
+        let mut active = self.enter_repair(partition)?;
+        active._alone = Some(alone);
         self.record_kept(partition, kept)?;
         Ok(active)
     }
@@ -3845,6 +3957,7 @@ impl StorageEngine {
             engine: self,
             partition,
             bit,
+            _alone: None,
         };
         self.under_repair.fetch_or(bit, Ordering::AcqRel);
         Ok(active)
@@ -5609,6 +5722,42 @@ impl StorageEngine {
         self.pin_new_snapshot(|| self.durable_view(self.snapshot()))
     }
 
+    /// Hold the set of trees for an operation that changes them outside one
+    /// commit, until the returned hold drops: a capture or repair waits for
+    /// it (see [`crate::engine::tree_set`]). Waits while one has the set.
+    pub fn hold_tree_set(&self) -> crate::engine::tree_set::TreeSetHold {
+        self.tree_set.hold()
+    }
+
+    /// The gate over the set of trees.
+    pub(crate) fn tree_set_gate(&self) -> &crate::engine::tree_set::TreeSetGate {
+        &self.tree_set
+    }
+
+    /// Name the catalog's list of tables: from here on a capture of a store
+    /// no Raft log orders is refused while the catalog and the table trees
+    /// disagree ([`StorageError::CatalogMismatch`]).
+    pub fn set_catalog_inventory(
+        &self,
+        inventory: Arc<dyn crate::engine::tree_set::CatalogInventory>,
+    ) {
+        *self.catalog.lock() = Some(inventory);
+    }
+
+    /// The catalog's list of tables, if one is named.
+    pub(crate) fn catalog_inventory(
+        &self,
+    ) -> Option<Arc<dyn crate::engine::tree_set::CatalogInventory>> {
+        self.catalog.lock().clone()
+    }
+
+    /// Shared holds of the set of trees granted so far, for tests that count
+    /// them.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn tree_set_holds_granted(&self) -> u64 {
+        self.tree_set.holds_granted()
+    }
+
     /// Record a transaction as open until the returned marker drops.
     /// [`Self::await_transactions_through`] waits for the ones opened before
     /// a boundary.
@@ -7229,6 +7378,29 @@ impl StorageEngine {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn set_cut_bound_hook(&self, hook: Option<Box<dyn FnMut() + Send>>) {
         *self.on_cut_bound.lock() = hook;
+    }
+
+    /// Run `hook` once a table's rebuild from a checkpoint has cleared the
+    /// live tree, before its history goes back in. For tests of what a
+    /// capture sees of a rebuild under way.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn set_rebuild_cleared_hook(&self, hook: Option<Box<dyn FnMut() + Send>>) {
+        *self.on_rebuild_cleared.lock() = hook;
+    }
+
+    /// Run `hook` once a drop within an operation
+    /// ([`Self::drop_columnar_table_held`]) has removed a table's tree. For
+    /// tests of what a capture sees of a drop under way.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn set_table_dropped_hook(&self, hook: Option<Box<dyn FnMut() + Send>>) {
+        *self.on_table_dropped.lock() = hook;
+    }
+
+    /// Run `hook` once each `STORAGE COLUMNAR` row has landed in its tree.
+    /// For tests of what a capture sees of a statement writing several.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn set_columnar_row_hook(&self, hook: Option<Box<dyn FnMut() + Send>>) {
+        *self.on_columnar_row.lock() = hook;
     }
 
     /// Stop the journal, as a disk that does not answer would: every write
@@ -8880,6 +9052,9 @@ pub struct PartitionRepair<'e> {
     engine: &'e StorageEngine,
     partition: Partition,
     bit: u64,
+    /// The set of trees, held alone by a rebuild from a checkpoint until its
+    /// result is installed: no capture pins its tree half rebuilt.
+    _alone: Option<crate::engine::tree_set::TreeSetExclusive<'e>>,
 }
 
 impl PartitionRepair<'_> {

@@ -203,6 +203,43 @@ pub enum StorageError {
         reason: String,
     },
 
+    /// The store's catalog and the `STORAGE COLUMNAR` table trees it holds
+    /// disagree, so no copy of it is consistent: a table the catalog declares
+    /// has no tree (a drop removed it and its catalog change did not commit),
+    /// or a tree has no table in the catalog (a create made it and its
+    /// catalog change did not commit). Nothing is taken; the table is created
+    /// or dropped again, and the copy then taken.
+    #[error(
+        "the catalog and the table trees disagree: declared without a tree {declared_only:?}, \
+         a tree without a declaration {trees_only:?}"
+    )]
+    CatalogMismatch {
+        /// Tables the catalog declares that have no tree.
+        declared_only: Vec<String>,
+        /// Trees whose table the catalog does not declare.
+        trees_only: Vec<String>,
+    },
+
+    /// A `STORAGE COLUMNAR` table the catalog declares has no tree to write
+    /// a row to: a drop removed it and its catalog change did not commit.
+    /// No new tree is made in its place, which would hold none of the
+    /// table's rows under its name; the table is dropped again.
+    #[error("table {table} has no tree: drop it again")]
+    TableTreeMissing {
+        /// The table.
+        table: String,
+    },
+
+    /// The set of trees stayed held by operations for longer than a capture
+    /// or a repair waits for it alone. Nothing was done; it is tried again.
+    #[error("the set of trees is busy: {operation} waited {waited_ms} ms")]
+    TreeSetBusy {
+        /// What waited: a checkpoint or a repair.
+        operation: &'static str,
+        /// How long it waited.
+        waited_ms: u64,
+    },
+
     /// The cut's view is not held by this store: the store it was taken of
     /// was closed since. The view is gone; a new cut is taken.
     #[error("the view of the cut below {bound} is no longer held; take a new cut")]

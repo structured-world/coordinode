@@ -301,6 +301,32 @@ pub trait SchemaStore {
     fn release_constraint_name_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
 }
 
+/// The catalog's list of `STORAGE COLUMNAR` tables, as the engine checks a
+/// capture's table trees against it
+/// ([`StorageEngine::set_catalog_inventory`]): every declared label whose
+/// schema is a columnar table, read from the store's current catalog.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CatalogTables;
+
+impl coordinode_storage::engine::tree_set::CatalogInventory for CatalogTables {
+    fn columnar_tables(
+        &self,
+        engine: &StorageEngine,
+    ) -> coordinode_storage::error::StorageResult<Vec<String>> {
+        let labels = LocalSchemaStore::new(engine)
+            .list_labels()
+            .map_err(|e| match e {
+                crate::error::StoreError::Storage(e) => e,
+                other => coordinode_storage::error::StorageError::Serialization(other.to_string()),
+            })?;
+        Ok(labels
+            .into_iter()
+            .filter(LabelSchema::is_columnar)
+            .map(|schema| schema.name)
+            .collect())
+    }
+}
+
 /// CE single-shard implementation of [`SchemaStore`]. Operates
 /// directly on a [`StorageEngine`]. Reads use point gets; writes use
 /// a two-op [`WriteBatch`] for revision-body + pointer atomicity.

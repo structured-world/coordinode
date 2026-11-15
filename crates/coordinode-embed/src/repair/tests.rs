@@ -1472,6 +1472,147 @@ fn a_table_rebuild_missing_part_of_the_journal_is_refused() {
     );
 }
 
+/// A checkpoint taken while a table's rebuild has cleared the live tree and
+/// not yet filled it again waits for the rebuild, or is refused: it never
+/// holds the table half rebuilt. Before, it held the cleared tree, and its
+/// copy opened with only the rows its journal copy replayed.
+#[test]
+fn a_checkpoint_never_takes_a_table_half_rebuilt() {
+    let dir = TempDir::new().expect("tempdir");
+    let backups = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded"),
+    );
+    let row = |key: String| {
+        engine
+            .columnar_insert(
+                "trades",
+                key.into_bytes(),
+                b"v".to_vec(),
+                oracle.next().as_raw(),
+            )
+            .expect("columnar insert");
+    };
+    for i in 0..10u32 {
+        row(format!("row:{i:06}"));
+    }
+    let checkpoint = create_checkpoint(&engine, &root).expect("checkpoint");
+    for i in 10..20u32 {
+        row(format!("row:{i:06}"));
+    }
+    let from = engine.checkpoint_replay_floor(&checkpoint).expect("floor");
+    let suffix = engine
+        .oplog_read_since(from)
+        .expect("read journal")
+        .expect("journal");
+    let rows = engine
+        .columnar_scan("trades", u64::MAX)
+        .expect("scan")
+        .len();
+    assert_eq!(rows, 20);
+
+    let (cleared, started) = std::sync::mpsc::channel();
+    let (finished, backup_done) = std::sync::mpsc::channel::<()>();
+    engine.set_rebuild_cleared_hook(Some(Box::new(move || {
+        let _told = cleared.send(()).is_ok();
+        let _done = backup_done
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+    })));
+    let backup = {
+        let engine = Arc::clone(&engine);
+        let target = backups.path().join("b");
+        std::thread::spawn(move || {
+            started
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the rebuild cleared the tree");
+            let taken = engine.create_checkpoint(&target).map(|_| target);
+            let _told = finished.send(()).is_ok();
+            taken
+        })
+    };
+    let rebuilt = engine
+        .repair_table_from_checkpoint(&checkpoint, &suffix, "trades", &[])
+        .expect("rebuild");
+    assert!(matches!(rebuilt, Rebuild::Rebuilt { .. }), "{rebuilt:?}");
+    let taken = backup.join().expect("backup");
+    engine.set_rebuild_cleared_hook(None);
+    let Ok(target) = taken else {
+        // Refused while the rebuild ran: nothing half rebuilt was taken.
+        return;
+    };
+    drop(engine);
+    let copy = StorageEngine::open_checkpoint(&target).expect("the copy opens");
+    assert_eq!(
+        copy.columnar_scan("trades", u64::MAX).expect("scan").len(),
+        rows,
+        "the checkpoint holds the table whole"
+    );
+}
+
+/// A table rebuild cut short after its clear leaves its intent behind and
+/// gives the set of trees back; a checkpoint taken then is refused on the
+/// intent rather than taking the table cleared. Before, it took it.
+#[test]
+// The hook cuts the rebuild short after its clear, as a crash there would.
+#[allow(clippy::panic)]
+fn a_checkpoint_after_a_rebuild_cut_short_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let backups = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle))
+            .expect("open_embedded"),
+    );
+    for i in 0..10u32 {
+        engine
+            .columnar_insert(
+                "trades",
+                format!("row:{i:06}").into_bytes(),
+                b"v".to_vec(),
+                oracle.next().as_raw(),
+            )
+            .expect("columnar insert");
+    }
+    let checkpoint = create_checkpoint(&engine, &root).expect("checkpoint");
+    let from = engine.checkpoint_replay_floor(&checkpoint).expect("floor");
+    let suffix = engine
+        .oplog_read_since(from)
+        .expect("read journal")
+        .expect("journal");
+
+    engine.set_rebuild_cleared_hook(Some(Box::new(|| {
+        panic!("the rebuild is cut short after its clear");
+    })));
+    let rebuild = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            engine.repair_table_from_checkpoint(&checkpoint, &suffix, "trades", &[])
+        })
+    };
+    assert!(rebuild.join().is_err(), "the rebuild was cut short");
+    engine.set_rebuild_cleared_hook(None);
+    assert_eq!(
+        engine.pending_table_rebuilds().expect("intents"),
+        vec!["trades".to_owned()],
+        "its intent stays"
+    );
+
+    let target = backups.path().join("b");
+    let refused = engine
+        .create_checkpoint(&target)
+        .expect_err("no checkpoint of a table a rebuild left cleared");
+    assert!(
+        refused.to_string().contains("repair of table trades"),
+        "{refused}"
+    );
+    assert!(!target.exists(), "the refused checkpoint left nothing");
+}
+
 /// The reported dead end: a lossy open repair with NO checkpoint to rebuild
 /// from. The loss must be REPORTED (partition listed, not clean), never
 /// silently absorbed, and nothing may claim a repair happened.

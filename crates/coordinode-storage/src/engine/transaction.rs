@@ -405,6 +405,10 @@ pub struct Transaction<'a> {
     /// creation until its last state drops. `None` only once
     /// [`Self::take_state`] has moved it to the parked state.
     open: Option<OpenTransaction>,
+    /// The set of trees, held from the first change this transaction makes
+    /// to them outside its commit until its last state drops
+    /// ([`Self::hold_tree_set`]).
+    tree_set: Option<crate::engine::tree_set::TreeSetHold>,
     /// DERIVED index work: entries staged in the write buffer that the unit
     /// logs as sealed work rather than as mutations.
     derived: derived::DerivedLedger,
@@ -471,6 +475,9 @@ pub struct TransactionState {
     validate_from: Option<StorageSnapshot>,
     /// Parked with the rest: the transaction stays open between statements.
     open: Option<OpenTransaction>,
+    /// Parked: a table one statement created or dropped commits with the
+    /// last, and the set stays held until then.
+    tree_set: Option<crate::engine::tree_set::TreeSetHold>,
     /// Parked with the write buffer whose index entries it describes.
     derived: derived::DerivedLedger,
     /// Parked with the write buffer: the removals commit with its writes.
@@ -665,6 +672,7 @@ impl<'a> Transaction<'a> {
             snapshot_pin,
             validate_from: snapshot.map(|s| Self::first_unseen(engine, s)),
             open: Some(engine.open_transaction()),
+            tree_set: None,
             derived: derived::DerivedLedger::default(),
             range_removals: Vec::new(),
             stamped: HashMap::new(),
@@ -868,6 +876,7 @@ impl<'a> Transaction<'a> {
             snapshot_pin: self.snapshot_pin,
             validate_from: self.validate_from,
             open: self.open,
+            tree_set: self.tree_set,
             derived: self.derived,
             range_removals: self.range_removals,
             stamped: self.stamped,
@@ -901,6 +910,7 @@ impl<'a> Transaction<'a> {
             snapshot_pin: self.snapshot_pin.take(),
             validate_from: self.validate_from,
             open: self.open.take(),
+            tree_set: self.tree_set.take(),
             derived: std::mem::take(&mut self.derived),
             range_removals: std::mem::take(&mut self.range_removals),
             stamped: std::mem::take(&mut self.stamped),
@@ -942,6 +952,7 @@ impl<'a> Transaction<'a> {
             snapshot_pin: state.snapshot_pin,
             validate_from: state.validate_from,
             open: state.open,
+            tree_set: state.tree_set,
             derived: state.derived,
             range_removals: state.range_removals,
             stamped: state.stamped,
@@ -951,6 +962,17 @@ impl<'a> Transaction<'a> {
             kept_counts: rustc_hash::FxHashMap::default(),
             operation: None,
         }
+    }
+
+    /// Hold the engine's set of trees for this transaction, once: a statement
+    /// about to change the trees outside its commit (write `STORAGE
+    /// COLUMNAR` rows, create or drop such a table) calls this first, and the
+    /// set stays held until the transaction's last state drops, after its
+    /// commit or its abandonment, so a capture never sees it half done. Waits
+    /// while a capture or a repair has the set.
+    pub fn hold_tree_set(&mut self) -> &crate::engine::tree_set::TreeSetHold {
+        let engine = self.engine;
+        self.tree_set.get_or_insert_with(|| engine.hold_tree_set())
     }
 
     /// The read timestamp this transaction is pinned at.

@@ -534,8 +534,15 @@ shares the device; elsewhere they are copies. What the database holds in
 memory is written into the backup, not flushed into the database first, so
 a backup outside the endpoint directory grows nothing under it: a database
 at its hard limit, refusing writes, still writes its backup to another
-directory. Backups outside the endpoint directory are not counted against
-the hard limit. The backup directory is a
+directory. A statement that writes `STORAGE COLUMNAR` rows, or creates or
+drops such a table, lands in steps no single commit gathers; a backup
+waits for one under way, as for a repair rebuilding a table, and holds it
+whole (after ten seconds it is refused instead and can be taken again).
+A backup is refused when the catalog and the tables disagree, as a drop
+whose transaction was rolled back after it removed the table's rows
+leaves them: drop the table again, then take the backup. Backups outside
+the endpoint directory are not counted against the hard limit. The backup
+directory is a
 complete database in one directory, whatever endpoint layout the original
 had, and opens with plain `Database::open`.
 

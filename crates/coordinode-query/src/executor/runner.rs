@@ -4344,7 +4344,9 @@ impl<'a> ExecutionContext<'a> {
     /// snapshot-isolated within an open transaction. The write is journalled to
     /// the retained oplog at its commit_ts before it touches the tree, so an
     /// un-flushed row is replayed on the next open (crash recovery); without
-    /// a journal the statement's end flushes the table.
+    /// a journal the statement's end flushes the table. The transaction
+    /// holds the engine's set of trees from its first such row until it
+    /// ends, so a checkpoint never takes part of the statement's rows.
     pub fn columnar_put_node(
         &mut self,
         label: &str,
@@ -4356,8 +4358,14 @@ impl<'a> ExecutionContext<'a> {
         let bytes = record.to_msgpack().map_err(|e| {
             ExecutionError::Serialization(format!("columnar node {} encode: {e}", node_id.as_raw()))
         })?;
-        // At a fresh timestamp, registered as in flight until the row lands.
-        self.engine.columnar_insert_next(label, key, bytes)?;
+        let seqno = self
+            .engine
+            .oracle()
+            .map(|o| o.next().as_raw())
+            .unwrap_or_else(|| self.engine.snapshot().saturating_add(1));
+        let held = self.txn.hold_tree_set();
+        self.engine
+            .columnar_insert_existing(held, label, key, bytes, seqno)?;
         Ok(())
     }
 
@@ -22082,9 +22090,12 @@ fn execute_create_table(
     ctx.save_current_label_schema(&schema)?;
 
     // A columnar table is backed by its own columnar-mode tree; open it now so
-    // it exists before any write. Row tables stay on the node path.
+    // it exists before any write. Row tables stay on the node path. The tree
+    // exists before the catalog change commits, so the transaction holds the
+    // engine's set of trees until it ends: a checkpoint takes both or neither.
     if columnar {
-        ctx.engine.create_columnar_table(name)?;
+        let held = ctx.txn.hold_tree_set();
+        ctx.engine.create_columnar_table_held(name, held)?;
     }
 
     let mut row = Row::new();
@@ -22137,8 +22148,12 @@ fn execute_drop_table(
     }
     ctx.release_all_table_keys(name)?;
     ctx.drop_current_label_schema(name)?;
+    // The tree goes before the catalog change commits, so the transaction
+    // holds the engine's set of trees until it ends: a checkpoint never takes
+    // the table declared without its tree.
     if columnar {
-        ctx.engine.drop_columnar_table(name)?;
+        let held = ctx.txn.hold_tree_set();
+        ctx.engine.drop_columnar_table_held(name, held)?;
     }
 
     let mut row = Row::new();

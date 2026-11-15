@@ -983,6 +983,8 @@ impl Database {
         // the store's own work: bounded, and allowed past a limit the
         // database no longer fits, so it opens to be read.
         let _opening = engine.footprints().open_phase();
+        // A capture checks the table trees it takes against the catalog.
+        engine.set_catalog_inventory(Arc::new(coordinode_modality::schema::CatalogTables));
         // Repair on open, for an engine with its own journal: what the store
         // already knows it owes (a rebuild a crash cut short, a salvage that
         // lost data) is rebuilt from the latest checkpoint and the journal

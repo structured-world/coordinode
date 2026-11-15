@@ -467,47 +467,31 @@ impl StorageEngine {
     /// in the pinned trees whole or not at all. The trees are pinned in
     /// turn, so a commit landing between two pins would be in one tree and
     /// not the other. So the cut is a timestamp `bound` drawn from the clock
-    /// every commit takes its own from: each write below it is waited for
-    /// until it has landed in every tree it writes (every commit, direct
-    /// write and table row registers before it draws its timestamp), and
-    /// each one at or above it is left out of the copy.
+    /// every commit takes its own from: each commit and direct write below it
+    /// is waited for until it has landed in every tree it writes (each
+    /// registers before it draws its timestamp), and each one at or above it
+    /// is left out of the copy. The caller has the set of trees alone, so no
+    /// operation that changes the trees outside one commit (a table's rows,
+    /// its creation or drop, a repair) is under way: each finished before,
+    /// below `bound`, or starts after the pins.
     ///
     /// A write at or above `bound` is in no pinned table file: no tree is
     /// flushed from the moment `bound` is drawn until it is pinned (its
     /// flush lock is held), a table flushed before held only earlier writes,
     /// and a compaction only rewrites what tables already hold. So it is
     /// only in the pinned memtables, which the copy is built from below
-    /// `bound`. The set of tables is the one at the cut: the table registry
-    /// is held from the listing until the pins, so no table is created or
-    /// dropped and no row gets its table's tree meanwhile; a row that got it
-    /// before is registered, and waited for when below `bound`. Returns the
-    /// trees and `bound`.
+    /// `bound`. Returns the trees and `bound`.
     ///
     /// # Errors
     ///
     /// [`StorageError::CutNotReady`] when a write below the cut is still in
     /// flight after [`CHECKPOINT_CUT_WAIT`]; a tree cannot be read.
     fn pin_at_cut(&self) -> StorageResult<(Vec<PinnedTree>, u64)> {
-        #[cfg(feature = "columnar")]
-        return self.with_columnar_tables_held(|tables| self.pin_at_cut_of(tables));
-        #[cfg(not(feature = "columnar"))]
-        self.pin_at_cut_of(Vec::new())
-    }
-
-    /// [`Self::pin_at_cut`] of the partitions and `tables`, the table
-    /// registry held by the caller.
-    fn pin_at_cut_of(
-        &self,
-        tables: Vec<(String, lsm_tree::AnyTree)>,
-    ) -> StorageResult<(Vec<PinnedTree>, u64)> {
         let mut parts = Vec::with_capacity(Partition::all().len());
         for &part in Partition::all() {
             parts.push(self.tree(part)?);
         }
-        #[cfg(test)]
-        if let Some(hook) = self.on_tables_listed.lock().as_mut() {
-            hook();
-        }
+        let tables = self.table_trees();
         let _no_flush: Vec<_> = parts
             .iter()
             .map(|tree| tree.get_flush_lock())
@@ -607,13 +591,27 @@ impl StorageEngine {
         target: &Path,
         summary: &mut crate::engine::core::CheckpointSummary,
     ) -> StorageResult<()> {
+        // Held alone until every tree is pinned: no table's rows, creation or
+        // drop and no repair is half done in what the pins hold. The copy is
+        // built from the pins after it is released.
+        let busy = || StorageError::TreeSetBusy {
+            operation: "checkpoint",
+            waited_ms: u64::try_from(CHECKPOINT_CUT_WAIT.as_millis()).unwrap_or(u64::MAX),
+        };
+        let alone = self
+            .tree_set_gate()
+            .exclusive(CHECKPOINT_CUT_WAIT)
+            .ok_or_else(busy)?;
+        self.refuse_while_repairing()?;
         let (trees, bound) = match self.raft_fence() {
             Some(_) => (self.pin_fenced(PinScope::Whole)?.0, None),
             None => {
                 let (trees, bound) = self.pin_at_cut()?;
+                self.check_catalog(&trees)?;
                 (trees, Some(bound))
             }
         };
+        drop(alone);
         for tree in &trees {
             summary.total_bytes += self.materialize(tree, target, bound)?;
             let held = bound.map_or(tree.pin.seqno(), |bound| tree.pin.seqno().min(bound));
@@ -623,6 +621,56 @@ impl StorageEngine {
             }
         }
         Ok(())
+    }
+
+    /// Refuse a capture while a repair has not installed its result: its
+    /// tree may be cleared or only partly filled, whether the repair is
+    /// running or stopped short (its intent is still on disk).
+    fn refuse_while_repairing(&self) -> StorageResult<()> {
+        let not_ready = |what: String| StorageError::CutNotReady {
+            reason: format!("the repair of {what} has not installed its result"),
+        };
+        if let Some(part) = Partition::all()
+            .iter()
+            .find(|&&part| self.is_under_repair(part))
+        {
+            return Err(not_ready(format!("partition {}", part.name())));
+        }
+        if let Some(part) = self.pending_rebuilds()?.first() {
+            return Err(not_ready(format!("partition {}", part.name())));
+        }
+        if let Some(table) = self.pending_table_rebuilds()?.first() {
+            return Err(not_ready(format!("table {table}")));
+        }
+        Ok(())
+    }
+
+    /// Refuse a capture whose table trees disagree with the tables the
+    /// catalog declares, when the catalog is named
+    /// ([`StorageEngine::set_catalog_inventory`]). Read with the set of trees
+    /// held, so no creation or drop is under way: a disagreement is one a
+    /// failed creation or drop left in the store, and a copy of it would open
+    /// as a table without its rows or rows without their table.
+    fn check_catalog(&self, trees: &[PinnedTree]) -> StorageResult<()> {
+        let Some(catalog) = self.catalog_inventory() else {
+            return Ok(());
+        };
+        let declared: std::collections::BTreeSet<String> =
+            catalog.columnar_tables(self)?.into_iter().collect();
+        let pinned: std::collections::BTreeSet<String> = trees
+            .iter()
+            .filter_map(|tree| match &tree.name {
+                TreeName::Table(id) => Some(id.clone()),
+                TreeName::Partition(_) => None,
+            })
+            .collect();
+        if declared == pinned {
+            return Ok(());
+        }
+        Err(StorageError::CatalogMismatch {
+            declared_only: declared.difference(&pinned).cloned().collect(),
+            trees_only: pinned.difference(&declared).cloned().collect(),
+        })
     }
 
     /// Lay `tree`'s pinned files into its folder under `root` and rebuild it
