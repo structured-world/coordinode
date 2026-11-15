@@ -1077,6 +1077,9 @@ pub struct Footprints {
 struct Squeeze {
     requested: AtomicBool,
     wake: parking_lot::RwLock<Option<Arc<coordinode_core::txn::wake::Wake>>>,
+    /// The journal reclaimer's wake: a failed reclamation waits for room
+    /// as a failed flush does, and may have no flush left to land for it.
+    reclaim_wake: parking_lot::RwLock<Option<Arc<coordinode_core::txn::wake::Wake>>>,
     /// A flush failed; the monitor is woken to try it again once room comes
     /// back on an endpoint or a limit changes, not before.
     stalled: AtomicBool,
@@ -1121,8 +1124,13 @@ impl Squeeze {
         }
     }
 
+    /// Wake whatever failed for room: the flush monitor and the journal
+    /// reclaimer. One that has nothing to retry goes back to sleep.
     fn wake(&self) {
         if let Some(wake) = self.wake.read().as_ref() {
+            wake.notify();
+        }
+        if let Some(wake) = self.reclaim_wake.read().as_ref() {
             wake.notify();
         }
     }
@@ -1199,6 +1207,12 @@ impl Footprints {
     /// The flush monitor's wake, which a squeeze notifies.
     pub(crate) fn set_flush_wake(&self, wake: Arc<coordinode_core::txn::wake::Wake>) {
         *self.squeeze.wake.write() = Some(wake);
+    }
+
+    /// The journal reclaimer's wake, notified with the flush monitor's when
+    /// room comes back after a failure.
+    pub(crate) fn set_reclaim_wake(&self, wake: Arc<coordinode_core::txn::wake::Wake>) {
+        *self.squeeze.reclaim_wake.write() = Some(wake);
     }
 
     /// Start a flush; see [`FlushAttempt`]. Without a hard limit nothing is

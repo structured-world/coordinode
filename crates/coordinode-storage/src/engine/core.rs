@@ -348,6 +348,9 @@ pub struct StorageEngine {
     /// Notified by the flush workers each time a table lands: the journal it
     /// covers may go ([`Self::start_journal_reclaim`]).
     table_landed: Arc<coordinode_core::txn::wake::Wake>,
+    /// Test hook: reclamation fails after its flushes, before any removal.
+    #[cfg(test)]
+    pub(crate) fail_journal_purge: std::sync::atomic::AtomicBool,
     /// The lowest journal index a rebuild from the latest local checkpoint
     /// replays from; reclamation keeps it. `u64::MAX` when no checkpoint
     /// needs any.
@@ -1778,6 +1781,8 @@ impl StorageEngine {
             footprints,
             footprint_reclaim: parking_lot::Mutex::new(()),
             table_landed,
+            #[cfg(test)]
+            fail_journal_purge: std::sync::atomic::AtomicBool::new(false),
             journal_keep_from: AtomicU64::new(u64::MAX),
             consumer_journal_floor: AtomicU64::new(if protections_pending { 0 } else { u64::MAX }),
             protections_pending: std::sync::atomic::AtomicBool::new(protections_pending),
@@ -4269,11 +4274,19 @@ impl StorageEngine {
         if self.oplog.is_none() || self.footprints.is_empty() {
             return Ok(None);
         }
+        self.footprints
+            .set_reclaim_wake(Arc::clone(&self.table_landed));
         crate::engine::journal_reclaim::JournalReclaimer::start(
             Arc::downgrade(self),
             Arc::clone(&self.table_landed),
         )
         .map(Some)
+    }
+
+    /// The reclaimer's wake, for a test that runs its rounds by hand.
+    #[cfg(test)]
+    pub(crate) fn table_landed(&self) -> Arc<coordinode_core::txn::wake::Wake> {
+        Arc::clone(&self.table_landed)
     }
 
     /// One background reclamation, run only when it may remove something the
@@ -4326,6 +4339,13 @@ impl StorageEngine {
         };
         // Every entry below `covered` is in a table of every tree.
         let covered = self.persist_coverage_base()?;
+        #[cfg(test)]
+        if self
+            .fail_journal_purge
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Io("injected journal purge failure".into()));
+        }
         let mut log = oplog
             .lock()
             .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;

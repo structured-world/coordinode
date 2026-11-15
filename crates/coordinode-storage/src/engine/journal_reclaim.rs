@@ -37,9 +37,9 @@ impl Round {
     /// segment sealed since it began, a floor raised since, or, after a
     /// failure, any wake. A failed round registers as a failed flush does
     /// ([`crate::engine::footprint::FlushAttempt::failed`]): room coming
-    /// back on any endpoint or a raised limit wakes the flush monitor, whose
-    /// landed table wakes the reclaimer. Without such an event nothing wakes
-    /// it, so an unchanged failure does not repeat.
+    /// back on any endpoint or a raised limit wakes the reclaimer directly,
+    /// with or without a flush left to land. Without such an event nothing
+    /// wakes it, so an unchanged failure does not repeat.
     pub(crate) fn due(&self, now: Grounds) -> bool {
         self.failed
             || now.newest_sealed > self.checked.newest_sealed
@@ -105,4 +105,5 @@ impl Drop for JournalReclaimer {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests;
