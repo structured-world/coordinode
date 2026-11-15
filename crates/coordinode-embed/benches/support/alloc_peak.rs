@@ -31,6 +31,8 @@ pub static ELSEWHERE: AtomicUsize = AtomicUsize::new(0);
 static LIVE: AtomicU64 = AtomicU64::new(OFF << BYTE_BITS);
 /// The counted group and the most its allocations held at once.
 static PEAK: AtomicU64 = AtomicU64::new(OFF << BYTE_BITS);
+/// Bytes the counted group allocated, freed or not.
+static SAMPLE_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
 struct Peaks;
 
@@ -53,6 +55,7 @@ impl AllocationTracker for Peaks {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    SAMPLE_ALLOCATED.fetch_add(size, Ordering::Relaxed);
                     let live = (state & BYTES) + size;
                     debug_assert!(live <= BYTES, "a sample held past the counter's range");
                     // Groups are numbered upward, so a later sample's word
@@ -117,6 +120,7 @@ pub fn peak_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
         group_of(previous) < group || group_of(previous) == OFF,
         "allocation groups are numbered upward"
     );
+    SAMPLE_ALLOCATED.store(0, Ordering::Release);
     LIVE.store(group << BYTE_BITS, Ordering::Release);
     let value = {
         let _counted = token.enter();
@@ -124,4 +128,12 @@ pub fn peak_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
     };
     LIVE.store(OFF << BYTE_BITS, Ordering::Release);
     (value, PEAK.load(Ordering::Acquire) & BYTES)
+}
+
+/// The bytes the last [`peak_of`] sample allocated on its thread, whether
+/// or not they were freed within it.
+// Included by binaries that read only the peak.
+#[allow(dead_code)]
+pub fn sample_allocated() -> u64 {
+    SAMPLE_ALLOCATED.load(Ordering::Acquire)
 }
