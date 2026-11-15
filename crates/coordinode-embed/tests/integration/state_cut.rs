@@ -246,6 +246,24 @@ fn an_empty_scope_rebuilds_to_absence() {
     );
 }
 
+/// A view does not survive its database: the database reopens while a cut
+/// taken of it is still held, and the reopened one gives a new cut with a
+/// bound of its own, never the lost view again under old positions.
+#[test]
+fn a_view_is_lost_with_its_database_and_a_new_cut_is_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("source");
+    let db = open_source(&at);
+    let old = db.state_cut(Duration::from_secs(10)).expect("cut");
+    drop(db);
+    let mut db = Database::open(&at).expect("reopen while the old cut is held");
+    db.execute_cypher("CREATE (:User {id: 5})").expect("create");
+    let new = db.state_cut(Duration::from_secs(10)).expect("new cut");
+    assert!(new.bound() > old.bound(), "a view of its own");
+    let rows = copy_view(&db, &new, NODES);
+    assert_eq!(rows, source_rows(&db, NODES));
+}
+
 /// A cut belongs to its history: read against another database, its
 /// continuation is refused rather than joined to a log it was not taken of.
 #[test]
