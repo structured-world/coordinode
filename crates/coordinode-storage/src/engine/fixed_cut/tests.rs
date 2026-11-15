@@ -184,9 +184,11 @@ fn a_late_commit_below_the_cut_is_in_the_view_and_counted_once() {
             .expect("view"),
     );
     assert_eq!(destination, 101, "the view holds the late commit");
-    let units = engine
+    let read = engine
         .fixed_cut_units(&cut, cut.first(), cut.join_end() - cut.first())
         .expect("join");
+    assert_eq!(read.next, cut.join_end(), "the read ends at the join");
+    let units = read.units;
     let late_unit = units
         .iter()
         .find(|u| u.commit_ts == late)

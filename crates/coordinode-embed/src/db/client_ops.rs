@@ -217,7 +217,7 @@ impl Database {
     /// were issued in, and another database refuses them. A group formed
     /// around this store later keeps the identity, so its descriptors stay
     /// valid.
-    fn found_deployment(&self) -> Result<DeploymentId, DatabaseError> {
+    pub(crate) fn found_deployment(&self) -> Result<DeploymentId, DatabaseError> {
         if let Some(id) = self.deployment()? {
             return Ok(id);
         }

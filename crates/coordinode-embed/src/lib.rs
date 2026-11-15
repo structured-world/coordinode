@@ -71,11 +71,13 @@ pub use repair::RepairReport;
 /// What a change-stream consumer registers with
 /// ([`Database::register_consumer`]) and what the registry reports of it.
 pub mod consumer {
+    pub use crate::db::{CutBatch, StateCut};
     pub use coordinode_replicate::{
         ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot,
         InitialSeqno, PriorIncarnation, RegisteredHandle, RegistrationState, RegistryError,
         RetentionPressure, RetentionSpace, RetentionSummary, TerminalReason, TopologyScope,
     };
+    pub use coordinode_storage::engine::fixed_cut::CutUnit;
 }
 
 /// Every Rust snippet of the embedded guide, compiled as a doctest against

@@ -358,6 +358,61 @@ no async runtime is needed. A database kept in memory, and a member of a
 replicated group (whose history is the group's log, not a journal of its
 own), refuse registrations as `Unsupported`.
 
+### Rebuilding after `RetentionLost`
+
+A consumer whose position is gone rebuilds its projection from a fixed cut
+of the database: a read view pinned below a bound, and the journal
+continuation that joins it. `state_cut` takes the cut, waiting up to its
+timeout for the commits below the bound to finish and be durable
+(`CutNotReady` otherwise). `state_cut_scan` pages through a key range of
+the view; `state_cut_tail` reads the continuation from where the last read
+ended and hands over only the units the view does not already hold, each
+with its own commit timestamp and data changes, so a non-idempotent change
+(a counter increment) is applied once. A position the journal no longer
+holds while the copy runs is `RetentionLost`: take a new cut.
+
+Copy the view into a new generation of the destination, apply the
+continuation, and publish the generation together with the consumer's
+progress in one destination write, only once `StateCut::joined` returns the
+position: publishing earlier would certify a prefix the view already
+passed. Building a new generation rather than updating the old one in place
+is what removes the rows deleted at the source. From the joined position on,
+the consumer reads the journal as before. The cut pins its view until it is
+dropped, and a cut is bound to its database's history: read against another
+database it is refused.
+
+```rust,no_run
+use std::time::Duration;
+use coordinode_embed::Database;
+use coordinode_storage::engine::partition::Partition;
+
+# fn main() -> Result<(), coordinode_embed::DatabaseError> {
+let db = Database::open("/var/lib/myapp/graph")?;
+let mut cut = db.state_cut(Duration::from_secs(10))?;
+let mut after: Option<Vec<u8>> = None;
+loop {
+    let page = db.state_cut_scan(&cut, Partition::Node, b"node:", after.as_deref(), 1024)?;
+    let Some((last, _)) = page.last() else { break };
+    after = Some(last.clone());
+    // ...write `page` into the destination's new generation.
+}
+let progress = loop {
+    let batch = db.state_cut_tail(&mut cut, 256)?;
+    // ...apply `batch.units` to the new generation.
+    if let Some(position) = batch.joined {
+        break position;
+    }
+};
+// ...publish the new generation and `progress` in one destination write.
+# let _ = progress;
+# Ok(())
+# }
+```
+
+A member of a replicated group (with the `replication` feature) takes its
+cut of the group's log the same way: the view is below the group's closed
+bound, and the continuation reads the log this member applied.
+
 ## Blobs
 
 Large binary objects are stored by id beside the graph. Each upload is its own

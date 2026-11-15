@@ -58,6 +58,7 @@ mod integration {
     mod schema;
     mod schema_publication;
     mod shared_engine;
+    mod state_cut;
     mod temporal_node_reads;
     mod temporal_strict_schema;
     mod temporal_traversal;

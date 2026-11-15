@@ -4304,6 +4304,13 @@ impl StorageEngine {
         })
     }
 
+    /// The last entry of its group's log this member applied and accounts
+    /// for; `0` before any. A reader of the log stops after it: an entry past
+    /// it may never commit.
+    pub fn group_applied_through(&self) -> u64 {
+        self.closure.lock().ledger.last_index()
+    }
+
     /// [`Self::fixed_cut`] of a member applying its group's log. `L` is the
     /// applied prefix, and the commit ceiling of that prefix is the lowest
     /// bound the view may take. The bound and the join end come from one
@@ -4371,7 +4378,7 @@ impl StorageEngine {
         cut: &crate::engine::fixed_cut::FixedCut,
         from: u64,
         entries: u64,
-    ) -> StorageResult<Vec<crate::engine::fixed_cut::CutUnit>> {
+    ) -> StorageResult<crate::engine::fixed_cut::CutRead> {
         let Some(oplog) = &self.oplog else {
             return Err(StorageError::InvalidConfig(
                 "the store keeps no journal".into(),
@@ -4393,7 +4400,17 @@ impl StorageEngine {
             let read = journal.read_range(from, from.saturating_add(entries))?;
             (hold, read)
         };
-        self.cut_units_of(cut, &read)
+        let next = match read.last() {
+            Some(last) => last
+                .index
+                .checked_add(1)
+                .ok_or_else(|| StorageError::Io("the journal index overflowed".into()))?,
+            None => from,
+        };
+        Ok(crate::engine::fixed_cut::CutRead {
+            units: self.cut_units_of(cut, &read)?,
+            next,
+        })
     }
 
     /// The units `entries` carry, entries of this store's own journal or of

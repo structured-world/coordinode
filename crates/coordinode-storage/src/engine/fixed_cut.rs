@@ -88,6 +88,17 @@ pub struct CutUnit {
     pub in_view: bool,
 }
 
+/// A read of a cut's continuation: its units, and the position the next
+/// read starts at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutRead {
+    /// The units of the entries read, in log order.
+    pub units: Vec<CutUnit>,
+    /// The position after the last entry read; where it started when the
+    /// journal held nothing more yet.
+    pub next: u64,
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests;

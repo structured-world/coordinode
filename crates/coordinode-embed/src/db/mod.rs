@@ -4162,6 +4162,7 @@ mod index_builds;
 mod index_maintenance;
 mod interactive;
 mod package;
+mod state_cut;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use blob::{BlobId, GroupMembers, UploadedBlob};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
@@ -4181,6 +4182,7 @@ pub use package::{
     PackageConstraint, PublishedObject, Readiness, SchemaPackage, SchemaPublication,
     SchemaReadiness,
 };
+pub use state_cut::{CutBatch, StateCut};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
