@@ -262,7 +262,7 @@ fn a_continuation_read_keeps_to_its_budget() {
     let whole = read(&engine, &cut, cut.first(), usize::MAX);
     assert_eq!(whole.units.len(), 200);
     // Room for the reader and a part of the entries.
-    let limit = 32 << 10;
+    let limit = 64 << 10;
     let small = QueryBudget::new(limit);
     let (part, charge) = engine
         .cut_read(&cut, cut.first(), usize::MAX, &small)
@@ -656,12 +656,12 @@ fn a_scope_without_a_successor_clips_to_the_end_of_the_key_space() {
     let all = super::CutScope::rows(Partition::Counter, Vec::new()).expect("scope");
     assert_eq!(
         all.clip_range(b"a", b"z"),
-        Some((b"a".to_vec(), b"z".to_vec()))
+        Some((b"a".as_slice(), b"z".as_slice()))
     );
     let top = super::CutScope::rows(Partition::Counter, vec![0xFF]).expect("scope");
     assert_eq!(
         top.clip_range(&[0x00], &[0xFF, 0x01]),
-        Some((vec![0xFF], vec![0xFF, 0x01]))
+        Some(([0xFF].as_slice(), [0xFF, 0x01].as_slice()))
     );
     assert_eq!(
         top.clip_range(&[0x00], &[0xFE]),

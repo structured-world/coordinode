@@ -646,6 +646,37 @@ pub fn decode_proposal_sized(
     frame: &[u8],
     limits: &DecodeLimits,
 ) -> Result<(RaftProposal, usize), FrameError> {
+    decode_with(frame, limits, Objects::Decode)
+}
+
+/// [`decode_proposal_sized`] for a reader that keeps only the row changes
+/// and the operation commands of a proposal: its metadata commands and
+/// DERIVED index work are read to their ends and left out, never decoded
+/// into objects, so what the proposal holds is its row changes and the
+/// bytes they expanded to. The operations kept keep their order.
+///
+/// # Errors
+///
+/// As [`decode_proposal`].
+pub fn decode_proposal_rows(
+    frame: &[u8],
+    limits: &DecodeLimits,
+) -> Result<(RaftProposal, usize), FrameError> {
+    decode_with(frame, limits, Objects::Skip)
+}
+
+/// Whether a decoder builds the objects of commands and DERIVED work.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Objects {
+    Decode,
+    Skip,
+}
+
+fn decode_with(
+    frame: &[u8],
+    limits: &DecodeLimits,
+    objects: Objects,
+) -> Result<(RaftProposal, usize), FrameError> {
     if frame.len() > limits.max_frame_bytes {
         return Err(FrameError::OverLimit {
             what: "frame size",
@@ -686,11 +717,13 @@ pub fn decode_proposal_sized(
         literals: Vec::new(),
         expanded: 0,
         limit: limits.max_expanded_bytes,
+        objects,
     };
     let mut mutations = Vec::with_capacity(op_count);
     for _ in 0..op_count {
-        let op = decoder.op(&mutations)?;
-        mutations.push(op);
+        if let Some(op) = decoder.op(&mutations)? {
+            mutations.push(op);
+        }
     }
     let left = decoder.reader.remaining();
     if left != 0 {
@@ -770,6 +803,7 @@ struct Decoder<'a> {
     literals: Vec<&'a [u8]>,
     expanded: usize,
     limit: usize,
+    objects: Objects,
 }
 
 impl<'a> Decoder<'a> {
@@ -788,35 +822,47 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn op(&mut self, earlier: &[Mutation]) -> Result<Mutation, FrameError> {
+    /// The next operation; `None` for one a reader of rows leaves out.
+    fn op(&mut self, earlier: &[Mutation]) -> Result<Option<Mutation>, FrameError> {
         let tag = self.reader.u8()?;
         let kind = tag & KIND_MASK;
         if kind == KIND_DERIVE {
             if tag != KIND_DERIVE {
                 return Err(FrameError::UnknownTag(tag));
             }
-            return self.derive(earlier).map(Mutation::Derive);
+            if self.objects == Objects::Skip {
+                self.skip_derive()?;
+                return Ok(None);
+            }
+            return self
+                .derive(earlier)
+                .map(|work| Some(Mutation::Derive(work)));
         }
         if kind == KIND_COMMAND {
             if tag != KIND_COMMAND {
                 return Err(FrameError::UnknownTag(tag));
             }
             let len = self.reader.len_at_most(self.limit, "command size")?;
-            self.spend(len)?;
             let bytes = self.reader.take(len)?;
+            if self.objects == Objects::Skip {
+                return Ok(None);
+            }
+            self.spend(len)?;
             let command =
                 rmp_serde::from_slice(bytes).map_err(|e| FrameError::Command(e.to_string()))?;
-            return Ok(Mutation::Command(command));
+            return Ok(Some(Mutation::Command(command)));
         }
         if kind == KIND_OPERATION {
             if tag != KIND_OPERATION {
                 return Err(FrameError::UnknownTag(tag));
             }
-            return self.operation().map(Mutation::Operation);
+            return self
+                .operation()
+                .map(|command| Some(Mutation::Operation(command)));
         }
         let p = usize::from(tag >> 3);
         let partition = *PARTITIONS.get(p).ok_or(FrameError::UnknownTag(tag))?;
-        match kind {
+        let row = match kind {
             KIND_PUT => Ok(Mutation::Put {
                 partition,
                 key: self.key(p)?,
@@ -837,7 +883,35 @@ impl<'a> Decoder<'a> {
                 end: self.key(p)?,
             }),
             _ => Err(FrameError::UnknownTag(tag)),
+        };
+        row.map(Some)
+    }
+
+    /// Read DERIVED work to its end without decoding it: its literals still
+    /// join the table later operations refer to.
+    fn skip_derive(&mut self) -> Result<(), FrameError> {
+        // The binding.
+        self.raw_slice()?;
+        let _node_id = self.reader.varint()?;
+        match self.reader.u8()? {
+            OWNER_NODE => {}
+            OWNER_VERSION => {
+                self.reader.take(8)?;
+            }
+            other => return Err(FrameError::UnknownTag(other)),
         }
+        // The old membership.
+        self.raw_slice()?;
+        match self.reader.u8()? {
+            SOURCE_UNIT_RECORD => {
+                self.reader.varint()?;
+            }
+            SOURCE_VALUES => {
+                self.raw_slice()?;
+            }
+            other => return Err(FrameError::UnknownTag(other)),
+        }
+        Ok(())
     }
 
     /// An operation command [`encode_operation`] wrote.
@@ -945,23 +1019,29 @@ impl<'a> Decoder<'a> {
 
     /// A literal or a reference to one, counted against the budget.
     fn slice(&mut self) -> Result<&'a [u8], FrameError> {
+        let slice = self.raw_slice()?;
+        self.spend(slice.len())?;
+        Ok(slice)
+    }
+
+    /// A literal or a reference to one, as in the frame: nothing is built
+    /// from it, so nothing is counted.
+    fn raw_slice(&mut self) -> Result<&'a [u8], FrameError> {
         let v = self.reader.varint()?;
         if v & 1 == 1 {
             let index = usize::try_from(v >> 1).unwrap_or(usize::MAX);
             let count = self.literals.len();
-            let slice = *self
+            return self
                 .literals
                 .get(index)
-                .ok_or(FrameError::BadReference { index, count })?;
-            self.spend(slice.len())?;
-            return Ok(slice);
+                .copied()
+                .ok_or(FrameError::BadReference { index, count });
         }
         let len = usize::try_from(v >> 1).map_err(|_| FrameError::OverLimit {
             what: "value size",
             limit: self.limit,
         })?;
         let slice = self.reader.take(len)?;
-        self.spend(len)?;
         if len >= MIN_SHARED {
             self.literals.push(slice);
         }

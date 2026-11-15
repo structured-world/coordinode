@@ -24,6 +24,9 @@ use crate::error::{StorageError, StorageResult};
 pub struct CutScope {
     partition: Partition,
     prefix: Vec<u8>,
+    /// The least key past every key under the prefix; `None` when the scope
+    /// reaches the end of the key space.
+    end: Option<Vec<u8>>,
 }
 
 impl CutScope {
@@ -44,7 +47,11 @@ impl CutScope {
                 reason: format!("the {partition:?} partition is not a row scope"),
             });
         }
-        Ok(Self { partition, prefix })
+        Ok(Self {
+            partition,
+            end: prefix_successor(&prefix),
+            prefix,
+        })
     }
 
     /// The partition.
@@ -75,16 +82,26 @@ impl CutScope {
     }
 
     /// The part of `[start, end)` inside the scope, `None` when nothing of
-    /// it is. Keys under the prefix sort from the prefix up to its
+    /// it is: bounds borrowed from the range or the scope, copied by whoever
+    /// keeps them. Keys under the prefix sort from the prefix up to its
     /// successor, or to the end of the key space when it has none.
-    pub(crate) fn clip_range(&self, start: &[u8], end: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    pub(crate) fn clip_range<'s>(
+        &'s self,
+        start: &'s [u8],
+        end: &'s [u8],
+    ) -> Option<(&'s [u8], &'s [u8])> {
         let lo = start.max(self.prefix.as_slice());
-        let successor = prefix_successor(&self.prefix);
-        let hi = match &successor {
+        let hi = match &self.end {
             Some(after) => end.min(after.as_slice()),
             None => end,
         };
-        (lo < hi).then(|| (lo.to_vec(), hi.to_vec()))
+        (lo < hi).then_some((lo, hi))
+    }
+
+    /// The least key past every key under the prefix; `None` when the scope
+    /// reaches the end of the key space.
+    pub(crate) fn end(&self) -> Option<&[u8]> {
+        self.end.as_deref()
     }
 }
 

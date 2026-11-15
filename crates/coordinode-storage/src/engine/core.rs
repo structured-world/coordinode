@@ -4556,8 +4556,16 @@ impl StorageEngine {
             used: budget.memory_used(),
             limit: budget.memory_limit(),
         };
-        // A segment's read buffer and the one path a search holds.
-        let reader = FRAME_CURSOR_BUFFER as u64 + READER_PATH_ROOM;
+        // A segment's read buffer, the one path a search holds, and a point
+        // read of the Schema tree deciding a unit's operation binding: a
+        // marker of an empty value under a short key.
+        let marker = crate::engine::operations::skipped_unit_key(
+            coordinode_core::txn::operation::LogPosition { index: 0, sub: 0 },
+        )
+        .len() as u64;
+        let reader = FRAME_CURSOR_BUFFER as u64
+            + READER_PATH_ROOM
+            + self.scan_hold_bytes(Partition::Schema, marker)?;
         charge.grow(reader).map_err(StorageError::Budget)?;
         'log: while next < until && taken < max_entries {
             let at = next;
@@ -4710,12 +4718,25 @@ impl StorageEngine {
             Some(after) if after >= prefix => Bound::Excluded(after),
             _ => Bound::Included(prefix),
         };
-        let end = crate::engine::fixed_cut::prefix_successor(prefix);
-        let hi = end.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+        let hi = cut.scope.end().map_or(Bound::Unbounded, Bound::Excluded);
         let mut page: crate::engine::fixed_cut::CutRows = Vec::new();
         let mut charge = budget.empty_charge();
-        // The scan's own state while the page is read.
-        charge.grow(PAGE_SCAN_ROOM).map_err(StorageError::Budget)?;
+        let refused = || {
+            StorageError::Budget(coordinode_core::budget::BudgetStop::Memory {
+                requested: 0,
+                used: budget.memory_used(),
+                limit: budget.memory_limit(),
+            })
+        };
+        // What the scan holds while the page is read, for the tree's runs as
+        // they stand and the longest row the page can then still take.
+        debug_assert!(budget.memory_used() <= budget.memory_limit());
+        // A budget refuses every reservation past its limit.
+        let room = budget.memory_limit() - budget.memory_used();
+        let Some((scan, longest)) = self.scan_room(cut.scope.partition(), room)? else {
+            return Err(refused());
+        };
+        charge.grow(scan).map_err(StorageError::Budget)?;
         let row_slot = core::mem::size_of::<(Vec<u8>, Vec<u8>)>();
         for guard in self.scan_range_at(cut.scope.partition(), lo, hi, cut.bound)? {
             if page.len() >= max_rows {
@@ -4724,16 +4745,23 @@ impl StorageEngine {
             // Shared with the block they were read from: nothing is copied
             // until the row is known to fit.
             let (key, value) = guard.into_inner()?;
+            // Slices of memory that exists: their lengths fit in u64.
+            let row = (key.len() + value.len()) as u64;
+            // A row longer than the scan was given room for is not taken.
+            if row > longest {
+                if page.is_empty() {
+                    return Err(refused());
+                }
+                break;
+            }
             // The row's copies, and the page's room for it when the page is
-            // full: it grows before the row is copied. Slices of memory that
-            // exists: their lengths fit in u64.
+            // full: it grows before the row is copied.
             let more = if page.len() == page.capacity() {
                 page.capacity().max(4)
             } else {
                 0
             };
-            let size = (key.len() + value.len() + more * row_slot) as u64;
-            if let Err(stop) = charge.grow(size) {
+            if let Err(stop) = charge.grow(row + (more * row_slot) as u64) {
                 if page.is_empty() {
                     return Err(StorageError::Budget(stop));
                 }
@@ -4742,7 +4770,7 @@ impl StorageEngine {
             page.reserve_exact(more);
             page.push((key.to_vec(), value.to_vec()));
         }
-        charge.shrink(PAGE_SCAN_ROOM);
+        charge.shrink(scan);
         // A repair that replaced the tree while the page was read leaves
         // rows of another copy in it: the page is not handed over.
         self.scope_view_intact(cut)?;
@@ -4895,7 +4923,9 @@ impl StorageEngine {
                     entry.index
                 )))
             })?;
-            let (unit, expanded) = match coordinode_core::txn::frame::decode_proposal_sized(
+            // A reader of rows: the unit's metadata commands and DERIVED work
+            // are read to their ends and never built.
+            let (unit, expanded) = match coordinode_core::txn::frame::decode_proposal_rows(
                 frame,
                 &pool.decode_limits(),
             ) {
@@ -4925,6 +4955,7 @@ impl StorageEngine {
                 mutations.clear();
             }
             // Kept in place: no second list is built.
+            let mut no_room = false;
             mutations.retain_mut(|m| match m {
                 Mutation::Put { partition, key, .. }
                 | Mutation::Delete { partition, key }
@@ -4932,23 +4963,32 @@ impl StorageEngine {
                     scope.holds_partition(*partition) && scope.holds_key(key)
                 }
                 // Only the part inside the scope: the rest deletes rows the
-                // consumer does not hold.
+                // consumer does not hold. Bounds that change are copied once
+                // their room is taken from the pool: a clipped bound can be
+                // longer than the one it replaces.
                 Mutation::RemoveRange {
                     partition,
                     start,
                     end,
-                } => match scope
-                    .holds_partition(*partition)
-                    .then(|| scope.clip_range(start, end))
-                    .flatten()
-                {
-                    Some((clipped_start, clipped_end)) => {
-                        *start = clipped_start;
-                        *end = clipped_end;
-                        true
+                } => {
+                    if !scope.holds_partition(*partition) {
+                        return false;
                     }
-                    None => false,
-                },
+                    let Some((lo, hi)) = scope.clip_range(start, end) else {
+                        return false;
+                    };
+                    if (lo, hi) == (start.as_slice(), end.as_slice()) {
+                        return true;
+                    }
+                    if no_room || !pool.retain((lo.len() + hi.len()) as u64) {
+                        no_room = true;
+                        return false;
+                    }
+                    let (lo, hi) = (lo.to_vec(), hi.to_vec());
+                    *start = lo;
+                    *end = hi;
+                    true
+                }
                 // Its effects land in the schema partition, which no row
                 // scope is.
                 Mutation::Command(_) => false,
@@ -4957,6 +4997,9 @@ impl StorageEngine {
                 // Decides the unit, already read as `refused`.
                 Mutation::Operation(_) => false,
             });
+            if no_room {
+                return Err(EntryOutcome::NoRoom);
+            }
             if units.len() == units.capacity() {
                 let more = units.capacity().max(4);
                 if !pool
@@ -6653,6 +6696,15 @@ impl StorageEngine {
     ///
     /// The partition's tree is not open.
     pub fn scan_hold_bytes(&self, part: Partition, longest_record: u64) -> StorageResult<u64> {
+        let (fixed, per_record_byte) = self.scan_hold_terms(part)?;
+        // Runs are bounded by the tree's levels, a record by the engine's
+        // key and value limits: far below u64::MAX.
+        Ok(fixed + per_record_byte * longest_record)
+    }
+
+    /// What one scan of `part` holds, as a fixed part and a part per byte
+    /// of its longest record: [`Self::scan_hold_bytes`] is their sum.
+    fn scan_hold_terms(&self, part: Partition) -> StorageResult<(u64, u64)> {
         use lsm_tree::AbstractTree as _;
         // The read's own state and memtable iterators.
         const READS_FIXED: u64 = 16 << 10;
@@ -6673,10 +6725,29 @@ impl StorageEngine {
             .map(|level| level.run_count() as u64)
             .sum::<u64>()
             + 1;
-        // A data block holds at most one record past its size. Runs are
-        // bounded by the tree's levels, a record by the engine's key and
-        // value limits: far below u64::MAX.
-        Ok(READS_FIXED + READS_PER_RUN * runs * (TABLE_READ + longest_record))
+        // A data block holds at most one record past its size.
+        Ok((
+            READS_FIXED + READS_PER_RUN * runs * TABLE_READ,
+            READS_PER_RUN * runs,
+        ))
+    }
+
+    /// For a scan of `part` given `room` bytes in all: what the scan holds
+    /// and the longest record it can then still hand over a copy of, the
+    /// two together within `room`. `None` when `room` does not cover the
+    /// scan with a record of one byte.
+    ///
+    /// # Errors
+    ///
+    /// The partition's tree is not open.
+    pub fn scan_room(&self, part: Partition, room: u64) -> StorageResult<Option<(u64, u64)>> {
+        let (fixed, per_record_byte) = self.scan_hold_terms(part)?;
+        // The scan holds `per_record_byte` bytes per byte of the record, and
+        // the copy handed over one more.
+        let longest = room
+            .checked_sub(fixed)
+            .map_or(0, |left| left / (per_record_byte + 1));
+        Ok((longest > 0).then(|| (fixed + per_record_byte * longest, longest)))
     }
 
     /// Physically reset a partition to empty: install a fresh empty version and
@@ -8755,14 +8826,9 @@ enum EntryOutcome {
     Failed(StorageError),
 }
 
-/// What a continuation read holds besides its segment buffer and the
-/// entries it takes: the path of the segment it reads and the point reads
-/// that decide its units' operation bindings.
-const READER_PATH_ROOM: u64 = 16 << 10;
-
-/// What a page's scan holds while it reads: its iterator over the tree's
-/// levels and the block of each it stands in.
-const PAGE_SCAN_ROOM: u64 = 64 << 10;
+/// The path of the segment a continuation read holds while it reads it: no
+/// longer than a path the operating system takes.
+const READER_PATH_ROOM: u64 = 4 << 10;
 
 /// The bit of `partition` in [`StorageEngine::under_repair`]: its place in
 /// [`Partition::all`], which holds far fewer than 64 partitions.

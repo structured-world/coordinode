@@ -379,6 +379,54 @@ fn derive(node_id: u64, new: DerivedSource) -> Mutation {
     })
 }
 
+/// A reader of rows gets the row changes and operation commands of a frame
+/// in their order, its metadata commands and DERIVED work left out and not
+/// counted, and literals the left-out work introduced still serve the
+/// operations that refer to them.
+#[test]
+fn a_reader_of_rows_leaves_commands_and_derived_work_out() {
+    let issuer = IssuerId([3; ISSUER_ID_LEN]);
+    let op = OperationId {
+        issuer,
+        incarnation: 1,
+        sequence: 7,
+    };
+    let bind = Mutation::Operation(OperationCommand::Bind(OperationBinding {
+        op,
+        intent: IntentDigest([6; INTENT_DIGEST_LEN]),
+        attempt: 1,
+    }));
+    let full = proposal(vec![
+        derive(1, DerivedSource::Values(None)),
+        derive(2, DerivedSource::Values(None)),
+        put(PartitionId::Node, b"node:1:42", b"record-bytes"),
+        Mutation::Command(MetadataCommand::RegisterFields {
+            names: vec!["email".into(); 64],
+        }),
+        bind.clone(),
+        derive(42, DerivedSource::UnitRecord(2)),
+        put(PartitionId::Node, b"node:1:43", b"record-bytes"),
+    ]);
+    let frame = encode_proposal(&full).expect("encode");
+    let (whole, whole_expanded) =
+        decode_proposal_sized(&frame, &DecodeLimits::DEFAULT).expect("decode");
+    assert_eq!(whole, full);
+    let (rows, rows_expanded) = decode_proposal_rows(&frame, &DecodeLimits::DEFAULT).expect("rows");
+    assert_eq!(
+        rows.mutations,
+        vec![
+            put(PartitionId::Node, b"node:1:42", b"record-bytes"),
+            bind,
+            put(PartitionId::Node, b"node:1:43", b"record-bytes"),
+        ]
+    );
+    assert_eq!((rows.id, rows.commit_ts), (full.id, full.commit_ts));
+    assert!(
+        rows_expanded < whole_expanded,
+        "left-out work is not counted: {rows_expanded} of {whole_expanded}"
+    );
+}
+
 /// An owner tag that is neither a node nor a version is refused by the
 /// decoder rather than read as some other owner.
 #[test]
