@@ -352,6 +352,140 @@ pub fn read_frames_from(path: &Path, offset: u64) -> StorageResult<Vec<(OplogEnt
         .collect())
 }
 
+/// What [`FrameCursor::peek`] finds at the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Peeked {
+    /// A frame whose payload is `len` bytes, holding log entry `index`.
+    Frame { len: u64, index: u64 },
+    /// No complete frame: the end of the segment's frames (its footer, or a
+    /// write in progress), or a frame that does not decode.
+    End,
+}
+
+/// Reads one segment's frames one at a time, from its first frame on, so a
+/// reader allocates for the frames it takes and none for those it passes:
+/// a frame's length and log index are read before its payload is.
+pub(crate) struct FrameCursor {
+    file: io::BufReader<std::fs::File>,
+    path: PathBuf,
+    /// The segment's length when opened: frames past it are not read.
+    len: u64,
+    /// Where the frame at the cursor starts.
+    at: u64,
+    /// The peeked frame: its payload's start and length.
+    peeked: Option<(u64, u64)>,
+}
+
+impl FrameCursor {
+    /// A cursor on the first frame of the segment at `path`.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be opened, or its header is not a segment header of
+    /// this format.
+    pub(crate) fn open(path: &Path) -> StorageResult<Self> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| StorageError::Io(format!("open segment {path:?}: {e}")))?;
+        let len = file
+            .metadata()
+            .map_err(|e| StorageError::Io(format!("stat segment {path:?}: {e}")))?
+            .len();
+        let mut file = io::BufReader::new(file);
+        let mut header = [0u8; HEADER_SIZE as usize];
+        file.read_exact(&mut header)
+            .map_err(|e| StorageError::Io(format!("read segment header {path:?}: {e}")))?;
+        check_header(&header, path)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            len,
+            at: HEADER_SIZE,
+            peeked: None,
+        })
+    }
+
+    /// The frame at the cursor: its payload's length and its entry's log
+    /// index, read without the rest of the payload.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read.
+    pub(crate) fn peek(&mut self) -> StorageResult<Peeked> {
+        self.seek(self.at)?;
+        let Ok(len) = decode_varint(&mut self.file) else {
+            return Ok(Peeked::End);
+        };
+        let start = self.position()?;
+        let fits = len
+            .checked_add(4)
+            .and_then(|n| start.checked_add(n))
+            .is_some_and(|end| end <= self.len);
+        if !fits {
+            return Ok(Peeked::End);
+        }
+        // An entry is encoded as the array of its fields: its timestamp,
+        // term and index come first.
+        let mut payload = (&mut self.file).take(len);
+        let index = (|| {
+            rmp::decode::read_array_len(&mut payload).ok()?;
+            let _ts: u64 = rmp::decode::read_int(&mut payload).ok()?;
+            let _term: u64 = rmp::decode::read_int(&mut payload).ok()?;
+            rmp::decode::read_int::<u64, _>(&mut payload).ok()
+        })();
+        let Some(index) = index else {
+            return Ok(Peeked::End);
+        };
+        self.peeked = Some((start, len));
+        Ok(Peeked::Frame { len, index })
+    }
+
+    /// Move past the peeked frame without reading its payload.
+    pub(crate) fn skip(&mut self) {
+        if let Some((start, len)) = self.peeked.take() {
+            self.at = start + len + 4;
+        }
+    }
+
+    /// Read the peeked frame's entry and move past it; `None` when its
+    /// checksum fails or it does not decode.
+    ///
+    /// # Errors
+    ///
+    /// Nothing was peeked, or the file cannot be read.
+    pub(crate) fn read(&mut self) -> StorageResult<Option<OplogEntry>> {
+        let (start, len) = self
+            .peeked
+            .take()
+            .ok_or_else(|| StorageError::Io("a frame is read before it is peeked".into()))?;
+        self.seek(start)?;
+        // Within the segment's length, checked by the peek.
+        let mut payload = vec![0u8; len as usize];
+        let mut crc = [0u8; 4];
+        self.file
+            .read_exact(&mut payload)
+            .and_then(|()| self.file.read_exact(&mut crc))
+            .map_err(|e| StorageError::Io(format!("read segment {:?}: {e}", self.path)))?;
+        self.at = start + len + 4;
+        if crc32fast::hash(&payload) != u32::from_le_bytes(crc) {
+            return Ok(None);
+        }
+        Ok(OplogEntry::decode(&payload).ok())
+    }
+
+    fn seek(&mut self, to: u64) -> StorageResult<()> {
+        self.file
+            .seek(SeekFrom::Start(to))
+            .map(drop)
+            .map_err(|e| StorageError::Io(format!("seek segment {:?}: {e}", self.path)))
+    }
+
+    fn position(&mut self) -> StorageResult<u64> {
+        self.file
+            .stream_position()
+            .map_err(|e| StorageError::Io(format!("seek segment {:?}: {e}", self.path)))
+    }
+}
+
 /// Up to `len` bytes of the file at `path` from byte `offset`, fewer at its
 /// end.
 ///

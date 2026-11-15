@@ -299,6 +299,10 @@ pub struct StorageEngine {
     /// the engine; read by whatever replaces or copies a partition at an
     /// exact log position. Written once per state machine open.
     raft_fence: parking_lot::RwLock<Option<Arc<dyn raft_coverage::RaftApplyFence>>>,
+    /// The group whose log the member running over the engine applies, set
+    /// when its node opens: with the deployment, the history its log
+    /// positions count entries of.
+    log_group: parking_lot::RwLock<Option<coordinode_core::group::GroupId>>,
     /// The lowest Raft log index the latest local checkpoint's trees may
     /// lack, which a partition rebuild from that checkpoint replays from;
     /// the log keeps it. `u64::MAX` when no checkpoint needs any.
@@ -1772,6 +1776,7 @@ impl StorageEngine {
             write_pressure,
             memtable_pressure,
             raft_fence: parking_lot::RwLock::new(None),
+            log_group: parking_lot::RwLock::new(None),
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
             promise_copy: parking_lot::Mutex::new(crate::engine::promise::CopyWriter::default()),
@@ -4316,7 +4321,7 @@ impl StorageEngine {
             first,
             bound,
             join_end,
-            history: self.journal_history()?,
+            history: self.known_cut_history()?,
             scope,
             _pin: pin,
         })
@@ -4379,7 +4384,7 @@ impl StorageEngine {
             first,
             bound,
             join_end,
-            history: self.journal_history()?,
+            history: self.known_cut_history()?,
             scope,
             _pin: pin,
         })
@@ -4448,10 +4453,10 @@ impl StorageEngine {
     }
 
     /// Read `cut`'s continuation from this store's own journal at `from`:
-    /// at most `max_entries` entries of at most `max_bytes` encoded bytes,
-    /// only of entries applied and durable. An entry not yet applied may
-    /// still be refused by its operation binding, and one not yet durable
-    /// may be lost: neither is handed over until it is settled.
+    /// at most `max_entries` entries, within `budget`, only of entries
+    /// applied and durable. An entry not yet applied may still be refused by
+    /// its operation binding, and one not yet durable may be lost: neither
+    /// is handed over until it is settled.
     ///
     /// The journal is held from `from` for the read only, and its lock only
     /// while the hold and the readable end are taken: the segments are read
@@ -4462,13 +4467,16 @@ impl StorageEngine {
     /// [`StorageError::RetentionLost`] when `from` is no longer held;
     /// [`StorageError::InvalidConfig`] for a store without a journal; see
     /// [`Self::cut_read_log`].
-    pub fn cut_read(
+    pub fn cut_read<'b>(
         &self,
         cut: &crate::engine::fixed_cut::FixedCut,
         from: u64,
         max_entries: usize,
-        max_bytes: u64,
-    ) -> StorageResult<crate::engine::fixed_cut::CutRead> {
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::fixed_cut::CutRead,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
         self.held_cut(cut)?;
         let (Some(oplog), Some(coverage)) = (&self.oplog, &self.coverage) else {
             return Err(StorageError::InvalidConfig(
@@ -4492,69 +4500,177 @@ impl StorageEngine {
             let until = journal.durable_below().min(coverage.applied_prefix());
             (hold, journal.dir().to_path_buf(), until)
         };
-        self.cut_read_log(cut, &[dir], from, until, max_entries, max_bytes)
+        self.cut_read_log(cut, &[dir], from, until, max_entries, budget)
     }
 
     /// Read `cut`'s continuation from the log segments in `dirs`, from
-    /// `from` up to (not including) `until`, the end of what the reader may
-    /// be given: at most `max_entries` entries of at most `max_bytes` encoded
-    /// bytes. The caller holds the log from `from`.
+    /// `from` up to (not including) `until`, the end of what is confirmed:
+    /// at most `max_entries` entries, within `budget`. The units handed over
+    /// keep their memory charged to `budget` through the returned charge.
+    ///
+    /// Frames are read one at a time, each frame's length checked against
+    /// the budget before its payload is read and each unit decoded within
+    /// what is left of it, so the read holds no more than it hands over plus
+    /// one frame. A read stops before an entry that does not fit, which a
+    /// later read with more room takes. Every confirmed entry is either
+    /// handed over or accounted for: one the log no longer holds is
+    /// [`StorageError::RetentionLost`], one it holds but cannot read an
+    /// error, never an empty read as if nothing were there yet.
     ///
     /// # Errors
     ///
     /// [`StorageError::CutLost`] for a cut this store does not hold;
-    /// [`StorageError::RetentionLost`] when the log no longer holds `from`;
-    /// [`StorageError::Budget`] for an entry larger than `max_bytes`; see
+    /// [`StorageError::RetentionLost`] when the log no longer holds the next
+    /// entry; [`StorageError::Budget`] when the first entry does not fit the
+    /// budget on its own; a confirmed entry that cannot be read; see
     /// [`Self::cut_units_of`]. On any of them the read hands nothing over.
-    pub fn cut_read_log(
+    pub fn cut_read_log<'b>(
         &self,
         cut: &crate::engine::fixed_cut::FixedCut,
         dirs: &[std::path::PathBuf],
         from: u64,
         until: u64,
         max_entries: usize,
-        max_bytes: u64,
-    ) -> StorageResult<crate::engine::fixed_cut::CutRead> {
-        use crate::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
-        self.held_cut(cut)?;
-        let mut tailer = OplogTailer::new(
-            dirs,
-            ResumeToken {
-                shard_id: 0,
-                segment_id: from,
-                entry_offset: 0,
-            },
-        )?
-        .with_unit_frames()
-        .with_byte_limit(max_bytes);
-        let read: Vec<_> = tailer
-            .read_next(max_entries, &CdcFilters::default(), until)?
-            .into_iter()
-            .map(|(entry, _)| entry)
-            .collect();
-        Ok(crate::engine::fixed_cut::CutRead {
-            units: self.cut_units_of(cut, &read)?,
-            next: tailer.next_index(),
-        })
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::fixed_cut::CutRead,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
+        use crate::oplog::segment::{FrameCursor, Peeked};
+        self.check_cut_history(cut)?;
+        let mut charge = budget.empty_charge();
+        let mut units = Vec::new();
+        let mut next = from;
+        let mut taken = 0usize;
+        // What an entry that does not fit does: the first one is refused,
+        // a later one ends the read before it.
+        let no_room = |stop: coordinode_core::budget::BudgetStop, taken: usize| {
+            if taken == 0 {
+                Err(StorageError::Budget(stop))
+            } else {
+                Ok(())
+            }
+        };
+        'log: while next < until && taken < max_entries {
+            let at = next;
+            let segments = crate::oplog::tailer::list_segments(dirs)?;
+            let held_from = segments.first().map(|&(first, _)| first);
+            let Some((_, path)) = segments.iter().rev().find(|(first, _)| *first <= next) else {
+                return Err(StorageError::RetentionLost {
+                    requested: next,
+                    first_retained: held_from.unwrap_or(until),
+                });
+            };
+            let mut frames = match FrameCursor::open(path) {
+                Ok(frames) => frames,
+                // Purged since it was listed: whether the entry is gone is
+                // read from the log as it stands now.
+                Err(_) if !path.exists() => continue,
+                Err(e) => return Err(e),
+            };
+            loop {
+                let (len, index) = match frames.peek()? {
+                    Peeked::End => break,
+                    Peeked::Frame { len, index } => (len, index),
+                };
+                if index < next {
+                    frames.skip();
+                    continue;
+                }
+                if index > next || next >= until || taken >= max_entries {
+                    break;
+                }
+                // The payload, before it is read.
+                if let Err(stop) = charge.grow(len) {
+                    no_room(stop, taken)?;
+                    break 'log;
+                }
+                let Some(entry) = frames.read()? else {
+                    charge.shrink(len);
+                    break;
+                };
+                // What is left of the budget bounds what the entry's units
+                // may decode to, before they are decoded. A budget refuses
+                // every reservation past its limit, so it holds no more.
+                debug_assert!(budget.memory_used() <= budget.memory_limit());
+                let left = budget.memory_limit() - budget.memory_used();
+                // A budget past the address space bounds nothing more.
+                let left = usize::try_from(left).unwrap_or(usize::MAX);
+                let limits = coordinode_core::txn::frame::DecodeLimits {
+                    max_frame_bytes: coordinode_core::txn::frame::DecodeLimits::DEFAULT
+                        .max_frame_bytes,
+                    max_ops: left
+                        / core::mem::size_of::<coordinode_core::txn::proposal::Mutation>(),
+                    max_expanded_bytes: left,
+                };
+                let decoded = self.units_of_entry(cut, &entry, &limits);
+                drop(entry);
+                charge.shrink(len);
+                let entry_units = match decoded {
+                    Ok(entry_units) => entry_units,
+                    Err(StorageError::Frame(
+                        coordinode_core::txn::frame::FrameError::OverLimit { .. },
+                    )) => {
+                        no_room(
+                            coordinode_core::budget::BudgetStop::Memory {
+                                requested: len,
+                                used: budget.memory_used(),
+                                limit: budget.memory_limit(),
+                            },
+                            taken,
+                        )?;
+                        break 'log;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Err(stop) = charge.grow(units_bytes(&entry_units)) {
+                    no_room(stop, taken)?;
+                    break 'log;
+                }
+                units.extend(entry_units);
+                next = index + 1;
+                taken += 1;
+            }
+            if next == at {
+                // The segment that should hold the next confirmed entry ends
+                // before it: purged meanwhile, or unreadable.
+                let segments = crate::oplog::tailer::list_segments(dirs)?;
+                return Err(match segments.first() {
+                    Some(&(first, _)) if first <= next => StorageError::Io(format!(
+                        "the log holds entry {next}, below its confirmed end {until}, but it \
+                         cannot be read"
+                    )),
+                    first => StorageError::RetentionLost {
+                        requested: next,
+                        first_retained: first.map_or(until, |&(first, _)| first),
+                    },
+                });
+            }
+        }
+        Ok((crate::engine::fixed_cut::CutRead { units, next }, charge))
     }
 
     /// One page of `cut`'s view: the rows of its scope in key order, past
-    /// `after` when given, at most `max_rows` of them and at most
-    /// `max_bytes` of keys and values. The read starts at `after`, not at
-    /// the scope's start, so a page costs what it hands over.
+    /// `after` when given, at most `max_rows` of them, within `budget`; the
+    /// rows keep their memory charged to it through the returned charge.
+    /// The read starts at `after`, not at the scope's start, so a page costs
+    /// what it hands over, and a row's size is checked before it is copied.
     ///
     /// # Errors
     ///
     /// [`StorageError::CutLost`] for a cut this store does not hold;
-    /// [`StorageError::Budget`] for a row larger than `max_bytes` on its
-    /// own; the view no longer readable, or a read that fails.
-    pub fn cut_page(
+    /// [`StorageError::Budget`] for a first row that does not fit the budget
+    /// on its own; the view no longer readable, or a read that fails.
+    pub fn cut_page<'b>(
         &self,
         cut: &crate::engine::fixed_cut::FixedCut,
         after: Option<&[u8]>,
         max_rows: usize,
-        max_bytes: u64,
-    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::fixed_cut::CutRows,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
         use std::ops::Bound;
         self.held_cut(cut)?;
         self.scope_view_intact(cut)?;
@@ -4568,33 +4684,29 @@ impl StorageEngine {
         let end = crate::engine::fixed_cut::prefix_successor(prefix);
         let hi = end.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
         let mut page = Vec::new();
-        let mut taken = 0u64;
+        let mut charge = budget.empty_charge();
         for guard in self.scan_range_at(cut.scope.partition(), lo, hi, cut.bound)? {
             if page.len() >= max_rows {
                 break;
             }
-            let (key, value) = guard.into_owned()?;
+            // Shared with the block they were read from: nothing is copied
+            // until the row is known to fit.
+            let (key, value) = guard.into_inner()?;
             // Slices of memory that exists: their lengths fit in u64.
-            let size = (key.len() + value.len()) as u64;
-            if taken + size > max_bytes {
+            let size =
+                (key.len() + value.len() + core::mem::size_of::<(Vec<u8>, Vec<u8>)>()) as u64;
+            if let Err(stop) = charge.grow(size) {
                 if page.is_empty() {
-                    return Err(StorageError::Budget(
-                        coordinode_core::budget::BudgetStop::Memory {
-                            requested: size,
-                            used: 0,
-                            limit: max_bytes,
-                        },
-                    ));
+                    return Err(StorageError::Budget(stop));
                 }
                 break;
             }
-            taken += size;
-            page.push((key, value.to_vec()));
+            page.push((key.to_vec(), value.to_vec()));
         }
         // A repair that replaced the tree while the page was read leaves
         // rows of another copy in it: the page is not handed over.
         self.scope_view_intact(cut)?;
-        Ok(page)
+        Ok((page, charge))
     }
 
     /// Refuse `cut` once its scope's tree no longer holds the view: a repair
@@ -4647,20 +4759,45 @@ impl StorageEngine {
         cut: &crate::engine::fixed_cut::FixedCut,
         entries: &[crate::oplog::OplogEntry],
     ) -> StorageResult<Vec<crate::engine::fixed_cut::CutUnit>> {
-        use crate::oplog::OplogOp;
-        use coordinode_core::txn::operation::LogPosition;
+        self.check_cut_history(cut)?;
+        let mut units = Vec::new();
+        for entry in entries {
+            units.extend(self.units_of_entry(
+                cut,
+                entry,
+                &coordinode_core::txn::frame::DecodeLimits::DEFAULT,
+            )?);
+        }
+        Ok(units)
+    }
+
+    /// Refuse a cut this store does not hold, or one of another history.
+    fn check_cut_history(&self, cut: &crate::engine::fixed_cut::FixedCut) -> StorageResult<()> {
         self.held_cut(cut)?;
-        if cut.history != self.journal_history()? {
+        if self.cut_history()? != Some(cut.history) {
             return Err(StorageError::InvalidConfig(
                 "the cut was taken of another history".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// [`Self::cut_units_of`] of one entry, each unit decoded within
+    /// `limits`.
+    fn units_of_entry(
+        &self,
+        cut: &crate::engine::fixed_cut::FixedCut,
+        entry: &crate::oplog::OplogEntry,
+        limits: &coordinode_core::txn::frame::DecodeLimits,
+    ) -> StorageResult<Vec<crate::engine::fixed_cut::CutUnit>> {
+        use crate::oplog::OplogOp;
+        use coordinode_core::txn::operation::LogPosition;
         let scope = &cut.scope;
         let unsupported = |index: u64, what: &str| StorageError::CutUnsupported {
             reason: format!("entry {index} carries {what} inside the scope"),
         };
         let mut units = Vec::new();
-        for entry in entries {
+        {
             let mut sub = 0u32;
             for op in &entry.ops {
                 let frame = match op {
@@ -4707,10 +4844,7 @@ impl StorageEngine {
                         entry.index
                     ))
                 })?;
-                let unit = coordinode_core::txn::frame::decode_proposal(
-                    frame,
-                    &coordinode_core::txn::frame::DecodeLimits::DEFAULT,
-                )?;
+                let unit = coordinode_core::txn::frame::decode_proposal(frame, limits)?;
                 let commit_ts = unit.commit_ts.as_raw();
                 let bound = unit
                     .mutations
@@ -4768,9 +4902,64 @@ impl StorageEngine {
         Ok(units)
     }
 
-    /// The identity of the history this store's journal records.
-    fn journal_history(&self) -> StorageResult<Option<coordinode_core::group::DeploymentId>> {
-        crate::engine::metadata::bound_deployment(self)
+    /// Record the group whose log the member running over the engine
+    /// applies, when its node opens.
+    pub fn set_log_group(&self, group: coordinode_core::group::GroupId) {
+        *self.log_group.write() = Some(group);
+    }
+
+    /// The history this store's log positions count entries of: its own
+    /// journal's, named by its deployment, or its group's log. `None` while
+    /// the deployment, or the group of a member, is not known.
+    ///
+    /// # Errors
+    ///
+    /// The deployment record cannot be read.
+    pub fn cut_history(&self) -> StorageResult<Option<crate::engine::fixed_cut::CutHistory>> {
+        use crate::engine::fixed_cut::CutHistory;
+        let Some(deployment) = crate::engine::metadata::bound_deployment(self)? else {
+            return Ok(None);
+        };
+        if self.oplog.is_some() {
+            return Ok(Some(CutHistory::Journal(deployment)));
+        }
+        Ok((*self.log_group.read()).map(|group| {
+            CutHistory::Group(coordinode_core::txn::read_concern::HistoryId { deployment, group })
+        }))
+    }
+
+    /// [`Self::cut_history`] for a cut, which names its history.
+    fn known_cut_history(&self) -> StorageResult<crate::engine::fixed_cut::CutHistory> {
+        self.cut_history()?
+            .ok_or_else(|| StorageError::CutNotReady {
+                reason: "the history of the store's log is not known yet".into(),
+            })
+    }
+
+    /// The position `resume` names in this store's log, where reading of
+    /// `scope` goes on after a cut's join.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a position of another history or
+    /// reached for another scope: it counts entries of another log, or the
+    /// consumer's state covers other rows.
+    pub fn resume_position(
+        &self,
+        resume: &crate::engine::fixed_cut::CutResume,
+        scope: &crate::engine::fixed_cut::CutScope,
+    ) -> StorageResult<u64> {
+        if self.cut_history()? != Some(resume.history) {
+            return Err(StorageError::InvalidConfig(
+                "the position is of another history".into(),
+            ));
+        }
+        if &resume.scope != scope {
+            return Err(StorageError::InvalidConfig(
+                "the position was reached for another scope".into(),
+            ));
+        }
+        Ok(resume.next)
     }
 
     /// Keep the journal from `index` on for a rebuild from the latest local
@@ -8478,6 +8667,33 @@ impl Drop for PartitionRepair<'_> {
             .repair_active
             .fetch_and(!self.bit, core::sync::atomic::Ordering::AcqRel);
     }
+}
+
+/// The memory `units` hold: each unit and mutation, and the bytes their keys,
+/// values and operands own.
+fn units_bytes(units: &[crate::engine::fixed_cut::CutUnit]) -> u64 {
+    use coordinode_core::txn::proposal::Mutation;
+    let owned = |m: &Mutation| match m {
+        Mutation::Put { key, value, .. } => key.len() + value.len(),
+        Mutation::Delete { key, .. } => key.len(),
+        Mutation::Merge { key, operand, .. } => key.len() + operand.len(),
+        Mutation::RemoveRange { start, end, .. } => start.len() + end.len(),
+        // A unit handed over carries only row changes.
+        Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => 0,
+    };
+    let bytes: usize = units
+        .iter()
+        .map(|unit| {
+            core::mem::size_of::<crate::engine::fixed_cut::CutUnit>()
+                + unit
+                    .mutations
+                    .iter()
+                    .map(|m| core::mem::size_of::<Mutation>() + owned(m))
+                    .sum::<usize>()
+        })
+        .sum();
+    // Memory that exists: its size fits in u64.
+    bytes as u64
 }
 
 /// The bit of `partition` in [`StorageEngine::under_repair`]: its place in

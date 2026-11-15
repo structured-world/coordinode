@@ -582,8 +582,9 @@ async fn a_fixed_cut_of_a_group_member_joins_its_log_once() {
     // stops at.
     let until = engine.group_applied_through() + 1;
     let dirs = raft_oplog_dirs(&engine, 0).expect("oplog dirs").all;
-    let read = engine
-        .cut_read_log(&cut, &dirs, cut.first(), until, 1000, u64::MAX)
+    let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
+    let (read, _) = engine
+        .cut_read_log(&cut, &dirs, cut.first(), until, 1000, &budget)
         .expect("log");
     assert!(read.next > cut.join_end(), "the log reaches past the join");
     for unit in read.units.iter().filter(|u| !u.in_view) {
@@ -669,7 +670,10 @@ async fn a_cut_of_a_partition_installed_ahead_or_replaced_is_refused() {
     .await
     .expect("join")
     .expect("install at the applies");
-    let page = engine.cut_page(&cut, None, 16, u64::MAX);
+    let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
+    let page = engine
+        .cut_page(&cut, None, 16, &budget)
+        .map(|(rows, _)| rows);
     assert!(
         matches!(page, Err(StorageError::CutLost { .. })),
         "no page of a replaced view: {page:?}"

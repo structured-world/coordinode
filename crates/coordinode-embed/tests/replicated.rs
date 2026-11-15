@@ -3157,26 +3157,39 @@ async fn a_member_rebuilds_a_counter_through_a_state_cut() {
 
     {
         let db = member.database().read();
-        let view = db.state_cut_scan(&cut, None, 16, u64::MAX).expect("page");
+        let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
+        let view = db.state_cut_scan(&cut, None, 16, &budget).expect("page");
         let mut rebuilt = view
+            .rows()
             .iter()
             .find(|(key, _)| key.as_slice() == KEY)
             .map_or(0, |(_, value)| decode_counter(value).expect("counter"));
         assert_eq!(rebuilt, 11, "the view holds the commits before the cut");
-        loop {
+        let resume = loop {
             let before = cut.next();
-            let batch = db.state_cut_tail(&mut cut, 4, u64::MAX).expect("tail");
-            for unit in &batch.units {
+            let batch = db.state_cut_tail(&mut cut, 4, &budget).expect("tail");
+            for unit in batch.units() {
                 for m in &unit.mutations {
                     if let Mutation::Merge { operand, .. } = m {
                         rebuilt += decode_counter(operand).expect("delta");
                     }
                 }
             }
-            if batch.joined.is_some() && cut.next() == before {
-                break;
+            if let Some(resume) = batch.joined()
+                && cut.next() == before
+            {
+                break resume.clone();
             }
-        }
+        };
+        // The position is of the group's history, not of a journal.
+        assert_eq!(
+            resume.history(),
+            coordinode_embed::consumer::CutHistory::Group(
+                member.member().node().history().unwrap()
+            )
+        );
+        let scope = CutScope::rows(Partition::Counter, b"counter:".to_vec()).unwrap();
+        assert_eq!(db.resume_position(&resume, &scope).unwrap(), cut.next());
         let source = db
             .engine()
             .get(Partition::Counter, KEY)

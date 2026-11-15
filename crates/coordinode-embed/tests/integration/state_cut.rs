@@ -11,11 +11,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use coordinode_core::budget::QueryBudget;
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
 use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_core::txn::write_concern::Journal;
 use coordinode_embed::Database;
-use coordinode_embed::consumer::{CutScope, StateCut};
+use coordinode_embed::consumer::{CutResume, CutScope, StateCut};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_test_fixtures::PowerRig;
@@ -126,29 +127,36 @@ fn source_rows(db: &Database, prefix: &[u8]) -> Rows {
         .collect()
 }
 
+/// The budget each read of these tests runs within.
+fn budget() -> QueryBudget {
+    QueryBudget::new(1 << 20)
+}
+
 /// Copy the cut's view, two keys a page.
 fn copy_view(db: &Database, cut: &StateCut) -> Rows {
     let mut rows = Rows::new();
     let mut after: Option<Vec<u8>> = None;
+    let budget = budget();
     loop {
         let page = db
-            .state_cut_scan(cut, after.as_deref(), 2, u64::MAX)
+            .state_cut_scan(cut, after.as_deref(), 2, &budget)
             .expect("page");
-        let Some((last, _)) = page.last() else {
+        let Some(last) = page.last_key() else {
             return rows;
         };
-        after = Some(last.clone());
-        rows.extend(page);
+        after = Some(last.to_vec());
+        rows.extend(page.rows().iter().cloned());
     }
 }
 
 /// Apply the continuation to `rows`, reading until the join is complete
-/// and the log holds nothing more.
-fn read_continuation(db: &Database, cut: &mut StateCut, rows: &mut Rows) {
+/// and the log holds nothing more; where ordinary reading resumes.
+fn read_continuation(db: &Database, cut: &mut StateCut, rows: &mut Rows) -> CutResume {
+    let budget = budget();
     loop {
         let before = cut.next();
-        let batch = db.state_cut_tail(cut, 4, u64::MAX).expect("tail");
-        for unit in &batch.units {
+        let batch = db.state_cut_tail(cut, 4, &budget).expect("tail");
+        for unit in batch.units() {
             for m in &unit.mutations {
                 match m {
                     Mutation::Put { key, value, .. } => {
@@ -161,8 +169,10 @@ fn read_continuation(db: &Database, cut: &mut StateCut, rows: &mut Rows) {
                 }
             }
         }
-        if batch.joined.is_some() && cut.next() == before {
-            return;
+        if let Some(resume) = batch.joined()
+            && cut.next() == before
+        {
+            return resume.clone();
         }
     }
 }
@@ -229,8 +239,8 @@ fn a_rebuild_through_a_cut_replaces_the_destination_with_the_source() {
         !rows.contains_key(b"node:joined".as_slice()),
         "the write inside the join is above the view"
     );
-    read_continuation(&db, &mut cut, &mut rows);
-    let progress = cut.joined().expect("joined");
+    let resume = read_continuation(&db, &mut cut, &mut rows);
+    let progress = db.resume_position(&resume, &scope(NODES)).expect("resume");
 
     destination.stage(2, &rows);
     destination.publish(2, progress);
@@ -253,8 +263,8 @@ fn power_lost_on_either_side_of_the_publication_leaves_one_projection() {
         .state_cut(scope(NODES), Duration::from_secs(10))
         .expect("cut");
     let mut rows = copy_view(&db, &cut);
-    read_continuation(&db, &mut cut, &mut rows);
-    let progress = cut.joined().expect("joined");
+    let resume = read_continuation(&db, &mut cut, &mut rows);
+    let progress = db.resume_position(&resume, &scope(NODES)).expect("resume");
 
     destination.stage(2, &rows);
     rig.cut(destination.engine);
@@ -284,9 +294,13 @@ fn an_empty_scope_rebuilds_to_absence() {
         .state_cut(scope(b"node:none:"), Duration::from_secs(10))
         .expect("cut");
     let mut rows = copy_view(&db, &cut);
-    read_continuation(&db, &mut cut, &mut rows);
+    let resume = read_continuation(&db, &mut cut, &mut rows);
     destination.stage(2, &rows);
-    destination.publish(2, cut.joined().expect("joined"));
+    destination.publish(
+        2,
+        db.resume_position(&resume, &scope(b"node:none:"))
+            .expect("resume"),
+    );
     assert!(
         destination.rows().is_empty(),
         "nothing of the scope remains"
@@ -320,12 +334,13 @@ fn a_view_is_lost_with_its_database_and_a_new_cut_is_taken() {
         .expect("new cut");
     assert!(new.bound() > old.bound(), "a view of its own");
     assert_eq!(copy_view(&db, &new), source_rows(&db, NODES));
+    let budget = budget();
     assert!(
-        db.state_cut_scan(&old, None, 2, u64::MAX).is_err(),
+        db.state_cut_scan(&old, None, 2, &budget).is_err(),
         "the lost view is not served from the reopened database"
     );
     assert!(
-        db.state_cut_tail(&mut old, 4, u64::MAX).is_err(),
+        db.state_cut_tail(&mut old, 4, &budget).is_err(),
         "nor is its continuation"
     );
 }
@@ -342,8 +357,60 @@ fn a_cut_read_against_another_history_is_refused() {
         .expect("cut");
     b.state_cut(scope(NODES), Duration::from_secs(10))
         .expect("b founds its history");
+    let before = cut.next();
     assert!(
-        b.state_cut_tail(&mut cut, 4, u64::MAX).is_err(),
+        b.state_cut_tail(&mut cut, 4, &budget()).is_err(),
         "another history"
     );
+    assert_eq!(cut.next(), before, "the refusal does not move it");
+}
+
+/// Where reading resumes after a join names its history and scope: given
+/// back for them, refused in another database's log or for another scope,
+/// rather than read as a number of a log it does not count.
+#[test]
+fn a_resume_position_is_given_back_only_for_its_history_and_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = open_source(&dir.path().join("a"));
+    let b = open_source(&dir.path().join("b"));
+    b.state_cut(scope(NODES), Duration::from_secs(10))
+        .expect("b founds its history");
+    let mut cut = a
+        .state_cut(scope(NODES), Duration::from_secs(10))
+        .expect("cut");
+    let mut rows = copy_view(&a, &cut);
+    let resume = read_continuation(&a, &mut cut, &mut rows);
+    assert_eq!(
+        a.resume_position(&resume, &scope(NODES)).expect("resume"),
+        cut.next()
+    );
+    assert!(
+        a.resume_position(&resume, &scope(b"node:other:")).is_err(),
+        "another scope"
+    );
+    assert!(
+        b.resume_position(&resume, &scope(NODES)).is_err(),
+        "another history"
+    );
+}
+
+/// A read refused by its budget does not move the continuation: a later read
+/// with room takes the same entries.
+#[test]
+fn a_read_refused_by_its_budget_leaves_the_continuation_where_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = open_source(&dir.path().join("source"));
+    write_inside_the_join(&db, b"node:joined");
+    let mut cut = db
+        .state_cut(scope(NODES), Duration::from_secs(10))
+        .expect("cut");
+    db.engine().set_cut_bound_hook(None);
+    db.execute_cypher("CREATE (:User {id: 4})").expect("create");
+    let before = cut.next();
+    let tiny = QueryBudget::new(4);
+    assert!(db.state_cut_tail(&mut cut, 4, &tiny).is_err(), "refused");
+    assert_eq!(cut.next(), before, "the refusal does not move it");
+    let mut rows = copy_view(&db, &cut);
+    read_continuation(&db, &mut cut, &mut rows);
+    assert_eq!(rows, source_rows(&db, NODES), "nothing was skipped");
 }

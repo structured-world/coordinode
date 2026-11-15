@@ -101,13 +101,52 @@ pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Keys and values of a cut's view, in key order.
+pub type CutRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// The log a cut's positions count entries of: a store's own journal, named
+/// by the deployment it founded, or one group's consensus log, named by its
+/// history. Positions of different histories are not comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CutHistory {
+    /// The journal of a store of this deployment.
+    Journal(coordinode_core::group::DeploymentId),
+    /// The log of this group of this deployment.
+    Group(coordinode_core::txn::read_concern::HistoryId),
+}
+
+/// Where ordinary change reading resumes after a cut's join: a position in
+/// one history's log, for one scope. Read back with
+/// [`crate::engine::core::StorageEngine::resume_position`], which refuses it
+/// in another history or for another scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutResume {
+    pub(crate) history: CutHistory,
+    pub(crate) scope: CutScope,
+    pub(crate) next: u64,
+}
+
+impl CutResume {
+    /// The history the position counts entries of.
+    #[must_use]
+    pub fn history(&self) -> CutHistory {
+        self.history
+    }
+
+    /// The scope the position was reached for.
+    #[must_use]
+    pub fn scope(&self) -> &CutScope {
+        &self.scope
+    }
+}
+
 /// A pinned view of one history below `bound`, and where its journal
 /// continuation starts and joins. Dropping it releases the view.
 pub struct FixedCut {
     pub(crate) first: u64,
     pub(crate) bound: u64,
     pub(crate) join_end: u64,
-    pub(crate) history: Option<coordinode_core::group::DeploymentId>,
+    pub(crate) history: CutHistory,
     pub(crate) scope: CutScope,
     pub(crate) _pin: SnapshotPin,
 }
@@ -150,12 +189,22 @@ impl FixedCut {
         self.join_end
     }
 
-    /// The history the cut belongs to, the store's deployment: a
-    /// continuation read from another history is refused. `None` for a store
-    /// that has founded none.
+    /// The history the cut belongs to: a continuation read from another
+    /// history is refused.
     #[must_use]
-    pub fn history(&self) -> Option<coordinode_core::group::DeploymentId> {
+    pub fn history(&self) -> CutHistory {
         self.history
+    }
+
+    /// Where ordinary reading resumes once the continuation is read to
+    /// `next`; `None` before the join is complete.
+    #[must_use]
+    pub fn resume_at(&self, next: u64) -> Option<CutResume> {
+        (next >= self.join_end).then(|| CutResume {
+            history: self.history,
+            scope: self.scope.clone(),
+            next,
+        })
     }
 
     /// Whether the unit committed at `commit_ts`, found at `position`, is
@@ -194,5 +243,5 @@ pub struct CutRead {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests;

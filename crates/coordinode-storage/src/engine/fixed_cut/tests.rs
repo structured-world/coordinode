@@ -26,7 +26,36 @@ fn open(dir: &tempfile::TempDir) -> Arc<StorageEngine> {
 }
 
 fn open_with(config: &StorageConfig) -> Arc<StorageEngine> {
-    Arc::new(StorageEngine::open_embedded(config, Arc::new(TimestampOracle::new())).expect("open"))
+    let engine = Arc::new(
+        StorageEngine::open_embedded(config, Arc::new(TimestampOracle::new())).expect("open"),
+    );
+    // A cut names the history it is of: the store's deployment.
+    engine
+        .put(
+            Partition::Schema,
+            coordinode_core::group::ENROLLED_DEPLOYMENT_KEY,
+            &[7; 16],
+        )
+        .expect("deployment");
+    engine
+}
+
+/// A budget no test read reaches.
+fn unlimited() -> coordinode_core::budget::QueryBudget {
+    coordinode_core::budget::QueryBudget::new(u64::MAX)
+}
+
+/// Up to `entries` entries of `cut`'s continuation from `from`.
+fn read(
+    engine: &StorageEngine,
+    cut: &super::FixedCut,
+    from: u64,
+    entries: usize,
+) -> super::CutRead {
+    engine
+        .cut_read(cut, from, entries, &unlimited())
+        .expect("read")
+        .0
 }
 
 /// The counter rows the tests count with.
@@ -135,7 +164,9 @@ fn a_continuation_pruned_during_the_copy_is_retention_lost() {
         + 3600;
     let removed = engine.oplog_purge_expired(later, u64::MAX).expect("purge");
     assert!(removed > 0, "the copy outlived the journal");
-    let lost = engine.cut_read(&cut, cut.first(), 16, u64::MAX);
+    let lost = engine
+        .cut_read(&cut, cut.first(), 16, &unlimited())
+        .map(|(read, _)| read);
     assert!(
         matches!(lost, Err(crate::error::StorageError::RetentionLost { .. })),
         "the join is lost, not partial: {lost:?}"
@@ -172,21 +203,17 @@ fn an_entry_journalled_and_not_applied_is_not_handed_over() {
             .expect("commit");
     });
     let index = appended.recv().expect("journalled");
-    let read = engine
-        .cut_read(&cut, cut.first(), 64, u64::MAX)
-        .expect("read");
+    let first = read(&engine, &cut, cut.first(), 64);
     assert!(
-        read.next <= index,
+        first.next <= index,
         "the read stops before an unapplied entry"
     );
-    assert_eq!(at(&read, index), 0, "nothing of it is handed over");
+    assert_eq!(at(&first, index), 0, "nothing of it is handed over");
     release.send(()).expect("release");
     commit.join().expect("writer");
     *engine.on_journalled.lock() = None;
-    let read = engine
-        .cut_read(&cut, read.next, 64, u64::MAX)
-        .expect("read");
-    assert_eq!(at(&read, index), 1, "applied, it is handed over");
+    let later = read(&engine, &cut, first.next, 64);
+    assert_eq!(at(&later, index), 1, "applied, it is handed over");
 }
 
 /// An entry applied but not yet durable can still be lost with the unsynced
@@ -207,44 +234,219 @@ fn an_entry_not_yet_durable_is_not_handed_over() {
     engine
         .commit_logged(&add(1), engine.next_seqno(), Journal::Cache)
         .expect("deferred commit");
-    let read = engine
-        .cut_read(&cut, cut.first(), 64, u64::MAX)
-        .expect("read");
+    let first = read(&engine, &cut, cut.first(), 64);
     assert!(
-        read.next <= index,
+        first.next <= index,
         "the read stops before an unsynced entry"
     );
     engine.sync_applied().expect("sync");
-    let read = engine
-        .cut_read(&cut, read.next, 64, u64::MAX)
-        .expect("read");
-    assert_eq!(at(&read, index), 1, "durable, it is handed over");
+    let later = read(&engine, &cut, first.next, 64);
+    assert_eq!(at(&later, index), 1, "durable, it is handed over");
 }
 
-/// A read hands over at most its byte limit: a second entry that does not
-/// fit stays for the next read, and an entry larger than the whole limit is
-/// refused without moving the position.
+/// A read keeps within its budget while the segment holds far more than it:
+/// the units handed over stay charged until the read is dropped, the entry
+/// that does not fit stays for the next read, and an entry larger than the
+/// whole budget is refused.
 #[test]
-fn a_continuation_read_keeps_to_its_byte_limit() {
+fn a_continuation_read_keeps_to_its_budget() {
+    use coordinode_core::budget::QueryBudget;
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = open(&dir);
     let cut = cut(&engine);
-    for _ in 0..2 {
+    for _ in 0..200 {
         engine
             .commit_logged(&add(1), engine.next_seqno(), Journal::Journal)
             .expect("commit");
     }
-    let whole = engine
-        .cut_read(&cut, cut.first(), 64, u64::MAX)
-        .expect("whole");
-    assert_eq!(whole.units.len(), 2);
-    let one = engine.cut_read(&cut, cut.first(), 64, 80).expect("one");
-    assert_eq!(one.units.len(), 1, "the second entry does not fit");
-    let refused = engine.cut_read(&cut, cut.first(), 64, 4);
+    let whole = read(&engine, &cut, cut.first(), usize::MAX);
+    assert_eq!(whole.units.len(), 200);
+    let small = QueryBudget::new(1024);
+    let (part, charge) = engine
+        .cut_read(&cut, cut.first(), usize::MAX, &small)
+        .expect("part");
+    assert!(
+        (1..200).contains(&part.units.len()),
+        "a part of the segment: {}",
+        part.units.len()
+    );
+    assert!(small.memory_peak() <= 1024, "within the budget");
+    assert_eq!(small.memory_used(), charge.bytes(), "held by the result");
+    drop(charge);
+    assert_eq!(small.memory_used(), 0, "returned once the read is dropped");
+    let rest = read(&engine, &cut, part.next, usize::MAX);
+    assert_eq!(part.units.len() + rest.units.len(), 200, "nothing skipped");
+    let tiny = QueryBudget::new(4);
+    let refused = engine.cut_read(&cut, cut.first(), usize::MAX, &tiny);
     assert!(
         matches!(refused, Err(crate::error::StorageError::Budget(_))),
-        "an entry past the whole limit is refused: {refused:?}"
+        "an entry past the whole budget is refused: {:?}",
+        refused.map(|(read, _)| read)
     );
+}
+
+/// A cut, then entries over several journal segments, and a copy of the
+/// journal's directory to read the continuation from.
+fn copied_journal(
+    dir: &tempfile::TempDir,
+) -> (Arc<StorageEngine>, super::FixedCut, std::path::PathBuf, u64) {
+    let mut config = config(dir);
+    config.oplog_segment_max_entries = 2;
+    let engine = open_with(&config);
+    let cut = cut(&engine);
+    for _ in 0..6 {
+        engine
+            .commit_logged(&add(1), engine.next_seqno(), Journal::Journal)
+            .expect("commit");
+    }
+    let until = engine
+        .journal_next_index()
+        .expect("journal")
+        .expect("a journal");
+    let (journal, _) = engine
+        .journal_location()
+        .expect("location")
+        .expect("a journal");
+    let copy = dir.path().join("copy");
+    std::fs::create_dir(&copy).expect("copy");
+    for file in std::fs::read_dir(&journal).expect("journal") {
+        let file = file.expect("file");
+        std::fs::copy(file.path(), copy.join(file.file_name())).expect("copy");
+    }
+    (engine, cut, copy, until)
+}
+
+/// The copied journal's segments, by first index.
+fn segments_of(dir: &std::path::Path) -> Vec<(u64, std::path::PathBuf)> {
+    crate::oplog::tailer::list_segments(&[dir.to_path_buf()]).expect("segments")
+}
+
+/// Confirmed entries are handed over or accounted for, never answered as an
+/// empty read: with every segment gone, or the one holding the next entry
+/// purged while later ones remain, the read is RetentionLost; a segment
+/// whose header is damaged is an error.
+#[test]
+fn confirmed_entries_the_log_cannot_give_are_not_an_empty_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, cut, copy, until) = copied_journal(&dir);
+    let read_copy = || {
+        engine
+            .cut_read_log(
+                &cut,
+                std::slice::from_ref(&copy),
+                cut.first(),
+                until,
+                usize::MAX,
+                &unlimited(),
+            )
+            .map(|(read, _)| read)
+    };
+    let whole = read_copy().expect("the copy reads whole");
+    assert_eq!(whole.next, until);
+    assert!(segments_of(&copy).len() > 2, "several segments");
+
+    // The segment holding the next entry purged, later ones kept.
+    let held = segments_of(&copy);
+    let (_, first) = held
+        .iter()
+        .rev()
+        .find(|(start, _)| *start <= cut.first())
+        .expect("a segment holds the first entry");
+    let saved = std::fs::read(first).expect("segment");
+    std::fs::remove_file(first).expect("purge");
+    let lost = read_copy();
+    assert!(
+        matches!(lost, Err(crate::error::StorageError::RetentionLost { .. })),
+        "{lost:?}"
+    );
+
+    // Its header damaged: an error, not a wait for entries.
+    let mut damaged = saved;
+    damaged[0] ^= 0xFF;
+    std::fs::write(first, &damaged).expect("damage");
+    let unreadable = read_copy();
+    assert!(
+        matches!(&unreadable, Err(e) if !matches!(e, crate::error::StorageError::RetentionLost { .. })),
+        "{unreadable:?}"
+    );
+
+    // Every segment gone.
+    for (_, path) in segments_of(&copy) {
+        std::fs::remove_file(path).expect("purge");
+    }
+    let gone = read_copy();
+    assert!(
+        matches!(gone, Err(crate::error::StorageError::RetentionLost { .. })),
+        "{gone:?}"
+    );
+}
+
+/// A small frame that expands to many changes is refused by what it decodes
+/// to, not admitted by its encoded size: the budget bounds the decoding
+/// before it runs.
+#[test]
+fn a_frame_expanding_past_the_budget_is_refused_before_it_is_decoded() {
+    use coordinode_core::budget::QueryBudget;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open(&dir);
+    let cut = cut(&engine);
+    // Keys sharing a long prefix encode to a few bytes each.
+    let many: Vec<Mutation> = (0..2000u32)
+        .map(|i| Mutation::Delete {
+            partition: PartitionId::Counter,
+            key: format!("counter:{:0>64}", i).into_bytes(),
+        })
+        .collect();
+    let frame = coordinode_core::txn::frame::encode_unit(
+        &many,
+        coordinode_core::txn::timestamp::Timestamp::from_raw(1),
+    )
+    .expect("frame")
+    .len() as u64;
+    engine
+        .commit_logged(&many, engine.next_seqno(), Journal::Journal)
+        .expect("commit");
+    // Room for the frame several times over, not for what it decodes to.
+    let budget = QueryBudget::new(frame * 4);
+    let refused = engine.cut_read(&cut, cut.first(), usize::MAX, &budget);
+    assert!(
+        matches!(refused, Err(crate::error::StorageError::Budget(_))),
+        "refused by what it decodes to: {:?}",
+        refused.map(|(read, _)| read.units.len())
+    );
+    assert!(budget.memory_peak() <= frame * 4, "within the budget");
+}
+
+/// A page refuses a row larger than its whole budget, and keeps within it
+/// otherwise.
+#[test]
+fn a_page_keeps_to_its_budget() {
+    use coordinode_core::budget::QueryBudget;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open(&dir);
+    engine
+        .commit_logged(
+            &[Mutation::Put {
+                partition: PartitionId::Counter,
+                key: b"counter:big".to_vec(),
+                value: vec![0; 4096],
+            }],
+            engine.next_seqno(),
+            Journal::Journal,
+        )
+        .expect("row");
+    let cut = cut(&engine);
+    let small = QueryBudget::new(1024);
+    let refused = engine.cut_page(&cut, None, 16, &small);
+    assert!(
+        matches!(refused, Err(crate::error::StorageError::Budget(_))),
+        "a row past the whole budget is refused"
+    );
+    assert_eq!(small.memory_peak(), 0, "refused before it is copied");
+    let (page, _) = engine
+        .cut_page(&cut, None, 16, &QueryBudget::new(1 << 20))
+        .expect("page");
+    assert_eq!(page.len(), 1);
 }
 
 /// Units carry only their changes inside the scope; an effect outside it
@@ -331,8 +533,9 @@ fn a_far_page_reads_only_from_where_the_last_ended() {
         .commit_logged(&rows, engine.next_seqno(), Journal::Journal)
         .expect("rows");
     let cut = cut(&engine);
-    let page = engine
-        .cut_page(&cut, Some(b"counter:0059"), 2, u64::MAX)
+    let budget = unlimited();
+    let (page, _) = engine
+        .cut_page(&cut, Some(b"counter:0059"), 2, &budget)
         .expect("page");
     let keys: Vec<&[u8]> = page.iter().map(|(k, _)| k.as_slice()).collect();
     assert_eq!(
@@ -342,8 +545,8 @@ fn a_far_page_reads_only_from_where_the_last_ended() {
     let mut seen = 0;
     let mut after: Option<Vec<u8>> = None;
     loop {
-        let page = engine
-            .cut_page(&cut, after.as_deref(), 5, u64::MAX)
+        let (page, _) = engine
+            .cut_page(&cut, after.as_deref(), 5, &budget)
             .expect("page");
         let Some((last, _)) = page.last() else { break };
         seen += page.len();
@@ -490,11 +693,9 @@ fn a_late_commit_below_the_cut_is_in_the_view_and_counted_once() {
     );
     assert_eq!(destination, 101, "the view holds the late commit");
     let span = usize::try_from(cut.join_end() - cut.first()).expect("span");
-    let read = engine
-        .cut_read(&cut, cut.first(), span, u64::MAX)
-        .expect("join");
-    assert_eq!(read.next, cut.join_end(), "the read ends at the join");
-    let units = read.units;
+    let joined = read(&engine, &cut, cut.first(), span);
+    assert_eq!(joined.next, cut.join_end(), "the read ends at the join");
+    let units = joined.units;
     let late_unit = units
         .iter()
         .find(|u| u.commit_ts == late)

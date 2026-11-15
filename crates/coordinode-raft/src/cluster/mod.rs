@@ -886,6 +886,8 @@ impl RaftNode {
                 .with_engine_work(log_store.engine_work())
                 .with_log(&oplog);
         let version = version_gate(node_id, group, &state_machine, host_epoch);
+        // With the deployment, the history this member's log positions are of.
+        engine.set_log_group(group);
         let mut deployment = state_machine.subscribe_deployment();
 
         let applied_rx = state_machine.subscribe_applied();
@@ -1202,6 +1204,8 @@ impl RaftNode {
         // enrolled in until the deployment's own record arrives.
         let enrolled_in = enrolled_deployment(&engine)?;
         let version = version_gate(node_id, group, &state_machine, host_epoch);
+        // With the deployment, the history this member's log positions are of.
+        engine.set_log_group(group);
         let mut deployment = state_machine.subscribe_deployment();
         let deployment_view = admission::DeploymentView::new(
             deployment.clone(),

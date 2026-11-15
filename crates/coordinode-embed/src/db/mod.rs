@@ -4182,7 +4182,7 @@ pub use package::{
     PackageConstraint, PublishedObject, Readiness, SchemaPackage, SchemaPublication,
     SchemaReadiness,
 };
-pub use state_cut::{CutBatch, CutRow, CutScope, StateCut};
+pub use state_cut::{CutBatch, CutHistory, CutPage, CutResume, CutRow, CutScope, StateCut};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

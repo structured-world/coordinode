@@ -151,11 +151,6 @@ pub struct OplogTailer {
     /// member that applied them recorded. Without it a bound unit fails the
     /// read instead of being delivered on a guess.
     decisions: Option<UnitDecisionSource>,
-    /// Hand entries over with their unit frames as recorded: see
-    /// [`OplogTailer::with_unit_frames`].
-    frames: bool,
-    /// See [`OplogTailer::with_byte_limit`].
-    byte_limit: Option<u64>,
 }
 
 /// See [`OplogTailer::with_unit_decisions`].
@@ -190,29 +185,7 @@ impl OplogTailer {
             held: !token.is_start(),
             cursor: None,
             decisions: None,
-            frames: false,
-            byte_limit: None,
         })
-    }
-
-    /// Hand over at most `bytes` of encoded entries a read: a read stops
-    /// before the entry that would pass it. An entry larger than the whole
-    /// limit is refused rather than handed over, and the position stays
-    /// before it.
-    #[must_use]
-    pub fn with_byte_limit(mut self, bytes: u64) -> Self {
-        self.byte_limit = Some(bytes);
-        self
-    }
-
-    /// Hand each entry over with its unit frames as recorded, each with its
-    /// own commit timestamp, for a reader that decides per unit (the join of
-    /// a fixed cut, [`crate::engine::core::StorageEngine::cut_units_of`]).
-    /// Filters do not apply: a filter judges expanded operations.
-    #[must_use]
-    pub fn with_unit_frames(mut self) -> Self {
-        self.frames = true;
-        self
     }
 
     /// Read a Raft log whose units may be bound to client operations: a unit
@@ -244,8 +217,7 @@ impl OplogTailer {
     ///
     /// # Errors
     ///
-    /// The oplog directory cannot be listed; [`StorageError::Budget`] for an
-    /// entry past [`Self::with_byte_limit`] on its own.
+    /// The oplog directory cannot be listed.
     pub fn read_next(
         &mut self,
         max_entries: usize,
@@ -253,8 +225,6 @@ impl OplogTailer {
         until: u64,
     ) -> StorageResult<Vec<(OplogEntry, ResumeToken)>> {
         let mut result = Vec::new();
-        // Encoded bytes of the entries handed over so far.
-        let mut taken = 0u64;
         // A cursor that reaches nothing is located afresh, once per call.
         let mut located = false;
         while result.len() < max_entries && self.next < until {
@@ -304,43 +274,20 @@ impl OplogTailer {
                     full = true;
                     break;
                 }
-                if let Some(limit) = self.byte_limit {
-                    // Frames follow one another, so the frame ends past where
-                    // it starts.
-                    let size = end - cursor.offset;
-                    if taken + size > limit {
-                        if taken == 0 {
-                            return Err(StorageError::Budget(
-                                coordinode_core::budget::BudgetStop::Memory {
-                                    requested: size,
-                                    used: 0,
-                                    limit,
-                                },
-                            ));
-                        }
-                        full = true;
-                        break;
-                    }
-                    taken += size;
-                }
                 cursor.offset = end;
                 self.next = entry.index + 1;
                 self.held = true;
                 reached = true;
-                let token = ResumeToken {
-                    shard_id: self.shard_id,
-                    segment_id: cursor.first_index,
-                    entry_offset: self.next - cursor.first_index,
-                };
-                if self.frames {
-                    result.push((entry, token));
-                    continue;
-                }
                 // A reader sees the operations a unit frame encodes, and
                 // none of a unit that took no effect.
                 let ops = expand_units_decided(&entry.ops, entry.index, self.decisions.as_deref())?
                     .into_owned();
                 if passes_filter(&entry, &ops, filters) {
+                    let token = ResumeToken {
+                        shard_id: self.shard_id,
+                        segment_id: cursor.first_index,
+                        entry_offset: self.next - cursor.first_index,
+                    };
                     result.push((OplogEntry { ops, ..entry }, token));
                 }
             }
