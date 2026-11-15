@@ -4356,12 +4356,8 @@ impl<'a> ExecutionContext<'a> {
         let bytes = record.to_msgpack().map_err(|e| {
             ExecutionError::Serialization(format!("columnar node {} encode: {e}", node_id.as_raw()))
         })?;
-        let seqno = self
-            .engine
-            .oracle()
-            .map(|o| o.next().as_raw())
-            .unwrap_or_else(|| self.engine.snapshot().saturating_add(1));
-        self.engine.columnar_insert(label, key, bytes, seqno)?;
+        // At a fresh timestamp, registered as in flight until the row lands.
+        self.engine.columnar_insert_next(label, key, bytes)?;
         Ok(())
     }
 

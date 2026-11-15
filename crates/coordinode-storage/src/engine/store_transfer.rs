@@ -467,23 +467,47 @@ impl StorageEngine {
     /// in the pinned trees whole or not at all. The trees are pinned in
     /// turn, so a commit landing between two pins would be in one tree and
     /// not the other. So the cut is a timestamp `bound` drawn from the clock
-    /// every commit takes its own from: each commit below it is waited for
-    /// until it has landed in every tree it writes, and each one at or above
-    /// it is left out of the copy. No tree installs a table from the moment
-    /// `bound` is drawn until it is pinned (its flush lock is held), so a
-    /// commit at or above `bound` is only in the pinned memtables, which the
-    /// copy is built from below `bound`. Returns the trees and `bound`.
+    /// every commit takes its own from: each write below it is waited for
+    /// until it has landed in every tree it writes (every commit, direct
+    /// write and table row registers before it draws its timestamp), and
+    /// each one at or above it is left out of the copy.
+    ///
+    /// A write at or above `bound` is in no pinned table file: no tree is
+    /// flushed from the moment `bound` is drawn until it is pinned (its
+    /// flush lock is held), a table flushed before held only earlier writes,
+    /// and a compaction only rewrites what tables already hold. So it is
+    /// only in the pinned memtables, which the copy is built from below
+    /// `bound`. The set of tables is the one at the cut: the table registry
+    /// is held from the listing until the pins, so no table is created or
+    /// dropped and no row gets its table's tree meanwhile; a row that got it
+    /// before is registered, and waited for when below `bound`. Returns the
+    /// trees and `bound`.
     ///
     /// # Errors
     ///
-    /// [`StorageError::CutNotReady`] when a commit below the cut is still in
+    /// [`StorageError::CutNotReady`] when a write below the cut is still in
     /// flight after [`CHECKPOINT_CUT_WAIT`]; a tree cannot be read.
     fn pin_at_cut(&self) -> StorageResult<(Vec<PinnedTree>, u64)> {
+        #[cfg(feature = "columnar")]
+        return self.with_columnar_tables_held(|tables| self.pin_at_cut_of(tables));
+        #[cfg(not(feature = "columnar"))]
+        self.pin_at_cut_of(Vec::new())
+    }
+
+    /// [`Self::pin_at_cut`] of the partitions and `tables`, the table
+    /// registry held by the caller.
+    fn pin_at_cut_of(
+        &self,
+        tables: Vec<(String, lsm_tree::AnyTree)>,
+    ) -> StorageResult<(Vec<PinnedTree>, u64)> {
         let mut parts = Vec::with_capacity(Partition::all().len());
         for &part in Partition::all() {
             parts.push(self.tree(part)?);
         }
-        let tables = self.table_trees();
+        #[cfg(test)]
+        if let Some(hook) = self.on_tables_listed.lock().as_mut() {
+            hook();
+        }
         let _no_flush: Vec<_> = parts
             .iter()
             .map(|tree| tree.get_flush_lock())

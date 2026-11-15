@@ -570,6 +570,23 @@ impl ColumnarTableRegistry {
             .collect()
     }
 
+    /// Run `work` with every live table's tree, in id order, while the
+    /// registry is held: no table is opened, created or dropped, and no row
+    /// gets its table's tree, until `work` returns. `work` must not use the
+    /// registry itself.
+    pub(crate) fn with_tables_held<T>(&self, work: impl FnOnce(Vec<(String, AnyTree)>) -> T) -> T {
+        let tables = self.lock();
+        let mut live: Vec<(String, AnyTree)> = tables
+            .live
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.tree.clone()))
+            .collect();
+        live.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let done = work(live);
+        drop(tables);
+        done
+    }
+
     /// Sorted list of currently-registered table ids.
     pub fn table_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.lock().live.keys().cloned().collect();

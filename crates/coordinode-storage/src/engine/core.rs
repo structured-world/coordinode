@@ -369,6 +369,10 @@ pub struct StorageEngine {
     /// before the next tree is pinned.
     #[cfg(test)]
     pub(crate) on_tree_pinned: parking_lot::Mutex<Option<TreePinnedHook>>,
+    /// Test hook: run once a checkpoint has listed the tables it captures,
+    /// before it draws its cut.
+    #[cfg(test)]
+    pub(crate) on_tables_listed: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// Test hook: run with an entry's index once it is journalled, before
     /// it is applied.
     #[cfg(test)]
@@ -1822,6 +1826,8 @@ impl StorageEngine {
             #[cfg(test)]
             on_tree_pinned: parking_lot::Mutex::new(None),
             #[cfg(test)]
+            on_tables_listed: parking_lot::Mutex::new(None),
+            #[cfg(test)]
             on_journalled: parking_lot::Mutex::new(None),
             #[cfg(test)]
             on_segment_found: parking_lot::Mutex::new(None),
@@ -2240,6 +2246,22 @@ impl StorageEngine {
         value: Vec<u8>,
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
+        let (tree, table_tier) = self.open_columnar_table(table_id)?;
+        self.insert_columnar_row(table_id, &tree, table_tier, key, value, seqno)
+    }
+
+    /// [`Self::columnar_insert`] into `tree`, the table's tree already open,
+    /// with its write-pressure tier `table_tier`.
+    #[cfg(feature = "columnar")]
+    fn insert_columnar_row(
+        &self,
+        table_id: &str,
+        tree: &lsm_tree::AnyTree,
+        table_tier: u8,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<()> {
         // Journal the row at its commit_ts BEFORE applying it to the tree
         // memtable, so a write that reached the retained oplog survives a crash
         // and is replayed on the next open. Columnar rows live outside the
@@ -2247,7 +2269,6 @@ impl StorageEngine {
         // routed back to the table registry on recovery, and the table's own
         // tree records its coverage. No journal (cluster mode / plain open /
         // in-memory) → durability follows the tree's own flush.
-        let (tree, table_tier) = self.open_columnar_table(table_id)?;
         // Under slowdown a row waits its turn at the write rate, as a commit
         // does; the stop tier refuses the statement before its first row.
         let memtable_tier = self
@@ -2268,7 +2289,7 @@ impl StorageEngine {
             }
             None => None,
         };
-        let (added, memtable) = apply_columnar_row(&tree, key, value, seqno, index)?;
+        let (added, memtable) = apply_columnar_row(tree, key, value, seqno, index)?;
         // A table's tree lands where the node partition's does.
         self.coordinator
             .flush_trigger()
@@ -2278,6 +2299,30 @@ impl StorageEngine {
             self.note_applied(coverage, index);
         }
         Ok(())
+    }
+
+    /// [`Self::columnar_insert`] at a fresh timestamp, drawn as every direct
+    /// write draws its own: registered as in flight until the row has landed,
+    /// so a reader or a checkpoint that waits for the writes below a
+    /// timestamp waits for this one too. Returns the row's timestamp.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::columnar_insert`].
+    #[cfg(feature = "columnar")]
+    pub fn columnar_insert_next(
+        &self,
+        table_id: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> StorageResult<lsm_tree::SeqNo> {
+        // The tree first: the registry is not taken while the row is in
+        // flight, so whoever holds the registry never waits on a row that
+        // waits on it.
+        let (tree, table_tier) = self.open_columnar_table(table_id)?;
+        let (seqno, _landing) = self.pending_commits.admit_direct(|| self.next_seqno());
+        self.insert_columnar_row(table_id, &tree, table_tier, key, value, seqno)?;
+        Ok(seqno)
     }
 
     /// End a write statement on a `STORAGE COLUMNAR` table: its rows are
@@ -2463,6 +2508,17 @@ impl StorageEngine {
             return std::time::Duration::ZERO;
         }
         self.write_slowdown.reserve(bytes)
+    }
+
+    /// Run `work` with every `STORAGE COLUMNAR` table's tree, in id order,
+    /// while no table is opened, created or dropped and no row gets its
+    /// table's tree. `work` must not use the table registry.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn with_columnar_tables_held<T>(
+        &self,
+        work: impl FnOnce(Vec<(String, lsm_tree::AnyTree)>) -> T,
+    ) -> T {
+        self.columnar_tables.with_tables_held(work)
     }
 
     /// Every `STORAGE COLUMNAR` table's tree with its id, in id order.

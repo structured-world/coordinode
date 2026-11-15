@@ -2535,6 +2535,74 @@ fn a_checkpoint_holds_a_commit_across_trees_whole_or_not_at_all() {
     );
 }
 
+/// A checkpoint of a store with neither a journal nor a Raft log holds every
+/// `STORAGE COLUMNAR` row written below its cut: a table created and written
+/// after the checkpoint listed its tables, but before it drew its cut, is in
+/// the copy with its row. A row past the cut is not. Before, the tables were
+/// listed ahead of the cut, and a table created in between was left out with
+/// a row the cut holds.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_checkpoint_holds_a_table_written_below_its_cut() {
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("tempdir");
+    let backups = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(&test_config(dir.path()), Arc::clone(&oracle))
+            .expect("open"),
+    );
+    assert!(!engine.has_journal(), "a store with no journal to replay");
+
+    let (listed, tables_listed) = mpsc::channel();
+    let (written, row_done) = mpsc::channel::<()>();
+    *engine.on_tables_listed.lock() = Some(Box::new(move || {
+        // A test that stopped listening has nothing more to say.
+        if listed.send(()).is_err() {
+            return;
+        }
+        // The table is written now, or (with its registry held) once the
+        // checkpoint lets it: either way the checkpoint goes on.
+        let _in_time = row_done.recv_timeout(Duration::from_millis(500)).is_ok();
+    }));
+
+    let writer = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            tables_listed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the tables were listed");
+            engine.create_columnar_table("late").expect("create");
+            let seqno = engine
+                .columnar_insert_next("late", b"node:0:late".to_vec(), b"row".to_vec())
+                .expect("insert");
+            // The checkpoint may have gone on already.
+            let _told = written.send(()).is_ok();
+            seqno
+        })
+    };
+
+    let target = backups.path().join("ckpt");
+    let summary = engine.create_checkpoint(&target).expect("checkpoint");
+    let row_at = writer.join().expect("writer");
+    *engine.on_tables_listed.lock() = None;
+    drop(engine);
+
+    let copy = StorageEngine::open_checkpoint(&target).expect("the checkpoint opens");
+    let rows = copy.columnar_scan("late", u64::MAX).expect("scan");
+    // The checkpoint holds every write below `max_seqno`, its cut.
+    let below_cut = row_at < summary.max_seqno;
+    assert_eq!(
+        rows.iter().any(|(key, _)| key.as_slice() == b"node:0:late"),
+        below_cut,
+        "the row at {row_at} against the checkpoint through {}: {rows:?}",
+        summary.max_seqno
+    );
+}
+
 /// A checkpoint step refused for room on one endpoint is reported as that
 /// refusal with the step added, never as the endpoint with the least room
 /// left: there, `hot` is nearly full and the growth was refused on `cold`.
