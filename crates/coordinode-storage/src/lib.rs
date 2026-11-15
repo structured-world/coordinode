@@ -9,6 +9,8 @@ pub mod format;
 pub mod oplog;
 pub mod placement;
 pub mod scrub;
+#[cfg(feature = "stage-timing")]
+pub mod stage_timing;
 
 #[cfg(test)]
 pub(crate) mod internal_test_helpers;

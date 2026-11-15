@@ -508,8 +508,12 @@ impl RaftProposalPipeline {
         proposal: &RaftProposal,
     ) -> Result<ProposalOutcome, ProposalError> {
         check_proposal(proposal)?;
+        #[cfg(feature = "stage-timing")]
+        let admitting = std::time::Instant::now();
         // Held across every attempt: each may put the entry in the log.
         let _room = self.check_admission(proposal)?;
+        #[cfg(feature = "stage-timing")]
+        coordinode_storage::stage_timing::record("raft.admission", admitting);
         let start = std::time::Instant::now();
 
         for attempt in 0..MAX_RETRIES {
@@ -523,7 +527,11 @@ impl RaftProposalPipeline {
 
             // Stamped per attempt: a retry is a new hand-over. The caller's
             // own hold covers the timestamp until this returns.
+            #[cfg(feature = "stage-timing")]
+            let stamping = std::time::Instant::now();
             let (request, _hold) = self.entry(proposal, attempt).await?;
+            #[cfg(feature = "stage-timing")]
+            coordinode_storage::stage_timing::record("raft.stamp", stamping);
             let leading = crate::authority::leading_term(&self.raft);
             let write = tokio::time::timeout(timeout, self.raft.client_write(request));
             let result = match leading {
@@ -655,6 +663,22 @@ impl ProposalPipeline for RaftProposalPipeline {
     }
 
     fn propose_with_concern(
+        &self,
+        proposal: &RaftProposal,
+        concern: &WriteConcern,
+    ) -> Result<ProposalOutcome, ProposalError> {
+        #[cfg(feature = "stage-timing")]
+        let called = std::time::Instant::now();
+        let outcome = self.propose_with_concern_inner(proposal, concern);
+        #[cfg(feature = "stage-timing")]
+        coordinode_storage::stage_timing::record("raft.call", called);
+        outcome
+    }
+}
+
+impl RaftProposalPipeline {
+    /// [`ProposalPipeline::propose_with_concern`] itself.
+    fn propose_with_concern_inner(
         &self,
         proposal: &RaftProposal,
         concern: &WriteConcern,

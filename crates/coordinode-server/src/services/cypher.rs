@@ -1280,12 +1280,14 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // Resolve and check the settings, fence the read and wait for the
         // causal position. A statement that needs the leader runs there.
         let requested = requested_from_proto(&req, deadline, &cancel)?;
-        let admitted = match self
+        let admitted = self
             .executor
             .admit(&req.query, &requested, false)
             .await
-            .map_err(db_error_to_status)?
-        {
+            .map_err(db_error_to_status)?;
+        #[cfg(feature = "stage-timing")]
+        coordinode_storage::stage_timing::record("grpc.admit", start);
+        let admitted = match admitted {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
                 return self
@@ -1294,6 +1296,8 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             }
         };
 
+        #[cfg(feature = "stage-timing")]
+        let executing = std::time::Instant::now();
         let exec_result = {
             let params = if req.parameters.is_empty() {
                 None
@@ -1322,6 +1326,10 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 }
             }
         };
+        #[cfg(feature = "stage-timing")]
+        coordinode_storage::stage_timing::record("grpc.execute", executing);
+        #[cfg(feature = "stage-timing")]
+        let responding = std::time::Instant::now();
         let result_rows = exec_result.rows;
         let write_stats = exec_result.write_stats;
         let Admitted {
@@ -1362,6 +1370,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 query::Row { values }
             })
             .collect();
+        #[cfg(feature = "stage-timing")]
+        {
+            coordinode_storage::stage_timing::record("grpc.respond", responding);
+            coordinode_storage::stage_timing::record("grpc.handler", start);
+        }
 
         Ok(Response::new(query::ExecuteCypherResponse {
             columns,

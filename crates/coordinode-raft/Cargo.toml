@@ -43,6 +43,9 @@ coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-h
 engine-holders = []
 # A test can make the node's Raft log refuse writes, as a full disk does.
 test-faults = ["coordinode-storage/test-faults"]
+# Diagnostic builds only: the stages of a proposal, recorded with the
+# storage engine's (see `coordinode-storage/stage-timing`).
+stage-timing = ["coordinode-storage/stage-timing"]
 
 [dev-dependencies]
 # The crate's own tests run with its holders recorded.

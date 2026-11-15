@@ -2837,6 +2837,8 @@ impl Database {
         ),
         DatabaseError,
     > {
+        #[cfg(feature = "stage-timing")]
+        let planning = std::time::Instant::now();
         let Statement {
             plan,
             canonical,
@@ -2887,6 +2889,8 @@ impl Database {
             }
             plan.substitute_params(p);
         }
+        #[cfg(feature = "stage-timing")]
+        coordinode_storage::stage_timing::record("embed.plan", planning);
 
         // An auto-commit statement refused at commit for contention applied
         // nothing, so it runs again from a fresh snapshot, a bounded number

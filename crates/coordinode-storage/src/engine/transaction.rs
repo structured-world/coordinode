@@ -2048,6 +2048,8 @@ impl<'a> Transaction<'a> {
     /// Returns the commit timestamp used (or `None` for a read-only / legacy
     /// transaction) plus the committed Raft index on the pipeline path.
     pub fn commit(&mut self, ctx: &CommitContext<'_>) -> Result<CommitOutcome, CommitError> {
+        #[cfg(feature = "stage-timing")]
+        let stage_at = std::time::Instant::now();
         // An operand whose fold cannot succeed is refused here, where the
         // caller is still listening, rather than acknowledged and then met
         // again in a compaction that has nowhere to report it.
@@ -2475,9 +2477,15 @@ impl<'a> Transaction<'a> {
             // on timeout the data is NOT rolled back, the proposal may still
             // commit after the timeout fires. In embedded/single-node mode the
             // default pipeline applies at once and the timeout is moot.
+            #[cfg(feature = "stage-timing")]
+            crate::stage_timing::record("txn.prepare", stage_at);
+            #[cfg(feature = "stage-timing")]
+            let proposed_at = std::time::Instant::now();
             let outcome = pipeline
                 .propose_with_concern(&proposal, ctx.write_concern)
                 .map_err(proposal_err_to_commit)?;
+            #[cfg(feature = "stage-timing")]
+            crate::stage_timing::record("txn.propose", proposed_at);
             // Record the committed Raft index of this write so the gRPC layer
             // can return it as the causal operationTime token. `None` in
             // local/embedded mode (no Raft log).
@@ -2540,6 +2548,8 @@ impl<'a> Transaction<'a> {
         }
 
         self.publish_schema_change();
+        #[cfg(feature = "stage-timing")]
+        crate::stage_timing::record("txn.commit", stage_at);
         Ok(CommitOutcome {
             commit_ts: Some(commit_ts),
             applied_index,

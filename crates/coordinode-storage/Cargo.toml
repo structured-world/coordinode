@@ -43,6 +43,10 @@ io-uring = ["lsm-tree/io-uring"]
 # Counting costs a relaxed atomic add per block load, so a build that exports
 # no metrics leaves it off; the server turns it on.
 lsm-metrics = ["lsm-tree/metrics"]
+# Diagnostic builds only: how long each stage of a statement's way through
+# the engine takes, as `coordinode_stage_duration_seconds{stage}`. Never in a
+# shipped build, which pays nothing for it.
+stage-timing = []
 
 [dependencies]
 coordinode-core = { workspace = true }

@@ -33,6 +33,9 @@ test-hooks = []
 # Bench builds only: the vector top-k bench counts each statement's
 # allocations instead of timing it under the system allocator.
 bench-alloc = []
+# Diagnostic builds only: the stages of a statement, recorded with the
+# storage engine's (see `coordinode-storage/stage-timing`).
+stage-timing = ["coordinode-storage/stage-timing", "coordinode-raft?/stage-timing"]
 
 [dependencies]
 coordinode-core = { workspace = true }
