@@ -352,11 +352,15 @@ pub fn read_frames_from(path: &Path, offset: u64) -> StorageResult<Vec<(OplogEnt
         .collect())
 }
 
+/// The read buffer a [`FrameCursor`] holds.
+pub(crate) const FRAME_CURSOR_BUFFER: usize = 8 << 10;
+
 /// What [`FrameCursor::peek`] finds at the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Peeked {
-    /// A frame whose payload is `len` bytes, holding log entry `index`.
-    Frame { len: u64, index: u64 },
+    /// A frame whose payload is `len` bytes, holding log entry `index` of
+    /// `ops` operations.
+    Frame { len: u64, index: u64, ops: u64 },
     /// No complete frame: the end of the segment's frames (its footer, or a
     /// write in progress), or a frame that does not decode.
     End,
@@ -390,7 +394,7 @@ impl FrameCursor {
             .metadata()
             .map_err(|e| StorageError::Io(format!("stat segment {path:?}: {e}")))?
             .len();
-        let mut file = io::BufReader::new(file);
+        let mut file = io::BufReader::with_capacity(FRAME_CURSOR_BUFFER, file);
         let mut header = [0u8; HEADER_SIZE as usize];
         file.read_exact(&mut header)
             .map_err(|e| StorageError::Io(format!("read segment header {path:?}: {e}")))?;
@@ -424,19 +428,22 @@ impl FrameCursor {
             return Ok(Peeked::End);
         }
         // An entry is encoded as the array of its fields: its timestamp,
-        // term and index come first.
+        // term, index and shard come first, then the array of its ops.
         let mut payload = (&mut self.file).take(len);
-        let index = (|| {
+        let fields = (|| {
             rmp::decode::read_array_len(&mut payload).ok()?;
             let _ts: u64 = rmp::decode::read_int(&mut payload).ok()?;
             let _term: u64 = rmp::decode::read_int(&mut payload).ok()?;
-            rmp::decode::read_int::<u64, _>(&mut payload).ok()
+            let index: u64 = rmp::decode::read_int(&mut payload).ok()?;
+            let _shard: u32 = rmp::decode::read_int(&mut payload).ok()?;
+            let ops = rmp::decode::read_array_len(&mut payload).ok()?;
+            Some((index, u64::from(ops)))
         })();
-        let Some(index) = index else {
+        let Some((index, ops)) = fields else {
             return Ok(Peeked::End);
         };
         self.peeked = Some((start, len));
-        Ok(Peeked::Frame { len, index })
+        Ok(Peeked::Frame { len, index, ops })
     }
 
     /// Move past the peeked frame without reading its payload.
@@ -446,13 +453,13 @@ impl FrameCursor {
         }
     }
 
-    /// Read the peeked frame's entry and move past it; `None` when its
-    /// checksum fails or it does not decode.
+    /// Read the peeked frame's payload, its encoded entry, and move past it;
+    /// `None` when its checksum fails.
     ///
     /// # Errors
     ///
     /// Nothing was peeked, or the file cannot be read.
-    pub(crate) fn read(&mut self) -> StorageResult<Option<OplogEntry>> {
+    pub(crate) fn read_payload(&mut self) -> StorageResult<Option<Vec<u8>>> {
         let (start, len) = self
             .peeked
             .take()
@@ -469,7 +476,7 @@ impl FrameCursor {
         if crc32fast::hash(&payload) != u32::from_le_bytes(crc) {
             return Ok(None);
         }
-        Ok(OplogEntry::decode(&payload).ok())
+        Ok(Some(payload))
     }
 
     fn seek(&mut self, to: u64) -> StorageResult<()> {

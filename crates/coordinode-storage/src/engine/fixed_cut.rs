@@ -104,6 +104,86 @@ pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Keys and values of a cut's view, in key order.
 pub type CutRows = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// The working memory one log entry's reading was given, already charged
+/// to the read's budget: the units decoding takes are spent from it, and
+/// what it holds at the end is what the entry keeps.
+#[derive(Debug)]
+pub(crate) struct EntryPool {
+    /// Not yet spent.
+    left: u64,
+    /// Held by the entry's decoded units.
+    retained: u64,
+    /// Added to the batch's capacity for units.
+    grown: u64,
+}
+
+impl EntryPool {
+    /// A pool of `left` bytes.
+    pub(crate) fn new(left: u64) -> Self {
+        Self {
+            left,
+            retained: 0,
+            grown: 0,
+        }
+    }
+
+    /// Bounds for decoding one unit within what is left: its operations
+    /// and whatever the decoder holds per operation take at most half, the
+    /// bytes it expands to, kept once in the unit and once more at most
+    /// while decoding, the other half.
+    pub(crate) fn decode_limits(&self) -> coordinode_core::txn::frame::DecodeLimits {
+        // A pool past the address space bounds nothing more.
+        let left = usize::try_from(self.left).unwrap_or(usize::MAX);
+        coordinode_core::txn::frame::DecodeLimits {
+            max_frame_bytes: coordinode_core::txn::frame::DecodeLimits::DEFAULT.max_frame_bytes,
+            max_ops: left / 2 / (core::mem::size_of::<Mutation>() + DECODER_PER_OP),
+            max_expanded_bytes: left / 4,
+        }
+    }
+
+    /// Keep `bytes` for a decoded unit; `false` when they do not fit.
+    pub(crate) fn retain(&mut self, bytes: u64) -> bool {
+        let fits = self.spend(bytes);
+        if fits {
+            self.retained += bytes;
+        }
+        fits
+    }
+
+    /// Grow the batch's units by `bytes`; `false` when they do not fit.
+    pub(crate) fn grow(&mut self, bytes: u64) -> bool {
+        let fits = self.spend(bytes);
+        if fits {
+            self.grown += bytes;
+        }
+        fits
+    }
+
+    fn spend(&mut self, bytes: u64) -> bool {
+        match self.left.checked_sub(bytes) {
+            Some(left) => {
+                self.left = left;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// What the entry keeps: its units and the batch's growth for them.
+    pub(crate) fn kept(&self) -> u64 {
+        self.retained + self.grown
+    }
+
+    /// The batch's growth alone.
+    pub(crate) fn grown(&self) -> u64 {
+        self.grown
+    }
+}
+
+/// What the frame decoder holds per operation besides the operation: its
+/// literal references, with room for their list to grow.
+const DECODER_PER_OP: usize = 2 * core::mem::size_of::<&[u8]>();
+
 /// The log a cut's positions count entries of: a store's own journal, named
 /// by the deployment it founded, or one group's consensus log, named by its
 /// history. Positions of different histories are not comparable.

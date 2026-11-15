@@ -144,6 +144,98 @@ pub struct OplogEntry {
     pub pre_images: Option<Vec<PreImage>>,
 }
 
+/// An [`OplogEntry`] read in place from its encoded bytes: its operations'
+/// keys, values and frames borrow the bytes rather than copy them, and its
+/// pre-images are passed over. What it holds besides the bytes is its list
+/// of operations, one [`OplogOpRef`] each.
+#[derive(Debug, Deserialize)]
+pub struct OplogEntryRef<'a> {
+    /// See [`OplogEntry::ts`].
+    pub ts: u64,
+    /// See [`OplogEntry::term`].
+    pub term: u64,
+    /// See [`OplogEntry::index`].
+    pub index: u64,
+    /// See [`OplogEntry::shard`].
+    pub shard: ShardId,
+    /// See [`OplogEntry::ops`].
+    #[serde(borrow)]
+    pub ops: Vec<OplogOpRef<'a>>,
+    /// See [`OplogEntry::is_migration`].
+    pub is_migration: bool,
+    /// Pre-images, passed over.
+    #[serde(rename = "pre_images")]
+    _pre_images: serde::de::IgnoredAny,
+}
+
+/// An [`OplogOp`] read in place: the same variants, in the same order, over
+/// borrowed bytes.
+#[derive(Debug, Deserialize)]
+#[allow(missing_docs)]
+pub enum OplogOpRef<'a> {
+    Insert {
+        partition: u8,
+        #[serde(borrow, with = "serde_bytes")]
+        key: &'a [u8],
+        #[serde(borrow, with = "serde_bytes")]
+        value: &'a [u8],
+    },
+    Delete {
+        partition: u8,
+        #[serde(borrow, with = "serde_bytes")]
+        key: &'a [u8],
+    },
+    Merge {
+        partition: u8,
+        #[serde(borrow, with = "serde_bytes")]
+        key: &'a [u8],
+        #[serde(borrow, with = "serde_bytes")]
+        operand: &'a [u8],
+    },
+    RemoveRange {
+        partition: u8,
+        #[serde(borrow, with = "serde_bytes")]
+        start: &'a [u8],
+        #[serde(borrow, with = "serde_bytes")]
+        end: &'a [u8],
+    },
+    Noop,
+    RaftEntry {
+        #[serde(borrow, with = "serde_bytes")]
+        data: &'a [u8],
+    },
+    RaftTruncation {
+        after_index: u64,
+    },
+    ColumnarInsert {
+        #[serde(borrow)]
+        table_id: &'a str,
+        #[serde(borrow, with = "serde_bytes")]
+        key: &'a [u8],
+        #[serde(borrow, with = "serde_bytes")]
+        value: &'a [u8],
+    },
+    Derive {
+        #[serde(borrow, with = "serde_bytes")]
+        work: &'a [u8],
+    },
+    Unit {
+        #[serde(borrow, with = "serde_bytes")]
+        frame: &'a [u8],
+    },
+}
+
+impl<'a> OplogEntryRef<'a> {
+    /// Read the entry `bytes` encode, in place.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not an encoded entry.
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, rmp_serde::decode::Error> {
+        rmp_serde::from_slice(bytes)
+    }
+}
+
 impl OplogEntry {
     /// Encode to MessagePack bytes.
     pub fn encode(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {

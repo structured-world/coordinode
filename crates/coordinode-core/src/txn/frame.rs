@@ -632,6 +632,20 @@ fn to_msgpack<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
 /// [`FrameError`] for bytes this build does not accept as a frame, or that
 /// exceed `limits`.
 pub fn decode_proposal(frame: &[u8], limits: &DecodeLimits) -> Result<RaftProposal, FrameError> {
+    decode_proposal_sized(frame, limits).map(|(proposal, _)| proposal)
+}
+
+/// [`decode_proposal`], with the bytes of keys, values and commands the
+/// proposal expanded to: with its operation count, what its decoded form
+/// holds, known without walking it.
+///
+/// # Errors
+///
+/// As [`decode_proposal`].
+pub fn decode_proposal_sized(
+    frame: &[u8],
+    limits: &DecodeLimits,
+) -> Result<(RaftProposal, usize), FrameError> {
     if frame.len() > limits.max_frame_bytes {
         return Err(FrameError::OverLimit {
             what: "frame size",
@@ -682,13 +696,16 @@ pub fn decode_proposal(frame: &[u8], limits: &DecodeLimits) -> Result<RaftPropos
     if left != 0 {
         return Err(FrameError::Trailing(left));
     }
-    Ok(RaftProposal {
-        id,
-        mutations,
-        commit_ts,
-        start_ts,
-        bypass_rate_limiter: flags & FLAG_BYPASS_RATE_LIMITER != 0,
-    })
+    Ok((
+        RaftProposal {
+            id,
+            mutations,
+            commit_ts,
+            start_ts,
+            bypass_rate_limiter: flags & FLAG_BYPASS_RATE_LIMITER != 0,
+        },
+        decoder.expanded,
+    ))
 }
 
 struct Reader<'a> {

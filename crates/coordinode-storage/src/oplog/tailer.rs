@@ -374,17 +374,57 @@ pub(crate) fn list_segments(oplog_dirs: &[PathBuf]) -> StorageResult<Vec<(u64, P
         };
         segments.extend(entries.filter_map(|e| e.ok()).filter_map(|e| {
             let p = e.path();
-            let idx = p
-                .file_stem()?
-                .to_str()?
-                .strip_prefix("oplog-")?
-                .parse()
-                .ok()?;
-            Some((idx, p))
+            Some((segment_first_index(&p)?, p))
         }));
     }
     segments.sort_by_key(|&(idx, _)| idx);
     Ok(segments)
+}
+
+/// The first log index the segment at `path` holds, read from its name;
+/// `None` for a file that is not a segment.
+fn segment_first_index(path: &std::path::Path) -> Option<u64> {
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix("oplog-")?
+        .parse()
+        .ok()
+}
+
+/// The first index a log's segments hold, and the first index and path of
+/// the segment holding a position: see [`segment_holding`].
+pub(crate) type SegmentHolding = (Option<u64>, Option<(u64, PathBuf)>);
+
+/// The first index the segments in `oplog_dirs` hold, and the segment that
+/// would hold `next` (the one starting latest at or below it), found
+/// without collecting the listing: a reader holds one path at a time.
+///
+/// # Errors
+///
+/// An oplog directory cannot be listed.
+pub(crate) fn segment_holding(oplog_dirs: &[PathBuf], next: u64) -> StorageResult<SegmentHolding> {
+    let mut first: Option<u64> = None;
+    let mut holding: Option<(u64, PathBuf)> = None;
+    for dir in oplog_dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(StorageError::Io(format!("list oplog dir {dir:?}: {e}")));
+            }
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Some(start) = segment_first_index(&path) else {
+                continue;
+            };
+            first = Some(first.map_or(start, |first| first.min(start)));
+            if start <= next && holding.as_ref().is_none_or(|(held, _)| start > *held) {
+                holding = Some((start, path));
+            }
+        }
+    }
+    Ok((first, holding))
 }
 
 /// The first log index the segments in `oplog_dirs` hold, or `None` when

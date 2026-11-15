@@ -363,6 +363,12 @@ pub struct StorageEngine {
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub(crate) on_journalled: parking_lot::Mutex<Option<Box<dyn FnMut(u64) + Send>>>,
+    /// Test hook: run with the segment a cut's continuation read found to
+    /// hold its next entry, before it opens it.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) on_segment_found:
+        parking_lot::Mutex<Option<Box<dyn FnMut(&std::path::Path) + Send>>>,
     /// The lowest journal index a rebuild from the latest local checkpoint
     /// replays from; reclamation keeps it. `u64::MAX` when no checkpoint
     /// needs any.
@@ -1800,6 +1806,8 @@ impl StorageEngine {
             on_cut_bound: parking_lot::Mutex::new(None),
             #[cfg(test)]
             on_journalled: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            on_segment_found: parking_lot::Mutex::new(None),
             journal_keep_from: AtomicU64::new(u64::MAX),
             consumer_journal_floor: AtomicU64::new(if protections_pending { 0 } else { u64::MAX }),
             protections_pending: std::sync::atomic::AtomicBool::new(protections_pending),
@@ -4536,42 +4544,49 @@ impl StorageEngine {
         crate::engine::fixed_cut::CutRead,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
-        use crate::oplog::segment::{FrameCursor, Peeked};
+        use crate::engine::fixed_cut::EntryPool;
+        use crate::oplog::segment::{FRAME_CURSOR_BUFFER, FrameCursor, Peeked};
         self.check_cut_history(cut)?;
         let mut charge = budget.empty_charge();
-        let mut units = Vec::new();
+        let mut units: Vec<crate::engine::fixed_cut::CutUnit> = Vec::new();
         let mut next = from;
         let mut taken = 0usize;
-        // What an entry that does not fit does: the first one is refused,
-        // a later one ends the read before it.
-        let no_room = |stop: coordinode_core::budget::BudgetStop, taken: usize| {
-            if taken == 0 {
-                Err(StorageError::Budget(stop))
-            } else {
-                Ok(())
-            }
+        let stop = || coordinode_core::budget::BudgetStop::Memory {
+            requested: 0,
+            used: budget.memory_used(),
+            limit: budget.memory_limit(),
         };
+        // A segment's read buffer and the one path a search holds.
+        let reader = FRAME_CURSOR_BUFFER as u64 + READER_PATH_ROOM;
+        charge.grow(reader).map_err(StorageError::Budget)?;
         'log: while next < until && taken < max_entries {
             let at = next;
-            let segments = crate::oplog::tailer::list_segments(dirs)?;
-            let held_from = segments.first().map(|&(first, _)| first);
-            let Some((_, path)) = segments.iter().rev().find(|(first, _)| *first <= next) else {
+            let (held_from, holding) = crate::oplog::tailer::segment_holding(dirs, next)?;
+            let Some((_, path)) = holding else {
+                charge.shrink(reader);
                 return Err(StorageError::RetentionLost {
                     requested: next,
                     first_retained: held_from.unwrap_or(until),
                 });
             };
-            let mut frames = match FrameCursor::open(path) {
+            #[cfg(test)]
+            if let Some(hook) = self.on_segment_found.lock().as_mut() {
+                hook(&path);
+            }
+            let mut frames = match FrameCursor::open(&path) {
                 Ok(frames) => frames,
-                // Purged since it was listed: whether the entry is gone is
+                // Purged since it was found: whether the entry is gone is
                 // read from the log as it stands now.
                 Err(_) if !path.exists() => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    charge.shrink(reader);
+                    return Err(e);
+                }
             };
             loop {
-                let (len, index) = match frames.peek()? {
+                let (len, index, ops) = match frames.peek()? {
                     Peeked::End => break,
-                    Peeked::Frame { len, index } => (len, index),
+                    Peeked::Frame { len, index, ops } => (len, index, ops),
                 };
                 if index < next {
                     frames.skip();
@@ -4580,73 +4595,87 @@ impl StorageEngine {
                 if index > next || next >= until || taken >= max_entries {
                     break;
                 }
-                // The payload, before it is read.
-                if let Err(stop) = charge.grow(len) {
-                    no_room(stop, taken)?;
-                    break 'log;
-                }
-                let Some(entry) = frames.read()? else {
-                    charge.shrink(len);
-                    break;
-                };
-                // What is left of the budget bounds what the entry's units
-                // may decode to, before they are decoded. A budget refuses
-                // every reservation past its limit, so it holds no more.
+                // The entry's working memory, taken before anything of it is
+                // read: what the budget has left, its payload and its list
+                // of operations out of it first. What is not spent returns.
                 debug_assert!(budget.memory_used() <= budget.memory_limit());
-                let left = budget.memory_limit() - budget.memory_used();
-                // A budget past the address space bounds nothing more.
-                let left = usize::try_from(left).unwrap_or(usize::MAX);
-                let limits = coordinode_core::txn::frame::DecodeLimits {
-                    max_frame_bytes: coordinode_core::txn::frame::DecodeLimits::DEFAULT
-                        .max_frame_bytes,
-                    max_ops: left
-                        / core::mem::size_of::<coordinode_core::txn::proposal::Mutation>(),
-                    max_expanded_bytes: left,
-                };
-                let decoded = self.units_of_entry(cut, &entry, &limits);
-                drop(entry);
-                charge.shrink(len);
-                let entry_units = match decoded {
-                    Ok(entry_units) => entry_units,
-                    Err(StorageError::Frame(
-                        coordinode_core::txn::frame::FrameError::OverLimit { .. },
-                    )) => {
-                        no_room(
-                            coordinode_core::budget::BudgetStop::Memory {
-                                requested: len,
-                                used: budget.memory_used(),
-                                limit: budget.memory_limit(),
-                            },
-                            taken,
-                        )?;
-                        break 'log;
+                // A budget refuses every reservation past its limit.
+                let room = budget.memory_limit() - budget.memory_used();
+                let envelope = ops
+                    .checked_mul(core::mem::size_of::<crate::oplog::OplogOpRef<'_>>() as u64)
+                    .and_then(|bytes| bytes.checked_add(len));
+                let Some(fixed) = envelope.filter(|fixed| *fixed <= room) else {
+                    if taken == 0 {
+                        charge.shrink(reader);
+                        return Err(StorageError::Budget(stop()));
                     }
-                    Err(e) => return Err(e),
+                    break 'log;
                 };
-                if let Err(stop) = charge.grow(units_bytes(&entry_units)) {
-                    no_room(stop, taken)?;
+                if let Err(refused) = charge.grow(room) {
+                    // Taken by another part of the budget meanwhile.
+                    if taken == 0 {
+                        charge.shrink(reader);
+                        return Err(StorageError::Budget(refused));
+                    }
                     break 'log;
                 }
-                units.extend(entry_units);
-                next = index + 1;
-                taken += 1;
+                let mut pool = EntryPool::new(room - fixed);
+                let start = units.len();
+                let outcome = match frames.read_payload()? {
+                    Some(payload) => match crate::oplog::OplogEntryRef::decode(&payload) {
+                        Ok(entry) if entry.index == index => {
+                            self.units_of_entry(cut, &entry, &mut pool, &mut units)
+                        }
+                        _ => Err(EntryOutcome::Unreadable),
+                    },
+                    None => Err(EntryOutcome::Unreadable),
+                };
+                match outcome {
+                    Ok(()) => {
+                        // The payload and the operation list are gone; the
+                        // units and the room they grew the batch by stay.
+                        charge.shrink(room - pool.kept());
+                        next = index + 1;
+                        taken += 1;
+                    }
+                    Err(failed) => {
+                        units.truncate(start);
+                        // Only the batch's grown room stays.
+                        charge.shrink(room - pool.grown());
+                        match failed {
+                            EntryOutcome::NoRoom if taken == 0 => {
+                                charge.shrink(reader);
+                                return Err(StorageError::Budget(stop()));
+                            }
+                            EntryOutcome::NoRoom => break 'log,
+                            EntryOutcome::Unreadable => break,
+                            EntryOutcome::Failed(e) => {
+                                charge.shrink(reader);
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
             }
             if next == at {
+                charge.shrink(reader);
                 // The segment that should hold the next confirmed entry ends
                 // before it: purged meanwhile, or unreadable.
-                let segments = crate::oplog::tailer::list_segments(dirs)?;
-                return Err(match segments.first() {
-                    Some(&(first, _)) if first <= next => StorageError::Io(format!(
+                let (first, holding) = crate::oplog::tailer::segment_holding(dirs, next)?;
+                return Err(if holding.is_some() {
+                    StorageError::Io(format!(
                         "the log holds entry {next}, below its confirmed end {until}, but it \
                          cannot be read"
-                    )),
-                    first => StorageError::RetentionLost {
+                    ))
+                } else {
+                    StorageError::RetentionLost {
                         requested: next,
-                        first_retained: first.map_or(until, |&(first, _)| first),
-                    },
+                        first_retained: first.unwrap_or(until),
+                    }
                 });
             }
         }
+        charge.shrink(reader);
         Ok((crate::engine::fixed_cut::CutRead { units, next }, charge))
     }
 
@@ -4683,8 +4712,11 @@ impl StorageEngine {
         };
         let end = crate::engine::fixed_cut::prefix_successor(prefix);
         let hi = end.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
-        let mut page = Vec::new();
+        let mut page: crate::engine::fixed_cut::CutRows = Vec::new();
         let mut charge = budget.empty_charge();
+        // The scan's own state while the page is read.
+        charge.grow(PAGE_SCAN_ROOM).map_err(StorageError::Budget)?;
+        let row_slot = core::mem::size_of::<(Vec<u8>, Vec<u8>)>();
         for guard in self.scan_range_at(cut.scope.partition(), lo, hi, cut.bound)? {
             if page.len() >= max_rows {
                 break;
@@ -4692,17 +4724,25 @@ impl StorageEngine {
             // Shared with the block they were read from: nothing is copied
             // until the row is known to fit.
             let (key, value) = guard.into_inner()?;
-            // Slices of memory that exists: their lengths fit in u64.
-            let size =
-                (key.len() + value.len() + core::mem::size_of::<(Vec<u8>, Vec<u8>)>()) as u64;
+            // The row's copies, and the page's room for it when the page is
+            // full: it grows before the row is copied. Slices of memory that
+            // exists: their lengths fit in u64.
+            let more = if page.len() == page.capacity() {
+                page.capacity().max(4)
+            } else {
+                0
+            };
+            let size = (key.len() + value.len() + more * row_slot) as u64;
             if let Err(stop) = charge.grow(size) {
                 if page.is_empty() {
                     return Err(StorageError::Budget(stop));
                 }
                 break;
             }
+            page.reserve_exact(more);
             page.push((key.to_vec(), value.to_vec()));
         }
+        charge.shrink(PAGE_SCAN_ROOM);
         // A repair that replaced the tree while the page was read leaves
         // rows of another copy in it: the page is not handed over.
         self.scope_view_intact(cut)?;
@@ -4762,11 +4802,19 @@ impl StorageEngine {
         self.check_cut_history(cut)?;
         let mut units = Vec::new();
         for entry in entries {
-            units.extend(self.units_of_entry(
-                cut,
-                entry,
-                &coordinode_core::txn::frame::DecodeLimits::DEFAULT,
-            )?);
+            let payload = entry
+                .encode()
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let entry = crate::oplog::OplogEntryRef::decode(&payload)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let mut pool = crate::engine::fixed_cut::EntryPool::new(u64::MAX);
+            self.units_of_entry(cut, &entry, &mut pool, &mut units)
+                .map_err(|failed| match failed {
+                    EntryOutcome::Failed(e) => e,
+                    EntryOutcome::NoRoom | EntryOutcome::Unreadable => {
+                        StorageError::Serialization(format!("entry {} cannot be read", entry.index))
+                    }
+                })?;
         }
         Ok(units)
     }
@@ -4782,124 +4830,151 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// [`Self::cut_units_of`] of one entry, each unit decoded within
-    /// `limits`.
+    /// The units of one entry, read in place, appended to `units`: each
+    /// unit decoded within what is left of `pool`, which its decoded form
+    /// and the room the batch grows by are kept from.
     fn units_of_entry(
         &self,
         cut: &crate::engine::fixed_cut::FixedCut,
-        entry: &crate::oplog::OplogEntry,
-        limits: &coordinode_core::txn::frame::DecodeLimits,
-    ) -> StorageResult<Vec<crate::engine::fixed_cut::CutUnit>> {
-        use crate::oplog::OplogOp;
+        entry: &crate::oplog::OplogEntryRef<'_>,
+        pool: &mut crate::engine::fixed_cut::EntryPool,
+        units: &mut Vec<crate::engine::fixed_cut::CutUnit>,
+    ) -> Result<(), EntryOutcome> {
+        use crate::oplog::OplogOpRef;
         use coordinode_core::txn::operation::LogPosition;
+        use coordinode_core::txn::proposal::Mutation;
         let scope = &cut.scope;
-        let unsupported = |index: u64, what: &str| StorageError::CutUnsupported {
-            reason: format!("entry {index} carries {what} inside the scope"),
+        let unsupported = |what: &str| {
+            EntryOutcome::Failed(StorageError::CutUnsupported {
+                reason: format!("entry {} carries {what} inside the scope", entry.index),
+            })
         };
-        let mut units = Vec::new();
-        {
-            let mut sub = 0u32;
-            for op in &entry.ops {
-                let frame = match op {
-                    OplogOp::Unit { frame } => frame,
-                    // A raw data op carries no commit timestamp of its own to
-                    // decide against the view by: inside the scope it cannot be
-                    // carried, outside it touches nothing handed over.
-                    OplogOp::Insert { partition, key, .. }
-                    | OplogOp::Delete { partition, key }
-                    | OplogOp::Merge { partition, key, .. } => {
-                        match crate::placement::partition_from_wire_tag(*partition) {
-                            Some(p) if p != scope.partition() => continue,
-                            Some(_) if !scope.holds_key(key) => continue,
-                            _ => return Err(unsupported(entry.index, "a raw row write")),
-                        }
-                    }
-                    OplogOp::RemoveRange {
-                        partition,
-                        start,
-                        end,
-                    } => match crate::placement::partition_from_wire_tag(*partition) {
+        let mut sub = 0u32;
+        for op in &entry.ops {
+            let frame = match op {
+                OplogOpRef::Unit { frame } => *frame,
+                // A raw data op carries no commit timestamp of its own to
+                // decide against the view by: inside the scope it cannot be
+                // carried, outside it touches nothing handed over.
+                OplogOpRef::Insert { partition, key, .. }
+                | OplogOpRef::Delete { partition, key }
+                | OplogOpRef::Merge { partition, key, .. } => {
+                    match crate::placement::partition_from_wire_tag(*partition) {
                         Some(p) if p != scope.partition() => continue,
-                        Some(_) if !scope.meets_range(start, end) => continue,
-                        _ => return Err(unsupported(entry.index, "a raw range delete")),
-                    },
-                    // Index entries: a row scope never holds the index
-                    // partition. Columnar rows live in their tables' own
-                    // trees, outside every partition.
-                    OplogOp::Derive { .. } | OplogOp::ColumnarInsert { .. } => continue,
-                    // Framing: a gap fill, a log truncation, and a group log
-                    // entry's envelope, which holds its closing bound or a
-                    // membership change; its proposals follow it as units.
-                    OplogOp::Noop | OplogOp::RaftTruncation { .. } | OplogOp::RaftEntry { .. } => {
-                        continue;
-                    }
-                };
-                let position = LogPosition {
-                    index: entry.index,
-                    sub,
-                };
-                sub = sub.checked_add(1).ok_or_else(|| {
-                    StorageError::Serialization(format!(
-                        "entry {} carries over 2^32 units",
-                        entry.index
-                    ))
-                })?;
-                let unit = coordinode_core::txn::frame::decode_proposal(frame, limits)?;
-                let commit_ts = unit.commit_ts.as_raw();
-                let bound = unit
-                    .mutations
-                    .iter()
-                    .any(|m| matches!(m, coordinode_core::txn::proposal::Mutation::Operation(_)));
-                let refused = bound && crate::engine::operations::unit_skipped(self, position)?;
-                let mut mutations = Vec::new();
-                if !refused {
-                    use coordinode_core::txn::proposal::Mutation;
-                    for m in unit.mutations {
-                        let inside = match m {
-                            Mutation::Put {
-                                partition, ref key, ..
-                            }
-                            | Mutation::Delete { partition, ref key }
-                            | Mutation::Merge {
-                                partition, ref key, ..
-                            } => (scope.holds_partition(partition) && scope.holds_key(key))
-                                .then_some(m),
-                            // Only the part inside the scope: the rest deletes
-                            // rows the consumer does not hold.
-                            Mutation::RemoveRange {
-                                partition,
-                                start,
-                                end,
-                            } => scope
-                                .holds_partition(partition)
-                                .then(|| scope.clip_range(&start, &end))
-                                .flatten()
-                                .map(|(start, end)| Mutation::RemoveRange {
-                                    partition,
-                                    start,
-                                    end,
-                                }),
-                            // Its effects land in the schema partition, which
-                            // no row scope is.
-                            Mutation::Command(_) => None,
-                            // Index entries, in the index partition.
-                            Mutation::Derive(_) => None,
-                            // Decides the unit, already read as `refused`.
-                            Mutation::Operation(_) => None,
-                        };
-                        mutations.extend(inside);
+                        Some(_) if !scope.holds_key(key) => continue,
+                        _ => return Err(unsupported("a raw row write")),
                     }
                 }
-                units.push(crate::engine::fixed_cut::CutUnit {
-                    position,
-                    commit_ts,
-                    mutations,
-                    refused,
-                    in_view: cut.in_view(position, commit_ts),
-                });
+                OplogOpRef::RemoveRange {
+                    partition,
+                    start,
+                    end,
+                } => match crate::placement::partition_from_wire_tag(*partition) {
+                    Some(p) if p != scope.partition() => continue,
+                    Some(_) if !scope.meets_range(start, end) => continue,
+                    _ => return Err(unsupported("a raw range delete")),
+                },
+                // Index entries: a row scope never holds the index partition.
+                // Columnar rows live in their tables' own trees, outside every
+                // partition.
+                OplogOpRef::Derive { .. } | OplogOpRef::ColumnarInsert { .. } => continue,
+                // Framing: a gap fill, a log truncation, and a group log entry's
+                // envelope, which holds its closing bound or a membership
+                // change; its proposals follow it as units.
+                OplogOpRef::Noop
+                | OplogOpRef::RaftTruncation { .. }
+                | OplogOpRef::RaftEntry { .. } => continue,
+            };
+            let position = LogPosition {
+                index: entry.index,
+                sub,
+            };
+            sub = sub.checked_add(1).ok_or_else(|| {
+                EntryOutcome::Failed(StorageError::Serialization(format!(
+                    "entry {} carries over 2^32 units",
+                    entry.index
+                )))
+            })?;
+            let (unit, expanded) = match coordinode_core::txn::frame::decode_proposal_sized(
+                frame,
+                &pool.decode_limits(),
+            ) {
+                Ok(decoded) => decoded,
+                Err(coordinode_core::txn::frame::FrameError::OverLimit { .. }) => {
+                    return Err(EntryOutcome::NoRoom);
+                }
+                Err(e) => return Err(EntryOutcome::Failed(e.into())),
+            };
+            // What the decoded unit holds: its operations, of the capacity
+            // decoded, and the bytes they own. Within the decode bounds.
+            let held = (unit.mutations.capacity() * core::mem::size_of::<Mutation>()) as u64
+                + expanded as u64;
+            if !pool.retain(held) {
+                return Err(EntryOutcome::NoRoom);
             }
+            let commit_ts = unit.commit_ts.as_raw();
+            let bound = unit
+                .mutations
+                .iter()
+                .any(|m| matches!(m, Mutation::Operation(_)));
+            let refused = bound
+                && crate::engine::operations::unit_skipped(self, position)
+                    .map_err(EntryOutcome::Failed)?;
+            let mut mutations = unit.mutations;
+            if refused {
+                mutations.clear();
+            }
+            // Kept in place: no second list is built.
+            mutations.retain_mut(|m| match m {
+                Mutation::Put { partition, key, .. }
+                | Mutation::Delete { partition, key }
+                | Mutation::Merge { partition, key, .. } => {
+                    scope.holds_partition(*partition) && scope.holds_key(key)
+                }
+                // Only the part inside the scope: the rest deletes rows the
+                // consumer does not hold.
+                Mutation::RemoveRange {
+                    partition,
+                    start,
+                    end,
+                } => match scope
+                    .holds_partition(*partition)
+                    .then(|| scope.clip_range(start, end))
+                    .flatten()
+                {
+                    Some((clipped_start, clipped_end)) => {
+                        *start = clipped_start;
+                        *end = clipped_end;
+                        true
+                    }
+                    None => false,
+                },
+                // Its effects land in the schema partition, which no row
+                // scope is.
+                Mutation::Command(_) => false,
+                // Index entries, in the index partition.
+                Mutation::Derive(_) => false,
+                // Decides the unit, already read as `refused`.
+                Mutation::Operation(_) => false,
+            });
+            if units.len() == units.capacity() {
+                let more = units.capacity().max(4);
+                if !pool
+                    .grow((more * core::mem::size_of::<crate::engine::fixed_cut::CutUnit>()) as u64)
+                {
+                    return Err(EntryOutcome::NoRoom);
+                }
+                units.reserve_exact(more);
+            }
+            units.push(crate::engine::fixed_cut::CutUnit {
+                position,
+                commit_ts,
+                mutations,
+                refused,
+                in_view: cut.in_view(position, commit_ts),
+            });
         }
-        Ok(units)
+        Ok(())
     }
 
     /// Record the group whose log the member running over the engine
@@ -8669,32 +8744,25 @@ impl Drop for PartitionRepair<'_> {
     }
 }
 
-/// The memory `units` hold: each unit and mutation, and the bytes their keys,
-/// values and operands own.
-fn units_bytes(units: &[crate::engine::fixed_cut::CutUnit]) -> u64 {
-    use coordinode_core::txn::proposal::Mutation;
-    let owned = |m: &Mutation| match m {
-        Mutation::Put { key, value, .. } => key.len() + value.len(),
-        Mutation::Delete { key, .. } => key.len(),
-        Mutation::Merge { key, operand, .. } => key.len() + operand.len(),
-        Mutation::RemoveRange { start, end, .. } => start.len() + end.len(),
-        // A unit handed over carries only row changes.
-        Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => 0,
-    };
-    let bytes: usize = units
-        .iter()
-        .map(|unit| {
-            core::mem::size_of::<crate::engine::fixed_cut::CutUnit>()
-                + unit
-                    .mutations
-                    .iter()
-                    .map(|m| core::mem::size_of::<Mutation>() + owned(m))
-                    .sum::<usize>()
-        })
-        .sum();
-    // Memory that exists: its size fits in u64.
-    bytes as u64
+/// Why one log entry of a cut's continuation was not taken.
+enum EntryOutcome {
+    /// It does not fit what is left of the read's budget.
+    NoRoom,
+    /// Its frame does not hold together: a purge or a rewrite raced the read,
+    /// or the bytes are damaged.
+    Unreadable,
+    /// Reading it failed.
+    Failed(StorageError),
 }
+
+/// What a continuation read holds besides its segment buffer and the
+/// entries it takes: the path of the segment it reads and the point reads
+/// that decide its units' operation bindings.
+const READER_PATH_ROOM: u64 = 16 << 10;
+
+/// What a page's scan holds while it reads: its iterator over the tree's
+/// levels and the block of each it stands in.
+const PAGE_SCAN_ROOM: u64 = 64 << 10;
 
 /// The bit of `partition` in [`StorageEngine::under_repair`]: its place in
 /// [`Partition::all`], which holds far fewer than 64 partitions.

@@ -33,6 +33,112 @@ fn make_full_entry() -> OplogEntry {
     }
 }
 
+/// The in-place view reads every operation an entry encodes, each variant
+/// over the same bytes, with the pre-images passed over: it mirrors the
+/// owned form field for field.
+#[test]
+fn the_in_place_view_reads_what_an_entry_encodes() {
+    let mut entry = make_full_entry();
+    entry.ops.extend([
+        OplogOp::RaftEntry {
+            data: b"envelope".to_vec(),
+        },
+        OplogOp::RaftTruncation { after_index: 9 },
+        OplogOp::ColumnarInsert {
+            table_id: "t".into(),
+            key: b"ck".to_vec(),
+            value: b"cv".to_vec(),
+        },
+        OplogOp::Derive {
+            work: b"work".to_vec(),
+        },
+        OplogOp::Unit {
+            frame: b"frame".to_vec(),
+        },
+    ]);
+    entry.pre_images = Some(vec![PreImage {
+        partition: 1,
+        key: b"pk".to_vec(),
+        value: b"pv".to_vec(),
+    }]);
+    let encoded = entry.encode().expect("encode");
+    let view = OplogEntryRef::decode(&encoded).expect("view");
+    assert_eq!(
+        (
+            view.ts,
+            view.term,
+            view.index,
+            view.shard,
+            view.is_migration
+        ),
+        (
+            entry.ts,
+            entry.term,
+            entry.index,
+            entry.shard,
+            entry.is_migration
+        )
+    );
+    let owned: Vec<OplogOp> = view
+        .ops
+        .iter()
+        .map(|op| match *op {
+            OplogOpRef::Insert {
+                partition,
+                key,
+                value,
+            } => OplogOp::Insert {
+                partition,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+            OplogOpRef::Delete { partition, key } => OplogOp::Delete {
+                partition,
+                key: key.to_vec(),
+            },
+            OplogOpRef::Merge {
+                partition,
+                key,
+                operand,
+            } => OplogOp::Merge {
+                partition,
+                key: key.to_vec(),
+                operand: operand.to_vec(),
+            },
+            OplogOpRef::RemoveRange {
+                partition,
+                start,
+                end,
+            } => OplogOp::RemoveRange {
+                partition,
+                start: start.to_vec(),
+                end: end.to_vec(),
+            },
+            OplogOpRef::Noop => OplogOp::Noop,
+            OplogOpRef::RaftEntry { data } => OplogOp::RaftEntry {
+                data: data.to_vec(),
+            },
+            OplogOpRef::RaftTruncation { after_index } => OplogOp::RaftTruncation { after_index },
+            OplogOpRef::ColumnarInsert {
+                table_id,
+                key,
+                value,
+            } => OplogOp::ColumnarInsert {
+                table_id: table_id.to_owned(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+            OplogOpRef::Derive { work } => OplogOp::Derive {
+                work: work.to_vec(),
+            },
+            OplogOpRef::Unit { frame } => OplogOp::Unit {
+                frame: frame.to_vec(),
+            },
+        })
+        .collect();
+    assert_eq!(owned, entry.ops);
+}
+
 #[test]
 fn encode_decode_roundtrip() {
     let entry = make_full_entry();

@@ -261,7 +261,9 @@ fn a_continuation_read_keeps_to_its_budget() {
     }
     let whole = read(&engine, &cut, cut.first(), usize::MAX);
     assert_eq!(whole.units.len(), 200);
-    let small = QueryBudget::new(1024);
+    // Room for the reader and a part of the entries.
+    let limit = 32 << 10;
+    let small = QueryBudget::new(limit);
     let (part, charge) = engine
         .cut_read(&cut, cut.first(), usize::MAX, &small)
         .expect("part");
@@ -270,7 +272,7 @@ fn a_continuation_read_keeps_to_its_budget() {
         "a part of the segment: {}",
         part.units.len()
     );
-    assert!(small.memory_peak() <= 1024, "within the budget");
+    assert!(small.memory_peak() <= limit, "within the budget");
     assert_eq!(small.memory_used(), charge.bytes(), "held by the result");
     drop(charge);
     assert_eq!(small.memory_used(), 0, "returned once the read is dropped");
@@ -378,6 +380,36 @@ fn confirmed_entries_the_log_cannot_give_are_not_an_empty_read() {
     assert!(
         matches!(gone, Err(crate::error::StorageError::RetentionLost { .. })),
         "{gone:?}"
+    );
+}
+
+/// The segment holding the next entry is purged after the read found it and
+/// before it opens it: the read looks again and answers RetentionLost, not
+/// an empty read, and its position stays where it was.
+#[test]
+fn a_segment_purged_between_finding_and_opening_it_is_retention_lost() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, cut, copy, until) = copied_journal(&dir);
+    let mut once = true;
+    *engine.on_segment_found.lock() = Some(Box::new(move |path: &std::path::Path| {
+        if std::mem::take(&mut once) {
+            std::fs::remove_file(path).expect("purge");
+        }
+    }));
+    let raced = engine
+        .cut_read_log(
+            &cut,
+            std::slice::from_ref(&copy),
+            cut.first(),
+            until,
+            usize::MAX,
+            &unlimited(),
+        )
+        .map(|(read, _)| read);
+    *engine.on_segment_found.lock() = None;
+    assert!(
+        matches!(raced, Err(crate::error::StorageError::RetentionLost { .. })),
+        "{raced:?}"
     );
 }
 
