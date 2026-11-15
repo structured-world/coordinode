@@ -215,11 +215,16 @@ fn sequential_writes_stop_before_the_footprint_passes_the_cap() {
         );
         let mut result = db.execute_cypher(&query);
         assert_within(dir.path(), &format!("write {key}"));
-        if matches!(result, Err(DatabaseError::CapacityExhausted { .. })) {
-            // A compaction running in the background holds the room its
-            // output may take until it ends: full is a refusal that stands
-            // once the background work settled.
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        // A compaction running in the background holds its inputs and its
+        // output together until it ends, and a flush refused meanwhile leaves
+        // the journal it covers: full is a refusal that stands once that
+        // work settled. Each try reclaims again; the deadline only bounds a
+        // refusal that stands, it decides nothing on a loaded host.
+        let settle = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(result, Err(DatabaseError::CapacityExhausted { .. }))
+            && std::time::Instant::now() < settle
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
             result = db.execute_cypher(&query);
             assert_within(dir.path(), &format!("write {key} again"));
         }
@@ -388,7 +393,16 @@ fn a_checkpoint_under_the_cap_is_charged_and_keeps_its_history() {
     for key in 0..24 {
         db.execute_cypher(&create(key)).unwrap();
     }
-    let checkpoint = db.checkpoint(1).expect("checkpoint under the cap");
+    // A compaction in flight holds its inputs beside its output, and the
+    // checkpoint's flushes may find no room until it ends: a refused
+    // checkpoint leaves nothing behind and is taken again.
+    let settle = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut taken = db.checkpoint(1);
+    while taken.is_err() && std::time::Instant::now() < settle {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        taken = db.checkpoint(1);
+    }
+    let checkpoint = taken.expect("checkpoint under the cap");
     assert_within(dir.path(), "after the checkpoint");
     assert_accounted(&db, dir.path(), "after the checkpoint");
 
