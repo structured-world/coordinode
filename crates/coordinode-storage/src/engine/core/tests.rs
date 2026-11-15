@@ -2504,6 +2504,28 @@ fn await_flushed(tree: &impl lsm_tree::AbstractTree, what: &str) {
     assert!(tree.table_count() > 0, "the memtable became a table");
 }
 
+/// Write until a client write of one byte is refused, which is what a store
+/// at its limit does to client writes. A refusal is by size, so a big write
+/// refused leaves room for a small one: fill with big writes, then small
+/// ones. The refusal that ends it is the evidence; a later write is not
+/// asked, since an admission that finds no room first reclaims the journal
+/// the trees cover, and a flush landing meanwhile may give it room.
+fn fill_to_the_limit(
+    engine: &StorageEngine,
+    oracle: &coordinode_core::txn::timestamp::TimestampOracle,
+    index: &mut u64,
+) {
+    while admitted_write(engine, oracle, *index + 1, 16 << 10) {
+        *index += 1;
+    }
+    let mut small = 0;
+    while admitted_write(engine, oracle, *index + 1, 1) {
+        *index += 1;
+        small += 1;
+        assert!(small < 100_000, "the store never refused a client write");
+    }
+}
+
 /// Persist `engine` as an operator of a full store does: a barrier short of
 /// room is refused as the limit, losing nothing it was to write; the limit
 /// is then raised, the barrier lands, and the limit goes back.
@@ -2531,8 +2553,6 @@ fn persist_making_room(engine: &StorageEngine, limit: u64) {
 #[test]
 fn closing_entries_clean_up_within_the_limit_client_writes_are_refused_at() {
     use crate::engine::closure_ledger::RETIRE_BATCH;
-    use crate::engine::footprint::Admit;
-    use coordinode_core::txn::proposal::{Mutation, PartitionId};
 
     // The smallest limit a store takes.
     const LIMIT: u64 = crate::engine::config::MIN_HARD_LIMIT_BYTES;
@@ -2565,18 +2585,8 @@ fn closing_entries_clean_up_within_the_limit_client_writes_are_refused_at() {
     engine.set_retention_window(std::time::Duration::from_secs(3_600));
     engine.reload_closure_frontier().expect("reload");
     assert_eq!(ledger_held(&engine), held);
-    while admitted_write(&engine, &oracle, index + 1, 16 << 10) {
-        index += 1;
-    }
-    let probe = [Mutation::Put {
-        partition: PartitionId::Node,
-        key: b"node:1:probe".to_vec(),
-        value: b"v".to_vec(),
-    }];
-    assert!(
-        engine.admit_proposal(&probe, Admit::Client).is_err(),
-        "client writes are refused at the limit"
-    );
+    // Client writes are refused at the limit: the fill ends on a refusal.
+    fill_to_the_limit(&engine, &oracle, &mut index);
     assert!(
         footprint.charged() <= footprint.enforced_limit(),
         "the files passed what the endpoint may hold: {} over {}",
