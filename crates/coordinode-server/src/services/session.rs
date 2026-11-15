@@ -214,6 +214,8 @@ impl SessionServiceTrait for SessionSvc {
         // events' receiver is how the core learns a statement's answer has
         // nowhere to go.
         let cluster = self.cluster.clone();
+        #[cfg(feature = "test-faults")]
+        let mut withhold = WithheldCommit::from_env();
         tokio::spawn(async move {
             loop {
                 let (request_id, event) = tokio::select! {
@@ -223,6 +225,10 @@ impl SessionServiceTrait for SessionSvc {
                     },
                     () = frame_tx.closed() => break,
                 };
+                #[cfg(feature = "test-faults")]
+                if withhold.holds(request_id, &event) {
+                    continue;
+                }
                 let history = cluster.as_ref().and_then(|node| node.history());
                 if frame_tx
                     .send(Ok(event_to_frame(request_id, event, history)))
@@ -235,6 +241,63 @@ impl SessionServiceTrait for SessionSvc {
         });
 
         Ok(Response::new(ReceiverStream::new(frame_rx)))
+    }
+}
+
+/// Test builds only: `COORDINODE_TEST_WITHHOLD_COMMIT` names a request id
+/// whose Committed answer a session never sends, as a reply lost on the way;
+/// from then on the session delivers nothing more. The commit has happened:
+/// `COORDINODE_TEST_WITHHOLD_MARKS` names a file that gets a line
+/// `withheld <request id> <commit_ts>` when the answer is held back.
+#[cfg(feature = "test-faults")]
+struct WithheldCommit {
+    request: Option<u64>,
+    held: bool,
+}
+
+#[cfg(feature = "test-faults")]
+impl WithheldCommit {
+    fn from_env() -> Self {
+        Self {
+            request: std::env::var("COORDINODE_TEST_WITHHOLD_COMMIT")
+                .ok()
+                .and_then(|id| id.parse().ok()),
+            held: false,
+        }
+    }
+
+    /// Whether `event`, answering `request_id`, is held back.
+    fn holds(&mut self, request_id: u64, event: &SessionEvent) -> bool {
+        use std::io::Write;
+
+        if self.held {
+            return true;
+        }
+        let SessionEvent::Committed { receipt } = event else {
+            return false;
+        };
+        if self.request != Some(request_id) {
+            return false;
+        }
+        self.held = true;
+        tracing::warn!(request_id, "test fault: a Committed answer is held back");
+        if let Some(path) = std::env::var_os("COORDINODE_TEST_WITHHOLD_MARKS") {
+            let written = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut marks| {
+                    writeln!(
+                        marks,
+                        "withheld {request_id} {}",
+                        receipt.commit_ts.as_raw()
+                    )
+                });
+            if let Err(e) = written {
+                tracing::error!(%e, "test fault: writing the withheld mark");
+            }
+        }
+        true
     }
 }
 

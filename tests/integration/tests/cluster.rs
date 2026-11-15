@@ -1712,6 +1712,219 @@ async fn interactive_commits_in_flight_at_a_leader_stop_resolve_truthfully() {
     commits_across_a_leader_stop(true).await;
 }
 
+/// A COMMIT that committed and whose Committed answer was lost, on the
+/// leader itself and through a follower, then the leader stopped: the client
+/// got no answer stating an outcome, the operation resolves at a member still
+/// running as committed with the commit time the lost answer carried, the
+/// transaction's one node is there exactly once, and the same holds after
+/// the stopped leader reopens its stored data.
+#[cfg(feature = "test-faults")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_committed_answer_across_a_leader_stop_resolves_committed() {
+    use coordinode_integration::proto::operation::{
+        self, operation_service_client::OperationServiceClient,
+    };
+    use coordinode_integration::proto::session::server_frame::Event;
+    use coordinode_integration::proto::session::session_service_client::SessionServiceClient;
+    use coordinode_integration::proto::session::{
+        Begin, ClientFrame, Commit, Execute, client_frame,
+    };
+    use tokio_stream::wrappers::ReceiverStream;
+
+    // The request ids whose Committed answers node 1 (the leader, the direct
+    // case) and node 3 (a follower, the routed case) hold back.
+    const DIRECT: u64 = 7001;
+    const ROUTED: u64 = 7002;
+
+    let direct_marks = tempfile::NamedTempFile::new().expect("marks file");
+    let routed_marks = tempfile::NamedTempFile::new().expect("marks file");
+    let direct_path = direct_marks.path().to_str().expect("utf-8").to_owned();
+    let routed_path = routed_marks.path().to_str().expect("utf-8").to_owned();
+    let direct_id = DIRECT.to_string();
+    let routed_id = ROUTED.to_string();
+    let (mut n1, n2, n3) = three_member_group_with(
+        &[
+            ("COORDINODE_TEST_WITHHOLD_COMMIT", &direct_id),
+            ("COORDINODE_TEST_WITHHOLD_MARKS", &direct_path),
+        ],
+        &[
+            ("COORDINODE_TEST_WITHHOLD_COMMIT", &routed_id),
+            ("COORDINODE_TEST_WITHHOLD_MARKS", &routed_path),
+        ],
+        "",
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(90);
+
+    let mut operations = OperationServiceClient::new(
+        tonic::transport::Endpoint::from_shared(n2.endpoint())
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect"),
+    );
+    let issuer = draw_transaction_id();
+    let enrolled = operations
+        .enroll_issuer(operation::EnrollIssuerRequest {
+            issuer: issuer.clone(),
+        })
+        .await
+        .expect("enrolled")
+        .into_inner();
+    let reference = |k: u64| operation::OperationRef {
+        issuer: issuer.clone(),
+        incarnation: enrolled.incarnation,
+        sequence: enrolled.next_sequence + k,
+        deployment: enrolled.deployment.clone(),
+    };
+
+    // Each case: a transaction opened, its node written, its COMMIT sent,
+    // and the member's mark that it committed and held the answer back.
+    let mut cases = Vec::new();
+    for (k, node, request_id, marks) in [
+        (0u64, &n1, DIRECT, direct_marks.path()),
+        (1, &n3, ROUTED, routed_marks.path()),
+    ] {
+        let channel = tonic::transport::Endpoint::from_shared(node.endpoint())
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut inbound = SessionServiceClient::new(channel)
+            .session(ReceiverStream::new(rx))
+            .await
+            .expect("open session")
+            .into_inner();
+        let txid = draw_transaction_id();
+        tx.send(ClientFrame {
+            request_id: 1,
+            op: Some(client_frame::Op::Begin(Begin {
+                txid: txid.clone(),
+                operation: Some(reference(k)),
+            })),
+        })
+        .await
+        .expect("begin");
+        tx.send(ClientFrame {
+            request_id: 2,
+            op: Some(client_frame::Op::Execute(Execute {
+                query: format!("CREATE (:LostReply {{k: {k}}})"),
+                txid: txid.clone(),
+                ..Default::default()
+            })),
+        })
+        .await
+        .expect("write");
+        loop {
+            let frame = inbound.message().await.expect("frame").expect("not end");
+            match (frame.request_id, frame.event) {
+                (2, Some(Event::CursorEnd(_))) => break,
+                (_, Some(Event::Error(e))) => panic!("the write failed: {e:?}"),
+                _ => {}
+            }
+        }
+        tx.send(ClientFrame {
+            request_id,
+            op: Some(client_frame::Op::Commit(Commit {
+                txid,
+                operation: None,
+                expect: Vec::new(),
+            })),
+        })
+        .await
+        .expect("commit");
+        let withheld_ts = loop {
+            let marked = std::fs::read_to_string(marks).unwrap_or_default();
+            if let Some(ts) = marked
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("withheld {request_id} ")))
+            {
+                break ts.trim().parse::<u64>().expect("a commit time");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {k}: the member never marked its answer held back"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_ne!(withheld_ts, 0, "case {k}: the commit had a time");
+        cases.push((k, request_id, withheld_ts, tx, inbound));
+    }
+
+    // Neither client got an answer stating the outcome, before the stop or
+    // after it.
+    let asked = Instant::now();
+    n1.request_stop();
+    // The direct session is a client stream left open, which the leader
+    // waits for through its drain window (15 s) before it closes it.
+    assert!(
+        n1.exits_within(Duration::from_secs(25)).await,
+        "the leader was still running {:?} after it was asked to stop",
+        asked.elapsed()
+    );
+    for (k, request_id, _, _, inbound) in &mut cases {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(500), inbound.message()).await {
+                Err(_) | Ok(Ok(None) | Err(_)) => break,
+                Ok(Ok(Some(frame))) => {
+                    if frame.request_id != *request_id {
+                        continue;
+                    }
+                    match frame.event {
+                        Some(Event::Committed(_)) => {
+                            panic!("case {k}: the held-back answer arrived")
+                        }
+                        Some(Event::Error(e)) => assert_eq!(
+                            stated_outcome(&e),
+                            None,
+                            "case {k}: the client was told an outcome: {e:?}"
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Resolved at a member still running.
+    let fence = write_after_a_leader_change(&n2, deadline).await;
+    for (k, _, withheld_ts, _, _) in &cases {
+        let resolved = resolve_excluded(&mut operations, reference(*k), deadline).await;
+        let label =
+            check_commit_outcome(&n3, "LostReply", *k, &Answer::None, &resolved, fence).await;
+        assert_eq!(
+            resolved.state(),
+            operation::OperationState::Committed,
+            "case {k}: {label}"
+        );
+        assert_eq!(
+            resolved.commit_ts, *withheld_ts,
+            "case {k}: the commit time the lost answer carried"
+        );
+    }
+
+    // The same after the stopped leader reopens its stored data: resolved
+    // through it and read there.
+    let peers = [n2.port, n3.port];
+    let n1 = n1.restart_member(1, &peers, &[], false).await;
+    let mut reopened = OperationServiceClient::new(
+        tonic::transport::Endpoint::from_shared(n1.endpoint())
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect to the reopened member"),
+    );
+    for (k, _, withheld_ts, _, _) in &cases {
+        let resolved = resolve_excluded(&mut reopened, reference(*k), deadline).await;
+        check_commit_outcome(&n1, "LostReply", *k, &Answer::None, &resolved, fence).await;
+        assert_eq!(
+            resolved.commit_ts, *withheld_ts,
+            "case {k}: the same commit after the reopen"
+        );
+    }
+}
+
 /// The commits of transactions held by node 1, the leader, sent through
 /// node 2 while node 1 is asked to stop; with `stall_leader_log`, node 1's
 /// own log syncs are held from just before the stop.
@@ -1894,8 +2107,80 @@ async fn commits_across_a_leader_stop(stall_leader_log: bool) {
             .await
             .expect("connect again"),
     );
-    let fence = loop {
-        match cypher_write_on(&n2, "CREATE (:AfterStop {k: 1})").await {
+    let fence = write_after_a_leader_change(&n2, deadline).await;
+    let mut outcomes = std::collections::BTreeMap::<String, u32>::new();
+    for i in 0..2 * TRANSACTIONS {
+        let side = if i < TRANSACTIONS {
+            "routed"
+        } else {
+            "on the leader"
+        };
+        let answer = match replies.get(&i) {
+            None => Answer::None,
+            Some(None) => Answer::Committed,
+            Some(Some(e)) => Answer::Error(e.clone()),
+        };
+        let resolved = resolve_excluded(&mut operations, reference(i), deadline).await;
+        let label = check_commit_outcome(&n3, "AtStop", i, &answer, &resolved, fence).await;
+        *outcomes.entry(format!("{side}: {label}")).or_default() += 1;
+    }
+    eprintln!("commit outcomes across the stop: {outcomes:?}");
+}
+
+/// The answer a client got to a COMMIT.
+#[derive(Debug, Clone)]
+enum Answer {
+    /// Committed.
+    Committed,
+    /// An error, with the typed details it carried.
+    Error(coordinode_integration::proto::session::SessionError),
+    /// None: the connection ended, or the answer was lost, before it came.
+    None,
+}
+
+/// The outcome an error answer to a COMMIT states, from its typed details:
+/// a settled operation's outcome, a transaction that ended committed or
+/// aborted, or a refusal that aborts the whole transaction (a conflict, a
+/// refused invariant, a revision mismatch). `None` for an error that states
+/// no outcome: a transaction not found where a COMMIT may have been sent, a
+/// refusal before anything ran, an outcome left to resolve.
+fn stated_outcome(
+    error: &coordinode_integration::proto::session::SessionError,
+) -> Option<coordinode_integration::proto::operation::OperationState> {
+    use coordinode_integration::proto::operation::OperationState;
+    use prost::Message as _;
+
+    let info = error
+        .status
+        .as_ref()?
+        .details
+        .iter()
+        .find(|any| any.type_url.ends_with("google.rpc.ErrorInfo"))
+        .and_then(|any| tonic_types::pb::ErrorInfo::decode(any.value.as_slice()).ok())?;
+    let outcome = |name: Option<&String>| match name.map(String::as_str) {
+        Some("COMMITTED") => Some(OperationState::Committed),
+        Some("ABORTED") => Some(OperationState::Aborted),
+        _ => None,
+    };
+    match info.reason.as_str() {
+        "OPERATION_SETTLED" => outcome(info.metadata.get("outcome")),
+        "TRANSACTION_CONFLICT" | "INVARIANT_REFUSED" | "REVISION_MISMATCH" => {
+            Some(OperationState::Aborted)
+        }
+        "TRANSACTION_ABORTED" => match info.metadata.get("end").map(String::as_str) {
+            Some("IDLE_COMMITTED") => Some(OperationState::Committed),
+            Some("IDLE_COMMIT_UNKNOWN") | None => None,
+            Some(_) => Some(OperationState::Aborted),
+        },
+        _ => None,
+    }
+}
+
+/// A write through `node` once the group has a leader again, retried until
+/// `deadline`: its commit time, a bound later reads wait for.
+async fn write_after_a_leader_change(node: &CoordinodeProcess, deadline: Instant) -> u64 {
+    loop {
+        match cypher_write_on(node, "CREATE (:AfterStop {k: 1})").await {
             Ok(at) => break at,
             Err(e) if Instant::now() < deadline => {
                 eprintln!("waiting for a new leader: {e}");
@@ -1903,86 +2188,235 @@ async fn commits_across_a_leader_stop(stall_leader_log: bool) {
             }
             Err(e) => panic!("no new leader: {e}"),
         }
-    };
-    let mut outcomes = std::collections::BTreeMap::<String, u32>::new();
-    for i in 0..2 * TRANSACTIONS {
-        let state = loop {
-            match operations
-                .resolve_operation(operation::ResolveOperationRequest {
-                    operation: Some(reference(i)),
+    }
+}
+
+/// `operation` resolved through `operations` with the exclusion, retried
+/// while no leader answers, until `deadline`.
+async fn resolve_excluded(
+    operations: &mut coordinode_integration::proto::operation::operation_service_client::OperationServiceClient<Channel>,
+    operation: coordinode_integration::proto::operation::OperationRef,
+    deadline: Instant,
+) -> coordinode_integration::proto::operation::ResolveOperationResponse {
+    loop {
+        match operations
+            .resolve_operation(
+                coordinode_integration::proto::operation::ResolveOperationRequest {
+                    operation: Some(operation.clone()),
                     exclude: true,
-                })
-                .await
-            {
-                Ok(r) => break r.into_inner().state(),
-                Err(e) if Instant::now() < deadline => {
-                    eprintln!("resolving operation {i}: {e}");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                Err(e) => panic!("operation {i} not resolved: {e}"),
+                },
+            )
+            .await
+        {
+            Ok(r) => break r.into_inner(),
+            Err(e) if Instant::now() < deadline => {
+                eprintln!("resolving operation {}: {e}", operation.sequence);
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-        };
-        let rows = cypher_after_on(
-            &n3,
-            &format!("MATCH (n:AtStop {{k: {i}}}) RETURN n.k"),
-            fence,
-        )
-        .await
-        .expect("read at another member");
-        let present = rows.len() == 1;
-        let side = if i < TRANSACTIONS {
-            "routed"
-        } else {
-            "on the leader"
-        };
-        let Some(reply) = replies.get(&i) else {
-            // The connection ended before an answer: only the resolution
-            // tells, and it was checked against the data above.
-            *outcomes
-                .entry(format!("{side}: no answer, resolved {state:?}"))
-                .or_default() += 1;
-            assert_eq!(
-                present,
-                state == operation::OperationState::Committed,
-                "transaction {i}: resolved {state:?}, write present {present}, no answer"
-            );
-            continue;
-        };
-        let label = match reply {
-            None => "Committed".to_owned(),
-            Some(e) => format!("error code {}", e.code),
-        };
-        *outcomes
-            .entry(format!("{side}: {label}, resolved {state:?}"))
-            .or_default() += 1;
-        assert!(
-            matches!(
-                state,
-                operation::OperationState::Committed | operation::OperationState::Aborted
-            ),
-            "operation {i} resolved to {state:?}"
-        );
-        assert_eq!(
-            present,
-            state == operation::OperationState::Committed,
-            "transaction {i}: resolved {state:?}, write present {present}, reply {reply:?}"
-        );
-        match reply {
-            None => assert!(present, "transaction {i} answered Committed is missing"),
-            Some(e)
-                if [
-                    tonic::Code::Aborted,
-                    tonic::Code::NotFound,
-                    tonic::Code::FailedPrecondition,
-                ]
-                .contains(&tonic::Code::from(i32::try_from(e.code).expect("code"))) =>
-            {
-                assert!(!present, "transaction {i} refused ({e:?}) committed");
-            }
-            Some(_) => {}
+            Err(e) => panic!("operation {} not resolved: {e}", operation.sequence),
         }
     }
-    eprintln!("commit outcomes across the stop: {outcomes:?}");
+}
+
+/// Check a transaction that wrote one `label` node `{k: k}` against how its
+/// operation resolved and what its COMMIT was answered: the resolution is
+/// terminal; committed means a commit time and exactly that one node at
+/// `reader` (read after the commit and after `fence`), aborted means none;
+/// an answer of Committed, or an error stating an outcome, agrees with the
+/// resolution. Returns a label of the case for the test's summary.
+async fn check_commit_outcome(
+    reader: &CoordinodeProcess,
+    label: &str,
+    k: u64,
+    answer: &Answer,
+    resolved: &coordinode_integration::proto::operation::ResolveOperationResponse,
+    fence: u64,
+) -> String {
+    let rows = cypher_after_on(
+        reader,
+        &format!("MATCH (n:{label} {{k: {k}}}) RETURN n.k"),
+        fence.max(resolved.commit_ts),
+    )
+    .await
+    .expect("read at another member");
+    let found: Vec<_> = rows
+        .iter()
+        .map(|row| row.values.first().and_then(|v| v.value.clone()))
+        .collect();
+    judge_commit_outcome(k, answer, resolved, &found)
+}
+
+/// [`check_commit_outcome`] over the values `found` of the transaction's
+/// nodes read back.
+fn judge_commit_outcome(
+    k: u64,
+    answer: &Answer,
+    resolved: &coordinode_integration::proto::operation::ResolveOperationResponse,
+    found: &[Option<coordinode_integration::proto::common::property_value::Value>],
+) -> String {
+    use coordinode_integration::proto::common::property_value::Value as Pv;
+    use coordinode_integration::proto::operation::OperationState;
+
+    let state = resolved.state();
+    assert!(
+        matches!(state, OperationState::Committed | OperationState::Aborted),
+        "transaction {k}: resolved to {state:?}, not an outcome; answer {answer:?}"
+    );
+    if state == OperationState::Committed {
+        assert_ne!(
+            resolved.commit_ts, 0,
+            "transaction {k}: committed with no commit time"
+        );
+        assert_eq!(
+            found,
+            [Some(Pv::IntValue(i64::try_from(k).expect("small")))],
+            "transaction {k}: committed must have written exactly its one node; answer {answer:?}"
+        );
+    } else {
+        assert!(
+            found.is_empty(),
+            "transaction {k}: aborted but wrote {found:?}; answer {answer:?}"
+        );
+    }
+    match answer {
+        Answer::Committed => {
+            assert_eq!(
+                state,
+                OperationState::Committed,
+                "transaction {k}: answered Committed but resolved {state:?}"
+            );
+            format!("Committed, resolved {state:?}")
+        }
+        Answer::Error(e) => {
+            let stated = stated_outcome(e);
+            if let Some(stated) = stated {
+                assert_eq!(
+                    stated, state,
+                    "transaction {k}: the answer states {stated:?}, resolved {state:?}: {e:?}"
+                );
+            }
+            let reason = e
+                .status
+                .as_ref()
+                .and_then(|s| s.details.iter().find(|a| a.type_url.ends_with("ErrorInfo")))
+                .and_then(|a| {
+                    use prost::Message as _;
+                    tonic_types::pb::ErrorInfo::decode(a.value.as_slice()).ok()
+                })
+                .map(|i| i.reason)
+                .unwrap_or_default();
+            format!(
+                "error {} {reason} (states {stated:?}), resolved {state:?}",
+                e.code
+            )
+        }
+        Answer::None => format!("no answer, resolved {state:?}"),
+    }
+}
+
+/// The commit-outcome check refuses what it exists to catch: an answer
+/// stating an abort for a transaction that committed, an outcome left
+/// unknown, a commit applied twice, a committed write missing, a commit
+/// time missing, and an answer of Committed for an aborted transaction.
+#[test]
+fn the_commit_outcome_check_refuses_false_outcomes() {
+    use coordinode_integration::proto::common::property_value::Value as Pv;
+    use coordinode_integration::proto::operation::{OperationState, ResolveOperationResponse};
+    use coordinode_integration::proto::session::SessionError;
+    use prost::Message as _;
+
+    let resolved = |state: OperationState, commit_ts: u64| {
+        let mut r = ResolveOperationResponse {
+            commit_ts,
+            ..Default::default()
+        };
+        r.set_state(state);
+        r
+    };
+    let refused_as = |reason: &str| {
+        let info = tonic_types::pb::ErrorInfo {
+            reason: reason.to_owned(),
+            domain: "coordinode".to_owned(),
+            metadata: std::collections::HashMap::new(),
+        };
+        Answer::Error(SessionError {
+            code: tonic::Code::Aborted as u32,
+            message: String::new(),
+            status: Some(tonic_types::pb::Status {
+                code: tonic::Code::Aborted as i32,
+                message: String::new(),
+                details: vec![prost_types::Any {
+                    type_url: "type.googleapis.com/google.rpc.ErrorInfo".to_owned(),
+                    value: info.encode_to_vec(),
+                }],
+            }),
+        })
+    };
+    let one = [Some(Pv::IntValue(3))];
+    let refuses = |answer: Answer, r: ResolveOperationResponse, found: &[Option<Pv>]| {
+        let found = found.to_vec();
+        std::panic::catch_unwind(move || judge_commit_outcome(3, &answer, &r, &found)).is_err()
+    };
+
+    // The honest cases pass.
+    assert!(!refuses(
+        Answer::Committed,
+        resolved(OperationState::Committed, 9),
+        &one
+    ));
+    assert!(!refuses(
+        Answer::None,
+        resolved(OperationState::Aborted, 0),
+        &[]
+    ));
+    // A not-found answer states nothing: either outcome may follow.
+    let not_found = Answer::Error(SessionError {
+        code: tonic::Code::NotFound as u32,
+        message: String::new(),
+        status: None,
+    });
+    assert!(!refuses(
+        not_found,
+        resolved(OperationState::Committed, 9),
+        &one
+    ));
+
+    assert!(
+        refuses(
+            refused_as("TRANSACTION_CONFLICT"),
+            resolved(OperationState::Committed, 9),
+            &one
+        ),
+        "a false abort passes"
+    );
+    assert!(
+        refuses(Answer::None, resolved(OperationState::Unknown, 0), &[]),
+        "an unresolved outcome passes"
+    );
+    assert!(
+        refuses(
+            Answer::None,
+            resolved(OperationState::Committed, 9),
+            &[Some(Pv::IntValue(3)), Some(Pv::IntValue(3))]
+        ),
+        "a double effect passes"
+    );
+    assert!(
+        refuses(Answer::None, resolved(OperationState::Committed, 9), &[]),
+        "a missing committed write passes"
+    );
+    assert!(
+        refuses(Answer::None, resolved(OperationState::Committed, 0), &one),
+        "a commit without a commit time passes"
+    );
+    assert!(
+        refuses(Answer::Committed, resolved(OperationState::Aborted, 0), &[]),
+        "a false success passes"
+    );
+    assert!(
+        refuses(Answer::None, resolved(OperationState::Aborted, 0), &one),
+        "an aborted transaction's write passes"
+    );
 }
 
 /// Poll `GetClusterStatus` on `client` until it reports exactly `expected`
