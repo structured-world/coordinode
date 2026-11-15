@@ -134,12 +134,27 @@ impl TreeName {
     }
 }
 
+/// Which trees a pin of the store takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PinScope {
+    /// The replicated store another member installs: the node-local Raft
+    /// partition stays behind.
+    Replicated,
+    /// Every tree, the Raft partition included: this store's own checkpoint.
+    /// Each table's tree is held open with its pin, so a drop of the table
+    /// waits until the pin's files are captured.
+    Whole,
+}
+
 /// One pinned tree of a transfer.
 struct PinnedTree {
     name: TreeName,
     /// Where the tree stands when it is past the transfer's position.
     position: Option<RaftPosition>,
     pin: PinnedVersion,
+    /// A table's tree held open under [`PinScope::Whole`]: its drop removes
+    /// the folder the pinned files lie in, and waits for this handle.
+    _held: Option<lsm_tree::AnyTree>,
 }
 
 impl PinnedTree {
@@ -413,36 +428,48 @@ impl StorageEngine {
     /// A tree, a coverage record or the index inventory cannot be read, or a
     /// header field exceeds the stream's limits.
     pub fn pin_store(&self) -> StorageResult<StoreTransfer> {
-        let (trees, inventory) = match self.raft_fence() {
+        let (trees, inventory) = self.pin_fenced(PinScope::Replicated)?;
+        StoreTransfer::new(trees, inventory)
+    }
+
+    /// [`Self::pin_trees`] of `scope`, with the applies paused when a Raft
+    /// state machine runs over the store.
+    fn pin_fenced(&self, scope: PinScope) -> StorageResult<(Vec<PinnedTree>, Option<Vec<u8>>)> {
+        match self.raft_fence() {
             Some(fence) => {
                 let mut pinned = None;
                 fence.with_applies_paused(&mut |applies, _| {
-                    pinned = Some(self.pin_trees(Some(applies))?);
+                    pinned = Some(self.pin_trees(Some(applies), scope)?);
                     Ok(())
                 })?;
                 pinned.ok_or_else(|| {
                     StorageError::InvalidConfig("the Raft apply fence never ran the pin".into())
-                })?
+                })
             }
-            None => self.pin_trees(None)?,
-        };
-        StoreTransfer::new(trees, inventory)
+            None => self.pin_trees(None, scope),
+        }
     }
 
-    /// Pin every replicated tree and take the sealed index inventory, with
-    /// the applies at `applies` when a Raft state machine runs.
+    /// Pin the trees of `scope`, with the applies at `applies` when a Raft
+    /// state machine runs, and for a transfer take the sealed index
+    /// inventory.
     fn pin_trees(
         &self,
         applies: Option<&RaftApplyState>,
+        scope: PinScope,
     ) -> StorageResult<(Vec<PinnedTree>, Option<Vec<u8>>)> {
         let mut trees = Vec::with_capacity(Partition::all().len());
         for &part in Partition::all() {
-            if part == Partition::Raft {
+            if part == Partition::Raft && scope == PinScope::Replicated {
                 continue;
             }
             let tree = self.tree(part)?;
+            // A checkpoint's trees carry their own coverage: a position
+            // travels only with a transfer to another member.
             let position = match applies {
-                Some(applies) if applies.floor(part) > applies.next() => {
+                Some(applies)
+                    if scope == PinScope::Replicated && applies.floor(part) > applies.next() =>
+                {
                     TreeCoverage::read(tree, Domain::Raft)?
                         .base()
                         .map(|(next, payload)| RaftPosition {
@@ -456,6 +483,7 @@ impl StorageEngine {
                 name: TreeName::Partition(part),
                 position,
                 pin: tree.pin(),
+                _held: None,
             });
         }
         #[cfg(feature = "columnar")]
@@ -464,7 +492,11 @@ impl StorageEngine {
                 name: TreeName::Table(table_id),
                 position: None,
                 pin: tree.pin(),
+                _held: (scope == PinScope::Whole).then_some(tree),
             });
+        }
+        if scope == PinScope::Whole {
+            return Ok((trees, None));
         }
         // Taken while nothing applies, as the trees are, and sealed at once:
         // the receiver keeps the evidence of what this member proved.
@@ -473,6 +505,130 @@ impl StorageEngine {
             None => None,
         };
         Ok((trees, inventory))
+    }
+
+    /// Build every tree of the store in `target`, as it is now, from pinned
+    /// versions: no tree is flushed and nothing is written under the store's
+    /// own endpoints for it. A pinned file is hard-linked into `target` (copied
+    /// where a link cannot be made), each tree's memtable contents are written
+    /// there, and the pins are released once every tree stands. On a store a
+    /// Raft state machine runs over, the trees are pinned with the applies
+    /// paused; otherwise each tree is pinned in turn, and the journal copied
+    /// beside the trees replays what one holds and another does not.
+    ///
+    /// # Errors
+    ///
+    /// A tree cannot be read, a file cannot be linked or copied, or a tree
+    /// cannot be rebuilt in `target`.
+    pub(crate) fn checkpoint_pinned(
+        &self,
+        target: &Path,
+        summary: &mut crate::engine::core::CheckpointSummary,
+    ) -> StorageResult<()> {
+        let (trees, _) = self.pin_fenced(PinScope::Whole)?;
+        for tree in &trees {
+            summary.total_bytes += self.materialize(tree, target)?;
+            summary.max_seqno = summary.max_seqno.max(tree.pin.seqno());
+            if matches!(tree.name, TreeName::Partition(_)) {
+                summary.partitions += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lay `tree`'s pinned files into its folder under `root` and rebuild it
+    /// there with its memtable contents. Returns the bytes copied: none for
+    /// files hard-linked.
+    fn materialize(&self, tree: &PinnedTree, root: &Path) -> StorageResult<u64> {
+        let dir = tree.name.dir(root);
+        let mut copied = 0;
+        for (kind, file) in tree.files() {
+            let folder = dir.join(kind.folder());
+            self.tree_fs()
+                .create_dir_all(&folder)
+                .map_err(|e| StorageError::Io(format!("create {folder:?}: {e}")))?;
+            let dst = folder.join(file.id().to_string());
+            copied += self.link_or_copy(file.path(), &dst, || file.open())?;
+            if let Some(attestation) = file.heal_attestation()? {
+                let mut name = dst.clone().into_os_string();
+                name.push(".heal-attest");
+                let open = || {
+                    self.tree_fs()
+                        .open(&attestation, &lsm_tree::fs::FsOpenOptions::new().read(true))
+                        .map_err(lsm_tree::Error::from)
+                };
+                copied += self.link_or_copy(&attestation, &PathBuf::from(name), open)?;
+            }
+        }
+        let seqno = lsm_tree::SharedSequenceNumberGenerator::from(
+            lsm_tree::SequenceNumberCounter::default(),
+        );
+        let config = match &tree.name {
+            TreeName::Partition(part) => {
+                use crate::engine::config::{
+                    Durability, EndpointConfig, Media, StorageConfig, Tier,
+                };
+                StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    root,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )])
+                .relocated()
+                .with_fs(std::sync::Arc::clone(self.tree_fs()))
+                .to_tree_config(*part, seqno)
+            }
+            TreeName::Table(_) => lsm_tree::Config::new_with_generators(&dir, seqno.clone(), seqno)
+                .with_shared_fs(std::sync::Arc::clone(self.tree_fs())),
+        };
+        // A checkpoint is a base other code reads file by file: no empty
+        // table file created ahead lies beside its tables.
+        let config = config.table_file_pool(0);
+        // The engine error as it is, so a rebuild refused for room stays a
+        // refusal for room.
+        let rebuilt = config.restore_pinned(
+            &tree.pin.layout()?,
+            tree.pin.memtable_entries(),
+            tree.pin.memtable_range_tombstones(),
+        )?;
+        // Closed before the checkpoint is opened as a store of its own.
+        drop(rebuilt);
+        Ok(copied)
+    }
+
+    /// Hard-link `src` as `dst`, or where a link cannot be made (another
+    /// volume, a file system without links) copy it through `open` and sync
+    /// the copy. Returns the bytes copied.
+    fn link_or_copy(
+        &self,
+        src: &Path,
+        dst: &Path,
+        open: impl FnOnce() -> lsm_tree::Result<Box<dyn lsm_tree::fs::FsFile>>,
+    ) -> StorageResult<u64> {
+        use lsm_tree::io::ErrorKind;
+        // Kept as the engine error it is: a copy refused for room stays a
+        // refusal for room.
+        let failed = |e: lsm_tree::io::Error| StorageError::from(lsm_tree::Error::Io(e));
+        let fs = self.tree_fs();
+        match fs.hard_link(src, dst) {
+            Ok(()) => return Ok(0),
+            Err(e) if matches!(e.kind(), ErrorKind::CrossesDevices | ErrorKind::Unsupported) => {}
+            Err(e) => return Err(failed(e)),
+        }
+        let mut from = open()?;
+        let mut to = fs
+            .open(
+                dst,
+                &lsm_tree::fs::FsOpenOptions::new()
+                    .write(true)
+                    .create_new(true),
+            )
+            .map_err(failed)?;
+        let copied = io::copy(&mut from, &mut to).map_err(|e| failed(e.into()))?;
+        to.flush().map_err(|e| failed(e.into()))?;
+        to.sync_all_with(self.tree_sync()).map_err(failed)?;
+        Ok(copied)
     }
 }
 

@@ -530,8 +530,12 @@ fn back_up(db: &Database, backups: &Path) -> Result<(), DatabaseError> {
 
 A physical backup is taken while writes go on. On the same file system its
 files are hard links to the database's own, so it costs little space but
-shares the device; elsewhere they are copies. Backups outside the endpoint
-directory are not counted against the hard limit. The backup directory is a
+shares the device; elsewhere they are copies. What the database holds in
+memory is written into the backup, not flushed into the database first, so
+a backup outside the endpoint directory grows nothing under it: a database
+at its hard limit, refusing writes, still writes its backup to another
+directory. Backups outside the endpoint directory are not counted against
+the hard limit. The backup directory is a
 complete database in one directory, whatever endpoint layout the original
 had, and opens with plain `Database::open`.
 

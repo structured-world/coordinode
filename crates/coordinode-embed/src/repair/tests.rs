@@ -666,6 +666,11 @@ fn a_repaired_schema_keeps_operation_outcomes_and_fences() {
         let before = issuer.next().expect("number");
         db.execute_cypher_shared_with("CREATE (:Op {k: 1})", None, None, &bound(before))
             .expect("bound write");
+        // Flushed first, so the tables written after the checkpoint hold
+        // only what came after it: a checkpoint captures the memtables
+        // without flushing them, and the store's own later flush of what it
+        // held would mix the records written before into those tables.
+        db.persist().expect("flush the records written before");
         db.checkpoint(3).expect("checkpoint");
         let after = issuer.next().expect("number");
         db.execute_cypher_shared_with("CREATE (:Op {k: 2})", None, None, &bound(after))

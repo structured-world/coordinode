@@ -546,6 +546,17 @@ async fn a_purge_below_what_is_already_purged_is_a_no_op() {
     assert_eq!(state.last_purged_log_id, Some(log_id(1, 3)));
 }
 
+/// Checkpoint `engine` into `path` off the async runtime: the checkpoint
+/// blocks, and on a store a state machine runs over it waits for the applies
+/// to pause.
+async fn checkpoint_off_runtime(engine: &Arc<StorageEngine>, path: &std::path::Path) {
+    let (engine, path) = (Arc::clone(engine), path.to_path_buf());
+    tokio::task::spawn_blocking(move || engine.create_checkpoint(&path))
+        .await
+        .expect("join")
+        .expect("checkpoint");
+}
+
 #[tokio::test]
 async fn a_checkpoint_raft_floor_is_the_lowest_base_of_its_trees() {
     let (_dir, engine) = test_engine();
@@ -1080,7 +1091,7 @@ async fn a_rebuild_the_log_cannot_complete_changes_nothing() {
     let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
     let ckpt_root = tempfile::tempdir().unwrap();
     let ckpt = ckpt_root.path().join("c");
-    engine.create_checkpoint(&ckpt).unwrap();
+    checkpoint_off_runtime(&engine, &ckpt).await;
     apply_entries(
         &mut sm,
         (1..=3).map(|i| two_tree_merge_entry(i, 1000 * i)).collect(),
@@ -1130,7 +1141,7 @@ async fn a_schema_rebuilt_from_a_checkpoint_keeps_the_replayed_ceilings() {
     apply_entries(&mut sm, first).await;
     let ckpt_root = tempfile::tempdir().unwrap();
     let ckpt = ckpt_root.path().join("c");
-    engine.create_checkpoint(&ckpt).unwrap();
+    checkpoint_off_runtime(&engine, &ckpt).await;
     let later: Vec<Entry> = (4..=6).map(|i| two_tree_merge_entry(i, 1000 * i)).collect();
     append_durable(&mut log, later.clone()).await;
     apply_entries(&mut sm, later).await;
@@ -1253,7 +1264,7 @@ async fn a_rebuild_decides_a_retransmitted_bound_proposal_as_its_apply_did() {
     apply_entries(&mut sm, first).await;
     let ckpt_root = tempfile::tempdir().unwrap();
     let ckpt = ckpt_root.path().join("c");
-    engine.create_checkpoint(&ckpt).unwrap();
+    checkpoint_off_runtime(&engine, &ckpt).await;
     // Another intent for the same operation, same id and size: the binding
     // refuses it and marks the unit.
     let later = vec![

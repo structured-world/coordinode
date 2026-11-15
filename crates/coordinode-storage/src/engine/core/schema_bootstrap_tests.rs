@@ -497,9 +497,12 @@ fn a_rebuild_from_a_damaged_checkpoint_is_refused() {
     let store = Checkpointed::new(true);
     store.cut_a_schema_rebuild_short();
     let schema = store.checkpoint.join(Partition::Schema.name());
+    // An empty file is one a tree created ahead for its next table, not a
+    // table: the checkpoint's trees were opened where they were built.
     let tables: HashSet<u64> = std::fs::read_dir(schema.join("tables"))
         .expect("checkpoint tables")
         .flatten()
+        .filter(|entry| entry.metadata().is_ok_and(|meta| meta.len() > 0))
         .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
         .collect();
     assert!(damage_schema_tables(&store.checkpoint, &tables) > 0);
@@ -556,17 +559,28 @@ fn a_corrupt_schema_tree_is_rebuilt_and_a_clean_one_is_not_read_in_full() {
             !engine.verified_at_open(Partition::Schema),
             "a clean tree was verified in full at the open"
         );
-        let after_checkpoint = &schema_table_ids(&engine)
-            - &std::fs::read_dir(
-                store
-                    .checkpoint
-                    .join(Partition::Schema.name())
-                    .join("tables"),
-            )
-            .expect("checkpoint tables")
-            .flatten()
-            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
-            .collect::<HashSet<u64>>();
+        // The tables written after the checkpoint: those whose bytes no file
+        // of the checkpoint holds. Ids do not tell, since the checkpoint's
+        // tree numbers the tables it builds itself.
+        let held: HashSet<Vec<u8>> = tree_files(
+            &store
+                .checkpoint
+                .join(Partition::Schema.name())
+                .join("tables"),
+        )
+        .into_values()
+        .collect();
+        let tables = store
+            .primary()
+            .join(Partition::Schema.name())
+            .join("tables");
+        let after_checkpoint: HashSet<u64> = schema_table_ids(&engine)
+            .into_iter()
+            .filter(|id| {
+                let bytes = std::fs::read(tables.join(id.to_string())).expect("read a table");
+                !held.contains(&bytes)
+            })
+            .collect();
         drop(engine);
         assert!(damage_schema_tables(&store.primary(), &after_checkpoint) > 0);
     }

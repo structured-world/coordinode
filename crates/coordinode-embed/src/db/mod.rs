@@ -925,7 +925,9 @@ impl Database {
     /// unknown there. Run it in place of this database, never beside it: both
     /// would answer the same descriptors from diverging histories. Writes go
     /// on while the backup is taken. On the same file system its files are
-    /// hard links, elsewhere copies.
+    /// hard links, elsewhere copies. Nothing is flushed for it: a `target`
+    /// outside the database's endpoints grows nothing under them, so a
+    /// database at its hard limit still writes its backup.
     ///
     /// # Errors
     ///

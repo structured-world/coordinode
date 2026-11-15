@@ -7256,7 +7256,8 @@ async fn a_partition_rebuilt_from_a_checkpoint_holds_each_entry_once() {
         pipeline.propose_and_wait(&edge(7, 100)).expect("pre");
         let ckpt_root = tempfile::tempdir().expect("ckpt tempdir");
         let ckpt = ckpt_root.path().join("c1");
-        n1.engine.create_checkpoint(&ckpt).expect("checkpoint");
+        // Blocking: it waits for the state machine's applies to pause.
+        tokio::task::block_in_place(|| n1.engine.create_checkpoint(&ckpt)).expect("checkpoint");
         pipeline.propose_and_wait(&edge(8, 200)).expect("post");
         tokio::time::sleep(Duration::from_millis(300)).await;
 

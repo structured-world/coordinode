@@ -2364,6 +2364,88 @@ fn a_checkpoint_refused_for_room_leaves_nothing_behind() {
         .expect("checkpoint with room");
 }
 
+/// A backup into a directory outside the store's endpoints is taken at the
+/// limit, with no room left on the endpoint at all, and holds what the
+/// memtables held: a put, merge operands and a range tombstone. The trees are
+/// captured as they stand rather than flushed first, so the endpoint grows by
+/// nothing. Before, each tree was flushed before it was linked, and the flush
+/// was refused for room.
+#[test]
+fn a_backup_elsewhere_at_the_limit_takes_no_room_and_keeps_the_memtables() {
+    const LIMIT: u64 = 64 << 20;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let backups = tempfile::TempDir::new().expect("tempdir");
+    let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    for index in 1..=8 {
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+    }
+    engine.persist().expect("persist");
+    // Left in the memtables.
+    engine
+        .put(Partition::Node, b"node:1:unflushed", &[7u8; 4096])
+        .expect("put");
+    engine
+        .put(Partition::Node, b"node:1:gone-a", b"a")
+        .expect("put");
+    engine
+        .put(Partition::Node, b"node:1:gone-b", b"b")
+        .expect("put");
+    engine
+        .remove_range(Partition::Node, b"node:1:gone-", b"node:1:gone.")
+        .expect("remove range");
+    let adj = b"adj:KNOWS:out:1";
+    for uid in [3, 5] {
+        engine
+            .merge(Partition::Adj, adj, &crate::engine::merge::encode_add(uid))
+            .expect("merge");
+    }
+    let adjacency = engine.get(Partition::Adj, adj).expect("read").expect("set");
+
+    let footprints = engine.footprints().clone();
+    let footprint = Arc::clone(footprints.get("default").expect("a limit"));
+    let scratch = dir.path().join("scratch");
+    let output = fill_with_scratch(&footprints, &footprint, &scratch);
+    let charged = footprint.charged();
+
+    let target = backups.path().join("backup");
+    engine
+        .create_checkpoint(&target)
+        .expect("a backup elsewhere needs no room on the endpoint");
+    assert_eq!(footprint.charged(), charged, "the endpoint grew by nothing");
+    footprints.removed(&scratch);
+    drop(output);
+    drop(engine);
+
+    let copy = StorageEngine::open_checkpoint(&target).expect("the backup opens");
+    assert_eq!(
+        copy.get(Partition::Node, b"node:1:unflushed")
+            .expect("read")
+            .as_deref(),
+        Some(&[7u8; 4096][..]),
+        "the unflushed put"
+    );
+    for gone in [&b"node:1:gone-a"[..], b"node:1:gone-b"] {
+        assert_eq!(
+            copy.get(Partition::Node, gone).expect("read"),
+            None,
+            "the range tombstone"
+        );
+    }
+    assert_eq!(
+        copy.get(Partition::Adj, adj).expect("read"),
+        Some(adjacency),
+        "the merge operands"
+    );
+    for index in 1..=8u64 {
+        assert!(
+            copy.get(Partition::Node, format!("node:1:w{index}").as_bytes())
+                .expect("read")
+                .is_some(),
+            "the flushed write {index}"
+        );
+    }
+}
+
 /// A checkpoint step refused for room on one endpoint is reported as that
 /// refusal with the step added, never as the endpoint with the least room
 /// left: there, `hot` is nearly full and the growth was refused on `cold`.

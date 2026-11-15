@@ -3013,12 +3013,17 @@ impl StorageEngine {
     }
 
     /// Create a consistent on-disk checkpoint of the whole database in
-    /// `target` (which must not yet exist). Each partition tree is
-    /// hard-link checkpointed into `target/<partition>/` (zero-copy on a
-    /// single filesystem, falling back to byte-copy across volumes), and
-    /// the oplog directory is copied alongside. The result is a complete,
-    /// independently-openable database in one directory, whatever the
-    /// endpoint layout it came from: [`Self::open_checkpoint`] opens it.
+    /// `target` (which must not yet exist). Each partition tree is captured
+    /// as it stands, its memtables included, without a flush: its files are
+    /// hard-linked into `target/<partition>/` (copied across volumes) and
+    /// what its memtables hold is written there. The oplog directory is
+    /// copied alongside. The result is a complete, independently-openable
+    /// database in one directory, whatever the endpoint layout it came from:
+    /// [`Self::open_checkpoint`] opens it. Nothing grows under the store's
+    /// own endpoints for a `target` outside them.
+    ///
+    /// Blocks: call it off the async runtime. On a store a Raft state
+    /// machine runs over, the trees are captured with the applies paused.
     ///
     /// The field interner and schema metadata live in the Schema partition
     /// tree, so they are captured by that tree's checkpoint — no separate
@@ -3120,66 +3125,26 @@ impl StorageEngine {
         }
     }
 
-    /// Flush and hard-link every partition tree and columnar table into
-    /// `target`.
+    /// Build every partition tree and columnar table in `target` from pinned
+    /// versions ([`Self::checkpoint_pinned`]): nothing is flushed, so taking
+    /// the checkpoint needs no room under the store's own endpoints.
     fn checkpoint_trees(
         &self,
         target: &Path,
         summary: &mut CheckpointSummary,
     ) -> StorageResult<()> {
-        use lsm_tree::AbstractTree;
+        self.checkpoint_pinned(target, summary)
+            .map_err(|e| Self::checkpoint_failure(e, || "checkpoint the trees".into()))
+    }
 
-        for &part in Partition::all() {
-            let tree = self.tree(part)?;
-            // Flush the active memtable to an on-disk segment first: a
-            // checkpoint snapshots persisted segments, so recent writes still
-            // resident in memory would otherwise be missing from the backup.
-            // This also makes the per-partition checkpoint directory appear
-            // deterministically (previously it depended on whether a
-            // background flush happened to have run before the checkpoint).
-            self.flush_memtables_in_order(tree).map_err(|e| {
-                Self::checkpoint_failure(e, || format!("flush before checkpoint {}", part.name()))
-            })?;
-            let info = tree
-                .create_checkpoint(&target.join(part.name()))
-                .map_err(|e| {
-                    Self::checkpoint_failure(e.into(), || {
-                        format!("checkpoint partition {}", part.name())
-                    })
-                })?;
-            summary.partitions += 1;
-            summary.total_bytes += info.total_bytes;
-            summary.max_seqno = summary.max_seqno.max(info.seqno);
-        }
+    /// The file system every tree writes through.
+    pub(crate) fn tree_fs(&self) -> &Arc<dyn lsm_tree::fs::Fs> {
+        &self.fs
+    }
 
-        // `STORAGE COLUMNAR` tables live outside the partition trees, under
-        // the same `tables` directory the registry reopens them from.
-        #[cfg(feature = "columnar")]
-        {
-            let tables = target.join("tables");
-            std::fs::create_dir_all(&tables)
-                .map_err(|e| StorageError::Io(format!("create {tables:?}: {e}")))?;
-            for table_id in self.columnar_tables.table_ids() {
-                // Under the table's life: a table dropped meanwhile is not in
-                // the checkpoint, and none is flushed into a folder its drop
-                // is removing.
-                let captured = self.columnar_tables.with_live(&table_id, |tree| {
-                    self.flush_memtables_in_order(tree)?;
-                    tree.create_checkpoint(&tables.join(&table_id))
-                        .map_err(|e| {
-                            Self::checkpoint_failure(e.into(), || {
-                                format!("checkpoint columnar table {table_id}")
-                            })
-                        })
-                });
-                let Some(info) = captured.transpose()? else {
-                    continue;
-                };
-                summary.total_bytes += info.total_bytes;
-                summary.max_seqno = summary.max_seqno.max(info.seqno);
-            }
-        }
-        Ok(())
+    /// How the trees sync their files.
+    pub(crate) fn tree_sync(&self) -> lsm_tree::fs::SyncMode {
+        self.tree_sync
     }
 
     /// Make the checkpoint in `target` durable, with the journal index a
