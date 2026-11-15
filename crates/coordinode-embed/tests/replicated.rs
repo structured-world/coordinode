@@ -3100,3 +3100,91 @@ async fn a_causal_wait_ends_at_its_deadline_or_cancel() {
     .await;
     assert!(result.is_ok(), "TIMED OUT");
 }
+
+/// A member rebuilds a counter through a state cut of its group's log, with
+/// commits before the cut and one landing while the view is copied: the
+/// view and the units the continuation hands over give the member's value
+/// with every increment counted once, through the public cut surface.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_rebuilds_a_counter_through_a_state_cut() {
+    use coordinode_core::txn::proposal::{
+        Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline as _, RaftProposal,
+    };
+    use coordinode_embed::consumer::CutScope;
+    use coordinode_storage::engine::merge::{decode_counter, encode_counter_delta};
+    const KEY: &[u8] = b"counter:degree:9";
+
+    let dir = tempfile::tempdir().unwrap();
+    let member = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+        .await
+        .unwrap();
+    wait_until("the member leads", || member.leader() == Some(1)).await;
+    let pipeline = member.member().node().pipeline();
+    let clock = member
+        .database()
+        .read()
+        .engine()
+        .oracle()
+        .expect("the member's clock");
+    let ids = ProposalIdGenerator::new();
+    let add = |delta: i64| {
+        let ts = clock.next();
+        pipeline
+            .propose_and_wait(&RaftProposal {
+                id: ids.next(),
+                mutations: vec![Mutation::Merge {
+                    partition: PartitionId::Counter,
+                    key: KEY.to_vec(),
+                    operand: encode_counter_delta(delta),
+                }],
+                commit_ts: ts,
+                start_ts: ts,
+                bypass_rate_limiter: false,
+            })
+            .expect("propose");
+    };
+    add(1);
+    add(10);
+    let database = Arc::clone(member.database());
+    let mut cut = tokio::task::spawn_blocking(move || {
+        let scope = CutScope::rows(Partition::Counter, b"counter:".to_vec()).unwrap();
+        database.read().state_cut(scope, Duration::from_secs(10))
+    })
+    .await
+    .unwrap()
+    .expect("cut");
+    add(100);
+
+    {
+        let db = member.database().read();
+        let view = db.state_cut_scan(&cut, None, 16, u64::MAX).expect("page");
+        let mut rebuilt = view
+            .iter()
+            .find(|(key, _)| key.as_slice() == KEY)
+            .map_or(0, |(_, value)| decode_counter(value).expect("counter"));
+        assert_eq!(rebuilt, 11, "the view holds the commits before the cut");
+        loop {
+            let before = cut.next();
+            let batch = db.state_cut_tail(&mut cut, 4, u64::MAX).expect("tail");
+            for unit in &batch.units {
+                for m in &unit.mutations {
+                    if let Mutation::Merge { operand, .. } = m {
+                        rebuilt += decode_counter(operand).expect("delta");
+                    }
+                }
+            }
+            if batch.joined.is_some() && cut.next() == before {
+                break;
+            }
+        }
+        let source = db
+            .engine()
+            .get(Partition::Counter, KEY)
+            .expect("source")
+            .map_or(0, |value| decode_counter(&value).expect("counter"));
+        assert_eq!(source, 111);
+        assert_eq!(rebuilt, source, "every increment counted once");
+    }
+    drop(cut);
+    member.shutdown().await.unwrap();
+}

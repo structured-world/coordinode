@@ -599,3 +599,114 @@ async fn a_fixed_cut_of_a_group_member_joins_its_log_once() {
     assert_eq!(destination, source, "every commit counted once");
     node.shutdown().await.expect("shutdown");
 }
+
+/// A partition installed from a peer ahead of this member's applies holds
+/// its copy's entries as rows below every commit, so a view at any bound
+/// would show them whatever their commit timestamps: no cut of it is given
+/// until the applies pass the copy. And a cut whose scope is replaced while
+/// it is copied gives no further page, rather than one of the new copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_of_a_partition_installed_ahead_or_replaced_is_refused() {
+    use coordinode_storage::engine::core::{PartitionCopy, RaftPosition};
+    use coordinode_storage::engine::fixed_cut::CutScope;
+    use coordinode_storage::engine::partition::Partition;
+    use coordinode_storage::error::StorageError;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            Arc::clone(&clock),
+        )
+        .expect("open engine"),
+    );
+    let node = RaftNode::single_node(Arc::clone(&engine))
+        .await
+        .expect("bootstrap");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let pipeline = node.pipeline();
+    let id_gen = ProposalIdGenerator::new();
+    // A write outside the scope: it moves the log and its closed bound on.
+    let write = |n: u32| {
+        let ts = clock.next();
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: format!("node:{n}").into_bytes(),
+                value: b"n".to_vec(),
+            }],
+            commit_ts: ts,
+            start_ts: ts,
+            bypass_rate_limiter: false,
+        };
+        pipeline.propose_and_wait(&proposal).expect("propose");
+    };
+    let scope = || CutScope::rows(Partition::Counter, b"counter:".to_vec()).expect("scope");
+    let cut_of = |engine: &Arc<StorageEngine>| {
+        let engine = Arc::clone(engine);
+        let scope = scope();
+        tokio::task::spawn_blocking(move || engine.fixed_cut(scope, Duration::from_secs(10)))
+    };
+
+    // Replaced while copied: the next page is refused.
+    let cut = cut_of(&engine).await.expect("join").expect("cut");
+    let copying = Arc::clone(&engine);
+    let copy = tokio::task::spawn_blocking(move || copying.copy_partition(Partition::Counter))
+        .await
+        .expect("join")
+        .expect("copy");
+    let installing = Arc::clone(&engine);
+    tokio::task::spawn_blocking(move || {
+        installing.install_partition(Partition::Counter, &copy, true)
+    })
+    .await
+    .expect("join")
+    .expect("install at the applies");
+    let page = engine.cut_page(&cut, None, 16, u64::MAX);
+    assert!(
+        matches!(page, Err(StorageError::CutLost { .. })),
+        "no page of a replaced view: {page:?}"
+    );
+    drop(cut);
+
+    // Installed ahead of the applies: no cut until they pass it.
+    let copying = Arc::clone(&engine);
+    let mut ahead = tokio::task::spawn_blocking(move || copying.copy_partition(Partition::Counter))
+        .await
+        .expect("join")
+        .expect("copy");
+    let at = ahead.position.take().expect("a position");
+    ahead.position = Some(RaftPosition {
+        next: at.next + 1000,
+        payload: at.payload,
+    });
+    let ahead = PartitionCopy {
+        rows: vec![(b"counter:ahead".to_vec(), b"1".to_vec())],
+        position: ahead.position,
+    };
+    let installing = Arc::clone(&engine);
+    tokio::task::spawn_blocking(move || {
+        installing.install_partition(Partition::Counter, &ahead, true)
+    })
+    .await
+    .expect("join")
+    .expect("install ahead");
+    // Commits closed past the install, the view at the bound is readable
+    // again; the applies are still far behind the copy.
+    for n in 0..3 {
+        write(n);
+    }
+    let refused = cut_of(&engine).await.expect("join");
+    assert!(
+        matches!(refused, Err(StorageError::CutNotReady { .. })),
+        "no cut of a partition ahead of the applies: {refused:?}"
+    );
+    node.shutdown().await.expect("shutdown");
+}

@@ -3791,6 +3791,15 @@ impl StorageEngine {
         Ok(active)
     }
 
+    /// Whether `partition` is under repair: its tree may be cleared or hold
+    /// a copy only partly installed.
+    pub(crate) fn is_under_repair(&self, partition: Partition) -> bool {
+        self.under_repair
+            .load(core::sync::atomic::Ordering::Acquire)
+            & repair_bit(partition)
+            != 0
+    }
+
     /// End the repair of `partition`.
     fn leave_repair(&self, partition: Partition) {
         self.under_repair
@@ -4365,6 +4374,7 @@ impl StorageEngine {
         let join_end = last
             .checked_add(1)
             .ok_or_else(|| StorageError::Io("the applied log index overflowed".into()))?;
+        self.qualify_group_cut(&scope, join_end)?;
         Ok(crate::engine::fixed_cut::FixedCut {
             first,
             bound,
@@ -4373,6 +4383,68 @@ impl StorageEngine {
             scope,
             _pin: pin,
         })
+    }
+
+    /// Refuse a group member's cut of `scope` whose view the scope's tree
+    /// does not physically hold as the closure says: every entry below
+    /// `join_end` applied, none beyond installed into it. The closure ledger
+    /// lives in the Schema tree, which can stand further along than another
+    /// tree after a reopen, and a partition installed from a peer ahead of
+    /// the applies holds the entries up to its copy's position as rows below
+    /// every commit, which a view at the bound would show whatever their
+    /// commit timestamps.
+    ///
+    /// A running member is asked with its applies paused; a store with none
+    /// running is qualified by the scope tree's durable coverage alone.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::CutNotReady`] when it is not held so, yet.
+    fn qualify_group_cut(
+        &self,
+        scope: &crate::engine::fixed_cut::CutScope,
+        join_end: u64,
+    ) -> StorageResult<()> {
+        let partition = scope.partition();
+        let not_ready = |reason: String| StorageError::CutNotReady { reason };
+        if self.is_under_repair(partition) {
+            return Err(not_ready(format!(
+                "the {} partition is under repair",
+                partition.name()
+            )));
+        }
+        let Some(fence) = self.raft_fence() else {
+            return match self.raft_coverage()?.base_of(partition) {
+                Some(next) if next == join_end => Ok(()),
+                held => Err(not_ready(format!(
+                    "the {} tree is shown to hold its group's log through {}, not through \
+                     entry {} the closure accounts for; open it as a member until its trees \
+                     hold the entries",
+                    partition.name(),
+                    held.unwrap_or(0),
+                    join_end - 1
+                ))),
+            };
+        };
+        let mut verdict = Ok(());
+        fence.with_applies_paused(&mut |applies, _| {
+            if applies.next() < join_end {
+                verdict = Err(not_ready(format!(
+                    "the applies stand at entry {}, behind the closure's {}",
+                    applies.next(),
+                    join_end
+                )));
+            } else if applies.floor(partition) > applies.next() {
+                verdict = Err(not_ready(format!(
+                    "the {} partition was installed at entry {}, ahead of the applies at {}",
+                    partition.name(),
+                    applies.floor(partition),
+                    applies.next()
+                )));
+            }
+            Ok(())
+        })?;
+        verdict
     }
 
     /// Read `cut`'s continuation from this store's own journal at `from`:
@@ -4485,6 +4557,7 @@ impl StorageEngine {
     ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
         use std::ops::Bound;
         self.held_cut(cut)?;
+        self.scope_view_intact(cut)?;
         self.check_snapshot_retained(cut.bound)?;
         let prefix = cut.scope.prefix();
         let lo = match after {
@@ -4518,7 +4591,29 @@ impl StorageEngine {
             taken += size;
             page.push((key, value.to_vec()));
         }
+        // A repair that replaced the tree while the page was read leaves
+        // rows of another copy in it: the page is not handed over.
+        self.scope_view_intact(cut)?;
         Ok(page)
+    }
+
+    /// Refuse `cut` once its scope's tree no longer holds the view: a repair
+    /// of the partition began (the tree is cleared or holds a copy partly
+    /// installed), or one replaced it, raising the tree's floor past the
+    /// view.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::CutLost`].
+    fn scope_view_intact(&self, cut: &crate::engine::fixed_cut::FixedCut) -> StorageResult<()> {
+        use lsm_tree::AbstractTree as _;
+        let partition = cut.scope.partition();
+        if self.is_under_repair(partition)
+            || self.tree(partition)?.oldest_retained_seqno() >= cut.bound
+        {
+            return Err(StorageError::CutLost { bound: cut.bound });
+        }
+        Ok(())
     }
 
     /// Refuse a cut whose view this store does not hold: one taken of a
