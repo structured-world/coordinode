@@ -196,6 +196,27 @@ fn a_transaction_in_fragments_takes_effect_whole() {
     for (from, batch) in &pieces {
         // A destination opened again for every fragment.
         let mut dst = Database::open(dst_dir.path()).expect("reopen destination");
+        let complete = batch.units.iter().all(UnitChanges::completes_unit);
+        if complete {
+            // The host fails on the last fragment, after the staged ones were
+            // handed to it: they stay staged, nothing takes effect, and the
+            // same batch applies whole next.
+            let failed = dst.apply_changes("people", from, batch, |tx, unit| {
+                mirror(tx, unit)?;
+                if unit.completes_unit() {
+                    return Err(DatabaseError::Other("the host stopped".into()));
+                }
+                Ok(())
+            });
+            assert!(failed.is_err());
+            assert_eq!(seen(&mut dst), 0);
+            let stands = dst
+                .projection_progress("people")
+                .expect("read")
+                .expect("kept");
+            assert_eq!(&stands.received, from);
+            assert!(stands.has_staged());
+        }
         let progress = dst
             .apply_changes("people", from, batch, |tx, unit| {
                 applied_calls.push((unit.first, unit.through));
@@ -203,7 +224,6 @@ fn a_transaction_in_fragments_takes_effect_whole() {
             })
             .expect("apply");
         assert_eq!(progress.received, batch.cursor);
-        let complete = batch.units.iter().all(UnitChanges::completes_unit);
         if complete {
             assert_eq!(progress.applied, batch.cursor);
             assert_eq!(seen(&mut dst), 40);

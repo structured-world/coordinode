@@ -746,6 +746,13 @@ impl Interest {
         Self::default()
     }
 
+    /// The label identities whose node events it takes, in identity order;
+    /// `None` for every label.
+    #[must_use]
+    pub fn labels(&self) -> Option<&[LabelId]> {
+        self.labels.as_deref()
+    }
+
     /// Node events routed by any of `labels` before or after them, and
     /// relationship events of any of `edge_types`; `None` for either takes
     /// every event of that kind.

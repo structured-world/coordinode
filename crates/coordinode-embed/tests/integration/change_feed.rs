@@ -315,6 +315,183 @@ fn identities_hold_across_interests_and_reads() {
     );
 }
 
+/// A change committed before its label was dropped and declared again keeps
+/// the identity its label had, through compaction and a reopen: a reader of
+/// the label declared again, another label, does not receive it, and a
+/// reader of everything sees it under the old identity.
+#[test]
+fn old_changes_keep_the_label_they_were_committed_under() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let start = {
+        let mut db = Database::open(dir.path()).expect("open");
+        run(
+            &mut db,
+            "CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING)",
+        );
+        let start = db
+            .change_cursor(&ChangeInterest::default())
+            .expect("cursor");
+        run(&mut db, "CREATE (:Acct {id: 1, email: 'a'})");
+        run(&mut db, "MATCH (a:Acct) DELETE a");
+        run(&mut db, "DROP TABLE Acct");
+        run(
+            &mut db,
+            "CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING)",
+        );
+        for partition in [
+            coordinode_storage::engine::partition::Partition::Node,
+            coordinode_storage::engine::partition::Partition::Schema,
+        ] {
+            db.engine().force_compaction(partition).expect("compact");
+        }
+        start
+    };
+    let db = Database::open(dir.path()).expect("reopen");
+    let all = events(&read_all(&db, &mut start.clone()));
+    let old_labels: Vec<_> = all
+        .iter()
+        .filter_map(|e| {
+            e.labels
+                .as_ref()
+                .map(|(before, after)| (before.clone(), after.clone()))
+        })
+        .collect();
+    assert_eq!(old_labels.len(), 2, "the put and the removal: {all:?}");
+    let old = old_labels[0].1[0];
+    assert_eq!(old_labels[1].0, vec![old], "removed under the label it had");
+
+    let again = db
+        .change_cursor_at(start.position(), &interest(Some(&["Acct"]), None))
+        .expect("cursor");
+    let new_id = again.interest().labels().expect("labels")[0];
+    assert_ne!(new_id, old, "the label declared again is another label");
+    assert!(events(&read_all(&db, &mut again.clone())).is_empty());
+}
+
+/// Dropping a table that still has rows removes each row, and each removal
+/// reaches a reader of the table under the label the row had, in the drop's
+/// one transaction.
+#[test]
+fn dropping_a_table_with_rows_removes_each_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    run(
+        &mut db,
+        "CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING)",
+    );
+    run(
+        &mut db,
+        "CREATE (:Acct {id: 1, email: 'a'}), (:Acct {id: 2, email: 'b'})",
+    );
+    let mut cursor = db
+        .change_cursor(&interest(Some(&["Acct"]), None))
+        .expect("cursor");
+    run(&mut db, "DROP TABLE Acct");
+    let units = read_all(&db, &mut cursor);
+    let dropping: Vec<&UnitChanges> = units.iter().filter(|u| !u.events.is_empty()).collect();
+    assert_eq!(dropping.len(), 1, "one transaction: {units:?}");
+    assert_eq!(
+        node_deliveries(&dropping[0].events),
+        vec![(Action::Remove, Delivery::Leave); 2]
+    );
+}
+
+/// The id of the node `name` names.
+fn node_id(db: &mut Database, label: &str, name: &str) -> coordinode_core::graph::node::NodeId {
+    let rows = db
+        .execute_cypher(&format!(
+            "MATCH (n:{label} {{name: '{name}'}}) RETURN id(n) AS id"
+        ))
+        .expect("id");
+    match rows[0].get("id") {
+        Some(coordinode_core::graph::types::Value::Int(id)) => {
+            coordinode_core::graph::node::NodeId::from_raw(*id as u64)
+        }
+        other => panic!("id {other:?}"),
+    }
+}
+
+/// Two instances of one discriminated pair are two targets: writing each is
+/// a put of that instance under its own key, besides the pair's presence,
+/// never one standing for the other.
+#[test]
+fn discriminated_instances_are_distinct_targets() {
+    use coordinode_core::graph::edge::EdgeProperties;
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    run(
+        &mut db,
+        "CREATE EDGE TYPE KNOWS WITH (context: STRING NOT NULL) DISCRIMINATED BY (context)",
+    );
+    run(
+        &mut db,
+        "CREATE (:Person {name: 'a'}), (:Person {name: 'b'})",
+    );
+    let (a, b) = (
+        node_id(&mut db, "Person", "a"),
+        node_id(&mut db, "Person", "b"),
+    );
+    let mut cursor = db
+        .change_cursor(&interest(Some(&[]), Some(&["KNOWS"])))
+        .expect("cursor");
+    let oracle = db.engine().oracle().expect("a clock").clone();
+    let mut txn = Transaction::begin(db.engine(), Some(&oracle), oracle.next());
+    for context in ["work", "home"] {
+        LocalEdgeStore
+            .put_edge_discriminated(
+                &mut txn,
+                "KNOWS",
+                a,
+                b,
+                &Value::String(context.into()),
+                &EdgeProperties::new(),
+            )
+            .expect("put");
+    }
+    txn.commit(&CommitContext {
+        write_concern: &WriteConcern::majority(),
+        pipeline: None,
+        id_gen: None,
+    })
+    .expect("commit");
+
+    let units = read_all(&db, &mut cursor);
+    let written: Vec<_> = units
+        .iter()
+        .filter(|u| !u.events.is_empty())
+        .map(|u| {
+            u.events
+                .iter()
+                .map(|e| (e.action, e.target.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(written.len(), 1, "{written:?}");
+    let mut instances: Vec<&Vec<u8>> = written[0]
+        .iter()
+        .filter_map(|(action, target)| match target {
+            OwnedTarget::RelationshipInstance(key) => {
+                assert_eq!(*action, Action::Put);
+                Some(key)
+            }
+            _ => None,
+        })
+        .collect();
+    instances.sort();
+    instances.dedup();
+    assert_eq!(instances.len(), 2, "{written:?}");
+    assert!(
+        written[0]
+            .iter()
+            .all(|(_, t)| !matches!(t, OwnedTarget::RelationshipProperties(_))),
+        "an instance is not the pair's property record: {written:?}"
+    );
+}
+
 /// A temporal node's writes are events of its versions, each named by its
 /// version key and routed by its labels; the history rows recording them
 /// add no events of their own.
