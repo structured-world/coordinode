@@ -1161,7 +1161,20 @@ impl SchemaStore for LocalSchemaStore<'_> {
         // refuses the commit instead of passing under the older schema.
         let version = txn.record_version(Partition::Schema, &pointer_key)?;
         let current = self.load_label(name)?;
-        txn.expect_version(Partition::Schema, &pointer_key, version)?;
+        // A name bound implicitly (its first use, or the binding the caller
+        // published before declaring it) carries no definition: the
+        // declaration builds on that binding as read, even when it was
+        // written after the transaction's snapshot. Any other binding, a
+        // definition above all, is held to the snapshot as every write is.
+        let implicit = self
+            .binding(name)?
+            .is_some_and(|binding| binding.state == BindingState::Implicit);
+        match version {
+            Some(version) if implicit => {
+                txn.accept_written_at(Partition::Schema, &pointer_key, version)?;
+            }
+            _ => txn.expect_version(Partition::Schema, &pointer_key, version)?,
+        }
         Ok(current)
     }
 

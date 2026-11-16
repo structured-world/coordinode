@@ -4365,10 +4365,17 @@ impl<'a> ExecutionContext<'a> {
             .unwrap_or_else(|| self.engine.snapshot().saturating_add(1));
         // A table created again under the name since this transaction read it
         // is not the one the row was made for.
-        let read_at = self.txn.table_read_at(label);
+        let (read_at, created_here) = self.txn.table_read(label);
         let held = self.txn.hold_tree_set();
-        self.engine
-            .columnar_insert_existing(held, read_at, label, key, bytes, seqno)?;
+        self.engine.columnar_insert_existing(
+            held,
+            read_at,
+            created_here,
+            label,
+            key,
+            bytes,
+            seqno,
+        )?;
         Ok(())
     }
 
@@ -22099,7 +22106,10 @@ fn execute_create_table(
     if columnar {
         let held = ctx.txn.hold_tree_set();
         ctx.engine.create_columnar_table_held(name, held)?;
-        ctx.txn.note_table_created(name);
+        // The stamp of the tree just made: this transaction's rows go into
+        // it, and into no tree made under the name after.
+        let created_at = ctx.engine.columnar_table_created_at(name).unwrap_or(0);
+        ctx.txn.note_table_created(name, created_at);
     }
 
     let mut row = Row::new();

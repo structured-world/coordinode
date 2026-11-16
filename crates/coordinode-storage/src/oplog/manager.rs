@@ -232,6 +232,16 @@ impl RetainedFloor {
 
 // ── OplogManager ──────────────────────────────────────────────────────────────
 
+/// Where a log ends at a moment ([`OplogManager::end_to_os`]): the files a
+/// copy of it takes, and how much of each.
+#[derive(Debug)]
+pub struct LogEnd {
+    /// The sealed segments, each whole.
+    pub sealed: Vec<PathBuf>,
+    /// The active segment and the length its last whole entry ends at.
+    pub active: Option<(PathBuf, u64)>,
+}
+
 /// Manages the oplog segment lifecycle for one shard.
 pub struct OplogManager {
     dir: PathBuf,
@@ -600,6 +610,26 @@ impl OplogManager {
             .map(crate::oplog::SegmentWriter::flush_to_os)
             .transpose();
         self.stop_on(flushed, true)
+    }
+
+    /// Where the journal ends now: its sealed segments, each whole, and the
+    /// active one up to its last whole entry, handed to the operating
+    /// system so a copy of the files reads it. Not synced, sealed or
+    /// rotated. A segment made after this is past the end.
+    ///
+    /// # Errors
+    ///
+    /// The log stopped, or the active segment's buffer cannot be flushed.
+    pub fn end_to_os(&mut self) -> StorageResult<LogEnd> {
+        self.check_running()?;
+        let active = self
+            .current
+            .as_mut()
+            .map(crate::oplog::SegmentWriter::end_to_os)
+            .transpose();
+        let active = self.stop_on(active, true)?;
+        let sealed = self.sealed.iter().map(|(_, path)| path.clone()).collect();
+        Ok(LogEnd { sealed, active })
     }
 
     /// The active segment's path and the length a power cut leaves it at

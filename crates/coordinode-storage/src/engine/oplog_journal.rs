@@ -401,6 +401,17 @@ impl EmbeddedOplog {
         self.next_index
     }
 
+    /// Where the journal ends now ([`OplogManager::end_to_os`]): its sealed
+    /// segments whole, and the active one up to its last whole entry,
+    /// readable by a copy of the files.
+    ///
+    /// # Errors
+    ///
+    /// As [`OplogManager::end_to_os`].
+    pub(crate) fn end_to_os(&mut self) -> StorageResult<crate::oplog::manager::LogEnd> {
+        self.manager.end_to_os()
+    }
+
     /// Every entry below this index is durable.
     pub(crate) fn durable_below(&self) -> u64 {
         self.durable_below

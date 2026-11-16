@@ -1553,6 +1553,61 @@ fn a_checkpoint_never_takes_a_table_half_rebuilt() {
     );
 }
 
+/// A table created again under its name and then rebuilt from a checkpoint
+/// keeps the stamp of its creation: a transaction that read the table before
+/// that creation is still refused a row in it. Before, the rebuilt tree was
+/// stamped as one the store held at its open, and the row went in.
+#[test]
+fn a_rebuilt_table_keeps_refusing_a_transaction_older_than_it() {
+    use crate::Database;
+    use coordinode_storage::error::StorageError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let run = |query: &str| {
+        db.execute_cypher_shared(query, None, None, None, None)
+            .map(drop)
+    };
+    run("CREATE TABLE Trade (id BIGINT PRIMARY KEY, qty INT) STORAGE COLUMNAR").expect("create");
+
+    let old = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(old, "MATCH (t:Trade) RETURN t.id AS id", None)
+        .expect("the old transaction reads the table");
+    run("DROP TABLE Trade").expect("drop");
+    run("CREATE TABLE Trade (id BIGINT PRIMARY KEY, qty INT) STORAGE COLUMNAR")
+        .expect("create again");
+    run("CREATE (:Trade {id: 7, qty: 70})").expect("row of the new table");
+
+    let engine = db.engine();
+    let root = checkpoint_root(dir.path());
+    let checkpoint = create_checkpoint(engine, &root).expect("checkpoint");
+    let from = engine.checkpoint_replay_floor(&checkpoint).expect("floor");
+    let suffix = engine
+        .oplog_read_since(from)
+        .expect("read journal")
+        .expect("journal");
+    let rebuilt = engine
+        .repair_table_from_checkpoint(&checkpoint, &suffix, "Trade", &[])
+        .expect("rebuild");
+    assert!(matches!(rebuilt, Rebuild::Rebuilt { .. }), "{rebuilt:?}");
+
+    let stale = db
+        .execute_in_transaction(old, "CREATE (:Trade {id: 1, qty: 10})", None)
+        .expect_err("the old transaction's row is refused");
+    assert!(
+        matches!(
+            stale.storage_cause(),
+            Some(StorageError::TableCreatedSinceRead { table }) if table == "Trade"
+        ),
+        "{stale:?}"
+    );
+    assert_eq!(
+        engine.columnar_scan("Trade", u64::MAX).expect("scan").len(),
+        1,
+        "the rebuilt table holds its own row only"
+    );
+}
+
 /// A table rebuild cut short after its clear leaves its intent behind and
 /// gives the set of trees back; a checkpoint taken then is refused on the
 /// intent rather than taking the table cleared. Before, it took it.

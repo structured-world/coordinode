@@ -1251,6 +1251,19 @@ impl SegmentWriter {
         self.total_bytes
     }
 
+    /// This segment's path and where its last whole entry ends in it, every
+    /// byte before that handed to the operating system: a copy of the file
+    /// up to that length holds every entry appended so far and nothing of a
+    /// later one. Not synced.
+    ///
+    /// # Errors
+    ///
+    /// The flush of the writer's buffer fails.
+    pub(crate) fn end_to_os(&mut self) -> StorageResult<(PathBuf, u64)> {
+        self.flush_buffer()?;
+        Ok((self.path.clone(), HEADER_SIZE + self.total_bytes))
+    }
+
     /// Flush user-space buffer and fsync the active segment to storage.
     ///
     /// This is the "ONE fsync" in the write path:

@@ -2351,21 +2351,26 @@ impl StorageEngine {
     /// writes rows into the tree its table's creation made, never into a new
     /// one standing in for a tree a drop removed, so a tree under a table's
     /// name is the one that table was created with. `read_at` is the
-    /// snapshot the statement read the table's definition at, `None` when
-    /// its own transaction created the table: a tree created after that
-    /// snapshot belongs to a table created again under the name since, and
-    /// the statement's row is refused before it is written.
+    /// snapshot the statement read the table's definition at, and
+    /// `created_here` the stamp of the tree its own transaction created
+    /// under the name, if it did ([`Self::columnar_table_created_at`]): a
+    /// tree newer than the snapshot and not that one belongs to a table
+    /// created again under the name since, and the row is refused before it
+    /// is written.
     ///
     /// # Errors
     ///
     /// [`StorageError::TableTreeMissing`] when the table has no tree;
     /// [`StorageError::TableCreatedSinceRead`] when its tree is newer than
-    /// `read_at`; as [`Self::columnar_insert`] otherwise.
+    /// `read_at` and not the one `created_here` names; as
+    /// [`Self::columnar_insert`] otherwise.
     #[cfg(feature = "columnar")]
+    #[allow(clippy::too_many_arguments)] // one row, and what it is checked against
     pub fn columnar_insert_existing(
         &self,
         _held: &crate::engine::tree_set::TreeSetHold,
-        read_at: Option<lsm_tree::SeqNo>,
+        read_at: lsm_tree::SeqNo,
+        created_here: Option<lsm_tree::SeqNo>,
         table_id: &str,
         key: Vec<u8>,
         value: Vec<u8>,
@@ -2377,12 +2382,23 @@ impl StorageEngine {
             .ok_or_else(|| StorageError::TableTreeMissing {
                 table: table_id.to_owned(),
             })?;
-        if read_at.is_some_and(|read_at| created_at > read_at) {
+        if created_at > read_at && created_here != Some(created_at) {
             return Err(StorageError::TableCreatedSinceRead {
                 table: table_id.to_owned(),
             });
         }
         self.insert_columnar_row(table_id, &tree, table_tier, key, value, seqno)
+    }
+
+    /// The stamp of `table_id`'s tree: the timestamp it was created at in
+    /// this process, 0 for a table the store held when it opened; `None`
+    /// when there is no such table. A transaction that creates the table
+    /// keeps it, so its later rows go into that tree and no other.
+    #[cfg(feature = "columnar")]
+    pub fn columnar_table_created_at(&self, table_id: &str) -> Option<lsm_tree::SeqNo> {
+        self.columnar_tables
+            .get_stamped(table_id)
+            .map(|(_, _, created_at)| created_at)
     }
 
     /// [`Self::columnar_insert`] into `tree`, the table's tree already open,
@@ -3322,23 +3338,42 @@ impl StorageEngine {
             })
     }
 
-    /// Where the journal under `src` ends now, read under its append lock so
-    /// every file ends at a whole entry. A checkpoint reads it with its trees
-    /// pinned and copies the journal up to it, never past.
+    /// Where the journal under `src` ends now. The store's own journal tells
+    /// it under its append lock, held only for that: its sealed segments
+    /// whole and the active one up to its last whole entry, that entry's
+    /// bytes handed to the operating system; the files are measured after
+    /// the lock is given back. A log this store does not append to itself
+    /// (a group's) is measured as its files stand. A checkpoint reads the
+    /// end with its trees pinned and copies the journal up to it, never past.
     ///
     /// # Errors
     ///
-    /// The journal's lock is poisoned, or its files cannot be measured.
+    /// The journal's lock is poisoned or its buffer cannot be flushed, or
+    /// its files cannot be measured.
     pub(crate) fn journal_end(&self, src: &Path) -> StorageResult<JournalEnd> {
-        let _appends = match &self.oplog {
-            Some(oplog) => Some(
-                oplog
-                    .lock()
-                    .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?,
-            ),
-            None => None,
+        let Some(oplog) = &self.oplog else {
+            return journal_lengths(src);
         };
-        journal_lengths(src)
+        let crate::oplog::manager::LogEnd { sealed, active } = oplog
+            .lock()
+            .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?
+            .end_to_os()?;
+        let rel = |path: &Path| {
+            path.strip_prefix(src).map(Path::to_path_buf).map_err(|_| {
+                StorageError::Io(format!("journal segment {path:?} lies outside {src:?}"))
+            })
+        };
+        let mut end = JournalEnd::default();
+        for path in sealed {
+            let len = std::fs::metadata(&path)
+                .map_err(|e| StorageError::Io(format!("measure {path:?}: {e}")))?
+                .len();
+            end.0.insert(rel(&path)?, len);
+        }
+        if let Some((path, len)) = active {
+            end.0.insert(rel(&path)?, len);
+        }
+        Ok(end)
     }
 
     /// The file system every tree writes through.
@@ -3779,11 +3814,19 @@ impl StorageEngine {
         // Held alone until the rebuilt table is installed (the end of this
         // call): no capture pins it dropped or half filled.
         let _alone = self.rebuild_alone()?;
+        // The rebuilt tree stands for the same table: it keeps the stamp the
+        // table was created with (none for one the store held at its open), so
+        // a transaction that read the table before a later creation under its
+        // name is still refused a row in it.
+        let created_at = self
+            .columnar_tables
+            .get_stamped(table_id)
+            .map_or(0, |(_, _, created_at)| created_at);
         write_rebuild_intent(&self.data_dir, target)?;
         self.columnar_tables.drop_table(table_id)?;
         let tree = self
             .columnar_tables
-            .create_or_open_with(table_id, |_| Ok(()))?;
+            .create_or_open_with(table_id, created_at, |_| Ok(()))?;
         tree.clear()?;
         #[cfg(any(test, feature = "test-faults"))]
         if let Some(hook) = self.on_rebuild_cleared.lock().as_mut() {
@@ -9283,14 +9326,6 @@ fn capture_journal(
 #[derive(Debug, Default)]
 pub(crate) struct JournalEnd(std::collections::HashMap<PathBuf, u64>);
 
-impl JournalEnd {
-    /// The length of the file at `rel`, under the journal's directory, when
-    /// it existed.
-    fn len_of(&self, rel: &Path) -> Option<u64> {
-        self.0.get(rel).copied()
-    }
-}
-
 /// The length of every file under the journal directory `src` now. Read
 /// under the journal's append lock ([`StorageEngine::journal_end`]), each
 /// ends at a whole entry.
@@ -9335,56 +9370,28 @@ fn capture_journal_tail(
     end: &JournalEnd,
     footprints: &crate::engine::footprint::Footprints,
 ) -> StorageResult<u64> {
-    capture_journal_tail_at(src, dst, Path::new(""), end, footprints)
-}
-
-/// [`capture_journal_tail`] of the directory `rel` under the journal's.
-fn capture_journal_tail_at(
-    src: &Path,
-    dst: &Path,
-    rel: &Path,
-    end: &JournalEnd,
-    footprints: &crate::engine::footprint::Footprints,
-) -> StorageResult<u64> {
     let mut bytes = 0u64;
-    let from_dir = src.join(rel);
-    let entries = std::fs::read_dir(&from_dir)
-        .map_err(|e| StorageError::Io(format!("read dir {from_dir:?}: {e}")))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| StorageError::Io(format!("dir entry in {from_dir:?}: {e}")))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|e| StorageError::Io(format!("file type {:?}: {e}", entry.path())))?;
-        let name = rel.join(entry.file_name());
-        let to = dst.join(&name);
-        let from = entry.path();
-        if file_type.is_dir() {
-            if !to.exists() {
-                create_dir_new(&to)?;
-            }
-            bytes += capture_journal_tail_at(src, dst, &name, end, footprints)?;
-            continue;
+    for (name, &ended) in &end.0 {
+        let from = src.join(name);
+        let to = dst.join(name);
+        if let Some(parent) = to.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| StorageError::Io(format!("create dir {parent:?}: {e}")))?;
         }
-        // Made after the journal's end: what it holds came after the trees.
-        let Some(ended) = end.len_of(&name) else {
-            continue;
-        };
         let len = |path: &Path| std::fs::metadata(path).map(|m| m.len());
-        match (len(&from), len(&to)) {
-            // Removed by the purge since the listing: it held only entries
-            // the trees already carry.
-            (Err(_), _) => continue,
+        match len(&to) {
             // A segment never shrinks: a copy as long as the end is the copy.
-            (Ok(_), Ok(copied)) if copied == ended => continue,
-            (Ok(_), Ok(_)) => {
+            Ok(copied) if copied == ended => continue,
+            Ok(_) => {
                 // The copy is a stale copy of the active segment, never a
                 // link: a linked segment is sealed and keeps its length.
                 std::fs::remove_file(&to)
                     .map_err(|e| StorageError::Io(format!("replace {to:?}: {e}")))?;
                 footprints.removed(&to);
             }
-            (Ok(_), Err(_)) => {}
+            Err(_) => {}
         }
         if len(&from).is_ok_and(|now| now == ended)
             && crate::oplog::segment::is_sealed(&from).unwrap_or(false)
@@ -9395,11 +9402,16 @@ fn capture_journal_tail_at(
                 .map_err(|e| StorageError::Io(format!("link {to:?}: {e}")))?;
             continue;
         }
-        match copy_prefix(&from, &to, Some(ended), footprints) {
-            Ok(copied) => bytes += copied,
-            Err(StorageError::Io(_)) if !from.exists() => {}
-            Err(e) => return Err(e),
+        // The journal's segments are kept for the whole checkpoint: one
+        // shorter than its end, or gone, would leave the copy without
+        // entries the trees rely on.
+        let copied = copy_prefix(&from, &to, Some(ended), footprints)?;
+        if copied != ended {
+            return Err(StorageError::Io(format!(
+                "copy {from:?}: {copied} bytes of the {ended} the journal ended at"
+            )));
         }
+        bytes += copied;
     }
     Ok(bytes)
 }

@@ -382,6 +382,10 @@ pub struct Transaction<'a> {
     /// it is what makes the write admissible, and the two are checked at
     /// different points against different evidence.
     expected_versions: Vec<(Partition, Vec<u8>, Option<u64>)>,
+    /// Records written since the snapshot at a version this attempt read and
+    /// builds on ([`Self::accept_written_at`]): their write-set check is the
+    /// exact version condition stated for them, not the snapshot.
+    accepted_writes: Vec<(Partition, Vec<u8>, u64)>,
     /// The schema generation as it stood when this attempt began. Every claim
     /// it makes is stamped with it, so a predicate evaluated here is not taken
     /// as evidence about a graph whose definitions have since changed.
@@ -409,10 +413,10 @@ pub struct Transaction<'a> {
     /// to them outside its commit until its last state drops
     /// ([`Self::hold_tree_set`]).
     tree_set: Option<crate::engine::tree_set::TreeSetHold>,
-    /// `STORAGE COLUMNAR` tables this transaction created
-    /// ([`Self::note_table_created`]): their trees are newer than its
-    /// snapshot, and its own.
-    created_tables: Vec<String>,
+    /// `STORAGE COLUMNAR` tables this transaction created, each with the
+    /// stamp of the tree it made ([`Self::note_table_created`]): those trees
+    /// are newer than its snapshot, and its own.
+    created_tables: Vec<(String, lsm_tree::SeqNo)>,
     /// DERIVED index work: entries staged in the write buffer that the unit
     /// logs as sealed work rather than as mutations.
     derived: derived::DerivedLedger,
@@ -471,6 +475,8 @@ pub struct TransactionState {
     /// Parked for the same reason as the claims: a condition stated by one
     /// statement of an interactive transaction binds the commit of the last.
     expected_versions: Vec<(Partition, Vec<u8>, Option<u64>)>,
+    /// Parked with the conditions they rest on.
+    accepted_writes: Vec<(Partition, Vec<u8>, u64)>,
     /// Parked with the claims it stamps: the generation belongs to the
     /// attempt, and the attempt spans the statements.
     schema_generation: u64,
@@ -483,7 +489,7 @@ pub struct TransactionState {
     /// last, and the set stays held until then.
     tree_set: Option<crate::engine::tree_set::TreeSetHold>,
     /// Parked: a later statement writes the tables an earlier one created.
-    created_tables: Vec<String>,
+    created_tables: Vec<(String, lsm_tree::SeqNo)>,
     /// Parked with the write buffer whose index entries it describes.
     derived: derived::DerivedLedger,
     /// Parked with the write buffer: the removals commit with its writes.
@@ -673,6 +679,7 @@ impl<'a> Transaction<'a> {
             claims: ClaimSet::new(),
             schema_reads: ClaimSet::new(),
             expected_versions: Vec::new(),
+            accepted_writes: Vec::new(),
             schema_generation: engine.schema_generation(),
             schema_changed: false,
             snapshot_pin,
@@ -876,6 +883,7 @@ impl<'a> Transaction<'a> {
             claims: self.claims,
             schema_reads: self.schema_reads,
             expected_versions: self.expected_versions,
+            accepted_writes: self.accepted_writes,
             schema_generation: self.schema_generation,
             schema_changed: self.schema_changed,
             merge_node_deltas: self.merge_node_deltas,
@@ -911,6 +919,7 @@ impl<'a> Transaction<'a> {
             claims: std::mem::take(&mut self.claims),
             schema_reads: std::mem::take(&mut self.schema_reads),
             expected_versions: std::mem::take(&mut self.expected_versions),
+            accepted_writes: std::mem::take(&mut self.accepted_writes),
             schema_generation: self.schema_generation,
             schema_changed: std::mem::take(&mut self.schema_changed),
             merge_node_deltas: std::mem::take(&mut self.merge_node_deltas),
@@ -954,6 +963,7 @@ impl<'a> Transaction<'a> {
             claims: state.claims,
             schema_reads: state.schema_reads,
             expected_versions: state.expected_versions,
+            accepted_writes: state.accepted_writes,
             schema_generation: state.schema_generation,
             schema_changed: state.schema_changed,
             merge_node_deltas: state.merge_node_deltas,
@@ -986,20 +996,25 @@ impl<'a> Transaction<'a> {
     }
 
     /// Record that this transaction created the `STORAGE COLUMNAR` table
-    /// `table`: its later rows go into the tree it made, newer than its
-    /// snapshot.
-    pub fn note_table_created(&mut self, table: &str) {
-        self.created_tables.push(table.to_owned());
+    /// `table`, its tree stamped `created_at`
+    /// ([`StorageEngine::columnar_table_created_at`]): its later rows go into
+    /// that tree, newer than its snapshot, and into no other made under the
+    /// name.
+    pub fn note_table_created(&mut self, table: &str, created_at: lsm_tree::SeqNo) {
+        self.created_tables.retain(|(name, _)| name != table);
+        self.created_tables.push((table.to_owned(), created_at));
     }
 
-    /// The snapshot a row this transaction writes to `table` is checked
-    /// against: its own, or `None` for a table it created itself
-    /// ([`StorageEngine::columnar_insert_existing`]).
-    pub fn table_read_at(&self, table: &str) -> Option<lsm_tree::SeqNo> {
-        if self.created_tables.iter().any(|created| created == table) {
-            return None;
-        }
-        Some(self.read_ts.as_raw())
+    /// What a row this transaction writes to `table` is checked against
+    /// ([`StorageEngine::columnar_insert_existing`]): its snapshot, and the
+    /// stamp of the tree it created under the name, if it did.
+    pub fn table_read(&self, table: &str) -> (lsm_tree::SeqNo, Option<lsm_tree::SeqNo>) {
+        let created_here = self
+            .created_tables
+            .iter()
+            .find(|(name, _)| name == table)
+            .map(|&(_, created_at)| created_at);
+        (self.read_ts.as_raw(), created_here)
     }
 
     /// The read timestamp this transaction is pinned at.
@@ -1792,6 +1807,33 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
+    /// Build on the record at `key` as written at `version`, a write this
+    /// transaction may have made after its snapshot and read past it: its own
+    /// write of the record conflicts only with a change past `version`. The
+    /// commit is refused unless the record is still at `version`
+    /// ([`Self::expect_version`]); the write-set check that would refuse any
+    /// write of the record since the snapshot is not made for it. Every other
+    /// record keeps that check, and the snapshot the transaction reads does
+    /// not move.
+    ///
+    /// For a write whose content the caller has read and judged one it may
+    /// build on (an implicit label binding, which declares nothing), never
+    /// for one it has not.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::expect_version`].
+    pub fn accept_written_at(
+        &mut self,
+        part: Partition,
+        key: &[u8],
+        version: u64,
+    ) -> StorageResult<()> {
+        self.expect_version(part, key, Some(version))?;
+        self.accepted_writes.push((part, key.to_vec(), version));
+        Ok(())
+    }
+
     /// Bind this transaction's index effects to the definition stored at
     /// `key` as it was at `version`: a transition or drop of the index
     /// before this commit refuses it, so no effect lands under a retired
@@ -2424,6 +2466,15 @@ impl<'a> Transaction<'a> {
         // it: those land beneath the snapshot after the reads were made.
         let occ_read_ts = self.validate_from.unwrap_or_else(|| self.read_ts.as_raw());
         for (part, key) in &scope {
+            // Built on as written at a version the check above found still
+            // in place: nothing wrote it past what this attempt read.
+            if self
+                .accepted_writes
+                .iter()
+                .any(|(p, k, _)| p == part && k == key)
+            {
+                continue;
+            }
             // Inclusive: a snapshot sees sequence numbers strictly below
             // itself, so a write landing at exactly that number is one this
             // transaction could not have seen. The strict comparison missed

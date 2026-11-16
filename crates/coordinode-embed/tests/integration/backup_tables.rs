@@ -327,11 +327,14 @@ fn a_transaction_never_writes_into_a_table_created_after_it_read() {
     assert_eq!(open_consistent(&target, "Trade"), 1);
 }
 
-/// A transaction's statement writes rows into a table the transaction
-/// created itself, though the table's tree is newer than its snapshot.
+/// A transaction writes rows into a table it created itself, though the
+/// table's tree is newer than its snapshot, and commits: the table and its
+/// row are there after a reopen and in a backup. Before, the commit was
+/// refused as a write conflict on the label the table's declaration bound.
 #[test]
 fn a_transaction_writes_into_a_table_it_created() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let backups = tempfile::tempdir().expect("tempdir");
     let db = journal_less(dir.path());
     let txn = db.begin_transaction().expect("begin");
     db.execute_in_transaction(
@@ -342,15 +345,99 @@ fn a_transaction_writes_into_a_table_it_created() {
     .expect("create in the transaction");
     db.execute_in_transaction(txn, "CREATE (:Trade {id: 1, qty: 10})", None)
         .expect("a row of the table it created");
+    db.commit_transaction(txn).expect("commit");
+
+    let target = backups.path().join("b");
+    db.physical_backup(&target).expect("backup");
+    drop(db);
+    assert_eq!(open_consistent(&target, "Trade"), 1, "the backup");
+    let db = journal_less(dir.path());
     assert_eq!(
-        db.engine()
-            .columnar_scan("Trade", u64::MAX)
-            .expect("scan")
+        db.execute_cypher_shared("MATCH (t:Trade) RETURN t.id AS id", None, None, None, None)
+            .expect("read the table after a reopen")
+            .rows
             .len(),
         1,
-        "the row is in the table it created"
+        "the table after a reopen"
     );
-    let _ended = db.rollback_transaction(txn).is_ok();
+}
+
+/// A declaration that builds on a label another transaction declared after
+/// this one's snapshot is still refused at commit: only an implicit binding,
+/// which declares nothing, is built on past the snapshot.
+#[test]
+fn a_declaration_over_a_definition_made_since_the_snapshot_conflicts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = journal_less(dir.path());
+    let txn = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(txn, "MATCH (n:Note) RETURN n.body AS body", None)
+        .expect("read at the snapshot");
+    run(&db, "CREATE NODE TYPE Note WITH (body: STRING)").expect("declared since the snapshot");
+    db.execute_in_transaction(txn, "ALTER LABEL Note SET SCHEMA FLEXIBLE", None)
+        .expect("the statement is staged");
+    let refused = db
+        .commit_transaction(txn)
+        .expect_err("the declaration made since the snapshot is not built on");
+    assert!(
+        matches!(
+            refused,
+            coordinode_embed::DatabaseError::TransactionConflict { .. }
+        ),
+        "{refused:?}"
+    );
+}
+
+/// A transaction that creates a table keeps its snapshot for everything
+/// else: a record it read before another transaction changed it reads as
+/// it was, and its own write of that record is refused at commit.
+#[test]
+fn creating_a_table_moves_no_other_read_past_the_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = journal_less(dir.path());
+    run(&db, "CREATE (:Account {id: 1, balance: 100})").expect("account");
+    let balance = |txn| {
+        db.execute_in_transaction(txn, "MATCH (a:Account) RETURN a.balance AS b", None)
+            .expect("read the account")[0]
+            .get("b")
+            .and_then(|v| v.as_int())
+    };
+    let txn = db.begin_transaction().expect("begin");
+    assert_eq!(balance(txn), Some(100));
+    run(&db, "MATCH (a:Account) SET a.balance = 250").expect("changed since the snapshot");
+    db.execute_in_transaction(
+        txn,
+        "CREATE TABLE Trade (id BIGINT PRIMARY KEY, qty INT) STORAGE COLUMNAR",
+        None,
+    )
+    .expect("create in the transaction");
+    assert_eq!(balance(txn), Some(100), "the snapshot did not move");
+    db.execute_in_transaction(txn, "MATCH (a:Account) SET a.balance = 500", None)
+        .expect("the write is staged");
+    let refused = db
+        .commit_transaction(txn)
+        .expect_err("the account changed since the snapshot");
+    assert!(
+        matches!(
+            refused,
+            coordinode_embed::DatabaseError::TransactionConflict { .. }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        db.execute_cypher_shared(
+            "MATCH (a:Account) RETURN a.balance AS b",
+            None,
+            None,
+            None,
+            None
+        )
+        .expect("read")
+        .rows[0]
+            .get("b")
+            .and_then(|v| v.as_int()),
+        Some(250),
+        "the refused transaction applied nothing"
+    );
 }
 
 /// A table dropped and created again under its name between two backups is

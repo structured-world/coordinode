@@ -2609,6 +2609,78 @@ fn a_checkpoint_holds_a_table_operation_whole() {
     );
 }
 
+/// A checkpoint of a store whose journal entries sit in the journal
+/// writer's buffer (written in memory, not yet handed to the operating
+/// system, one of them perhaps in part) copies the journal up to its last
+/// whole entry: every active segment of the copy ends at a whole entry, and
+/// the copy opens with every write. Before, the copy ended where the file
+/// did, which a buffer flushed in the middle of an entry leaves inside it.
+#[test]
+fn a_checkpoint_journal_copy_ends_at_a_whole_entry() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use coordinode_core::txn::write_concern::Journal;
+
+    const WRITES: u64 = 2_000;
+    let dir = TempDir::new().expect("tempdir");
+    let backups = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine =
+        StorageEngine::open_embedded(&test_config(dir.path()), Arc::clone(&oracle)).expect("open");
+    assert!(engine.has_journal());
+    for i in 0..WRITES {
+        let write = [Mutation::Put {
+            partition: PartitionId::Node,
+            key: format!("node:1:m{i:06}").into_bytes(),
+            // Entries of uneven length, so the buffer's flushes fall inside
+            // them.
+            value: vec![b'v'; 37 + (i as usize % 61)],
+        }];
+        engine
+            .commit_logged(&write, oracle.next().as_raw(), Journal::Memory)
+            .expect("commit");
+    }
+
+    let target = backups.path().join("b");
+    engine.create_checkpoint(&target).expect("checkpoint");
+    drop(engine);
+
+    let mut segments = 0;
+    let mut pending = vec![target.join("oplog")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("read the journal copy")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if crate::oplog::segment::is_sealed(&path).unwrap_or(true) {
+                continue;
+            }
+            let data = std::fs::read(&path).expect("read a segment copy");
+            let header = usize::try_from(crate::oplog::segment::HEADER_SIZE).expect("small");
+            let ends = crate::oplog::segment::frame_ends(&data[header..]);
+            let last = ends.last().copied().unwrap_or(0) + crate::oplog::segment::HEADER_SIZE;
+            assert_eq!(last, data.len() as u64, "{path:?} ends inside an entry");
+            segments += 1;
+        }
+    }
+    assert!(segments > 0, "the copy holds the active segment");
+
+    let copy = StorageEngine::open_checkpoint(&target).expect("the copy opens");
+    for i in 0..WRITES {
+        assert!(
+            copy.get(Partition::Node, format!("node:1:m{i:06}").as_bytes())
+                .expect("read")
+                .is_some(),
+            "write {i}"
+        );
+    }
+}
+
 /// A checkpoint step refused for room on one endpoint is reported as that
 /// refusal with the step added, never as the endpoint with the least room
 /// left: there, `hot` is nearly full and the growth was refused on `cold`.

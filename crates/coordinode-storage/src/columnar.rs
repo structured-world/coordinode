@@ -365,7 +365,7 @@ impl ColumnarTableRegistry {
     /// Returns [`StorageError::Engine`] if the tree cannot be opened.
     #[cfg(test)]
     pub(crate) fn create_or_open(&self, table_id: &str) -> StorageResult<AnyTree> {
-        self.create_or_open_with(table_id, |_| Ok(()))
+        self.create_or_open_with(table_id, 0, |_| Ok(()))
     }
 
     /// Open or create the table's tree, running `on_create` on a tree it had to
@@ -376,14 +376,16 @@ impl ColumnarTableRegistry {
     /// # Errors
     ///
     /// Returns [`StorageError::Engine`] if the tree cannot be opened, or the
-    /// error `on_create` returns (the table is then not registered).
+    /// error `on_create` returns (the table is then not registered). A tree
+    /// it creates is stamped `created_at`: a tree made in a table's place (a
+    /// rebuild) keeps the stamp of the table it stands for.
     pub(crate) fn create_or_open_with(
         &self,
         table_id: &str,
+        created_at: u64,
         on_create: impl FnOnce(&AnyTree) -> StorageResult<()>,
     ) -> StorageResult<AnyTree> {
-        // A tree made in its table's place (a rebuild) is the same table.
-        self.open_judged(table_id, || 0, on_create)
+        self.open_judged(table_id, || created_at, on_create)
             .map(|(tree, _)| tree)
     }
 
