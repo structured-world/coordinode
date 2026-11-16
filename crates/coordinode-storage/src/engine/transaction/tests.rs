@@ -410,13 +410,13 @@ fn node_deltas_on_one_record_conflict_like_whole_writes() {
     for second_whole in [false, true] {
         let mut first = mvcc_txn(&engine, &oracle);
         let mut second = mvcc_txn(&engine, &oracle);
-        first.push_node_delta(key.to_vec(), set(1));
+        first.push_node_delta(key.to_vec(), set(1)).expect("stage");
         if second_whole {
             second
                 .put(Partition::Node, key, &base.to_msgpack().expect("encode"))
                 .expect("stage");
         } else {
-            second.push_node_delta(key.to_vec(), set(2));
+            second.push_node_delta(key.to_vec(), set(2)).expect("stage");
         }
         first.commit(&ctx()).expect("the first committer wins");
         match second.commit(&ctx()) {
@@ -475,8 +475,10 @@ fn deltas_of_a_node_written_whole_in_the_same_attempt_fold_into_it() {
 
     let mut txn = mvcc_txn(&engine, &oracle);
     txn.put(Partition::Node, created, &bytes).expect("stage");
-    txn.push_node_delta(created.to_vec(), set(5));
-    txn.push_node_delta(deleted.to_vec(), set(6));
+    txn.push_node_delta(created.to_vec(), set(5))
+        .expect("stage");
+    txn.push_node_delta(deleted.to_vec(), set(6))
+        .expect("stage");
     txn.delete(Partition::Node, deleted).expect("stage");
     txn.commit(&ctx())
         .expect("one record per key reaches the engine");

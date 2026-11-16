@@ -1038,6 +1038,10 @@ fn stage_expired(
                 .stage_delete(engine, txn, node_id, record, carried.iter().copied())
                 .map_err(|e| e.to_string())?;
             stage_detach(txn, node_id, edge_types)?;
+            // The record read is the one removed: its labels route the
+            // removal, so the node store need not read it again.
+            txn.note_node_basis(key, Some(&record.labels))
+                .map_err(|e| e.to_string())?;
             // Deleting through the node store states that the identity is
             // being destroyed, which excludes an edge attached to it before
             // this commit lands.
@@ -1057,7 +1061,12 @@ fn stage_expired(
                 return Ok(false);
             }
             let operand = removal_operand(record, target.anchor_field_id, &target.anchor_field)?;
-            txn.push_node_delta(key.to_vec(), operand);
+            // The record read is the one the delta lands on: its labels
+            // route the change, with no second read.
+            txn.note_node_basis(key, Some(&record.labels))
+                .map_err(|e| e.to_string())?;
+            txn.push_node_delta(key.to_vec(), operand)
+                .map_err(|e| e.to_string())?;
             result.fields_removed += 1;
             Ok(true)
         }
@@ -1083,7 +1092,10 @@ fn stage_expired(
                 return Ok(false);
             }
             let operand = removal_operand(record, del_field_id, del_field_name)?;
-            txn.push_node_delta(key.to_vec(), operand);
+            txn.note_node_basis(key, Some(&record.labels))
+                .map_err(|e| e.to_string())?;
+            txn.push_node_delta(key.to_vec(), operand)
+                .map_err(|e| e.to_string())?;
             result.subtrees_removed += 1;
             Ok(true)
         }
@@ -1113,7 +1125,8 @@ fn stage_detach(
             for peer_uid in posting.iter() {
                 let peer = NodeId::from_raw(peer_uid);
                 let (source, target) = if forward {
-                    edges.merge_remove_rev(txn, edge_type, peer, node.as_raw());
+                    // The node's own list is purged below.
+                    edges.unhook_from_target(txn, edge_type, node, peer);
                     (node, peer)
                 } else {
                     edges.merge_remove_fwd(txn, edge_type, peer, node.as_raw());

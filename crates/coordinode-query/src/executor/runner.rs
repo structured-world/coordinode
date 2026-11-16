@@ -2419,6 +2419,25 @@ impl<'a> ExecutionContext<'a> {
         self.mvcc_put_node(self.shard_id, node_id, &record)
     }
 
+    /// Record, for the change feed, the labels the current record of node
+    /// `node_id` stored before a write that changes them, as the writer read
+    /// them: what routes the change to subscribers of the labels it leaves.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure reading the record before the transaction, when the
+    /// read the writer made already saw the transaction's own write.
+    pub fn note_labels_before(
+        &mut self,
+        node_id: NodeId,
+        labels_before: &[LabelId],
+    ) -> Result<(), ExecutionError> {
+        self.sync_txn_state();
+        let key = coordinode_core::graph::node::encode_node_key(self.shard_id, node_id);
+        self.txn.note_node_basis(&key, Some(labels_before))?;
+        Ok(())
+    }
+
     /// Move the per-label statistics of a node whose stored labels went from
     /// `before` to `after`: every label it gained or lost, implied ones too.
     ///
@@ -4960,7 +4979,7 @@ impl<'a> ExecutionContext<'a> {
                     shard_id, node_id,
                 ));
         }
-        LocalNodeStore.buffer_node_delta(&mut self.txn, shard_id, node_id, operand);
+        LocalNodeStore.buffer_node_delta(&mut self.txn, shard_id, node_id, operand)?;
         Ok(())
     }
 
@@ -5347,6 +5366,13 @@ impl<'a> ExecutionContext<'a> {
     pub fn adj_merge_remove_rev(&mut self, edge_type: &str, tgt: NodeId, uid: u64) {
         use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
         LocalEdgeStore.merge_remove_rev(&mut self.txn, edge_type, tgt, uid);
+    }
+
+    /// Remove the relationship `src -> tgt` that goes with `src`'s whole
+    /// forward list, which the caller deletes or purges after it.
+    pub fn adj_unhook_from_target(&mut self, edge_type: &str, src: NodeId, tgt: NodeId) {
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        LocalEdgeStore.unhook_from_target(&mut self.txn, edge_type, src, tgt);
     }
 
     /// Buffered wholesale delete of a node's forward posting list. Goes
@@ -17518,6 +17544,7 @@ fn execute_update(
                         // The labels the node then stores, and the indexes of
                         // every label it then carries.
                         ctx.relabel(&mut record, &labels_before, None)?;
+                        ctx.note_labels_before(node_id, &labels_before)?;
                         ctx.stat_labels_changed(&labels_before, &record.labels)?;
                         ctx.index_labels_changed(node_id, None, &labels_before, &record)?;
                         ctx.write_stats.labels_added += 1;
@@ -17662,6 +17689,7 @@ fn execute_retype_node(
         }
         let before = record.clone();
         ctx.retype_labels(&mut record, to)?;
+        ctx.note_labels_before(node_id, &before.labels)?;
         ctx.stat_labels_changed(&before.labels, &record.labels)?;
         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
         refresh_label_columns(&mut row, variable, &record, ctx)?;
@@ -18024,6 +18052,7 @@ fn execute_remove(
                         // nor a label the type implies; the node leaves the
                         // removed label's indexes.
                         ctx.relabel(&mut record, &labels_before, Some(removed))?;
+                        ctx.note_labels_before(node_id, &labels_before)?;
                         ctx.stat_labels_changed(&labels_before, &record.labels)?;
                         ctx.index_labels_changed(node_id, None, &labels_before, &record)?;
                         ctx.write_stats.labels_removed += 1;
@@ -18333,11 +18362,11 @@ fn execute_delete(
                             // adj:TYPE:out:NODE → counterpart adj:TYPE:in:PEER,
                             // and adj:TYPE:in:NODE → counterpart adj:TYPE:out:PEER.
                             match parts.direction {
-                                AdjDirection::Out => ctx.adj_merge_remove_rev(
-                                    &parts.edge_type,
-                                    peer_id,
-                                    node_id.as_raw(),
-                                ),
+                                // The node's own list is purged below, so no
+                                // forward removal names this edge.
+                                AdjDirection::Out => {
+                                    ctx.adj_unhook_from_target(&parts.edge_type, node_id, peer_id)
+                                }
                                 AdjDirection::In => ctx.adj_merge_remove_fwd(
                                     &parts.edge_type,
                                     peer_id,
@@ -18601,6 +18630,7 @@ fn execute_merge_nodes(
         // and its own auxiliary ones.
         if target_rec.labels != target_labels_before {
             ctx.relabel(&mut target_rec, &target_labels_before, None)?;
+            ctx.note_labels_before(target_id, &target_labels_before)?;
             ctx.stat_labels_changed(&target_labels_before, &target_rec.labels)?;
         }
 
@@ -19458,12 +19488,13 @@ fn transfer_node_edges(
                 if keep_old_edge {
                     // Drop the source-side edge entirely (no transfer).
                     // Remove from source's posting list + counterpart, and
-                    // delete edgeprop for the old endpoints.
+                    // delete edgeprop for the old endpoints. The source's own
+                    // list is deleted after the loop, naming none of them.
                     match direction {
-                        AdjDirection::Out => ctx.adj_merge_remove_rev(
+                        AdjDirection::Out => ctx.adj_unhook_from_target(
                             edge_type,
+                            source_id,
                             NodeId::from_raw(peer_uid),
-                            source_id.as_raw(),
                         ),
                         AdjDirection::In => ctx.adj_merge_remove_fwd(
                             edge_type,
@@ -19479,11 +19510,9 @@ fn transfer_node_edges(
                 // Re-point this edge.
                 // 1. Adjacency rewrite: remove source from posting lists; add target.
                 match direction {
-                    AdjDirection::Out => ctx.adj_merge_remove_rev(
-                        edge_type,
-                        NodeId::from_raw(peer_uid),
-                        source_id.as_raw(),
-                    ),
+                    AdjDirection::Out => {
+                        ctx.adj_unhook_from_target(edge_type, source_id, NodeId::from_raw(peer_uid))
+                    }
                     AdjDirection::In => ctx.adj_merge_remove_fwd(
                         edge_type,
                         NodeId::from_raw(peer_uid),
@@ -19701,9 +19730,8 @@ fn detach_delete_node(
             for peer_uid in plist.iter() {
                 let peer_id = NodeId::from_raw(peer_uid);
                 match direction {
-                    AdjDirection::Out => {
-                        ctx.adj_merge_remove_rev(edge_type, peer_id, node_id.as_raw())
-                    }
+                    // The node's own list is purged below.
+                    AdjDirection::Out => ctx.adj_unhook_from_target(edge_type, node_id, peer_id),
                     AdjDirection::In => {
                         ctx.adj_merge_remove_fwd(edge_type, peer_id, node_id.as_raw())
                     }
@@ -21090,8 +21118,9 @@ fn cascade_delete_source_node(
                 for peer_uid in plist.iter() {
                     let peer_id = NodeId::from_raw(peer_uid);
                     match parts.direction {
+                        // The source's own list is purged below.
                         AdjDirection::Out => {
-                            ctx.adj_merge_remove_rev(&parts.edge_type, peer_id, source_id.as_raw())
+                            ctx.adj_unhook_from_target(&parts.edge_type, source_id, peer_id)
                         }
                         AdjDirection::In => {
                             ctx.adj_merge_remove_fwd(&parts.edge_type, peer_id, source_id.as_raw())

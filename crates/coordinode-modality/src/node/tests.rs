@@ -125,35 +125,41 @@ fn post_state_applies_pending_deltas_without_staging() {
 
     let mut t = db.read();
     let delta = |d: DocDelta| d.encode().expect("encode");
-    LocalNodeStore.buffer_node_delta(
-        &mut t,
-        0,
-        id,
-        delta(DocDelta::SetPath {
-            target: PathTarget::PropField(1),
-            path: vec!["unit".into()],
-            value: rmpv::Value::from("kg"),
-        }),
-    );
-    LocalNodeStore.buffer_node_delta(
-        &mut t,
-        0,
-        id,
-        delta(DocDelta::RemoveProperty {
-            target: PathTarget::PropField(2),
-            key: None,
-        }),
-    );
-    LocalNodeStore.buffer_node_delta(
-        &mut t,
-        0,
-        id,
-        delta(DocDelta::SetPath {
-            target: PathTarget::Extra,
-            path: vec!["note".into()],
-            value: rmpv::Value::from("x"),
-        }),
-    );
+    LocalNodeStore
+        .buffer_node_delta(
+            &mut t,
+            0,
+            id,
+            delta(DocDelta::SetPath {
+                target: PathTarget::PropField(1),
+                path: vec!["unit".into()],
+                value: rmpv::Value::from("kg"),
+            }),
+        )
+        .expect("stage");
+    LocalNodeStore
+        .buffer_node_delta(
+            &mut t,
+            0,
+            id,
+            delta(DocDelta::RemoveProperty {
+                target: PathTarget::PropField(2),
+                key: None,
+            }),
+        )
+        .expect("stage");
+    LocalNodeStore
+        .buffer_node_delta(
+            &mut t,
+            0,
+            id,
+            delta(DocDelta::SetPath {
+                target: PathTarget::Extra,
+                path: vec!["note".into()],
+                value: rmpv::Value::from("x"),
+            }),
+        )
+        .expect("stage");
 
     let key = encode_node_key(0, id);
     let state = LocalNodeStore::post_state(&t, &key)
@@ -194,25 +200,29 @@ fn materialized_deltas_match_what_the_commit_stores() {
 
     let mut t = db.read();
     let delta = |d: DocDelta| d.encode().expect("encode");
-    LocalNodeStore.buffer_node_delta(
-        &mut t,
-        0,
-        id,
-        delta(DocDelta::RemoveProperty {
-            target: PathTarget::PropField(2),
-            key: None,
-        }),
-    );
-    LocalNodeStore.buffer_node_delta(
-        &mut t,
-        0,
-        id,
-        delta(DocDelta::SetPath {
-            target: PathTarget::Extra,
-            path: vec!["note".into()],
-            value: rmpv::Value::from("x"),
-        }),
-    );
+    LocalNodeStore
+        .buffer_node_delta(
+            &mut t,
+            0,
+            id,
+            delta(DocDelta::RemoveProperty {
+                target: PathTarget::PropField(2),
+                key: None,
+            }),
+        )
+        .expect("stage");
+    LocalNodeStore
+        .buffer_node_delta(
+            &mut t,
+            0,
+            id,
+            delta(DocDelta::SetPath {
+                target: PathTarget::Extra,
+                path: vec!["note".into()],
+                value: rmpv::Value::from("x"),
+            }),
+        )
+        .expect("stage");
     let key = encode_node_key(0, id);
     LocalNodeStore::materialize_pending_deltas(&mut t, &key).expect("materialize");
     let seen = LocalNodeStore.get(&t, 0, id).expect("get").expect("exists");

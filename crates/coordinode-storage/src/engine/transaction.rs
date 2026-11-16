@@ -448,6 +448,60 @@ pub struct Transaction<'a> {
         coordinode_core::txn::operation::OperationId,
         coordinode_core::txn::operation::IntentDigest,
     )>,
+    /// What this attempt's row changes mean to the change feed where they
+    /// cannot say it themselves ([`Self::note_node_basis`],
+    /// [`Self::note_removed_edge`]). Sealed with the unit.
+    effects: EffectContext,
+}
+
+/// The change-feed context an attempt gathers as its writers stage changes:
+/// the labels each node it removes, patches or relabels stored before the
+/// attempt, and the relationships it removes without naming them in a
+/// forward adjacency removal. Moves with the write buffer it describes.
+#[derive(Debug, Default)]
+struct EffectContext {
+    nodes: std::collections::BTreeMap<Vec<u8>, Vec<coordinode_core::schema::label_id::LabelId>>,
+    removed_edges: std::collections::BTreeSet<Vec<u8>>,
+}
+
+impl EffectContext {
+    /// The unit operation it seals to, under this build's interpretation.
+    fn seal(&mut self) -> Mutation {
+        let mut effects = coordinode_core::txn::proposal::UnitEffects::new();
+        effects.nodes = std::mem::take(&mut self.nodes)
+            .into_iter()
+            .map(|(key, labels)| coordinode_core::txn::proposal::NodeBasis { key, labels })
+            .collect();
+        effects.removed_edges = std::mem::take(&mut self.removed_edges)
+            .into_iter()
+            .collect();
+        Mutation::Effects(effects)
+    }
+}
+
+/// Whether a unit holding `mutations` changes application data, which the
+/// change feed projects: node, relationship, blob and vector rows and node
+/// history. Index entries, counters, catalog and registry records are not.
+fn changes_application_data(mutations: &[Mutation]) -> bool {
+    mutations.iter().any(|m| match m {
+        Mutation::Put { partition, .. }
+        | Mutation::Delete { partition, .. }
+        | Mutation::Merge { partition, .. }
+        | Mutation::RemoveRange { partition, .. } => matches!(
+            partition,
+            PartitionId::Node
+                | PartitionId::Adj
+                | PartitionId::EdgeProp
+                | PartitionId::Blob
+                | PartitionId::BlobRef
+                | PartitionId::VectorF32
+                | PartitionId::NodeHistory
+        ),
+        Mutation::Command(_)
+        | Mutation::Derive(_)
+        | Mutation::Operation(_)
+        | Mutation::Effects(_) => false,
+    })
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -503,6 +557,8 @@ pub struct TransactionState {
     /// Parked: a statement whose writes were cut short by its budget leaves
     /// the attempt unable to commit, whatever statement asks.
     budget_refusal: Option<coordinode_core::budget::BudgetStop>,
+    /// Parked with the write buffer whose changes it describes.
+    effects: EffectContext,
 }
 
 /// Bytes the write buffer holds for one staged key beside the key and value
@@ -698,6 +754,7 @@ impl<'a> Transaction<'a> {
             overlap_wait: None,
             kept_counts: rustc_hash::FxHashMap::default(),
             operation: None,
+            effects: EffectContext::default(),
         }
     }
 
@@ -901,6 +958,7 @@ impl<'a> Transaction<'a> {
             stamped: self.stamped,
             post_state_checks: self.post_state_checks,
             budget_refusal: self.budget_refusal,
+            effects: self.effects,
         }
     }
 
@@ -937,6 +995,7 @@ impl<'a> Transaction<'a> {
             stamped: std::mem::take(&mut self.stamped),
             post_state_checks: std::mem::take(&mut self.post_state_checks),
             budget_refusal: self.budget_refusal.take(),
+            effects: std::mem::take(&mut self.effects),
         }
     }
 
@@ -984,6 +1043,7 @@ impl<'a> Transaction<'a> {
             overlap_wait: None,
             kept_counts: rustc_hash::FxHashMap::default(),
             operation: None,
+            effects: state.effects,
         }
     }
 
@@ -1153,6 +1213,82 @@ impl<'a> Transaction<'a> {
     /// often as it was recorded.
     pub fn take_post_state_checks(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.post_state_checks)
+    }
+
+    /// Record the labels node `key` (a version's included) stored before
+    /// this attempt, for the change feed: what routes the node's removal,
+    /// document delta or relabelling to subscribers of the labels it had. The
+    /// first record of a key stands, so a node changed twice keeps the labels
+    /// it had before the first change.
+    ///
+    /// `stored` is what the writer read of the record through this
+    /// transaction. While the attempt has staged no change to the key, that
+    /// read came from the snapshot, which its write set makes the record the
+    /// commit replaces. Once it has, the read saw the attempt's own write, so
+    /// the record is read at the snapshot instead, as it is for a writer with
+    /// no labels at hand (a delete by key). A record that did not exist
+    /// stored no labels.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure reading the record, or a record that does not
+    /// decode. A record the budget refuses fails the statement and the
+    /// commit instead.
+    pub fn note_node_basis(
+        &mut self,
+        key: &[u8],
+        stored: Option<&[coordinode_core::schema::label_id::LabelId]>,
+    ) -> StorageResult<()> {
+        if self.effects.nodes.contains_key(key) {
+            return Ok(());
+        }
+        let staged = self
+            .write_buffer
+            .contains_key(&(Partition::Node, key.to_vec()));
+        let labels = match stored {
+            Some(labels) if !staged => labels.to_vec(),
+            _ => self.labels_before(key)?,
+        };
+        let held =
+            key.len() + labels.len() * size_of::<coordinode_core::schema::label_id::LabelId>();
+        if self.admit_staged(STAGED_WRITE + held).is_err() {
+            return Ok(());
+        }
+        self.effects.nodes.insert(key.to_vec(), labels);
+        Ok(())
+    }
+
+    /// Record that this attempt removes the relationship whose edge property
+    /// key is `key` (a version's or discriminator's included) where no
+    /// forward adjacency removal of the attempt names it: a whole adjacency
+    /// list removed with its node.
+    pub fn note_removed_edge(&mut self, key: &[u8]) {
+        if self.effects.removed_edges.contains(key)
+            || self.admit_staged(STAGED_WRITE + key.len()).is_err()
+        {
+            return;
+        }
+        self.effects.removed_edges.insert(key.to_vec());
+    }
+
+    /// The labels node `key` stored at this transaction's snapshot, none for
+    /// a record that did not exist.
+    fn labels_before(
+        &self,
+        key: &[u8],
+    ) -> StorageResult<Vec<coordinode_core::schema::label_id::LabelId>> {
+        let decode = |bytes: Option<&[u8]>| {
+            bytes.map_or(Ok(Vec::new()), |bytes| {
+                coordinode_core::graph::node::NodeRecord::labels_from_msgpack(bytes)
+                    .map_err(|e| StorageError::Serialization(format!("node record labels: {e}")))
+            })
+        };
+        match self.snapshot {
+            Some(snap) => self
+                .engine
+                .with_snapshot_value(&snap, Partition::Node, key, decode)?,
+            None => decode(self.engine.get(Partition::Node, key)?.as_deref()),
+        }
     }
 
     /// Read without OCC tracking: write buffer (read-your-own-writes) →
@@ -1985,15 +2121,23 @@ impl<'a> Transaction<'a> {
     }
 
     /// Buffer a node merge operand (pre-encoded document delta) at `node_key`.
-    pub fn push_node_delta(&mut self, node_key: Vec<u8>, operand: Vec<u8>) {
-        // A refused write is recorded and fails the statement and the commit.
+    /// A delta carries no labels, so the node's labels before the attempt
+    /// are recorded for the change feed first ([`Self::note_node_basis`]).
+    ///
+    /// # Errors
+    ///
+    /// A storage failure reading those labels. A write the budget refuses is
+    /// recorded instead and fails the statement and the commit.
+    pub fn push_node_delta(&mut self, node_key: Vec<u8>, operand: Vec<u8>) -> StorageResult<()> {
+        self.note_node_basis(&node_key, None)?;
         if self
             .admit_staged(STAGED_DELTA + node_key.capacity() + operand.capacity())
             .is_err()
         {
-            return;
+            return Ok(());
         }
         self.merge_node_deltas.push((node_key, operand));
+        Ok(())
     }
 
     /// Buffer a commutative counter increment at `counter_key` (statistics
@@ -2543,6 +2687,15 @@ impl<'a> Transaction<'a> {
                 key,
                 value,
             });
+        }
+        // What the rows mean to the change feed, after them and before the
+        // binding. Every unit changing application data carries it, empty or
+        // not, so a reader tells a unit sealed under an interpretation from
+        // one sealed before there was any.
+        if changes_application_data(&mutations) {
+            mutations.push(self.effects.seal());
+        } else {
+            self.effects = EffectContext::default();
         }
         // The binding goes last, after the sealed DERIVED work whose record
         // sources name positions of the list before it.
@@ -3313,3 +3466,7 @@ mod derived;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod effects_tests;

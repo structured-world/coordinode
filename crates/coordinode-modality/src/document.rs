@@ -157,7 +157,7 @@ impl LocalDocumentStore {
             kind: "doc delta",
             message: format!("encode: {e}"),
         })?;
-        txn.push_node_delta(encode_node_key(shard_id, node_id), operand);
+        txn.push_node_delta(encode_node_key(shard_id, node_id), operand)?;
         Ok(())
     }
 }

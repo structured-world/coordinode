@@ -167,13 +167,18 @@ pub trait NodeStore {
     /// key; `operand` is a pre-built `DocDelta::encode()` blob). Applied via
     /// [`LocalNodeStore::materialize_pending_deltas`] on the next read and
     /// drained at commit — the `SET n.path = x` / `REMOVE n.path` write path.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure reading the labels the node had before the
+    /// transaction, which the change feed routes the delta by.
     fn buffer_node_delta(
         &self,
         txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         operand: Vec<u8>,
-    );
+    ) -> StoreResult<()>;
 
     /// The key prefix that matches every node row in a shard. The query layer
     /// uses it for a full-shard node scan without naming the key encoder.
@@ -1039,6 +1044,7 @@ impl NodeStore for LocalNodeStore {
         valid_from_ms: i64,
     ) -> StoreResult<()> {
         let key = encode_temporal_node_key(shard_id, node_id, valid_from_ms);
+        txn.note_node_basis(&key, None)?;
         txn.delete(Partition::Node, &key)?;
         // The canonical history keeps that this commit removed the version.
         txn.put_stamped(
@@ -1076,6 +1082,9 @@ impl NodeStore for LocalNodeStore {
             generation,
         ));
         let key = encode_node_key(shard_id, node_id);
+        // A tombstone carries no labels: the change feed routes the removal
+        // to the subscribers of those the node had.
+        txn.note_node_basis(&key, None)?;
         txn.delete(Partition::Node, &key)?;
         Ok(())
     }
@@ -1086,9 +1095,10 @@ impl NodeStore for LocalNodeStore {
         shard_id: u16,
         node_id: NodeId,
         operand: Vec<u8>,
-    ) {
+    ) -> StoreResult<()> {
         let key = encode_node_key(shard_id, node_id);
-        txn.push_node_delta(key, operand);
+        txn.push_node_delta(key, operand)?;
+        Ok(())
     }
 
     fn shard_scan_prefix(&self, shard_id: u16) -> Vec<u8> {

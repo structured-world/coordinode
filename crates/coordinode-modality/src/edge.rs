@@ -445,6 +445,12 @@ pub trait EdgeStore {
     /// Buffer a reverse-adjacency remove (`tgt` loses in-neighbour `uid`).
     fn merge_remove_rev(&self, txn: &mut Transaction, edge_type: &str, tgt: NodeId, uid: u64);
 
+    /// Remove the relationship `src -> tgt` whose forward entry goes with
+    /// `src`'s whole forward list, deleted or purged by the caller: `tgt`
+    /// loses in-neighbour `src`, and the removal is recorded for the change
+    /// feed, as no forward removal names it.
+    fn unhook_from_target(&self, txn: &mut Transaction, edge_type: &str, src: NodeId, tgt: NodeId);
+
     /// Buffered wholesale delete (tombstone) of a node's forward posting list.
     fn delete_adj_fwd(
         &self,
@@ -1166,6 +1172,11 @@ impl EdgeStore for LocalEdgeStore {
 
     fn merge_remove_rev(&self, txn: &mut Transaction, edge_type: &str, tgt: NodeId, uid: u64) {
         txn.merge_adj_remove(&encode_adj_key_reverse(edge_type, tgt), uid);
+    }
+
+    fn unhook_from_target(&self, txn: &mut Transaction, edge_type: &str, src: NodeId, tgt: NodeId) {
+        txn.merge_adj_remove(&encode_adj_key_reverse(edge_type, tgt), src.as_raw());
+        txn.note_removed_edge(&encode_edgeprop_key(edge_type, src, tgt));
     }
 
     fn delete_adj_fwd(
