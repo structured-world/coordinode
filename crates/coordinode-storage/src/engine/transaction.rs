@@ -462,6 +462,8 @@ pub struct Transaction<'a> {
 struct EffectContext {
     nodes: std::collections::BTreeMap<Vec<u8>, Vec<coordinode_core::schema::label_id::LabelId>>,
     removed_edges: std::collections::BTreeSet<Vec<u8>>,
+    /// Set as the unit is sealed: the positions of its coalesced runs.
+    runs: Vec<u32>,
 }
 
 impl EffectContext {
@@ -475,6 +477,7 @@ impl EffectContext {
         effects.removed_edges = std::mem::take(&mut self.removed_edges)
             .into_iter()
             .collect();
+        effects.runs = std::mem::take(&mut self.runs);
         Mutation::Effects(effects)
     }
 }
@@ -2956,6 +2959,7 @@ impl<'a> Transaction<'a> {
                 end,
             })
             .collect();
+        let genuine_ranges = mutations.len();
         mutations.extend(
             wb.into_iter()
                 .filter(|((part, key), _)| !(*part == Partition::Idx && derived.owns(key)))
@@ -3009,6 +3013,20 @@ impl<'a> Transaction<'a> {
             mutations,
             coordinode_core::txn::coalesce::DEFAULT_MIN_RUN,
         );
+        // The ranges coalescing made stand for point deletes, each of a key
+        // the change feed names. The removals of whole ranges come first and
+        // pass through as they are, so every later range is a run. Every
+        // operation here is a row change, so its position is its row
+        // position.
+        self.effects.runs = mutations
+            .iter()
+            .enumerate()
+            .skip(genuine_ranges)
+            .filter(|(_, m)| matches!(m, Mutation::RemoveRange { .. }))
+            // A unit past u32 positions exceeds every frame bound and is
+            // refused before the log.
+            .filter_map(|(at, _)| u32::try_from(at).ok())
+            .collect();
         if !derived.is_empty() {
             derived.seal(&mut mutations);
         }

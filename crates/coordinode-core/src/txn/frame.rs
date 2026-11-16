@@ -54,6 +54,8 @@ const KIND_MASK: u8 = 0b111;
 
 /// Bytes a decoded label identity holds.
 const LABEL_BYTES: usize = core::mem::size_of::<crate::schema::label_id::LabelId>();
+/// Bytes a decoded run position holds.
+const RUN_BYTES: usize = core::mem::size_of::<u32>();
 
 /// The operation commands, as the byte after [`KIND_OPERATION`] numbers
 /// them.
@@ -305,8 +307,10 @@ fn encode_within<'a>(
 
     let mut encoder = Encoder::default();
     for (at, mutation) in unit.mutations.iter().enumerate() {
-        if let Mutation::Derive(work) = mutation {
-            check_derived(work, &unit.mutations[..at])?;
+        match mutation {
+            Mutation::Derive(work) => check_derived(work, &unit.mutations[..at])?,
+            Mutation::Effects(effects) => check_runs(&effects.runs, &unit.mutations[..at])?,
+            _ => {}
         }
         encoder.op(mutation, &mut out)?;
     }
@@ -441,6 +445,11 @@ impl<'a> Encoder<'a> {
         for key in &effects.removed_edges {
             self.key(edge, key, out);
         }
+        put_varint(effects.runs.len() as u64, out);
+        for &at in &effects.runs {
+            put_varint(u64::from(at), out);
+        }
+        self.expanded += effects.runs.len() * RUN_BYTES;
     }
 
     /// [`Self::bytes`] for a slice encoded here rather than borrowed.
@@ -595,6 +604,7 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
             }
             Mutation::Operation(command) => command.size_estimate(),
             Mutation::Effects(effects) => {
+                check_runs(&effects.runs, &unit.mutations[..at])?;
                 let mut bytes = 0;
                 for basis in &effects.nodes {
                     entries += 3 * 10 + basis.labels.len();
@@ -604,7 +614,10 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
                     entries += 2 * 10;
                     bytes += key.len();
                 }
-                bytes
+                // A position's varint takes at most one byte past the four it
+                // decodes to; the count is within the operation's overhead.
+                entries += 10 + effects.runs.len();
+                bytes + effects.runs.len() * RUN_BYTES
             }
         };
     }
@@ -656,6 +669,41 @@ fn check_derived(work: &DerivedIndexWork, earlier: &[Mutation]) -> Result<(), Fr
             Err(FrameError::BadSource { ordinal })
         }
         _ => Ok(()),
+    }
+}
+
+/// Refuse run positions that are not ascending positions of range removals
+/// among the row changes in `earlier`.
+fn check_runs(runs: &[u32], earlier: &[Mutation]) -> Result<(), FrameError> {
+    let mut runs = runs.iter().copied().peekable();
+    let rows = earlier.iter().filter(|m| {
+        matches!(
+            m,
+            Mutation::Put { .. }
+                | Mutation::Delete { .. }
+                | Mutation::Merge { .. }
+                | Mutation::RemoveRange { .. }
+        )
+    });
+    for (at, row) in rows.enumerate() {
+        let Some(&next) = runs.peek() else {
+            return Ok(());
+        };
+        if u64::from(next) < at as u64 {
+            return Err(FrameError::Effects("run positions are not ascending"));
+        }
+        if u64::from(next) == at as u64 {
+            if !matches!(row, Mutation::RemoveRange { .. }) {
+                return Err(FrameError::Effects("a run position names no range removal"));
+            }
+            runs.next();
+        }
+    }
+    match runs.next() {
+        None => Ok(()),
+        Some(_) => Err(FrameError::Effects(
+            "a run position names no earlier row change",
+        )),
     }
 }
 
@@ -914,10 +962,11 @@ impl<'a> Decoder<'a> {
             if tag != KIND_EFFECTS {
                 return Err(FrameError::UnknownTag(tag));
             }
-            // Kept by a reader of rows too: it is what the rows mean.
-            return self
-                .effects()
-                .map(|effects| Some(Mutation::Effects(effects)));
+            // Kept by a reader of rows too: it is what the rows mean. Its run
+            // positions count row changes, which both readers keep.
+            let effects = self.effects()?;
+            check_runs(&effects.runs, earlier)?;
+            return Ok(Some(Mutation::Effects(effects)));
         }
         let p = usize::from(tag >> 3);
         let partition = *PARTITIONS.get(p).ok_or(FrameError::UnknownTag(tag))?;
@@ -1044,10 +1093,22 @@ impl<'a> Decoder<'a> {
         let removed_edges = (0..count)
             .map(|_| self.key(edge))
             .collect::<Result<Vec<_>, _>>()?;
+        let count = self.reader.len_at_most(self.limit, "effect count")?;
+        if count > self.reader.remaining() {
+            return Err(FrameError::Truncated { at: self.reader.at });
+        }
+        self.spend(count * RUN_BYTES)?;
+        let runs = (0..count)
+            .map(|_| {
+                u32::try_from(self.reader.varint()?)
+                    .map_err(|_| FrameError::Effects("run position out of range"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(UnitEffects {
             interpretation,
             nodes,
             removed_edges,
+            runs,
         })
     }
 

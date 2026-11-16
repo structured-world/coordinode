@@ -200,6 +200,36 @@ fn the_labels_before_are_the_records_before_the_attempt() {
     );
 }
 
+/// Point deletes of adjacent nodes are sealed as one range removal; the unit
+/// names it a run, so its keys are the deleted nodes and nothing else, and
+/// each keeps the labels it stored. A removal of a whole range stays
+/// unnamed.
+#[test]
+fn a_coalesced_run_of_deletes_is_named_a_run() {
+    let (engine, oracle, _d) = test_engine();
+    for id in 10..15 {
+        seed(&engine, &oracle, id, &[3]);
+    }
+    let mut t = txn(&engine, &oracle);
+    t.remove_range(Partition::EdgeProp, b"edgeprop:GONE:", b"edgeprop:GONE;")
+        .expect("stage");
+    for id in 10..15 {
+        t.note_node_basis(&key(id), None).expect("basis");
+        t.delete(Partition::Node, &key(id)).expect("stage");
+    }
+    let unit = sealed(&engine, t);
+    let ranges: Vec<usize> = unit
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Mutation::RemoveRange { .. }))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(ranges.len(), 2, "{unit:?}");
+    let effects = effects_of(&unit).expect("context");
+    assert_eq!(effects.runs, vec![ranges[1] as u32]);
+    assert_eq!(effects.nodes.len(), 5);
+}
+
 /// A document delta carries no labels: the node's are recorded as it is
 /// staged.
 #[test]

@@ -218,6 +218,13 @@ pub struct UnitEffects {
     /// the unit names, as edge property keys: the pair's key, or an
     /// instance's key with its version or discriminator. In key order.
     pub removed_edges: Vec<Vec<u8>>,
+    /// The range removals of the unit that stand for a run of point deletes:
+    /// every key of the start's length from the start up to the end, each
+    /// deleted on its own. Any other range removal of the unit removes a key
+    /// range as such. Each is its position among the unit's row changes
+    /// (puts, deletes, merges and range removals), which a reader of rows
+    /// keeps as they are. Ascending, all before the context.
+    pub runs: Vec<u32>,
 }
 
 impl UnitEffects {
@@ -227,12 +234,13 @@ impl UnitEffects {
             interpretation: EFFECTS_INTERPRETATION,
             nodes: Vec::new(),
             removed_edges: Vec::new(),
+            runs: Vec::new(),
         }
     }
 
     /// Whether it says nothing beyond its interpretation.
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && self.removed_edges.is_empty()
+        self.nodes.is_empty() && self.removed_edges.is_empty() && self.runs.is_empty()
     }
 
     /// Approximate encoded size, for rate limiting and buffer accounting.
@@ -243,7 +251,7 @@ impl UnitEffects {
             .map(|n| n.key.len() + 1 + n.labels.len() * 4)
             .sum();
         let edges: usize = self.removed_edges.iter().map(|k| k.len() + 1).sum();
-        4 + nodes + edges
+        4 + nodes + edges + self.runs.len() * 4
     }
 }
 

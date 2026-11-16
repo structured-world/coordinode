@@ -58,7 +58,8 @@ fn mixed() -> RaftProposal {
         }),
         put(PartitionId::Registry, b"", b""),
         put(PartitionId::VectorF32, b"vec:1:42", &email),
-        effects(),
+        // Both range removals among the row changes, the command not counted.
+        effects_with(vec![5, 6]),
     ])
 }
 
@@ -69,6 +70,11 @@ fn label(raw: u32) -> crate::schema::label_id::LabelId {
 /// A context naming a node the unit writes, one it removes without a record,
 /// and a relationship.
 fn effects() -> Mutation {
+    effects_with(Vec::new())
+}
+
+/// [`effects`] naming the range removals at `runs` as runs of point deletes.
+fn effects_with(runs: Vec<u32>) -> Mutation {
     Mutation::Effects(UnitEffects {
         interpretation: crate::txn::proposal::EFFECTS_INTERPRETATION,
         nodes: vec![
@@ -85,6 +91,7 @@ fn effects() -> Mutation {
             b"edgeprop:KNOWS:\0\0\0\0\0\0\0\x2a:\0\0\0\0\0\0\0\x2b".to_vec(),
             b"edgeprop:KNOWS:\0\0\0\0\0\0\0\x2a:\0\0\0\0\0\0\0\x2b:\x80\0\0\0\0\0\0\x01".to_vec(),
         ],
+        runs,
     })
 }
 
@@ -779,6 +786,7 @@ fn an_effect_context_costs_little_beside_the_rows_it_describes() {
             })
             .collect(),
         removed_edges: Vec::new(),
+        runs: Vec::new(),
     }));
     let bare = encode_proposal(&proposal(deletes)).expect("encode").len();
     let full = encode_proposal(&proposal(described.clone()))
@@ -797,6 +805,63 @@ fn an_effect_context_costs_little_beside_the_rows_it_describes() {
         full - bare,
         keys.len()
     );
+}
+
+/// A run must name a range removal among the row changes before it, in
+/// ascending order: a reader enumerates the keys of what it names, so a
+/// position naming anything else is refused by the encoder and the decoder
+/// alike. Commands between the rows do not count, which keeps the positions
+/// the same for a reader of rows.
+#[test]
+fn a_run_must_name_an_earlier_range_removal() {
+    let range = Mutation::RemoveRange {
+        partition: PartitionId::Node,
+        start: b"node:1:1".to_vec(),
+        end: b"node:1:5".to_vec(),
+    };
+    let command = Mutation::Command(MetadataCommand::RegisterFields {
+        names: vec!["x".into()],
+    });
+    let good = vec![
+        put(PartitionId::Node, b"node:1:0", b"r"),
+        command.clone(),
+        range.clone(),
+        effects_with(vec![1]),
+    ];
+    let frame = encode_proposal(&proposal(good.clone())).expect("encode");
+    assert_eq!(decode(&frame).expect("decode").mutations, good);
+    let (rows, _) = decode_proposal_rows(&frame, &DecodeLimits::DEFAULT).expect("rows");
+    assert_eq!(
+        rows.mutations,
+        vec![good[0].clone(), good[2].clone(), good[3].clone()]
+    );
+
+    for bad in [
+        // A put, not a range removal.
+        vec![
+            put(PartitionId::Node, b"node:1:0", b"r"),
+            range.clone(),
+            effects_with(vec![0]),
+        ],
+        // Past every row change before the context.
+        vec![range.clone(), effects_with(vec![1])],
+        // Not ascending.
+        vec![range.clone(), range.clone(), effects_with(vec![1, 0])],
+        // Repeated.
+        vec![range.clone(), effects_with(vec![0, 0])],
+    ] {
+        assert!(
+            matches!(
+                encode_proposal(&proposal(bad.clone())),
+                Err(FrameError::Effects(_))
+            ),
+            "encoded {bad:?}"
+        );
+        assert!(
+            matches!(decode(&unchecked_frame(&bad)), Err(FrameError::Effects(_))),
+            "decoded {bad:?}"
+        );
+    }
 }
 
 /// Label id 0 names no label: a context carrying it is refused rather than
