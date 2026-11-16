@@ -29,6 +29,11 @@ use crate::storage::{AppendNotifier, Entry, LogStore, TypeConfig};
 /// enough for replication to a follower a little behind to read from memory.
 pub(crate) const TAIL_WRITTEN_ENTRIES: usize = 4096;
 
+/// A group whose oldest append waited this long from queued to answered has
+/// its phases logged, under stage timing.
+#[cfg(feature = "stage-timing")]
+const SLOW_GROUP: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// One append waiting to be written and made durable.
 pub(crate) struct Append {
     /// Told once the entries are durable.
@@ -114,6 +119,9 @@ pub(crate) type RecordWrite =
 #[derive(Default)]
 struct Queue {
     appends: Vec<Append>,
+    /// When each of `appends` was queued, in the same order.
+    #[cfg(feature = "stage-timing")]
+    queued_at: Vec<std::time::Instant>,
     /// The latest consensus record waiting to be written: each replaces the
     /// one before it, so a burst of commits writes one record.
     record: Option<coordinode_storage::engine::core::LocalWrite>,
@@ -196,6 +204,8 @@ impl LogSync {
     pub(crate) fn submit(&self, append: Append) {
         let mut queue = self.shared.queue.lock();
         queue.appends.push(append);
+        #[cfg(feature = "stage-timing")]
+        queue.queued_at.push(std::time::Instant::now());
         self.shared.queued.notify_one();
     }
 
@@ -276,6 +286,9 @@ impl Drop for LogSync {
 impl Shared {
     fn run(&self) {
         loop {
+            // When each taken append was queued, taken with them.
+            #[cfg(feature = "stage-timing")]
+            let queued_at;
             let (appends, record, failed) = {
                 let mut queue = self.queue.lock();
                 while queue.appends.is_empty() && queue.record.is_none() && !queue.closed {
@@ -287,14 +300,27 @@ impl Shared {
                     return;
                 }
                 queue.syncing = true;
+                #[cfg(feature = "stage-timing")]
+                {
+                    queued_at = std::mem::take(&mut queue.queued_at);
+                }
                 (
                     std::mem::take(&mut queue.appends),
                     queue.record.take(),
                     queue.failed.clone(),
                 )
             };
+            // Each append's wait for the thread.
+            #[cfg(feature = "stage-timing")]
+            for &at in &queued_at {
+                coordinode_storage::stage_timing::record("raft.log_sync.queue", at);
+            }
             // The consensus record goes to its own journal, off the Raft
             // core: a write there waits out that journal's syncs too.
+            #[cfg(feature = "stage-timing")]
+            let recording = std::time::Instant::now();
+            #[cfg(feature = "stage-timing")]
+            let recorded = record.is_some();
             if let Some(record) = record
                 && failed.is_none()
                 && let Err(e) = (self.record_write)(record)
@@ -303,6 +329,10 @@ impl Shared {
                 let mut queue = self.queue.lock();
                 queue.failed.get_or_insert(e);
                 self.written_tx.send_replace(Some(u64::MAX));
+            }
+            #[cfg(feature = "stage-timing")]
+            if recorded {
+                coordinode_storage::stage_timing::record("raft.log_sync.record", recording);
             }
             if appends.is_empty() {
                 let mut queue = self.queue.lock();
@@ -317,10 +347,15 @@ impl Shared {
             metrics::histogram!("coordinode_raft_log_sync_appends").record(appends.len() as f64);
             metrics::histogram!("coordinode_raft_log_sync_proposals")
                 .record(appends.iter().map(|a| a.proposals.len()).sum::<usize>() as f64);
+            // The write to the segments, with a rotation and its seal sync.
+            #[cfg(feature = "stage-timing")]
+            let writing = std::time::Instant::now();
             let written = match failed {
                 Some(failed) => Err(failed),
                 None => self.write(&appends),
             };
+            #[cfg(feature = "stage-timing")]
+            coordinode_storage::stage_timing::record("raft.log_sync.write", writing);
             if let Ok((_, last)) = &written {
                 // Written to the kernel: a reader of the segments sees them,
                 // and a writer under a volatile `j` is answered now.
@@ -341,7 +376,34 @@ impl Shared {
             });
             metrics::histogram!("coordinode_raft_log_sync_seconds")
                 .record(started.elapsed().as_secs_f64());
+            #[cfg(feature = "stage-timing")]
+            let answering = std::time::Instant::now();
             self.answer(appends, &synced);
+            #[cfg(feature = "stage-timing")]
+            {
+                coordinode_storage::stage_timing::record("raft.log_sync.answer", answering);
+                // Each append from queued to answered.
+                for &at in &queued_at {
+                    coordinode_storage::stage_timing::record("raft.log_sync.total", at);
+                }
+                // One slow group's own phases, linked, at its boundary.
+                let answered = std::time::Instant::now();
+                if let Some(&oldest) = queued_at.iter().min()
+                    && answered.duration_since(oldest) >= SLOW_GROUP
+                {
+                    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+                    tracing::warn!(
+                        appends = queued_at.len(),
+                        total_ms = ms(answered.duration_since(oldest)),
+                        queue_ms = ms(recording.duration_since(oldest)),
+                        record_ms = ms(writing.duration_since(recording)),
+                        write_ms = ms(started.duration_since(writing)),
+                        sync_ms = ms(answering.duration_since(started)),
+                        answer_ms = ms(answered.duration_since(answering)),
+                        "slow raft log group"
+                    );
+                }
+            }
             let mut queue = self.queue.lock();
             if let Err(e) = &synced
                 && queue.failed.is_none()
