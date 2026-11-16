@@ -4313,6 +4313,7 @@ fn query_memory_limit_from_mib(text: &str) -> Result<u64, SessionSettingRefused>
 mod after_commit;
 mod blob;
 mod catalog;
+mod changes;
 mod client_ops;
 mod consumers;
 mod error;
@@ -4326,6 +4327,7 @@ mod state_cut;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use blob::{BlobId, GroupMembers, UploadedBlob};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
+pub use changes::{ChangeInterest, ChangePage};
 pub use coordinode_core::txn::command::{
     ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,
 };

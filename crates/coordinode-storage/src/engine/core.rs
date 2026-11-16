@@ -4787,6 +4787,304 @@ impl StorageEngine {
         self.cut_read_log(cut, &[dir], from, until, max_entries, budget)
     }
 
+    /// Read the committed units of this store's own journal from `from`, for
+    /// a change feed: at most `max_entries` entries, within `budget`, only of
+    /// entries applied and durable, every unit whole with all its
+    /// operations. An entry not yet applied may still be refused by its
+    /// operation binding, and one not yet durable may be lost: neither is
+    /// handed over until it is settled. The units keep their memory charged
+    /// to `budget` through the returned charge.
+    ///
+    /// The journal is held from `from` for the read only; a reader's position
+    /// does not keep it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::RetentionLost`] when `from` is no longer held;
+    /// [`StorageError::InvalidConfig`] for a store without a journal;
+    /// [`StorageError::Budget`] when the first entry does not fit the budget
+    /// on its own; a confirmed entry that cannot be read.
+    pub fn change_read<'b>(
+        &self,
+        from: u64,
+        max_entries: usize,
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::change_feed::ChangeRead,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
+        let (Some(oplog), Some(coverage)) = (&self.oplog, &self.coverage) else {
+            return Err(StorageError::InvalidConfig(
+                "the store keeps no journal".into(),
+            ));
+        };
+        let (_hold, dir, until) = {
+            let journal = oplog
+                .lock()
+                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+            let first_retained = journal.first_index();
+            if from < first_retained {
+                return Err(StorageError::RetentionLost {
+                    requested: from,
+                    first_retained,
+                });
+            }
+            let hold = crate::engine::oplog_journal::JournalHold::take(&self.journal_holds, from);
+            let until = journal.durable_below().min(coverage.applied_prefix());
+            (hold, journal.dir().to_path_buf(), until)
+        };
+        self.change_read_log(&[dir], from, until, max_entries, budget)
+    }
+
+    /// [`Self::change_read`] over the log segments in `dirs`, from `from` up
+    /// to (not including) `until`, the end of what is confirmed: the
+    /// consensus log of the group this store applies, read up to the last
+    /// entry it applied.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::change_read`].
+    pub fn change_read_log<'b>(
+        &self,
+        dirs: &[std::path::PathBuf],
+        from: u64,
+        until: u64,
+        max_entries: usize,
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::change_feed::ChangeRead,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
+        let mut units = Vec::new();
+        let (next, charge) = self.read_log_units(
+            dirs,
+            from,
+            until,
+            max_entries,
+            budget,
+            &mut units,
+            |entry, pool, units| self.change_units_of_entry(entry, pool, units),
+        )?;
+        Ok((
+            crate::engine::change_feed::ChangeRead { units, next },
+            charge,
+        ))
+    }
+
+    /// A change cursor at `position` of this store's journal, for
+    /// `interest`: where a reader that holds everything before `position`
+    /// continues, as a registered consumer's acknowledged position says.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] while the store's history is not
+    /// known.
+    pub fn change_cursor_at(
+        &self,
+        position: u64,
+        interest: crate::engine::change_feed::Interest,
+    ) -> StorageResult<crate::engine::change_feed::ChangeCursor> {
+        let history = self.cut_history()?.ok_or_else(|| {
+            StorageError::InvalidConfig("the store's history is not known yet".into())
+        })?;
+        Ok(crate::engine::change_feed::ChangeCursor::new(
+            history, interest, position,
+        ))
+    }
+
+    /// A change cursor after every entry of this store's journal applied and
+    /// durable now: a reader starting here gets what commits from now on.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::change_cursor_at`]; [`StorageError::InvalidConfig`] for a
+    /// store without a journal.
+    pub fn change_cursor_at_end(
+        &self,
+        interest: crate::engine::change_feed::Interest,
+    ) -> StorageResult<crate::engine::change_feed::ChangeCursor> {
+        let (Some(oplog), Some(coverage)) = (&self.oplog, &self.coverage) else {
+            return Err(StorageError::InvalidConfig(
+                "the store keeps no journal".into(),
+            ));
+        };
+        let end = {
+            let journal = oplog
+                .lock()
+                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+            journal.durable_below().min(coverage.applied_prefix())
+        };
+        self.change_cursor_at(end, interest)
+    }
+
+    /// Read the feed from `cursor`: the units of at most `max_entries`
+    /// journal entries, within `budget`, each whole with the events of it
+    /// the cursor's interest takes, and the cursor to continue from. A
+    /// reader's position keeps nothing of the journal: one that falls
+    /// behind what it holds is told so.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::ChangeCursor`] for a cursor of another history;
+    /// [`StorageError::RetentionLost`] when the journal no longer holds the
+    /// cursor's position; [`StorageError::ChangeFeedUnsupported`] for a unit
+    /// the feed cannot project; see [`Self::change_read`]. On any of them
+    /// nothing is handed over and the cursor stays valid.
+    pub fn read_changes<'b>(
+        &self,
+        cursor: &crate::engine::change_feed::ChangeCursor,
+        max_entries: usize,
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::change_feed::ChangeBatch,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
+        self.check_cursor_history(cursor)?;
+        let (read, charge) = self.change_read(cursor.position(), max_entries, budget)?;
+        Ok((Self::batch_of(cursor, &read)?, charge))
+    }
+
+    /// [`Self::read_changes`] over the log segments in `dirs`, up to (not
+    /// including) `until`: the consensus log of the group this store
+    /// applies, read up to the last entry it applied.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_changes`].
+    pub fn read_changes_log<'b>(
+        &self,
+        cursor: &crate::engine::change_feed::ChangeCursor,
+        dirs: &[std::path::PathBuf],
+        until: u64,
+        max_entries: usize,
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::change_feed::ChangeBatch,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
+        self.check_cursor_history(cursor)?;
+        let (read, charge) =
+            self.change_read_log(dirs, cursor.position(), until, max_entries, budget)?;
+        Ok((Self::batch_of(cursor, &read)?, charge))
+    }
+
+    /// Refuse a cursor whose positions count another log than this store's.
+    fn check_cursor_history(
+        &self,
+        cursor: &crate::engine::change_feed::ChangeCursor,
+    ) -> StorageResult<()> {
+        if self.cut_history()? != Some(cursor.history()) {
+            return Err(crate::engine::change_feed::CursorError::OtherHistory.into());
+        }
+        Ok(())
+    }
+
+    /// The batch `read` hands a reader at `cursor`.
+    fn batch_of(
+        cursor: &crate::engine::change_feed::ChangeCursor,
+        read: &crate::engine::change_feed::ChangeRead,
+    ) -> StorageResult<crate::engine::change_feed::ChangeBatch> {
+        use crate::engine::change_feed::{
+            ChangeBatch, ChangeCursor, ProjectionError, unit_changes,
+        };
+        let units = unit_changes(&read.units, cursor.interest()).map_err(|e| match e {
+            ProjectionError::Unsupported(reason) => StorageError::ChangeFeedUnsupported { reason },
+            ProjectionError::Malformed(reason) => StorageError::Serialization(reason),
+        })?;
+        Ok(ChangeBatch {
+            units,
+            cursor: ChangeCursor::new(cursor.history(), cursor.interest().clone(), read.next),
+        })
+    }
+
+    /// The units of one entry for a change feed, read in place and appended
+    /// to `units`, each decoded within what is left of `pool`. A data change
+    /// recorded outside a unit carries no effect context and cannot be
+    /// projected, so it fails the read rather than vanish from the feed.
+    fn change_units_of_entry(
+        &self,
+        entry: &crate::oplog::OplogEntryRef<'_>,
+        pool: &mut crate::engine::fixed_cut::EntryPool,
+        units: &mut Vec<crate::engine::change_feed::ChangeUnit>,
+    ) -> Result<(), EntryOutcome> {
+        use crate::oplog::OplogOpRef;
+        use coordinode_core::txn::operation::LogPosition;
+        use coordinode_core::txn::proposal::Mutation;
+        let unsupported = |what: &str| {
+            EntryOutcome::Failed(StorageError::ChangeFeedUnsupported {
+                reason: format!("entry {} carries {what}", entry.index),
+            })
+        };
+        let mut sub = 0u32;
+        for op in &entry.ops {
+            let frame = match op {
+                OplogOpRef::Unit { frame } => *frame,
+                OplogOpRef::Insert { .. }
+                | OplogOpRef::Delete { .. }
+                | OplogOpRef::Merge { .. }
+                | OplogOpRef::RemoveRange { .. } => return Err(unsupported("a raw row change")),
+                OplogOpRef::ColumnarInsert { .. } => return Err(unsupported("a columnar insert")),
+                // Index entries and framing: nothing a feed projects.
+                OplogOpRef::Derive { .. }
+                | OplogOpRef::Noop
+                | OplogOpRef::RaftTruncation { .. }
+                | OplogOpRef::RaftEntry { .. } => continue,
+            };
+            let position = LogPosition {
+                index: entry.index,
+                sub,
+            };
+            sub = sub.checked_add(1).ok_or_else(|| {
+                EntryOutcome::Failed(StorageError::Serialization(format!(
+                    "entry {} carries over 2^32 units",
+                    entry.index
+                )))
+            })?;
+            let (unit, expanded) = match coordinode_core::txn::frame::decode_proposal_rows(
+                frame,
+                &pool.decode_limits(),
+            ) {
+                Ok(decoded) => decoded,
+                Err(coordinode_core::txn::frame::FrameError::OverLimit { .. }) => {
+                    return Err(EntryOutcome::NoRoom);
+                }
+                Err(e) => return Err(EntryOutcome::Failed(e.into())),
+            };
+            let held = (unit.mutations.capacity() * core::mem::size_of::<Mutation>()) as u64
+                + expanded as u64;
+            if !pool.retain(held) {
+                return Err(EntryOutcome::NoRoom);
+            }
+            let bound = unit
+                .mutations
+                .iter()
+                .any(|m| matches!(m, Mutation::Operation(_)));
+            let refused = bound
+                && crate::engine::operations::unit_skipped(self, position)
+                    .map_err(EntryOutcome::Failed)?;
+            let mut mutations = unit.mutations;
+            if refused {
+                mutations.clear();
+            }
+            if units.len() == units.capacity() {
+                let more = units.capacity().max(4);
+                if !pool.grow(
+                    (more * core::mem::size_of::<crate::engine::change_feed::ChangeUnit>()) as u64,
+                ) {
+                    return Err(EntryOutcome::NoRoom);
+                }
+                units.reserve_exact(more);
+            }
+            units.push(crate::engine::change_feed::ChangeUnit {
+                position,
+                commit_ts: unit.commit_ts.as_raw(),
+                refused,
+                mutations,
+            });
+        }
+        Ok(())
+    }
+
     /// Read `cut`'s continuation from the log segments in `dirs`, from
     /// `from` up to (not including) `until`, the end of what is confirmed:
     /// at most `max_entries` entries, within `budget`. The units handed over
@@ -4820,11 +5118,51 @@ impl StorageEngine {
         crate::engine::fixed_cut::CutRead,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
+        self.check_cut_history(cut)?;
+        let mut units = Vec::new();
+        let (next, charge) = self.read_log_units(
+            dirs,
+            from,
+            until,
+            max_entries,
+            budget,
+            &mut units,
+            |entry, pool, units| self.units_of_entry(cut, entry, pool, units),
+        )?;
+        Ok((crate::engine::fixed_cut::CutRead { units, next }, charge))
+    }
+
+    /// Read the log segments in `dirs` from `from` up to (not including)
+    /// `until`: at most `max_entries` entries, within `budget`, each entry
+    /// turned into units by `units_of` and appended to `units`. Returns the
+    /// position after the last entry read and the charge the units keep.
+    ///
+    /// Frames are read one at a time, each frame's length checked against
+    /// the budget before its payload is read and each unit decoded within
+    /// what is left of it, so the read holds no more than it hands over plus
+    /// one frame. A read stops before an entry that does not fit, which a
+    /// later read with more room takes. Every confirmed entry is either
+    /// handed over or accounted for: one the log no longer holds is
+    /// [`StorageError::RetentionLost`], one it holds but cannot read an
+    /// error, never an empty read as if nothing were there yet.
+    #[allow(clippy::too_many_arguments)]
+    fn read_log_units<'b, U>(
+        &self,
+        dirs: &[std::path::PathBuf],
+        from: u64,
+        until: u64,
+        max_entries: usize,
+        budget: &'b coordinode_core::budget::QueryBudget,
+        units: &mut Vec<U>,
+        mut units_of: impl FnMut(
+            &crate::oplog::OplogEntryRef<'_>,
+            &mut crate::engine::fixed_cut::EntryPool,
+            &mut Vec<U>,
+        ) -> Result<(), EntryOutcome>,
+    ) -> StorageResult<(u64, coordinode_core::budget::MemoryCharge<'b>)> {
         use crate::engine::fixed_cut::EntryPool;
         use crate::oplog::segment::{FRAME_CURSOR_BUFFER, FrameCursor, Peeked};
-        self.check_cut_history(cut)?;
         let mut charge = budget.empty_charge();
-        let mut units: Vec<crate::engine::fixed_cut::CutUnit> = Vec::new();
         let mut next = from;
         let mut taken = 0usize;
         let stop = || coordinode_core::budget::BudgetStop::Memory {
@@ -4907,9 +5245,7 @@ impl StorageEngine {
                 let start = units.len();
                 let outcome = match frames.read_payload()? {
                     Some(payload) => match crate::oplog::OplogEntryRef::decode(&payload) {
-                        Ok(entry) if entry.index == index => {
-                            self.units_of_entry(cut, &entry, &mut pool, &mut units)
-                        }
+                        Ok(entry) if entry.index == index => units_of(&entry, &mut pool, units),
                         _ => Err(EntryOutcome::Unreadable),
                     },
                     None => Err(EntryOutcome::Unreadable),
@@ -4960,7 +5296,7 @@ impl StorageEngine {
             }
         }
         charge.shrink(reader);
-        Ok((crate::engine::fixed_cut::CutRead { units, next }, charge))
+        Ok((next, charge))
     }
 
     /// One page of `cut`'s view: the rows of its scope in key order, past

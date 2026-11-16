@@ -130,6 +130,48 @@ pub enum ProjectionError {
     Malformed(String),
 }
 
+/// One committed unit of the journal as a change feed reads it: where it is,
+/// its own commit timestamp and its operations as a reader of rows decodes
+/// them, effect context included.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeUnit {
+    /// The journal entry and the unit's place in it.
+    pub position: coordinode_core::txn::operation::LogPosition,
+    /// The unit's own commit timestamp, not its entry's.
+    pub commit_ts: u64,
+    /// Whether its operation binding refused it: it took no effect and has
+    /// no events.
+    pub refused: bool,
+    /// Its operations; empty when it was refused.
+    pub mutations: Vec<Mutation>,
+}
+
+impl ChangeUnit {
+    /// The unit's logical events, in canonical order; none for a refused
+    /// unit.
+    ///
+    /// # Errors
+    ///
+    /// As [`project_unit`].
+    pub fn events(&self) -> Result<Vec<LogicalEvent<'_>>, ProjectionError> {
+        if self.refused {
+            return Ok(Vec::new());
+        }
+        project_unit(&self.mutations)
+    }
+}
+
+/// A read of the journal for a change feed: its units in log order, and the
+/// position the next read starts at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeRead {
+    /// The units of the entries read, in log order.
+    pub units: Vec<ChangeUnit>,
+    /// The position after the last entry read; where the read started when
+    /// the journal held nothing more yet.
+    pub next: u64,
+}
+
 /// Most keys one run of point deletes may stand for: no unit holds more
 /// operations than a frame does.
 const MAX_RUN_KEYS: u64 = coordinode_core::txn::frame::DecodeLimits::DEFAULT.max_ops as u64;
@@ -604,6 +646,425 @@ fn run_keys(start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>, ProjectionError> {
         }
     }
     Ok(keys)
+}
+
+/// What a reader of the feed is interested in: nodes routed by some labels,
+/// relationships of some types. `None` takes every one of that kind; an
+/// empty list takes none.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Interest {
+    labels: Option<Vec<LabelId>>,
+    edge_types: Option<Vec<Vec<u8>>>,
+}
+
+impl Interest {
+    /// Every event.
+    #[must_use]
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Node events routed by any of `labels` before or after them, and
+    /// relationship events of any of `edge_types`; `None` for either takes
+    /// every event of that kind.
+    #[must_use]
+    pub fn new(labels: Option<Vec<LabelId>>, edge_types: Option<Vec<Vec<u8>>>) -> Self {
+        let labels = labels.map(|mut l| {
+            l.sort_unstable();
+            l.dedup();
+            l
+        });
+        let edge_types = edge_types.map(|mut t| {
+            t.sort_unstable();
+            t.dedup();
+            t
+        });
+        Self { labels, edge_types }
+    }
+
+    /// How `event` reaches this reader: `None` when it does not.
+    #[must_use]
+    pub fn delivery(&self, event: &LogicalEvent<'_>) -> Option<Delivery> {
+        if let Some(routing) = &event.routing {
+            let delivery = match &self.labels {
+                None => Delivery::Apply,
+                Some(labels) => routing.delivery(|l| labels.binary_search(&l).is_ok()),
+            };
+            return (delivery != Delivery::None).then_some(delivery);
+        }
+        let edge_type = match &event.target {
+            Target::Relationship { edge_type, .. } => *edge_type,
+            Target::RelationshipProperties(key) | Target::RelationshipInstance(key) => {
+                edgeprop_key(key).map_or(&[][..], |((edge_type, _, _), _)| edge_type)
+            }
+            Target::Node(_) => return Some(Delivery::Apply),
+        };
+        let wanted = match &self.edge_types {
+            None => true,
+            Some(types) => types.iter().any(|t| t.as_slice() == edge_type),
+        };
+        wanted.then_some(Delivery::Apply)
+    }
+
+    /// The bytes a cursor binds it by: equal interests encode equally.
+    fn encode(&self, out: &mut Vec<u8>) {
+        match &self.labels {
+            None => out.push(0),
+            Some(labels) => {
+                out.push(1);
+                out.extend_from_slice(&(labels.len() as u32).to_be_bytes());
+                for label in labels {
+                    out.extend_from_slice(&label.get().to_be_bytes());
+                }
+            }
+        }
+        match &self.edge_types {
+            None => out.push(0),
+            Some(types) => {
+                out.push(1);
+                out.extend_from_slice(&(types.len() as u32).to_be_bytes());
+                for name in types {
+                    out.extend_from_slice(&(name.len() as u32).to_be_bytes());
+                    out.extend_from_slice(name);
+                }
+            }
+        }
+    }
+}
+
+/// Why a cursor is not one this reader can continue from.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CursorError {
+    /// Bytes no build wrote as a cursor, or of a layout this build does not
+    /// read.
+    #[error("not a change cursor this build reads: {0}")]
+    Malformed(&'static str),
+    /// A cursor of another history: its positions count another log.
+    #[error("the cursor belongs to another history")]
+    OtherHistory,
+    /// A cursor made under another projection interpretation.
+    #[error(
+        "the cursor was made under interpretation {0}, this build reads {EFFECTS_INTERPRETATION}"
+    )]
+    OtherInterpretation(u32),
+}
+
+/// Layout of the cursors this build writes.
+const CURSOR_VERSION: u8 = 1;
+const HISTORY_JOURNAL: u8 = 0;
+const HISTORY_GROUP: u8 = 1;
+
+/// Where a reader of the feed continues: the history it reads, the
+/// interpretation and interest it read under, and the next journal entry.
+/// Opaque to the reader; saved and handed back as bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeCursor {
+    history: crate::engine::fixed_cut::CutHistory,
+    interest: Interest,
+    next: u64,
+}
+
+impl ChangeCursor {
+    /// A cursor at `next` in `history`, for `interest`.
+    pub(crate) fn new(
+        history: crate::engine::fixed_cut::CutHistory,
+        interest: Interest,
+        next: u64,
+    ) -> Self {
+        Self {
+            history,
+            interest,
+            next,
+        }
+    }
+
+    /// The journal entry the next read starts at: the position a flat
+    /// consumer acknowledges.
+    #[must_use]
+    pub fn position(&self) -> u64 {
+        self.next
+    }
+
+    /// The history the cursor reads.
+    #[must_use]
+    pub fn history(&self) -> crate::engine::fixed_cut::CutHistory {
+        self.history
+    }
+
+    /// The interest the cursor reads for.
+    #[must_use]
+    pub fn interest(&self) -> &Interest {
+        &self.interest
+    }
+
+    /// The cursor's bytes, to save and hand back.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        use crate::engine::fixed_cut::CutHistory;
+        let mut out = vec![CURSOR_VERSION];
+        match self.history {
+            CutHistory::Journal(deployment) => {
+                out.push(HISTORY_JOURNAL);
+                out.extend_from_slice(&deployment.0);
+            }
+            CutHistory::Group(history) => {
+                out.push(HISTORY_GROUP);
+                out.extend_from_slice(&history.deployment.0);
+                out.extend_from_slice(&history.group.0.to_be_bytes());
+            }
+        }
+        out.extend_from_slice(&EFFECTS_INTERPRETATION.to_be_bytes());
+        out.extend_from_slice(&self.next.to_be_bytes());
+        self.interest.encode(&mut out);
+        out
+    }
+
+    /// Read back a cursor's bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`CursorError::Malformed`] for bytes no cursor of this layout has;
+    /// [`CursorError::OtherInterpretation`] for one made under another
+    /// interpretation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CursorError> {
+        use crate::engine::fixed_cut::CutHistory;
+        use coordinode_core::group::{DeploymentId, GroupId};
+        let mut r = CursorReader(bytes);
+        if r.u8()? != CURSOR_VERSION {
+            return Err(CursorError::Malformed("an unknown layout version"));
+        }
+        let history = match r.u8()? {
+            HISTORY_JOURNAL => CutHistory::Journal(DeploymentId(r.array()?)),
+            HISTORY_GROUP => {
+                let deployment = DeploymentId(r.array()?);
+                let group = GroupId(u64::from_be_bytes(r.array()?));
+                CutHistory::Group(coordinode_core::txn::read_concern::HistoryId {
+                    deployment,
+                    group,
+                })
+            }
+            _ => return Err(CursorError::Malformed("an unknown history kind")),
+        };
+        let interpretation = u32::from_be_bytes(r.array()?);
+        if interpretation != EFFECTS_INTERPRETATION {
+            return Err(CursorError::OtherInterpretation(interpretation));
+        }
+        let next = u64::from_be_bytes(r.array()?);
+        let labels = match r.u8()? {
+            0 => None,
+            1 => {
+                let count = r.count(4)?;
+                let mut labels = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let raw = u32::from_be_bytes(r.array()?);
+                    labels.push(LabelId::new(raw).ok_or(CursorError::Malformed("label id 0"))?);
+                }
+                Some(labels)
+            }
+            _ => return Err(CursorError::Malformed("an unknown label interest")),
+        };
+        let edge_types = match r.u8()? {
+            0 => None,
+            1 => {
+                let count = r.count(4)?;
+                let mut types = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let len = r.count(1)?;
+                    types.push(r.take(len)?.to_vec());
+                }
+                Some(types)
+            }
+            _ => return Err(CursorError::Malformed("an unknown type interest")),
+        };
+        if !r.0.is_empty() {
+            return Err(CursorError::Malformed("bytes after the cursor"));
+        }
+        let interest = Interest::new(labels.clone(), edge_types.clone());
+        if interest.labels != labels || interest.edge_types != edge_types {
+            return Err(CursorError::Malformed("an interest not in canonical order"));
+        }
+        Ok(Self {
+            history,
+            interest,
+            next,
+        })
+    }
+}
+
+/// A cursor's bytes, read from the front.
+struct CursorReader<'a>(&'a [u8]);
+
+impl<'a> CursorReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], CursorError> {
+        let (head, rest) = self
+            .0
+            .split_at_checked(n)
+            .ok_or(CursorError::Malformed("a truncated cursor"))?;
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn u8(&mut self) -> Result<u8, CursorError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], CursorError> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.take(N)?);
+        Ok(out)
+    }
+
+    /// A count of items at least `min` bytes each, refused when the cursor
+    /// cannot hold that many.
+    fn count(&mut self, min: usize) -> Result<usize, CursorError> {
+        let count = u32::from_be_bytes(self.array()?) as usize;
+        if count
+            .checked_mul(min)
+            .is_none_or(|bytes| bytes > self.0.len())
+        {
+            return Err(CursorError::Malformed("a count the cursor cannot hold"));
+        }
+        Ok(count)
+    }
+}
+
+/// An event's identity: the unit it belongs to and its ordinal in the unit's
+/// projection. The same in every reader's delivery of it, whatever each
+/// filtered out, and in every read of it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EventId {
+    /// The unit's journal entry and place in it.
+    pub position: coordinode_core::txn::operation::LogPosition,
+    /// The event's place in the unit's projection.
+    pub ordinal: u32,
+}
+
+/// One event as a reader receives it: owned, with its identity and how it
+/// reaches the reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeEvent {
+    /// Its identity in its history.
+    pub id: EventId,
+    /// What it does.
+    pub action: Action,
+    /// What it does it to.
+    pub target: OwnedTarget,
+    /// The replacement for a put, the delta for a patch.
+    pub payload: Option<Vec<u8>>,
+    /// How it reaches this reader: enter, apply or leave its scope.
+    pub delivery: Delivery,
+    /// For a node, the labels it stored before and after.
+    pub labels: Option<(Vec<LabelId>, Vec<LabelId>)>,
+}
+
+/// [`Target`] with its bytes owned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedTarget {
+    /// A node's record or a temporal node's version: its node key.
+    Node(Vec<u8>),
+    /// A relationship's presence.
+    Relationship {
+        /// The relationship type's name.
+        edge_type: Vec<u8>,
+        /// The source node's id.
+        source: u64,
+        /// The target node's id.
+        target: u64,
+    },
+    /// The properties of a relationship: its edge property key.
+    RelationshipProperties(Vec<u8>),
+    /// A relationship's version or discriminated instance: its edge property
+    /// key.
+    RelationshipInstance(Vec<u8>),
+}
+
+impl From<&Target<'_>> for OwnedTarget {
+    fn from(target: &Target<'_>) -> Self {
+        match target {
+            Target::Node(key) => Self::Node(key.to_vec()),
+            Target::Relationship {
+                edge_type,
+                source,
+                target,
+            } => Self::Relationship {
+                edge_type: edge_type.to_vec(),
+                source: *source,
+                target: *target,
+            },
+            Target::RelationshipProperties(key) => Self::RelationshipProperties(key.to_vec()),
+            Target::RelationshipInstance(key) => Self::RelationshipInstance(key.to_vec()),
+        }
+    }
+}
+
+/// One committed unit as a reader receives it: every event of it the
+/// reader's interest takes, and the count of events its projection holds,
+/// so the reader can tell it got all of the unit it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitChanges {
+    /// The unit's journal entry and place in it.
+    pub position: coordinode_core::txn::operation::LogPosition,
+    /// The unit's commit timestamp.
+    pub commit_ts: u64,
+    /// The events the reader's interest takes, in ordinal order.
+    pub events: Vec<ChangeEvent>,
+    /// How many events the unit's projection holds, taken or not.
+    pub projected: u32,
+}
+
+/// A read of the feed: whole units in log order, and the cursor the next
+/// read continues from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeBatch {
+    /// The units read, each complete; a unit none of whose events the
+    /// reader takes is here too, with no events.
+    pub units: Vec<UnitChanges>,
+    /// Where the next read continues.
+    pub cursor: ChangeCursor,
+}
+
+/// The changes of `units` that `interest` takes.
+///
+/// # Errors
+///
+/// As [`project_unit`].
+pub(crate) fn unit_changes(
+    units: &[ChangeUnit],
+    interest: &Interest,
+) -> Result<Vec<UnitChanges>, ProjectionError> {
+    let mut out = Vec::with_capacity(units.len());
+    for unit in units {
+        let events = unit.events()?;
+        let projected = u32::try_from(events.len())
+            .map_err(|_| ProjectionError::Malformed("the unit projects over 2^32 events".into()))?;
+        let taken = events
+            .iter()
+            .filter_map(|event| {
+                let delivery = interest.delivery(event)?;
+                Some(ChangeEvent {
+                    id: EventId {
+                        position: unit.position,
+                        ordinal: event.ordinal,
+                    },
+                    action: event.action,
+                    target: OwnedTarget::from(&event.target),
+                    payload: event.payload.map(<[u8]>::to_vec),
+                    delivery,
+                    labels: event
+                        .routing
+                        .as_ref()
+                        .map(|r| (r.before.to_vec(), r.after.to_vec())),
+                })
+            })
+            .collect();
+        out.push(UnitChanges {
+            position: unit.position,
+            commit_ts: unit.commit_ts,
+            events: taken,
+            projected,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

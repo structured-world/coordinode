@@ -80,6 +80,16 @@ pub mod consumer {
     pub use coordinode_storage::engine::fixed_cut::CutUnit;
 }
 
+/// Committed changes as logical events ([`Database::read_changes`]): the
+/// cursor a reader keeps, the units and events it receives.
+pub mod changes {
+    pub use crate::db::{ChangeInterest, ChangePage};
+    pub use coordinode_storage::engine::change_feed::{
+        Action, ChangeBatch, ChangeCursor, ChangeEvent, CursorError, Delivery, EventId,
+        OwnedTarget, UnitChanges,
+    };
+}
+
 /// Every Rust snippet of the embedded guide, compiled as a doctest against
 /// this crate so the guide cannot advertise code that does not build. The
 /// replicated snippets need the feature; the documentation suite runs with

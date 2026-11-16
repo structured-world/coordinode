@@ -267,6 +267,20 @@ pub enum StorageError {
         reason: String,
     },
 
+    /// The change feed cannot read an entry of the journal: a data change
+    /// recorded without the unit context that says what it means. Nothing
+    /// is handed over and the reader stays where it was.
+    #[error("the change feed cannot read this: {reason}")]
+    ChangeFeedUnsupported {
+        /// What is not supported.
+        reason: String,
+    },
+
+    /// A change cursor this store cannot continue from: malformed, of
+    /// another history, or of another interpretation.
+    #[error(transparent)]
+    ChangeCursor(#[from] crate::engine::change_feed::CursorError),
+
     /// No cut of the store can be shown complete for a whole-store capture;
     /// nothing is captured.
     #[error("the store cannot be captured: {reason}")]

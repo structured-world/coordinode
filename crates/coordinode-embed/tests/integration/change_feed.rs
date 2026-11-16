@@ -1,0 +1,336 @@
+//! Committed changes read as logical events through the public reader:
+//! puts, patches and removals reproduce the source, label scopes are entered
+//! and left by the labels a node had and has, relationships are told apart
+//! from their physical forms, and an event keeps its identity across readers
+//! and reopens.
+
+#![allow(clippy::expect_used, clippy::panic)]
+
+use coordinode_core::budget::QueryBudget;
+use coordinode_embed::Database;
+use coordinode_embed::changes::{
+    Action, ChangeCursor, ChangeEvent, ChangeInterest, Delivery, OwnedTarget, UnitChanges,
+};
+
+fn open(dir: &std::path::Path) -> Database {
+    let mut db = Database::open(dir).expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Person WITH (name: STRING)",
+        "CREATE NODE TYPE Org WITH (name: STRING)",
+        "CREATE LABEL Admin AUXILIARY",
+    ] {
+        db.execute_cypher(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    db
+}
+
+fn run(db: &mut Database, query: &str) {
+    db.execute_cypher(query)
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+}
+
+fn interest(labels: Option<&[&str]>, edge_types: Option<&[&str]>) -> ChangeInterest {
+    ChangeInterest {
+        labels: labels.map(|l| l.iter().map(|s| (*s).to_string()).collect()),
+        edge_types: edge_types.map(|t| t.iter().map(|s| (*s).to_string()).collect()),
+    }
+}
+
+/// Every unit after `cursor` up to the end of what is committed, the cursor
+/// moved past them.
+fn read_all(db: &Database, cursor: &mut ChangeCursor) -> Vec<UnitChanges> {
+    let budget = QueryBudget::new(1 << 24);
+    let mut units = Vec::new();
+    loop {
+        let page = db.read_changes(cursor, 8, &budget).expect("read");
+        let next = page.batch.cursor.clone();
+        let moved = next.position() != cursor.position();
+        units.extend(page.batch.units);
+        *cursor = next;
+        if !moved {
+            return units;
+        }
+    }
+}
+
+/// The events of `units`, in order.
+fn events(units: &[UnitChanges]) -> Vec<ChangeEvent> {
+    units.iter().flat_map(|u| u.events.clone()).collect()
+}
+
+/// Each node event's action and delivery, in order.
+fn node_deliveries(events: &[ChangeEvent]) -> Vec<(Action, Delivery)> {
+    events
+        .iter()
+        .filter(|e| matches!(e.target, OwnedTarget::Node(_)))
+        .map(|e| (e.action, e.delivery))
+        .collect()
+}
+
+/// A node written, changed and removed reaches a reader of its label as a
+/// put that enters the scope, a put that applies and a removal that leaves:
+/// the last write states the record, never whether it was new.
+#[test]
+fn a_node_is_put_changed_and_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    let mut cursor = db
+        .change_cursor(&interest(Some(&["Person"]), None))
+        .expect("cursor");
+    run(&mut db, "CREATE (:Person {name: 'a'}), (:Org {name: 'o'})");
+    run(&mut db, "MATCH (n:Person) SET n.name = 'b'");
+    run(&mut db, "MATCH (n:Person) REMOVE n.name");
+    run(&mut db, "MATCH (n:Person) DELETE n");
+    let events = events(&read_all(&db, &mut cursor));
+    assert_eq!(
+        node_deliveries(&events),
+        vec![
+            (Action::Put, Delivery::Apply),
+            (Action::Put, Delivery::Apply),
+            (Action::Put, Delivery::Apply),
+            (Action::Remove, Delivery::Leave),
+        ],
+        "{events:?}"
+    );
+    // The Org node is not in the scope; the payloads are the records written.
+    assert!(events.iter().all(|e| e.labels.as_ref().is_some()));
+    assert!(events[..3].iter().all(|e| e.payload.is_some()));
+    assert!(events[3].payload.is_none());
+}
+
+/// A removal reaches the readers of every label the node stored, from a
+/// cursor saved before and read back after a reopen: what routes it is the
+/// unit's own, not a read of a row the deletion removed.
+#[test]
+fn a_removed_multi_labelled_node_reaches_each_label_after_a_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let saved = {
+        let mut db = open(dir.path());
+        run(&mut db, "CREATE (:Person:Admin {name: 'a'})");
+        let saved = db
+            .change_cursor(&interest(Some(&["Admin"]), None))
+            .expect("cursor")
+            .to_bytes();
+        run(&mut db, "MATCH (n:Admin) DETACH DELETE n");
+        saved
+    };
+    let db = Database::open(dir.path()).expect("reopen");
+    let mut cursor = ChangeCursor::from_bytes(&saved).expect("cursor bytes");
+    let events = events(&read_all(&db, &mut cursor));
+    assert_eq!(
+        node_deliveries(&events),
+        vec![(Action::Remove, Delivery::Leave)],
+        "{events:?}"
+    );
+}
+
+/// RETYPE and an auxiliary label: a reader of the old type sees the node
+/// leave, a reader of the new type sees it enter with the written record, a
+/// reader of both gets the one event once, and removing the auxiliary label
+/// leaves its scope without touching the type's.
+#[test]
+fn a_retype_and_an_auxiliary_label_move_the_node_between_scopes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    run(&mut db, "CREATE (:Person:Admin {name: 'a'})");
+    let mut old = db
+        .change_cursor(&interest(Some(&["Person"]), None))
+        .expect("cursor");
+    let mut new = db
+        .change_cursor(&interest(Some(&["Org"]), None))
+        .expect("cursor");
+    let mut both = db
+        .change_cursor(&interest(Some(&["Person", "Org"]), None))
+        .expect("cursor");
+    let mut admin = db
+        .change_cursor(&interest(Some(&["Admin"]), None))
+        .expect("cursor");
+    run(
+        &mut db,
+        "MATCH (n:Person) RETYPE NODE n TO Org SET n.name = 'o'",
+    );
+    run(&mut db, "MATCH (n:Org) REMOVE n:Admin");
+
+    let old = events(&read_all(&db, &mut old));
+    let new = events(&read_all(&db, &mut new));
+    let both = events(&read_all(&db, &mut both));
+    let admin = events(&read_all(&db, &mut admin));
+    assert_eq!(node_deliveries(&old), vec![(Action::Put, Delivery::Leave)]);
+    assert_eq!(
+        node_deliveries(&new),
+        vec![
+            (Action::Put, Delivery::Enter),
+            (Action::Put, Delivery::Apply)
+        ]
+    );
+    assert_eq!(
+        node_deliveries(&both),
+        vec![
+            (Action::Put, Delivery::Apply),
+            (Action::Put, Delivery::Apply)
+        ]
+    );
+    assert_eq!(
+        node_deliveries(&admin),
+        vec![
+            (Action::Put, Delivery::Apply),
+            (Action::Put, Delivery::Leave)
+        ]
+    );
+    // The retype is one source event, the same for every reader of it.
+    assert_eq!(old[0].id, new[0].id);
+    assert_eq!(old[0].id, both[0].id);
+    assert_eq!(old[0].id, admin[0].id);
+    assert_eq!(new[0].payload, both[0].payload);
+}
+
+/// The relationship events of each write, by type.
+fn relationship_actions(units: &[UnitChanges]) -> Vec<Vec<(Action, &'static str)>> {
+    units
+        .iter()
+        .filter(|u| !u.events.is_empty())
+        .map(|u| {
+            u.events
+                .iter()
+                .map(|e| {
+                    let kind = match &e.target {
+                        OwnedTarget::Relationship { .. } => "presence",
+                        OwnedTarget::RelationshipProperties(_) => "properties",
+                        OwnedTarget::RelationshipInstance(_) => "instance",
+                        OwnedTarget::Node(_) => "node",
+                    };
+                    (e.action, kind)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// A relationship without properties is one presence event; setting a
+/// property puts the properties; removing its last property clears them
+/// while the relationship stays; deleting it is one removal, its property
+/// record with it; reverse adjacency adds nothing to any of them.
+#[test]
+fn relationship_presence_and_properties_are_distinct_effects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    run(
+        &mut db,
+        "CREATE (:Person {name: 'a'}), (:Person {name: 'b'})",
+    );
+    let mut cursor = db
+        .change_cursor(&interest(Some(&[]), Some(&["KNOWS"])))
+        .expect("cursor");
+    run(
+        &mut db,
+        "MATCH (a:Person {name: 'a'}), (b:Person {name: 'b'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(&mut db, "MATCH ()-[r:KNOWS]->() SET r.since = 1");
+    run(&mut db, "MATCH ()-[r:KNOWS]->() REMOVE r.since");
+    run(&mut db, "MATCH ()-[r:KNOWS]->() DELETE r");
+    let units = read_all(&db, &mut cursor);
+    assert_eq!(
+        relationship_actions(&units),
+        vec![
+            vec![(Action::Put, "presence")],
+            vec![(Action::Put, "properties")],
+            vec![(Action::Remove, "properties")],
+            vec![(Action::Remove, "presence")],
+        ],
+        "{units:?}"
+    );
+}
+
+/// DETACH DELETE of a node with an outgoing relationship and a self-loop
+/// removes each relationship once, though the node's own lists go whole and
+/// name none of them; the peer that stays is unaffected.
+#[test]
+fn detach_delete_removes_each_relationship_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    run(
+        &mut db,
+        "CREATE (a:Person {name: 'a'})-[:KNOWS]->(:Person {name: 'b'}), (a)-[:KNOWS]->(a)",
+    );
+    let mut cursor = db
+        .change_cursor(&interest(Some(&["Person"]), Some(&["KNOWS"])))
+        .expect("cursor");
+    run(&mut db, "MATCH (a:Person {name: 'a'}) DETACH DELETE a");
+    let events = events(&read_all(&db, &mut cursor));
+    let removed: Vec<(u64, u64)> = events
+        .iter()
+        .filter_map(|e| match &e.target {
+            OwnedTarget::Relationship { source, target, .. } => {
+                assert_eq!(e.action, Action::Remove);
+                Some((*source, *target))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(removed.len(), 2, "{events:?}");
+    assert!(
+        removed.iter().any(|(s, t)| s == t),
+        "the self-loop: {removed:?}"
+    );
+    assert_eq!(
+        node_deliveries(&events),
+        vec![(Action::Remove, Delivery::Leave)]
+    );
+}
+
+/// Readers with overlapping interests get a common event under one
+/// identity, and a reader reading again gets the same identities: ordinals
+/// number the unit before any reader filters it. Every unit a reader passes
+/// is in its batch, an empty one too, with the count of its projection.
+#[test]
+fn identities_hold_across_interests_and_reads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    let start_all = db.change_cursor(&ChangeInterest::default()).expect("all");
+    // Org nodes only: no relationship type.
+    let start_org = db
+        .change_cursor(&interest(Some(&["Org"]), Some(&[])))
+        .expect("org");
+    run(
+        &mut db,
+        "CREATE (:Person {name: 'p'})-[:KNOWS]->(:Org {name: 'o'})",
+    );
+    let all = read_all(&db, &mut start_all.clone());
+    let again = read_all(&db, &mut start_all.clone());
+    let org = read_all(&db, &mut start_org.clone());
+    assert_eq!(all, again);
+    let org_events = events(&org);
+    assert_eq!(org_events.len(), 1, "{org:?}");
+    assert!(events(&all).iter().any(|e| e.id == org_events[0].id));
+    let unit = org
+        .iter()
+        .find(|u| !u.events.is_empty())
+        .expect("the write's unit");
+    assert!(unit.projected > 1, "{unit:?}");
+    assert_eq!(
+        org.iter().map(|u| u.position).collect::<Vec<_>>(),
+        all.iter().map(|u| u.position).collect::<Vec<_>>()
+    );
+}
+
+/// A label a type implies is refused as an interest rather than followed
+/// by stored labels only, which would miss every node carrying it by
+/// implication.
+#[test]
+fn an_implied_label_is_refused_as_an_interest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    run(
+        &mut db,
+        "CREATE NODE TYPE Manager IMPLIES (Person) WITH (name: STRING)",
+    );
+    let refused = db.change_cursor(&interest(Some(&["Person"]), None));
+    assert!(
+        matches!(
+            refused,
+            Err(coordinode_embed::DatabaseError::Unsupported(_))
+        ),
+        "{refused:?}"
+    );
+}

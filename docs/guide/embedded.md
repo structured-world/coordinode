@@ -358,6 +358,81 @@ no async runtime is needed. A database kept in memory, and a member of a
 replicated group (whose history is the group's log, not a journal of its
 own), refuse registrations as `Unsupported`.
 
+### Reading changes as events
+
+`read_changes` hands a reader what was committed after its cursor as logical
+events, unit by unit (a unit is one committed transaction). Each event is a
+`Put` (the record or properties written, as the payload), a `Patch` (a
+document delta) or a `Remove` of one target: a node, a relationship's
+presence, a relationship's properties, or one version or discriminated
+instance of a relationship. A put states what was written, not whether the
+target was new; a node or relationship is never read back to tell. The
+reverse side of a relationship, index entries and history rows are not
+events of their own.
+
+A `ChangeInterest` names the labels whose nodes the reader follows and the
+relationship types it follows (`None` takes all of that kind, an empty list
+none). A node event reaches the reader when the node carries one of its
+labels before or after the change, with its `delivery`: `Enter` (it joins the
+scope, with the record written), `Apply`, or `Leave` (deleted, relabelled or
+retyped out of the scope). The labels before a deletion or relabelling come
+from the transaction itself, so a removal reaches its readers after the
+deleted record is gone. A reader of several labels gets each event once.
+A label some type implies is refused as an interest for now.
+
+Each unit comes whole, with its position and commit timestamp, the events
+the interest takes and `projected`, the number of events the unit has in
+all; a unit with none of the reader's events is in the batch too. An event's
+`id` (unit position and ordinal) is the same for every reader and every read
+of it, so a reader that delivers twice can drop the repeat by it. The
+cursor is opaque bytes to save with what the reader built (`to_bytes`,
+`ChangeCursor::from_bytes`); it binds the history, the event interpretation
+and the interest, and holds nothing of the journal. Its `position` is the
+journal position a registered consumer acknowledges.
+
+```rust,no_run
+use coordinode_core::budget::QueryBudget;
+use coordinode_embed::Database;
+use coordinode_embed::changes::{ChangeCursor, ChangeInterest};
+
+# fn main() -> Result<(), coordinode_embed::DatabaseError> {
+let db = Database::open("/var/lib/myapp/graph")?;
+let interest = ChangeInterest {
+    labels: Some(vec!["Person".into()]),
+    edge_types: Some(vec!["KNOWS".into()]),
+};
+let mut cursor = db.change_cursor(&interest)?;
+let budget = QueryBudget::new(64 << 20);
+loop {
+    let page = db.read_changes(&cursor, 256, &budget)?;
+    for unit in &page.batch.units {
+        for event in &unit.events {
+            // ...apply `event` to the projection.
+            let _ = (event.id, event.action, event.delivery);
+        }
+    }
+    let next = page.batch.cursor.clone();
+    if next.position() == cursor.position() {
+        break;
+    }
+    cursor = next;
+    // ...store `cursor.to_bytes()` with what was applied, in one write.
+}
+let saved = cursor.to_bytes();
+let _resumed = ChangeCursor::from_bytes(&saved).expect("a saved cursor");
+# Ok(())
+# }
+```
+
+Only units this database applied and made durable are read. A cursor whose
+position the journal no longer holds is `RetentionLost`, never moved forward
+on its own; a cursor of another database or of another event interpretation
+is refused (`ChangeCursor`); a unit the feed cannot read, such as a change
+recorded without the context that says what it means, is
+`ChangeFeedUnsupported`; a first entry that does not fit the budget alone is
+`Budget`. On each the cursor stays valid. A member of a replicated group
+reads the group's log up to what it applied.
+
 ### Rebuilding after `RetentionLost`
 
 A consumer whose position is gone rebuilds its projection from a fixed cut

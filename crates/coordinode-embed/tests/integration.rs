@@ -13,6 +13,7 @@ mod integration {
     mod backup_tables;
     mod btree_index;
     mod capacity_tracking;
+    mod change_feed;
     mod compound_queries;
     mod computed;
     mod concurrent;
