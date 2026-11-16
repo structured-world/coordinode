@@ -1786,12 +1786,63 @@ fn a_fresh_store_holds_no_user_data() {
 #[test]
 fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
     use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs};
+    const KEY: &[u8] = b"meta:probe";
     let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
+    // A store whose persist of `partition` meets the faults `arm` sets, after
+    // one write to it: the store, its file system's crash and fault controls.
+    let store = |partition: Partition, arm: &dyn Fn(&FaultInjector)| {
+        let dir = TempDir::new().expect("temp dir");
+        let crash = Arc::new(CrashFs::new(StdFs));
+        let faults = Arc::new(FaultInjector::new());
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        config.fs = Some(Arc::new(FaultFs::with_injector(
+            CrashFs::clone(&crash),
+            Arc::clone(&faults),
+        )));
+        let engine = StorageEngine::open(&config).expect("open");
+        arm(&faults);
+        engine.put(partition, KEY, b"v").expect("put");
+        (dir, config, engine, crash, faults)
+    };
+    // After a failed persist: the retry on a healthy disk succeeds, and the
+    // write survives a power cut after it, which every file falls back to
+    // its last sync at.
+    let survives = |partition: Partition,
+                    case: &str,
+                    config: &StorageConfig,
+                    engine: StorageEngine,
+                    crash: &CrashFs,
+                    faults: &FaultInjector| {
+        faults.clear();
+        let retry = engine.persist_partition(partition);
+        assert!(retry.is_ok(), "{partition:?} {case}: retry: {retry:?}");
+        for op in [
+            FaultOp::Open,
+            FaultOp::Write,
+            FaultOp::SyncAll,
+            FaultOp::SyncData,
+            FaultOp::Rename,
+        ] {
+            faults.arm(FaultRule::new(op, refuse));
+        }
+        drop(engine);
+        faults.clear();
+        crash.crash();
+        let engine = StorageEngine::open(config).expect("reopen");
+        assert_eq!(
+            engine.get(partition, KEY).expect("read").as_deref(),
+            Some(&b"v"[..]),
+            "{partition:?} {case}: the write acknowledged by the retry was lost"
+        );
+    };
+
     let mut reached_by = Vec::new();
-    // Failures whose installation outcome is unknown: the table was written
-    // and its installation's sync failed, so whether it is installed is
-    // decided at the next install or the reopen.
-    let mut unknown_by: Vec<Partition> = Vec::new();
     for (partition, failed) in [Partition::Raft, Partition::Schema]
         .into_iter()
         .flat_map(|p| {
@@ -1807,80 +1858,75 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
     {
         let mut reached = 0;
         for k in 0.. {
-            let dir = TempDir::new().expect("temp dir");
-            let crash = Arc::new(CrashFs::new(StdFs));
-            let faults = Arc::new(FaultInjector::new());
-            let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]);
-            config.fs = Some(Arc::new(FaultFs::with_injector(
-                CrashFs::clone(&crash),
-                Arc::clone(&faults),
-            )));
-            let engine = StorageEngine::open(&config).expect("open");
-            let key = b"meta:probe";
-            engine.put(partition, key, b"v").expect("put");
-
             // Every matching operation on the partition's files from the k-th
             // on fails, not just one: a one-shot rule could be taken by a
             // background thread's operation on the same files, leaving the
             // persist unfailed. Background work failing too only leaves more
             // for the retry to write.
+            let (_dir, config, engine, crash, faults) = store(partition, &|_| {});
             faults.arm(
                 FaultRule::new(failed, refuse)
                     .on_path(partition.name())
                     .skip(k),
             );
-            let first = engine.persist_partition(partition);
-            if first.is_ok() {
+            if engine.persist_partition(partition).is_ok() {
                 // The operation to fail lies past the last one a persist makes.
                 break;
             }
             reached += 1;
-            if matches!(
-                first,
-                Err(StorageError::Engine(
-                    lsm_tree::Error::InstallOutcomeUnknown(_)
-                ))
-            ) {
-                unknown_by.push(partition);
-            }
-            // A healthy disk from here; the second call must write again. The
-            // proof that it did is the value surviving the power cut below.
-            faults.clear();
-            let retry = engine.persist_partition(partition);
-            assert!(
-                retry.is_ok(),
-                "{partition:?} {failed:?} {k}: retry: {retry:?}"
-            );
-
-            // Power cut: nothing written from here on is durable, and every
-            // file falls back to its last sync.
-            for op in [
-                FaultOp::Open,
-                FaultOp::Write,
-                FaultOp::SyncAll,
-                FaultOp::SyncData,
-                FaultOp::Rename,
-            ] {
-                faults.arm(FaultRule::new(op, refuse));
-            }
-            drop(engine);
-            faults.clear();
-            crash.crash();
-
-            let engine = StorageEngine::open(&config).expect("reopen");
-            assert_eq!(
-                engine.get(partition, key).expect("read").as_deref(),
-                Some(&b"v"[..]),
-                "{partition:?} {failed:?} {k}: the write acknowledged by the retry was lost"
+            survives(
+                partition,
+                &format!("{failed:?} {k}"),
+                &config,
+                engine,
+                &crash,
+                &faults,
             );
         }
         reached_by.push((partition, failed, reached));
+    }
+
+    // The table's installation failed on its own: every sync of the edit log
+    // that installs it fails. How often the table is synced before it varies
+    // with the flush workers, so the count above does not reliably land here.
+    // Installed by the persist, the failure leaves its outcome unknown;
+    // installed by a flush worker, the tree settles it by writing a new
+    // version, and the persist succeeds. A plain I/O error would mean the
+    // installation was taken for not done. Either way the write survives.
+    for partition in [Partition::Raft, Partition::Schema] {
+        let edits = format!("{}{}edits", partition.name(), std::path::MAIN_SEPARATOR);
+        let (_dir, config, engine, crash, faults) = store(partition, &|faults| {
+            for op in [FaultOp::SyncAll, FaultOp::SyncData] {
+                faults.arm(FaultRule::new(op, refuse).on_path(edits.as_str()));
+            }
+        });
+        let first = engine.persist_partition(partition);
+        let failed_installation = faults
+            .take_syncs()
+            .iter()
+            .any(|(path, _)| path.to_string_lossy().contains(edits.as_str()));
+        assert!(
+            failed_installation,
+            "{partition:?}: no sync of the edit log was failed"
+        );
+        assert!(
+            matches!(
+                first,
+                Ok(())
+                    | Err(StorageError::Engine(
+                        lsm_tree::Error::InstallOutcomeUnknown(_)
+                    ))
+            ),
+            "{partition:?}: a failed installation reported as {first:?}"
+        );
+        survives(
+            partition,
+            "failed installation",
+            &config,
+            engine,
+            &crash,
+            &faults,
+        );
     }
     // Every partition's persist opens, writes and syncs a table; it need not
     // rename one. Which sync it is depends on the platform and the file:
@@ -1901,13 +1947,6 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
         assert!(
             reached(partition, FaultOp::SyncAll) + reached(partition, FaultOp::SyncData) > 0,
             "{partition:?}: no sync of a persist was failed: {reached_by:?}"
-        );
-        // A failed sync of the table itself is not an unknown installation:
-        // the sweep must also reach the failure after the table, whose retry,
-        // power cut and reopen above then resolve it.
-        assert!(
-            unknown_by.contains(&partition),
-            "{partition:?}: no persist failed with an unknown installation"
         );
     }
 }
