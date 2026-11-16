@@ -499,7 +499,11 @@ one read from anywhere else, such as the same batch applied again, is
 refused as `ProjectionOutOfStep` with nothing applied. A failed closure or
 commit applies nothing, and the batch is applied again from the same cursor.
 A projection's progress is its own: it does not hold the source's journal,
-which follows its consumers' acknowledgements.
+which follows its consumers' acknowledgements. A `ScopeChange` event moves a
+type's nodes in or out of label scopes with no event per node: a closure
+returning `Ok` for it claims the projection reconciled them; one that cannot
+returns an error, and the projection stays before the change until it is
+rebuilt.
 
 ### Rebuilding after `RetentionLost`
 

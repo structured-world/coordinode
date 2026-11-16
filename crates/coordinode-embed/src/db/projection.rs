@@ -199,6 +199,13 @@ impl Database {
     /// nothing of the batch, and the batch is applied again from the same
     /// cursor.
     ///
+    /// `apply` returning `Ok` claims the projection holds the effects it was
+    /// handed. For a [`ScopeChange`](coordinode_storage::engine::change_feed::Action::ScopeChange)
+    /// event, whose nodes enter or leave label scopes with no event of their
+    /// own, that means the projection reconciled the type's nodes; one that
+    /// cannot returns an error, the projection's progress staying before the
+    /// change until it is rebuilt.
+    ///
     /// # Errors
     ///
     /// [`DatabaseError::UnknownProjection`] for a name not started;

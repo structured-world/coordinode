@@ -315,6 +315,105 @@ fn identities_hold_across_interests_and_reads() {
     );
 }
 
+/// A temporal node's writes are events of its versions, each named by its
+/// version key and routed by its labels; the history rows recording them
+/// add no events of their own.
+#[test]
+fn a_temporal_nodes_versions_are_its_events() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    run(
+        &mut db,
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    );
+    let mut cursor = db
+        .change_cursor(&ChangeInterest::default())
+        .expect("cursor");
+    run(&mut db, "CREATE (:Emp {name: 'Alice', valid_from: 1000})");
+    run(&mut db, "MATCH (e:Emp {name: 'Alice'}) CLONE NODE e AS c");
+    let events = events(&read_all(&db, &mut cursor));
+    assert!(events.len() >= 2, "{events:?}");
+    for event in &events {
+        let OwnedTarget::Node(key) = &event.target else {
+            panic!("only node versions change: {event:?}");
+        };
+        assert!(
+            coordinode_core::graph::node::decode_temporal_node_key(key).is_some(),
+            "a version key: {key:?}"
+        );
+        assert!(event.labels.is_some(), "routed: {event:?}");
+    }
+}
+
+/// One statement deleting many nodes, whose deletes the commit packs into
+/// key ranges, reaches each label's reader as one removal per node with the
+/// labels that node had, the same as deletes one at a time.
+#[test]
+fn a_packed_delete_is_one_removal_per_node() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    run(
+        &mut db,
+        "UNWIND range(1, 50) AS i CREATE (:Person {name: 'p' + toString(i)})",
+    );
+    run(&mut db, "CREATE (:Org {name: 'o'})");
+    let mut person = db
+        .change_cursor(&interest(Some(&["Person"]), None))
+        .expect("cursor");
+    run(&mut db, "MATCH (n) DETACH DELETE n");
+    let events = events(&read_all(&db, &mut person));
+    assert_eq!(
+        node_deliveries(&events),
+        vec![(Action::Remove, Delivery::Leave); 50],
+        "{events:?}"
+    );
+    let mut keys: Vec<&Vec<u8>> = events
+        .iter()
+        .filter_map(|e| match &e.target {
+            OwnedTarget::Node(key) => Some(key),
+            _ => None,
+        })
+        .collect();
+    keys.dedup();
+    assert_eq!(keys.len(), 50, "each node once");
+}
+
+/// A change of what a type implies that its proof refuses puts nothing in
+/// force and delivers no scope change; compaction, which rewrites the
+/// store's files, delivers nothing either.
+#[test]
+fn a_refused_change_and_compaction_deliver_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE CONSTRAINT thing_title FOR (n:Thing) REQUIRE n.title IS UNIQUE",
+    ] {
+        run(&mut db, ddl);
+    }
+    run(
+        &mut db,
+        "CREATE (:Thing {title: 'x'}), (:Task {title: 'x'})",
+    );
+    let mut thing = db
+        .change_cursor(&interest(Some(&["Thing"]), None))
+        .expect("cursor");
+    assert!(
+        db.execute_cypher("ALTER NODE TYPE Task SET IMPLIES (Thing)")
+            .is_err(),
+        "the shared title refuses it"
+    );
+    for partition in [
+        coordinode_storage::engine::partition::Partition::Node,
+        coordinode_storage::engine::partition::Partition::Schema,
+    ] {
+        db.engine().force_compaction(partition).expect("compact");
+    }
+    let units = read_all(&db, &mut thing);
+    assert!(events(&units).is_empty(), "{units:?}");
+}
+
 /// A read whose memory cannot hold one event of the next unit refuses with
 /// the budget, the cursor staying where it was.
 #[test]
