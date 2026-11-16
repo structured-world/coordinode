@@ -536,10 +536,11 @@ pub struct ServerConfig {
     /// ms (`None` = 10000). Delivery does not wait on it: a caught-up stream
     /// wakes when an entry applies.
     pub cdc_heartbeat_interval_ms: Option<NonZeroU64>,
-    /// Most entries a CDC change stream reads and sends per poll (`None` = 256).
+    /// Most log entries a CDC change stream reads and sends per batch
+    /// (`None` = 256).
     pub cdc_batch_size: Option<NonZeroUsize>,
-    /// Most bytes of log entries the change streams' shared reader keeps in
-    /// memory for streams that have not read them yet (`None` = 64 MiB).
+    /// Most bytes one read of a CDC change stream holds in memory
+    /// (`None` = 64 MiB).
     pub cdc_buffer_bytes: Option<usize>,
     /// Read concern of a statement that names none and whose session set
     /// none (`None` = `local`).

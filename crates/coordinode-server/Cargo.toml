@@ -46,6 +46,8 @@ coordinode-core = { workspace = true }
 # The member assembly: store, consensus node, database and background work.
 coordinode-embed = { workspace = true, features = ["replication"] }
 coordinode-replicate = { workspace = true, features = ["transfer"] }
+# The change stream binds a subscription's label names through the catalog.
+coordinode-modality = { workspace = true }
 coordinode-query = { workspace = true }
 coordinode-session = { workspace = true }
 coordinode-vector = { workspace = true, optional = true }

@@ -1,21 +1,24 @@
-//! gRPC ChangeStreamService: CE oplog CDC consumer.
+//! gRPC ChangeStreamService: CE change data capture as logical events.
 //!
-//! Tails the Raft log's oplog segments and streams [`ChangeEvent`] messages
-//! to the client, only for entries this node has applied: the log also holds
-//! entries that are not committed yet, which a later leader may truncate and
-//! replace. A caught-up stream sleeps until this node applies another entry,
-//! waking only to heartbeat its registration.
+//! Reads the Raft log's committed units, only those this node has applied:
+//! the log also holds entries that are not committed yet, which a later
+//! leader may truncate and replace. Each unit is projected into its logical
+//! events (puts, patches and removals of nodes and relationships) by the
+//! storage engine's change feed, filtered by the subscription's interest and
+//! streamed in batches with the cursor after them. A caught-up stream sleeps
+//! until this node applies another entry, waking only to heartbeat its
+//! registration.
 //!
 //! Every stream reads as a consumer registered in the
 //! [`ShardConsumerRegistry`] with the retention policy its client chose. The
 //! registration outlives the connection: a client reconnects to the same
 //! incarnation, and ends it with `CancelSubscription`. Its checkpoint moves
 //! only on `AcknowledgeSubscription`, the client's statement that it holds
-//! the events before a position: sending an event, or a resume token naming
-//! where to read, releases nothing.
+//! the units before a cursor: sending a batch, or a cursor naming where to
+//! read, releases nothing.
 //!
 //! In embedded mode (no Raft) nothing is applied from a Raft log and the
-//! stream is empty — no error.
+//! stream is empty: no error.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -23,10 +26,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustc_hash::FxHashMap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status};
 
+use coordinode_core::budget::QueryBudget;
+use coordinode_core::schema::label_id::LabelId;
+use coordinode_modality::change_interest::{InterestRefusal, resolve_change_interest};
+use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::storage::raft_oplog_dirs;
 use coordinode_replicate::{
@@ -34,17 +42,19 @@ use coordinode_replicate::{
     RegistrationWatch, RegistryError, RetentionPressure, SeqnoConsumerRegistry,
     ShardConsumerRegistry, TopologyScope,
 };
+use coordinode_storage::engine::change_feed::{
+    self as feed, ChangeCursor, CursorError, Interest, OwnedTarget,
+};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::error::StorageError;
-use coordinode_storage::oplog::entry::OplogOp;
-use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken, UnitDecisionSource};
 
 use super::error_details::{Reason, status_with_reason};
 use crate::proto::replication::cdc::{
     AcknowledgeSubscriptionRequest, AcknowledgeSubscriptionResponse, CancelSubscriptionRequest,
-    CancelSubscriptionResponse, CdcFilters as ProtoCdcFilters, ChangeEvent, ChangeOp, ChangeOpType,
-    ConsumerRetention, ResumeToken as ProtoResumeToken, SubscribeRequest,
-    change_stream_service_server::ChangeStreamService, consumer_retention,
+    CancelSubscriptionResponse, ChangeAction, ChangeBatch, ChangeDelivery,
+    ChangeInterest as ProtoInterest, ChangeUnit, ConsumerRetention, LogicalChange, NodeTarget,
+    RelationshipTarget, SubscribeRequest, change_stream_service_server::ChangeStreamService,
+    consumer_retention, logical_change,
 };
 
 /// One past the last Raft log entry this node has applied, `0` when none:
@@ -63,6 +73,9 @@ pub const INCARNATION_METADATA: &str = "x-coordinode-consumer-incarnation";
 pub struct ChangeEventServiceImpl {
     /// The shard whose Raft log the service streams.
     shard_id: u32,
+    /// The store applying that log: it projects the units and names their
+    /// labels.
+    engine: Arc<StorageEngine>,
     /// Every directory holding segments of that log.
     oplog_dirs: Vec<PathBuf>,
     registry: ShardConsumerRegistry,
@@ -72,59 +85,29 @@ pub struct ChangeEventServiceImpl {
     applied_changes: AppliedSignal,
     /// Read pacing of every stream.
     tuning: CdcStreamTuning,
-    /// The log reader every stream shares, made on the first subscription.
-    // no-std: spin::Mutex; taken once per subscription.
-    hub: parking_lot::Mutex<Option<Arc<CdcHub>>>,
-    /// Which units of the log their operation binding refused.
-    decisions: UnitDecisionSource,
 }
 
 impl ChangeEventServiceImpl {
-    /// A service streaming shard `shard_id`'s Raft log from `oplog_dirs`
-    /// (see `coordinode_raft::storage::raft_oplog_dirs`), up to `applied`,
-    /// which `applied_changes` signals moving. `decisions` says which units
-    /// their operation binding refused (see
-    /// `coordinode_storage::engine::operations::unit_decisions`): none of
-    /// their operations is streamed.
+    /// A service streaming shard `shard_id`'s Raft log, applied by `engine`,
+    /// from `oplog_dirs` (see `coordinode_raft::storage::raft_oplog_dirs`),
+    /// up to `applied`, which `applied_changes` signals moving.
     pub fn new(
         shard_id: u32,
+        engine: Arc<StorageEngine>,
         oplog_dirs: Vec<PathBuf>,
         registry: ShardConsumerRegistry,
         applied: AppliedFrontier,
         applied_changes: AppliedSignal,
-        decisions: UnitDecisionSource,
     ) -> Self {
         Self {
             shard_id,
+            engine,
             oplog_dirs,
             registry,
             applied,
             applied_changes,
             tuning: CdcStreamTuning::default(),
-            hub: parking_lot::Mutex::new(None),
-            decisions,
         }
-    }
-
-    /// The shard's shared log reader, made at the applied position on the
-    /// first call.
-    fn hub(&self) -> Result<Arc<CdcHub>, Status> {
-        let mut slot = self.hub.lock();
-        if let Some(hub) = slot.as_ref() {
-            return Ok(Arc::clone(hub));
-        }
-        let hub = Arc::new(
-            CdcHub::new(
-                &self.oplog_dirs,
-                self.shard_id,
-                (self.applied)(),
-                self.tuning.buffer_bytes,
-                Arc::clone(&self.decisions),
-            )
-            .map_err(|e| Status::internal(format!("change stream reader: {e}")))?,
-        );
-        *slot = Some(Arc::clone(&hub));
-        Ok(hub)
     }
 
     /// The same service pacing its streams by `tuning`.
@@ -148,11 +131,11 @@ impl ChangeEventServiceImpl {
         let changes = node.subscribe_applied();
         Ok(Self::new(
             0,
+            Arc::clone(engine),
             dirs,
             registry,
             Arc::new(move || node.applied_through()),
             Some(changes),
-            coordinode_storage::engine::operations::unit_decisions(Arc::clone(engine)),
         ))
     }
 }
@@ -172,18 +155,18 @@ fn retention(proto: Option<ConsumerRetention>) -> Result<ConsumerRetentionPolicy
 }
 
 /// How a change stream paces its reads (`cdc_heartbeat_interval_ms`,
-/// `cdc_batch_size`).
+/// `cdc_batch_size`, `cdc_buffer_bytes`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CdcStreamTuning {
     /// How often a stream waiting (caught up, or on a slow reader) heartbeats
     /// its registration. Delivery does not wait on it: a caught-up stream
     /// wakes as soon as another entry applies.
     pub heartbeat_interval: Duration,
-    /// Most entries read and sent per poll (back-pressure).
+    /// Most log entries read and sent per batch (back-pressure).
     pub batch_size: NonZeroUsize,
-    /// Most bytes of log entries the streams' shared reader keeps in memory
-    /// for streams that have not passed them yet (`cdc_buffer_bytes`); a
-    /// stream further behind reads from the log.
+    /// Most bytes one read of a stream holds in memory: its units, their
+    /// events and the read's own buffers. A first entry larger than this is
+    /// refused rather than read.
     pub buffer_bytes: usize,
 }
 
@@ -279,6 +262,27 @@ fn registry_status(e: RegistryError) -> Status {
     }
 }
 
+/// The client status for a read of the feed that failed at log `index`.
+fn read_status(e: StorageError, index: u64) -> Status {
+    match e {
+        StorageError::RetentionLost {
+            requested,
+            first_retained,
+        } => registry_status(RegistryError::RetentionLost {
+            checkpoint: requested,
+            floor: first_retained,
+        }),
+        StorageError::ChangeFeedUnsupported { reason } => status_with_reason(
+            Code::FailedPrecondition,
+            format!("the change stream cannot read on: {reason}"),
+            Reason::ChangeFeedUnsupported,
+            [("log_index", index.to_string())],
+        ),
+        StorageError::ChangeCursor(e) => Status::invalid_argument(e.to_string()),
+        e => Status::internal(e.to_string()),
+    }
+}
+
 /// Run a blocking registry call off the async runtime: each one commits a
 /// transaction and waits on its durability.
 async fn blocking<T: Send + 'static>(
@@ -293,17 +297,17 @@ async fn blocking<T: Send + 'static>(
 #[tonic::async_trait]
 impl ChangeStreamService for ChangeEventServiceImpl {
     type SubscribeStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<ChangeEvent, Status>> + Send>>;
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ChangeBatch, Status>> + Send>>;
 
     async fn subscribe(
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let (tx, rx) = mpsc::channel::<Result<ChangeEvent, Status>>(64);
+        let (tx, rx) = mpsc::channel::<Result<ChangeBatch, Status>>(64);
         let incarnation = self
             .open(request.into_inner(), Delivery::Stream { tx })
             .await?;
-        let stream: Pin<Box<dyn tokio_stream::Stream<Item = Result<ChangeEvent, Status>> + Send>> =
+        let stream: Pin<Box<dyn tokio_stream::Stream<Item = Result<ChangeBatch, Status>> + Send>> =
             Box::pin(ReceiverStream::new(rx));
         let mut response = Response::new(stream);
         response.metadata_mut().insert(
@@ -333,9 +337,23 @@ impl ChangeStreamService for ChangeEventServiceImpl {
     }
 }
 
+/// The interest a request names, bound to the labels its names are bound to
+/// now.
+fn interest(engine: &StorageEngine, proto: Option<ProtoInterest>) -> Result<Interest, Status> {
+    let proto = proto.unwrap_or_default();
+    let labels = proto.labels.map(|l| l.names);
+    let edge_types = proto.edge_types.map(|t| t.names);
+    let resolved = resolve_change_interest(engine, labels.as_deref(), edge_types.as_deref())
+        .map_err(|e| Status::internal(format!("the catalog: {e}")))?;
+    resolved.map_err(|refusal| match refusal {
+        InterestRefusal::Unbound(_) => Status::invalid_argument(refusal.to_string()),
+        InterestRefusal::Implied(_) => Status::unimplemented(refusal.to_string()),
+    })
+}
+
 impl ChangeEventServiceImpl {
     /// Register or resume the consumer `req` names and start delivering its
-    /// events to `delivery`. Returns the registration's incarnation.
+    /// units to `delivery`. Returns the registration's incarnation.
     ///
     /// # Errors
     ///
@@ -352,27 +370,19 @@ impl ChangeEventServiceImpl {
                 "a change stream needs a consumer_id",
             ));
         }
-        let token = match req.resume_token {
-            Some(t) if t.shard_id != shard_id => {
-                return Err(Status::invalid_argument(format!(
-                    "resume token is for shard {}, this stream serves shard {shard_id}",
-                    t.shard_id
-                )));
+        let interest = interest(&self.engine, req.interest)?;
+        let start = if req.cursor.is_empty() {
+            None
+        } else {
+            let cursor = ChangeCursor::from_bytes(&req.cursor)
+                .map_err(|e| Status::invalid_argument(format!("cursor: {e}")))?;
+            if cursor.interest() != &interest {
+                return Err(Status::invalid_argument(
+                    "the cursor was read with another interest than the request's",
+                ));
             }
-            Some(t) => Some(ResumeToken {
-                shard_id: t.shard_id,
-                segment_id: t.segment_id,
-                entry_offset: t.entry_offset,
-            }),
-            None => None,
+            Some(cursor.position())
         };
-        let start = token
-            .as_ref()
-            .filter(|t| !t.is_start())
-            .map(ResumeToken::next_index)
-            .transpose()
-            .map_err(|e| Status::invalid_argument(format!("resume token: {e}")))?;
-        let filters = proto_filters_to_cdc(req.filters);
 
         let registry = self.registry.clone();
         let consumer_id = req.consumer_id;
@@ -393,7 +403,7 @@ impl ChangeEventServiceImpl {
             blocking(move || registry.resume(&consumer_id, incarnation)).await?
         };
 
-        // Without a token a resumed stream starts where its registration
+        // Without a cursor a resumed stream starts where its registration
         // stands; a registered one already started at the oldest retained
         // entry, which is its checkpoint.
         let from = match start {
@@ -403,21 +413,19 @@ impl ChangeEventServiceImpl {
                 blocking(move || registry.check_retention(&handle)).await?
             }
         };
-        let hub = self.hub()?;
-        let reader = hub.reader(from);
+        let cursor = self
+            .engine
+            .change_cursor_at(from, interest)
+            .map_err(|e| Status::internal(format!("change cursor: {e}")))?;
 
         let incarnation = handle.incarnation();
         tokio::spawn(stream_consumer(StreamState {
-            shard_id,
+            engine: Arc::clone(&self.engine),
             watch: registry.watch(&handle),
             registry,
             handle,
-            hub,
-            reader,
-            position: from,
-            own_tailer: None,
+            cursor,
             oplog_dirs: self.oplog_dirs.clone(),
-            filters,
             delivery,
             applied: Arc::clone(&self.applied),
             applied_changes: self.applied_changes.clone(),
@@ -440,13 +448,13 @@ impl ChangeEventServiceImpl {
         blocking(move || registry.unregister(handle)).await
     }
 
-    /// Record that the consumer `req` names holds its events before the
-    /// position it gives.
+    /// Record that the consumer `req` names holds its units before the
+    /// cursor it gives.
     ///
     /// # Errors
     ///
-    /// The request is malformed, names a position this node has not applied,
-    /// or the registry refuses it.
+    /// The request is malformed, names a cursor of another history or past
+    /// what this node has applied, or the registry refuses it.
     pub(crate) async fn acknowledge(
         &self,
         req: AcknowledgeSubscriptionRequest,
@@ -456,28 +464,27 @@ impl ChangeEventServiceImpl {
                 "acknowledging needs a consumer_id",
             ));
         }
-        let position = req
-            .position
-            .ok_or_else(|| Status::invalid_argument("acknowledging needs a position"))?;
-        if position.shard_id != self.shard_id {
-            return Err(Status::invalid_argument(format!(
-                "position is for shard {}, this service serves shard {}",
-                position.shard_id, self.shard_id
-            )));
+        if req.cursor.is_empty() {
+            return Err(Status::invalid_argument("acknowledging needs a cursor"));
         }
-        let index = ResumeToken {
-            shard_id: position.shard_id,
-            segment_id: position.segment_id,
-            entry_offset: position.entry_offset,
+        let cursor = ChangeCursor::from_bytes(&req.cursor)
+            .map_err(|e| Status::invalid_argument(format!("cursor: {e}")))?;
+        let history = self
+            .engine
+            .cut_history()
+            .map_err(|e| Status::internal(format!("history: {e}")))?;
+        if history != Some(cursor.history()) {
+            return Err(Status::invalid_argument(
+                CursorError::OtherHistory.to_string(),
+            ));
         }
-        .next_index()
-        .map_err(|e| Status::invalid_argument(format!("position: {e}")))?;
-        // Nothing past what this node applied was sent, so a position beyond
-        // it is not a statement about held events and releases nothing.
+        let index = cursor.position();
+        // Nothing past what this node applied was sent, so a cursor beyond
+        // it is not a statement about held units and releases nothing.
         let applied = (self.applied)();
         if index > applied {
             return Err(Status::invalid_argument(format!(
-                "position {index} is past the last entry this node applied ({applied})"
+                "cursor position {index} is past the last entry this node applied ({applied})"
             )));
         }
         let registry = self.registry.clone();
@@ -490,34 +497,29 @@ impl ChangeEventServiceImpl {
 
 /// Everything one stream's task owns.
 struct StreamState {
-    shard_id: u32,
+    engine: Arc<StorageEngine>,
     registry: ShardConsumerRegistry,
     handle: RegisteredHandle,
     /// Tells when a write to the registration applied, the only time it
     /// can have ended.
     watch: RegistrationWatch,
-    /// The shard's shared reader of the log.
-    hub: Arc<CdcHub>,
-    reader: HubReader,
-    /// The next log index this stream reads.
-    position: u64,
-    /// Reads the log while the stream is behind what the hub holds.
-    own_tailer: Option<OplogTailer>,
+    /// Where the stream reads next.
+    cursor: ChangeCursor,
     oplog_dirs: Vec<PathBuf>,
-    filters: CdcFilters,
-    /// Where the events go.
+    /// Where the batches go.
     delivery: Delivery,
     applied: AppliedFrontier,
     applied_changes: AppliedSignal,
     tuning: CdcStreamTuning,
 }
 
-/// Tail the log for one stream until the client leaves, the registration
+/// Read the log for one stream until the client leaves, the registration
 /// ends, or the log no longer holds what the stream needs. Leaving does not
 /// end the registration: the client resumes it.
 async fn stream_consumer(mut s: StreamState) {
     // Counted while this task runs, whichever way it ends.
     let _open = OpenStream::count(&s.delivery);
+    let mut names = LabelNames::default();
     loop {
         // Client cancelled (channel closed).
         if s.delivery.is_closed() {
@@ -545,9 +547,7 @@ async fn stream_consumer(mut s: StreamState) {
         }
 
         // What the client takes now: a session subscription waits here for
-        // credit. Reading no more than that keeps every batch, its progress
-        // event included, within it: a read stops right after the last entry
-        // it keeps, so a progress event only follows a short batch.
+        // credit.
         let Some(room) = s
             .delivery
             .room(
@@ -561,67 +561,59 @@ async fn stream_consumer(mut s: StreamState) {
             break;
         };
 
-        let read_from = s.position;
+        let read_from = s.cursor.position();
         let until = (s.applied)();
-        let batch = match read_batch(&mut s, until, room) {
-            Ok(b) => b,
-            Err(StorageError::RetentionLost {
-                requested,
-                first_retained,
-            }) => {
+        let read = {
+            let engine = Arc::clone(&s.engine);
+            let cursor = s.cursor.clone();
+            let dirs = s.oplog_dirs.clone();
+            let budget_bytes = s.tuning.buffer_bytes as u64;
+            let mut taken = std::mem::take(&mut names);
+            tokio::task::spawn_blocking(move || {
+                let budget = QueryBudget::new(budget_bytes);
+                let read = engine
+                    .read_changes_log(&cursor, &dirs, until, room, &budget)
+                    .and_then(|(batch, _charge)| {
+                        let proto = batch_to_proto(&engine, &batch, &mut taken)?;
+                        Ok((proto, batch.cursor))
+                    });
+                (read, taken)
+            })
+            .await
+        };
+        let (read, kept) = match read {
+            Ok(done) => done,
+            Err(e) => {
                 s.delivery
-                    .fail(registry_status(RegistryError::RetentionLost {
-                        checkpoint: requested,
-                        floor: first_retained,
-                    }))
+                    .fail(Status::internal(format!("change stream read: {e}")))
                     .await;
                 break;
             }
+        };
+        names = kept;
+        let (batch, next) = match read {
+            Ok(read) => read,
             Err(e) => {
-                s.delivery.fail(Status::internal(e.to_string())).await;
+                s.delivery.fail(read_status(e, read_from)).await;
                 break;
             }
         };
-        // Nothing to send, and either nothing applied past the position or
-        // nothing readable there yet: wait for the next entry.
-        let caught_up = batch.is_empty() && (s.position >= until || s.position == read_from);
-
-        // Where the client can resume and acknowledge after what was sent.
-        let mut sent_to = read_from;
-        let mut events = Vec::with_capacity(batch.len() + 1);
-        for shared in &batch {
-            let (entry, token) = &**shared;
-            if let Ok(next) = token.next_index() {
-                sent_to = sent_to.max(next);
-            }
-            events.push(oplog_entry_to_proto(entry, token));
-        }
-        // Sending is not delivery: the registration moves only when the
-        // client acknowledges. Entries the filters dropped after the last
-        // event sent are reported as a progress event, so a client whose
-        // filters match little can still acknowledge past them.
-        let read_to = s.position;
-        if read_to > sent_to {
-            events.push(ChangeEvent {
-                ts: 0,
-                term: 0,
-                log_index: read_to - 1,
-                shard_id: s.shard_id,
-                is_migration: false,
-                ops: Vec::new(),
-                position: Some(ProtoResumeToken {
-                    shard_id: s.shard_id,
-                    segment_id: read_to,
-                    entry_offset: 0,
-                }),
-            });
-        }
+        let read_to = next.position();
+        // Every entry read uses credit, whether or not it carried a unit.
+        let entries = read_to - read_from;
+        let caught_up = entries == 0;
         // Applied entries left past the read: the room, not the log, ended it.
-        let more = s.position < until;
-        if !events.is_empty()
+        let more = read_to < until;
+        s.cursor = next;
+        // Sending is not delivery: the registration moves only when the
+        // client acknowledges. A batch whose entries carried no unit still
+        // moves the cursor, so a client whose interest matches little can
+        // acknowledge past them.
+        if entries > 0
             && s.delivery
                 .send(
-                    events,
+                    batch,
+                    entries,
                     more,
                     &s.registry,
                     &s.handle,
@@ -636,8 +628,7 @@ async fn stream_consumer(mut s: StreamState) {
         if caught_up {
             // Heartbeat so the registration shows a connected reader (a
             // diagnostic: it ends and extends nothing), then sleep until an
-            // entry applies, a write to the registration
-            // applies (the relay may notice it after the entry woke us), the
+            // entry applies, a write to the registration applies, the
             // client leaves, or the next heartbeat is due.
             if let Err(e) = s.registry.heartbeat(&s.handle) {
                 tracing::warn!(error = %e, "change stream heartbeat failed");
@@ -666,7 +657,7 @@ async fn stream_consumer(mut s: StreamState) {
 }
 
 /// One open change stream in `coordinode_subscription_active`, labelled by
-/// how its events are delivered; released when the stream's task ends.
+/// how its batches are delivered; released when the stream's task ends.
 struct OpenStream(&'static str);
 
 impl OpenStream {
@@ -686,162 +677,138 @@ impl Drop for OpenStream {
     }
 }
 
-/// The next entries for stream `s` below `until`: from the shard's hub, or
-/// from the log itself while the stream is behind what the hub holds. Moves
-/// `s.position` past every entry read, sent or filtered out. At most `max`
-/// entries are kept, and the read stops right after the last one kept.
-fn read_batch(
-    s: &mut StreamState,
-    until: u64,
-    max: usize,
-) -> Result<Vec<SharedEntry>, StorageError> {
-    match s.hub.read(&s.reader, s.position, max, until, &s.filters)? {
-        HubRead::Entries { entries, next } => {
-            s.own_tailer = None;
-            s.position = next;
-            Ok(entries)
+/// Label names a stream has resolved, kept for its later batches: an
+/// identity's name never changes, it is recorded once.
+#[derive(Default)]
+struct LabelNames(FxHashMap<LabelId, String>);
+
+impl LabelNames {
+    fn names(
+        &mut self,
+        engine: &StorageEngine,
+        labels: &[LabelId],
+    ) -> Result<Vec<String>, StorageError> {
+        let mut out = Vec::with_capacity(labels.len());
+        for &label in labels {
+            if let Some(name) = self.0.get(&label) {
+                out.push(name.clone());
+                continue;
+            }
+            let name = LocalSchemaStore::new(engine)
+                .label_name(label)
+                .map_err(|e| StorageError::Serialization(format!("label {label}: {e}")))?
+                .ok_or_else(|| {
+                    StorageError::Serialization(format!("label {label} has no identity record"))
+                })?;
+            self.0.insert(label, name.clone());
+            out.push(name);
         }
-        HubRead::Behind(base) => {
-            let tailer = match s.own_tailer.as_mut() {
-                Some(tailer) => tailer,
-                None => s.own_tailer.insert(
-                    OplogTailer::new(
-                        &s.oplog_dirs,
-                        ResumeToken {
-                            shard_id: s.shard_id,
-                            segment_id: s.position,
-                            entry_offset: 0,
-                        },
-                    )?
-                    .with_unit_decisions(s.hub.decisions()),
-                ),
-            };
-            let entries = tailer.read_next(max, &s.filters, until.min(base))?;
-            s.position = tailer.next_index();
-            Ok(entries.into_iter().map(Arc::new).collect())
-        }
+        Ok(out)
     }
 }
 
+/// The batch a client receives for `batch`.
+fn batch_to_proto(
+    engine: &StorageEngine,
+    batch: &feed::ChangeBatch,
+    names: &mut LabelNames,
+) -> Result<ChangeBatch, StorageError> {
+    let mut units = Vec::with_capacity(batch.units.len());
+    for unit in &batch.units {
+        let mut events = Vec::with_capacity(unit.events.len());
+        for event in &unit.events {
+            events.push(event_to_proto(engine, event, names)?);
+        }
+        units.push(ChangeUnit {
+            commit_ts: unit.commit_ts,
+            log_index: unit.position.index,
+            unit: unit.position.sub,
+            projected: unit.projected,
+            events,
+        });
+    }
+    Ok(ChangeBatch {
+        units,
+        cursor: batch.cursor.to_bytes(),
+    })
+}
+
+fn event_to_proto(
+    engine: &StorageEngine,
+    event: &feed::ChangeEvent,
+    names: &mut LabelNames,
+) -> Result<LogicalChange, StorageError> {
+    let malformed = |what: &str| StorageError::Serialization(format!("a change event's {what}"));
+    let relationship = |key: &[u8]| -> Result<RelationshipTarget, StorageError> {
+        let parts = feed::edgeprop_parts(key).ok_or_else(|| malformed("edge property key"))?;
+        Ok(RelationshipTarget {
+            edge_type: String::from_utf8_lossy(parts.edge_type).into_owned(),
+            source_id: parts.source,
+            target_id: parts.target,
+            instance: parts.instance.map(<[u8]>::to_vec).unwrap_or_default(),
+        })
+    };
+    let target = match &event.target {
+        OwnedTarget::Node(key) => {
+            let node = if let Some((_, id)) = coordinode_core::graph::node::decode_node_key(key) {
+                NodeTarget {
+                    node_id: id.as_raw(),
+                    valid_from: None,
+                }
+            } else {
+                let (_, id, valid_from) =
+                    coordinode_core::graph::node::decode_temporal_node_key(key)
+                        .ok_or_else(|| malformed("node key"))?;
+                NodeTarget {
+                    node_id: id.as_raw(),
+                    valid_from: Some(valid_from),
+                }
+            };
+            logical_change::Target::Node(node)
+        }
+        OwnedTarget::Relationship {
+            edge_type,
+            source,
+            target,
+        } => logical_change::Target::Relationship(RelationshipTarget {
+            edge_type: String::from_utf8_lossy(edge_type).into_owned(),
+            source_id: *source,
+            target_id: *target,
+            instance: Vec::new(),
+        }),
+        OwnedTarget::RelationshipProperties(key) => {
+            logical_change::Target::Properties(relationship(key)?)
+        }
+        OwnedTarget::RelationshipInstance(key) => {
+            logical_change::Target::Instance(relationship(key)?)
+        }
+    };
+    let (labels_before, labels_after) = match &event.labels {
+        Some((before, after)) => (names.names(engine, before)?, names.names(engine, after)?),
+        None => (Vec::new(), Vec::new()),
+    };
+    Ok(LogicalChange {
+        ordinal: event.id.ordinal,
+        action: match event.action {
+            feed::Action::Put => ChangeAction::Put,
+            feed::Action::Patch => ChangeAction::Patch,
+            feed::Action::Remove => ChangeAction::Remove,
+        } as i32,
+        target: Some(target),
+        payload: event.payload.clone().unwrap_or_default(),
+        delivery: match event.delivery {
+            feed::Delivery::Apply | feed::Delivery::None => ChangeDelivery::Apply,
+            feed::Delivery::Enter => ChangeDelivery::Enter,
+            feed::Delivery::Leave => ChangeDelivery::Leave,
+        } as i32,
+        labels_before,
+        labels_after,
+    })
+}
+
 mod delivery;
-mod hub;
 pub(crate) use delivery::{Credit, Delivery, session_error};
-use hub::{CdcHub, HubRead, HubReader, SharedEntry};
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests;
-
-// ── Conversion helpers ────────────────────────────────────────────────────────
-
-fn proto_filters_to_cdc(proto: Option<ProtoCdcFilters>) -> CdcFilters {
-    match proto {
-        None => CdcFilters::default(),
-        Some(f) => CdcFilters {
-            edge_types: f.edge_types,
-            is_migration: f.is_migration,
-        },
-    }
-}
-
-fn oplog_entry_to_proto(
-    entry: &coordinode_storage::oplog::entry::OplogEntry,
-    token: &ResumeToken,
-) -> ChangeEvent {
-    let ops = entry
-        .ops
-        .iter()
-        .cloned()
-        .filter_map(oplog_op_to_proto)
-        .collect();
-
-    ChangeEvent {
-        ts: entry.ts,
-        term: entry.term,
-        log_index: entry.index,
-        shard_id: entry.shard,
-        is_migration: entry.is_migration,
-        ops,
-        position: Some(ProtoResumeToken {
-            shard_id: token.shard_id,
-            segment_id: token.segment_id,
-            entry_offset: token.entry_offset,
-        }),
-    }
-}
-
-/// The change a journalled op shows a CDC reader, or `None` for DERIVED
-/// index work: index maintenance is not a change of its own, and the data
-/// change it follows is already on the stream.
-fn oplog_op_to_proto(op: OplogOp) -> Option<ChangeOp> {
-    Some(match op {
-        OplogOp::Insert {
-            partition,
-            key,
-            value,
-        } => ChangeOp {
-            r#type: ChangeOpType::Insert as i32,
-            partition: partition as u32,
-            key,
-            value,
-        },
-        OplogOp::Delete { partition, key } => ChangeOp {
-            r#type: ChangeOpType::Delete as i32,
-            partition: partition as u32,
-            key,
-            value: vec![],
-        },
-        OplogOp::Merge {
-            partition,
-            key,
-            operand,
-        } => ChangeOp {
-            r#type: ChangeOpType::Merge as i32,
-            partition: partition as u32,
-            key,
-            value: operand,
-        },
-        OplogOp::RemoveRange {
-            partition,
-            start,
-            end,
-        } => ChangeOp {
-            r#type: ChangeOpType::RemoveRange as i32,
-            partition: partition as u32,
-            // Half-open range [start, end): key carries start, value carries end.
-            key: start,
-            value: end,
-        },
-        OplogOp::Noop => ChangeOp {
-            r#type: ChangeOpType::Noop as i32,
-            partition: 0,
-            key: vec![],
-            value: vec![],
-        },
-        OplogOp::RaftEntry { data } => ChangeOp {
-            r#type: ChangeOpType::RaftEntry as i32,
-            partition: 0,
-            key: vec![],
-            value: data,
-        },
-        OplogOp::RaftTruncation { after_index } => ChangeOp {
-            r#type: ChangeOpType::RaftTruncation as i32,
-            partition: 0,
-            key: after_index.to_be_bytes().to_vec(),
-            value: vec![],
-        },
-        // A columnar table write is keyed by table id, not a partition
-        // discriminant, so it cannot be carried by the partition-shaped ChangeOp.
-        // Surfacing columnar tables on the CDC stream needs a table-id field on
-        // the wire; until then a columnar write maps to a no-op change rather
-        // than a misencoded partition op.
-        OplogOp::ColumnarInsert { .. } => ChangeOp {
-            r#type: ChangeOpType::Noop as i32,
-            partition: 0,
-            key: vec![],
-            value: vec![],
-        },
-        // The tailer hands out a unit frame expanded into its operations.
-        OplogOp::Derive { .. } | OplogOp::Unit { .. } => return None,
-    })
-}

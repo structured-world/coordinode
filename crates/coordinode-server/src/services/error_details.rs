@@ -210,6 +210,11 @@ pub enum Reason {
     /// `checkpoint` (the last position acknowledged). Terminal for that
     /// incarnation: registering the id again starts a new one.
     ConsumerTerminated,
+    /// A change stream reached a unit it cannot project into events: a
+    /// change recorded without the context that says what it means. The
+    /// stream does not pass it. Metadata carries `log_index`, the entry the
+    /// stream stands at. Terminal for that position.
+    ChangeFeedUnsupported,
     /// A request field has a value the server refuses: missing, malformed
     /// or contradicting another field. Nothing changed. Metadata carries
     /// `field`, the path of the field; `BadRequest` describes the violation.
@@ -345,6 +350,7 @@ impl Reason {
             Reason::ConstraintViolation => "CONSTRAINT_VIOLATION",
             Reason::RetentionLost => "RETENTION_LOST",
             Reason::ConsumerTerminated => "CONSUMER_TERMINATED",
+            Reason::ChangeFeedUnsupported => "CHANGE_FEED_UNSUPPORTED",
             Reason::InvalidField => "INVALID_FIELD",
             Reason::CatalogObjectExists => "CATALOG_OBJECT_EXISTS",
             Reason::CatalogObjectNotFound => "CATALOG_OBJECT_NOT_FOUND",

@@ -66,6 +66,7 @@
 #![deny(missing_docs)]
 
 pub mod blob;
+pub mod change_interest;
 pub mod document;
 pub mod edge;
 pub mod encrypted_index;

@@ -1,6 +1,6 @@
-//! Where a change stream's events go: the change-stream service's server
-//! stream, one event per message, or a subscription of a session, in batches
-//! within the credit its client granted.
+//! Where a change stream's batches go: the change-stream service's server
+//! stream, one batch per message, or a subscription of a session, one batch
+//! per frame within the credit of log entries its client granted.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,12 +11,13 @@ use prost::Message as _;
 use tokio::sync::{Notify, mpsc};
 use tonic::Status;
 
-use crate::proto::replication::cdc::ChangeEvent;
+use crate::proto::replication::cdc::ChangeBatch;
 use crate::proto::session::server_frame::Event;
 use crate::proto::session::{ChangeEventBatch, ServerFrame, SessionError};
 
-/// Events a session subscription may still be sent: granted by its client,
-/// used by every event sent. Also how the session stops one subscription.
+/// Log entries a session subscription may still be read: granted by its
+/// client, used by every entry a batch sent passes. Also how the session
+/// stops one subscription.
 #[derive(Debug, Default)]
 pub(crate) struct Credit {
     left: AtomicU64,
@@ -76,11 +77,11 @@ impl Credit {
     }
 }
 
-/// How a stream's events reach its client.
+/// How a stream's batches reach its client.
 pub(crate) enum Delivery {
-    /// The change-stream service's server stream: one message per event.
+    /// The change-stream service's server stream: one message per batch.
     Stream {
-        tx: mpsc::Sender<Result<ChangeEvent, Status>>,
+        tx: mpsc::Sender<Result<ChangeBatch, Status>>,
     },
     /// A subscription of a session: one frame per batch on the subscription's
     /// request id, within its credit.
@@ -116,9 +117,9 @@ impl Delivery {
         }
     }
 
-    /// How many events the client takes now, waiting for a session client to
-    /// grant credit if it has none left; `None` once the client is gone. A
-    /// wait keeps the registration alive, as a caught-up stream does.
+    /// How many log entries the client takes now, waiting for a session
+    /// client to grant credit if it has none left; `None` once the client is
+    /// gone. A wait keeps the registration alive, as a caught-up stream does.
     pub(crate) async fn room(
         &self,
         registry: &ShardConsumerRegistry,
@@ -148,11 +149,13 @@ impl Delivery {
         }
     }
 
-    /// Send `events`, at most the room last returned; `more` when applied
-    /// entries were left past them. `Err` once the client is gone.
+    /// Send `batch`, read from `entries` log entries, at most the room last
+    /// returned; `more` when applied entries were left past them. `Err` once
+    /// the client is gone.
     pub(crate) async fn send(
         &self,
-        events: Vec<ChangeEvent>,
+        batch: ChangeBatch,
+        entries: u64,
         more: bool,
         registry: &ShardConsumerRegistry,
         handle: &RegisteredHandle,
@@ -160,18 +163,16 @@ impl Delivery {
     ) -> Result<(), ()> {
         match self {
             Self::Stream { tx } => {
-                for event in events {
-                    // A slow reader leaves no room in the channel; keep its
-                    // registration alive while waiting, as an idle poll does.
-                    let permit = loop {
-                        match tokio::time::timeout(heartbeat_interval, tx.reserve()).await {
-                            Ok(Ok(permit)) => break permit,
-                            Ok(Err(_)) => return Err(()),
-                            Err(_) => heartbeat(registry, handle),
-                        }
-                    };
-                    permit.send(Ok(event));
-                }
+                // A slow reader leaves no room in the channel; keep its
+                // registration alive while waiting, as an idle poll does.
+                let permit = loop {
+                    match tokio::time::timeout(heartbeat_interval, tx.reserve()).await {
+                        Ok(Ok(permit)) => break permit,
+                        Ok(Err(_)) => return Err(()),
+                        Err(_) => heartbeat(registry, handle),
+                    }
+                };
+                permit.send(Ok(batch));
                 Ok(())
             }
             Self::Session {
@@ -179,10 +180,15 @@ impl Delivery {
                 request_id,
                 credit,
             } => {
-                credit.take(events.len() as u64);
+                credit.take(entries);
                 let frame = ServerFrame {
                     request_id: *request_id,
-                    event: Some(Event::ChangeEvents(ChangeEventBatch { events, more })),
+                    event: Some(Event::ChangeEvents(ChangeEventBatch {
+                        batch: Some(batch),
+                        more,
+                        // At most the credit left, a u32 the client granted.
+                        entries: u32::try_from(entries).unwrap_or(u32::MAX),
+                    })),
                 };
                 frames.send(Ok(frame)).await.map_err(|_| ())
             }

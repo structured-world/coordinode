@@ -69,7 +69,8 @@ mod value;
 pub use config::{ClientConfig, CoordinodeClientBuilder, Transport};
 pub use error::ClientError;
 pub use subscription::{
-    ChangeEvent, ChangeKind, ChangeOp, Position, Retention, SubscribeOptions, Subscription,
+    ChangeAction, ChangeBatch, ChangeDelivery, ChangeEvent, ChangeTarget, ChangeUnit, Cursor,
+    Relationship, Retention, SubscribeOptions, Subscription,
 };
 pub use value::Value;
 

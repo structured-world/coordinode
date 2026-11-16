@@ -584,6 +584,30 @@ fn edgeprop_key(key: &[u8]) -> Option<(Pair<'_>, Option<&[u8]>)> {
     Some(((edge_type, source, target), suffix))
 }
 
+/// The parts of an edge property key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgePropParts<'k> {
+    /// The relationship type's name.
+    pub edge_type: &'k [u8],
+    /// The source node's id.
+    pub source: u64,
+    /// The target node's id.
+    pub target: u64,
+    /// The instance's version or discriminator, when the key names one.
+    pub instance: Option<&'k [u8]>,
+}
+
+/// The parts of an edge property key; `None` for a key of no known shape.
+#[must_use]
+pub fn edgeprop_parts(key: &[u8]) -> Option<EdgePropParts<'_>> {
+    edgeprop_key(key).map(|((edge_type, source, target), instance)| EdgePropParts {
+        edge_type,
+        source,
+        target,
+        instance,
+    })
+}
+
 /// The relationship target an edge property key names.
 fn edge_target(key: Cow<'_, [u8]>) -> Result<Target<'_>, ProjectionError> {
     match edgeprop_key(&key) {

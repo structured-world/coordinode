@@ -3,17 +3,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use coordinode_core::graph::node::{NodeId, NodeRecord, encode_node_key};
 use coordinode_core::txn::proposal::{
-    Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline as _, RaftProposal,
+    Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal, UnitEffects,
 };
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_replicate::{
     ConsumerKind, RegistrationState, RegistryBackground, SeqnoConsumerRegistry,
     ShardConsumerRegistry, TerminalReason,
 };
+use coordinode_storage::engine::change_feed::Interest;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
+use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
 use coordinode_storage::oplog::manager::{OplogManager, RetainedFloor};
 use tokio_stream::StreamExt as _;
@@ -23,9 +28,9 @@ use tonic_types::StatusExt;
 use super::{AppliedFrontier, AppliedSignal, ChangeEventServiceImpl, INCARNATION_METADATA};
 use crate::proto::replication::cdc::change_stream_service_server::ChangeStreamService;
 use crate::proto::replication::cdc::{
-    AcknowledgeSubscriptionRequest, CancelSubscriptionRequest, CdcFilters as ProtoCdcFilters,
-    ConsumerRetention, OrdinaryRetention, ResumeToken as ProtoResumeToken, StrictRetention,
-    SubscribeRequest, consumer_retention,
+    AcknowledgeSubscriptionRequest, CancelSubscriptionRequest, ChangeBatch, ChangeInterest,
+    ConsumerRetention, NameList, OrdinaryRetention, StrictRetention, SubscribeRequest,
+    consumer_retention, logical_change,
 };
 use crate::registry::{RegistryTuning, build_consumer_registry};
 use coordinode_replicate::LogRetentionSource;
@@ -45,10 +50,30 @@ fn open_engine() -> (Arc<StorageEngine>, tempfile::TempDir) {
     (engine, dir)
 }
 
+/// Found `engine`'s deployment with a commit through `pipeline` (a record
+/// keyed by its commit, which binds the history domain first), and name the
+/// group whose log the tests write: the history every cursor binds.
+fn found_history(engine: &StorageEngine, pipeline: &dyn ProposalPipeline) {
+    let oracle = engine.oracle().expect("the store has a clock");
+    let mut txn = Transaction::begin(engine, Some(&oracle), oracle.next());
+    txn.put_stamped(Partition::Schema, b"test:founded:", b"")
+        .expect("stage");
+    let ids = ProposalIdGenerator::new();
+    let wc = WriteConcern::default();
+    txn.commit(&CommitContext {
+        write_concern: &wc,
+        pipeline: Some(pipeline),
+        id_gen: Some(&ids),
+    })
+    .expect("found the deployment");
+    engine.set_log_group(coordinode_core::group::GroupId::FORMING);
+}
+
 /// A service over the log in `dirs`, applied up to `applied`, with the
 /// registry the server builds over the same log.
 struct Fixture {
     service: ChangeEventServiceImpl,
+    engine: Arc<StorageEngine>,
     registry: ShardConsumerRegistry,
     _bg: RegistryBackground,
     _engine_dir: tempfile::TempDir,
@@ -62,24 +87,40 @@ fn fixture(
     tuning: RegistryTuning,
 ) -> Fixture {
     let (engine, engine_dir) = open_engine();
-    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
-        Arc::new(OwnedLocalProposalPipeline::new(&engine));
+    let pipeline: Arc<dyn ProposalPipeline> = Arc::new(OwnedLocalProposalPipeline::new(&engine));
+    found_history(&engine, &*pipeline);
     let source = Arc::new(LogRetentionSource::new(
         Arc::clone(&engine),
         dirs.clone(),
         floor,
         Arc::clone(&applied),
     ));
-    let decisions = coordinode_storage::engine::operations::unit_decisions(Arc::clone(&engine));
     let (registry, bg) =
-        build_consumer_registry(engine, pipeline, source, tuning).expect("registry");
-    let service =
-        ChangeEventServiceImpl::new(0, dirs, registry.clone(), applied, signal, decisions);
+        build_consumer_registry(Arc::clone(&engine), pipeline, source, tuning).expect("registry");
+    let service = ChangeEventServiceImpl::new(
+        0,
+        Arc::clone(&engine),
+        dirs,
+        registry.clone(),
+        applied,
+        signal,
+    );
     Fixture {
         service,
+        engine,
         registry,
         _bg: bg,
         _engine_dir: engine_dir,
+    }
+}
+
+impl Fixture {
+    /// A cursor at `position` following every change.
+    fn cursor_at(&self, position: u64) -> Vec<u8> {
+        self.engine
+            .change_cursor_at(position, Interest::all())
+            .expect("cursor")
+            .to_bytes()
     }
 }
 
@@ -95,11 +136,11 @@ fn ordinary() -> Option<ConsumerRetention> {
     })
 }
 
-/// A request registering `id` anew with `retention`.
+/// A request registering `id` anew with `retention`, following every change.
 fn register(id: &str, retention: Option<ConsumerRetention>) -> SubscribeRequest {
     SubscribeRequest {
-        resume_token: None,
-        filters: None,
+        cursor: Vec::new(),
+        interest: None,
         consumer_id: id.to_string(),
         incarnation: 0,
         retention,
@@ -129,6 +170,35 @@ fn empty_log(dir: &std::path::Path) -> RetainedFloor {
         .retained_floor()
 }
 
+/// The entry at `index` carrying one unit, as a commit writes it: a node
+/// record put and the unit's effect context.
+fn unit_entry(index: u64, ts: u64) -> OplogEntry {
+    let record = NodeRecord::with_labels(Vec::new())
+        .to_msgpack()
+        .expect("record");
+    let frame = coordinode_core::txn::frame::encode_unit(
+        &[
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key: encode_node_key(0, NodeId::from_raw(index + 1)),
+                value: record,
+            },
+            Mutation::Effects(UnitEffects::new()),
+        ],
+        Timestamp::from_raw(ts),
+    )
+    .expect("frame");
+    OplogEntry {
+        ts,
+        term: 1,
+        index,
+        shard: 0,
+        ops: vec![OplogOp::Unit { frame }],
+        is_migration: false,
+        pre_images: None,
+    }
+}
+
 /// Write `count` node-write entries as oplog segments into `dir`, stamped
 /// with the current wall clock so a progress-lag bound sees fresh entries.
 /// Returns where the log starts.
@@ -140,34 +210,40 @@ fn write_oplog(dir: &std::path::Path, count: u64) -> RetainedFloor {
         .expect("clock after the epoch")
         .as_micros() as u64;
     for index in 0..count {
-        mgr.append(&OplogEntry {
-            ts: now_us + index,
-            term: 1,
-            index,
-            shard: 0,
-            ops: vec![OplogOp::Insert {
-                partition: 0,
-                key: format!("node:{index}").into_bytes(),
-                value: b"v".to_vec(),
-            }],
-            is_migration: false,
-            pre_images: None,
-        })
-        .expect("append");
+        mgr.append(&unit_entry(index, now_us + index))
+            .expect("append");
     }
     mgr.flush().expect("flush");
     mgr.retained_floor()
 }
 
-async fn next_index(
+/// The next batch received, within `within`.
+async fn next_batch(
     stream: &mut <ChangeEventServiceImpl as ChangeStreamService>::SubscribeStream,
     within: Duration,
-) -> Option<u64> {
+) -> Option<ChangeBatch> {
     tokio::time::timeout(within, stream.next())
         .await
         .ok()
         .flatten()
-        .map(|event| event.expect("event").log_index)
+        .map(|batch| batch.expect("batch"))
+}
+
+/// The log indexes of the next `count` units received, each within
+/// `within`; fewer when none arrives in time.
+async fn next_units(
+    stream: &mut <ChangeEventServiceImpl as ChangeStreamService>::SubscribeStream,
+    count: usize,
+    within: Duration,
+) -> Vec<u64> {
+    let mut indexes = Vec::new();
+    while indexes.len() < count {
+        let Some(batch) = next_batch(stream, within).await else {
+            break;
+        };
+        indexes.extend(batch.units.iter().map(|u| u.log_index));
+    }
+    indexes
 }
 
 /// A scrape of the ops port shows how far each live consumer is behind and
@@ -302,7 +378,9 @@ fn an_open_stream_is_counted_until_its_client_leaves() {
 }
 
 /// Requests a stream cannot serve are refused up front, and nothing is left
-/// registered for them.
+/// registered for them: a missing id or policy, a cursor no build wrote,
+/// a cursor read with another interest than the request's, and a label
+/// that is not bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn subscribe_refuses_requests_it_cannot_serve() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
@@ -313,6 +391,12 @@ async fn subscribe_refuses_requests_it_cannot_serve() {
         None,
         RegistryTuning::default(),
     );
+    let types = |names: &[&str]| ChangeInterest {
+        labels: None,
+        edge_types: Some(NameList {
+            names: names.iter().map(|n| (*n).to_string()).collect(),
+        }),
+    };
     let cases = [
         (register("", strict()), "no consumer id"),
         (register("c", None), "no retention policy"),
@@ -322,25 +406,30 @@ async fn subscribe_refuses_requests_it_cannot_serve() {
         ),
         (
             SubscribeRequest {
-                resume_token: Some(ProtoResumeToken {
-                    shard_id: 7,
-                    segment_id: 0,
-                    entry_offset: 0,
-                }),
+                cursor: vec![0xFF, 1, 2],
                 ..register("c", strict())
             },
-            "a token for another shard",
+            "bytes no build wrote as a cursor",
         ),
         (
             SubscribeRequest {
-                resume_token: Some(ProtoResumeToken {
-                    shard_id: 0,
-                    segment_id: u64::MAX,
-                    entry_offset: 1,
+                cursor: f.cursor_at(0),
+                interest: Some(types(&["KNOWS"])),
+                ..register("c", strict())
+            },
+            "a cursor read with another interest",
+        ),
+        (
+            SubscribeRequest {
+                interest: Some(ChangeInterest {
+                    labels: Some(NameList {
+                        names: vec!["NeverBound".into()],
+                    }),
+                    edge_types: None,
                 }),
                 ..register("c", strict())
             },
-            "a token past the last log index",
+            "a label that is not bound",
         ),
     ];
     for (request, what) in cases {
@@ -366,20 +455,8 @@ async fn registering_below_the_retained_log_is_refused_with_retention_lost() {
     let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
         .expect("open oplog");
     for index in 0..10u64 {
-        mgr.append(&OplogEntry {
-            ts: 1000 + index,
-            term: 1,
-            index,
-            shard: 0,
-            ops: vec![OplogOp::Insert {
-                partition: 0,
-                key: format!("node:{index}").into_bytes(),
-                value: b"v".to_vec(),
-            }],
-            is_migration: false,
-            pre_images: None,
-        })
-        .expect("append");
+        mgr.append(&unit_entry(index, 1000 + index))
+            .expect("append");
         if index == 4 {
             mgr.rotate().expect("seal");
         }
@@ -397,11 +474,7 @@ async fn registering_below_the_retained_log_is_refused_with_retention_lost() {
     let status = match f
         .service
         .subscribe(Request::new(SubscribeRequest {
-            resume_token: Some(ProtoResumeToken {
-                shard_id: 0,
-                segment_id: 0,
-                entry_offset: 2,
-            }),
+            cursor: f.cursor_at(2),
             ..register("late", strict())
         }))
         .await
@@ -419,19 +492,17 @@ async fn registering_below_the_retained_log_is_refused_with_retention_lost() {
         Some(&"5".to_string())
     );
 
-    // Without a token the same log streams what it holds.
+    // Without a cursor the same log streams what it holds.
     let mut fresh = f
         .service
         .subscribe(Request::new(register("fresh", strict())))
         .await
         .expect("subscribe")
         .into_inner();
-    for expected in 5..10 {
-        assert_eq!(
-            next_index(&mut fresh, Duration::from_secs(5)).await,
-            Some(expected)
-        );
-    }
+    assert_eq!(
+        next_units(&mut fresh, 5, Duration::from_secs(5)).await,
+        vec![5, 6, 7, 8, 9]
+    );
 }
 
 /// An ordinary consumer that stopped keeps nothing of the log: the log is
@@ -445,20 +516,8 @@ async fn a_stopped_ordinary_consumer_learns_its_history_is_gone() {
     let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
         .expect("open oplog");
     for index in 0..10u64 {
-        mgr.append(&OplogEntry {
-            ts: 1000 + index,
-            term: 1,
-            index,
-            shard: 0,
-            ops: vec![OplogOp::Insert {
-                partition: 0,
-                key: format!("node:{index}").into_bytes(),
-                value: b"v".to_vec(),
-            }],
-            is_migration: false,
-            pre_images: None,
-        })
-        .expect("append");
+        mgr.append(&unit_entry(index, 1000 + index))
+            .expect("append");
         if index == 4 {
             mgr.rotate().expect("seal");
         }
@@ -514,8 +573,8 @@ async fn a_stopped_ordinary_consumer_learns_its_history_is_gone() {
     );
 }
 
-/// A change stream sends an entry only once this node has applied it: the
-/// log also holds entries a later leader may replace.
+/// A change stream sends a unit only once this node has applied its entry:
+/// the log also holds entries a later leader may replace.
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_sends_only_applied_entries() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
@@ -537,27 +596,22 @@ async fn stream_sends_only_applied_entries() {
         .expect("subscribe")
         .into_inner();
 
-    for expected in 0..3 {
-        assert_eq!(
-            next_index(&mut stream, Duration::from_secs(5)).await,
-            Some(expected)
-        );
-    }
     assert_eq!(
-        next_index(&mut stream, Duration::from_millis(400)).await,
-        None,
+        next_units(&mut stream, 3, Duration::from_secs(5)).await,
+        vec![0, 1, 2]
+    );
+    assert!(
+        next_batch(&mut stream, Duration::from_millis(400))
+            .await
+            .is_none(),
         "entries 3 and 4 are not applied yet"
     );
     // Only the signal can wake the stream: the heartbeat is far beyond this.
     applied.store(5, Ordering::Release);
     applies.send(5).expect("stream listens");
     assert_eq!(
-        next_index(&mut stream, Duration::from_secs(5)).await,
-        Some(3)
-    );
-    assert_eq!(
-        next_index(&mut stream, Duration::from_secs(5)).await,
-        Some(4)
+        next_units(&mut stream, 2, Duration::from_secs(5)).await,
+        vec![3, 4]
     );
 }
 
@@ -569,36 +623,21 @@ fn checkpoint_of(registry: &ShardConsumerRegistry, id: &str) -> Option<u64> {
         .map(|c| c.checkpoint_seqno)
 }
 
-/// The event received next, within `within`.
-async fn next_event(
-    stream: &mut <ChangeEventServiceImpl as ChangeStreamService>::SubscribeStream,
-    within: Duration,
-) -> Option<crate::proto::replication::cdc::ChangeEvent> {
-    tokio::time::timeout(within, stream.next())
-        .await
-        .ok()
-        .flatten()
-        .map(|event| event.expect("event"))
-}
-
-fn ack(
-    id: &str,
-    incarnation: u64,
-    position: ProtoResumeToken,
-) -> Request<AcknowledgeSubscriptionRequest> {
+fn ack(id: &str, incarnation: u64, cursor: Vec<u8>) -> Request<AcknowledgeSubscriptionRequest> {
     Request::new(AcknowledgeSubscriptionRequest {
         consumer_id: id.to_string(),
         incarnation,
-        position: Some(position),
+        cursor,
     })
 }
 
-/// A stream whose filters match nothing still reads the log and reports how
-/// far with a progress event: no ops, a position past the dropped entries.
-/// Acknowledging it moves the registration, and only that does: a filter
-/// that matches nothing does not have to hold the log forever.
+/// A stream whose interest takes nothing still reads the log and reports
+/// how far: its batch holds every unit it passed, with no event, and a
+/// cursor past them. Acknowledging that cursor moves the registration, and
+/// only that does: an interest that takes nothing does not have to hold the
+/// log forever.
 #[tokio::test(flavor = "multi_thread")]
-async fn filtered_stream_reports_progress_the_client_can_acknowledge() {
+async fn an_interest_taking_nothing_still_moves_a_cursor_the_client_can_acknowledge() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
     let floor = write_oplog(oplog_dir.path(), 5);
     let f = fixture(
@@ -611,9 +650,11 @@ async fn filtered_stream_reports_progress_the_client_can_acknowledge() {
     let mut stream = f
         .service
         .subscribe(Request::new(SubscribeRequest {
-            filters: Some(ProtoCdcFilters {
-                edge_types: vec!["NEVER_WRITTEN".to_string()],
-                is_migration: None,
+            interest: Some(ChangeInterest {
+                labels: Some(NameList { names: Vec::new() }),
+                edge_types: Some(NameList {
+                    names: vec!["NEVER_WRITTEN".to_string()],
+                }),
             }),
             ..register("filtered", strict())
         }))
@@ -621,12 +662,17 @@ async fn filtered_stream_reports_progress_the_client_can_acknowledge() {
         .expect("subscribe")
         .into_inner();
 
-    let progress = next_event(&mut stream, Duration::from_secs(5))
+    let batch = next_batch(&mut stream, Duration::from_secs(5))
         .await
-        .expect("a progress event");
-    assert!(progress.ops.is_empty(), "no entry matched the filter");
-    let position = progress.position.expect("a position");
-    assert_eq!((position.segment_id, position.entry_offset), (5, 0));
+        .expect("a batch");
+    assert_eq!(batch.units.len(), 5, "every unit passed is in the batch");
+    assert!(
+        batch
+            .units
+            .iter()
+            .all(|u| u.events.is_empty() && u.projected == 1),
+        "the units have their event, which the interest does not take: {batch:?}"
+    );
     assert_eq!(
         checkpoint_of(&f.registry, "filtered"),
         Some(0),
@@ -634,20 +680,21 @@ async fn filtered_stream_reports_progress_the_client_can_acknowledge() {
     );
 
     f.service
-        .acknowledge_subscription(ack("filtered", 1, position))
+        .acknowledge_subscription(ack("filtered", 1, batch.cursor))
         .await
         .expect("acknowledge");
     assert_eq!(checkpoint_of(&f.registry, "filtered"), Some(5));
-    assert_eq!(
-        next_index(&mut stream, Duration::from_millis(200)).await,
-        None,
-        "no further entry matched the filter"
+    assert!(
+        next_batch(&mut stream, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "nothing further was applied"
     );
 }
 
-/// Events a client never got are sent again: a stream that queued a batch
-/// and was dropped unread moved nothing, so resuming without a token starts
-/// at the same place and re-sends the batch.
+/// Units a client never got are sent again: a stream that queued a batch and
+/// was dropped unread moved nothing, so resuming without a cursor starts at
+/// the same place and re-sends it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_dropped_unread_is_sent_again_on_resume() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
@@ -671,7 +718,7 @@ async fn a_batch_dropped_unread_is_sent_again_on_resume() {
     assert_eq!(
         checkpoint_of(&f.registry, "dropper"),
         Some(0),
-        "queued events are not delivered"
+        "queued batches are not delivered"
     );
 
     let mut resumed = f
@@ -680,19 +727,17 @@ async fn a_batch_dropped_unread_is_sent_again_on_resume() {
         .await
         .expect("resume")
         .into_inner();
-    for expected in 0..5 {
-        assert_eq!(
-            next_index(&mut resumed, Duration::from_secs(5)).await,
-            Some(expected),
-            "the unread batch comes again"
-        );
-    }
+    assert_eq!(
+        next_units(&mut resumed, 5, Duration::from_secs(5)).await,
+        vec![0, 1, 2, 3, 4],
+        "the unread batch comes again"
+    );
 }
 
-/// Only a position the client could have received releases history: one
-/// past what this node applied is refused, one for another shard too, an
-/// earlier one than already acknowledged changes nothing, and an
-/// acknowledgement for another incarnation is refused.
+/// Only a cursor the client could have received releases history: one past
+/// what this node applied is refused, one of another history or no cursor
+/// at all too, an earlier one than already acknowledged changes nothing,
+/// and an acknowledgement for another incarnation is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn acknowledgements_release_only_what_was_received() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
@@ -709,31 +754,28 @@ async fn acknowledgements_release_only_what_was_received() {
         .subscribe(Request::new(register("acker", strict())))
         .await
         .expect("subscribe");
-    let at = |index: u64| ProtoResumeToken {
-        shard_id: 0,
-        segment_id: index,
-        entry_offset: 0,
-    };
 
     let past = f
         .service
-        .acknowledge_subscription(ack("acker", 1, at(4)))
+        .acknowledge_subscription(ack("acker", 1, f.cursor_at(4)))
         .await
         .expect_err("past the applied entries");
     assert_eq!(past.code(), Code::InvalidArgument);
-    let other_shard = f
+    // A cursor of another deployment: its history byte range differs.
+    let mut foreign = f.cursor_at(1);
+    foreign[2] ^= 0xFF;
+    let other_history = f
         .service
-        .acknowledge_subscription(ack(
-            "acker",
-            1,
-            ProtoResumeToken {
-                shard_id: 9,
-                ..at(1)
-            },
-        ))
+        .acknowledge_subscription(ack("acker", 1, foreign))
         .await
-        .expect_err("another shard");
-    assert_eq!(other_shard.code(), Code::InvalidArgument);
+        .expect_err("another history");
+    assert_eq!(other_history.code(), Code::InvalidArgument);
+    let none = f
+        .service
+        .acknowledge_subscription(ack("acker", 1, Vec::new()))
+        .await
+        .expect_err("no cursor");
+    assert_eq!(none.code(), Code::InvalidArgument);
     assert_eq!(
         checkpoint_of(&f.registry, "acker"),
         Some(0),
@@ -741,28 +783,28 @@ async fn acknowledgements_release_only_what_was_received() {
     );
 
     f.service
-        .acknowledge_subscription(ack("acker", 1, at(3)))
+        .acknowledge_subscription(ack("acker", 1, f.cursor_at(3)))
         .await
         .expect("acknowledge what was applied");
     f.service
-        .acknowledge_subscription(ack("acker", 1, at(1)))
+        .acknowledge_subscription(ack("acker", 1, f.cursor_at(1)))
         .await
-        .expect("an earlier position is accepted");
+        .expect("an earlier cursor is accepted");
     assert_eq!(
         checkpoint_of(&f.registry, "acker"),
         Some(3),
-        "an earlier position does not move it back"
+        "an earlier cursor does not move it back"
     );
 
     let stale = f
         .service
-        .acknowledge_subscription(ack("acker", 2, at(3)))
+        .acknowledge_subscription(ack("acker", 2, f.cursor_at(3)))
         .await
         .expect_err("another incarnation");
     assert_eq!(stale.code(), Code::FailedPrecondition);
 }
 
-/// A consumer reconnecting to its incarnation without a token continues
+/// A consumer reconnecting to its incarnation without a cursor continues
 /// from its last acknowledgement, not from the start of the log.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resumed_stream_continues_where_its_registration_stands() {
@@ -784,16 +826,18 @@ async fn a_resumed_stream_continues_where_its_registration_stands() {
         .await
         .expect("subscribe")
         .into_inner();
+    let mut indexes = Vec::new();
     let mut last = None;
-    for expected in 0..5 {
-        let event = next_event(&mut first, Duration::from_secs(5))
+    while indexes.len() < 5 {
+        let batch = next_batch(&mut first, Duration::from_secs(5))
             .await
-            .expect("an event");
-        assert_eq!(event.log_index, expected);
-        last = event.position;
+            .expect("a batch");
+        indexes.extend(batch.units.iter().map(|u| u.log_index));
+        last = Some(batch.cursor);
     }
+    assert_eq!(indexes, vec![0, 1, 2, 3, 4]);
     f.service
-        .acknowledge_subscription(ack("resumer", 1, last.expect("a position")))
+        .acknowledge_subscription(ack("resumer", 1, last.expect("a cursor")))
         .await
         .expect("acknowledge what was read");
     assert_eq!(checkpoint_of(&f.registry, "resumer"), Some(5));
@@ -807,12 +851,75 @@ async fn a_resumed_stream_continues_where_its_registration_stands() {
         .await
         .expect("resume")
         .into_inner();
-    for expected in 5..8 {
-        assert_eq!(
-            next_index(&mut resumed, Duration::from_secs(5)).await,
-            Some(expected)
-        );
-    }
+    assert_eq!(
+        next_units(&mut resumed, 3, Duration::from_secs(5)).await,
+        vec![5, 6, 7]
+    );
+}
+
+/// A unit recorded without the context that says what it means cannot be
+/// projected: the stream ends with CHANGE_FEED_UNSUPPORTED at its entry,
+/// having handed over the units before it, and never passes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unit_without_its_context_ends_the_stream_explicitly() {
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog");
+    mgr.append(&unit_entry(0, 1000)).expect("append");
+    let bare = coordinode_core::txn::frame::encode_unit(
+        &[Mutation::Put {
+            partition: PartitionId::Node,
+            key: encode_node_key(0, NodeId::from_raw(9)),
+            value: NodeRecord::with_labels(Vec::new())
+                .to_msgpack()
+                .expect("record"),
+        }],
+        Timestamp::from_raw(1001),
+    )
+    .expect("frame");
+    mgr.append(&OplogEntry {
+        ts: 1001,
+        term: 1,
+        index: 1,
+        shard: 0,
+        ops: vec![OplogOp::Unit { frame: bare }],
+        is_migration: false,
+        pre_images: None,
+    })
+    .expect("append");
+    mgr.flush().expect("flush");
+    let mut f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
+        Arc::new(|| 2),
+        None,
+        RegistryTuning::default(),
+    );
+    // One entry a batch, so the unit before is handed over first.
+    f.service = f.service.with_tuning(super::CdcStreamTuning {
+        batch_size: std::num::NonZeroUsize::new(1).expect("nonzero"),
+        ..super::CdcStreamTuning::default()
+    });
+    let mut stream = f
+        .service
+        .subscribe(Request::new(register("strict-reader", strict())))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    assert_eq!(
+        next_units(&mut stream, 1, Duration::from_secs(5)).await,
+        vec![0]
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream is told")
+        .expect("an item");
+    let status = ended.expect_err("the stream ends with the refusal");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo");
+    assert_eq!(info.reason, "CHANGE_FEED_UNSUPPORTED");
+    assert_eq!(info.metadata.get("log_index"), Some(&"1".to_string()));
 }
 
 /// A live id cannot be registered a second time: ALREADY_EXISTS, and the
@@ -1018,8 +1125,8 @@ fn a_registration_refused_under_pressure_is_retryable_backpressure() {
 }
 
 /// The service the server builds for a Raft node streams what the node
-/// commits: up to the node's applied entries, each event carrying the
-/// proposal's commit timestamp and the leader's term.
+/// commits: up to the node's applied entries, each unit carrying the
+/// proposal's commit timestamp and its node put.
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_follows_a_raft_node() {
     let (engine, _engine_dir) = open_engine();
@@ -1028,8 +1135,8 @@ async fn stream_follows_a_raft_node() {
             .await
             .expect("bootstrap"),
     );
-    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
-        Arc::new(node.pipeline());
+    let pipeline: Arc<dyn ProposalPipeline> = Arc::new(node.pipeline());
+    found_history(&engine, &*pipeline);
     let applied_node = Arc::clone(&node);
     let source = Arc::new(LogRetentionSource::new(
         Arc::clone(&engine),
@@ -1041,7 +1148,7 @@ async fn stream_follows_a_raft_node() {
     ));
     let (registry, _bg) = build_consumer_registry(
         Arc::clone(&engine),
-        pipeline,
+        Arc::clone(&pipeline),
         source,
         RegistryTuning::default(),
     )
@@ -1059,17 +1166,23 @@ async fn stream_follows_a_raft_node() {
     let oracle = engine.oracle().expect("the store has a clock");
     let raft_pipeline = node.pipeline();
     let ids = ProposalIdGenerator::new();
+    let record = NodeRecord::with_labels(Vec::new())
+        .to_msgpack()
+        .expect("record");
     let mut committed = Vec::new();
     for i in 1..=3u64 {
         let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
         raft_pipeline
             .propose_and_wait(&RaftProposal {
                 id: ids.next(),
-                mutations: vec![Mutation::Put {
-                    partition: PartitionId::Node,
-                    key: format!("cdc-{i}").into_bytes(),
-                    value: b"v".to_vec(),
-                }],
+                mutations: vec![
+                    Mutation::Put {
+                        partition: PartitionId::Node,
+                        key: encode_node_key(0, NodeId::from_raw(100 + i)),
+                        value: record.clone(),
+                    },
+                    Mutation::Effects(UnitEffects::new()),
+                ],
                 commit_ts: Timestamp::from_raw(ts),
                 start_ts: Timestamp::from_raw(ts),
                 bypass_rate_limiter: false,
@@ -1081,14 +1194,20 @@ async fn stream_follows_a_raft_node() {
 
     let mut seen = Vec::new();
     while seen.len() < 3 {
-        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        let batch = tokio::time::timeout(Duration::from_secs(10), stream.next())
             .await
-            .expect("an event for every committed proposal")
+            .expect("a batch for every committed proposal")
             .expect("stream open")
-            .expect("event");
-        if committed.contains(&event.ts) {
-            assert!(event.term >= 1, "the leader's term, got {}", event.term);
-            seen.push(event.ts);
+            .expect("batch");
+        for unit in batch.units {
+            if committed.contains(&unit.commit_ts) {
+                let node = unit.events.iter().find_map(|e| match &e.target {
+                    Some(logical_change::Target::Node(node)) => Some(node.node_id),
+                    _ => None,
+                });
+                assert!(node.is_some_and(|id| id > 100), "{unit:?}");
+                seen.push(unit.commit_ts);
+            }
         }
     }
     assert_eq!(seen, committed);

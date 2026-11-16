@@ -10,7 +10,7 @@
 //! behind what the log keeps is told so rather than skipped forward.
 
 use coordinode_core::budget::{MemoryCharge, QueryBudget};
-use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+use coordinode_modality::change_interest::{InterestRefusal, resolve_change_interest};
 use coordinode_storage::engine::change_feed::{ChangeBatch, ChangeCursor, Interest};
 
 use super::{Database, DatabaseError};
@@ -41,44 +41,16 @@ impl Database {
     /// bound to now: a label dropped and created again later is another
     /// label, whose nodes this interest does not follow.
     fn change_interest(&self, interest: &ChangeInterest) -> Result<Interest, DatabaseError> {
-        let labels = match &interest.labels {
-            None => None,
-            Some(names) => {
-                // A node carries a label its type implies without storing it,
-                // and what a type implies can change after the node is
-                // written: following such a label needs the implications as
-                // each unit committed under them, which the feed does not
-                // read yet.
-                let implied: Vec<String> = self
-                    .label_schemas()?
-                    .into_iter()
-                    .flat_map(|schema| schema.implies().to_vec())
-                    .collect();
-                let store = LocalSchemaStore::new(&self.engine);
-                let mut ids = Vec::with_capacity(names.len());
-                for name in names {
-                    if implied.iter().any(|i| i == name) {
-                        return Err(DatabaseError::Unsupported(format!(
-                            "following :{name} by its changes: a type implies it, and the \
-                             change feed does not route by implied labels yet"
-                        )));
-                    }
-                    let id = store
-                        .label_id(name)
-                        .map_err(coordinode_query::executor::ExecutionError::from)?
-                        .ok_or_else(|| {
-                            DatabaseError::Semantic(format!("label :{name} is not bound"))
-                        })?;
-                    ids.push(id);
-                }
-                Some(ids)
-            }
-        };
-        let edge_types = interest
-            .edge_types
-            .as_ref()
-            .map(|names| names.iter().map(|n| n.as_bytes().to_vec()).collect());
-        Ok(Interest::new(labels, edge_types))
+        let resolved = resolve_change_interest(
+            &self.engine,
+            interest.labels.as_deref(),
+            interest.edge_types.as_deref(),
+        )
+        .map_err(coordinode_query::executor::ExecutionError::from)?;
+        resolved.map_err(|refusal| match refusal {
+            InterestRefusal::Unbound(_) => DatabaseError::Semantic(refusal.to_string()),
+            InterestRefusal::Implied(_) => DatabaseError::Unsupported(refusal.to_string()),
+        })
     }
 
     /// A cursor after every change committed and durable now: a reader

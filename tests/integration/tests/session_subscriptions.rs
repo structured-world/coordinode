@@ -112,8 +112,8 @@ impl Session {
 fn subscribe(consumer_id: &str, credit: u32) -> client_frame::Op {
     client_frame::Op::Subscribe(Subscribe {
         request: Some(SubscribeRequest {
-            resume_token: None,
-            filters: None,
+            cursor: Vec::new(),
+            interest: None,
             consumer_id: consumer_id.to_string(),
             incarnation: 0,
             retention: Some(ConsumerRetention {
@@ -124,13 +124,14 @@ fn subscribe(consumer_id: &str, credit: u32) -> client_frame::Op {
     })
 }
 
-/// Events in the change-event batches among `frames` for `request_id`.
-fn events_for(frames: &[ServerFrame], request_id: u64) -> usize {
+/// Log entries the change batches among `frames` for `request_id` passed:
+/// the credit they used.
+fn entries_for(frames: &[ServerFrame], request_id: u64) -> u32 {
     frames
         .iter()
         .filter(|f| f.request_id == request_id)
         .map(|f| match &f.event {
-            Some(Event::ChangeEvents(batch)) => batch.events.len(),
+            Some(Event::ChangeEvents(batch)) => batch.entries,
             _ => 0,
         })
         .sum()
@@ -150,11 +151,11 @@ fn last_more(frames: &[ServerFrame], request_id: u64) -> bool {
         .expect("a batch")
 }
 
-/// A subscription is sent exactly as many events as its client granted, in
-/// batches; more credit releases more. A batch cut short by the credit says
-/// more is waiting, and the one that reaches everything applied says not. A
-/// subscription with no credit left sends nothing and does not hold up the
-/// session's queries.
+/// A subscription reads exactly as many log entries as its client granted,
+/// in batches; more credit releases more. A batch cut short by the credit
+/// says more is waiting, and the one that reaches everything applied says
+/// not. A subscription with no credit left sends nothing and does not hold
+/// up the session's queries.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subscription_is_sent_what_its_credit_allows() {
     let proc = CoordinodeProcess::start().await;
@@ -174,7 +175,7 @@ async fn a_subscription_is_sent_what_its_credit_allows() {
     while let Some(frame) = s.next(Duration::from_millis(500)).await {
         frames.push(frame);
     }
-    assert_eq!(events_for(&frames, 1), 3, "the initial credit");
+    assert_eq!(entries_for(&frames, 1), 3, "the initial credit");
     assert!(last_more(&frames, 1), "the log holds more than 3 entries");
 
     // Out of credit: a query on the same session still answers at once.
@@ -192,7 +193,7 @@ async fn a_subscription_is_sent_what_its_credit_allows() {
         frames.push(frame);
     }
     assert_eq!(
-        events_for(&frames, 1),
+        entries_for(&frames, 1),
         7,
         "the initial and the granted credit"
     );
@@ -209,7 +210,7 @@ async fn a_subscription_is_sent_what_its_credit_allows() {
     while let Some(frame) = s.next(Duration::from_millis(500)).await {
         frames.push(frame);
     }
-    assert!(events_for(&frames, 1) > 7, "the rest of the log");
+    assert!(entries_for(&frames, 1) > 7, "the rest of the log");
     assert!(!last_more(&frames, 1), "drained to what was applied");
 }
 
@@ -228,14 +229,10 @@ async fn acknowledging_and_cancelling_ride_the_session() {
         Event::Subscribed(sub) => sub.incarnation,
         other => panic!("expected Subscribed, got {other:?}"),
     };
-    let position = loop {
-        let frame = s.next(Duration::from_secs(10)).await.expect("events");
+    let cursor = loop {
+        let frame = s.next(Duration::from_secs(10)).await.expect("batches");
         if let (1, Some(Event::ChangeEvents(batch))) = (frame.request_id, &frame.event) {
-            break batch
-                .events
-                .last()
-                .and_then(|e| e.position)
-                .expect("a position");
+            break batch.batch.as_ref().expect("a batch").cursor.clone();
         }
     };
 
@@ -244,7 +241,7 @@ async fn acknowledging_and_cancelling_ride_the_session() {
         client_frame::Op::Acknowledge(AcknowledgeSubscriptionRequest {
             consumer_id: "acker".to_string(),
             incarnation,
-            position: Some(position),
+            cursor,
         }),
     )
     .await;
@@ -299,11 +296,14 @@ async fn acknowledging_and_cancelling_ride_the_session() {
 }
 
 /// The driver's subscription drains a backlog larger than its window by
-/// granting credit as batches are taken, and a subscription resumed after an
-/// acknowledgement starts right past it.
+/// granting credit as batches are taken, each node written arriving as a
+/// node put, and a subscription resumed after an acknowledgement starts
+/// right past it.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_driver_drains_and_resumes_after_its_acknowledgement() {
-    use coordinode_client::{CoordinodeClient, Retention, SubscribeOptions};
+    use coordinode_client::{
+        ChangeAction, ChangeTarget, ChangeUnit, CoordinodeClient, Retention, SubscribeOptions,
+    };
 
     let proc = CoordinodeProcess::start().await;
     let mut client = CoordinodeClient::connect(proc.endpoint())
@@ -315,14 +315,12 @@ async fn the_driver_drains_and_resumes_after_its_acknowledgement() {
             .await
             .expect("write");
     }
-    let node_inserts = |events: &[coordinode_client::ChangeEvent]| {
-        events
+    let node_puts = |units: &[ChangeUnit]| {
+        units
             .iter()
-            .flat_map(|e| &e.ops)
-            .filter(|op| {
-                op.kind == coordinode_client::ChangeKind::Insert
-                    && op.key.len() == 16
-                    && op.key.starts_with(b"node:")
+            .flat_map(|u| &u.events)
+            .filter(|e| {
+                e.action == ChangeAction::Put && matches!(e.target, Some(ChangeTarget::Node { .. }))
             })
             .count()
     };
@@ -333,17 +331,18 @@ async fn the_driver_drains_and_resumes_after_its_acknowledgement() {
         .expect("subscribe");
     let incarnation = sub.incarnation();
     let mut seen = Vec::new();
-    while node_inserts(&seen) < 20 {
+    let mut cursor = None;
+    while node_puts(&seen) < 20 {
         let batch = tokio::time::timeout(Duration::from_secs(10), sub.next())
             .await
             .expect("the backlog drains")
             .expect("a batch")
             .expect("session open");
-        assert!(batch.len() <= 4, "a batch within the window");
-        seen.extend(batch);
+        seen.extend(batch.units);
+        cursor = Some(batch.cursor);
     }
-    let last = seen.last().expect("events").position;
-    sub.acknowledge(last).await.expect("acknowledge");
+    let cursor = cursor.expect("a cursor");
+    sub.acknowledge(&cursor).await.expect("acknowledge");
     drop(sub);
 
     client
@@ -361,9 +360,10 @@ async fn the_driver_drains_and_resumes_after_its_acknowledgement() {
         .expect("session open");
     assert!(
         batch
+            .units
             .iter()
-            .all(|e| e.log_index > seen.last().expect("seen").log_index),
-        "resumed past the acknowledged position"
+            .all(|u| u.log_index > seen.last().expect("seen").log_index),
+        "resumed past the acknowledged cursor"
     );
     resumed.cancel_registration().await.expect("cancel");
 }

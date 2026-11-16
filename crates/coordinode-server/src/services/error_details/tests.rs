@@ -109,6 +109,7 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::ConstraintViolation,
         Reason::RetentionLost,
         Reason::ConsumerTerminated,
+        Reason::ChangeFeedUnsupported,
     ];
     let mut seen = std::collections::BTreeSet::new();
     for reason in all {

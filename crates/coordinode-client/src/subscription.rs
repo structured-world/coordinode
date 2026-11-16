@@ -2,10 +2,11 @@
 //!
 //! A subscription reads as a consumer registered on the server with a
 //! retention policy; the registration outlives the subscription and the
-//! connection, so a consumer resumes it later by its incarnation. Events
-//! arrive in batches. The driver grants the server credit as the caller takes
+//! connection, so a consumer resumes it later by its incarnation. Committed
+//! transactions arrive as units of logical events, in batches with the
+//! cursor after them. The driver grants the server credit as the caller takes
 //! batches, so a caller that stops reading stops the server sending, and
-//! drains at once when the server says applied events are waiting.
+//! drains at once when the server says applied entries are waiting.
 
 use std::sync::Arc;
 
@@ -13,57 +14,59 @@ use tokio::sync::mpsc;
 
 use crate::error::ClientError;
 use crate::proto::replication::{
-    AcknowledgeSubscriptionRequest, CancelSubscriptionRequest, CdcFilters, ChangeOpType,
-    ConsumerRetention, OrdinaryRetention, ResumeToken, StrictRetention, SubscribeRequest,
-    consumer_retention,
+    AcknowledgeSubscriptionRequest, CancelSubscriptionRequest, ChangeInterest, ConsumerRetention,
+    NameList, OrdinaryRetention, StrictRetention, SubscribeRequest, consumer_retention,
+    logical_change,
 };
 use crate::proto::session::server_frame::Event;
 use crate::proto::session::{Cancel, Credit, Subscribe, client_frame};
 use crate::session::{SessionLink, error_status};
 
-/// Events granted to the server at a time unless set otherwise.
+/// Log entries granted to the server at a time unless set otherwise.
 pub const DEFAULT_WINDOW: u32 = 256;
 
 /// Whether a consumer's registration protects the history it still needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retention {
-    /// The server keeps every event from the acknowledged position until the
+    /// The server keeps every entry from the acknowledged cursor until the
     /// registration is cancelled.
     Strict,
-    /// The registration records the acknowledged position only; the server's
+    /// The registration records the acknowledged cursor only; the server's
     /// own log retention decides how far back it reaches. A position it no
     /// longer holds is refused as retention lost, and the consumer rebuilds.
     Ordinary,
 }
 
-/// Which consumer a subscription reads as and from where.
+/// Which consumer a subscription reads as, what it follows and from where.
 #[derive(Debug, Clone)]
 pub struct SubscribeOptions {
     consumer_id: String,
     /// `None` resumes `incarnation`.
     retention: Option<Retention>,
     incarnation: u64,
-    from: Option<Position>,
-    edge_types: Vec<String>,
+    from: Option<Cursor>,
+    labels: Option<Vec<String>>,
+    edge_types: Option<Vec<String>>,
     window: u32,
 }
 
 impl SubscribeOptions {
-    /// Register `consumer_id` anew with `retention`, reading from the oldest
-    /// event the server holds.
+    /// Register `consumer_id` anew with `retention`, following every change
+    /// from the oldest the server holds.
     pub fn register(consumer_id: impl Into<String>, retention: Retention) -> Self {
         Self {
             consumer_id: consumer_id.into(),
             retention: Some(retention),
             incarnation: 0,
             from: None,
-            edge_types: Vec::new(),
+            labels: None,
+            edge_types: None,
             window: DEFAULT_WINDOW,
         }
     }
 
     /// Resume the live registration `incarnation` of `consumer_id`, reading
-    /// from its last acknowledged position.
+    /// from its last acknowledged cursor.
     pub fn resume(consumer_id: impl Into<String>, incarnation: u64) -> Self {
         Self {
             retention: None,
@@ -72,21 +75,29 @@ impl SubscribeOptions {
         }
     }
 
-    /// Read from `position` instead.
-    pub fn from(mut self, position: Position) -> Self {
-        self.from = Some(position);
+    /// Read from `cursor` instead: the cursor of a batch received with the
+    /// same interest.
+    pub fn from(mut self, cursor: Cursor) -> Self {
+        self.from = Some(cursor);
         self
     }
 
-    /// Keep only events touching one of `edge_types`.
+    /// Follow the nodes of `labels` only: a node event arrives when the node
+    /// carries one of them before or after it.
+    pub fn labels(mut self, labels: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.labels = Some(labels.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Follow the relationships of `edge_types` only.
     pub fn edge_types(mut self, edge_types: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.edge_types = edge_types.into_iter().map(Into::into).collect();
+        self.edge_types = Some(edge_types.into_iter().map(Into::into).collect());
         self
     }
 
-    /// Grant the server `events` at a time (at least 1).
-    pub fn window(mut self, events: u32) -> Self {
-        self.window = events.max(1);
+    /// Grant the server `entries` log entries at a time (at least 1).
+    pub fn window(mut self, entries: u32) -> Self {
+        self.window = entries.max(1);
         self
     }
 
@@ -97,11 +108,16 @@ impl SubscribeOptions {
                 Retention::Ordinary => consumer_retention::Policy::Ordinary(OrdinaryRetention {}),
             }),
         });
+        let names = |list: &Option<Vec<String>>| {
+            list.as_ref().map(|names| NameList {
+                names: names.clone(),
+            })
+        };
         SubscribeRequest {
-            resume_token: self.from.map(Position::to_proto),
-            filters: (!self.edge_types.is_empty()).then(|| CdcFilters {
-                edge_types: self.edge_types.clone(),
-                is_migration: None,
+            cursor: self.from.as_ref().map(|c| c.0.clone()).unwrap_or_default(),
+            interest: Some(ChangeInterest {
+                labels: names(&self.labels),
+                edge_types: names(&self.edge_types),
             }),
             consumer_id: self.consumer_id.clone(),
             incarnation: self.incarnation,
@@ -110,120 +126,200 @@ impl SubscribeOptions {
     }
 }
 
-/// Where a stream continues after an event: pass it to
-/// [`Subscription::acknowledge`] once the event is held, or to
-/// [`SubscribeOptions::from`] to read from there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Position {
-    shard_id: u32,
-    segment_id: u64,
-    entry_offset: u64,
-}
+/// Where a stream continues after a batch: pass it to
+/// [`Subscription::acknowledge`] once the batch is held, or to
+/// [`SubscribeOptions::from`] to read from there. Opaque bytes to save with
+/// what the caller built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor(Vec<u8>);
 
-impl Position {
-    fn from_proto(token: ResumeToken) -> Self {
-        Self {
-            shard_id: token.shard_id,
-            segment_id: token.segment_id,
-            entry_offset: token.entry_offset,
-        }
+impl Cursor {
+    /// The cursor's bytes, to save.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 
-    fn to_proto(self) -> ResumeToken {
-        ResumeToken {
-            shard_id: self.shard_id,
-            segment_id: self.segment_id,
-            entry_offset: self.entry_offset,
-        }
+    /// A cursor saved as `bytes`.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
     }
 }
 
-/// What one mutation of an event does.
+/// What an event does to its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeKind {
-    /// Writes `value` at `key`.
-    Insert,
-    /// Deletes `key`.
-    Delete,
-    /// Merges the operand `value` into `key`.
-    Merge,
-    /// Changes nothing.
-    Noop,
-    /// A Raft log record.
-    RaftEntry,
-    /// A Raft log truncation.
-    RaftTruncation,
-    /// Deletes every key in `[key, value)`.
-    RemoveRange,
-    /// A kind this driver does not know.
+pub enum ChangeAction {
+    /// The target is written whole: replaced, or it comes to exist.
+    Put,
+    /// The target changes by the payload's delta.
+    Patch,
+    /// The target ceases to exist.
+    Remove,
+    /// An action this driver does not know.
     Other(i32),
 }
 
-impl ChangeKind {
-    fn from_proto(kind: i32) -> Self {
-        match ChangeOpType::try_from(kind) {
-            Ok(ChangeOpType::Insert) => Self::Insert,
-            Ok(ChangeOpType::Delete) => Self::Delete,
-            Ok(ChangeOpType::Merge) => Self::Merge,
-            Ok(ChangeOpType::Noop) => Self::Noop,
-            Ok(ChangeOpType::RaftEntry) => Self::RaftEntry,
-            Ok(ChangeOpType::RaftTruncation) => Self::RaftTruncation,
-            Ok(ChangeOpType::RemoveRange) => Self::RemoveRange,
-            Ok(ChangeOpType::Unspecified) | Err(_) => Self::Other(kind),
+/// How a node event reaches the labels the subscription follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeDelivery {
+    /// The node stays in the subscription's scope: the event applies.
+    Apply,
+    /// The node joins the scope with the record the event writes.
+    Enter,
+    /// The node leaves the scope: deleted, relabelled or retyped out of it.
+    Leave,
+    /// A delivery this driver does not know.
+    Other(i32),
+}
+
+/// A relationship by type and endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relationship {
+    /// The relationship type's name.
+    pub edge_type: String,
+    /// The source node's id.
+    pub source_id: u64,
+    /// The target node's id.
+    pub target_id: u64,
+}
+
+/// What an event changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeTarget {
+    /// A node's record, or one version of a temporal node.
+    Node {
+        /// The node's id.
+        node_id: u64,
+        /// The version's start for a temporal node, in milliseconds.
+        valid_from: Option<i64>,
+    },
+    /// A relationship's presence.
+    Relationship(Relationship),
+    /// The properties of a relationship that is neither versioned nor
+    /// discriminated.
+    Properties(Relationship),
+    /// One version or discriminated instance of a relationship.
+    Instance {
+        /// The relationship.
+        relationship: Relationship,
+        /// The version or discriminator, in its key encoding.
+        instance: Vec<u8>,
+    },
+}
+
+/// One effect of a committed transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeEvent {
+    /// Its place among the transaction's events, the same for every
+    /// subscription and delivery.
+    pub ordinal: u32,
+    /// What it does.
+    pub action: ChangeAction,
+    /// What it changes; `None` for a target this driver does not know.
+    pub target: Option<ChangeTarget>,
+    /// The record or properties a put writes, the delta a patch applies, in
+    /// the storage encoding.
+    pub payload: Vec<u8>,
+    /// How a node event reaches the subscription's labels.
+    pub delivery: ChangeDelivery,
+    /// The labels a node carried before the transaction.
+    pub labels_before: Vec<String>,
+    /// The labels a node carries after the event.
+    pub labels_after: Vec<String>,
+}
+
+/// One committed transaction: the events of it the subscription takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeUnit {
+    /// Its commit timestamp (HLC microseconds).
+    pub commit_ts: u64,
+    /// The log index of the entry carrying it.
+    pub log_index: u64,
+    /// Its place among the transactions of that entry.
+    pub unit: u32,
+    /// How many events it has in all, taken by the subscription or not.
+    pub projected: u32,
+    /// The events the subscription takes, in ordinal order.
+    pub events: Vec<ChangeEvent>,
+}
+
+/// Units read from the log and the cursor after them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeBatch {
+    /// The units, in log order; none when the entries read carried none.
+    pub units: Vec<ChangeUnit>,
+    /// Where the stream continues after them.
+    pub cursor: Cursor,
+}
+
+fn relationship(target: crate::proto::replication::RelationshipTarget) -> Relationship {
+    Relationship {
+        edge_type: target.edge_type,
+        source_id: target.source_id,
+        target_id: target.target_id,
+    }
+}
+
+impl ChangeEvent {
+    fn from_proto(event: crate::proto::replication::LogicalChange) -> Self {
+        use crate::proto::replication::{
+            ChangeAction as ProtoAction, ChangeDelivery as ProtoDelivery,
+        };
+        let target = event.target.map(|target| match target {
+            logical_change::Target::Node(node) => ChangeTarget::Node {
+                node_id: node.node_id,
+                valid_from: node.valid_from,
+            },
+            logical_change::Target::Relationship(r) => ChangeTarget::Relationship(relationship(r)),
+            logical_change::Target::Properties(r) => ChangeTarget::Properties(relationship(r)),
+            logical_change::Target::Instance(r) => {
+                let instance = r.instance.clone();
+                ChangeTarget::Instance {
+                    relationship: relationship(r),
+                    instance,
+                }
+            }
+        });
+        Self {
+            ordinal: event.ordinal,
+            action: match ProtoAction::try_from(event.action) {
+                Ok(ProtoAction::Put) => ChangeAction::Put,
+                Ok(ProtoAction::Patch) => ChangeAction::Patch,
+                Ok(ProtoAction::Remove) => ChangeAction::Remove,
+                Ok(ProtoAction::Unspecified) | Err(_) => ChangeAction::Other(event.action),
+            },
+            target,
+            payload: event.payload,
+            delivery: match ProtoDelivery::try_from(event.delivery) {
+                Ok(ProtoDelivery::Apply) => ChangeDelivery::Apply,
+                Ok(ProtoDelivery::Enter) => ChangeDelivery::Enter,
+                Ok(ProtoDelivery::Leave) => ChangeDelivery::Leave,
+                Ok(ProtoDelivery::Unspecified) | Err(_) => ChangeDelivery::Other(event.delivery),
+            },
+            labels_before: event.labels_before,
+            labels_after: event.labels_after,
         }
     }
 }
 
-/// One storage mutation of a [`ChangeEvent`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChangeOp {
-    /// What it does.
-    pub kind: ChangeKind,
-    /// Storage partition.
-    pub partition: u32,
-    /// Storage key; for [`ChangeKind::RemoveRange`] the range's start.
-    pub key: Vec<u8>,
-    /// Value or merge operand; for [`ChangeKind::RemoveRange`] the range's
-    /// exclusive end.
-    pub value: Vec<u8>,
-}
-
-/// One applied log entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChangeEvent {
-    /// Commit timestamp (HLC microseconds); 0 for an entry carrying none.
-    pub commit_ts: u64,
-    /// Term of the leader that wrote the entry.
-    pub term: u64,
-    /// Log index.
-    pub log_index: u64,
-    /// Written during a shard migration.
-    pub is_migration: bool,
-    /// The mutations; empty for a progress event, which lets the caller
-    /// acknowledge past entries its filters dropped.
-    pub ops: Vec<ChangeOp>,
-    /// Where the stream continues after this event.
-    pub position: Position,
-}
-
-impl ChangeEvent {
-    fn from_proto(event: crate::proto::replication::ChangeEvent) -> Self {
+impl ChangeBatch {
+    fn from_proto(batch: crate::proto::replication::ChangeBatch) -> Self {
         Self {
-            commit_ts: event.ts,
-            term: event.term,
-            log_index: event.log_index,
-            is_migration: event.is_migration,
-            ops: event
-                .ops
+            units: batch
+                .units
                 .into_iter()
-                .map(|op| ChangeOp {
-                    kind: ChangeKind::from_proto(op.r#type),
-                    partition: op.partition,
-                    key: op.key,
-                    value: op.value,
+                .map(|unit| ChangeUnit {
+                    commit_ts: unit.commit_ts,
+                    log_index: unit.log_index,
+                    unit: unit.unit,
+                    projected: unit.projected,
+                    events: unit
+                        .events
+                        .into_iter()
+                        .map(ChangeEvent::from_proto)
+                        .collect(),
                 })
                 .collect(),
-            position: Position::from_proto(event.position.unwrap_or_default()),
+            cursor: Cursor(batch.cursor),
         }
     }
 }
@@ -245,8 +341,8 @@ impl Subscription {
         link: Arc<SessionLink>,
         options: &SubscribeOptions,
     ) -> Result<Self, ClientError> {
-        // Room for every batch the window allows (a batch holds at least one
-        // event) and the answers around them, so the session never waits on
+        // Room for every batch the window allows (a batch passes at least one
+        // entry) and the answers around them, so the session never waits on
         // a subscription its caller is not reading.
         let (request_id, mut frames) = link.request(options.window as usize + 4);
         link.send(
@@ -286,44 +382,39 @@ impl Subscription {
         self.incarnation
     }
 
-    /// The next batch of events, oldest first, waiting until one arrives.
-    /// `Ok(None)` when the session ended.
+    /// The next batch, waiting until one arrives. `Ok(None)` when the
+    /// session ended.
     ///
     /// # Errors
     ///
     /// The subscription ended on the server: the registration was cancelled
-    /// or ended (CONSUMER_TERMINATED), or the server no longer holds where it
-    /// reads (RETENTION_LOST); the status carries the ErrorInfo reason.
-    pub async fn next(&mut self) -> Result<Option<Vec<ChangeEvent>>, ClientError> {
+    /// or ended (CONSUMER_TERMINATED), the server no longer holds where it
+    /// reads (RETENTION_LOST), or it reached a change it cannot read
+    /// (CHANGE_FEED_UNSUPPORTED); the status carries the ErrorInfo reason.
+    pub async fn next(&mut self) -> Result<Option<ChangeBatch>, ClientError> {
         loop {
             let Some(frame) = self.frames.recv().await else {
                 return Ok(None);
             };
             match frame.event {
-                Some(Event::ChangeEvents(batch)) => {
-                    // The server sends no more than the credit granted.
-                    self.outstanding = u32::try_from(batch.events.len())
-                        .ok()
-                        .and_then(|taken| self.outstanding.checked_sub(taken))
-                        .ok_or_else(|| {
+                Some(Event::ChangeEvents(frame)) => {
+                    // The server reads no more than the credit granted.
+                    self.outstanding =
+                        self.outstanding.checked_sub(frame.entries).ok_or_else(|| {
                             ClientError::UnexpectedAnswer(format!(
-                                "a batch of {} events with {} granted",
-                                batch.events.len(),
-                                self.outstanding
+                                "a batch of {} entries with {} granted",
+                                frame.entries, self.outstanding
                             ))
                         })?;
-                    // Applied events are waiting: grant at once to drain
+                    // Applied entries are waiting: grant at once to drain
                     // them. Otherwise top the window up once half is used.
-                    if batch.more || self.outstanding <= self.window / 2 {
+                    if frame.more || self.outstanding <= self.window / 2 {
                         self.grant().await?;
                     }
-                    return Ok(Some(
-                        batch
-                            .events
-                            .into_iter()
-                            .map(ChangeEvent::from_proto)
-                            .collect(),
-                    ));
+                    let batch = frame.batch.ok_or_else(|| {
+                        ClientError::UnexpectedAnswer("a change frame without a batch".into())
+                    })?;
+                    return Ok(Some(ChangeBatch::from_proto(batch)));
                 }
                 Some(Event::Error(error)) => return Err(error_status(error).into()),
                 // Nothing else is answered on the subscription's request.
@@ -332,22 +423,21 @@ impl Subscription {
         }
     }
 
-    /// Record that the caller holds every event before `position` durably:
-    /// the server may stop keeping them, and a resumed subscription starts
-    /// there.
+    /// Record that the caller holds every unit before `cursor` durably: the
+    /// server may stop keeping them, and a resumed subscription starts there.
     ///
     /// # Errors
     ///
-    /// The server refused it: a position past what it applied, or an ended
-    /// registration.
-    pub async fn acknowledge(&self, position: Position) -> Result<(), ClientError> {
+    /// The server refused it: a cursor past what it applied or of another
+    /// history, or an ended registration.
+    pub async fn acknowledge(&self, cursor: &Cursor) -> Result<(), ClientError> {
         let answer = self
             .link
             .call(client_frame::Op::Acknowledge(
                 AcknowledgeSubscriptionRequest {
                     consumer_id: self.consumer_id.clone(),
                     incarnation: self.incarnation,
-                    position: Some(position.to_proto()),
+                    cursor: cursor.0.clone(),
                 },
             ))
             .await?;
@@ -383,8 +473,8 @@ impl Subscription {
 
     /// Grant the server the window back.
     async fn grant(&mut self) -> Result<(), ClientError> {
-        let events = self.window - self.outstanding;
-        if events == 0 {
+        let entries = self.window - self.outstanding;
+        if entries == 0 {
             return Ok(());
         }
         // Answered only when refused, and a refusal of a credit for an open
@@ -394,7 +484,7 @@ impl Subscription {
                 self.link.fresh_id(),
                 client_frame::Op::Credit(Credit {
                     target_request_id: self.request_id,
-                    events,
+                    events: entries,
                 }),
             )
             .await?;

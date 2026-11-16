@@ -1103,13 +1103,11 @@ pub(crate) async fn serve(
             )?,
             None => services::cdc::ChangeEventServiceImpl::new(
                 0,
+                database.read().engine_shared(),
                 Vec::new(),
                 consumer_registry,
                 Arc::new(|| 0),
                 None,
-                coordinode_storage::engine::operations::unit_decisions(
-                    database.read().engine_shared(),
-                ),
             ),
         }
         .with_tuning(cdc_tuning),
