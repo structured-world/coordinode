@@ -140,6 +140,73 @@ fn a_node_created_and_deleted_at_once_leaves_no_scope() {
     );
 }
 
+/// A node written through its store and given a document delta in the same
+/// transaction: the delta lands on the record the transaction writes, so a
+/// reader of its new label receives that record entering with the delta in
+/// it, a reader of the label it had sees it leave, and no event is routed
+/// by the labels the node had before.
+#[test]
+fn a_write_and_a_delta_of_one_node_route_by_the_labels_in_between() {
+    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+    let db = Db::open();
+    db.unit(|t| LocalNodeStore.put(t, 0, id(5), &node(&[3])).expect("put"));
+    let mut relabelled = node(&[4]);
+    relabelled.set(1, Value::Int(7));
+    let operand = DocDelta::RemoveProperty {
+        target: PathTarget::PropField(1),
+        key: None,
+    }
+    .encode()
+    .expect("delta");
+    let deliveries = |unit: &[Mutation], reader: u32| -> Vec<(Action, Delivery, Vec<u8>)> {
+        project_unit(unit)
+            .expect("project")
+            .iter()
+            .map(|e| {
+                (
+                    e.action,
+                    e.routing
+                        .as_ref()
+                        .expect("routing")
+                        .delivery(|l| l == label(reader)),
+                    e.payload.expect("payload").to_vec(),
+                )
+            })
+            .collect()
+    };
+    // What the transaction leaves: the relabelled record, its property 1
+    // removed by the delta.
+    let record = node(&[4]).to_msgpack().expect("record");
+
+    // An existing node relabelled, then given a delta.
+    let unit = db.unit(|t| {
+        LocalNodeStore.put(t, 0, id(5), &relabelled).expect("put");
+        LocalNodeStore
+            .buffer_node_delta(t, 0, id(5), operand.clone())
+            .expect("delta");
+    });
+    assert_eq!(
+        deliveries(&unit, 4),
+        vec![(Action::Put, Delivery::Enter, record.clone())]
+    );
+    assert_eq!(
+        deliveries(&unit, 3),
+        vec![(Action::Put, Delivery::Leave, record.clone())]
+    );
+
+    // A node created and given a delta at once.
+    let unit = db.unit(|t| {
+        LocalNodeStore.put(t, 0, id(6), &relabelled).expect("put");
+        LocalNodeStore
+            .buffer_node_delta(t, 0, id(6), operand.clone())
+            .expect("delta");
+    });
+    assert_eq!(
+        deliveries(&unit, 4),
+        vec![(Action::Put, Delivery::Enter, record)]
+    );
+}
+
 /// Writing a relationship is one presence event and one property event,
 /// whatever both adjacency directions store; deleting it is one removal,
 /// its property record with it; clearing the properties of one that stays

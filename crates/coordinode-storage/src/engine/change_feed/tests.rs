@@ -280,6 +280,76 @@ fn a_delta_is_a_patch_under_the_labels_it_lands_on() {
     );
 }
 
+/// The deliveries of each event of `unit` to a reader of `label`.
+fn deliveries_to(unit: &[Mutation], label_raw: u32) -> Vec<(Action, Delivery)> {
+    project_unit(unit)
+        .expect("project")
+        .iter()
+        .map(|e| {
+            (
+                e.action,
+                e.routing
+                    .as_ref()
+                    .expect("routing")
+                    .delivery(|l| l == label(label_raw)),
+            )
+        })
+        .collect()
+}
+
+/// A delta after a write that changed the node's labels in the same unit
+/// lands on the labels that write left: a reader of the new label receives
+/// the record entering and then the delta; a reader of the old label only
+/// the record leaving.
+#[test]
+fn a_delta_after_a_relabelling_put_lands_on_the_new_labels() {
+    let unit = vec![
+        put(PartitionId::Node, key(1), record(&[5])),
+        Mutation::Merge {
+            partition: PartitionId::Node,
+            key: key(1),
+            operand: vec![0x01],
+        },
+        context(vec![basis(1, &[3])], Vec::new(), Vec::new()),
+    ];
+    assert_eq!(
+        deliveries_to(&unit, 5),
+        vec![
+            (Action::Put, Delivery::Enter),
+            (Action::Patch, Delivery::Apply)
+        ]
+    );
+    assert_eq!(
+        deliveries_to(&unit, 3),
+        vec![
+            (Action::Put, Delivery::Leave),
+            (Action::Patch, Delivery::None)
+        ]
+    );
+}
+
+/// A node created and given a delta in the same unit: the delta reaches the
+/// reader of its label after the record entered.
+#[test]
+fn a_delta_on_a_node_created_in_the_unit_reaches_its_label() {
+    let unit = vec![
+        put(PartitionId::Node, key(1), record(&[5])),
+        Mutation::Merge {
+            partition: PartitionId::Node,
+            key: key(1),
+            operand: vec![0x01],
+        },
+        context(vec![basis(1, &[])], Vec::new(), Vec::new()),
+    ];
+    assert_eq!(
+        deliveries_to(&unit, 5),
+        vec![
+            (Action::Put, Delivery::Enter),
+            (Action::Patch, Delivery::Apply)
+        ]
+    );
+}
+
 /// A removal or a delta without the labels that route it contradicts the
 /// context its writer sealed: refused, never routed by a guess.
 #[test]

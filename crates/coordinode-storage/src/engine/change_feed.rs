@@ -255,6 +255,10 @@ struct Projector<'u> {
     /// Pairs some forward adjacency change of the unit names: a removal the
     /// context also names is already an event.
     named: FxHashSet<Pair<'u>>,
+    /// The labels each node the unit already changed carries after that
+    /// change: a later change of the same node in the unit starts from
+    /// them, not from the labels it had before the unit.
+    left: rustc_hash::FxHashMap<Cow<'u, [u8]>, Cow<'u, [LabelId]>>,
     events: Vec<LogicalEvent<'u>>,
 }
 
@@ -265,8 +269,20 @@ impl<'u> Projector<'u> {
             effects,
             removed: FxHashSet::default(),
             named: FxHashSet::default(),
+            left: rustc_hash::FxHashMap::default(),
             events: Vec::new(),
         }
+    }
+
+    /// The labels node `key` carries before its next change in the unit:
+    /// what its last change in the unit left, else what its context says it
+    /// had before the unit; `None` when neither is known.
+    fn labels_before(&self, key: &[u8]) -> Option<Cow<'u, [LabelId]>> {
+        if let Some(left) = self.left.get(key) {
+            return Some(left.clone());
+        }
+        self.basis(key)
+            .map(|basis| self.carried(Cow::Borrowed(basis.labels.as_slice())))
     }
 
     fn run(mut self) -> Result<Vec<LogicalEvent<'u>>, ProjectionError> {
@@ -402,8 +418,12 @@ impl<'u> Projector<'u> {
     }
 
     /// The basis of a node whose change cannot state its own labels.
-    fn required_basis(&self, key: &[u8], what: &str) -> Result<&'u NodeBasis, ProjectionError> {
-        self.basis(key).ok_or_else(|| {
+    fn required_labels(
+        &self,
+        key: &[u8],
+        what: &str,
+    ) -> Result<Cow<'u, [LabelId]>, ProjectionError> {
+        self.labels_before(key).ok_or_else(|| {
             ProjectionError::Malformed(format!(
                 "a node {what} carries no labels it stored before the unit"
             ))
@@ -421,11 +441,10 @@ impl<'u> Projector<'u> {
                 let after = coordinode_core::graph::node::NodeRecord::labels_from_msgpack(value)
                     .map_err(|e| ProjectionError::Malformed(format!("a node record: {e}")))?;
                 let after = self.carried(Cow::Owned(after));
-                let before = match self.basis(key) {
-                    Some(basis) => self.carried(Cow::Borrowed(basis.labels.as_slice())),
-                    // Its labels are unchanged: the record states both.
-                    None => after.clone(),
-                };
+                // Without a context entry its labels are unchanged: the
+                // record states both.
+                let before = self.labels_before(key).unwrap_or_else(|| after.clone());
+                self.left.insert(Cow::Borrowed(key), after.clone());
                 let routing = Routing { before, after };
                 let target = Target::Node(Cow::Borrowed(key));
                 self.emit(Action::Put, target, Some(value), Some(routing))
@@ -466,9 +485,10 @@ impl<'u> Projector<'u> {
     ) -> Result<(), ProjectionError> {
         match partition {
             PartitionId::Node => {
-                let basis = self.required_basis(&key, "removal")?;
+                let before = self.required_labels(&key, "removal")?;
+                self.left.insert(key.clone(), Cow::Borrowed(&[]));
                 let routing = Routing {
-                    before: self.carried(Cow::Borrowed(basis.labels.as_slice())),
+                    before,
                     after: Cow::Borrowed(&[]),
                 };
                 self.emit(Action::Remove, Target::Node(key), None, Some(routing))
@@ -497,8 +517,7 @@ impl<'u> Projector<'u> {
     ) -> Result<(), ProjectionError> {
         match partition {
             PartitionId::Node => {
-                let basis = self.required_basis(key, "document delta")?;
-                let labels = self.carried(Cow::Borrowed(basis.labels.as_slice()));
+                let labels = self.required_labels(key, "document delta")?;
                 let routing = Routing {
                     before: labels.clone(),
                     after: labels,
