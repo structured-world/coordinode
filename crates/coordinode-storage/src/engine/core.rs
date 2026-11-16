@@ -4968,6 +4968,40 @@ impl StorageEngine {
         Ok((Self::batch_of(cursor, &read)?, charge))
     }
 
+    /// The batch a reader at `cursor` receives for `entries`, the log
+    /// entries from its position on as stored (unit frames whole, see
+    /// [`crate::oplog::tailer::OplogTailer::keeping_frames`]), read once for
+    /// every reader, with `next` the position after the last of them. The
+    /// entries are projected here for this reader's interest; a unit refused
+    /// by its operation binding has no events.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_changes`], for the units the entries carry.
+    pub fn changes_of_entries<'e>(
+        &self,
+        cursor: &crate::engine::change_feed::ChangeCursor,
+        entries: impl IntoIterator<Item = &'e crate::oplog::entry::OplogEntry>,
+        next: u64,
+    ) -> StorageResult<crate::engine::change_feed::ChangeBatch> {
+        self.check_cursor_history(cursor)?;
+        let mut units = Vec::new();
+        let mut pool = crate::engine::fixed_cut::EntryPool::new(u64::MAX);
+        for entry in entries {
+            self.change_units_of_entry(&entry.borrowed(), &mut pool, &mut units)
+                .map_err(|failed| match failed {
+                    EntryOutcome::Failed(e) => e,
+                    EntryOutcome::NoRoom | EntryOutcome::Unreadable => {
+                        StorageError::Serialization(format!("entry {} cannot be read", entry.index))
+                    }
+                })?;
+        }
+        Self::batch_of(
+            cursor,
+            &crate::engine::change_feed::ChangeRead { units, next },
+        )
+    }
+
     /// Refuse a cursor whose positions count another log than this store's.
     fn check_cursor_history(
         &self,

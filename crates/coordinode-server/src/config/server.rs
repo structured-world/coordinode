@@ -539,8 +539,8 @@ pub struct ServerConfig {
     /// Most log entries a CDC change stream reads and sends per batch
     /// (`None` = 256).
     pub cdc_batch_size: Option<NonZeroUsize>,
-    /// Most bytes one read of a CDC change stream holds in memory
-    /// (`None` = 64 MiB).
+    /// Most bytes of log entries the change streams' shared reader keeps in
+    /// memory for streams that have not read them yet (`None` = 64 MiB).
     pub cdc_buffer_bytes: Option<usize>,
     /// Read concern of a statement that names none and whose session set
     /// none (`None` = `local`).

@@ -151,6 +151,9 @@ pub struct OplogTailer {
     /// member that applied them recorded. Without it a bound unit fails the
     /// read instead of being delivered on a guess.
     decisions: Option<UnitDecisionSource>,
+    /// Hand entries over as they are stored, unit frames whole and no filter
+    /// applied ([`Self::keeping_frames`]).
+    keep_frames: bool,
 }
 
 /// See [`OplogTailer::with_unit_decisions`].
@@ -185,7 +188,18 @@ impl OplogTailer {
             held: !token.is_start(),
             cursor: None,
             decisions: None,
+            keep_frames: false,
         })
+    }
+
+    /// Hand every entry over as it is stored: a unit's frame stays whole,
+    /// with the effect context a change feed projects it by, and filters are
+    /// not applied. For a reader that projects units itself; a unit refused
+    /// by its operation binding is decided there.
+    #[must_use]
+    pub fn keeping_frames(mut self) -> Self {
+        self.keep_frames = true;
+        self
     }
 
     /// Read a Raft log whose units may be bound to client operations: a unit
@@ -259,7 +273,7 @@ impl OplogTailer {
             let mut reached = false;
             let mut stale = false;
             let mut full = false;
-            for (entry, end) in frames {
+            for (mut entry, end) in frames {
                 if entry.index < self.next {
                     cursor.offset = end;
                     continue;
@@ -279,10 +293,15 @@ impl OplogTailer {
                 self.held = true;
                 reached = true;
                 // A reader sees the operations a unit frame encodes, and
-                // none of a unit that took no effect.
-                let ops = expand_units_decided(&entry.ops, entry.index, self.decisions.as_deref())?
-                    .into_owned();
-                if passes_filter(&entry, &ops, filters) {
+                // none of a unit that took no effect; one keeping frames sees
+                // the entry as stored.
+                let ops = if self.keep_frames {
+                    std::mem::take(&mut entry.ops)
+                } else {
+                    expand_units_decided(&entry.ops, entry.index, self.decisions.as_deref())?
+                        .into_owned()
+                };
+                if self.keep_frames || passes_filter(&entry, &ops, filters) {
                     let token = ResumeToken {
                         shard_id: self.shard_id,
                         segment_id: cursor.first_index,

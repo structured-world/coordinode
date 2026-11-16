@@ -246,6 +246,75 @@ impl OplogEntry {
     pub fn decode(bytes: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
         rmp_serde::from_slice(bytes)
     }
+
+    /// The entry as [`OplogEntryRef`], borrowing its operations' bytes: what
+    /// a reader of entries read in place takes, for one already decoded.
+    pub fn borrowed(&self) -> OplogEntryRef<'_> {
+        OplogEntryRef {
+            ts: self.ts,
+            term: self.term,
+            index: self.index,
+            shard: self.shard,
+            ops: self.ops.iter().map(OplogOp::borrowed).collect(),
+            is_migration: self.is_migration,
+            _pre_images: serde::de::IgnoredAny,
+        }
+    }
+}
+
+impl OplogOp {
+    /// The operation as [`OplogOpRef`], borrowing its bytes.
+    pub fn borrowed(&self) -> OplogOpRef<'_> {
+        match self {
+            Self::Insert {
+                partition,
+                key,
+                value,
+            } => OplogOpRef::Insert {
+                partition: *partition,
+                key,
+                value,
+            },
+            Self::Delete { partition, key } => OplogOpRef::Delete {
+                partition: *partition,
+                key,
+            },
+            Self::Merge {
+                partition,
+                key,
+                operand,
+            } => OplogOpRef::Merge {
+                partition: *partition,
+                key,
+                operand,
+            },
+            Self::RemoveRange {
+                partition,
+                start,
+                end,
+            } => OplogOpRef::RemoveRange {
+                partition: *partition,
+                start,
+                end,
+            },
+            Self::Noop => OplogOpRef::Noop,
+            Self::RaftEntry { data } => OplogOpRef::RaftEntry { data },
+            Self::RaftTruncation { after_index } => OplogOpRef::RaftTruncation {
+                after_index: *after_index,
+            },
+            Self::ColumnarInsert {
+                table_id,
+                key,
+                value,
+            } => OplogOpRef::ColumnarInsert {
+                table_id,
+                key,
+                value,
+            },
+            Self::Derive { work } => OplogOpRef::Derive { work },
+            Self::Unit { frame } => OplogOpRef::Unit { frame },
+        }
+    }
 }
 
 #[cfg(test)]

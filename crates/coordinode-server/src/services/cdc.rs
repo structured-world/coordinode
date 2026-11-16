@@ -31,7 +31,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status};
 
-use coordinode_core::budget::QueryBudget;
 use coordinode_core::schema::label_id::LabelId;
 use coordinode_modality::change_interest::{InterestRefusal, resolve_change_interest};
 use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
@@ -47,6 +46,7 @@ use coordinode_storage::engine::change_feed::{
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::error::StorageError;
+use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer};
 
 use super::error_details::{Reason, status_with_reason};
 use crate::proto::replication::cdc::{
@@ -85,9 +85,32 @@ pub struct ChangeEventServiceImpl {
     applied_changes: AppliedSignal,
     /// Read pacing of every stream.
     tuning: CdcStreamTuning,
+    /// The log reader every stream shares, made on the first subscription.
+    // no-std: spin::Mutex; taken once per subscription.
+    hub: parking_lot::Mutex<Option<Arc<CdcHub>>>,
 }
 
 impl ChangeEventServiceImpl {
+    /// The shard's shared log reader, made at the applied position on the
+    /// first call.
+    fn hub(&self) -> Result<Arc<CdcHub>, Status> {
+        let mut slot = self.hub.lock();
+        if let Some(hub) = slot.as_ref() {
+            return Ok(Arc::clone(hub));
+        }
+        let hub = Arc::new(
+            CdcHub::new(
+                &self.oplog_dirs,
+                self.shard_id,
+                (self.applied)(),
+                self.tuning.buffer_bytes,
+            )
+            .map_err(|e| Status::internal(format!("change stream reader: {e}")))?,
+        );
+        *slot = Some(Arc::clone(&hub));
+        Ok(hub)
+    }
+
     /// A service streaming shard `shard_id`'s Raft log, applied by `engine`,
     /// from `oplog_dirs` (see `coordinode_raft::storage::raft_oplog_dirs`),
     /// up to `applied`, which `applied_changes` signals moving.
@@ -107,6 +130,7 @@ impl ChangeEventServiceImpl {
             applied,
             applied_changes,
             tuning: CdcStreamTuning::default(),
+            hub: parking_lot::Mutex::new(None),
         }
     }
 
@@ -164,9 +188,9 @@ pub struct CdcStreamTuning {
     pub heartbeat_interval: Duration,
     /// Most log entries read and sent per batch (back-pressure).
     pub batch_size: NonZeroUsize,
-    /// Most bytes one read of a stream holds in memory: its units, their
-    /// events and the read's own buffers. A first entry larger than this is
-    /// refused rather than read.
+    /// Most bytes of log entries the streams' shared reader keeps in memory
+    /// for streams that have not passed them yet (`cdc_buffer_bytes`); a
+    /// stream further behind reads from the log.
     pub buffer_bytes: usize,
 }
 
@@ -418,6 +442,8 @@ impl ChangeEventServiceImpl {
             .change_cursor_at(from, interest)
             .map_err(|e| Status::internal(format!("change cursor: {e}")))?;
 
+        let hub = self.hub()?;
+        let reader = hub.reader(from);
         let incarnation = handle.incarnation();
         tokio::spawn(stream_consumer(StreamState {
             engine: Arc::clone(&self.engine),
@@ -425,7 +451,9 @@ impl ChangeEventServiceImpl {
             registry,
             handle,
             cursor,
-            oplog_dirs: self.oplog_dirs.clone(),
+            hub,
+            reader: Some(reader),
+            own_tailer: None,
             delivery,
             applied: Arc::clone(&self.applied),
             applied_changes: self.applied_changes.clone(),
@@ -505,7 +533,13 @@ struct StreamState {
     watch: RegistrationWatch,
     /// Where the stream reads next.
     cursor: ChangeCursor,
-    oplog_dirs: Vec<PathBuf>,
+    /// The shard's shared reader of the log.
+    hub: Arc<CdcHub>,
+    /// The stream's registration with the hub; out of the state only while a
+    /// read holds it.
+    reader: Option<HubReader>,
+    /// Reads the log while the stream is behind what the hub holds.
+    own_tailer: Option<OplogTailer>,
     /// Where the batches go.
     delivery: Delivery,
     applied: AppliedFrontier,
@@ -563,26 +597,36 @@ async fn stream_consumer(mut s: StreamState) {
 
         let read_from = s.cursor.position();
         let until = (s.applied)();
+        let Some(reader) = s.reader.take() else {
+            break;
+        };
         let read = {
             let engine = Arc::clone(&s.engine);
+            let hub = Arc::clone(&s.hub);
             let cursor = s.cursor.clone();
-            let dirs = s.oplog_dirs.clone();
-            let budget_bytes = s.tuning.buffer_bytes as u64;
+            let mut tailer = s.own_tailer.take();
             let mut taken = std::mem::take(&mut names);
             tokio::task::spawn_blocking(move || {
-                let budget = QueryBudget::new(budget_bytes);
-                let read = engine
-                    .read_changes_log(&cursor, &dirs, until, room, &budget)
-                    .and_then(|(batch, _charge)| {
+                let read = read_entries(&hub, &reader, &mut tailer, read_from, room, until)
+                    .and_then(|(entries, next)| {
+                        let batch = engine.changes_of_entries(
+                            &cursor,
+                            entries.iter().map(|e| &**e),
+                            next,
+                        )?;
                         let proto = batch_to_proto(&engine, &batch, &mut taken)?;
                         Ok((proto, batch.cursor))
                     });
-                (read, taken)
+                (read, taken, reader, tailer)
             })
             .await
         };
         let (read, kept) = match read {
-            Ok(done) => done,
+            Ok((read, kept, reader, tailer)) => {
+                s.reader = Some(reader);
+                s.own_tailer = tailer;
+                (read, kept)
+            }
             Err(e) => {
                 s.delivery
                     .fail(Status::internal(format!("change stream read: {e}")))
@@ -652,6 +696,37 @@ async fn stream_consumer(mut s: StreamState) {
                     () = heartbeat => {}
                 },
             }
+        }
+    }
+}
+
+/// The next entries from `position` below `until`, at most `max`, as stored:
+/// from the shard's hub, or from the log itself while the stream is behind
+/// what the hub holds. Returns them and the position after the last one.
+fn read_entries(
+    hub: &CdcHub,
+    reader: &HubReader,
+    own_tailer: &mut Option<OplogTailer>,
+    position: u64,
+    max: usize,
+    until: u64,
+) -> Result<(Vec<SharedEntry>, u64), StorageError> {
+    match hub.read(reader, position, max, until)? {
+        HubRead::Entries { entries, next } => {
+            *own_tailer = None;
+            Ok((entries, next))
+        }
+        HubRead::Behind(base) => {
+            let tailer = match own_tailer {
+                Some(tailer) => tailer,
+                None => own_tailer.insert(hub.tailer_at(position)?),
+            };
+            let entries = tailer.read_next(max, &CdcFilters::default(), until.min(base))?;
+            let next = tailer.next_index();
+            Ok((
+                entries.into_iter().map(|(e, _)| Arc::new(e)).collect(),
+                next,
+            ))
         }
     }
 }
@@ -807,7 +882,9 @@ fn event_to_proto(
 }
 
 mod delivery;
+mod hub;
 pub(crate) use delivery::{Credit, Delivery, session_error};
+use hub::{CdcHub, HubRead, HubReader, SharedEntry};
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
