@@ -143,9 +143,10 @@ pub(crate) fn spawn_closer(
             let Ok(count) = woke else {
                 return;
             };
-            // A commit applied here and not covered is closed too: one a lost
-            // leader confirmed but never covered is in no withdrawal here.
-            if count == seen && !engine.applied_past_closure() {
+            // A committed entry here whose commit is not covered is closed
+            // too: one a lost leader confirmed but never covered is in no
+            // withdrawal here.
+            if count == seen && !engine.effects_past_closure() {
                 continue;
             }
             if count != seen {
@@ -165,7 +166,7 @@ pub(crate) fn spawn_closer(
             let due = engine
                 .pending_commits()
                 .closure_due(|| oracle.current().as_raw());
-            if due.is_none() && !engine.applied_past_closure() {
+            if due.is_none() && !engine.effects_past_closure() {
                 continue;
             }
             let mut request = Request::closing(0);

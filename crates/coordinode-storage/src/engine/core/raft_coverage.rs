@@ -330,6 +330,9 @@ impl StorageEngine {
             // Resolved above; its entries are index records.
             Mutation::Derive(_) => Partition::Idx,
         };
+        // A committed entry: a read that sees any of its writes is not ahead
+        // of the ceiling, which is raised before the first lands.
+        self.note_raft_effects(commit_ts);
         if mutations.iter().any(|m| skip(partition_of(m))) {
             // A partition that already holds the entry takes none of it.
             let kept: Vec<Mutation> = mutations

@@ -593,7 +593,7 @@ fn a_member_store_is_backed_up_offline() {
             // A capture holds what the group's log closed; the leader closes
             // an idle write shortly after it lands.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while member.database().read().engine().applied_past_closure() {
+            while member.database().read().engine().effects_past_closure() {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "the write was never closed"

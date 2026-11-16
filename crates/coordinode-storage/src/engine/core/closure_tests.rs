@@ -22,6 +22,7 @@ fn config(dir: &std::path::Path) -> StorageConfig {
 /// closure records it plans with its coverage, then the plan installed.
 fn closure_entry(engine: &StorageEngine, index: u64, commits: &[u64], below: u64) {
     for &ts in commits {
+        engine.note_raft_effects(ts);
         engine.note_raft_applied(index, ts);
     }
     if let Some((records, at)) = engine

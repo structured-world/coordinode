@@ -170,10 +170,12 @@ pub struct StorageEngine {
     /// below it is in an entry applied on this node. `0` while no entry
     /// carrying one has applied. Mirrors the ledger's head record.
     closure_frontier: AtomicU64,
-    /// The highest commit timestamp of the Raft log applied here; `0` before
-    /// any. Every such commit is in the log, so a closed bound reaches it
-    /// once the leader covers it. Mirrors the ledger in `closure`.
-    raft_applied_ts: AtomicU64,
+    /// The highest commit timestamp of a committed Raft entry whose effects
+    /// may be visible here: raised before an entry's first write lands, so a
+    /// read that sees a write is never ahead of it. `0` before any. Every
+    /// such commit is in the log, so a closed bound reaches it once the
+    /// leader covers it; it says nothing about the apply having finished.
+    raft_effects_ceiling: AtomicU64,
     /// The closed bound and the commit ceilings of the Raft log applied
     /// here, as its head and breakpoint records hold them in the Schema
     /// tree's reserved namespace; see [`Self::commit_ceiling_through`].
@@ -1793,7 +1795,7 @@ impl StorageEngine {
             field_dictionary_epoch: AtomicU64::new(0),
             pending_commits,
             closure_frontier: AtomicU64::new(0),
-            raft_applied_ts: AtomicU64::new(0),
+            raft_effects_ceiling: AtomicU64::new(0),
             closure: parking_lot::Mutex::new(ClosureState::default()),
             flush_thresholds,
             closure_held,
@@ -8147,11 +8149,14 @@ impl StorageEngine {
     /// The cut is the view's own: below every commit at or below `view`
     /// still in flight and below the closed bound, read as it stands. A
     /// commit stamped after the view is no part of what the read saw, and
-    /// the receipt neither waits for it nor for one below the view.
+    /// the receipt neither waits for it nor for one below the view. A Raft
+    /// entry whose write the read may have seen is covered by the effects
+    /// ceiling, raised before that write lands; a commit only admitted here,
+    /// not yet in the log, never is.
     pub fn observed_commit_ceiling(&self, view: u64) -> Option<u64> {
         self.raft_fence()?;
         let applied = self
-            .raft_applied_ts
+            .raft_effects_ceiling
             .load(std::sync::atomic::Ordering::Acquire);
         let complete = self
             .pending_commits
@@ -8164,14 +8169,23 @@ impl StorageEngine {
         )
     }
 
-    /// Whether a Raft entry applied here carries a commit the closed bound
-    /// does not cover yet. A leader that took over from one lost before it
-    /// covered its last commits closes them: nothing else would, while no
-    /// new write comes.
-    pub fn applied_past_closure(&self) -> bool {
-        self.raft_applied_ts
+    /// A scheduling hint for the closer: a committed Raft entry reaching
+    /// this node may carry a commit the closed bound does not cover yet. A
+    /// leader that took over from one lost before it covered its last
+    /// commits closes them: nothing else would, while no new write comes.
+    /// It is raised before the entry finishes applying, so it never proves
+    /// the entry ready; the closer checks its own state.
+    pub fn effects_past_closure(&self) -> bool {
+        self.raft_effects_ceiling
             .load(std::sync::atomic::Ordering::Acquire)
             >= self.closure_frontier()
+    }
+
+    /// Raise the effects ceiling to `commit_ts`, a committed Raft entry's,
+    /// before its first write lands here.
+    pub(crate) fn note_raft_effects(&self, commit_ts: u64) {
+        self.raft_effects_ceiling
+            .fetch_max(commit_ts, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Record that the Raft entry at `index` carrying `commit_ts` applied
@@ -8179,8 +8193,6 @@ impl StorageEngine {
     /// the entry's closure record makes it a breakpoint readers see.
     pub(crate) fn note_raft_applied(&self, index: u64, commit_ts: u64) {
         self.closure.lock().pending.push((index, commit_ts));
-        self.raft_applied_ts
-            .fetch_max(commit_ts, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The commit timestamp a read must reach to hold every commit of the
@@ -8254,7 +8266,7 @@ impl StorageEngine {
         self.closure_frontier
             .store(ledger.below(), std::sync::atomic::Ordering::Release);
         self.coordinator.hold_closed_bound(ledger.below());
-        self.raft_applied_ts.store(
+        self.raft_effects_ceiling.store(
             ledger.applied_ceiling(),
             std::sync::atomic::Ordering::Release,
         );

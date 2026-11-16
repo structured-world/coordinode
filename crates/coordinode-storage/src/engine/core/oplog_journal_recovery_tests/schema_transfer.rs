@@ -10,6 +10,7 @@ use super::*;
 /// Apply Raft entry `index` committing at `ts` as the state machine does:
 /// its commit, the closure records it plans, then the plan installed.
 fn closure_entry(engine: &StorageEngine, index: u64, ts: u64, below: u64) {
+    engine.note_raft_effects(ts);
     engine.note_raft_applied(index, ts);
     if let Some((records, at)) = engine
         .closure_record(below, index, false)

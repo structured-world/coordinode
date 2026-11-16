@@ -453,6 +453,67 @@ fn an_entry_is_pending_before_a_reader_can_see_it() {
     ));
 }
 
+/// Passes every pause straight through; marks the store as a Raft member.
+struct OpenFence;
+
+impl crate::engine::core::RaftApplyFence for OpenFence {
+    fn with_applies_paused(
+        &self,
+        work: &mut dyn FnMut(
+            &mut crate::engine::core::RaftApplyState,
+            &[u8],
+        ) -> crate::error::StorageResult<()>,
+    ) -> crate::error::StorageResult<()> {
+        work(&mut crate::engine::core::RaftApplyState::new(0), &[])
+    }
+}
+
+/// A read that already sees a Raft entry's write gets a causal receipt that
+/// covers the entry's commit, even while the apply has not finished: a later
+/// read carrying a lower receipt could be served by a member that has not
+/// applied the entry and miss what the first read returned. A commit that is
+/// only admitted here, not yet in the log, never raises the receipt.
+#[test]
+fn a_receipt_covers_a_raft_write_a_read_already_sees() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const NOT_SEEN: u64 = u64::MAX;
+    let dir = TempDir::new().expect("tempdir");
+    let engine = Arc::new(engine(&dir));
+    engine.register_raft_fence(Arc::new(OpenFence));
+    let (admitted_ts, _admission) = engine
+        .pending_commits()
+        .admit_allocated(|| 20, Vec::new(), Vec::new(), None)
+        .expect("admit");
+    let receipt_when_seen = Arc::new(AtomicU64::new(NOT_SEEN));
+    {
+        let weak = Arc::downgrade(&engine);
+        let receipt_when_seen = Arc::clone(&receipt_when_seen);
+        engine.pause_applies_after_write(Arc::new(move || {
+            let Some(engine) = weak.upgrade() else { return };
+            if engine.get(Partition::Node, b"k").ok().flatten().is_some() {
+                let receipt = engine.observed_commit_ceiling(11).expect("a Raft store");
+                receipt_when_seen.store(receipt, Ordering::SeqCst);
+            }
+        }));
+    }
+    engine
+        .apply_raft_proposal(&[put(PartitionId::Node, b"k")], 11, 1, 0, |_| false)
+        .expect("apply");
+    let seen = receipt_when_seen.load(Ordering::SeqCst);
+    assert_ne!(seen, NOT_SEEN, "the hook read the write");
+    assert!(
+        seen >= 11,
+        "a read that saw the commit at 11 got the receipt {seen}"
+    );
+    let after = engine.observed_commit_ceiling(30).expect("a Raft store");
+    assert!(
+        after < admitted_ts,
+        "the admitted, unlogged commit at {admitted_ts} raised the receipt to {after}"
+    );
+}
+
 /// Unreleased events count toward the capacity, and an event dropped for
 /// lack of room makes the pending keys unknown until the consumer releases
 /// past it, as it does once a rebuild from the store covers it.
