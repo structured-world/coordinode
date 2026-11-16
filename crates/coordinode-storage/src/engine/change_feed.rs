@@ -1654,6 +1654,13 @@ impl Interest {
         self.labels.as_deref()
     }
 
+    /// The relationship type names whose events it takes, in name order;
+    /// `None` for every type.
+    #[must_use]
+    pub fn edge_types(&self) -> Option<&[Vec<u8>]> {
+        self.edge_types.as_deref()
+    }
+
     /// Node events routed by any of `labels` before or after them, and
     /// relationship events of any of `edge_types`; `None` for either takes
     /// every event of that kind. No blob object: [`Self::with_blobs`] adds
@@ -2219,6 +2226,37 @@ pub(crate) fn event_heap_bytes(event: &LogicalEvent<'_>) -> u64 {
     (target + event.payload.map_or(0, <[u8]>::len) + labels) as u64
 }
 
+/// What a reader's own form of what it reads takes, charged to the read's
+/// budget with the events, before they are kept: a server encoding each
+/// batch for its wire holds the batch and its encoding at once, within one
+/// limit.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not say what a reader's form of a change read takes",
+    label = "not a change encoding",
+    note = "pass `Unencoded` for a reader that keeps the batch as it is read"
+)]
+pub trait ChangeEncoding {
+    /// Bytes the reader's form of `event` takes.
+    fn event(&mut self, event: &LogicalEvent<'_>) -> u64;
+
+    /// Bytes the reader's form of a unit takes besides its events.
+    fn unit(&mut self) -> u64;
+}
+
+/// A reader that keeps the batch as it is read: no form of its own.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Unencoded;
+
+impl ChangeEncoding for Unencoded {
+    fn event(&mut self, _: &LogicalEvent<'_>) -> u64 {
+        0
+    }
+
+    fn unit(&mut self) -> u64 {
+        0
+    }
+}
+
 /// Bytes a read takes from its budget at a time for the events it keeps:
 /// the budget is asked once per block, not once per event.
 const CHARGE_BLOCK: u64 = 64 * 1024;
@@ -2291,6 +2329,8 @@ impl Room for BlockCharge<'_, '_> {
 /// unit's projection is taken from `charge` before it is allocated; when
 /// the charge refuses it, the read stops there, and the place it stopped is
 /// returned. A read that can keep nothing refuses with the budget's stop.
+/// What `encoding` says the reader's form of each unit and event takes is
+/// charged with it.
 ///
 /// # Errors
 ///
@@ -2302,6 +2342,7 @@ pub(crate) fn unit_changes(
     interest: &Interest,
     from: ReadPlace,
     charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+    encoding: &mut impl ChangeEncoding,
 ) -> Result<(Vec<UnitChanges>, Option<ReadPlace>), crate::error::StorageError> {
     use crate::error::StorageError;
     let projection = |e: ProjectionError| match e {
@@ -2351,8 +2392,10 @@ pub(crate) fn unit_changes(
                 ordinal,
             },
         };
-        // The unit's place in the batch, taken before it is read.
-        if !grow_within(&mut out, &mut room) {
+        // The unit's place in the batch and in the reader's form, taken
+        // before it is read.
+        let unit_form = encoding.unit();
+        if !grow_within(&mut out, &mut room) || !room.take(unit_form) {
             return stop(&mut room, out, stopped(first));
         }
         // Events are handed over one at a time from `first` on; those after
@@ -2362,7 +2405,8 @@ pub(crate) fn unit_changes(
         let mut refused = false;
         let projected = unit.project_with(first, &mut room, |event, room| {
             if let Some(delivery) = interest.delivery(&event) {
-                if !grow_within(&mut taken, room) || !room.take(event_heap_bytes(&event)) {
+                let kept = event_heap_bytes(&event) + encoding.event(&event);
+                if !grow_within(&mut taken, room) || !room.take(kept) {
                     refused = true;
                     return Take::Enough;
                 }

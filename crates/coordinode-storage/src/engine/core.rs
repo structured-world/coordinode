@@ -4941,7 +4941,12 @@ impl StorageEngine {
     )> {
         self.check_cursor_history(cursor)?;
         let (read, mut charge) = self.change_read(cursor.position(), max_entries, budget)?;
-        let batch = Self::batch_of(cursor, &read, &mut charge)?;
+        let batch = Self::batch_of(
+            cursor,
+            &read,
+            &mut charge,
+            &mut crate::engine::change_feed::Unencoded,
+        )?;
         Ok((batch, charge))
     }
 
@@ -4966,7 +4971,12 @@ impl StorageEngine {
         self.check_cursor_history(cursor)?;
         let (read, mut charge) =
             self.change_read_log(dirs, cursor.position(), until, max_entries, budget)?;
-        let batch = Self::batch_of(cursor, &read, &mut charge)?;
+        let batch = Self::batch_of(
+            cursor,
+            &read,
+            &mut charge,
+            &mut crate::engine::change_feed::Unencoded,
+        )?;
         Ok((batch, charge))
     }
 
@@ -4988,6 +4998,34 @@ impl StorageEngine {
         entries: impl IntoIterator<Item = &'e crate::oplog::entry::OplogEntry>,
         next: u64,
         budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::change_feed::ChangeBatch,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
+        self.changes_of_entries_encoded(
+            cursor,
+            entries,
+            next,
+            budget,
+            &mut crate::engine::change_feed::Unencoded,
+        )
+    }
+
+    /// [`Self::changes_of_entries`] for a reader that holds its own form of
+    /// the batch with it, as `encoding` says what each unit and event of
+    /// that form takes: the batch stops where the events and their form no
+    /// longer fit the budget together, and the returned charge holds both.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::changes_of_entries`].
+    pub fn changes_of_entries_encoded<'e, 'b>(
+        &self,
+        cursor: &crate::engine::change_feed::ChangeCursor,
+        entries: impl IntoIterator<Item = &'e crate::oplog::entry::OplogEntry>,
+        next: u64,
+        budget: &'b coordinode_core::budget::QueryBudget,
+        encoding: &mut impl crate::engine::change_feed::ChangeEncoding,
     ) -> StorageResult<(
         crate::engine::change_feed::ChangeBatch,
         coordinode_core::budget::MemoryCharge<'b>,
@@ -5040,7 +5078,7 @@ impl StorageEngine {
             units,
             next: read_to,
         };
-        let batch = Self::batch_of(cursor, &read, &mut charge)?;
+        let batch = Self::batch_of(cursor, &read, &mut charge, encoding)?;
         // The decoded units go with the read; the batch keeps its events.
         drop(read);
         charge.shrink(decoded);
@@ -5065,6 +5103,7 @@ impl StorageEngine {
         cursor: &crate::engine::change_feed::ChangeCursor,
         read: &crate::engine::change_feed::ChangeRead,
         charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+        encoding: &mut impl crate::engine::change_feed::ChangeEncoding,
     ) -> StorageResult<crate::engine::change_feed::ChangeBatch> {
         use crate::engine::change_feed::{ChangeBatch, ChangeCursor, ReadPlace, unit_changes};
         let (units, stopped) = unit_changes(
@@ -5075,6 +5114,7 @@ impl StorageEngine {
                 within: cursor.within_entry(),
             },
             charge,
+            encoding,
         )?;
         let next = match stopped {
             Some(place) => ChangeCursor::within(

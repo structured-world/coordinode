@@ -745,13 +745,57 @@ fn a_read_charges_its_events_by_the_block() {
     let units = entry_units(20);
     let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
     let mut charge = budget.empty_charge();
-    let (got, _) = unit_changes(&units, &Interest::all(), at(0, 0), &mut charge).expect("read");
+    let (got, _) = unit_changes(
+        &units,
+        &Interest::all(),
+        at(0, 0),
+        &mut charge,
+        &mut Unencoded,
+    )
+    .expect("read");
     let events: usize = got.iter().map(|u| u.events.len()).sum();
     assert_eq!(events, 21);
     // What the events and units hold, the unspent rest of the block returned.
     let held = budget.memory_used();
     assert!(held > 0 && held <= CHARGE_BLOCK, "{held}");
     assert_eq!(held, charge.bytes());
+}
+
+/// What a reader's own form of each event takes is charged with the event:
+/// a read whose budget holds the events alone, but not their form beside
+/// them, stops inside the unit.
+#[test]
+fn a_readers_form_is_charged_with_the_events() {
+    /// A form ten kilobytes an event.
+    struct Heavy;
+    impl ChangeEncoding for Heavy {
+        fn event(&mut self, _: &LogicalEvent<'_>) -> u64 {
+            10_000
+        }
+        fn unit(&mut self) -> u64 {
+            0
+        }
+    }
+    let units = entry_units(20);
+    let budget = coordinode_core::budget::QueryBudget::new(64 << 10);
+    let mut charge = budget.empty_charge();
+    let (alone, stopped) = unit_changes(
+        &units,
+        &Interest::all(),
+        at(0, 0),
+        &mut charge,
+        &mut Unencoded,
+    )
+    .expect("read");
+    assert_eq!((alone.len(), stopped), (2, None), "the events alone fit");
+    drop((alone, charge));
+    let budget = coordinode_core::budget::QueryBudget::new(64 << 10);
+    let mut charge = budget.empty_charge();
+    let (with_form, stopped) =
+        unit_changes(&units, &Interest::all(), at(0, 0), &mut charge, &mut Heavy).expect("read");
+    let events: usize = with_form.iter().map(|u| u.events.len()).sum();
+    assert!(events > 0 && events < 7, "{events} events with their form");
+    assert!(stopped.is_some(), "the read stops inside the unit");
 }
 
 /// The place in entry 7 at unit `sub`, ordinal `ordinal`.
@@ -808,7 +852,7 @@ fn a_read_stops_inside_a_unit_and_continues_there() {
         let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
         let mut charge = budget.empty_charge();
         let (whole, stopped) =
-            unit_changes(&units, &interest, at(0, 0), &mut charge).expect("read");
+            unit_changes(&units, &interest, at(0, 0), &mut charge, &mut Unencoded).expect("read");
         assert_eq!(stopped, None);
         whole
     };
@@ -826,7 +870,8 @@ fn a_read_stops_inside_a_unit_and_continues_there() {
     for _ in 0..32 {
         let budget = coordinode_core::budget::QueryBudget::new(room);
         let mut charge = budget.empty_charge();
-        let (got, stopped) = unit_changes(&units, &interest, from, &mut charge).expect("read");
+        let (got, stopped) =
+            unit_changes(&units, &interest, from, &mut charge, &mut Unencoded).expect("read");
         pieces.extend(got);
         match stopped {
             Some(next) => from = next,
@@ -861,18 +906,38 @@ fn a_read_starts_at_its_place_inside_the_entry() {
     let units = entry_units(5);
     let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
     let mut charge = budget.empty_charge();
-    let (got, _) = unit_changes(&units, &Interest::all(), at(0, 3), &mut charge).expect("read");
+    let (got, _) = unit_changes(
+        &units,
+        &Interest::all(),
+        at(0, 3),
+        &mut charge,
+        &mut Unencoded,
+    )
+    .expect("read");
     assert_eq!(
         covered(&got),
         vec![(0, 3, 5, vec![3, 4]), (1, 0, 1, vec![0])]
     );
-    let (got, _) = unit_changes(&units, &Interest::all(), at(1, 0), &mut charge).expect("read");
+    let (got, _) = unit_changes(
+        &units,
+        &Interest::all(),
+        at(1, 0),
+        &mut charge,
+        &mut Unencoded,
+    )
+    .expect("read");
     assert_eq!(covered(&got), vec![(1, 0, 1, vec![0])]);
 
     let tiny = coordinode_core::budget::QueryBudget::new(8);
     let mut charge = tiny.empty_charge();
     assert!(matches!(
-        unit_changes(&units, &Interest::all(), at(0, 0), &mut charge),
+        unit_changes(
+            &units,
+            &Interest::all(),
+            at(0, 0),
+            &mut charge,
+            &mut Unencoded
+        ),
         Err(crate::error::StorageError::Budget(_))
     ));
 }

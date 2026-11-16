@@ -13,6 +13,7 @@
 //! client granted.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use coordinode_core::graph::node::NodeId;
@@ -24,11 +25,12 @@ use coordinode_session::{
     SessionManager, SessionOp, SessionRegistry, SessionStats, StatementSource,
 };
 use tokio::sync::{mpsc, watch};
+use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status, Streaming};
 
 pub(crate) use self::engine::DatabaseCursorEngine;
-use super::cdc::{ChangeEventServiceImpl, Credit, Delivery, session_error};
+use super::cdc::{ChangeEventServiceImpl, Credit, Delivery, Outgoing, session_error};
 use super::cypher::{
     build_wait, build_wait_ms, proto_to_value_pub, read_concern_level, read_preference,
     value_to_proto_pub, vector_consistency, vector_consistency_to_proto, write_concern_from_proto,
@@ -137,7 +139,8 @@ fn connection_state(raft: &RaftNode) -> ConnectionState {
 
 #[tonic::async_trait]
 impl SessionServiceTrait for SessionSvc {
-    type SessionStream = ReceiverStream<Result<ServerFrame, Status>>;
+    type SessionStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ServerFrame, Status>> + Send>>;
 
     async fn session(
         &self,
@@ -161,7 +164,9 @@ impl SessionServiceTrait for SessionSvc {
         let mut inbound = request.into_inner();
         let (op_tx, op_rx) = mpsc::channel::<InOp>(BUFFER);
         let (ev_tx, mut ev_rx) = mpsc::channel::<OutEvent>(BUFFER);
-        let (frame_tx, frame_rx) = mpsc::channel::<Result<ServerFrame, Status>>(BUFFER);
+        // A subscription's batch holds its slot in here until the transport
+        // takes it: a session queues one batch per subscription at most.
+        let (frame_tx, frame_rx) = mpsc::channel::<Outgoing<Result<ServerFrame, Status>>>(BUFFER);
 
         // The core: concurrent dispatch + correlation + single writer, all
         // transport-agnostic.
@@ -231,7 +236,9 @@ impl SessionServiceTrait for SessionSvc {
                 }
                 let history = cluster.as_ref().and_then(|node| node.history());
                 if frame_tx
-                    .send(Ok(event_to_frame(request_id, event, history)))
+                    .send(Outgoing::free(Ok(event_to_frame(
+                        request_id, event, history,
+                    ))))
                     .await
                     .is_err()
                 {
@@ -240,7 +247,10 @@ impl SessionServiceTrait for SessionSvc {
             }
         });
 
-        Ok(Response::new(ReceiverStream::new(frame_rx)))
+        // The transport takes each frame here, which returns its slot.
+        Ok(Response::new(Box::pin(
+            ReceiverStream::new(frame_rx).map(Outgoing::into_inner),
+        )))
     }
 }
 
@@ -309,7 +319,7 @@ fn serve_subscription_op(
     request_id: u64,
     subscriptions: &mut HashMap<u64, Arc<Credit>>,
     change_streams: Option<&Arc<ChangeEventServiceImpl>>,
-    frames: &mpsc::Sender<Result<ServerFrame, Status>>,
+    frames: &mpsc::Sender<Outgoing<Result<ServerFrame, Status>>>,
 ) -> Option<Option<client_frame::Op>> {
     let reply = move |event: Event| ServerFrame {
         request_id,
@@ -319,10 +329,10 @@ fn serve_subscription_op(
         let frames = frames.clone();
         tokio::spawn(async move {
             let _ = frames
-                .send(Ok(ServerFrame {
+                .send(Outgoing::free(Ok(ServerFrame {
                     request_id,
                     event: Some(Event::Error(session_error(&status))),
-                }))
+                })))
                 .await;
         });
     };
@@ -366,7 +376,7 @@ fn serve_subscription_op(
                         reply(Event::Error(session_error(&status)))
                     }
                 };
-                let _ = frames.send(Ok(frame)).await;
+                let _ = frames.send(Outgoing::free(Ok(frame))).await;
                 credit.grant(u64::from(sub.credit));
             });
             None
@@ -391,7 +401,7 @@ fn serve_subscription_op(
                     Ok(()) => reply(Event::Acknowledged(Acknowledged {})),
                     Err(status) => reply(Event::Error(session_error(&status))),
                 };
-                let _ = frames.send(Ok(frame)).await;
+                let _ = frames.send(Outgoing::free(Ok(frame))).await;
             });
             None
         }
@@ -402,7 +412,7 @@ fn serve_subscription_op(
                     Ok(()) => reply(Event::SubscriptionCancelled(SubscriptionCancelled {})),
                     Err(status) => reply(Event::Error(session_error(&status))),
                 };
-                let _ = frames.send(Ok(frame)).await;
+                let _ = frames.send(Outgoing::free(Ok(frame))).await;
             });
             None
         }

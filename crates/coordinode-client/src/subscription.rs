@@ -197,6 +197,26 @@ pub struct Relationship {
     pub target_id: u64,
 }
 
+/// A label as the transaction knew it. Two labels of the same name and
+/// different identities are different labels: one was dropped and the
+/// other created later, and they have different scopes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Label {
+    /// The label's identity, never reused.
+    pub id: u32,
+    /// The name it was created under.
+    pub name: String,
+}
+
+impl From<crate::proto::replication::Label> for Label {
+    fn from(label: crate::proto::replication::Label) -> Self {
+        Self {
+            id: label.id,
+            name: label.name,
+        }
+    }
+}
+
 /// What an event changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeTarget {
@@ -222,13 +242,14 @@ pub enum ChangeTarget {
     /// What a blob owner holds, by its owner key; a put's payload is the
     /// owner record.
     BlobOwner(Vec<u8>),
-    /// A label a drop ended, by its name when the drop committed.
-    DroppedLabel(String),
+    /// A label a drop ended, which a label created later under its name is
+    /// not.
+    DroppedLabel(Label),
     /// A type whose implied labels changed: the event's labels before and
-    /// after name it and what it implied before and implies after.
+    /// after hold it and what it implied before and implies after.
     Scope {
-        /// The type's name.
-        label: String,
+        /// The type label.
+        label: Label,
         /// The activation of the change, distinct for every change.
         activation: u64,
     },
@@ -250,9 +271,9 @@ pub struct ChangeEvent {
     /// How a node event reaches the subscription's labels.
     pub delivery: ChangeDelivery,
     /// The labels a node carried before the transaction.
-    pub labels_before: Vec<String>,
+    pub labels_before: Vec<Label>,
     /// The labels a node carries after the event.
-    pub labels_after: Vec<String>,
+    pub labels_after: Vec<Label>,
 }
 
 /// One committed transaction, or a fragment of one: the events of it in the
@@ -306,26 +327,33 @@ impl ChangeEvent {
         use crate::proto::replication::{
             ChangeAction as ProtoAction, ChangeDelivery as ProtoDelivery,
         };
-        let target = event.target.map(|target| match target {
-            logical_change::Target::Node(node) => ChangeTarget::Node {
-                node_id: node.node_id,
-                valid_from: node.valid_from,
-            },
-            logical_change::Target::Relationship(r) => ChangeTarget::Relationship(relationship(r)),
-            logical_change::Target::Properties(r) => ChangeTarget::Properties(relationship(r)),
-            logical_change::Target::Instance(r) => {
-                let instance = r.instance.clone();
-                ChangeTarget::Instance {
-                    relationship: relationship(r),
-                    instance,
+        let target = event.target.and_then(|target| {
+            Some(match target {
+                logical_change::Target::Node(node) => ChangeTarget::Node {
+                    node_id: node.node_id,
+                    valid_from: node.valid_from,
+                },
+                logical_change::Target::Relationship(r) => {
+                    ChangeTarget::Relationship(relationship(r))
                 }
-            }
-            logical_change::Target::Scope(s) => ChangeTarget::Scope {
-                label: s.label,
-                activation: s.activation,
-            },
-            logical_change::Target::BlobOwner(key) => ChangeTarget::BlobOwner(key),
-            logical_change::Target::DroppedLabel(name) => ChangeTarget::DroppedLabel(name),
+                logical_change::Target::Properties(r) => ChangeTarget::Properties(relationship(r)),
+                logical_change::Target::Instance(r) => {
+                    let instance = r.instance.clone();
+                    ChangeTarget::Instance {
+                        relationship: relationship(r),
+                        instance,
+                    }
+                }
+                // A scope naming no type is not one this driver knows.
+                logical_change::Target::Scope(s) => ChangeTarget::Scope {
+                    label: Label::from(s.label?),
+                    activation: s.activation,
+                },
+                logical_change::Target::BlobOwner(key) => ChangeTarget::BlobOwner(key),
+                logical_change::Target::DroppedLabel(label) => {
+                    ChangeTarget::DroppedLabel(Label::from(label))
+                }
+            })
         });
         Self {
             ordinal: event.ordinal,
@@ -345,8 +373,8 @@ impl ChangeEvent {
                 Ok(ProtoDelivery::Leave) => ChangeDelivery::Leave,
                 Ok(ProtoDelivery::Unspecified) | Err(_) => ChangeDelivery::Other(event.delivery),
             },
-            labels_before: event.labels_before,
-            labels_after: event.labels_after,
+            labels_before: event.labels_before.into_iter().map(Label::from).collect(),
+            labels_after: event.labels_after.into_iter().map(Label::from).collect(),
         }
     }
 }

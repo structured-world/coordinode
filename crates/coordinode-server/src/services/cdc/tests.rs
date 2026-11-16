@@ -634,6 +634,108 @@ async fn stream_sends_only_applied_entries() {
     );
 }
 
+/// A service over six written entries, reading one entry a batch.
+fn one_entry_a_batch(dir: &std::path::Path) -> Fixture {
+    let floor = write_oplog(dir, 6);
+    let mut f = fixture(
+        vec![dir.to_path_buf()],
+        floor,
+        Arc::new(|| 6),
+        None,
+        RegistryTuning::default(),
+    );
+    f.service = f.service.with_tuning(super::CdcStreamTuning {
+        batch_size: std::num::NonZeroUsize::new(1).expect("one"),
+        ..super::CdcStreamTuning::default()
+    });
+    f
+}
+
+/// Wait until `rx` holds `count` messages, for at most a few seconds; then
+/// a little longer, so a message past `count` shows too.
+async fn settled<T>(rx: &tokio::sync::mpsc::Receiver<T>, count: usize) -> usize {
+    for _ in 0..100 {
+        if rx.len() >= count {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    rx.len()
+}
+
+/// A stream whose client reads nothing has one batch on its way: the next
+/// is not read until the transport takes it, whatever room its channel has,
+/// so it holds one read's memory at a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unread_stream_holds_one_batch() {
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let f = one_entry_a_batch(oplog_dir.path());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    f.service
+        .open(register("unread", strict()), super::Delivery::Stream { tx })
+        .await
+        .expect("open");
+    assert_eq!(settled(&rx, 1).await, 1, "one batch on its way");
+    // The transport takes it: the stream reads its next one.
+    let taken = rx.recv().await.expect("a batch").into_inner();
+    assert_eq!(taken.expect("batch").units.len(), 1);
+    assert_eq!(settled(&rx, 1).await, 1);
+}
+
+/// Each subscription of a session whose client reads nothing has one batch
+/// on its way, in a queue it shares with the session's other frames; a
+/// frame taken lets its own subscription read on. When the client leaves,
+/// the frames still queued are dropped and the subscriptions end.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unread_session_holds_one_batch_per_subscription() {
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let f = one_entry_a_batch(oplog_dir.path());
+    let (frames, mut rx) = tokio::sync::mpsc::channel(256);
+    let credits: Vec<Arc<super::Credit>> =
+        (0..2).map(|_| Arc::new(super::Credit::new(100))).collect();
+    for (request_id, credit) in credits.iter().enumerate() {
+        f.service
+            .open(
+                register(&format!("unread-{request_id}"), strict()),
+                super::Delivery::Session {
+                    frames: frames.clone(),
+                    request_id: request_id as u64,
+                    credit: Arc::clone(credit),
+                },
+            )
+            .await
+            .expect("open");
+    }
+    drop(frames);
+    assert_eq!(settled(&rx, 2).await, 2, "one batch a subscription");
+    let taken = rx.recv().await.expect("a frame").into_inner();
+    let taken = taken.expect("frame").request_id;
+    assert_eq!(
+        settled(&rx, 2).await,
+        2,
+        "the subscription taken from read on"
+    );
+    let next = rx.recv().await.expect("a frame").into_inner();
+    let next = next.expect("frame").request_id;
+    assert_ne!(next, taken, "the other subscription's batch was ahead");
+
+    // The client leaves: its queued frames go, and the subscriptions end,
+    // each giving up what it held.
+    drop(rx);
+    for credit in &credits {
+        let mut left = false;
+        for _ in 0..100 {
+            if Arc::strong_count(credit) == 1 {
+                left = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(left, "the subscription ended with its client");
+    }
+}
+
 /// A transaction with more events than one read holds goes out in fragments
 /// covering consecutive ordinal ranges, every event once; a subscription
 /// started from the cursor of a fragment continues inside the transaction.
@@ -873,16 +975,32 @@ async fn a_label_a_type_implies_receives_its_nodes_and_scope_changes() {
         events[0].target,
         Some(logical_change::Target::Node(_))
     ));
+    // Each label by its identity and name.
+    let wire = |id: coordinode_core::schema::label_id::LabelId, name: &str| {
+        crate::proto::replication::cdc::Label {
+            id: id.get(),
+            name: name.to_string(),
+        }
+    };
     assert_eq!(events[0].delivery, ChangeDelivery::Apply as i32);
-    assert_eq!(events[0].labels_after, ["Task", "Thing"]);
+    assert_eq!(
+        events[0].labels_after,
+        [wire(task, "Task"), wire(thing, "Thing")]
+    );
     let Some(logical_change::Target::Scope(scope)) = &events[1].target else {
         panic!("a scope change: {events:?}");
     };
-    assert_eq!((scope.label.as_str(), scope.activation), ("Task", 77));
+    assert_eq!(
+        (scope.label.clone(), scope.activation),
+        (Some(wire(task, "Task")), 77)
+    );
     assert_eq!(events[1].action, ChangeAction::ScopeChange as i32);
     assert_eq!(events[1].delivery, ChangeDelivery::Leave as i32);
-    assert_eq!(events[1].labels_before, ["Task", "Thing"]);
-    assert_eq!(events[1].labels_after, ["Task"]);
+    assert_eq!(
+        events[1].labels_before,
+        [wire(task, "Task"), wire(thing, "Thing")]
+    );
+    assert_eq!(events[1].labels_after, [wire(task, "Task")]);
 
     let mut unrelated = f
         .service
@@ -895,6 +1013,213 @@ async fn a_label_a_type_implies_receives_its_nodes_and_scope_changes() {
         taken += batch.units.iter().map(|u| u.events.len()).sum::<usize>();
     }
     assert_eq!(taken, 0);
+}
+
+/// A label dropped and created again under its name is another label on
+/// the wire: a stream reading the old one by a cursor taken before the drop
+/// keeps reading it, receives its node and its drop by its identity, and
+/// not the new label's node; a stream opened by the name after receives the
+/// new label's node by the new identity and nothing of the old.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_label_dropped_and_created_again_is_another_label_on_the_wire() {
+    use crate::proto::replication::cdc::ChangeAction;
+    use coordinode_core::txn::proposal::{Implication, NodeBasis};
+    use coordinode_modality::SchemaStore as _;
+
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog");
+    let f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
+        Arc::new(|| 3),
+        None,
+        RegistryTuning::default(),
+    );
+    let schemas = coordinode_modality::LocalSchemaStore::new(&f.engine);
+    let old = schemas.bind_label("Place").expect("bind");
+    let place = |names: &[&str]| ChangeInterest {
+        labels: Some(NameList {
+            names: names.iter().map(|n| (*n).to_string()).collect(),
+        }),
+        edge_types: Some(NameList { names: Vec::new() }),
+        blobs: false,
+    };
+    // A reader of the label as it is now.
+    let old_cursor = f
+        .engine
+        .change_cursor_at(0, Interest::new(Some(vec![old]), Some(Vec::new())))
+        .expect("cursor")
+        .to_bytes();
+    {
+        let pipeline = OwnedLocalProposalPipeline::new(&f.engine);
+        let oracle = f.engine.oracle().expect("clock");
+        let mut txn = Transaction::begin(&f.engine, Some(&oracle), oracle.next());
+        schemas.drop_label_txn(&mut txn, "Place").expect("drop");
+        txn.commit(&CommitContext {
+            write_concern: &WriteConcern::default(),
+            pipeline: Some(&pipeline),
+            id_gen: Some(&ProposalIdGenerator::new()),
+        })
+        .expect("commit the drop");
+    }
+    let new = schemas.bind_label("Place").expect("bind again");
+    assert_ne!(old, new);
+
+    // A node of the old label, the drop removing it, a node of the new one.
+    let key = |id| encode_node_key(0, NodeId::from_raw(id));
+    let written = |id, label| {
+        let mut effects = UnitEffects::new();
+        effects.nodes.push(NodeBasis {
+            key: key(id),
+            labels: Vec::new(),
+        });
+        effects.implications.push(Implication {
+            label,
+            implies: Vec::new(),
+        });
+        vec![
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key: key(id),
+                value: NodeRecord::with_labels(vec![label])
+                    .to_msgpack()
+                    .expect("record"),
+            },
+            Mutation::Effects(effects),
+        ]
+    };
+    let mut dropped = UnitEffects::new();
+    dropped.nodes.push(NodeBasis {
+        key: key(1),
+        labels: vec![old],
+    });
+    dropped.implications.push(Implication {
+        label: old,
+        implies: Vec::new(),
+    });
+    dropped.dropped.push(old);
+    let units = [
+        written(1, old),
+        vec![
+            Mutation::Delete {
+                partition: PartitionId::Node,
+                key: key(1),
+            },
+            Mutation::Effects(dropped),
+        ],
+        written(2, new),
+    ];
+    for (index, mutations) in units.iter().enumerate() {
+        let ts = 1_000 + index as u64;
+        let frame = coordinode_core::txn::frame::encode_unit(mutations, Timestamp::from_raw(ts))
+            .expect("frame");
+        mgr.append(&OplogEntry {
+            ts,
+            term: 1,
+            index: index as u64,
+            shard: 0,
+            ops: vec![OplogOp::Unit { frame }],
+            is_migration: false,
+            pre_images: None,
+        })
+        .expect("append");
+    }
+    mgr.flush().expect("flush");
+
+    let events_of =
+        |mut stream: <ChangeEventServiceImpl as ChangeStreamService>::SubscribeStream| async move {
+            let mut events = Vec::new();
+            while let Some(batch) = next_batch(&mut stream, Duration::from_millis(500)).await {
+                events.extend(batch.units.into_iter().flat_map(|u| u.events));
+            }
+            events
+        };
+    let wire =
+        |id: coordinode_core::schema::label_id::LabelId| crate::proto::replication::cdc::Label {
+            id: id.get(),
+            name: "Place".into(),
+        };
+
+    // The old cursor, with the interest it was read with by name.
+    let old_events = events_of(
+        f.service
+            .subscribe(Request::new(SubscribeRequest {
+                cursor: old_cursor,
+                interest: Some(place(&["Place"])),
+                ..register("old", strict())
+            }))
+            .await
+            .expect("resume with the old cursor")
+            .into_inner(),
+    )
+    .await;
+    let shape: Vec<_> = old_events
+        .iter()
+        .map(|e| {
+            (
+                e.action,
+                e.target.clone(),
+                e.labels_before.clone(),
+                e.labels_after.clone(),
+            )
+        })
+        .collect();
+    let node = |id| {
+        Some(logical_change::Target::Node(
+            crate::proto::replication::cdc::NodeTarget {
+                node_id: id,
+                valid_from: None,
+            },
+        ))
+    };
+    assert_eq!(
+        shape,
+        vec![
+            (
+                ChangeAction::Put as i32,
+                node(1),
+                Vec::new(),
+                vec![wire(old)]
+            ),
+            (
+                ChangeAction::Remove as i32,
+                node(1),
+                vec![wire(old)],
+                Vec::new()
+            ),
+            (
+                ChangeAction::Drop as i32,
+                Some(logical_change::Target::DroppedLabel(wire(old))),
+                vec![wire(old)],
+                Vec::new()
+            ),
+        ],
+        "the old label's node and drop, by its identity, and not the new one's"
+    );
+
+    // A stream opened by the name now reads the new label.
+    let new_cursor = f
+        .engine
+        .change_cursor_at(0, Interest::new(Some(vec![new]), Some(Vec::new())))
+        .expect("cursor")
+        .to_bytes();
+    let new_events = events_of(
+        f.service
+            .subscribe(Request::new(SubscribeRequest {
+                cursor: new_cursor,
+                interest: Some(place(&["Place"])),
+                ..register("new", strict())
+            }))
+            .await
+            .expect("subscribe by the name")
+            .into_inner(),
+    )
+    .await;
+    assert_eq!(new_events.len(), 1, "{new_events:?}");
+    assert_eq!(new_events[0].target, node(2));
+    assert_eq!(new_events[0].labels_after, vec![wire(new)]);
+    assert_ne!(wire(old), wire(new), "one name, two labels");
 }
 
 fn checkpoint_of(registry: &ShardConsumerRegistry, id: &str) -> Option<u64> {

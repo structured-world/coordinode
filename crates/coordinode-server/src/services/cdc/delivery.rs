@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use coordinode_replicate::{RegisteredHandle, SeqnoConsumerRegistry, ShardConsumerRegistry};
 use prost::Message as _;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tonic::Status;
 
 use crate::proto::replication::cdc::ChangeBatch;
@@ -77,16 +77,45 @@ impl Credit {
     }
 }
 
+/// A message on its way to the transport, with the stream's slot when it
+/// carries a batch: the slot returns, and the stream reads its next batch,
+/// only once the transport takes the message or the client is gone and it
+/// is dropped.
+pub(crate) struct Outgoing<T> {
+    item: T,
+    _slot: Option<OwnedSemaphorePermit>,
+}
+
+impl<T> Outgoing<T> {
+    /// A message holding no stream's slot: an answer or an error.
+    pub(crate) fn free(item: T) -> Self {
+        Self { item, _slot: None }
+    }
+
+    /// A batch holding its stream's slot.
+    fn holding(item: T, slot: OwnedSemaphorePermit) -> Self {
+        Self {
+            item,
+            _slot: Some(slot),
+        }
+    }
+
+    /// The message, as the transport takes it: its slot returns.
+    pub(crate) fn into_inner(self) -> T {
+        self.item
+    }
+}
+
 /// How a stream's batches reach its client.
 pub(crate) enum Delivery {
     /// The change-stream service's server stream: one message per batch.
     Stream {
-        tx: mpsc::Sender<Result<ChangeBatch, Status>>,
+        tx: mpsc::Sender<Outgoing<Result<ChangeBatch, Status>>>,
     },
     /// A subscription of a session: one frame per batch on the subscription's
     /// request id, within its credit.
     Session {
-        frames: mpsc::Sender<Result<ServerFrame, Status>>,
+        frames: mpsc::Sender<Outgoing<Result<ServerFrame, Status>>>,
         request_id: u64,
         credit: Arc<Credit>,
     },
@@ -149,32 +178,43 @@ impl Delivery {
         }
     }
 
-    /// Send `batch`, read from `entries` log entries, at most the room last
-    /// returned; `more` when applied entries were left past them. `Err` once
-    /// the client is gone.
-    pub(crate) async fn send(
+    /// The stream's slot for its next batch: free once the transport took
+    /// the batch before it, or the client left and it was dropped. A slow
+    /// client keeps its registration alive meanwhile, as an idle poll does.
+    /// `None` once the client is gone.
+    pub(crate) async fn slot(
         &self,
-        batch: ChangeBatch,
-        entries: u64,
-        more: bool,
+        slot: &Arc<Semaphore>,
         registry: &ShardConsumerRegistry,
         handle: &RegisteredHandle,
         heartbeat_interval: Duration,
+    ) -> Option<OwnedSemaphorePermit> {
+        loop {
+            tokio::select! {
+                permit = Arc::clone(slot).acquire_owned() => return permit.ok(),
+                () = self.closed() => return None,
+                () = tokio::time::sleep(heartbeat_interval) => heartbeat(registry, handle),
+            }
+        }
+    }
+
+    /// Send `batch`, read from `entries` log entries, at most the room last
+    /// returned, holding the stream's `slot` until the transport takes it;
+    /// `more` when applied entries were left past them. `Err` once the
+    /// client is gone.
+    pub(crate) async fn send(
+        &self,
+        batch: ChangeBatch,
+        slot: OwnedSemaphorePermit,
+        entries: u64,
+        more: bool,
     ) -> Result<(), ()> {
         match self {
-            Self::Stream { tx } => {
-                // A slow reader leaves no room in the channel; keep its
-                // registration alive while waiting, as an idle poll does.
-                let permit = loop {
-                    match tokio::time::timeout(heartbeat_interval, tx.reserve()).await {
-                        Ok(Ok(permit)) => break permit,
-                        Ok(Err(_)) => return Err(()),
-                        Err(_) => heartbeat(registry, handle),
-                    }
-                };
-                permit.send(Ok(batch));
-                Ok(())
-            }
+            // The slot was free: the batch before this one left the channel.
+            Self::Stream { tx } => tx
+                .send(Outgoing::holding(Ok(batch), slot))
+                .await
+                .map_err(|_| ()),
             Self::Session {
                 frames,
                 request_id,
@@ -190,7 +230,10 @@ impl Delivery {
                         entries: u32::try_from(entries).unwrap_or(u32::MAX),
                     })),
                 };
-                frames.send(Ok(frame)).await.map_err(|_| ())
+                frames
+                    .send(Outgoing::holding(Ok(frame), slot))
+                    .await
+                    .map_err(|_| ())
             }
         }
     }
@@ -199,16 +242,16 @@ impl Delivery {
     pub(crate) async fn fail(&self, status: Status) {
         match self {
             Self::Stream { tx } => {
-                let _ = tx.send(Err(status)).await;
+                let _ = tx.send(Outgoing::free(Err(status))).await;
             }
             Self::Session {
                 frames, request_id, ..
             } => {
                 let _ = frames
-                    .send(Ok(ServerFrame {
+                    .send(Outgoing::free(Ok(ServerFrame {
                         request_id: *request_id,
                         event: Some(Event::Error(session_error(&status))),
-                    }))
+                    })))
                     .await;
             }
         }
