@@ -21,9 +21,9 @@ use coordinode_core::graph::node::NodeRecord;
 use lsm_tree::{Error as LsmError, MergeOperator, UserValue};
 
 /// Tag bytes for merge operand encoding.
-const TAG_ADD: u8 = 0x01;
-const TAG_REMOVE: u8 = 0x02;
-const TAG_ADD_BATCH: u8 = 0x03;
+pub(crate) const TAG_ADD: u8 = 0x01;
+pub(crate) const TAG_REMOVE: u8 = 0x02;
+pub(crate) const TAG_ADD_BATCH: u8 = 0x03;
 
 /// Encode a single Add operand: `[TAG_ADD, uid_be_bytes(8)]`.
 pub fn encode_add(uid: u64) -> Vec<u8> {

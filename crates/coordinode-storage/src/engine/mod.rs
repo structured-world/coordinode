@@ -4,6 +4,7 @@ pub mod applied;
 pub mod batch;
 pub mod capacity;
 pub mod cardinality;
+pub mod change_feed;
 pub mod claims;
 pub(crate) mod closure_ledger;
 pub(crate) mod compaction;
