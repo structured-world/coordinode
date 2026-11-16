@@ -384,8 +384,9 @@ pub struct Transaction<'a> {
     expected_versions: Vec<(Partition, Vec<u8>, Option<u64>)>,
     /// Records written since the snapshot at a version this attempt read and
     /// builds on ([`Self::accept_written_at`]): their write-set check is the
-    /// exact version condition stated for them, not the snapshot.
-    accepted_writes: Vec<(Partition, Vec<u8>, u64)>,
+    /// exact version condition stated for them in `expected_versions`, not
+    /// the snapshot.
+    accepted_writes: Vec<(Partition, Vec<u8>)>,
     /// The schema generation as it stood when this attempt began. Every claim
     /// it makes is stamped with it, so a predicate evaluated here is not taken
     /// as evidence about a graph whose definitions have since changed.
@@ -476,7 +477,7 @@ pub struct TransactionState {
     /// statement of an interactive transaction binds the commit of the last.
     expected_versions: Vec<(Partition, Vec<u8>, Option<u64>)>,
     /// Parked with the conditions they rest on.
-    accepted_writes: Vec<(Partition, Vec<u8>, u64)>,
+    accepted_writes: Vec<(Partition, Vec<u8>)>,
     /// Parked with the claims it stamps: the generation belongs to the
     /// attempt, and the attempt spans the statements.
     schema_generation: u64,
@@ -1830,7 +1831,7 @@ impl<'a> Transaction<'a> {
         version: u64,
     ) -> StorageResult<()> {
         self.expect_version(part, key, Some(version))?;
-        self.accepted_writes.push((part, key.to_vec(), version));
+        self.accepted_writes.push((part, key.to_vec()));
         Ok(())
     }
 
@@ -2465,16 +2466,19 @@ impl<'a> Transaction<'a> {
         // starts below its snapshot when commits were still in flight under
         // it: those land beneath the snapshot after the reads were made.
         let occ_read_ts = self.validate_from.unwrap_or_else(|| self.read_ts.as_raw());
+        // Records built on as written at a version the check above found
+        // still in place: nothing wrote them past what this attempt read.
+        // Left out of this check only; admission registered them with the
+        // rest of the scope, which holds them until the commit applies.
+        if !self.accepted_writes.is_empty() {
+            scope.retain(|(part, key)| {
+                !self
+                    .accepted_writes
+                    .iter()
+                    .any(|(p, k)| p == part && k == key)
+            });
+        }
         for (part, key) in &scope {
-            // Built on as written at a version the check above found still
-            // in place: nothing wrote it past what this attempt read.
-            if self
-                .accepted_writes
-                .iter()
-                .any(|(p, k, _)| p == part && k == key)
-            {
-                continue;
-            }
             // Inclusive: a snapshot sees sequence numbers strictly below
             // itself, so a write landing at exactly that number is one this
             // transaction could not have seen. The strict comparison missed

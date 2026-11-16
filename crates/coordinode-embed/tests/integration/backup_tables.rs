@@ -362,6 +362,76 @@ fn a_transaction_writes_into_a_table_it_created() {
     );
 }
 
+/// A transaction keeps the tree its own creation of a table got: when the
+/// table's tree is dropped and made again between that creation and the
+/// transaction recording it, a row the transaction writes is refused before
+/// it is written, and the new tree holds none of it. Before, the creation's
+/// stamp was looked up again by name, found the new tree's, and let the row
+/// into it.
+#[test]
+fn a_transaction_writes_only_into_the_tree_its_creation_got() {
+    use coordinode_storage::error::StorageError;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = journal_less(dir.path());
+    let (paused_tx, paused) = mpsc::channel::<()>();
+    let (go, go_rx) = mpsc::channel::<()>();
+    let go_rx = std::sync::Mutex::new(go_rx);
+    db.engine().set_table_created_hook(Some(Box::new(move || {
+        let _ = paused_tx.send(());
+        let _ = go_rx
+            .lock()
+            .expect("hook lock")
+            .recv_timeout(Duration::from_secs(30));
+    })));
+
+    let txn = db.begin_transaction().expect("begin");
+    let creator = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.execute_in_transaction(
+                txn,
+                "CREATE TABLE Trade (id BIGINT PRIMARY KEY, qty INT) STORAGE COLUMNAR",
+                None,
+            )
+            .map(drop)
+        })
+    };
+    paused
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the creation got its tree");
+    db.engine()
+        .drop_columnar_table("Trade")
+        .expect("drop the tree");
+    db.engine()
+        .create_columnar_table("Trade")
+        .expect("make the tree again");
+    go.send(()).expect("resume the creation");
+    creator
+        .join()
+        .expect("creator thread")
+        .expect("create in the transaction");
+
+    let refused = db
+        .execute_in_transaction(txn, "CREATE (:Trade {id: 1, qty: 10})", None)
+        .expect_err("the row is refused: the tree is not the one this creation got");
+    assert!(
+        matches!(
+            refused.storage_cause(),
+            Some(StorageError::TableCreatedSinceRead { table }) if table == "Trade"
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        db.engine()
+            .columnar_scan("Trade", u64::MAX)
+            .expect("scan")
+            .is_empty(),
+        "the new tree holds none of the transaction's rows"
+    );
+    let _ended = db.rollback_transaction(txn);
+}
+
 /// A declaration that builds on a label another transaction declared after
 /// this one's snapshot is still refused at commit: only an implicit binding,
 /// which declares nothing, is built on past the snapshot.

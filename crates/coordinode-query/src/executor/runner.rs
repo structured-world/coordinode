@@ -22105,10 +22105,10 @@ fn execute_create_table(
     // engine's set of trees until it ends: a checkpoint takes both or neither.
     if columnar {
         let held = ctx.txn.hold_tree_set();
-        ctx.engine.create_columnar_table_held(name, held)?;
-        // The stamp of the tree just made: this transaction's rows go into
-        // it, and into no tree made under the name after.
-        let created_at = ctx.engine.columnar_table_created_at(name).unwrap_or(0);
+        // The stamp of the tree this creation got, read with it: this
+        // transaction's rows go into that tree, and into no tree made under
+        // the name after.
+        let created_at = ctx.engine.create_columnar_table_held(name, held)?;
         ctx.txn.note_table_created(name, created_at);
     }
 

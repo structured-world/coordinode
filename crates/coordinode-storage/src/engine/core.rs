@@ -394,6 +394,10 @@ pub struct StorageEngine {
     /// Test hook: run once a `STORAGE COLUMNAR` row has landed in its tree.
     #[cfg(any(test, feature = "test-faults"))]
     on_columnar_row: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test hook: run once a creation within an operation has its table's
+    /// tree and stamp, the registry's lock given back, before it returns.
+    #[cfg(any(test, feature = "test-faults"))]
+    on_table_created: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// Test hook: run once a checkpoint has pinned its trees and given the
     /// set of trees back, before it copies anything.
     #[cfg(any(test, feature = "test-faults"))]
@@ -1859,6 +1863,8 @@ impl StorageEngine {
             #[cfg(any(test, feature = "test-faults"))]
             on_columnar_row: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-faults"))]
+            on_table_created: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-faults"))]
             on_trees_pinned: parking_lot::Mutex::new(None),
             #[cfg(test)]
             on_journalled: parking_lot::Mutex::new(None),
@@ -2213,13 +2219,18 @@ impl StorageEngine {
     /// Returns [`StorageError::Engine`] if the tree cannot be opened.
     #[cfg(feature = "columnar")]
     pub fn create_columnar_table(&self, table_id: &str) -> StorageResult<lsm_tree::AnyTree> {
-        let held = self.hold_tree_set();
-        self.create_columnar_table_held(table_id, &held)
+        let _held = self.hold_tree_set();
+        self.open_columnar_table(table_id).map(|(tree, _, _)| tree)
     }
 
     /// [`Self::create_columnar_table`] within an operation that holds the
     /// set of trees as `_held` from before the tree is made until its
-    /// catalog change commits.
+    /// catalog change commits. Returns the stamp of the tree it got, read
+    /// with the tree under the registry's lock: the timestamp it was created
+    /// at in this process, 0 for a table the store held when it opened. A
+    /// transaction that creates the table keeps the stamp, so its rows go
+    /// into that tree and into no other made under the name. No handle of
+    /// the tree is kept: a drop of the table waits for every one.
     ///
     /// # Errors
     ///
@@ -2229,17 +2240,27 @@ impl StorageEngine {
         &self,
         table_id: &str,
         _held: &crate::engine::tree_set::TreeSetHold,
-    ) -> StorageResult<lsm_tree::AnyTree> {
-        self.open_columnar_table(table_id).map(|(tree, _)| tree)
+    ) -> StorageResult<lsm_tree::SeqNo> {
+        let (_, _, created_at) = self.open_columnar_table(table_id)?;
+        // Taken once, and called with its lock given back: what it runs may
+        // create a table itself.
+        #[cfg(any(test, feature = "test-faults"))]
+        {
+            let hook = self.on_table_created.lock().take();
+            if let Some(mut hook) = hook {
+                hook();
+            }
+        }
+        Ok(created_at)
     }
 
     /// The tree of `table_id`, created on first use, with the table's own
-    /// write-pressure tier. A table created here holds none of the entries
+    /// write-pressure tier and the tree's stamp. A table created here holds none of the entries
     /// journalled before it existed (those belonged to a dropped table of the
     /// same name, if any), so on a journalled engine it gets a coverage base
     /// at the journal's next index, made durable before any row can reach it.
     #[cfg(feature = "columnar")]
-    fn open_columnar_table(&self, table_id: &str) -> StorageResult<(lsm_tree::AnyTree, u8)> {
+    fn open_columnar_table(&self, table_id: &str) -> StorageResult<(lsm_tree::AnyTree, u8, u64)> {
         self.columnar_tables.open_judged(
             table_id,
             || self.next_seqno(),
@@ -2343,7 +2364,7 @@ impl StorageEngine {
         value: Vec<u8>,
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
-        let (tree, table_tier) = self.open_columnar_table(table_id)?;
+        let (tree, table_tier, _) = self.open_columnar_table(table_id)?;
         self.insert_columnar_row(table_id, &tree, table_tier, key, value, seqno)
     }
 
@@ -2353,7 +2374,7 @@ impl StorageEngine {
     /// name is the one that table was created with. `read_at` is the
     /// snapshot the statement read the table's definition at, and
     /// `created_here` the stamp of the tree its own transaction created
-    /// under the name, if it did ([`Self::columnar_table_created_at`]): a
+    /// under the name, if it did ([`Self::create_columnar_table_held`]): a
     /// tree newer than the snapshot and not that one belongs to a table
     /// created again under the name since, and the row is refused before it
     /// is written.
@@ -2388,17 +2409,6 @@ impl StorageEngine {
             });
         }
         self.insert_columnar_row(table_id, &tree, table_tier, key, value, seqno)
-    }
-
-    /// The stamp of `table_id`'s tree: the timestamp it was created at in
-    /// this process, 0 for a table the store held when it opened; `None`
-    /// when there is no such table. A transaction that creates the table
-    /// keeps it, so its later rows go into that tree and no other.
-    #[cfg(feature = "columnar")]
-    pub fn columnar_table_created_at(&self, table_id: &str) -> Option<lsm_tree::SeqNo> {
-        self.columnar_tables
-            .get_stamped(table_id)
-            .map(|(_, _, created_at)| created_at)
     }
 
     /// [`Self::columnar_insert`] into `tree`, the table's tree already open,
@@ -2673,7 +2683,7 @@ impl StorageEngine {
             }
             for (table_id, rows) in &tables {
                 self.columnar_tables.drop_table(table_id)?;
-                let (tree, _) = self.open_columnar_table(table_id)?;
+                let (tree, _, _) = self.open_columnar_table(table_id)?;
                 if !rows.is_empty() {
                     let rows: Vec<crate::columnar::ColumnarRow<'_>> = rows
                         .iter()
@@ -2751,7 +2761,7 @@ impl StorageEngine {
     ) -> StorageResult<()> {
         #[cfg(feature = "columnar")]
         {
-            let (tree, _) = self.open_columnar_table(table_id)?;
+            let (tree, _, _) = self.open_columnar_table(table_id)?;
             let rows: Vec<crate::columnar::ColumnarRow<'_>> = rows
                 .iter()
                 .map(|(key, value)| crate::columnar::ColumnarRow { key, value })
@@ -7493,6 +7503,15 @@ impl StorageEngine {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn set_columnar_row_hook(&self, hook: Option<Box<dyn FnMut() + Send>>) {
         *self.on_columnar_row.lock() = hook;
+    }
+
+    /// Run `hook` once a creation within an operation
+    /// ([`Self::create_columnar_table_held`]) has its tree and stamp, before
+    /// the operation records them. For tests of a table dropped and created
+    /// again in between.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn set_table_created_hook(&self, hook: Option<Box<dyn FnMut() + Send>>) {
+        *self.on_table_created.lock() = hook;
     }
 
     /// Run `hook` once a checkpoint has pinned its trees and given the set

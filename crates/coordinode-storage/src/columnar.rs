@@ -386,23 +386,28 @@ impl ColumnarTableRegistry {
         on_create: impl FnOnce(&AnyTree) -> StorageResult<()>,
     ) -> StorageResult<AnyTree> {
         self.open_judged(table_id, || created_at, on_create)
-            .map(|(tree, _)| tree)
+            .map(|(tree, _, _)| tree)
     }
 
     /// [`Self::create_or_open_with`], with the table's write-pressure tier
-    /// (see [`Self::pressure`]) read under the same lock: what a write to
-    /// the table needs, for one lookup. A table created here is stamped with
-    /// `created_at()`, asked only then ([`Self::get_stamped`]).
+    /// (see [`Self::pressure`]) and the stamp of its tree
+    /// ([`Self::get_stamped`]) read under the same lock: what a write to the
+    /// table needs, for one lookup, and the identity of the tree it got. A
+    /// table created here is stamped with `created_at()`, asked only then.
     pub(crate) fn open_judged(
         &self,
         table_id: &str,
         created_at: impl FnOnce() -> u64,
         on_create: impl FnOnce(&AnyTree) -> StorageResult<()>,
-    ) -> StorageResult<(AnyTree, u8)> {
+    ) -> StorageResult<(AnyTree, u8, u64)> {
         let mut tables = self.lock();
         loop {
             if let Some(entry) = tables.live.get(table_id) {
-                return Ok((entry.tree.clone(), entry.pressure.load(Ordering::Relaxed)));
+                return Ok((
+                    entry.tree.clone(),
+                    entry.pressure.load(Ordering::Relaxed),
+                    entry.created_at,
+                ));
             }
             match tables.retiring.get(table_id) {
                 None => break,
@@ -421,11 +426,12 @@ impl ColumnarTableRegistry {
         // has not judged it.
         let (tree, _) = self.open_tree(table_id)?;
         on_create(&tree)?;
+        let created_at = created_at();
         tables.live.insert(
             table_id.to_owned(),
-            TableEntry::new(tree.clone(), created_at()),
+            TableEntry::new(tree.clone(), created_at),
         );
-        Ok((tree, 0))
+        Ok((tree, 0, created_at))
     }
 
     /// The tree of `table_id`, its write-pressure tier and the timestamp it
