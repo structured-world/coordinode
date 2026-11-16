@@ -61,6 +61,35 @@ fn create_node_with_various_types() {
     assert_eq!(rows.len(), 1);
 }
 
+/// REMOVE of a relationship's property removes it, the relationship and its
+/// other properties staying; removing its last one leaves a relationship
+/// without properties. A REMOVE that changed nothing on a relationship
+/// would report success and leave the value in place.
+#[test]
+fn remove_takes_a_property_off_a_relationship() {
+    let mut db = open_db();
+    db.execute_cypher(
+        "CREATE (:User {name: 'a'})-[:KNOWS {since: 1, via: 'x'}]->(:User {name: 'b'})",
+    )
+    .expect("create");
+    db.execute_cypher("MATCH ()-[r:KNOWS]->() REMOVE r.since")
+        .expect("remove one");
+    let rows = db
+        .execute_cypher("MATCH ()-[r:KNOWS]->() RETURN r.since AS s, r.via AS v")
+        .expect("read");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s"), Some(&Value::Null));
+    assert_eq!(rows[0].get("v"), Some(&Value::String("x".into())));
+
+    db.execute_cypher("MATCH ()-[r:KNOWS]->() REMOVE r.via")
+        .expect("remove the last");
+    let rows = db
+        .execute_cypher("MATCH (a)-[r:KNOWS]->(b) RETURN r.via AS v, a.name AS a")
+        .expect("read");
+    assert_eq!(rows.len(), 1, "the relationship stays");
+    assert_eq!(rows[0].get("v"), Some(&Value::Null));
+}
+
 #[test]
 fn create_relationship() {
     let mut db = open_db();

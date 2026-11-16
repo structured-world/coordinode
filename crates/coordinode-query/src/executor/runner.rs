@@ -17979,6 +17979,12 @@ fn execute_remove(
             }
             match item {
                 crate::plan::RemoveItem::Property { variable, property } => {
+                    // A relationship binding carries its type, as for SET.
+                    if let Some(Value::String(edge_type)) = out_row.get(variable).cloned() {
+                        remove_edge_property(variable, &edge_type, property, &mut out_row, ctx)?;
+                        out_row.remove(&format!("{variable}.{property}"));
+                        continue;
+                    }
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -21360,6 +21366,77 @@ fn update_edge_property(
     }
     ctx.mvcc_put_edge_props_either(edge_type, src, tgt, valid_from_for_key, &prop_map)?;
     ctx.write_stats.properties_set += 1;
+    Ok(())
+}
+
+/// Apply `REMOVE r.<property>` to the matched edge, located as
+/// [`update_edge_property`] locates it. A relationship that has no such
+/// property is left as it is. Removing the last property of a relationship
+/// that is neither versioned nor discriminated removes its property record,
+/// the relationship staying; a version's or instance's record is the
+/// version or instance itself and stays, with no properties.
+fn remove_edge_property(
+    edge_variable: &str,
+    edge_type: &str,
+    property: &str,
+    row: &mut Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let src_raw = match row.get(&format!("{edge_variable}.__src__")) {
+        Some(Value::Int(n)) => *n as u64,
+        _ => return Ok(()),
+    };
+    let tgt_raw = match row.get(&format!("{edge_variable}.__tgt__")) {
+        Some(Value::Int(n)) => *n as u64,
+        _ => return Ok(()),
+    };
+    let src = NodeId::from_raw(src_raw);
+    let tgt = NodeId::from_raw(tgt_raw);
+    if matches!(property, "__src__" | "__tgt__" | "__type__") {
+        return Err(ExecutionError::Unsupported(format!(
+            "REMOVE {edge_variable}.{property} is reserved: '{property}' is \
+             engine-internal row metadata"
+        )));
+    }
+    let is_temporal = lookup_edge_type_temporal(edge_type, ctx)?;
+    if is_temporal && property == "valid_from" {
+        return Err(ExecutionError::Unsupported(format!(
+            "REMOVE {edge_variable}.valid_from is not allowed on temporal edges: \
+             valid_from is part of the storage key"
+        )));
+    }
+    let valid_from_for_key: Option<i64> = if is_temporal {
+        match row.get(&format!("{edge_variable}.valid_from")) {
+            Some(Value::Int(ms)) => Some(*ms),
+            _ => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "REMOVE on temporal edge '{edge_variable}': matched row is missing valid_from"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    // A name without a binding is on no record.
+    let Some(field_id) = ctx.interner.lookup(property) else {
+        return Ok(());
+    };
+    let Some(mut prop_map) =
+        ctx.mvcc_get_edge_props_either(edge_type, src, tgt, valid_from_for_key)?
+    else {
+        return Ok(());
+    };
+    let before = prop_map.len();
+    prop_map.retain(|(id, _)| *id != field_id);
+    if prop_map.len() == before {
+        return Ok(());
+    }
+    if prop_map.is_empty() && valid_from_for_key.is_none() {
+        ctx.mvcc_delete_edge_props(edge_type, src, tgt)?;
+    } else {
+        ctx.mvcc_put_edge_props_either(edge_type, src, tgt, valid_from_for_key, &prop_map)?;
+    }
+    ctx.write_stats.properties_removed += 1;
     Ok(())
 }
 
