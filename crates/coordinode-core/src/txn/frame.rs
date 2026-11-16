@@ -30,7 +30,8 @@ use super::operation::{
     OperationId,
 };
 use super::proposal::{
-    DerivedIndexWork, DerivedSource, IndexBinding, Mutation, PartitionId, ProposalId, RaftProposal,
+    DerivedIndexWork, DerivedSource, IndexBinding, Mutation, NodeBasis, PartitionId, ProposalId,
+    RaftProposal, UnitEffects,
 };
 use super::timestamp::Timestamp;
 
@@ -48,7 +49,11 @@ const KIND_REMOVE_RANGE: u8 = 3;
 const KIND_COMMAND: u8 = 4;
 const KIND_DERIVE: u8 = 5;
 const KIND_OPERATION: u8 = 6;
+const KIND_EFFECTS: u8 = 7;
 const KIND_MASK: u8 = 0b111;
+
+/// Bytes a decoded label identity holds.
+const LABEL_BYTES: usize = core::mem::size_of::<crate::schema::label_id::LabelId>();
 
 /// The operation commands, as the byte after [`KIND_OPERATION`] numbers
 /// them.
@@ -189,6 +194,9 @@ pub enum FrameError {
     /// A DERIVED binding whose interpretation this build cannot derive.
     #[error(transparent)]
     Unsupported(#[from] crate::index::derive::UnsupportedInterpretation),
+    /// An effect context whose entries do not decode.
+    #[error("frame effect context does not decode: {0}")]
+    Effects(&'static str),
     /// A DERIVED source naming no earlier node record put of the unit.
     #[error("derivation source {ordinal} is not an earlier node record put")]
     BadSource {
@@ -407,8 +415,32 @@ impl<'a> Encoder<'a> {
                 self.expanded += command.size_estimate();
                 encode_operation(command, out);
             }
+            Mutation::Effects(effects) => self.effects(effects, out),
         }
         Ok(())
+    }
+
+    /// An effect context: its keys are coded against the keys of the
+    /// partition they name, so a node or pair the unit also writes costs a
+    /// few bytes.
+    fn effects(&mut self, effects: &'a UnitEffects, out: &mut Vec<u8>) {
+        out.push(KIND_EFFECTS);
+        put_varint(u64::from(effects.interpretation), out);
+        let node = usize::from(partition_number(PartitionId::Node));
+        put_varint(effects.nodes.len() as u64, out);
+        for basis in &effects.nodes {
+            self.key(node, &basis.key, out);
+            put_varint(basis.labels.len() as u64, out);
+            for label in &basis.labels {
+                put_varint(u64::from(label.get()), out);
+            }
+            self.expanded += basis.labels.len() * LABEL_BYTES;
+        }
+        let edge = usize::from(partition_number(PartitionId::EdgeProp));
+        put_varint(effects.removed_edges.len() as u64, out);
+        for key in &effects.removed_edges {
+            self.key(edge, key, out);
+        }
     }
 
     /// [`Self::bytes`] for a slice encoded here rather than borrowed.
@@ -538,6 +570,10 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
     }
     // Each addend is the length of a slice held in memory for this unit.
     let mut expanded = 0usize;
+    // Lengths and counts an effect context adds per entry, beyond the one
+    // operation overhead: two key lengths per key, a label count, and a
+    // label id's varint byte past the bytes it decodes to.
+    let mut entries = 0usize;
     for (at, mutation) in unit.mutations.iter().enumerate() {
         expanded += match mutation {
             Mutation::Put { key, value, .. } => key.len() + value.len(),
@@ -558,6 +594,18 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
                     + new
             }
             Mutation::Operation(command) => command.size_estimate(),
+            Mutation::Effects(effects) => {
+                let mut bytes = 0;
+                for basis in &effects.nodes {
+                    entries += 3 * 10 + basis.labels.len();
+                    bytes += basis.key.len() + basis.labels.len() * LABEL_BYTES;
+                }
+                for key in &effects.removed_edges {
+                    entries += 2 * 10;
+                    bytes += key.len();
+                }
+                bytes
+            }
         };
     }
     if expanded > limits.max_expanded_bytes {
@@ -572,6 +620,7 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
     let most = ops
         .checked_mul(MAX_OP_OVERHEAD)
         .and_then(|overhead| overhead.checked_add(FRAME_HEADER_MAX))
+        .and_then(|fixed| fixed.checked_add(entries))
         .and_then(|fixed| fixed.checked_add(expanded));
     match most {
         Some(most) if most <= limits.max_frame_bytes => Ok(()),
@@ -649,11 +698,12 @@ pub fn decode_proposal_sized(
     decode_with(frame, limits, Objects::Decode)
 }
 
-/// [`decode_proposal_sized`] for a reader that keeps only the row changes
-/// and the operation commands of a proposal: its metadata commands and
-/// DERIVED index work are read to their ends and left out, never decoded
-/// into objects, so what the proposal holds is its row changes and the
-/// bytes they expanded to. The operations kept keep their order.
+/// [`decode_proposal_sized`] for a reader that keeps only the row changes,
+/// the operation commands and the effect context of a proposal: its metadata
+/// commands and DERIVED index work are read to their ends and left out,
+/// never decoded into objects, so what the proposal holds is its row changes,
+/// what they mean, and the bytes they expanded to. The operations kept keep
+/// their order.
 ///
 /// # Errors
 ///
@@ -860,6 +910,15 @@ impl<'a> Decoder<'a> {
                 .operation()
                 .map(|command| Some(Mutation::Operation(command)));
         }
+        if kind == KIND_EFFECTS {
+            if tag != KIND_EFFECTS {
+                return Err(FrameError::UnknownTag(tag));
+            }
+            // Kept by a reader of rows too: it is what the rows mean.
+            return self
+                .effects()
+                .map(|effects| Some(Mutation::Effects(effects)));
+        }
         let p = usize::from(tag >> 3);
         let partition = *PARTITIONS.get(p).ok_or(FrameError::UnknownTag(tag))?;
         let row = match kind {
@@ -945,6 +1004,51 @@ impl<'a> Decoder<'a> {
         };
         self.spend(command.size_estimate())?;
         Ok(command)
+    }
+
+    /// An effect context [`Encoder::effects`] wrote. Each count is checked
+    /// against the bytes left before anything is allocated for it: a key takes
+    /// at least two bytes, a label id one.
+    fn effects(&mut self) -> Result<UnitEffects, FrameError> {
+        let interpretation = u32::try_from(self.reader.varint()?)
+            .map_err(|_| FrameError::Effects("interpretation out of range"))?;
+        let node = usize::from(partition_number(PartitionId::Node));
+        let count = self.reader.len_at_most(self.limit, "effect count")?;
+        if count > self.reader.remaining() / 3 {
+            return Err(FrameError::Truncated { at: self.reader.at });
+        }
+        let mut nodes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key = self.key(node)?;
+            let labels = self.reader.len_at_most(self.limit, "label count")?;
+            if labels > self.reader.remaining() {
+                return Err(FrameError::Truncated { at: self.reader.at });
+            }
+            self.spend(labels * LABEL_BYTES)?;
+            let labels = (0..labels)
+                .map(|_| {
+                    let raw = self.reader.varint()?;
+                    u32::try_from(raw)
+                        .ok()
+                        .and_then(crate::schema::label_id::LabelId::new)
+                        .ok_or(FrameError::Effects("label id out of range"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            nodes.push(NodeBasis { key, labels });
+        }
+        let edge = usize::from(partition_number(PartitionId::EdgeProp));
+        let count = self.reader.len_at_most(self.limit, "effect count")?;
+        if count > self.reader.remaining() / 2 {
+            return Err(FrameError::Truncated { at: self.reader.at });
+        }
+        let removed_edges = (0..count)
+            .map(|_| self.key(edge))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(UnitEffects {
+            interpretation,
+            nodes,
+            removed_edges,
+        })
     }
 
     fn issuer(&mut self) -> Result<IssuerId, FrameError> {

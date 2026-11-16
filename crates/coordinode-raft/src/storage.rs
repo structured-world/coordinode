@@ -1368,12 +1368,14 @@ impl LogStore {
                     // Removals, metadata and operation commands and index
                     // maintenance add nothing of the user's: an index entry
                     // follows a record the same unit or an earlier one wrote,
-                    // and an operation record describes the unit's own data.
+                    // and an operation record describes the unit's own data,
+                    // as an effect context describes its rows.
                     Mutation::Delete { .. }
                     | Mutation::RemoveRange { .. }
                     | Mutation::Command(_)
                     | Mutation::Derive(_)
-                    | Mutation::Operation(_) => false,
+                    | Mutation::Operation(_)
+                    | Mutation::Effects(_) => false,
                 });
             if writes {
                 return Ok(true);

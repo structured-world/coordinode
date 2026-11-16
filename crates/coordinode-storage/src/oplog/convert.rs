@@ -69,6 +69,11 @@ pub fn mutation_to_op(m: &Mutation) -> StorageResult<OplogOp> {
             work: rmp_serde::to_vec(work)
                 .map_err(|e| StorageError::Serialization(format!("derived index work: {e}")))?,
         },
+        Mutation::Effects(_) => {
+            return Err(StorageError::InvalidConfig(
+                "an effect context has no raw op: only its unit's frame carries it".into(),
+            ));
+        }
     })
 }
 
@@ -149,8 +154,9 @@ pub type UnitDecisions<'a> = &'a (dyn Fn(LogPosition) -> StorageResult<bool> + S
 /// The ops a journalled entry records, each unit frame expanded into the
 /// operations it encodes, in order. DERIVED work stays work; a metadata or
 /// operation command a Raft log entry carries is left out, its effects being
-/// decided at application and never a data change. An entry without a frame
-/// is returned as it is.
+/// decided at application and never a data change, and so is an effect
+/// context, which is no data change either. An entry without a frame is
+/// returned as it is.
 ///
 /// # Errors
 ///
@@ -205,7 +211,10 @@ pub fn expand_units_decided<'o>(
             }
         }
         for mutation in mutations {
-            if !matches!(mutation, Mutation::Command(_) | Mutation::Operation(_)) {
+            if !matches!(
+                mutation,
+                Mutation::Command(_) | Mutation::Operation(_) | Mutation::Effects(_)
+            ) {
                 out.push(mutation_to_op(&mutation)?);
             }
         }

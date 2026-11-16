@@ -329,6 +329,8 @@ impl StorageEngine {
             Mutation::Operation(_) => Partition::Schema,
             // Resolved above; its entries are index records.
             Mutation::Derive(_) => Partition::Idx,
+            // Writes nothing; it goes with the node rows it describes.
+            Mutation::Effects(_) => Partition::Node,
         };
         // A committed entry: a read that sees any of its writes is not ahead
         // of the ceiling, which is raised before the first lands.

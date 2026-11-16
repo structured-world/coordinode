@@ -58,7 +58,34 @@ fn mixed() -> RaftProposal {
         }),
         put(PartitionId::Registry, b"", b""),
         put(PartitionId::VectorF32, b"vec:1:42", &email),
+        effects(),
     ])
+}
+
+fn label(raw: u32) -> crate::schema::label_id::LabelId {
+    crate::schema::label_id::LabelId::new(raw).expect("a nonzero label id")
+}
+
+/// A context naming a node the unit writes, one it removes without a record,
+/// and a relationship.
+fn effects() -> Mutation {
+    Mutation::Effects(UnitEffects {
+        interpretation: crate::txn::proposal::EFFECTS_INTERPRETATION,
+        nodes: vec![
+            NodeBasis {
+                key: b"node:1:42".to_vec(),
+                labels: vec![label(1), label(300), label(u32::MAX)],
+            },
+            NodeBasis {
+                key: b"node:1:44".to_vec(),
+                labels: Vec::new(),
+            },
+        ],
+        removed_edges: vec![
+            b"edgeprop:KNOWS:\0\0\0\0\0\0\0\x2a:\0\0\0\0\0\0\0\x2b".to_vec(),
+            b"edgeprop:KNOWS:\0\0\0\0\0\0\0\x2a:\0\0\0\0\0\0\0\x2b:\x80\0\0\0\0\0\0\x01".to_vec(),
+        ],
+    })
 }
 
 fn decode(bytes: &[u8]) -> Result<RaftProposal, FrameError> {
@@ -174,12 +201,12 @@ fn unknown_flags_and_tags_are_refused() {
     assert_eq!(decode(&signed(body)), Err(FrameError::UnknownFlags(0x80)));
 
     for tag in [
-        7u8,
         // One past the last partition a frame numbers.
         KIND_PUT | ((PARTITIONS.len() as u8) << 3),
         KIND_COMMAND | (1 << 3),
         KIND_DERIVE | (1 << 3),
         KIND_OPERATION | (1 << 3),
+        KIND_EFFECTS | (1 << 3),
     ] {
         let mut body = header(1);
         body.extend_from_slice(&[tag, 0, 0, 0]);
@@ -379,10 +406,11 @@ fn derive(node_id: u64, new: DerivedSource) -> Mutation {
     })
 }
 
-/// A reader of rows gets the row changes and operation commands of a frame
-/// in their order, its metadata commands and DERIVED work left out and not
-/// counted, and literals the left-out work introduced still serve the
-/// operations that refer to them.
+/// A reader of rows gets the row changes, operation commands and effect
+/// context of a frame in their order, its metadata commands and DERIVED work
+/// left out and not counted, and literals the left-out work introduced still
+/// serve the operations that refer to them. The change feed reads rows this
+/// way, so a context lost here would be lost to every subscriber.
 #[test]
 fn a_reader_of_rows_leaves_commands_and_derived_work_out() {
     let issuer = IssuerId([3; ISSUER_ID_LEN]);
@@ -403,9 +431,10 @@ fn a_reader_of_rows_leaves_commands_and_derived_work_out() {
         Mutation::Command(MetadataCommand::RegisterFields {
             names: vec!["email".into(); 64],
         }),
-        bind.clone(),
         derive(42, DerivedSource::UnitRecord(2)),
         put(PartitionId::Node, b"node:1:43", b"record-bytes"),
+        effects(),
+        bind.clone(),
     ]);
     let frame = encode_proposal(&full).expect("encode");
     let (whole, whole_expanded) =
@@ -416,8 +445,9 @@ fn a_reader_of_rows_leaves_commands_and_derived_work_out() {
         rows.mutations,
         vec![
             put(PartitionId::Node, b"node:1:42", b"record-bytes"),
-            bind,
             put(PartitionId::Node, b"node:1:43", b"record-bytes"),
+            effects(),
+            bind,
         ]
     );
     assert_eq!((rows.id, rows.commit_ts), (full.id, full.commit_ts));
@@ -718,6 +748,110 @@ fn an_unsupported_interpretation_is_refused() {
     assert!(matches!(
         decode(&unchecked_frame(&[work])),
         Err(FrameError::Unsupported(_))
+    ));
+}
+
+/// The routing basis of removed nodes costs a few bytes each beside the
+/// deletes it describes: its keys share the node partition's prefixes, so no
+/// identity is written twice.
+#[test]
+fn an_effect_context_costs_little_beside_the_rows_it_describes() {
+    let keys: Vec<Vec<u8>> = (0..200u64)
+        .map(|i| {
+            crate::graph::node::encode_node_key(1, crate::graph::node::NodeId::from_raw(i * 7))
+        })
+        .collect();
+    let deletes: Vec<Mutation> = keys
+        .iter()
+        .map(|key| Mutation::Delete {
+            partition: PartitionId::Node,
+            key: key.clone(),
+        })
+        .collect();
+    let mut described = deletes.clone();
+    described.push(Mutation::Effects(UnitEffects {
+        interpretation: crate::txn::proposal::EFFECTS_INTERPRETATION,
+        nodes: keys
+            .iter()
+            .map(|key| NodeBasis {
+                key: key.clone(),
+                labels: vec![label(3), label(9)],
+            })
+            .collect(),
+        removed_edges: Vec::new(),
+    }));
+    let bare = encode_proposal(&proposal(deletes)).expect("encode").len();
+    let full = encode_proposal(&proposal(described.clone()))
+        .expect("encode")
+        .len();
+    assert_eq!(
+        decode(&encode_proposal(&proposal(described.clone())).expect("encode"))
+            .expect("decode")
+            .mutations,
+        described
+    );
+    // Shared and suffix lengths, a short suffix, a count and two ids.
+    assert!(
+        full - bare <= 8 + keys.len() * 8,
+        "{} context bytes for {} nodes",
+        full - bare,
+        keys.len()
+    );
+}
+
+/// Label id 0 names no label: a context carrying it is refused rather than
+/// read as some label.
+#[test]
+fn a_zero_label_id_in_an_effect_context_is_refused() {
+    let mut body = header(1);
+    body.push(KIND_EFFECTS);
+    put_varint(1, &mut body); // interpretation
+    put_varint(1, &mut body); // one node
+    put_varint(0, &mut body); // shared
+    put_varint(1, &mut body); // suffix length
+    body.push(b'n');
+    put_varint(1, &mut body); // one label
+    put_varint(0, &mut body); // label id 0
+    put_varint(0, &mut body); // no edges
+    assert_eq!(
+        decode(&signed(body)),
+        Err(FrameError::Effects("label id out of range"))
+    );
+}
+
+/// Counts the frame cannot hold are refused before anything is allocated
+/// for them.
+#[test]
+fn impossible_effect_counts_are_refused_before_allocation() {
+    let mut nodes = header(1);
+    nodes.push(KIND_EFFECTS);
+    put_varint(1, &mut nodes);
+    put_varint(1 << 40, &mut nodes);
+    assert!(matches!(
+        decode(&signed(nodes)),
+        Err(FrameError::Truncated { .. } | FrameError::OverLimit { .. })
+    ));
+
+    let mut labels = header(1);
+    labels.push(KIND_EFFECTS);
+    put_varint(1, &mut labels);
+    put_varint(1, &mut labels);
+    put_varint(0, &mut labels);
+    put_varint(0, &mut labels);
+    put_varint(1 << 30, &mut labels);
+    assert!(matches!(
+        decode(&signed(labels)),
+        Err(FrameError::Truncated { .. } | FrameError::OverLimit { .. })
+    ));
+
+    let mut edges = header(1);
+    edges.push(KIND_EFFECTS);
+    put_varint(1, &mut edges);
+    put_varint(0, &mut edges);
+    put_varint(1 << 40, &mut edges);
+    assert!(matches!(
+        decode(&signed(edges)),
+        Err(FrameError::Truncated { .. } | FrameError::OverLimit { .. })
     ));
 }
 

@@ -503,7 +503,10 @@ fn mutation_partition(mutation: &Mutation) -> Option<Partition> {
         | Mutation::Delete { partition, .. }
         | Mutation::Merge { partition, .. }
         | Mutation::RemoveRange { partition, .. } => Some(Partition::from(*partition)),
-        Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => None,
+        Mutation::Command(_)
+        | Mutation::Derive(_)
+        | Mutation::Operation(_)
+        | Mutation::Effects(_) => None,
     }
 }
 
@@ -5261,6 +5264,8 @@ impl StorageEngine {
                 Mutation::Derive(_) => false,
                 // Decides the unit, already read as `refused`.
                 Mutation::Operation(_) => false,
+                // What the rows mean, not a row: a copy of rows applies none.
+                Mutation::Effects(_) => false,
             });
             if no_room {
                 return Err(EntryOutcome::NoRoom);
@@ -6445,6 +6450,8 @@ impl StorageEngine {
             Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => {
                 self.apply_proposal_at(std::slice::from_ref(mutation), 0)
             }
+            // Writes nothing.
+            Mutation::Effects(_) => Ok(()),
         }
     }
 
@@ -6999,6 +7006,9 @@ impl StorageEngine {
                         "an operation command reached the write batch undecided".into(),
                     ));
                 }
+                // What the unit's rows mean for the change feed; it writes
+                // nothing of its own.
+                Mutation::Effects(_) => {}
             }
         }
         let seqno = match (&self.oracle, commit_ts) {

@@ -475,6 +475,9 @@ impl AppliedFeed {
                             replaced = true;
                         }
                     }
+                    // Writes nothing: the keys it names are written by the
+                    // unit's own row changes, staged above.
+                    Mutation::Effects(_) => {}
                 }
             }
             let seq = if replaced {

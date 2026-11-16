@@ -191,6 +191,71 @@ pub enum Mutation {
     /// effects apply at all: the first attempt of an operation applies, any
     /// later one applies nothing.
     Operation(super::operation::OperationCommand),
+    /// What the unit's application effects mean where its row changes alone
+    /// cannot tell: the change feed reads it, applying it changes nothing.
+    /// At most one per unit, after its row changes and before its operation
+    /// command.
+    Effects(UnitEffects),
+}
+
+/// The projection interpretation this build seals a unit's
+/// [`UnitEffects`] under and reads them by.
+pub const EFFECTS_INTERPRETATION: u32 = 1;
+
+/// The logical context of one unit's application effects that its row
+/// changes do not carry: the routing membership a node had before the unit,
+/// and the relationships it removed without naming them. Payloads are never
+/// repeated here; each entry names a target the unit's rows change.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct UnitEffects {
+    /// The projection interpretation the context was sealed under.
+    pub interpretation: u32,
+    /// Nodes whose row changes cannot prove their routing membership before
+    /// the unit: removal, a document delta, or a record whose labels the
+    /// unit changed. In key order.
+    pub nodes: Vec<NodeBasis>,
+    /// Relationships the unit removed that no forward adjacency removal of
+    /// the unit names, as edge property keys: the pair's key, or an
+    /// instance's key with its version or discriminator. In key order.
+    pub removed_edges: Vec<Vec<u8>>,
+}
+
+impl UnitEffects {
+    /// An empty context under this build's interpretation.
+    pub fn new() -> Self {
+        Self {
+            interpretation: EFFECTS_INTERPRETATION,
+            nodes: Vec::new(),
+            removed_edges: Vec::new(),
+        }
+    }
+
+    /// Whether it says nothing beyond its interpretation.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.removed_edges.is_empty()
+    }
+
+    /// Approximate encoded size, for rate limiting and buffer accounting.
+    pub fn size_estimate(&self) -> usize {
+        let nodes: usize = self
+            .nodes
+            .iter()
+            .map(|n| n.key.len() + 1 + n.labels.len() * 4)
+            .sum();
+        let edges: usize = self.removed_edges.iter().map(|k| k.len() + 1).sum();
+        4 + nodes + edges
+    }
+}
+
+/// The labels a node stored when the unit first touched it: its type label
+/// first, then its own auxiliary labels, as its record stores them. Empty
+/// when the node did not exist then.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeBasis {
+    /// The node's key in the node partition, a temporal version's included.
+    pub key: Vec<u8>,
+    /// Its stored labels before the unit.
+    pub labels: Vec<crate::schema::label_id::LabelId>,
 }
 
 /// The maintenance binding a DERIVED effect was sealed under.
@@ -374,6 +439,7 @@ impl Mutation {
             Self::Command(command) => 1 + command.size_estimate(),
             Self::Derive(work) => 1 + work.size_estimate(),
             Self::Operation(command) => 1 + command.size_estimate(),
+            Self::Effects(effects) => 1 + effects.size_estimate(),
         }
     }
 }
