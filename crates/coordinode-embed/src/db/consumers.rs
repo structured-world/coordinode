@@ -97,8 +97,9 @@ impl Database {
     /// Register a change-stream consumer with the retention policy it chose,
     /// returning the handle of its new registration.
     ///
-    /// Its starting position is held from here on: a log consumer's in the
-    /// store's journal, any other's in the MVCC history.
+    /// An ordinary registration records progress without retaining history.
+    /// A strict registration holds its starting position in the journal for
+    /// a log consumer, or in MVCC history for other consumers.
     ///
     /// # Errors
     ///
@@ -128,9 +129,9 @@ impl Database {
         Ok(self.consumers()?.resume(consumer_id, incarnation)?)
     }
 
-    /// Acknowledge that the consumer holds everything before `position`;
-    /// what lies below it is no longer kept for it. A lower position than
-    /// already acknowledged changes nothing.
+    /// Acknowledge that the consumer holds everything before `position`.
+    /// For a strict registration this also releases its retention below that
+    /// position. A lower position than already acknowledged changes nothing.
     ///
     /// # Errors
     ///
