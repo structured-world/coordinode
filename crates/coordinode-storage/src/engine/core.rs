@@ -5001,6 +5001,9 @@ impl StorageEngine {
         debug_assert!(budget.memory_used() <= budget.memory_limit());
         // A budget refuses every reservation past its limit.
         let room = budget.memory_limit() - budget.memory_used();
+        // The decoding's working memory is held before anything is decoded,
+        // and what the decoded units do not keep returns after.
+        charge.grow(room).map_err(StorageError::Budget)?;
         let mut pool = crate::engine::fixed_cut::EntryPool::new(room);
         let mut units = Vec::new();
         let mut read_to = next;
@@ -5032,7 +5035,7 @@ impl StorageEngine {
             }
         }
         let decoded = pool.kept();
-        charge.grow(decoded).map_err(StorageError::Budget)?;
+        charge.shrink(room - decoded);
         let read = crate::engine::change_feed::ChangeRead {
             units,
             next: read_to,
@@ -5650,32 +5653,53 @@ impl StorageEngine {
             // projection before the scope chooses its rows below.
             // Only the events in the scope are built, each kept within the
             // pool as it is handed over.
-            let mut events = Vec::new();
+            let mut events: Vec<crate::engine::change_feed::ChangeEvent> = Vec::new();
             let mut no_room = false;
-            let projection = crate::engine::change_feed::project_unit_with(&mutations, |event| {
-                use crate::engine::change_feed::Take;
-                if !scope.holds_target(&event.target) {
-                    return Take::More;
-                }
-                if !pool.retain(crate::engine::change_feed::event_bytes(&event)) {
-                    no_room = true;
-                    return Take::Enough;
-                }
-                events.push(crate::engine::change_feed::owned_event(
-                    position,
-                    &event,
-                    crate::engine::change_feed::Delivery::Apply,
-                ));
-                Take::More
-            });
-            if no_room {
-                return Err(EntryOutcome::NoRoom);
-            }
+            // The ordinal after the last event handed over: short of the
+            // unit's count when its working state ran out of room.
+            let mut through = 0u32;
+            let projection =
+                crate::engine::change_feed::project_within(&mutations, 0, pool, |event, pool| {
+                    use crate::engine::change_feed::Take;
+                    through = event.ordinal + 1;
+                    if !scope.holds_target(&event.target) {
+                        return Take::More;
+                    }
+                    // The list's room and the event's, kept with the unit,
+                    // taken before they are allocated.
+                    if events.len() == events.capacity() {
+                        let slot =
+                            core::mem::size_of::<crate::engine::change_feed::ChangeEvent>() as u64;
+                        let old = events.capacity();
+                        let new = old.max(2) * 2;
+                        if !pool.retain(new as u64 * slot) {
+                            no_room = true;
+                            return Take::Enough;
+                        }
+                        events.reserve_exact(new - events.len());
+                        pool.unretain(old as u64 * slot);
+                    }
+                    if !pool.retain(crate::engine::change_feed::event_heap_bytes(&event)) {
+                        no_room = true;
+                        return Take::Enough;
+                    }
+                    events.push(crate::engine::change_feed::owned_event(
+                        position,
+                        &event,
+                        crate::engine::change_feed::Delivery::Apply,
+                    ));
+                    Take::More
+                });
             let events = match projection {
+                _ if no_room => return Err(EntryOutcome::NoRoom),
+                Ok(projected) if through < projected => return Err(EntryOutcome::NoRoom),
                 Ok(projected) => Some(crate::engine::fixed_cut::CutEvents { events, projected }),
+                Err(crate::engine::change_feed::ProjectStop::NoRoom) => {
+                    return Err(EntryOutcome::NoRoom);
+                }
                 // Rows without the context their meaning is read by: a
                 // consumer of rows applies them; one of events is told.
-                Err(_) => None,
+                Err(crate::engine::change_feed::ProjectStop::Projection(_)) => None,
             };
             // Kept in place: no second list is built.
             let mut no_room = false;

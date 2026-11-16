@@ -642,9 +642,31 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
     let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
         .expect("open oplog");
-    // One run of deletes standing for 60 nodes: a frame of two operations
-    // whose projection is 60 events.
+    // The log is written after the fixture binds the labels it names.
+    let mut f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
+        Arc::new(|| 1),
+        None,
+        RegistryTuning::default(),
+    );
+    let schemas = coordinode_modality::LocalSchemaStore::new(&f.engine);
+    let labels: Vec<_> = (0..121)
+        .map(|i| schemas.bind_label(&format!("L{i}")).expect("bind"))
+        .collect();
+    // One run of deletes standing for 60 nodes of a type implying many
+    // labels: a frame of two operations whose projection is 60 events, each
+    // routed by far more labels than the frame stores for it.
     let mut context = creating((1..=60u64).map(|id| encode_node_key(0, NodeId::from_raw(id))));
+    for basis in &mut context.nodes {
+        basis.labels = vec![labels[0]];
+    }
+    let mut implied = labels[1..].to_vec();
+    implied.sort_unstable();
+    context.implications = vec![coordinode_core::txn::proposal::Implication {
+        label: labels[0],
+        implies: implied,
+    }];
     context.runs = vec![0];
     let mutations = vec![
         Mutation::RemoveRange {
@@ -667,13 +689,6 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
     };
     mgr.append(&entry).expect("append");
     mgr.flush().expect("flush");
-    let mut f = fixture(
-        vec![oplog_dir.path().to_path_buf()],
-        mgr.retained_floor(),
-        Arc::new(|| 1),
-        None,
-        RegistryTuning::default(),
-    );
     // The smallest read the entry decodes within: what it leaves does not
     // hold the 60 events.
     let start = f.cursor_at(0);

@@ -22,7 +22,6 @@ use coordinode_core::schema::label_id::LabelId;
 use coordinode_core::txn::proposal::{
     EFFECTS_INTERPRETATION, Mutation, NodeBasis, PartitionId, UnitEffects,
 };
-use rustc_hash::FxHashSet;
 
 /// What an event does to its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -182,21 +181,19 @@ impl ChangeUnit {
         project_unit(&self.mutations)
     }
 
-    /// Hand the unit's logical events to `take` one at a time, in canonical
-    /// order, as [`project_unit_with`] does; none for a refused unit.
-    /// Returns how many events the unit's projection holds.
-    ///
-    /// # Errors
-    ///
-    /// As [`project_unit`].
-    pub fn project_with<'u>(
+    /// Hand the unit's events from ordinal `first` on to `take` one at a
+    /// time, as [`project_within`] does; none for a refused unit. Returns
+    /// how many events the unit's projection holds.
+    pub(crate) fn project_with<'u, R: Room>(
         &'u self,
-        take: impl FnMut(LogicalEvent<'u>) -> Take,
-    ) -> Result<u32, ProjectionError> {
+        first: u32,
+        room: &mut R,
+        take: impl FnMut(LogicalEvent<'u>, &mut R) -> Take,
+    ) -> Result<u32, ProjectStop> {
         if self.refused {
             return Ok(0);
         }
-        project_unit_with(&self.mutations, take)
+        project_within(&self.mutations, first, room, take)
     }
 }
 
@@ -209,6 +206,62 @@ pub enum Take {
     /// Hand over no more: the projection still counts the rest, so the
     /// unit's whole count is known, without building them for anyone.
     Enough,
+}
+
+/// Memory a projection's working state, and the events its consumer keeps,
+/// are taken from before they are allocated: a read's budget, a cut's
+/// pool, or none.
+pub(crate) trait Room {
+    /// Take `bytes` before they are allocated; `false` when they do not
+    /// fit, nothing taken.
+    fn take(&mut self, bytes: u64) -> bool;
+    /// Return `bytes` taken earlier, once their memory is freed.
+    fn give(&mut self, bytes: u64);
+}
+
+/// No bound: a projection whose caller holds what it builds as its own.
+pub(crate) struct Unbounded;
+
+impl Room for Unbounded {
+    fn take(&mut self, _: u64) -> bool {
+        true
+    }
+
+    fn give(&mut self, _: u64) {}
+}
+
+/// Why a bounded projection stopped.
+#[derive(Debug)]
+pub(crate) enum ProjectStop {
+    /// The unit does not project.
+    Projection(ProjectionError),
+    /// Its room refused the working state the unit's projection needs
+    /// before any event of it could be handed over.
+    NoRoom,
+}
+
+impl From<ProjectionError> for ProjectStop {
+    fn from(e: ProjectionError) -> Self {
+        Self::Projection(e)
+    }
+}
+
+/// Grow `v`'s capacity to hold one more element, its room taken first: the
+/// old and the new buffer while the elements move, then the new one only.
+/// `false`, nothing grown, when the room refuses it.
+pub(crate) fn grow_within<T>(v: &mut Vec<T>, room: &mut impl Room) -> bool {
+    if v.len() < v.capacity() {
+        return true;
+    }
+    let slot = core::mem::size_of::<T>() as u64;
+    let old = v.capacity();
+    let new = old.max(2) * 2;
+    if !room.take(new as u64 * slot) {
+        return false;
+    }
+    v.reserve_exact(new - v.len());
+    room.give(old as u64 * slot);
+    true
 }
 
 /// A read of the journal for a change feed: its units in log order, and the
@@ -255,8 +308,36 @@ pub fn project_unit(mutations: &[Mutation]) -> Result<Vec<LogicalEvent<'_>>, Pro
 /// As [`project_unit`].
 pub fn project_unit_with<'u>(
     mutations: &'u [Mutation],
-    take: impl FnMut(LogicalEvent<'u>) -> Take,
+    mut take: impl FnMut(LogicalEvent<'u>) -> Take,
 ) -> Result<u32, ProjectionError> {
+    project_within(mutations, 0, &mut Unbounded, |event, _| take(event)).map_err(
+        |stop| match stop {
+            ProjectStop::Projection(e) => e,
+            // An unbounded room refuses nothing.
+            ProjectStop::NoRoom => ProjectionError::Unsupported("no room to project it".into()),
+        },
+    )
+}
+
+/// [`project_unit_with`] within `room`: the events before ordinal `first`,
+/// handed over by an earlier read, are neither built nor handed again, and
+/// once `take` answers [`Take::Enough`] the rest are only counted, neither
+/// built nor checked; only what the events handed over need of the unit
+/// is kept. The working state the unit's projection needs is taken from
+/// `room` before it is allocated and given back once freed; `take` charges
+/// what it keeps of each event to the same room.
+///
+/// # Errors
+///
+/// [`ProjectStop::Projection`] as [`project_unit`], for the part of the
+/// unit read before the consumer had enough; [`ProjectStop::NoRoom`] when
+/// `room` refuses the working state.
+pub(crate) fn project_within<'u, R: Room>(
+    mutations: &'u [Mutation],
+    first: u32,
+    room: &mut R,
+    take: impl FnMut(LogicalEvent<'u>, &mut R) -> Take,
+) -> Result<u32, ProjectStop> {
     let effects = mutations.iter().find_map(|m| match m {
         Mutation::Effects(effects) => Some(effects),
         _ => None,
@@ -265,7 +346,8 @@ pub fn project_unit_with<'u>(
         if mutations.iter().any(changes_application_data) {
             return Err(ProjectionError::Unsupported(
                 "it changes application data and carries no effect context".into(),
-            ));
+            )
+            .into());
         }
         return Ok(0);
     };
@@ -273,9 +355,10 @@ pub fn project_unit_with<'u>(
         return Err(ProjectionError::Unsupported(format!(
             "its effect context is of interpretation {}, this build reads {}",
             effects.interpretation, EFFECTS_INTERPRETATION
-        )));
+        ))
+        .into());
     }
-    Projector::new(mutations, effects, take).run()
+    Projector::new(mutations, effects, first, room, take).run()
 }
 
 /// Whether `m` changes data the feed projects or must account for.
@@ -312,24 +395,90 @@ enum Component {
     Internal,
 }
 
-struct Projector<'u, F> {
+/// What the next event's ordinal asks of the projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// Handed over by an earlier read: not built; only what a later change
+    /// of the same node needs of it is kept.
+    Delivered,
+    /// Built and handed to the consumer.
+    Build,
+    /// Past what the consumer takes: only counted.
+    Counted,
+}
+
+/// One change of a relationship's presence the unit makes, or a removal
+/// its context names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PairChange<'u> {
+    pair: Pair<'u>,
+    /// Its place among the unit's forward adjacency changes; [`u32::MAX`]
+    /// for a removal the context names, which no change overrides.
+    seq: u32,
+    present: bool,
+}
+
+/// A run of node deletes of the unit.
+#[derive(Debug, Clone, Copy)]
+struct NodeRun<'u> {
+    start: &'u [u8],
+    end: &'u [u8],
+    /// The run's place among the unit's operations.
+    at: u32,
+    /// The greatest end of this run and every run ordered before it: a
+    /// search for the runs holding a key stops where it falls below it.
+    reach: &'u [u8],
+}
+
+/// Bytes a hash table of `capacity` entries of `T` allocates at most.
+fn table_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = match capacity {
+        0..4 => 4,
+        4..8 => 8,
+        _ => (capacity * 8 / 7).next_power_of_two(),
+    };
+    // Its slots, its control bytes and one group of them past the end.
+    ((buckets * core::mem::size_of::<T>()).next_multiple_of(16) + buckets + 16) as u64
+}
+
+/// The labels a node changed again later in the unit carries after its
+/// last change so far.
+type Left<'u> = rustc_hash::FxHashMap<Cow<'u, [u8]>, Vec<LabelId>>;
+
+struct Projector<'u, 'r, R, F> {
     mutations: &'u [Mutation],
     effects: &'u UnitEffects,
-    /// Pairs whose last forward adjacency change in the unit removes them,
-    /// with the pairs the context names removed: their plain edge property
-    /// tombstone is part of the removal, not a clearing of properties.
-    removed: FxHashSet<Pair<'u>>,
-    /// Pairs some forward adjacency change of the unit names: a removal the
-    /// context also names is already an event.
-    named: FxHashSet<Pair<'u>>,
-    /// The labels each node the unit already changed carries after that
-    /// change: a later change of the same node in the unit starts from
-    /// them, not from the labels it had before the unit.
-    left: rustc_hash::FxHashMap<Cow<'u, [u8]>, Cow<'u, [LabelId]>>,
-    /// The node records and versions the unit writes or removes: a history
-    /// assertion stands for one of them.
-    versions: FxHashSet<&'u [u8]>,
-    /// The consumer each event is handed to as it is projected.
+    /// Every change of a relationship's presence the unit makes and every
+    /// removal its context names, by pair and then in unit order: whether
+    /// a pair is named, and whether its last change removes it, so its
+    /// plain edge property tombstone is part of the removal.
+    pairs: Vec<PairChange<'u>>,
+    /// The key of every node a put, delete or merge of the unit changes,
+    /// with that operation's place, by key and then place: whether a node
+    /// changes again later, and which versions the unit writes.
+    nodes: Vec<(&'u [u8], u32)>,
+    /// The unit's runs of node deletes, by start.
+    runs: Vec<NodeRun<'u>>,
+    /// What each node changed again later carries after its change so far:
+    /// the later change starts from it, not from what the node had before
+    /// the unit. Only such nodes are kept.
+    left: Left<'u>,
+    /// The room `left`'s table was given.
+    table: u64,
+    /// The most the label lists of one node event take while it is built:
+    /// what its record decodes to and the lists that route it.
+    routing: u64,
+    /// Bytes of working state taken from the room.
+    held: u64,
+    /// The operation being projected.
+    at: u32,
+    /// The first ordinal to build: those before it were handed over.
+    first: u32,
+    room: &'r mut R,
+    /// The consumer each event is handed to as it is built.
     take: F,
     /// Whether the consumer takes more events.
     taking: bool,
@@ -337,19 +486,363 @@ struct Projector<'u, F> {
     count: u32,
 }
 
-impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
-    fn new(mutations: &'u [Mutation], effects: &'u UnitEffects, take: F) -> Self {
+/// Hand `each` every operation of `mutations` with its place and whether
+/// it is one of the `runs` of point deletes.
+fn for_each_operation<'u>(
+    mutations: &'u [Mutation],
+    runs: &[u32],
+    mut each: impl FnMut(u32, &'u Mutation, bool) -> Result<(), ProjectStop>,
+) -> Result<(), ProjectStop> {
+    let mut runs = runs.iter().copied().peekable();
+    let mut row = 0u32;
+    for (at, mutation) in mutations.iter().enumerate() {
+        let at = u32::try_from(at).map_err(|_| {
+            ProjectionError::Malformed("the unit holds over 2^32 operations".into())
+        })?;
+        let is_row = !matches!(
+            mutation,
+            Mutation::Command(_)
+                | Mutation::Derive(_)
+                | Mutation::Operation(_)
+                | Mutation::Effects(_)
+        );
+        let is_run = is_row && runs.next_if_eq(&row).is_some();
+        each(at, mutation, is_run)?;
+        if is_row {
+            row = row.checked_add(1).ok_or_else(|| {
+                ProjectionError::Malformed("the unit holds over 2^32 row changes".into())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 'r, R, F> {
+    fn new(
+        mutations: &'u [Mutation],
+        effects: &'u UnitEffects,
+        first: u32,
+        room: &'r mut R,
+        take: F,
+    ) -> Self {
         Self {
             mutations,
             effects,
-            removed: FxHashSet::default(),
-            named: FxHashSet::default(),
-            left: rustc_hash::FxHashMap::default(),
-            versions: FxHashSet::default(),
+            pairs: Vec::new(),
+            nodes: Vec::new(),
+            runs: Vec::new(),
+            left: Left::default(),
+            table: 0,
+            routing: 0,
+            held: 0,
+            at: 0,
+            first,
+            room,
             take,
             taking: true,
             count: 0,
         }
+    }
+
+    fn run(mut self) -> Result<u32, ProjectStop> {
+        let walked = self.prepare().and_then(|()| self.walk());
+        let count = self.count;
+        // The working state is freed before its room is given back.
+        let Self {
+            pairs,
+            nodes,
+            runs,
+            left,
+            held,
+            room,
+            ..
+        } = self;
+        drop((pairs, nodes, runs, left));
+        room.give(held);
+        walked.map(|()| count)
+    }
+
+    /// Take `bytes` of working state from the room.
+    fn lend(&mut self, bytes: u64) -> Result<(), ProjectStop> {
+        if !self.room.take(bytes) {
+            return Err(ProjectStop::NoRoom);
+        }
+        self.held += bytes;
+        Ok(())
+    }
+
+    /// Give back `bytes` of working state, freed.
+    fn repay(&mut self, bytes: u64) {
+        self.held -= bytes;
+        self.room.give(bytes);
+    }
+
+    /// The unit's node changes, runs and relationship presence changes,
+    /// sorted to be searched, read before any event so a property tombstone
+    /// before its pair's removal, and a node's change before a later one of
+    /// it, are read right. Counted first, their room taken, then built at
+    /// that size.
+    fn prepare(&mut self) -> Result<(), ProjectStop> {
+        let (mutations, run_rows) = (self.mutations, self.effects.runs.as_slice());
+        let (mut nodes, mut runs) = (0usize, 0usize);
+        let mut pairs = self.effects.removed_edges.len();
+        for_each_operation(mutations, run_rows, |_, mutation, is_run| {
+            match mutation {
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    ..
+                }
+                | Mutation::Delete {
+                    partition: PartitionId::Node,
+                    ..
+                }
+                | Mutation::Merge {
+                    partition: PartitionId::Node,
+                    ..
+                } => nodes += 1,
+                Mutation::RemoveRange {
+                    partition: PartitionId::Node,
+                    ..
+                } if is_run => runs += 1,
+                Mutation::Merge {
+                    partition: PartitionId::Adj,
+                    key,
+                    operand,
+                } if forward_adj_key(key).is_some() => pairs += adj_operand(operand)?.len(),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        let bytes = nodes * core::mem::size_of::<(&[u8], u32)>()
+            + runs * core::mem::size_of::<NodeRun<'_>>()
+            + pairs * core::mem::size_of::<PairChange<'_>>();
+        self.lend(bytes as u64)?;
+        self.nodes = Vec::with_capacity(nodes);
+        self.runs = Vec::with_capacity(runs);
+        self.pairs = Vec::with_capacity(pairs);
+        let mut seq = 0u32;
+        for_each_operation(mutations, run_rows, |at, mutation, is_run| {
+            match mutation {
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key,
+                    ..
+                }
+                | Mutation::Delete {
+                    partition: PartitionId::Node,
+                    key,
+                }
+                | Mutation::Merge {
+                    partition: PartitionId::Node,
+                    key,
+                    ..
+                } => self.nodes.push((key, at)),
+                Mutation::RemoveRange {
+                    partition: PartitionId::Node,
+                    start,
+                    end,
+                } if is_run => self.runs.push(NodeRun {
+                    start,
+                    end,
+                    at,
+                    reach: end,
+                }),
+                Mutation::Merge {
+                    partition: PartitionId::Adj,
+                    key,
+                    operand,
+                } => {
+                    if let Some((edge_type, source)) = forward_adj_key(key) {
+                        for (present, target) in adj_operand(operand)? {
+                            self.pairs.push(PairChange {
+                                pair: (edge_type, source, target),
+                                seq,
+                                present,
+                            });
+                            seq = seq.checked_add(1).ok_or_else(|| {
+                                ProjectionError::Malformed(
+                                    "the unit changes over 2^32 relationships".into(),
+                                )
+                            })?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        for key in &self.effects.removed_edges {
+            let (pair, _) = edgeprop_key(key).ok_or_else(|| {
+                ProjectionError::Malformed("a removed relationship has no edge property key".into())
+            })?;
+            self.pairs.push(PairChange {
+                pair,
+                seq: u32::MAX,
+                present: false,
+            });
+        }
+        self.pairs.sort_unstable();
+        self.nodes.sort_unstable();
+        self.runs.sort_unstable_by(|a, b| a.start.cmp(b.start));
+        let mut reach: &[u8] = &[];
+        for run in &mut self.runs {
+            reach = reach.max(run.end);
+            run.reach = reach;
+        }
+        // A node changed again later is one named twice, or named and in a
+        // run: at most this many are kept at once.
+        let again = (0..self.nodes.len())
+            .filter(|&i| {
+                let key = self.nodes[i].0;
+                (i > 0 && self.nodes[i - 1].0 == key)
+                    || self.nodes.get(i + 1).is_some_and(|n| n.0 == key)
+                    || self.in_run_after(key, None)
+            })
+            .count();
+        self.table = table_bytes::<(Cow<'u, [u8]>, Vec<LabelId>)>(again);
+        self.lend(self.table)?;
+        self.left = Left::with_capacity_and_hasher(again, Default::default());
+        // A record stores at most a label per byte; a node carries at most
+        // the most labels a record or a basis of the unit stores, and what
+        // its type implies. Its event decodes one record and builds two
+        // lists, a delta's two copies of one.
+        let stored = mutations
+            .iter()
+            .filter_map(|m| match m {
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    value,
+                    ..
+                } => Some(value.len()),
+                _ => None,
+            })
+            .chain(self.effects.nodes.iter().map(|basis| basis.labels.len()))
+            .max()
+            .unwrap_or(0);
+        let implied = self
+            .effects
+            .implications
+            .iter()
+            .map(|i| i.implies.len())
+            .max()
+            .unwrap_or(0);
+        self.routing = (3 * stored + 2 * implied) as u64 * core::mem::size_of::<LabelId>() as u64;
+        Ok(())
+    }
+
+    /// Run `build`, the label lists one node event decodes and builds while
+    /// it is built given room first. While building, a room that refuses
+    /// them ends what the consumer is handed, this event included.
+    fn with_routing(
+        &mut self,
+        slot: Slot,
+        build: impl FnOnce(&mut Self) -> Result<(), ProjectStop>,
+    ) -> Result<(), ProjectStop> {
+        let bytes = self.routing;
+        match self.lend(bytes) {
+            Ok(()) => {}
+            Err(ProjectStop::NoRoom) if slot == Slot::Build => {
+                self.taking = false;
+                return Ok(());
+            }
+            Err(stop) => return Err(stop),
+        }
+        let built = build(self);
+        self.repay(bytes);
+        built
+    }
+
+    /// Run `build`, an event's own lists of `bytes` given room first; a
+    /// room that refuses them ends what the consumer is handed.
+    fn with_lists(&mut self, bytes: u64, build: impl FnOnce(&mut Self)) {
+        if !self.room.take(bytes) {
+            self.taking = false;
+            return;
+        }
+        build(self);
+        self.room.give(bytes);
+    }
+
+    /// Whether a run of node deletes placed after operation `after` (any,
+    /// for `None`) holds `key`.
+    fn in_run_after(&self, key: &[u8], after: Option<u32>) -> bool {
+        let to = self.runs.partition_point(|run| run.start <= key);
+        for run in self.runs[..to].iter().rev() {
+            if run.reach <= key {
+                break;
+            }
+            if run.end > key && run.start.len() == key.len() && after.is_none_or(|at| run.at > at) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether an operation after the current one changes node `key`.
+    fn changes_later(&self, key: &[u8]) -> bool {
+        let at = self.at;
+        let next = self.nodes.partition_point(|&(k, i)| (k, i) <= (key, at));
+        self.nodes.get(next).is_some_and(|&(k, _)| k == key) || self.in_run_after(key, Some(at))
+    }
+
+    /// Whether a put or delete of the unit writes node version `key`.
+    fn writes_version(&self, key: &[u8]) -> bool {
+        let from = self.nodes.partition_point(|&(k, _)| k < key);
+        self.nodes[from..]
+            .iter()
+            .take_while(|&&(k, _)| k == key)
+            .any(|&(_, at)| {
+                matches!(
+                    self.mutations.get(at as usize),
+                    Some(Mutation::Put { .. } | Mutation::Delete { .. })
+                )
+            })
+    }
+
+    /// Whether a forward adjacency change of the unit names `pair`: a
+    /// removal the context also names is already an event.
+    fn named(&self, pair: Pair<'_>) -> bool {
+        let from = self.pairs.partition_point(|c| c.pair < pair);
+        self.pairs
+            .get(from)
+            .is_some_and(|c| c.pair == pair && c.seq != u32::MAX)
+    }
+
+    /// Whether the unit removes `pair`: its context names the removal, or
+    /// its last forward adjacency change is one.
+    fn removed(&self, pair: Pair<'_>) -> bool {
+        let to = self.pairs.partition_point(|c| c.pair <= pair);
+        to > 0 && {
+            let last = self.pairs[to - 1];
+            last.pair == pair && (last.seq == u32::MAX || !last.present)
+        }
+    }
+
+    /// Keep what node `key` carries after its change, for its later change
+    /// in the unit, its room taken first.
+    fn remember(&mut self, key: Cow<'u, [u8]>, labels: Vec<LabelId>) -> Result<(), ProjectStop> {
+        let value = (labels.capacity() * core::mem::size_of::<LabelId>()) as u64;
+        self.lend(value)?;
+        if let Some(old) = self.left.get_mut(key.as_ref()) {
+            let freed = (old.capacity() * core::mem::size_of::<LabelId>()) as u64;
+            *old = labels;
+            self.repay(freed);
+            return Ok(());
+        }
+        if self.left.len() == self.left.capacity() {
+            // Past what the unit was counted to keep: the table doubles.
+            let grown = (self.left.capacity().max(2)) * 2;
+            let bytes = table_bytes::<(Cow<'u, [u8]>, Vec<LabelId>)>(grown);
+            self.lend(bytes)?;
+            self.left.reserve(grown - self.left.len());
+            let old = core::mem::replace(&mut self.table, bytes);
+            self.repay(old);
+        }
+        if let Cow::Owned(owned) = &key {
+            self.lend(owned.capacity() as u64)?;
+        }
+        self.left.insert(key, labels);
+        Ok(())
     }
 
     /// The labels node `key` carries before its next change in the unit:
@@ -357,128 +850,84 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
     /// had before the unit; `None` when neither is known.
     fn labels_before(&self, key: &[u8]) -> Result<Option<Cow<'u, [LabelId]>>, ProjectionError> {
         if let Some(left) = self.left.get(key) {
-            return Ok(Some(left.clone()));
+            return Ok(Some(Cow::Owned(left.clone())));
         }
         self.basis(key)
             .map(|basis| self.carried(Cow::Borrowed(basis.labels.as_slice())))
             .transpose()
     }
 
-    fn run(mut self) -> Result<u32, ProjectionError> {
-        self.collect_presence()?;
-        let mut runs = self.effects.runs.iter().copied().peekable();
-        let mut row = 0u32;
-        for mutation in self.mutations {
-            let is_row = !matches!(
-                mutation,
-                Mutation::Command(_)
-                    | Mutation::Derive(_)
-                    | Mutation::Operation(_)
-                    | Mutation::Effects(_)
-            );
-            let is_run = is_row && runs.next_if_eq(&row).is_some();
+    /// The labels a node record stores, its type's implied ones included.
+    fn after_labels(&self, record: &[u8]) -> Result<Vec<LabelId>, ProjectionError> {
+        let stored = coordinode_core::graph::node::NodeRecord::labels_from_msgpack(record)
+            .map_err(|e| ProjectionError::Malformed(format!("a node record: {e}")))?;
+        Ok(self.carried(Cow::Owned(stored))?.into_owned())
+    }
+
+    fn walk(&mut self) -> Result<(), ProjectStop> {
+        let (mutations, run_rows) = (self.mutations, self.effects.runs.as_slice());
+        for_each_operation(mutations, run_rows, |at, mutation, is_run| {
+            self.at = at;
             match mutation {
                 Mutation::Put {
                     partition,
                     key,
                     value,
-                } => self.put(*partition, key, value)?,
-                Mutation::Delete { partition, key } => {
-                    self.delete(*partition, Cow::Borrowed(key))?;
-                }
+                } => self.put(*partition, key, value),
+                Mutation::Delete { partition, key } => self.delete(*partition, key, Some(key)),
                 Mutation::Merge {
                     partition,
                     key,
                     operand,
-                } => self.merge(*partition, key, operand)?,
+                } => self.merge(*partition, key, operand),
                 Mutation::RemoveRange {
                     partition,
                     start,
                     end,
-                } => self.remove_range(*partition, start, end, is_run)?,
-                Mutation::Effects(effects) => self.removed_with_lists(effects)?,
-                Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => {}
+                } => self.remove_range(*partition, start, end, is_run),
+                Mutation::Effects(effects) => self.removed_with_lists(effects),
+                Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => Ok(()),
             }
-            if is_row {
-                row = row.checked_add(1).ok_or_else(|| {
-                    ProjectionError::Malformed("the unit holds over 2^32 row changes".into())
-                })?;
-            }
-        }
-        Ok(self.count)
+        })
     }
 
-    /// The pairs the unit's forward adjacency changes name, and those whose
-    /// last change removes them, read before any event so a property
-    /// tombstone that comes before its pair's removal is classified right.
-    fn collect_presence(&mut self) -> Result<(), ProjectionError> {
-        for mutation in self.mutations {
-            if let Mutation::Put {
-                partition: PartitionId::Node,
-                key,
-                ..
-            }
-            | Mutation::Delete {
-                partition: PartitionId::Node,
-                key,
-            } = mutation
-            {
-                self.versions.insert(key);
-            }
-        }
-        for mutation in self.mutations {
-            let Mutation::Merge {
-                partition: PartitionId::Adj,
-                key,
-                operand,
-            } = mutation
-            else {
-                continue;
-            };
-            let Some((edge_type, source)) = forward_adj_key(key) else {
-                continue;
-            };
-            for (present, target) in adj_operand(operand)? {
-                let pair = (edge_type, source, target);
-                self.named.insert(pair);
-                if present {
-                    self.removed.remove(&pair);
-                } else {
-                    self.removed.insert(pair);
-                }
-            }
-        }
-        for key in &self.effects.removed_edges {
-            let (pair, _) = edgeprop_key(key).ok_or_else(|| {
-                ProjectionError::Malformed("a removed relationship has no edge property key".into())
-            })?;
-            self.removed.insert(pair);
-        }
-        Ok(())
+    /// Count the next event, and say what its ordinal asks.
+    fn slot(&mut self) -> Result<Slot, ProjectionError> {
+        let ordinal = self.count;
+        self.count = ordinal.checked_add(1).ok_or_else(|| {
+            ProjectionError::Malformed("the unit projects over 2^32 events".into())
+        })?;
+        Ok(if !self.taking {
+            Slot::Counted
+        } else if ordinal < self.first {
+            Slot::Delivered
+        } else {
+            Slot::Build
+        })
     }
 
-    fn emit(
+    /// Whether the next event would be built: what the operations before it
+    /// are checked for, those of a part the consumer reads.
+    fn building(&self) -> bool {
+        self.taking && self.count >= self.first
+    }
+
+    /// Hand the event of the last slot to the consumer.
+    fn hand(
         &mut self,
         action: Action,
         target: Target<'u>,
         payload: Option<&'u [u8]>,
         routing: Option<Routing<'u>>,
-    ) -> Result<(), ProjectionError> {
-        let ordinal = self.count;
-        self.count = ordinal.checked_add(1).ok_or_else(|| {
-            ProjectionError::Malformed("the unit projects over 2^32 events".into())
-        })?;
-        if self.taking {
-            let event = LogicalEvent {
-                ordinal,
-                action,
-                target,
-                payload,
-                routing,
-            };
-            self.taking = (self.take)(event) == Take::More;
-        }
-        Ok(())
+    ) {
+        let event = LogicalEvent {
+            ordinal: self.count - 1,
+            action,
+            target,
+            payload,
+            routing,
+        };
+        self.taking = (self.take)(event, &mut *self.room) == Take::More;
     }
 
     /// The labels node `key` stored before the unit, as its context records.
@@ -510,9 +959,11 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
         if implied.is_empty() {
             return Ok(stored);
         }
-        let mut all = stored.into_owned();
+        // One list at the size it can reach, not grown push by push.
+        let mut all = Vec::with_capacity(stored.len() + implied.len());
+        all.extend_from_slice(&stored);
         for &label in implied {
-            if !all.contains(&label) {
+            if !stored.contains(&label) {
                 all.push(label);
             }
         }
@@ -532,33 +983,128 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
         })
     }
 
+    /// Keep what node `key` carries after its change, when a later
+    /// operation changes it again. While building, a room that refuses it
+    /// ends what the consumer is handed, this event included.
+    /// The key is copied by `owned` only when it is kept.
+    fn keep_for_later(
+        &mut self,
+        slot: Slot,
+        key: &[u8],
+        owned: impl FnOnce(&[u8]) -> Cow<'u, [u8]>,
+        labels: impl FnOnce() -> Vec<LabelId>,
+    ) -> Result<bool, ProjectStop> {
+        if !self.changes_later(key) {
+            return Ok(true);
+        }
+        match self.remember(owned(key), labels()) {
+            Ok(()) => Ok(true),
+            Err(ProjectStop::NoRoom) if slot == Slot::Build => {
+                self.taking = false;
+                Ok(false)
+            }
+            Err(stop) => Err(stop),
+        }
+    }
+
     fn put(
         &mut self,
         partition: PartitionId,
         key: &'u [u8],
         value: &'u [u8],
-    ) -> Result<(), ProjectionError> {
+    ) -> Result<(), ProjectStop> {
         match partition {
             PartitionId::Node => {
-                let after = coordinode_core::graph::node::NodeRecord::labels_from_msgpack(value)
-                    .map_err(|e| ProjectionError::Malformed(format!("a node record: {e}")))?;
-                let after = self.carried(Cow::Owned(after))?;
-                // Its writer bound the labels the record replaces.
-                let before = self.required_labels(key, "write")?;
-                self.left.insert(Cow::Borrowed(key), after.clone());
-                let routing = Routing { before, after };
-                let target = Target::Node(Cow::Borrowed(key));
-                self.emit(Action::Put, target, Some(value), Some(routing))
+                let slot = self.slot()?;
+                if slot == Slot::Counted || (slot == Slot::Delivered && !self.changes_later(key)) {
+                    return Ok(());
+                }
+                self.with_routing(slot, |this| {
+                    let after = this.after_labels(value)?;
+                    if slot == Slot::Delivered {
+                        this.keep_for_later(slot, key, |_| Cow::Borrowed(key), || after)?;
+                        return Ok(());
+                    }
+                    // Its writer bound the labels the record replaces.
+                    let before = this.required_labels(key, "write")?;
+                    if this.keep_for_later(slot, key, |_| Cow::Borrowed(key), || after.clone())? {
+                        let routing = Routing {
+                            before,
+                            after: Cow::Owned(after),
+                        };
+                        this.hand(
+                            Action::Put,
+                            Target::Node(Cow::Borrowed(key)),
+                            Some(value),
+                            Some(routing),
+                        );
+                    }
+                    Ok(())
+                })
             }
             PartitionId::Adj => {
                 // A whole list written at once, as a restore writes it.
                 let Some((edge_type, source)) = forward_adj_key(key) else {
                     return Ok(());
                 };
-                let list = coordinode_core::graph::edge::PostingList::from_bytes(value)
-                    .map_err(|e| ProjectionError::Malformed(format!("a posting list: {e}")))?;
-                for target in list.iter() {
-                    self.emit(
+                self.posting_list(edge_type, source, value)
+            }
+            PartitionId::EdgeProp => {
+                if self.slot()? == Slot::Build {
+                    let target = edge_target(Cow::Borrowed(key))?;
+                    self.hand(Action::Put, target, Some(value), None);
+                }
+                Ok(())
+            }
+            _ if is_blob_owner(partition, key) => {
+                if self.slot()? == Slot::Build {
+                    self.hand(
+                        Action::Put,
+                        Target::BlobOwner(Cow::Borrowed(key)),
+                        Some(value),
+                        None,
+                    );
+                }
+                Ok(())
+            }
+            _ => {
+                if self.building() {
+                    // Refuses a record of no known kind.
+                    self.component(partition, key)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The relationships a whole posting list puts. Its blocks, and its
+    /// members when one of them is built, are decoded within room taken
+    /// first and given back once they are dropped.
+    fn posting_list(
+        &mut self,
+        edge_type: &'u [u8],
+        source: u64,
+        value: &'u [u8],
+    ) -> Result<(), ProjectStop> {
+        use coordinode_core::graph::codec::{UidBlock, UidPack, decode_uids};
+        let bad = |e: rmp_serde::decode::Error| {
+            ProjectStop::Projection(ProjectionError::Malformed(format!("a posting list: {e}")))
+        };
+        // Every block takes more than a byte of its encoding.
+        let pack_bytes = value.len() as u64 * (1 + core::mem::size_of::<UidBlock>() as u64);
+        self.lend(pack_bytes)?;
+        let pack: UidPack = rmp_serde::from_slice(value).map_err(bad)?;
+        let total = pack.total_uids();
+        // A sum of block counts each under 2^32, over fewer blocks than the
+        // frame has bytes: far below 2^64, past an event count of 2^32.
+        let builds = self.taking && u64::from(self.count) + total > u64::from(self.first);
+        if builds {
+            let uid_bytes = total * core::mem::size_of::<u64>() as u64;
+            self.lend(uid_bytes)?;
+            let uids = decode_uids(&pack);
+            for target in uids.iter().copied() {
+                if self.slot()? == Slot::Build {
+                    self.hand(
                         Action::Put,
                         Target::Relationship {
                             edge_type,
@@ -567,24 +1113,19 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
                         },
                         None,
                         None,
-                    )?;
+                    );
                 }
-                Ok(())
             }
-            PartitionId::EdgeProp => {
-                let target = edge_target(Cow::Borrowed(key))?;
-                self.emit(Action::Put, target, Some(value), None)
+            drop(uids);
+            self.repay(uid_bytes);
+        } else {
+            for _ in 0..total {
+                self.slot()?;
             }
-            _ => match self.component(partition, key)? {
-                Component::BlobOwner => self.emit(
-                    Action::Put,
-                    Target::BlobOwner(Cow::Borrowed(key)),
-                    Some(value),
-                    None,
-                ),
-                Component::Internal => Ok(()),
-            },
         }
+        drop(pack);
+        self.repay(pack_bytes);
+        Ok(())
     }
 
     /// What a change of `key` in `partition`, outside nodes and
@@ -595,11 +1136,6 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
         use coordinode_core::graph::blob;
         match partition {
             PartitionId::BlobRef => {
-                let owner = [
-                    blob::PROPERTY_OWNER_PREFIX,
-                    blob::DIRECT_OWNER_PREFIX,
-                    blob::S3_OWNER_PREFIX,
-                ];
                 // The catalog of copies, staged uploads, release candidates,
                 // retired copies and the collector's own records: how the
                 // blobs owners hold are kept, not what they hold.
@@ -611,7 +1147,7 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
                     blob::COMPACTION_PENDING_KEY,
                     blob::COLLECTOR_STATE_KEY,
                 ];
-                if owner.iter().any(|p| key.starts_with(p)) {
+                if is_blob_owner(partition, key) {
                     Ok(Component::BlobOwner)
                 } else if internal.iter().any(|p| key.starts_with(p)) {
                     Ok(Component::Internal)
@@ -635,7 +1171,7 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
                     id.node_id,
                     id.valid_from,
                 );
-                if self.versions.contains(version.as_slice()) {
+                if self.writes_version(&version) {
                     Ok(Component::Internal)
                 } else {
                     Err(ProjectionError::Unsupported(
@@ -654,40 +1190,73 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
         }
     }
 
+    /// A delete of `key`: the unit's own bytes as `unit_key`, or `None` for
+    /// a key of a run, which is copied only when an event or a later change
+    /// of it keeps it.
     fn delete(
         &mut self,
         partition: PartitionId,
-        key: Cow<'u, [u8]>,
-    ) -> Result<(), ProjectionError> {
+        key: &[u8],
+        unit_key: Option<&'u [u8]>,
+    ) -> Result<(), ProjectStop> {
+        let owned = |key: &[u8]| -> Cow<'u, [u8]> {
+            match unit_key {
+                Some(unit_key) => Cow::Borrowed(unit_key),
+                None => Cow::Owned(key.to_vec()),
+            }
+        };
         match partition {
             PartitionId::Node => {
-                let before = self.required_labels(&key, "removal")?;
-                self.left.insert(key.clone(), Cow::Borrowed(&[]));
-                let routing = Routing {
-                    before,
-                    after: Cow::Borrowed(&[]),
-                };
-                self.emit(Action::Remove, Target::Node(key), None, Some(routing))
-            }
-            PartitionId::EdgeProp => {
-                let part_of_removal = edgeprop_key(&key)
-                    .is_some_and(|(pair, suffix)| suffix.is_none() && self.removed.contains(&pair));
-                if part_of_removal {
-                    // The pair's property record goes with the relationship.
+                let slot = self.slot()?;
+                if slot == Slot::Counted {
                     return Ok(());
                 }
-                let target = edge_target(key)?;
-                self.emit(Action::Remove, target, None, None)
+                if slot == Slot::Delivered {
+                    self.keep_for_later(slot, key, owned, Vec::new)?;
+                    return Ok(());
+                }
+                self.with_routing(slot, |this| {
+                    let before = this.required_labels(key, "removal")?;
+                    if this.keep_for_later(slot, key, owned, Vec::new)? {
+                        let routing = Routing {
+                            before,
+                            after: Cow::Borrowed(&[]),
+                        };
+                        this.hand(
+                            Action::Remove,
+                            Target::Node(owned(key)),
+                            None,
+                            Some(routing),
+                        );
+                    }
+                    Ok(())
+                })
+            }
+            PartitionId::EdgeProp => {
+                let part_of_removal = edgeprop_key(key)
+                    .is_some_and(|(pair, suffix)| suffix.is_none() && self.removed(pair));
+                // The pair's property record goes with the relationship.
+                if !part_of_removal && self.slot()? == Slot::Build {
+                    let target = edge_target(owned(key))?;
+                    self.hand(Action::Remove, target, None, None);
+                }
+                Ok(())
             }
             // A whole adjacency list goes with its node: the relationships it
             // held are named by forward removals or the context.
             PartitionId::Adj => Ok(()),
-            _ => match self.component(partition, &key)? {
-                Component::BlobOwner => {
-                    self.emit(Action::Remove, Target::BlobOwner(key), None, None)
+            _ if is_blob_owner(partition, key) => {
+                if self.slot()? == Slot::Build {
+                    self.hand(Action::Remove, Target::BlobOwner(owned(key)), None, None);
                 }
-                Component::Internal => Ok(()),
-            },
+                Ok(())
+            }
+            _ => {
+                if self.building() {
+                    self.component(partition, key)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -696,47 +1265,63 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
         partition: PartitionId,
         key: &'u [u8],
         operand: &'u [u8],
-    ) -> Result<(), ProjectionError> {
+    ) -> Result<(), ProjectStop> {
         match partition {
             PartitionId::Node => {
-                let labels = self.required_labels(key, "document delta")?;
-                let routing = Routing {
-                    before: labels.clone(),
-                    after: labels,
-                };
-                self.emit(
-                    Action::Patch,
-                    Target::Node(Cow::Borrowed(key)),
-                    Some(operand),
-                    Some(routing),
-                )
+                if self.slot()? != Slot::Build {
+                    return Ok(());
+                }
+                self.with_routing(Slot::Build, |this| {
+                    let labels = this.required_labels(key, "document delta")?;
+                    let routing = Routing {
+                        before: labels.clone(),
+                        after: labels,
+                    };
+                    this.hand(
+                        Action::Patch,
+                        Target::Node(Cow::Borrowed(key)),
+                        Some(operand),
+                        Some(routing),
+                    );
+                    Ok(())
+                })
             }
             PartitionId::Adj => {
                 let Some((edge_type, source)) = forward_adj_key(key) else {
                     return Ok(());
                 };
                 for (present, target) in adj_operand(operand)? {
-                    let action = if present { Action::Put } else { Action::Remove };
-                    self.emit(
-                        action,
-                        Target::Relationship {
-                            edge_type,
-                            source,
-                            target,
-                        },
-                        None,
-                        None,
-                    )?;
+                    if self.slot()? == Slot::Build {
+                        let action = if present { Action::Put } else { Action::Remove };
+                        self.hand(
+                            action,
+                            Target::Relationship {
+                                edge_type,
+                                source,
+                                target,
+                            },
+                            None,
+                            None,
+                        );
+                    }
                 }
                 Ok(())
             }
-            _ => match self.component(partition, key)? {
-                // A blob owner's record is written whole, never merged.
-                Component::BlobOwner => Err(ProjectionError::Unsupported(
-                    "it merges into a blob owner's record".into(),
-                )),
-                Component::Internal => Ok(()),
-            },
+            _ => {
+                if self.building() {
+                    match self.component(partition, key)? {
+                        // A blob owner's record is written whole, never merged.
+                        Component::BlobOwner => {
+                            return Err(ProjectionError::Unsupported(
+                                "it merges into a blob owner's record".into(),
+                            )
+                            .into());
+                        }
+                        Component::Internal => {}
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -746,7 +1331,7 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
         start: &'u [u8],
         end: &'u [u8],
         is_run: bool,
-    ) -> Result<(), ProjectionError> {
+    ) -> Result<(), ProjectStop> {
         let projected = matches!(
             partition,
             PartitionId::Node | PartitionId::EdgeProp | PartitionId::Adj
@@ -758,7 +1343,8 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
                 PartitionId::BlobRef | PartitionId::NodeHistory | PartitionId::VectorF32 => {
                     Err(ProjectionError::Unsupported(format!(
                         "it removes a {partition:?} key range that names no logical targets"
-                    )))
+                    ))
+                    .into())
                 }
                 _ => Ok(()),
             };
@@ -766,76 +1352,108 @@ impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
         if !is_run {
             return Err(ProjectionError::Unsupported(
                 "it removes a key range that names no logical targets".into(),
-            ));
+            )
+            .into());
         }
         if partition == PartitionId::Adj {
             // Adjacency lists, as their nodes go: named elsewhere.
             return Ok(());
         }
         // The run's keys are every key of the start's length up to the end,
-        // each projected as its own delete: the unit holds them only as the
-        // run, so each event owns its key.
-        for_each_run_key(start, end, |key| self.delete(partition, Cow::Owned(key)))
+        // each projected as its own delete, walked in one buffer whose room
+        // is taken first: a key is copied only when it is kept.
+        let buffer = start.len() as u64;
+        self.lend(buffer)?;
+        let walked = for_each_run_key(start, end, |key| self.delete(partition, key, None));
+        self.repay(buffer);
+        walked
     }
 
     /// The relationships removed with whole forward lists, which no forward
     /// change of the unit names.
-    fn removed_with_lists(&mut self, effects: &'u UnitEffects) -> Result<(), ProjectionError> {
+    fn removed_with_lists(&mut self, effects: &'u UnitEffects) -> Result<(), ProjectStop> {
         for key in &effects.removed_edges {
             let Some(((edge_type, source, target), _)) = edgeprop_key(key) else {
                 continue;
             };
-            if self.named.contains(&(edge_type, source, target)) {
+            if self.named((edge_type, source, target)) {
                 continue;
             }
-            self.emit(
-                Action::Remove,
-                Target::Relationship {
-                    edge_type,
-                    source,
-                    target,
-                },
-                None,
-                None,
-            )?;
+            if self.slot()? == Slot::Build {
+                self.hand(
+                    Action::Remove,
+                    Target::Relationship {
+                        edge_type,
+                        source,
+                        target,
+                    },
+                    None,
+                    None,
+                );
+            }
         }
         // A change of what a type implies: one control for the whole type,
         // routed to every label it reaches before or after, the type's own
         // included, without a node of it enumerated.
         for change in &effects.scope_changes {
+            if self.slot()? != Slot::Build {
+                continue;
+            }
             let with_type = |implied: &[LabelId]| {
                 let mut all = Vec::with_capacity(implied.len() + 1);
                 all.push(change.label);
                 all.extend(implied.iter().copied().filter(|&l| l != change.label));
                 Cow::Owned(all)
             };
-            self.emit(
-                Action::ScopeChange,
-                Target::Scope {
-                    label: change.label,
-                    activation: change.activation,
-                },
-                None,
-                Some(Routing {
-                    before: with_type(&change.before),
-                    after: with_type(&change.after),
-                }),
-            )?;
+            let lists = (2 + change.before.len() + change.after.len()) as u64
+                * core::mem::size_of::<LabelId>() as u64;
+            self.with_lists(lists, |this| {
+                this.hand(
+                    Action::ScopeChange,
+                    Target::Scope {
+                        label: change.label,
+                        activation: change.activation,
+                    },
+                    None,
+                    Some(Routing {
+                        before: with_type(&change.before),
+                        after: with_type(&change.after),
+                    }),
+                );
+            });
         }
         // A dropped label: its scope ends, routed by the identity it had.
         for &label in &effects.dropped {
-            self.emit(
-                Action::Drop,
-                Target::Label(label),
-                None,
-                Some(Routing {
-                    before: Cow::Owned(vec![label]),
-                    after: Cow::Borrowed(&[]),
-                }),
-            )?;
+            if self.slot()? == Slot::Build {
+                self.with_lists(core::mem::size_of::<LabelId>() as u64, |this| {
+                    this.hand(
+                        Action::Drop,
+                        Target::Label(label),
+                        None,
+                        Some(Routing {
+                            before: Cow::Owned(vec![label]),
+                            after: Cow::Borrowed(&[]),
+                        }),
+                    );
+                });
+            }
         }
         Ok(())
     }
+}
+
+/// Whether `key` in `partition` is a blob owner's record: a node's large
+/// property, a stored object or an S3 object.
+fn is_blob_owner(partition: PartitionId, key: &[u8]) -> bool {
+    use coordinode_core::graph::blob;
+    partition == PartitionId::BlobRef
+        && [
+            blob::PROPERTY_OWNER_PREFIX,
+            blob::DIRECT_OWNER_PREFIX,
+            blob::S3_OWNER_PREFIX,
+        ]
+        .iter()
+        .any(|p| key.starts_with(p))
 }
 
 /// The type name and source of a forward adjacency key
@@ -903,15 +1521,45 @@ fn edge_target(key: Cow<'_, [u8]>) -> Result<Target<'_>, ProjectionError> {
 }
 
 /// The members an adjacency operand adds (`true`) or removes (`false`), in
-/// order.
-fn adj_operand(operand: &[u8]) -> Result<Vec<(bool, u64)>, ProjectionError> {
+/// order, read in place.
+enum AdjMembers<'o> {
+    One(Option<(bool, u64)>),
+    Added(core::slice::Iter<'o, [u8; 8]>),
+}
+
+impl Iterator for AdjMembers<'_> {
+    type Item = (bool, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::One(member) => member.take(),
+            Self::Added(uids) => uids.next().map(|uid| (true, u64::from_be_bytes(*uid))),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = match self {
+            Self::One(member) => usize::from(member.is_some()),
+            Self::Added(uids) => uids.len(),
+        };
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for AdjMembers<'_> {}
+
+fn adj_operand(operand: &[u8]) -> Result<AdjMembers<'_>, ProjectionError> {
     let bad = || ProjectionError::Malformed("an adjacency operand of no known shape".into());
     let uid = |bytes: &[u8]| -> Result<u64, ProjectionError> {
         Ok(u64::from_be_bytes(bytes.try_into().map_err(|_| bad())?))
     };
     match operand.split_first() {
-        Some((&crate::engine::merge::TAG_ADD, rest)) => Ok(vec![(true, uid(rest)?)]),
-        Some((&crate::engine::merge::TAG_REMOVE, rest)) => Ok(vec![(false, uid(rest)?)]),
+        Some((&crate::engine::merge::TAG_ADD, rest)) => {
+            Ok(AdjMembers::One(Some((true, uid(rest)?))))
+        }
+        Some((&crate::engine::merge::TAG_REMOVE, rest)) => {
+            Ok(AdjMembers::One(Some((false, uid(rest)?))))
+        }
         Some((&crate::engine::merge::TAG_ADD_BATCH, rest)) => {
             let (count, uids) = rest.split_at_checked(4).ok_or_else(bad)?;
             let count = u32::from_be_bytes(count.try_into().map_err(|_| bad())?) as usize;
@@ -919,10 +1567,7 @@ fn adj_operand(operand: &[u8]) -> Result<Vec<(bool, u64)>, ProjectionError> {
                 return Err(bad());
             }
             let (chunks, _) = uids.as_chunks::<8>();
-            Ok(chunks
-                .iter()
-                .map(|chunk| (true, u64::from_be_bytes(*chunk)))
-                .collect())
+            Ok(AdjMembers::Added(chunks.iter()))
         }
         _ => Err(bad()),
     }
@@ -930,13 +1575,17 @@ fn adj_operand(operand: &[u8]) -> Result<Vec<(bool, u64)>, ProjectionError> {
 
 /// Hand `each` every key of `start`'s length from `start` up to `end`, both
 /// of one length, in order: the point deletes a run stands for, one at a
-/// time, never listed.
+/// time in one buffer, never listed.
 fn for_each_run_key(
     start: &[u8],
     end: &[u8],
-    mut each: impl FnMut(Vec<u8>) -> Result<(), ProjectionError>,
-) -> Result<(), ProjectionError> {
-    let bad = |what: &str| ProjectionError::Malformed(format!("a run of deletes {what}"));
+    mut each: impl FnMut(&[u8]) -> Result<(), ProjectStop>,
+) -> Result<(), ProjectStop> {
+    let bad = |what: &str| {
+        ProjectStop::Projection(ProjectionError::Malformed(format!(
+            "a run of deletes {what}"
+        )))
+    };
     if start.len() != end.len() || start >= end {
         return Err(bad("with bounds of different lengths or out of order"));
     }
@@ -947,8 +1596,7 @@ fn for_each_run_key(
             return Err(bad("longer than any unit"));
         }
         walked += 1;
-        let next = key.clone();
-        each(next)?;
+        each(&key)?;
         // Big-endian increment within the length; a key of all 0xFF bytes
         // has no successor of its length, and nothing of it is below `end`.
         let Some(at) = key.iter().rposition(|&b| b != 0xFF) else {
@@ -1553,8 +2201,10 @@ pub(crate) fn owned_event(
     }
 }
 
-/// Bytes one delivered event holds.
-pub(crate) fn event_bytes(event: &LogicalEvent<'_>) -> u64 {
+/// Bytes the heap holds for one delivered event beyond its slot in its
+/// unit's list of events: its key, payload and labels, each allocated at
+/// its length.
+pub(crate) fn event_heap_bytes(event: &LogicalEvent<'_>) -> u64 {
     let target = match &event.target {
         Target::Node(key)
         | Target::RelationshipProperties(key)
@@ -1566,45 +2216,31 @@ pub(crate) fn event_bytes(event: &LogicalEvent<'_>) -> u64 {
     let labels = event.routing.as_ref().map_or(0, |r| {
         (r.before.len() + r.after.len()) * core::mem::size_of::<LabelId>()
     });
-    (core::mem::size_of::<ChangeEvent>() + target + event.payload.map_or(0, <[u8]>::len) + labels)
-        as u64
+    (target + event.payload.map_or(0, <[u8]>::len) + labels) as u64
 }
 
 /// Bytes a read takes from its budget at a time for the events it keeps:
 /// the budget is asked once per block, not once per event.
 const CHARGE_BLOCK: u64 = 64 * 1024;
 
-/// A charge taken from its budget a block at a time, the events kept
-/// spending the block without asking the budget again.
+/// A charge taken from its budget a block at a time: the events kept, the
+/// lists holding them and the projection's working state spend the block
+/// and give back to it without asking the budget again.
 struct BlockCharge<'c, 'b> {
     charge: &'c mut coordinode_core::budget::MemoryCharge<'b>,
     /// Taken from the budget and not yet spent.
     left: u64,
+    /// Why the budget last refused a block.
+    refused: Option<coordinode_core::budget::BudgetStop>,
 }
 
 impl<'c, 'b> BlockCharge<'c, 'b> {
     fn new(charge: &'c mut coordinode_core::budget::MemoryCharge<'b>) -> Self {
-        Self { charge, left: 0 }
-    }
-
-    /// Spend `bytes`, taking another block when the one held is spent; a
-    /// block the budget refuses is asked for again at exactly what is
-    /// missing, so the budget's last bytes are not lost to the block size.
-    fn take(&mut self, bytes: u64) -> Result<(), coordinode_core::budget::BudgetStop> {
-        if let Some(left) = self.left.checked_sub(bytes) {
-            self.left = left;
-            return Ok(());
+        Self {
+            charge,
+            left: 0,
+            refused: None,
         }
-        let missing = bytes - self.left;
-        let block = missing.max(CHARGE_BLOCK);
-        if self.charge.grow(block).is_ok() {
-            // `block` covers what was missing: the rest stays held.
-            self.left = block - missing;
-            return Ok(());
-        }
-        self.charge.grow(missing)?;
-        self.left = 0;
-        Ok(())
     }
 
     /// Return what was taken and not spent.
@@ -1614,12 +2250,47 @@ impl<'c, 'b> BlockCharge<'c, 'b> {
     }
 }
 
+impl Room for BlockCharge<'_, '_> {
+    /// Spend `bytes`, taking another block when the one held is spent; a
+    /// block the budget refuses is asked for again at exactly what is
+    /// missing, so the budget's last bytes are not lost to the block size.
+    fn take(&mut self, bytes: u64) -> bool {
+        if let Some(left) = self.left.checked_sub(bytes) {
+            self.left = left;
+            return true;
+        }
+        let missing = bytes - self.left;
+        let block = missing.max(CHARGE_BLOCK);
+        if self.charge.grow(block).is_ok() {
+            // `block` covers what was missing: the rest stays held.
+            self.left = block - missing;
+            return true;
+        }
+        match self.charge.grow(missing) {
+            Ok(()) => {
+                self.left = 0;
+                true
+            }
+            Err(stop) => {
+                self.refused = Some(stop);
+                false
+            }
+        }
+    }
+
+    fn give(&mut self, bytes: u64) {
+        // At most what the charge holds: it was taken from it.
+        self.left += bytes;
+    }
+}
+
 /// The changes a reader at `from` receives of `units`, the units of the
 /// entries read from its entry on: units before `from` inside its entry are
-/// passed over, and the unit it stopped in continues at its ordinal. Every
-/// event and unit kept is charged to `charge` first; when the charge refuses
-/// one, the read stops there, and the place it stopped is returned. A read
-/// that cannot keep its first event refuses with the budget's stop.
+/// passed over, and the unit it stopped in continues at its ordinal. The
+/// room of every list grown, every event kept and the working state of each
+/// unit's projection is taken from `charge` before it is allocated; when
+/// the charge refuses it, the read stops there, and the place it stopped is
+/// returned. A read that can keep nothing refuses with the budget's stop.
 ///
 /// # Errors
 ///
@@ -1641,9 +2312,25 @@ pub(crate) fn unit_changes(
         entry: from_entry,
         within: from_within,
     } = from;
-    let mut charged = BlockCharge::new(charge);
+    let mut room = BlockCharge::new(charge);
     let mut out: Vec<UnitChanges> = Vec::new();
-    let mut kept_any = false;
+    // Where the read stops: nothing kept at all is the budget's refusal.
+    let stop = |room: &mut BlockCharge<'_, '_>,
+                out: Vec<UnitChanges>,
+                place: ReadPlace|
+     -> Result<(Vec<UnitChanges>, Option<ReadPlace>), StorageError> {
+        room.release();
+        if out.is_empty() {
+            return Err(StorageError::Budget(room.refused.take().unwrap_or(
+                coordinode_core::budget::BudgetStop::Memory {
+                    requested: 0,
+                    used: 0,
+                    limit: 0,
+                },
+            )));
+        }
+        Ok((out, Some(place)))
+    };
     for unit in units {
         let first = if unit.position.index == from_entry {
             if unit.position.sub < from_within.sub {
@@ -1657,61 +2344,58 @@ pub(crate) fn unit_changes(
         } else {
             0
         };
-        let stopped = |ordinal: u32| {
-            Some(ReadPlace {
-                entry: unit.position.index,
-                within: Within {
-                    sub: unit.position.sub,
-                    ordinal,
-                },
-            })
+        let stopped = |ordinal: u32| ReadPlace {
+            entry: unit.position.index,
+            within: Within {
+                sub: unit.position.sub,
+                ordinal,
+            },
         };
-        if let Err(stop) = charged.take(core::mem::size_of::<UnitChanges>() as u64) {
-            if !kept_any {
-                return Err(StorageError::Budget(stop));
-            }
-            charged.release();
-            return Ok((out, stopped(first)));
+        // The unit's place in the batch, taken before it is read.
+        if !grow_within(&mut out, &mut room) {
+            return stop(&mut room, out, stopped(first));
         }
-        // Events are handed over one at a time: those before `first` were
-        // delivered already and are only counted, those after the one the
-        // budget refuses are not built.
-        let mut taken = Vec::new();
+        // Events are handed over one at a time from `first` on; those after
+        // the one the budget refuses are only counted.
+        let mut taken: Vec<ChangeEvent> = Vec::new();
         let mut through = first;
-        let mut refused = None;
-        let projected = unit
-            .project_with(|event| {
-                if event.ordinal < first {
-                    return Take::More;
+        let mut refused = false;
+        let projected = unit.project_with(first, &mut room, |event, room| {
+            if let Some(delivery) = interest.delivery(&event) {
+                if !grow_within(&mut taken, room) || !room.take(event_heap_bytes(&event)) {
+                    refused = true;
+                    return Take::Enough;
                 }
-                if let Some(delivery) = interest.delivery(&event) {
-                    if let Err(stop) = charged.take(event_bytes(&event)) {
-                        refused = Some(stop);
-                        return Take::Enough;
-                    }
-                    kept_any = true;
-                    taken.push(owned_event(unit.position, &event, delivery));
-                }
-                through = event.ordinal + 1;
-                Take::More
-            })
-            .map_err(projection)?;
-        if let Some(stop) = refused {
-            if !kept_any {
-                return Err(StorageError::Budget(stop));
+                taken.push(owned_event(unit.position, &event, delivery));
             }
-            out.push(UnitChanges {
-                position: unit.position,
-                commit_ts: unit.commit_ts,
-                events: taken,
-                projected,
-                first,
-                through,
-            });
-            charged.release();
-            return Ok((out, stopped(through)));
+            through = event.ordinal + 1;
+            Take::More
+        });
+        let projected = match projected {
+            Ok(projected) => projected,
+            // The unit's working state does not fit beside what the read
+            // keeps: the read stops before the unit.
+            Err(ProjectStop::NoRoom) => {
+                drop(taken);
+                return stop(&mut room, out, stopped(first));
+            }
+            Err(ProjectStop::Projection(e)) => return Err(projection(e)),
+        };
+        // A projection that stopped handing events over before the unit's
+        // end: the read stops inside it.
+        if refused || through < projected {
+            if through > first {
+                out.push(UnitChanges {
+                    position: unit.position,
+                    commit_ts: unit.commit_ts,
+                    events: taken,
+                    projected,
+                    first,
+                    through,
+                });
+            }
+            return stop(&mut room, out, stopped(through));
         }
-        kept_any = true;
         out.push(UnitChanges {
             position: unit.position,
             commit_ts: unit.commit_ts,
@@ -1721,7 +2405,7 @@ pub(crate) fn unit_changes(
             through: projected,
         });
     }
-    charged.release();
+    room.release();
     Ok((out, None))
 }
 

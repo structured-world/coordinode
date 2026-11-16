@@ -812,9 +812,13 @@ fn a_read_stops_inside_a_unit_and_continues_there() {
         assert_eq!(stopped, None);
         whole
     };
-    // Room for the unit and a few of its events a read.
+    // Room for the batch's first places, the unit's working state (its
+    // node keys and one event's label lists) and four of its events a read:
+    // a fifth needs the event list to grow.
     let event = whole[0].events.len();
-    let room = (core::mem::size_of::<UnitChanges>()
+    let room = (4 * core::mem::size_of::<UnitChanges>()
+        + 10 * core::mem::size_of::<(&[u8], u32)>()
+        + 256
         + 4 * core::mem::size_of::<ChangeEvent>()
         + 4 * 64) as u64;
     let mut from = at(0, 0);

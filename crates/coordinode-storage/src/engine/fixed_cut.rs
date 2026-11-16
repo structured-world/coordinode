@@ -325,6 +325,13 @@ impl EntryPool {
         fits
     }
 
+    /// Free `bytes` kept for the entry's units, once their memory is freed:
+    /// a list that grew into a larger buffer.
+    pub(crate) fn unretain(&mut self, bytes: u64) {
+        self.retained -= bytes;
+        self.left += bytes;
+    }
+
     /// Grow the batch's units by `bytes`; `false` when they do not fit.
     pub(crate) fn grow(&mut self, bytes: u64) -> bool {
         let fits = self.spend(bytes);
@@ -352,6 +359,17 @@ impl EntryPool {
     /// The batch's growth alone.
     pub(crate) fn grown(&self) -> u64 {
         self.grown
+    }
+}
+
+/// Working state a unit's projection takes while it runs and gives back.
+impl crate::engine::change_feed::Room for EntryPool {
+    fn take(&mut self, bytes: u64) -> bool {
+        self.spend(bytes)
+    }
+
+    fn give(&mut self, bytes: u64) {
+        self.left += bytes;
     }
 }
 

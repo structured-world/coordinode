@@ -279,18 +279,27 @@ fn a_transaction_in_fragments_takes_effect_whole() {
 /// Nodes the large transaction of these tests removes.
 const LINKS: usize = 300;
 
-/// Write [`LINKS`] people, then return a cursor before one transaction
-/// deleting them all, which the commit packs into runs of deletes: a
-/// transaction whose few stored operations project to many events.
+/// Write [`LINKS`] members of a type implying many labels, then return a
+/// cursor before one transaction deleting them all, which the commit packs
+/// into runs of deletes: a transaction whose few stored operations project
+/// to many events, each routed by far more labels than its row stores.
 fn linked_hub(src: &mut Database) -> ChangeCursor {
+    let implied: Vec<String> = (1..=30).map(|i| format!("Group{i}")).collect();
     run(
         src,
-        &format!("UNWIND range(1, {LINKS}) AS i CREATE (:Person {{name: 'p' + toString(i)}})"),
+        &format!(
+            "CREATE NODE TYPE Member IMPLIES ({}) WITH (name: STRING)",
+            implied.join(", ")
+        ),
+    );
+    run(
+        src,
+        &format!("UNWIND range(1, {LINKS}) AS i CREATE (:Member {{name: 'm' + toString(i)}})"),
     );
     let start = src
         .change_cursor(&ChangeInterest::default())
         .expect("cursor");
-    run(src, "MATCH (p:Person) DELETE p");
+    run(src, "MATCH (m:Member) DELETE m");
     start
 }
 

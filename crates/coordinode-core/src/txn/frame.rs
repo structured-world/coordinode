@@ -432,6 +432,11 @@ impl<'a> Encoder<'a> {
     fn effects(&mut self, effects: &'a UnitEffects, out: &mut Vec<u8>) {
         out.push(KIND_EFFECTS);
         put_varint(u64::from(effects.interpretation), out);
+        // The slots of each list, as the decoder counts them.
+        self.expanded += effects.nodes.len() * core::mem::size_of::<NodeBasis>()
+            + effects.removed_edges.len() * core::mem::size_of::<Vec<u8>>()
+            + effects.implications.len() * core::mem::size_of::<Implication>()
+            + effects.scope_changes.len() * core::mem::size_of::<ScopeChange>();
         let node = usize::from(partition_number(PartitionId::Node));
         put_varint(effects.nodes.len() as u64, out);
         for basis in &effects.nodes {
@@ -626,7 +631,11 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
             Mutation::Operation(command) => command.size_estimate(),
             Mutation::Effects(effects) => {
                 check_runs(&effects.runs, &unit.mutations[..at])?;
-                let mut bytes = 0;
+                // The slots of each list, as the decoder counts them.
+                let mut bytes = effects.nodes.len() * core::mem::size_of::<NodeBasis>()
+                    + effects.removed_edges.len() * core::mem::size_of::<Vec<u8>>()
+                    + effects.implications.len() * core::mem::size_of::<Implication>()
+                    + effects.scope_changes.len() * core::mem::size_of::<ScopeChange>();
                 for basis in &effects.nodes {
                     entries += 3 * 10 + basis.labels.len();
                     bytes += basis.key.len() + basis.labels.len() * LABEL_BYTES;
@@ -1102,6 +1111,9 @@ impl<'a> Decoder<'a> {
         if count > self.reader.remaining() / 3 {
             return Err(FrameError::Truncated { at: self.reader.at });
         }
+        // Each list's slots, as well as what each slot owns, count before
+        // the list is allocated.
+        self.spend(count * core::mem::size_of::<NodeBasis>())?;
         let mut nodes = Vec::with_capacity(count);
         for _ in 0..count {
             let key = self.key(node)?;
@@ -1113,24 +1125,28 @@ impl<'a> Decoder<'a> {
         if count > self.reader.remaining() / 2 {
             return Err(FrameError::Truncated { at: self.reader.at });
         }
-        let removed_edges = (0..count)
-            .map(|_| self.key(edge))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.spend(count * core::mem::size_of::<Vec<u8>>())?;
+        let mut removed_edges = Vec::with_capacity(count);
+        for _ in 0..count {
+            removed_edges.push(self.key(edge)?);
+        }
         let count = self.reader.len_at_most(self.limit, "effect count")?;
         if count > self.reader.remaining() {
             return Err(FrameError::Truncated { at: self.reader.at });
         }
         self.spend(count * RUN_BYTES)?;
-        let runs = (0..count)
-            .map(|_| {
+        let mut runs = Vec::with_capacity(count);
+        for _ in 0..count {
+            runs.push(
                 u32::try_from(self.reader.varint()?)
-                    .map_err(|_| FrameError::Effects("run position out of range"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                    .map_err(|_| FrameError::Effects("run position out of range"))?,
+            );
+        }
         let count = self.reader.len_at_most(self.limit, "effect count")?;
         if count > self.reader.remaining() / 2 {
             return Err(FrameError::Truncated { at: self.reader.at });
         }
+        self.spend(count * core::mem::size_of::<Implication>())?;
         let mut implications = Vec::with_capacity(count);
         for _ in 0..count {
             let label = self.label()?;
@@ -1141,6 +1157,7 @@ impl<'a> Decoder<'a> {
         if count > self.reader.remaining() / 4 {
             return Err(FrameError::Truncated { at: self.reader.at });
         }
+        self.spend(count * core::mem::size_of::<ScopeChange>())?;
         let mut scope_changes = Vec::with_capacity(count);
         for _ in 0..count {
             let label = self.label()?;
@@ -1175,7 +1192,12 @@ impl<'a> Decoder<'a> {
             return Err(FrameError::Truncated { at: self.reader.at });
         }
         self.spend(count * LABEL_BYTES)?;
-        (0..count).map(|_| self.label_id()).collect()
+        // At the counted size: collecting fallible items starts from a guess.
+        let mut labels = Vec::with_capacity(count);
+        for _ in 0..count {
+            labels.push(self.label_id()?);
+        }
+        Ok(labels)
     }
 
     /// A list of exactly one label identity: a label an entry is about.
