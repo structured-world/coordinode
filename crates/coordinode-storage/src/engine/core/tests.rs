@@ -1806,22 +1806,21 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
             Arc::clone(&faults),
         )));
         let engine = StorageEngine::open(&config).expect("open");
+        // What the open synced is not what the armed persist attempts.
+        faults.clear();
         arm(&faults);
         engine.put(partition, KEY, b"v").expect("put");
         (dir, config, engine, crash, faults)
     };
-    // After a failed persist: the retry on a healthy disk succeeds, and the
-    // write survives a power cut after it, which every file falls back to
-    // its last sync at.
-    let survives = |partition: Partition,
-                    case: &str,
-                    config: &StorageConfig,
-                    engine: StorageEngine,
-                    crash: &CrashFs,
-                    faults: &FaultInjector| {
-        faults.clear();
-        let retry = engine.persist_partition(partition);
-        assert!(retry.is_ok(), "{partition:?} {case}: retry: {retry:?}");
+    // A persist that answered success left the write durable: it survives a
+    // power cut right after it, which every file falls back to its last sync
+    // at, with nothing written or synced in between.
+    let power_cut_keeps = |partition: Partition,
+                           case: &str,
+                           config: &StorageConfig,
+                           engine: StorageEngine,
+                           crash: &CrashFs,
+                           faults: &FaultInjector| {
         for op in [
             FaultOp::Open,
             FaultOp::Write,
@@ -1838,8 +1837,21 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
         assert_eq!(
             engine.get(partition, KEY).expect("read").as_deref(),
             Some(&b"v"[..]),
-            "{partition:?} {case}: the write acknowledged by the retry was lost"
+            "{partition:?} {case}: the write the persist acknowledged was lost"
         );
+    };
+    // After a failed persist: the retry on a healthy disk succeeds, and the
+    // write it acknowledges survives a power cut.
+    let retry_keeps = |partition: Partition,
+                       case: &str,
+                       config: &StorageConfig,
+                       engine: StorageEngine,
+                       crash: &CrashFs,
+                       faults: &FaultInjector| {
+        faults.clear();
+        let retry = engine.persist_partition(partition);
+        assert!(retry.is_ok(), "{partition:?} {case}: retry: {retry:?}");
+        power_cut_keeps(partition, case, config, engine, crash, faults);
     };
 
     let mut reached_by = Vec::new();
@@ -1874,7 +1886,7 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
                 break;
             }
             reached += 1;
-            survives(
+            retry_keeps(
                 partition,
                 &format!("{failed:?} {k}"),
                 &config,
@@ -1892,7 +1904,8 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
     // Installed by the persist, the failure leaves its outcome unknown;
     // installed by a flush worker, the tree settles it by writing a new
     // version, and the persist succeeds. A plain I/O error would mean the
-    // installation was taken for not done. Either way the write survives.
+    // installation was taken for not done. A success must hold across a power
+    // cut as it is; an unknown outcome, after its retry.
     for partition in [Partition::Raft, Partition::Schema] {
         let edits = format!("{}{}edits", partition.name(), std::path::MAIN_SEPARATOR);
         let (_dir, config, engine, crash, faults) = store(partition, &|faults| {
@@ -1919,14 +1932,27 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
             ),
             "{partition:?}: a failed installation reported as {first:?}"
         );
-        survives(
-            partition,
-            "failed installation",
-            &config,
-            engine,
-            &crash,
-            &faults,
-        );
+        if first.is_ok() {
+            eprintln!("{partition:?}: the failed installation was settled; the persist succeeded");
+            power_cut_keeps(
+                partition,
+                "settled installation",
+                &config,
+                engine,
+                &crash,
+                &faults,
+            );
+        } else {
+            eprintln!("{partition:?}: the failed installation left its outcome unknown");
+            retry_keeps(
+                partition,
+                "unknown installation",
+                &config,
+                engine,
+                &crash,
+                &faults,
+            );
+        }
     }
     // Every partition's persist opens, writes and syncs a table; it need not
     // rename one. Which sync it is depends on the platform and the file:
