@@ -576,18 +576,38 @@ impl PendingCommits {
     /// than reading behind it. The wait is bounded, and its expiry falls back
     /// to the floor: an older complete view, never an incomplete fresh one.
     pub fn complete_snapshot(&self, read_clock: impl Fn() -> u64, wait: Duration) -> u64 {
-        let deadline = Instant::now() + wait;
+        let start = Instant::now();
+        let deadline = start + wait;
         let mut table = self.inner.lock();
+        #[cfg(feature = "stage-timing")]
+        let mut waited = false;
         loop {
             let latest = read_clock();
             if table.admitted.is_empty() {
+                #[cfg(feature = "stage-timing")]
+                if waited {
+                    crate::stage_timing::record("snapshot.wait", start);
+                }
                 return latest;
             }
             let floor = Self::floor_of(&table, latest);
             if floor == latest {
+                #[cfg(feature = "stage-timing")]
+                if waited {
+                    crate::stage_timing::record("snapshot.wait", start);
+                }
                 return latest;
             }
+            #[cfg(feature = "stage-timing")]
+            {
+                waited = true;
+            }
             if self.finished.wait_until(&mut table, deadline).timed_out() {
+                #[cfg(feature = "stage-timing")]
+                {
+                    crate::stage_timing::record("snapshot.wait", start);
+                    crate::stage_timing::record("snapshot.timeout", start);
+                }
                 let latest = read_clock();
                 return Self::floor_of(&table, latest);
             }
