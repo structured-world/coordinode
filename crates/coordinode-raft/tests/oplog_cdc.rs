@@ -760,6 +760,18 @@ async fn an_offline_cut_of_a_tree_behind_the_closure_is_refused() {
                 })
                 .expect("propose");
         }
+        // The store as it was is the store with its commits closed: the
+        // leader closes an idle write shortly after it lands. Stopped before
+        // that, its closure stands behind its trees, and an offline cut is
+        // refused until it is opened as a member again.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while engine.effects_past_closure() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writes were never closed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         node.shutdown().await.expect("shutdown");
     }
     let offline = |engine: Arc<StorageEngine>| async move {
