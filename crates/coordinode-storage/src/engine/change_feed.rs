@@ -731,14 +731,16 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
     }
 
     /// Run `build`, the label lists one node event decodes and builds while
-    /// it is built given room first. While building, a room that refuses
-    /// them ends what the consumer is handed, this event included.
+    /// it is built, and `extra` bytes more it copies, given room first.
+    /// While building, a room that refuses them ends what the consumer is
+    /// handed, this event included.
     fn with_routing(
         &mut self,
         slot: Slot,
+        extra: u64,
         build: impl FnOnce(&mut Self) -> Result<(), ProjectStop>,
     ) -> Result<(), ProjectStop> {
-        let bytes = self.routing;
+        let bytes = self.routing + extra;
         match self.lend(bytes) {
             Ok(()) => {}
             Err(ProjectStop::NoRoom) if slot == Slot::Build => {
@@ -819,13 +821,29 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
     }
 
     /// Keep what node `key` carries after its change, for its later change
-    /// in the unit, its room taken first.
-    fn remember(&mut self, key: Cow<'u, [u8]>, labels: Vec<LabelId>) -> Result<(), ProjectStop> {
-        let value = (labels.capacity() * core::mem::size_of::<LabelId>()) as u64;
-        self.lend(value)?;
-        if let Some(old) = self.left.get_mut(key.as_ref()) {
-            let freed = (old.capacity() * core::mem::size_of::<LabelId>()) as u64;
-            *old = labels;
+    /// in the unit: the unit's own key as `unit_key`, or `None` for a key of
+    /// a run, copied when it is kept; `labels` borrowed are copied, owned
+    /// are moved in. Every copy and the table's growth have their room taken
+    /// before they are allocated; a list moved in is charged as it changes
+    /// owner.
+    fn remember(
+        &mut self,
+        key: &[u8],
+        unit_key: Option<&'u [u8]>,
+        labels: Cow<'_, [LabelId]>,
+    ) -> Result<(), ProjectStop> {
+        let slot = core::mem::size_of::<LabelId>() as u64;
+        let value = match &labels {
+            Cow::Borrowed(labels) => labels.len() as u64 * slot,
+            Cow::Owned(labels) => labels.capacity() as u64 * slot,
+        };
+        if let Some(old) = self.left.get(key) {
+            let freed = old.capacity() as u64 * slot;
+            self.lend(value)?;
+            let labels = labels.into_owned();
+            if let Some(old) = self.left.get_mut(key) {
+                *old = labels;
+            }
             self.repay(freed);
             return Ok(());
         }
@@ -838,10 +856,17 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
             let old = core::mem::replace(&mut self.table, bytes);
             self.repay(old);
         }
-        if let Cow::Owned(owned) = &key {
-            self.lend(owned.capacity() as u64)?;
-        }
-        self.left.insert(key, labels);
+        let copied = if unit_key.is_some() {
+            0
+        } else {
+            key.len() as u64
+        };
+        self.lend(value + copied)?;
+        let key = match unit_key {
+            Some(unit_key) => Cow::Borrowed(unit_key),
+            None => Cow::Owned(key.to_vec()),
+        };
+        self.left.insert(key, labels.into_owned());
         Ok(())
     }
 
@@ -986,18 +1011,18 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
     /// Keep what node `key` carries after its change, when a later
     /// operation changes it again. While building, a room that refuses it
     /// ends what the consumer is handed, this event included.
-    /// The key is copied by `owned` only when it is kept.
+    /// As [`Self::remember`] keeps them, nothing copied when it is not kept.
     fn keep_for_later(
         &mut self,
         slot: Slot,
         key: &[u8],
-        owned: impl FnOnce(&[u8]) -> Cow<'u, [u8]>,
-        labels: impl FnOnce() -> Vec<LabelId>,
+        unit_key: Option<&'u [u8]>,
+        labels: Cow<'_, [LabelId]>,
     ) -> Result<bool, ProjectStop> {
         if !self.changes_later(key) {
             return Ok(true);
         }
-        match self.remember(owned(key), labels()) {
+        match self.remember(key, unit_key, labels) {
             Ok(()) => Ok(true),
             Err(ProjectStop::NoRoom) if slot == Slot::Build => {
                 self.taking = false;
@@ -1019,15 +1044,18 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
                 if slot == Slot::Counted || (slot == Slot::Delivered && !self.changes_later(key)) {
                     return Ok(());
                 }
-                self.with_routing(slot, |this| {
+                self.with_routing(slot, 0, |this| {
                     let after = this.after_labels(value)?;
                     if slot == Slot::Delivered {
-                        this.keep_for_later(slot, key, |_| Cow::Borrowed(key), || after)?;
+                        // Its labels move in: nothing else holds them.
+                        this.keep_for_later(slot, key, Some(key), Cow::Owned(after))?;
                         return Ok(());
                     }
                     // Its writer bound the labels the record replaces.
                     let before = this.required_labels(key, "write")?;
-                    if this.keep_for_later(slot, key, |_| Cow::Borrowed(key), || after.clone())? {
+                    // The event routes by them too: the kept copy is made
+                    // within the room taken for it.
+                    if this.keep_for_later(slot, key, Some(key), Cow::Borrowed(&after))? {
                         let routing = Routing {
                             before,
                             after: Cow::Owned(after),
@@ -1212,12 +1240,18 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
                     return Ok(());
                 }
                 if slot == Slot::Delivered {
-                    self.keep_for_later(slot, key, owned, Vec::new)?;
+                    self.keep_for_later(slot, key, unit_key, Cow::Borrowed(&[]))?;
                     return Ok(());
                 }
-                self.with_routing(slot, |this| {
+                // A run's key is copied into the event it is handed in.
+                let copied = if unit_key.is_some() {
+                    0
+                } else {
+                    key.len() as u64
+                };
+                self.with_routing(slot, copied, |this| {
                     let before = this.required_labels(key, "removal")?;
-                    if this.keep_for_later(slot, key, owned, Vec::new)? {
+                    if this.keep_for_later(slot, key, unit_key, Cow::Borrowed(&[]))? {
                         let routing = Routing {
                             before,
                             after: Cow::Borrowed(&[]),
@@ -1237,8 +1271,23 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
                     .is_some_and(|(pair, suffix)| suffix.is_none() && self.removed(pair));
                 // The pair's property record goes with the relationship.
                 if !part_of_removal && self.slot()? == Slot::Build {
-                    let target = edge_target(owned(key))?;
-                    self.hand(Action::Remove, target, None, None);
+                    if edgeprop_key(key).is_none() {
+                        return Err(ProjectionError::Malformed(
+                            "an edge property key of no known shape".into(),
+                        )
+                        .into());
+                    }
+                    // A run's key is copied into the event it is handed in.
+                    let copied = if unit_key.is_some() {
+                        0
+                    } else {
+                        key.len() as u64
+                    };
+                    self.with_lists(copied, |this| {
+                        if let Ok(target) = edge_target(owned(key)) {
+                            this.hand(Action::Remove, target, None, None);
+                        }
+                    });
                 }
                 Ok(())
             }
@@ -1271,7 +1320,7 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
                 if self.slot()? != Slot::Build {
                     return Ok(());
                 }
-                self.with_routing(Slot::Build, |this| {
+                self.with_routing(Slot::Build, 0, |this| {
                     let labels = this.required_labels(key, "document delta")?;
                     let routing = Routing {
                         before: labels.clone(),
@@ -2236,8 +2285,12 @@ pub(crate) fn event_heap_bytes(event: &LogicalEvent<'_>) -> u64 {
     note = "pass `Unencoded` for a reader that keeps the batch as it is read"
 )]
 pub trait ChangeEncoding {
-    /// Bytes the reader's form of `event` takes.
-    fn event(&mut self, event: &LogicalEvent<'_>) -> u64;
+    /// Bytes the reader's form of `event` takes. What the reader keeps to
+    /// build that form (names it looks up, say) is taken from `take` before
+    /// it is allocated, and stays charged for the read; `None` when `take`
+    /// refuses it, which ends the read there.
+    fn event(&mut self, event: &LogicalEvent<'_>, take: &mut dyn FnMut(u64) -> bool)
+    -> Option<u64>;
 
     /// Bytes the reader's form of a unit takes besides its events.
     fn unit(&mut self) -> u64;
@@ -2248,8 +2301,8 @@ pub trait ChangeEncoding {
 pub struct Unencoded;
 
 impl ChangeEncoding for Unencoded {
-    fn event(&mut self, _: &LogicalEvent<'_>) -> u64 {
-        0
+    fn event(&mut self, _: &LogicalEvent<'_>, _: &mut dyn FnMut(u64) -> bool) -> Option<u64> {
+        Some(0)
     }
 
     fn unit(&mut self) -> u64 {
@@ -2405,7 +2458,11 @@ pub(crate) fn unit_changes(
         let mut refused = false;
         let projected = unit.project_with(first, &mut room, |event, room| {
             if let Some(delivery) = interest.delivery(&event) {
-                let kept = event_heap_bytes(&event) + encoding.event(&event);
+                let Some(form) = encoding.event(&event, &mut |bytes| room.take(bytes)) else {
+                    refused = true;
+                    return Take::Enough;
+                };
+                let kept = event_heap_bytes(&event) + form;
                 if !grow_within(&mut taken, room) || !room.take(kept) {
                     refused = true;
                     return Take::Enough;

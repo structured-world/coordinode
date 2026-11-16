@@ -26,7 +26,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustc_hash::FxHashMap;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
@@ -401,13 +400,18 @@ fn read_with(
     let labels = match read.labels() {
         None => None,
         Some(ids) => {
-            let mut store = LabelNames::default();
+            let store = LocalSchemaStore::new(engine);
             let mut names = Vec::with_capacity(ids.len());
             for &id in ids {
                 let name = store
-                    .name(engine, id)
-                    .map_err(|e| Status::internal(format!("the catalog: {e}")))?;
-                names.push(name.to_owned());
+                    .label_name(id)
+                    .map_err(|e| Status::internal(format!("the catalog: {e}")))?
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "the cursor names label {id}, never bound"
+                        ))
+                    })?;
+                names.push(name);
             }
             Some(sorted(names))
         }
@@ -614,7 +618,6 @@ struct StreamState {
 async fn stream_consumer(mut s: StreamState) {
     // Counted while this task runs, whichever way it ends.
     let _open = OpenStream::count(&s.delivery);
-    let mut names = LabelNames::default();
     loop {
         // Client cancelled (channel closed).
         if s.delivery.is_closed() {
@@ -675,16 +678,17 @@ async fn stream_consumer(mut s: StreamState) {
             let hub = Arc::clone(&s.hub);
             let cursor = s.cursor.clone();
             let mut tailer = s.own_tailer.take();
-            let mut taken = std::mem::take(&mut names);
             let read_bytes = s.tuning.buffer_bytes as u64;
             tokio::task::spawn_blocking(move || {
                 let read = read_entries(&hub, &reader, &mut tailer, read_from, room, until)
                     .and_then(|(entries, next)| {
-                        // What one read holds, its batch and the batch's wire
-                        // form together: a unit larger than this goes out in
-                        // fragments, the cursor continuing inside it.
+                        // What one read holds, its batch, the label names it
+                        // needs and the batch's wire form together: a unit
+                        // larger than this goes out in fragments, the cursor
+                        // continuing inside it.
                         let budget = QueryBudget::new(read_bytes);
-                        let mut form = ProtoForm::new(&engine, &mut taken, &cursor);
+                        let mut names = ReadNames::default();
+                        let mut form = ProtoForm::new(&engine, &mut names, &cursor);
                         let (batch, charge) = engine.changes_of_entries_encoded(
                             &cursor,
                             entries.iter().map(|e| &**e),
@@ -693,22 +697,22 @@ async fn stream_consumer(mut s: StreamState) {
                             &mut form,
                         )?;
                         hub.passed(&reader, batch.cursor.position());
-                        let proto = batch_to_proto(&engine, &batch, &mut taken)?;
+                        let proto = batch_to_proto(&batch, &names)?;
                         // The wire form goes on alone, in the stream's slot.
                         let cursor = batch.cursor.clone();
-                        drop(batch);
+                        drop((batch, names));
                         drop(charge);
                         Ok((proto, cursor))
                     });
-                (read, taken, reader, tailer)
+                (read, reader, tailer)
             })
             .await
         };
-        let (read, kept) = match read {
-            Ok((read, kept, reader, tailer)) => {
+        let read = match read {
+            Ok((read, reader, tailer)) => {
                 s.reader = Some(reader);
                 s.own_tailer = tailer;
-                (read, kept)
+                read
             }
             Err(e) => {
                 s.delivery
@@ -717,7 +721,6 @@ async fn stream_consumer(mut s: StreamState) {
                 break;
             }
         };
-        names = kept;
         let (batch, next) = match read {
             Ok(read) => read,
             Err(e) => {
@@ -830,68 +833,111 @@ impl Drop for OpenStream {
     }
 }
 
-/// Label names a stream has resolved, kept for its later batches: an
-/// identity's name never changes, it is recorded once.
+/// The label names one read needs, each identity looked up once and kept
+/// for that read only, its room taken from the read before it is kept: the
+/// read's wire form takes its names from here, and they go with the read.
 #[derive(Default)]
-struct LabelNames(FxHashMap<LabelId, String>);
+struct ReadNames {
+    /// Identity records read, by identity: the name each label was created
+    /// under, as stored.
+    names: Vec<(LabelId, bytes::Bytes)>,
+    /// Whether the read's room holds a catalog lookup's working state.
+    looking_up: bool,
+}
 
-impl LabelNames {
-    /// The name `label` was created under.
-    fn name(&mut self, engine: &StorageEngine, label: LabelId) -> Result<&str, StorageError> {
-        let name = match self.0.entry(label) {
-            std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
-            std::collections::hash_map::Entry::Vacant(unknown) => {
-                let name = LocalSchemaStore::new(engine)
-                    .label_name(label)
-                    .map_err(|e| StorageError::Serialization(format!("label {label}: {e}")))?
-                    .ok_or_else(|| {
-                        StorageError::Serialization(format!("label {label} has no identity record"))
-                    })?;
-                unknown.insert(name)
-            }
+impl ReadNames {
+    /// The name `label` was created under, looked up in the catalog the
+    /// first time this read needs it; `None` when `take` refuses the room to
+    /// keep it.
+    fn resolve(
+        &mut self,
+        engine: &StorageEngine,
+        label: LabelId,
+        take: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<Option<&str>, StorageError> {
+        let at = match self.names.binary_search_by_key(&label, |(id, _)| *id) {
+            Ok(at) => return Ok(Some(name_of(label, &self.names[at].1)?)),
+            Err(at) => at,
         };
-        Ok(name.as_str())
+        let key = coordinode_core::schema::label_id::label_id_key(label);
+        if !self.looking_up {
+            // One point read of the catalog at a time: its working state,
+            // taken once for the read.
+            let hold = engine.scan_hold_bytes(
+                coordinode_storage::engine::partition::Partition::Schema,
+                key.len() as u64,
+            )?;
+            if !take(hold) {
+                return Ok(None);
+            }
+            self.looking_up = true;
+        }
+        if self.names.len() == self.names.capacity() {
+            let slot = core::mem::size_of::<(LabelId, bytes::Bytes)>();
+            let grown = self.names.capacity().max(2) * 2;
+            if !take((grown * slot) as u64) {
+                return Ok(None);
+            }
+            self.names.reserve_exact(grown - self.names.len());
+        }
+        let record = engine
+            .get(
+                coordinode_storage::engine::partition::Partition::Schema,
+                &key,
+            )?
+            .ok_or_else(|| {
+                StorageError::Serialization(format!("label {label} has no identity record"))
+            })?;
+        // The record the read returned is kept as it is, not copied.
+        if !take(record.len() as u64) {
+            return Ok(None);
+        }
+        name_of(label, &record)?;
+        self.names.insert(at, (label, record));
+        Ok(Some(name_of(label, &self.names[at].1)?))
     }
 
-    /// `label` on the wire: its identity and its name.
-    fn label(&mut self, engine: &StorageEngine, label: LabelId) -> Result<Label, StorageError> {
+    /// `label` on the wire: its identity and the name this read resolved.
+    fn label(&self, label: LabelId) -> Result<Label, StorageError> {
+        let name = self
+            .names
+            .binary_search_by_key(&label, |(id, _)| *id)
+            .map_err(|_| {
+                StorageError::Serialization(format!("label {label} was not resolved by the read"))
+            })
+            .and_then(|at| name_of(label, &self.names[at].1))?;
         Ok(Label {
             id: label.get(),
-            name: self.name(engine, label)?.to_owned(),
+            name: name.to_owned(),
         })
     }
 
-    fn labels(
-        &mut self,
-        engine: &StorageEngine,
-        labels: &[LabelId],
-    ) -> Result<Vec<Label>, StorageError> {
+    fn labels(&self, labels: &[LabelId]) -> Result<Vec<Label>, StorageError> {
         let mut out = Vec::with_capacity(labels.len());
         for &label in labels {
-            out.push(self.label(engine, label)?);
+            out.push(self.label(label)?);
         }
         Ok(out)
     }
+}
 
-    /// Bytes `label` takes on the wire; its slot alone for a label of no
-    /// name, whose conversion is refused.
-    fn label_bytes(&mut self, engine: &StorageEngine, label: LabelId) -> u64 {
-        let name = self.name(engine, label).map_or(0, str::len);
-        (core::mem::size_of::<Label>() + name) as u64
-    }
+/// The name an identity record holds.
+fn name_of(label: LabelId, record: &[u8]) -> Result<&str, StorageError> {
+    core::str::from_utf8(record)
+        .map_err(|e| StorageError::Serialization(format!("the name of label {label}: {e}")))
 }
 
 /// What the wire form of a batch takes, unit by unit and event by event,
 /// charged to the read with the events it is built from.
 struct ProtoForm<'a> {
     engine: &'a StorageEngine,
-    names: &'a mut LabelNames,
+    names: &'a mut ReadNames,
     /// The batch's cursor, charged with its first unit.
     cursor: u64,
 }
 
 impl<'a> ProtoForm<'a> {
-    fn new(engine: &'a StorageEngine, names: &'a mut LabelNames, cursor: &ChangeCursor) -> Self {
+    fn new(engine: &'a StorageEngine, names: &'a mut ReadNames, cursor: &ChangeCursor) -> Self {
         Self {
             engine,
             names,
@@ -907,46 +953,54 @@ impl feed::ChangeEncoding for ProtoForm<'_> {
         core::mem::size_of::<ChangeUnit>() as u64 + core::mem::take(&mut self.cursor)
     }
 
-    fn event(&mut self, event: &feed::LogicalEvent<'_>) -> u64 {
+    fn event(
+        &mut self,
+        event: &feed::LogicalEvent<'_>,
+        take: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<u64> {
         let (engine, names) = (self.engine, &mut *self.names);
-        let target = match &event.target {
-            feed::Target::Node(_) => 0,
-            feed::Target::Relationship { edge_type, .. } => edge_type.len() as u64,
+        let (target, label) = match &event.target {
+            feed::Target::Node(_) => (0, None),
+            feed::Target::Relationship { edge_type, .. } => (edge_type.len() as u64, None),
             // A relationship's type and instance, or an owner's key: no more
             // than the key holds.
             feed::Target::RelationshipProperties(key)
             | feed::Target::RelationshipInstance(key)
-            | feed::Target::BlobOwner(key) => key.len() as u64,
-            feed::Target::Scope { label, .. } | feed::Target::Label(label) => {
-                names.label_bytes(engine, *label)
-            }
+            | feed::Target::BlobOwner(key) => (key.len() as u64, None),
+            feed::Target::Scope { label, .. } | feed::Target::Label(label) => (0, Some(*label)),
         };
-        let labels: u64 = event.routing.as_ref().map_or(0, |routing| {
-            routing
-                .before
-                .iter()
-                .chain(routing.after.iter())
-                .map(|&label| names.label_bytes(engine, label))
-                .sum()
-        });
-        core::mem::size_of::<LogicalChange>() as u64
+        let routing = event
+            .routing
+            .iter()
+            .flat_map(|routing| routing.before.iter().chain(routing.after.iter()));
+        let mut bytes = core::mem::size_of::<LogicalChange>() as u64
             + event.payload.map_or(0, |payload| payload.len() as u64)
-            + target
-            + labels
+            + target;
+        for &label in label.iter().chain(routing) {
+            let name = match names.resolve(engine, label, take) {
+                Ok(Some(name)) => name.len(),
+                Ok(None) => return None,
+                // A label of no readable name: its conversion refuses the
+                // batch with the cause.
+                Err(_) => 0,
+            };
+            bytes += (core::mem::size_of::<Label>() + name) as u64;
+        }
+        Some(bytes)
     }
 }
 
-/// The batch a client receives for `batch`.
+/// The batch a client receives for `batch`, its labels named as the read
+/// resolved them.
 fn batch_to_proto(
-    engine: &StorageEngine,
     batch: &feed::ChangeBatch,
-    names: &mut LabelNames,
+    names: &ReadNames,
 ) -> Result<ChangeBatch, StorageError> {
     let mut units = Vec::with_capacity(batch.units.len());
     for unit in &batch.units {
         let mut events = Vec::with_capacity(unit.events.len());
         for event in &unit.events {
-            events.push(event_to_proto(engine, event, names)?);
+            events.push(event_to_proto(event, names)?);
         }
         units.push(ChangeUnit {
             commit_ts: unit.commit_ts,
@@ -965,9 +1019,8 @@ fn batch_to_proto(
 }
 
 fn event_to_proto(
-    engine: &StorageEngine,
     event: &feed::ChangeEvent,
-    names: &mut LabelNames,
+    names: &ReadNames,
 ) -> Result<LogicalChange, StorageError> {
     let malformed = |what: &str| StorageError::Serialization(format!("a change event's {what}"));
     let relationship = |key: &[u8]| -> Result<RelationshipTarget, StorageError> {
@@ -1014,16 +1067,14 @@ fn event_to_proto(
             logical_change::Target::Instance(relationship(key)?)
         }
         OwnedTarget::Scope { label, activation } => logical_change::Target::Scope(ScopeTarget {
-            label: Some(names.label(engine, *label)?),
+            label: Some(names.label(*label)?),
             activation: *activation,
         }),
         OwnedTarget::BlobOwner(key) => logical_change::Target::BlobOwner(key.clone()),
-        OwnedTarget::Label(label) => {
-            logical_change::Target::DroppedLabel(names.label(engine, *label)?)
-        }
+        OwnedTarget::Label(label) => logical_change::Target::DroppedLabel(names.label(*label)?),
     };
     let (labels_before, labels_after) = match &event.labels {
-        Some((before, after)) => (names.labels(engine, before)?, names.labels(engine, after)?),
+        Some((before, after)) => (names.labels(before)?, names.labels(after)?),
         None => (Vec::new(), Vec::new()),
     };
     Ok(LogicalChange {

@@ -60,38 +60,110 @@ fn open_engine(dir: &std::path::Path) -> (StorageEngine, Arc<TimestampOracle>) {
 /// implying many labels, each with the labels it had before, and a cursor
 /// before it: what a large import commits.
 fn large_unit(dir: &std::path::Path) -> (StorageEngine, ChangeCursor) {
-    let (engine, oracle) = open_engine(dir);
-    let start = engine.change_cursor_at_end(Interest::all()).unwrap();
-    let record = NodeRecord::with_labels(vec![label(3)])
-        .to_msgpack()
-        .expect("record");
-    let mut unit: Vec<Mutation> = (1..=NODES)
-        .map(|id| Mutation::Put {
-            partition: PartitionId::Node,
-            key: encode_node_key(0, NodeId::from_raw(id)),
-            value: record.clone(),
-        })
-        .collect();
-    unit.push(Mutation::Effects(UnitEffects {
+    let mut unit: Vec<Mutation> = (1..=NODES).map(put).collect();
+    // Many implied labels: each event routes by far more than its row
+    // stores, so a read holds events heavier than the rows it decoded.
+    unit.push(context(1..=NODES, Vec::new(), 40));
+    journal_with(dir, &unit)
+}
+
+/// A node record of the type label 3.
+fn put(id: u64) -> Mutation {
+    Mutation::Put {
+        partition: PartitionId::Node,
+        key: encode_node_key(0, NodeId::from_raw(id)),
+        value: NodeRecord::with_labels(vec![label(3)])
+            .to_msgpack()
+            .expect("record"),
+    }
+}
+
+/// The effect context of a unit changing `nodes`, each of type 3 before
+/// it, with the run of deletes at `runs`, type 3 implying `implied` labels.
+fn context(nodes: core::ops::RangeInclusive<u64>, runs: Vec<u32>, implied: u32) -> Mutation {
+    Mutation::Effects(UnitEffects {
         interpretation: EFFECTS_INTERPRETATION,
-        nodes: (1..=NODES)
+        nodes: nodes
             .map(|id| NodeBasis {
                 key: encode_node_key(0, NodeId::from_raw(id)),
                 labels: vec![label(3)],
             })
             .collect(),
-        // Many implied labels: each event routes by far more than its row
-        // stores, so a read holds events heavier than the rows it decoded.
+        runs,
         implications: vec![Implication {
             label: label(3),
-            implies: (4..44).map(label).collect(),
+            implies: (4..4 + implied).map(label).collect(),
         }],
         ..UnitEffects::new()
-    }));
+    })
+}
+
+/// An engine whose journal holds `unit`, and a cursor before it.
+fn journal_with(dir: &std::path::Path, unit: &[Mutation]) -> (StorageEngine, ChangeCursor) {
+    let (engine, oracle) = open_engine(dir);
+    let start = engine.change_cursor_at_end(Interest::all()).unwrap();
     engine
-        .commit_logged(&unit, oracle.next().as_raw(), Journal::Journal)
+        .commit_logged(unit, oracle.next().as_raw(), Journal::Journal)
         .unwrap();
     (engine, start)
+}
+
+/// Read from `start` within each of `limits`, refused or not, and assert
+/// the read held no more than its budget at any moment.
+fn holds_within(
+    engine: &StorageEngine,
+    start: &ChangeCursor,
+    limits: impl IntoIterator<Item = u64>,
+) {
+    for limit in limits {
+        let budget = QueryBudget::new(limit);
+        let (_, peak) = alloc_peak::peak_of(|| engine.read_changes(start, 16, &budget).map(|_| ()));
+        assert!(
+            peak as u64 <= limit,
+            "held {peak} bytes at once within a {limit}-byte budget"
+        );
+    }
+}
+
+/// Nodes the units changing nodes again write.
+const AGAIN: u64 = 200;
+
+/// Labels type 3 implies in the units changing nodes again: the lists a
+/// node's later change starts from are large.
+const IMPLIED: u32 = 400;
+
+/// A node changed again later in its unit keeps the labels its first change
+/// left for that later change: a read keeping them, each copy taken from
+/// its budget before it is made, holds its budget at every limit around
+/// where it starts to fit.
+#[test]
+fn a_node_changed_again_holds_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut unit: Vec<Mutation> = (1..=AGAIN).flat_map(|id| [put(id), put(id)]).collect();
+    unit.push(context(1..=AGAIN, Vec::new(), IMPLIED));
+    let (engine, start) = journal_with(dir.path(), &unit);
+    // Budgets from well below to past the least one the read succeeds in
+    // (210 976 bytes): fixed, so a change of the read does not move them.
+    holds_within(&engine, &start, (0..96).map(|step| 146_000 + step * 1024));
+}
+
+/// A run of deletes whose keys a later put of the unit changes again: the
+/// run's keys are copied only within the budget, kept for the later put.
+#[test]
+fn a_run_key_changed_again_holds_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = |id| encode_node_key(0, NodeId::from_raw(id));
+    let mut unit = vec![Mutation::RemoveRange {
+        partition: PartitionId::Node,
+        start: key(1),
+        end: key(AGAIN + 1),
+    }];
+    unit.extend((1..=AGAIN).map(put));
+    unit.push(context(1..=AGAIN, vec![0], IMPLIED));
+    let (engine, start) = journal_with(dir.path(), &unit);
+    // Budgets from well below to past the least one the read succeeds in
+    // (126 600 bytes): fixed, so a change of the read does not move them.
+    holds_within(&engine, &start, (0..96).map(|step| 62_000 + step * 1024));
 }
 
 /// A unit far larger than the read's budget is read in fragments, and the
@@ -109,11 +181,9 @@ fn a_read_stopping_inside_a_large_unit_holds_its_budget() {
             (unit.events.len(), unit.projected)
         })
     };
-    // The least budget the unit is read in, in part, at all.
-    let mut limit: u64 = 64 << 10;
-    while read(&QueryBudget::new(limit)).is_err() {
-        limit += limit / 8;
-    }
+    // Near the least budget the unit is read in, in part, at all: fixed, so
+    // a change of the read does not move the condition it is held to.
+    let limit: u64 = 9_222_996;
     let budget = QueryBudget::new(limit);
     let (read, peak) = alloc_peak::peak_of(|| read(&budget));
     let (events, projected) = read.expect("read");

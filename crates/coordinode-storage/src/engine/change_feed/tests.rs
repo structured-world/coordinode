@@ -769,8 +769,8 @@ fn a_readers_form_is_charged_with_the_events() {
     /// A form ten kilobytes an event.
     struct Heavy;
     impl ChangeEncoding for Heavy {
-        fn event(&mut self, _: &LogicalEvent<'_>) -> u64 {
-            10_000
+        fn event(&mut self, _: &LogicalEvent<'_>, _: &mut dyn FnMut(u64) -> bool) -> Option<u64> {
+            Some(10_000)
         }
         fn unit(&mut self) -> u64 {
             0

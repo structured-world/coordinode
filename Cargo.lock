@@ -1127,6 +1127,7 @@ version = "0.9.0"
 dependencies = [
  "async-trait",
  "axum",
+ "bytes",
  "bzip2-rs",
  "coordinode-auth",
  "coordinode-client",

@@ -791,16 +791,24 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
     };
     mgr.append(&entry).expect("append");
     mgr.flush().expect("flush");
-    // The smallest read the entry decodes within: what it leaves does not
-    // hold the 60 events.
+    // The smallest read a stream makes of the entry, its wire form and the
+    // label names it reads included: what it leaves does not hold the 60
+    // events.
     let start = f.cursor_at(0);
     let start =
         coordinode_storage::engine::change_feed::ChangeCursor::from_bytes(&start).expect("cursor");
     let buffer_bytes = (1..)
         .map(|step| step * 250)
         .find(|&bytes| {
+            let mut names = super::ReadNames::default();
             f.engine
-                .changes_of_entries(&start, [&entry], 1, &QueryBudget::new(bytes as u64))
+                .changes_of_entries_encoded(
+                    &start,
+                    [&entry],
+                    1,
+                    &QueryBudget::new(bytes as u64),
+                    &mut super::ProtoForm::new(&f.engine, &mut names, &start),
+                )
                 .is_ok()
         })
         .expect("a read the entry decodes within");
@@ -1220,6 +1228,174 @@ async fn a_label_dropped_and_created_again_is_another_label_on_the_wire() {
     assert_eq!(new_events[0].target, node(2));
     assert_eq!(new_events[0].labels_after, vec![wire(new)]);
     assert_ne!(wire(old), wire(new), "one name, two labels");
+}
+
+/// `count` labels bound in `engine` under names `width` bytes long.
+fn long_labels(
+    engine: &StorageEngine,
+    count: usize,
+    width: usize,
+) -> Vec<coordinode_core::schema::label_id::LabelId> {
+    let schemas = coordinode_modality::LocalSchemaStore::new(engine);
+    (0..count)
+        .map(|i| schemas.bind_label(&format!("L{i:0>width$}")).expect("bind"))
+        .collect()
+}
+
+/// A read's label names are kept only within the room taken for them: a
+/// name is looked up only when the read needs it, its record and its place
+/// are taken before they are kept, and a refusal keeps nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reads_label_names_take_their_room_first() {
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        empty_log(oplog_dir.path()),
+        Arc::new(|| 0),
+        None,
+        RegistryTuning::default(),
+    );
+    let labels = long_labels(&f.engine, 40, 1000);
+    // Room for about half of the names.
+    let mut left: u64 = 24_000
+        + f.engine
+            .scan_hold_bytes(Partition::Schema, 32)
+            .expect("hold");
+    let mut taken = 0u64;
+    let mut take = |bytes: u64| match left.checked_sub(bytes) {
+        Some(rest) => {
+            left = rest;
+            taken += bytes;
+            true
+        }
+        None => false,
+    };
+    let mut names = super::ReadNames::default();
+    let mut resolved = 0;
+    for &label in &labels {
+        match names.resolve(&f.engine, label, &mut take).expect("resolve") {
+            Some(name) => {
+                assert_eq!(name.len(), 1001);
+                resolved += 1;
+            }
+            None => break,
+        }
+    }
+    assert!(
+        resolved > 0 && resolved < labels.len(),
+        "{resolved} resolved"
+    );
+    assert_eq!(names.names.len(), resolved, "a refusal keeps nothing more");
+    let kept: u64 = names
+        .names
+        .iter()
+        .map(|(_, record)| record.len() as u64)
+        .sum::<u64>()
+        + (names.names.capacity()
+            * std::mem::size_of::<(coordinode_core::schema::label_id::LabelId, bytes::Bytes)>())
+            as u64;
+    assert!(kept <= taken, "keeps {kept} bytes, took {taken}");
+    // A name already resolved is not looked up or charged again.
+    let before = taken;
+    let again = names
+        .resolve(&f.engine, labels[0], &mut |bytes| {
+            taken += bytes;
+            true
+        })
+        .expect("resolve");
+    assert!(again.is_some());
+    assert_eq!(taken, before);
+}
+
+/// A stream following every label, whose nodes carry many labels of long
+/// names, goes out in many batches, each naming its labels from a cold
+/// lookup of its own read: every event arrives once, named right.
+#[tokio::test(flavor = "multi_thread")]
+async fn labels_are_named_on_every_batch_by_its_own_read() {
+    use coordinode_core::txn::proposal::{Implication, NodeBasis};
+    use coordinode_modality::SchemaStore as _;
+
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog");
+    let mut f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
+        Arc::new(|| 1),
+        None,
+        RegistryTuning::default(),
+    );
+    let labels = long_labels(&f.engine, 300, 500);
+    let names = coordinode_modality::LocalSchemaStore::new(&f.engine);
+    // One unit, a node of each label.
+    let key = |id: u64| encode_node_key(0, NodeId::from_raw(id));
+    let mut effects = UnitEffects::new();
+    let mut unit = Vec::new();
+    for (i, &label) in labels.iter().enumerate() {
+        let id = i as u64 + 1;
+        unit.push(Mutation::Put {
+            partition: PartitionId::Node,
+            key: key(id),
+            value: NodeRecord::with_labels(vec![label])
+                .to_msgpack()
+                .expect("record"),
+        });
+        effects.nodes.push(NodeBasis {
+            key: key(id),
+            labels: Vec::new(),
+        });
+        effects.implications.push(Implication {
+            label,
+            implies: Vec::new(),
+        });
+    }
+    effects.implications.sort_by_key(|i| i.label);
+    unit.push(Mutation::Effects(effects));
+    let frame =
+        coordinode_core::txn::frame::encode_unit(&unit, Timestamp::from_raw(1_000)).expect("frame");
+    mgr.append(&OplogEntry {
+        ts: 1_000,
+        term: 1,
+        index: 0,
+        shard: 0,
+        ops: vec![OplogOp::Unit { frame }],
+        is_migration: false,
+        pre_images: None,
+    })
+    .expect("append");
+    mgr.flush().expect("flush");
+    // Room for the unit's rows and some tens of its events and names a read.
+    f.service = f.service.with_tuning(super::CdcStreamTuning {
+        buffer_bytes: 256 << 10,
+        ..super::CdcStreamTuning::default()
+    });
+    let mut stream = f
+        .service
+        .subscribe(Request::new(register("named", strict())))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let mut batches = 0;
+    let mut events = Vec::new();
+    while events.len() < labels.len() {
+        let batch = next_batch(&mut stream, Duration::from_secs(5))
+            .await
+            .expect("a batch");
+        batches += 1;
+        events.extend(batch.units.into_iter().flat_map(|u| u.events));
+    }
+    assert!(batches > 2, "{batches} batches");
+    for (i, event) in events.iter().enumerate() {
+        let label = labels[i];
+        let name = names.label_name(label).expect("name").expect("bound");
+        assert_eq!(
+            event.labels_after,
+            vec![crate::proto::replication::cdc::Label {
+                id: label.get(),
+                name,
+            }]
+        );
+    }
 }
 
 fn checkpoint_of(registry: &ShardConsumerRegistry, id: &str) -> Option<u64> {
