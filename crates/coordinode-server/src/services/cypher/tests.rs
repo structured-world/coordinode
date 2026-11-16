@@ -3426,9 +3426,13 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
                 if *next == from {
                     break;
                 }
-                engine
-                    .persist()
-                    .expect("a filled store flushes into its reserve");
+                // A flush refused for room is the store full too: a write it
+                // admitted is not promised the room to flush.
+                match engine.persist() {
+                    Ok(()) => {}
+                    Err(e) if e.is_out_of_room() => return,
+                    Err(other) => panic!("a filled store's flush failed otherwise: {other:?}"),
+                }
             }
         }
     }
