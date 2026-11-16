@@ -1788,6 +1788,10 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
     use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs};
     let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
     let mut reached_by = Vec::new();
+    // Failures whose installation outcome is unknown: the table was written
+    // and its installation's sync failed, so whether it is installed is
+    // decided at the next install or the reopen.
+    let mut unknown_by: Vec<Partition> = Vec::new();
     for (partition, failed) in [Partition::Raft, Partition::Schema]
         .into_iter()
         .flat_map(|p| {
@@ -1837,6 +1841,14 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
                 break;
             }
             reached += 1;
+            if matches!(
+                first,
+                Err(StorageError::Engine(
+                    lsm_tree::Error::InstallOutcomeUnknown(_)
+                ))
+            ) {
+                unknown_by.push(partition);
+            }
             // A healthy disk from here; the second call must write again. The
             // proof that it did is the value surviving the power cut below.
             faults.clear();
@@ -1889,6 +1901,13 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
         assert!(
             reached(partition, FaultOp::SyncAll) + reached(partition, FaultOp::SyncData) > 0,
             "{partition:?}: no sync of a persist was failed: {reached_by:?}"
+        );
+        // A failed sync of the table itself is not an unknown installation:
+        // the sweep must also reach the failure after the table, whose retry,
+        // power cut and reopen above then resolve it.
+        assert!(
+            unknown_by.contains(&partition),
+            "{partition:?}: no persist failed with an unknown installation"
         );
     }
 }
