@@ -234,6 +234,50 @@ async fn the_snapshot_trigger_is_work_until_its_task_ends() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A dropped reply stream of `stream_append` releases its input even while
+/// no request is coming: the append service's input owns the disk room of
+/// the requests it took and the caller's admission, so a producer left
+/// waiting on it after the leader went away would hold both, and the Raft
+/// handle, for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_append_stream_releases_its_input() {
+    use std::task::Poll;
+
+    let (_dir, engine) = test_engine();
+    let node = RaftNode::single_node(engine).await.expect("bootstrap");
+    let (polled_tx, polled_rx) = tokio::sync::oneshot::channel::<()>();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut polled_tx = Some(polled_tx);
+    // Never yields: the leader opened the stream and sends nothing more.
+    let input =
+        futures_util::stream::poll_fn(
+            move |_cx| -> Poll<
+                Option<openraft::raft::AppendEntriesRequest<crate::storage::TypeConfig>>,
+            > {
+                // Held by the input until the producer drops it.
+                let _keepalive = &dropped_tx;
+                if let Some(tx) = polled_tx.take() {
+                    let _ = tx.send(());
+                }
+                Poll::Pending
+            },
+        );
+    let output = node.raft().stream_append(input);
+    tokio::time::timeout(std::time::Duration::from_secs(5), polled_rx)
+        .await
+        .expect("the producer polled its input")
+        .expect("polled");
+
+    drop(output);
+    let dropped = tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx).await;
+    assert!(
+        matches!(dropped, Ok(Err(_))),
+        "the producer kept its input after the reply stream was dropped"
+    );
+
+    node.shutdown().await.expect("shutdown");
+}
+
 /// A leader that is its own quorum never loses it: a write waiting on it
 /// longer than the lease is not answered as if the leadership were lost,
 /// though no other member ever acknowledges anything.

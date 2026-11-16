@@ -51,8 +51,10 @@ publish = false
 # for trees a journal already covers.
 lsm-tree = { package = "coordinode-lsm-tree", version = "7.6.0", default-features = false }
 
-# Consensus
-openraft = { version = "0.10", features = ["serde"] }
+# Consensus. Upstream main until a release carries the cancellation of an
+# abandoned stream_append producer and of a pending snapshot acquisition;
+# back to crates.io with that release.
+openraft = { git = "https://github.com/databendlabs/openraft", branch = "main", features = ["serde"] }
 
 # Full-text search.
 # default-features = false to drop `columnar-zstd-compression`, the only tantivy
