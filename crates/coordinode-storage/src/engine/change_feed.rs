@@ -918,6 +918,15 @@ impl ChangeCursor {
         self.within == Within::default()
     }
 
+    /// Whether this cursor reads the same stream as `earlier` (the same
+    /// history and interest) at or past its place.
+    #[must_use]
+    pub fn continues(&self, earlier: &Self) -> bool {
+        self.history == earlier.history
+            && self.interest == earlier.interest
+            && (self.next, self.within) >= (earlier.next, earlier.within)
+    }
+
     /// Whether this cursor is at the start of a unit: no part of the unit it
     /// stands at read.
     #[must_use]
@@ -1220,6 +1229,31 @@ pub struct ChangeBatch {
     pub units: Vec<UnitChanges>,
     /// Where the next read continues.
     pub cursor: ChangeCursor,
+    /// Where this read started: the units continue a reader that stood
+    /// there, and no other.
+    start: ChangeCursor,
+}
+
+impl ChangeBatch {
+    /// The batch a read from `start` handed over.
+    pub(crate) fn read_from(
+        start: ChangeCursor,
+        units: Vec<UnitChanges>,
+        cursor: ChangeCursor,
+    ) -> Self {
+        Self {
+            units,
+            cursor,
+            start,
+        }
+    }
+
+    /// The cursor this batch was read from: it continues a reader that
+    /// stood there.
+    #[must_use]
+    pub fn start(&self) -> &ChangeCursor {
+        &self.start
+    }
 }
 
 /// `event` of the unit at `position` as a reader receives it, reaching it

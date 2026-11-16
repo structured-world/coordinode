@@ -52,6 +52,18 @@ struct ProgressRecord {
     applied: Vec<u8>,
     /// Fragments staged of the transaction being received.
     staged: u32,
+    /// The transaction being received in fragments, and the ordinal its
+    /// next fragment starts at: what the next delivery must continue.
+    receiving: Option<Receiving>,
+}
+
+/// A transaction received in part: where it is, and the ordinal after the
+/// last one received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Receiving {
+    index: u64,
+    sub: u32,
+    through: u32,
 }
 
 impl ProgressRecord {
@@ -161,6 +173,7 @@ impl Database {
                 received: from.to_bytes(),
                 applied: from.to_bytes(),
                 staged: 0,
+                receiving: None,
             };
             txn.put(
                 Partition::Schema,
@@ -188,8 +201,9 @@ impl Database {
             .transpose()
     }
 
-    /// Apply `batch`, read from `from`, to projection `name` in one
-    /// transaction: `apply` runs for each whole transaction of the batch
+    /// Apply `batch` to projection `name` in one transaction, when it was
+    /// read from the cursor the projection received through: `apply` runs
+    /// for each whole transaction of the batch
     /// with the host's writes for it, and the projection's progress moves
     /// past the batch in the same commit. A transaction the batch delivers
     /// only the start or a middle of is staged here, with the progress
@@ -209,19 +223,20 @@ impl Database {
     /// # Errors
     ///
     /// [`DatabaseError::UnknownProjection`] for a name not started;
-    /// [`DatabaseError::ProjectionOutOfStep`] when `from` is not the
-    /// projection's received cursor; what `apply` returns; the commit's
-    /// errors, among them a conflict with another applier of the same
-    /// projection.
+    /// [`DatabaseError::ProjectionOutOfStep`] for a batch not read from the
+    /// projection's received cursor (a batch after a skipped one, one read
+    /// for another interest or history, one applied already) or whose
+    /// fragments do not continue the transaction being received, refused
+    /// before `apply` runs; what `apply` returns; the commit's errors, among
+    /// them a conflict with another applier of the same projection.
     pub fn apply_changes(
         &self,
         name: &str,
-        from: &ChangeCursor,
         batch: &ChangeBatch,
         mut apply: impl FnMut(&ProjectionTransaction<'_>, &UnitChanges) -> Result<(), DatabaseError>,
     ) -> Result<ProjectionProgress, DatabaseError> {
         let id = self.begin_transaction()?;
-        let applied = self.apply_in(id, name, from, batch, &mut apply);
+        let applied = self.apply_in(id, name, batch, &mut apply);
         self.finish(id, applied)?.progress()
     }
 
@@ -229,7 +244,6 @@ impl Database {
         &self,
         id: TransactionId,
         name: &str,
-        from: &ChangeCursor,
         batch: &ChangeBatch,
         apply: &mut impl FnMut(&ProjectionTransaction<'_>, &UnitChanges) -> Result<(), DatabaseError>,
     ) -> Result<ProgressRecord, DatabaseError> {
@@ -240,20 +254,50 @@ impl Database {
         let mut record = self
             .with_open_transaction(id, |txn| read_progress(txn, name))?
             .ok_or_else(|| DatabaseError::UnknownProjection(name.to_string()))?;
-        if record.received != from.to_bytes() {
+        // The cursor bytes bind the history, the interpretation, the
+        // interest and the place: equal bytes are the same continuation.
+        if record.received != batch.start().to_bytes() {
             return Err(out_of_step(
                 "the changes were read from another cursor than the one it received through",
             ));
+        }
+        if !batch.cursor.continues(batch.start()) {
+            return Err(out_of_step("the batch's cursor is of another stream"));
+        }
+        // Every fragment continues the one before, checked before the host
+        // runs: a refused batch leaves nothing to undo.
+        let mut receiving = record.receiving;
+        let mut last = None;
+        for unit in &batch.units {
+            let at = (unit.position.index, unit.position.sub);
+            if last.is_some_and(|before| at <= before) {
+                return Err(out_of_step("the batch's transactions are out of order"));
+            }
+            last = Some(at);
+            let expected = match receiving {
+                Some(r) if (r.index, r.sub) == at => r.through,
+                Some(_) => {
+                    return Err(out_of_step(
+                        "a transaction received in part does not continue",
+                    ));
+                }
+                None => 0,
+            };
+            if unit.first != expected {
+                return Err(out_of_step(
+                    "a fragment does not continue the transaction where it stopped",
+                ));
+            }
+            receiving = (!unit.completes_unit()).then_some(Receiving {
+                index: at.0,
+                sub: at.1,
+                through: unit.through,
+            });
         }
         let tx = ProjectionTransaction { db: self, id };
         let mut applied = ChangeCursor::from_bytes(&record.applied)
             .map_err(|e| DatabaseError::Other(format!("a stored projection cursor: {e}")))?;
         for unit in &batch.units {
-            if record.staged == 0 && unit.first != 0 {
-                return Err(out_of_step(
-                    "a transaction continues whose beginning it did not receive",
-                ));
-            }
             if !unit.completes_unit() {
                 // Received, not applied: kept until its last fragment.
                 let fragment = record.staged;
@@ -264,7 +308,7 @@ impl Database {
                 record.staged = fragment
                     .checked_add(1)
                     .ok_or_else(|| out_of_step("a transaction staged in over 2^32 fragments"))?;
-                applied = from.before_unit(unit.position);
+                applied = batch.start().before_unit(unit.position);
                 continue;
             }
             // The fragments staged before this last one, in order, one at a
@@ -291,6 +335,7 @@ impl Database {
             apply(&tx, unit)?;
         }
         record.received = batch.cursor.to_bytes();
+        record.receiving = receiving;
         if record.staged == 0 {
             applied = batch.cursor.clone();
         }

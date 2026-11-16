@@ -5051,10 +5051,7 @@ impl StorageEngine {
             ),
             None => ChangeCursor::new(cursor.history(), cursor.interest().clone(), read.next),
         };
-        Ok(ChangeBatch {
-            units,
-            cursor: next,
-        })
+        Ok(ChangeBatch::read_from(cursor.clone(), units, next))
     }
 
     /// The units of one entry for a change feed, read in place and appended

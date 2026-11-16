@@ -473,7 +473,7 @@ let start = source.change_cursor(&ChangeInterest::default())?;
 let progress = projection.start_projection("people", &start)?;
 let budget = QueryBudget::new(64 << 20);
 let page = source.read_changes(&progress.received, 256, &budget)?;
-let progress = projection.apply_changes("people", &progress.received, &page.batch, |tx, unit| {
+let progress = projection.apply_changes("people", &page.batch, |tx, unit| {
     for event in &unit.events {
         if let OwnedTarget::Node(_) = &event.target {
             // ...the projection's writes for this event.

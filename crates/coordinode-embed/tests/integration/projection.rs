@@ -78,7 +78,7 @@ fn effects_and_progress_commit_together_and_once() {
     let batch = read(&src, &start);
 
     // The host fails after writing one effect: none of it lands.
-    let failed = dst.apply_changes("people", &start, &batch, |tx, unit| {
+    let failed = dst.apply_changes("people", &batch, |tx, unit| {
         mirror(tx, unit)?;
         Err(DatabaseError::Other("the host stopped".into()))
     });
@@ -90,16 +90,14 @@ fn effects_and_progress_commit_together_and_once() {
         .expect("kept");
     assert_eq!(progress.applied, start);
 
-    let applied = dst
-        .apply_changes("people", &start, &batch, mirror)
-        .expect("apply");
+    let applied = dst.apply_changes("people", &batch, mirror).expect("apply");
     assert_eq!(applied.applied, batch.cursor);
     assert_eq!(applied.received, batch.cursor);
     assert!(!applied.has_staged());
     assert_eq!(seen(&mut dst), 2);
 
     // The same batch again: refused, nothing applied twice.
-    let again = dst.apply_changes("people", &start, &batch, mirror);
+    let again = dst.apply_changes("people", &batch, mirror);
     assert!(
         matches!(again, Err(DatabaseError::ProjectionOutOfStep { .. })),
         "{again:?}"
@@ -109,12 +107,11 @@ fn effects_and_progress_commit_together_and_once() {
     // Deletions follow from where it stands.
     run(&mut src, "MATCH (n:Person {name: 'a'}) DELETE n");
     let next = read(&src, &applied.received);
-    dst.apply_changes("people", &applied.received, &next, mirror)
-        .expect("apply");
+    dst.apply_changes("people", &next, mirror).expect("apply");
     assert_eq!(seen(&mut dst), 1);
 
     assert!(matches!(
-        dst.apply_changes("nobody", &start, &batch, mirror),
+        dst.apply_changes("nobody", &batch, mirror),
         Err(DatabaseError::UnknownProjection(_))
     ));
 }
@@ -201,7 +198,7 @@ fn a_transaction_in_fragments_takes_effect_whole() {
             // The host fails on the last fragment, after the staged ones were
             // handed to it: they stay staged, nothing takes effect, and the
             // same batch applies whole next.
-            let failed = dst.apply_changes("people", from, batch, |tx, unit| {
+            let failed = dst.apply_changes("people", batch, |tx, unit| {
                 mirror(tx, unit)?;
                 if unit.completes_unit() {
                     return Err(DatabaseError::Other("the host stopped".into()));
@@ -218,7 +215,7 @@ fn a_transaction_in_fragments_takes_effect_whole() {
             assert!(stands.has_staged());
         }
         let progress = dst
-            .apply_changes("people", from, batch, |tx, unit| {
+            .apply_changes("people", batch, |tx, unit| {
                 applied_calls.push((unit.first, unit.through));
                 mirror(tx, unit)
             })
@@ -239,4 +236,98 @@ fn a_transaction_in_fragments_takes_effect_whole() {
         covered = *through;
     }
     assert_eq!(covered, 40);
+}
+
+/// `projection`'s committed progress, which a refusal must leave as it was.
+fn stands(db: &Database, projection: &str) -> (ChangeCursor, ChangeCursor) {
+    let progress = db
+        .projection_progress(projection)
+        .expect("read")
+        .expect("kept");
+    (progress.received, progress.applied)
+}
+
+/// A batch that does not continue where the projection stands is refused
+/// before the host is called: one after a skipped batch, one read for
+/// another interest from the same place, and a fragment after a skipped
+/// fragment of the same transaction. Nothing is applied, staged or moved.
+#[test]
+fn a_batch_that_skips_or_reads_otherwise_is_refused() {
+    let src_dir = tempfile::tempdir().expect("tempdir");
+    let dst_dir = tempfile::tempdir().expect("tempdir");
+    let mut src = source(src_dir.path());
+    let mut dst = Database::open(dst_dir.path()).expect("open destination");
+    let start = src
+        .change_cursor(&ChangeInterest::default())
+        .expect("cursor");
+    dst.start_projection("people", &start).expect("start");
+
+    run(&mut src, "CREATE (:Person {name: 'a'})");
+    let first = read(&src, &start);
+    run(&mut src, "CREATE (:Person {name: 'b'})");
+    let second = read(&src, &first.cursor);
+    let refuses = |dst: &Database, batch: &ChangeBatch| {
+        let before = stands(dst, "people");
+        let mut called = false;
+        let refused = dst.apply_changes("people", batch, |_, _| {
+            called = true;
+            Ok(())
+        });
+        assert!(
+            matches!(refused, Err(DatabaseError::ProjectionOutOfStep { .. })),
+            "{refused:?}"
+        );
+        assert!(!called, "refused before the host is called");
+        assert_eq!(stands(dst, "people"), before);
+    };
+    // The second batch handed over as if it followed the start.
+    refuses(&dst, &second);
+    // The first batch, read for another interest.
+    let other = src
+        .change_cursor_at(
+            start.position(),
+            &ChangeInterest {
+                labels: Some(vec!["Person".into()]),
+                edge_types: None,
+            },
+        )
+        .expect("cursor");
+    refuses(&dst, &read(&src, &other));
+    assert_eq!(seen(&mut dst), 0);
+}
+
+/// A fragment after a skipped fragment of the same transaction is refused
+/// before the host is called, the fragments staged so far kept as they
+/// were.
+#[test]
+fn a_fragment_after_a_skipped_one_is_refused() {
+    let src_dir = tempfile::tempdir().expect("tempdir");
+    let dst_dir = tempfile::tempdir().expect("tempdir");
+    let mut src = source(src_dir.path());
+    let dst = Database::open(dst_dir.path()).expect("open destination");
+    let start = src
+        .change_cursor(&ChangeInterest::default())
+        .expect("cursor");
+    run(
+        &mut src,
+        "UNWIND range(1, 40) AS i CREATE (:Person {name: 'p' + toString(i)})",
+    );
+    let pieces = fragments(&src, src_dir.path(), &start, 2_000);
+    assert!(pieces.len() > 3, "{} pieces", pieces.len());
+    dst.start_projection("people", &start).expect("start");
+    dst.apply_changes("people", &pieces[0].1, mirror)
+        .expect("the first fragment");
+    let before = stands(&dst, "people");
+    // The third piece handed over in place of the second.
+    let mut called = false;
+    let refused = dst.apply_changes("people", &pieces[2].1, |_, _| {
+        called = true;
+        Ok(())
+    });
+    assert!(
+        matches!(refused, Err(DatabaseError::ProjectionOutOfStep { .. })),
+        "{refused:?}"
+    );
+    assert!(!called);
+    assert_eq!(stands(&dst, "people"), before);
 }
