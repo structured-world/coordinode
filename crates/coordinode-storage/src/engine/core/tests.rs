@@ -2323,6 +2323,155 @@ fn room_freed_while_a_failed_flush_registers_still_wakes_it() {
     );
 }
 
+/// A background flush whose disk fails at any of its operations keeps its
+/// sealed memtable; once the disk is healthy it runs again, and after the
+/// store's durability barrier a power cut leaves a store that opens whole,
+/// every row once. Swept over every operation a flush makes on the node
+/// tree's files. The node tree's flush syncs nothing itself (its durability
+/// is the barrier, `persist`), so a failed sync of an installation is the
+/// barrier's and is swept by the persist test above.
+#[test]
+fn a_background_flush_failed_at_any_step_keeps_its_rows_across_a_power_cut() {
+    use lsm_tree::AbstractTree;
+    use lsm_tree::fs::{CrashFs, Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs};
+    const LIMIT: u64 = 64 << 20;
+    const ROWS: u32 = 64;
+    let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
+    let key = |i: u32| format!("node:1:flushed{i:04}").into_bytes();
+    let mut reached = Vec::new();
+    for failed in [
+        FaultOp::SyncAll,
+        FaultOp::SyncData,
+        FaultOp::Write,
+        FaultOp::Flush,
+        FaultOp::Open,
+        FaultOp::Rename,
+    ] {
+        let mut failures = 0;
+        for k in 0.. {
+            let dir = TempDir::new().expect("temp dir");
+            let crash = Arc::new(CrashFs::new(StdFs));
+            let faults = Arc::new(FaultInjector::new());
+            let mut config = StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )
+                .with_hard_limit_bytes(LIMIT),
+            ]);
+            config.fs = Some(Arc::new(FaultFs::with_injector(
+                CrashFs::clone(&crash),
+                Arc::clone(&faults),
+            )));
+            let engine = StorageEngine::open(&config).expect("open");
+            // Every other tree flushed: the node tree's flush is the only one.
+            engine.persist().expect("persist");
+            for i in 0..ROWS {
+                engine
+                    .put(Partition::Node, &key(i), &[7; 512])
+                    .expect("put");
+            }
+            let footprints = engine.footprints().clone();
+            let (tx, failed_flush) = std::sync::mpsc::channel();
+            footprints.on_flush_failed(move || {
+                // A failure after the test stopped listening tells nobody.
+                if tx.send(()).is_err() {}
+            });
+
+            // Every matching operation on the node tree's files from the k-th
+            // on fails: a one-shot rule could be taken by another thread.
+            faults.arm(FaultRule::new(failed, refuse).on_path("node").skip(k));
+            let node = engine.tree(Partition::Node).expect("node tree");
+            node.rotate_memtable();
+            footprints.squeeze();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let failed_once = loop {
+                if failed_flush.try_recv().is_ok() {
+                    break true;
+                }
+                if node.sealed_memtable_count() == 0 {
+                    break false;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{failed:?} {k}: the flush neither failed nor ran"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            if !failed_once {
+                // The operation to fail lies past the last one a flush makes.
+                faults.clear();
+                break;
+            }
+            failures += 1;
+            assert_eq!(
+                node.sealed_memtable_count(),
+                1,
+                "{failed:?} {k}: the failed flush gave up its memtable"
+            );
+
+            // A healthy disk; the next pass of the monitor runs it again.
+            faults.clear();
+            footprints.squeeze();
+            await_flushed(node, "the failed flush never ran again on a healthy disk");
+            engine
+                .persist_partition(Partition::Node)
+                .expect("the barrier on a healthy disk");
+
+            // Power cut: nothing written from here on is durable, and every
+            // file falls back to its last sync.
+            for op in [
+                FaultOp::Open,
+                FaultOp::Write,
+                FaultOp::SyncAll,
+                FaultOp::SyncData,
+                FaultOp::Rename,
+            ] {
+                faults.arm(FaultRule::new(op, refuse));
+            }
+            drop(engine);
+            faults.clear();
+            crash.crash();
+
+            let engine = StorageEngine::open(&config).expect("reopen whole");
+            let rows = engine
+                .prefix_scan(Partition::Node, b"node:1:flushed")
+                .expect("scan")
+                .count();
+            assert_eq!(
+                rows, ROWS as usize,
+                "{failed:?} {k}: rows after the power cut, each once"
+            );
+            for i in 0..ROWS {
+                assert!(
+                    engine
+                        .get(Partition::Node, &key(i))
+                        .expect("read")
+                        .is_some(),
+                    "{failed:?} {k}: row {i} lost"
+                );
+            }
+        }
+        reached.push((failed, failures));
+    }
+    // A flush opens and writes its table's files and its installation's.
+    let count = |op: FaultOp| {
+        reached
+            .iter()
+            .find(|(o, _)| *o == op)
+            .map_or(0, |(_, n)| *n)
+    };
+    for op in [FaultOp::Open, FaultOp::Write] {
+        assert!(
+            count(op) > 0,
+            "no {op:?} of a flush was failed: {reached:?}"
+        );
+    }
+}
+
 /// A checkpoint refused for room leaves no partial checkpoint behind: its
 /// links would keep tables a compaction replaced, and its journal copy would
 /// keep its bytes, charged to a store that is already short of room.
