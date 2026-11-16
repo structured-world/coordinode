@@ -136,7 +136,9 @@ impl OperationCommand {
 /// Where in a log a unit was applied: its entry index and its place in the
 /// entry. [`LogPosition::LOCAL`] for a unit applied without a log, which is
 /// never delivered twice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub struct LogPosition {
     /// The log entry.
     pub index: u64,

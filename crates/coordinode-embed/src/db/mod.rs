@@ -4323,6 +4323,7 @@ mod index_builds;
 mod index_maintenance;
 mod interactive;
 mod package;
+mod projection;
 mod state_cut;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use blob::{BlobId, GroupMembers, UploadedBlob};
@@ -4344,6 +4345,7 @@ pub use package::{
     PackageConstraint, PublishedObject, Readiness, SchemaPackage, SchemaPublication,
     SchemaReadiness,
 };
+pub use projection::{ProjectionProgress, ProjectionTransaction};
 pub use state_cut::{CutBatch, CutHistory, CutPage, CutResume, CutRows, CutScope, StateCut};
 
 #[cfg(test)]

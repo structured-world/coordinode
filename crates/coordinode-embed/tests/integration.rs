@@ -55,6 +55,7 @@ mod integration {
     mod page_checksum;
     mod per_level_routing;
     mod procedures;
+    mod projection;
     mod retention;
     mod retype;
     mod schema;

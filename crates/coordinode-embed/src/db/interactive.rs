@@ -748,6 +748,29 @@ impl Database {
         self.interactive_idle_timeout
     }
 
+    /// Run `stage` on the storage transaction behind interactive transaction
+    /// `id`, acting for the host: records the engine keeps beside the
+    /// transaction's statements, committed or rolled back with them.
+    pub(crate) fn with_open_transaction<R>(
+        &self,
+        id: TransactionId,
+        stage: impl FnOnce(
+            &mut coordinode_storage::engine::transaction::Transaction<'_>,
+        ) -> Result<R, DatabaseError>,
+    ) -> Result<R, DatabaseError> {
+        let actor = host_actor(None);
+        let checked = self.interactive.check_out(&id, &actor, None)?;
+        let mut txn = coordinode_storage::engine::transaction::Transaction::resume(
+            &self.engine,
+            Some(&self.oracle),
+            checked.state,
+        );
+        let staged = stage(&mut txn);
+        let state = txn.take_state();
+        self.interactive.check_in(&id, state, checked.chain)?;
+        staged
+    }
+
     /// Run one statement of an interactive transaction.
     ///
     /// The statement reads at the transaction's pinned snapshot and its writes

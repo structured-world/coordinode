@@ -25,7 +25,7 @@ use coordinode_core::txn::proposal::{
 use rustc_hash::FxHashSet;
 
 /// What an event does to its target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     /// The target is replaced by the payload, or comes to exist.
     Put,
@@ -82,7 +82,7 @@ pub struct Routing<'u> {
 }
 
 /// How an event reaches a reader interested in some labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Delivery {
     /// Neither before nor after: the reader gets no data event.
     None,
@@ -911,6 +911,29 @@ impl ChangeCursor {
         self.within == Within::default()
     }
 
+    /// Whether this cursor is at the start of a unit: no part of the unit it
+    /// stands at read.
+    #[must_use]
+    pub fn at_unit_start(&self) -> bool {
+        self.within.ordinal == 0
+    }
+
+    /// This cursor's history and interest at the start of the unit at
+    /// `position`: where a reader that holds everything before that unit
+    /// continues.
+    #[must_use]
+    pub fn before_unit(&self, position: coordinode_core::txn::operation::LogPosition) -> Self {
+        Self::within(
+            self.history,
+            self.interest.clone(),
+            position.index,
+            Within {
+                sub: position.sub,
+                ordinal: 0,
+            },
+        )
+    }
+
     /// The history the cursor reads.
     #[must_use]
     pub fn history(&self) -> crate::engine::fixed_cut::CutHistory {
@@ -1064,7 +1087,7 @@ impl<'a> CursorReader<'a> {
 /// An event's identity: the unit it belongs to and its ordinal in the unit's
 /// projection. The same in every reader's delivery of it, whatever each
 /// filtered out, and in every read of it again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct EventId {
     /// The unit's journal entry and place in it.
     pub position: coordinode_core::txn::operation::LogPosition,
@@ -1074,7 +1097,7 @@ pub struct EventId {
 
 /// One event as a reader receives it: owned, with its identity and how it
 /// reaches the reader.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChangeEvent {
     /// Its identity in its history.
     pub id: EventId,
@@ -1083,6 +1106,7 @@ pub struct ChangeEvent {
     /// What it does it to.
     pub target: OwnedTarget,
     /// The replacement for a put, the delta for a patch.
+    #[serde(with = "serde_bytes")]
     pub payload: Option<Vec<u8>>,
     /// How it reaches this reader: enter, apply or leave its scope.
     pub delivery: Delivery,
@@ -1091,13 +1115,14 @@ pub struct ChangeEvent {
 }
 
 /// [`Target`] with its bytes owned.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OwnedTarget {
     /// A node's record or a temporal node's version: its node key.
-    Node(Vec<u8>),
+    Node(#[serde(with = "serde_bytes")] Vec<u8>),
     /// A relationship's presence.
     Relationship {
         /// The relationship type's name.
+        #[serde(with = "serde_bytes")]
         edge_type: Vec<u8>,
         /// The source node's id.
         source: u64,
@@ -1105,10 +1130,10 @@ pub enum OwnedTarget {
         target: u64,
     },
     /// The properties of a relationship: its edge property key.
-    RelationshipProperties(Vec<u8>),
+    RelationshipProperties(#[serde(with = "serde_bytes")] Vec<u8>),
     /// A relationship's version or discriminated instance: its edge property
     /// key.
-    RelationshipInstance(Vec<u8>),
+    RelationshipInstance(#[serde(with = "serde_bytes")] Vec<u8>),
     /// What a type implies, as one activation changed it.
     Scope {
         /// The type label.
@@ -1145,7 +1170,7 @@ impl From<&Target<'_>> for OwnedTarget {
 /// event of it in the ordinal range `[first, through)` the reader's interest
 /// takes, and the count of events its projection holds, so the reader can
 /// tell when it has all of the unit it asked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnitChanges {
     /// The unit's journal entry and place in it.
     pub position: coordinode_core::txn::operation::LogPosition,

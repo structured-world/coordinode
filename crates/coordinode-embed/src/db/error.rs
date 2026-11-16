@@ -300,6 +300,23 @@ pub enum DatabaseError {
     #[error("unknown transaction {0}")]
     UnknownTransaction(TransactionId),
 
+    /// Changes handed to a projection do not continue where it stands:
+    /// read from another cursor than its received one (a batch applied
+    /// already, or one after a gap), or starting inside a transaction whose
+    /// beginning it did not receive. Nothing was applied; read again from
+    /// the projection's received cursor.
+    #[error("projection {name}: {reason}")]
+    ProjectionOutOfStep {
+        /// The projection.
+        name: String,
+        /// How the changes do not continue it.
+        reason: String,
+    },
+
+    /// No projection of this name is kept here.
+    #[error("no projection named {0}")]
+    UnknownProjection(String),
+
     /// A transaction is open under this ID, or ended under it recently: an
     /// ID names one transaction, and a start never joins another. Nothing was
     /// done; a new transaction takes a newly drawn ID.

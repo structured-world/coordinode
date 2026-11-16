@@ -424,7 +424,7 @@ loop {
         }
     }
     let next = page.batch.cursor.clone();
-    if next.position() == cursor.position() {
+    if next == cursor {
         break;
     }
     cursor = next;
@@ -444,6 +444,62 @@ recorded without the context that says what it means, is
 `ChangeFeedUnsupported`; a first entry that does not fit the budget alone is
 `Budget`. On each the cursor stays valid. A member of a replicated group
 reads the group's log up to what it applied.
+
+A transaction with more events than one read holds is delivered in
+fragments: each `UnitChanges` covers the ordinals `first..through` of its
+transaction, `completes_unit()` tells the last one, and the cursor continues
+inside the transaction. Compare cursors, not positions, to tell whether a
+read moved.
+
+### Keeping a projection
+
+A projection kept in a database (the same one or another) can commit its
+effects and its progress through the feed together, so a crash leaves either
+the previous complete projection or the new one, never part of a
+transaction. `start_projection` records where it starts; `apply_changes`
+applies a batch in one transaction of the destination: the closure runs for
+each transaction of the batch with the host's writes for it, and the
+projection's progress moves past the batch in the same commit.
+
+```rust,no_run
+use coordinode_core::budget::QueryBudget;
+use coordinode_embed::Database;
+use coordinode_embed::changes::{ChangeInterest, OwnedTarget};
+
+# fn main() -> Result<(), coordinode_embed::DatabaseError> {
+let source = Database::open("/var/lib/myapp/graph")?;
+let projection = Database::open("/var/lib/myapp/projection")?;
+let start = source.change_cursor(&ChangeInterest::default())?;
+let progress = projection.start_projection("people", &start)?;
+let budget = QueryBudget::new(64 << 20);
+let page = source.read_changes(&progress.received, 256, &budget)?;
+let progress = projection.apply_changes("people", &progress.received, &page.batch, |tx, unit| {
+    for event in &unit.events {
+        if let OwnedTarget::Node(_) = &event.target {
+            // ...the projection's writes for this event.
+            tx.execute("CREATE (:Seen)", None)?;
+        }
+    }
+    Ok(())
+})?;
+// The next read starts here, in this process or after a restart.
+println!("next read from {:?}", progress.received);
+# Ok(())
+# }
+```
+
+The progress has two positions. `received` is where the next read starts.
+`applied` is past every change that has taken effect. They differ only while
+a transaction arrives in fragments: each fragment is staged in the
+destination as it is received, and the batch carrying the last one runs the
+closure for every staged fragment in order and then for the last, all in its
+one transaction. Until then the projection's state shows nothing of that
+transaction. A batch must be read from the projection's `received` cursor;
+one read from anywhere else, such as the same batch applied again, is
+refused as `ProjectionOutOfStep` with nothing applied. A failed closure or
+commit applies nothing, and the batch is applied again from the same cursor.
+A projection's progress is its own: it does not hold the source's journal,
+which follows its consumers' acknowledgements.
 
 ### Rebuilding after `RetentionLost`
 

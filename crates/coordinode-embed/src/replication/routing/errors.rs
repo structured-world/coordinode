@@ -125,6 +125,8 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::ForeignOperation { .. } => "ForeignOperation",
         E::Storage(_) => "Storage",
         E::Consumer(_) => "Consumer",
+        E::ProjectionOutOfStep { .. } => "ProjectionOutOfStep",
+        E::UnknownProjection(_) => "UnknownProjection",
         E::Other(_) => "Other",
         E::PeerUnreachable { .. } => "PeerUnreachable",
         E::PeerOutcomeUnknown { .. } => "PeerOutcomeUnknown",
@@ -663,6 +665,11 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
         // history, never routed as a statement: no routed command answers
         // with one, so it travels as text rather than as a case of its own.
         E::Consumer(e) => Kind::Other(text(e.to_string())),
+        // A projection is kept by the database applying it, never routed
+        // as a statement: these too travel as text.
+        e @ (E::ProjectionOutOfStep { .. } | E::UnknownProjection(_)) => {
+            Kind::Other(text(e.to_string()))
+        }
         E::Other(message) => Kind::Other(text(message)),
         // An ingress's own account of a member it reached; an executing
         // member routes nothing on, so these reach the wire only as text.
