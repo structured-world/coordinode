@@ -1000,7 +1000,7 @@ impl<'a> Transaction<'a> {
 
     /// Record that this transaction created the `STORAGE COLUMNAR` table
     /// `table`, its tree stamped `created_at`
-    /// ([`StorageEngine::columnar_table_created_at`]): its later rows go into
+    /// ([`StorageEngine::create_columnar_table_held`]): its later rows go into
     /// that tree, newer than its snapshot, and into no other made under the
     /// name.
     pub fn note_table_created(&mut self, table: &str, created_at: lsm_tree::SeqNo) {
