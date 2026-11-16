@@ -506,8 +506,33 @@ struct NodeSet {
     /// is closed instead of served.
     closed: bool,
     next: u64,
-    /// A control handle of each open node connection's socket.
-    live: std::collections::HashMap<u64, socket2::Socket>,
+    /// A control handle of each open node connection's socket, and its stop.
+    live: std::collections::HashMap<u64, (socket2::Socket, Arc<Stop>)>,
+}
+
+/// One node connection's stop: set by [`NodeConnections::close`], it ends
+/// the connection's reads, a read already waiting included. Shutting the
+/// socket down tells the peer, but does not wake a read waiting on it on
+/// every platform (Windows signals no readiness for its own SD_RECEIVE).
+#[derive(Default)]
+struct Stop {
+    stopped: core::sync::atomic::AtomicBool,
+    reader: futures_util::task::AtomicWaker,
+}
+
+impl Stop {
+    fn stop(&self) {
+        self.stopped
+            .store(true, core::sync::atomic::Ordering::Release);
+        self.reader.wake();
+    }
+
+    /// Whether the connection was stopped, with `cx` registered first to be
+    /// woken when it is, so a stop between the check and the read is seen.
+    fn stopped(&self, cx: &Context<'_>) -> bool {
+        self.reader.register(cx.waker());
+        self.stopped.load(core::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl NodeConnections {
@@ -520,7 +545,8 @@ impl NodeConnections {
             set.closed = true;
             core::mem::take(&mut set.live)
         };
-        for (_, socket) in live {
+        for (_, (socket, stop)) in live {
+            stop.stop();
             // A socket the peer closed already refuses; nothing is left then.
             if let Err(e) = socket.shutdown(std::net::Shutdown::Both) {
                 tracing::debug!(error = %e, "closing a node connection");
@@ -542,10 +568,12 @@ impl NodeConnections {
         }
         let id = set.next;
         set.next += 1;
-        set.live.insert(id, control);
+        let stop = Arc::new(Stop::default());
+        set.live.insert(id, (control, Arc::clone(&stop)));
         Ok(Some(NodeRegistration {
             set: self.clone(),
             id,
+            stop,
         }))
     }
 }
@@ -555,6 +583,7 @@ impl NodeConnections {
 pub struct NodeRegistration {
     set: NodeConnections,
     id: u64,
+    stop: Arc<Stop>,
 }
 
 impl Drop for NodeRegistration {
@@ -607,7 +636,12 @@ impl AsyncRead for InboundStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Node(s, _, _) => Pin::new(s).poll_read(cx, buf),
+            Self::Node(s, _, registration) => {
+                if registration.stop.stopped(cx) {
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionAborted)));
+                }
+                Pin::new(s).poll_read(cx, buf)
+            }
             Self::ClientTls(s, _) => Pin::new(s).poll_read(cx, buf),
             Self::ClientPlain(s, _) => Pin::new(s).poll_read(cx, buf),
         }
