@@ -464,6 +464,13 @@ struct EffectContext {
     removed_edges: std::collections::BTreeSet<Vec<u8>>,
     /// Set as the unit is sealed: the positions of its coalesced runs.
     runs: Vec<u32>,
+    /// What each type label a writer routed by implied, transitively.
+    implications: std::collections::BTreeMap<
+        coordinode_core::schema::label_id::LabelId,
+        Vec<coordinode_core::schema::label_id::LabelId>,
+    >,
+    /// Changes of what a type implies this attempt puts in force.
+    scope_changes: Vec<coordinode_core::txn::proposal::ScopeChange>,
 }
 
 impl EffectContext {
@@ -478,6 +485,12 @@ impl EffectContext {
             .into_iter()
             .collect();
         effects.runs = std::mem::take(&mut self.runs);
+        effects.implications = std::mem::take(&mut self.implications)
+            .into_iter()
+            .filter(|(_, implies)| !implies.is_empty())
+            .map(|(label, implies)| coordinode_core::txn::proposal::Implication { label, implies })
+            .collect();
+        effects.scope_changes = std::mem::take(&mut self.scope_changes);
         Mutation::Effects(effects)
     }
 }
@@ -1272,6 +1285,44 @@ impl<'a> Transaction<'a> {
             return;
         }
         self.effects.removed_edges.insert(key.to_vec());
+    }
+
+    /// Record what type label `label` implies, transitively (`implies`, its
+    /// own label left out), as the writer routing a node of it read the
+    /// catalog: the interpretation the change feed routes the attempt's node
+    /// effects by after the catalog changes. A type implying nothing is
+    /// recorded as such and sealed as nothing. The first record of a type
+    /// stands: a change of what it implies excludes the writers of the type,
+    /// so one attempt reads one.
+    pub fn note_implication(
+        &mut self,
+        label: coordinode_core::schema::label_id::LabelId,
+        implies: &[coordinode_core::schema::label_id::LabelId],
+    ) {
+        if self.implication_noted(label) {
+            return;
+        }
+        let held = (1 + implies.len()) * size_of::<coordinode_core::schema::label_id::LabelId>();
+        if self.admit_staged(STAGED_WRITE + held).is_err() {
+            return;
+        }
+        let mut implies = implies.to_vec();
+        implies.sort_unstable();
+        implies.dedup();
+        self.effects.implications.insert(label, implies);
+    }
+
+    /// Whether what `label` implies is recorded already: a writer need not
+    /// work it out again.
+    pub fn implication_noted(&self, label: coordinode_core::schema::label_id::LabelId) -> bool {
+        self.effects.implications.contains_key(&label)
+    }
+
+    /// Record that this attempt puts `change` in force: what a type implies
+    /// changes for every node of it, which the change feed delivers as one
+    /// scope change.
+    pub fn note_scope_change(&mut self, change: coordinode_core::txn::proposal::ScopeChange) {
+        self.effects.scope_changes.push(change);
     }
 
     /// The labels node `key` stored at this transaction's snapshot, none for
@@ -2695,7 +2746,7 @@ impl<'a> Transaction<'a> {
         // binding. Every unit changing application data carries it, empty or
         // not, so a reader tells a unit sealed under an interpretation from
         // one sealed before there was any.
-        if changes_application_data(&mutations) {
+        if changes_application_data(&mutations) || !self.effects.scope_changes.is_empty() {
             mutations.push(self.effects.seal());
         } else {
             self.effects = EffectContext::default();

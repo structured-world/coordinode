@@ -525,6 +525,10 @@ impl Shared {
                     withdraw_all(&mut refused);
                     continue;
                 }
+                if coupled && withdrawn.is_empty() {
+                    stage_scope_changes(env.engine(), &mut txn, labels, generation)
+                        .map_err(text)?;
+                }
                 stage_selection_conclusion(
                     env.engine(),
                     &mut txn,
@@ -655,6 +659,49 @@ fn stage_activation(
     // every stored node was proved against it: no scan at this commit.
     store.save_label_admitting_txn(txn, &schema)?;
     Ok(true)
+}
+
+/// Record, for the change feed, what the activation of the candidates of
+/// `labels` changes in the labels each type implies: one scope change for
+/// every type whose implied labels differ, the descendants of a changed type
+/// included, with what it implied before and after. No node is enumerated:
+/// a reader routes the change by the labels it names.
+fn stage_scope_changes(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
+    labels: &[String],
+    generation: GenerationId,
+) -> Result<(), StoreError> {
+    use crate::index::membership::CatalogMembership;
+    let Some(snapshot) = txn.snapshot() else {
+        return Err(StoreError::Invariant(
+            "an activation reads the catalog at no snapshot".to_string(),
+        ));
+    };
+    let mut before = CatalogMembership::at(engine, snapshot);
+    let mut activated = Vec::with_capacity(labels.len());
+    for label in labels {
+        if let Some(id) = before.label_id(label)? {
+            activated.push(id);
+        }
+    }
+    let mut after = CatalogMembership::at(engine, snapshot).with_candidates_of(activated);
+    // Every type is judged, not only the altered ones: a type implying an
+    // altered one, at any depth, changes with it. Identity records are never
+    // removed, so none is missed.
+    for (id, _) in LocalSchemaStore::new(engine).label_names()? {
+        let was = before.implied_by(id)?;
+        let is = after.implied_by(id)?;
+        if was != is {
+            txn.note_scope_change(coordinode_core::txn::proposal::ScopeChange {
+                label: id,
+                activation: generation.as_raw(),
+                before: was,
+                after: is,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Stage the withdrawal of the candidate `generation` of `label`, at the

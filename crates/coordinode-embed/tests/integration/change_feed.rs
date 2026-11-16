@@ -199,6 +199,7 @@ fn relationship_actions(units: &[UnitChanges]) -> Vec<Vec<(Action, &'static str)
                         OwnedTarget::RelationshipProperties(_) => "properties",
                         OwnedTarget::RelationshipInstance(_) => "instance",
                         OwnedTarget::Node(_) => "node",
+                        OwnedTarget::Scope { .. } => "scope",
                     };
                     (e.action, kind)
                 })
@@ -314,23 +315,120 @@ fn identities_hold_across_interests_and_reads() {
     );
 }
 
-/// A label a type implies is refused as an interest rather than followed
-/// by stored labels only, which would miss every node carrying it by
-/// implication.
+/// A reader of a label a type implies follows the nodes of that type, which
+/// carry the label without storing it, through every change of them.
 #[test]
-fn an_implied_label_is_refused_as_an_interest() {
+fn a_label_a_type_implies_follows_the_nodes_of_the_type() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = open(dir.path());
     run(
         &mut db,
         "CREATE NODE TYPE Manager IMPLIES (Person) WITH (name: STRING)",
     );
-    let refused = db.change_cursor(&interest(Some(&["Person"]), None));
-    assert!(
-        matches!(
-            refused,
-            Err(coordinode_embed::DatabaseError::Unsupported(_))
-        ),
-        "{refused:?}"
+    let mut person = db
+        .change_cursor(&interest(Some(&["Person"]), None))
+        .expect("cursor");
+    let mut org = db
+        .change_cursor(&interest(Some(&["Org"]), None))
+        .expect("cursor");
+    run(&mut db, "CREATE (:Manager {name: 'm'})");
+    run(&mut db, "MATCH (n:Manager) SET n.name = 'n'");
+    run(&mut db, "MATCH (n:Manager) DELETE n");
+    let person = events(&read_all(&db, &mut person));
+    assert_eq!(
+        node_deliveries(&person),
+        vec![
+            (Action::Put, Delivery::Apply),
+            (Action::Put, Delivery::Apply),
+            (Action::Remove, Delivery::Leave),
+        ],
+        "{person:?}"
+    );
+    assert!(events(&read_all(&db, &mut org)).is_empty());
+}
+
+/// The scope changes one reader receives: each one's type and activation,
+/// and how it delivers.
+fn scope_changes(events: &[ChangeEvent]) -> Vec<(u32, u64, Delivery)> {
+    events
+        .iter()
+        .filter_map(|e| match e.target {
+            OwnedTarget::Scope { label, activation } => {
+                assert_eq!(e.action, Action::ScopeChange);
+                Some((label.get(), activation, e.delivery))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Changing what a type implies is one scope change per type it moves, the
+/// types implying it included, delivered to readers of every label it gains
+/// or loses with no node written; each activation has its own identity, a
+/// change back included; and a node change is routed by the implication it
+/// was committed under, however the type has changed since it is read.
+#[test]
+fn a_change_of_what_a_type_implies_reaches_its_scopes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for ddl in [
+        "CREATE NODE TYPE Thing WITH (title: STRING)",
+        "CREATE NODE TYPE Task WITH (title: STRING)",
+        "CREATE NODE TYPE Chore IMPLIES (Task) WITH (title: STRING)",
+    ] {
+        run(&mut db, ddl);
+    }
+    run(&mut db, "CREATE (:Task {title: 'before'})");
+    let mut thing = db
+        .change_cursor(&interest(Some(&["Thing"]), None))
+        .expect("cursor");
+    let mut task = db
+        .change_cursor(&interest(Some(&["Task"]), None))
+        .expect("cursor");
+    run(&mut db, "ALTER NODE TYPE Task SET IMPLIES (Thing)");
+    run(&mut db, "CREATE (:Task {title: 'implied'})");
+    run(&mut db, "ALTER NODE TYPE Task SET IMPLIES ()");
+    run(&mut db, "CREATE (:Task {title: 'plain'})");
+    run(&mut db, "ALTER NODE TYPE Task SET IMPLIES (Thing)");
+
+    let thing = events(&read_all(&db, &mut thing));
+    let scopes = scope_changes(&thing);
+    // Task and Chore move together on each of the three activations.
+    assert_eq!(scopes.len(), 6, "{thing:?}");
+    let deliveries: Vec<Delivery> = scopes.iter().map(|s| s.2).collect();
+    assert_eq!(
+        deliveries,
+        [
+            Delivery::Enter,
+            Delivery::Enter,
+            Delivery::Leave,
+            Delivery::Leave,
+            Delivery::Enter,
+            Delivery::Enter
+        ]
+    );
+    let mut activations: Vec<u64> = scopes.iter().map(|s| s.1).collect();
+    activations.dedup();
+    assert_eq!(activations.len(), 3, "one identity per activation");
+    assert!(activations[0] != activations[2], "a change back is another");
+    // The one Task written while it implied Thing, routed as committed.
+    assert_eq!(
+        node_deliveries(&thing),
+        vec![(Action::Put, Delivery::Apply)],
+        "{thing:?}"
+    );
+
+    // A reader of the type itself: the type is in its scope before and
+    // after, so each change applies.
+    let task = events(&read_all(&db, &mut task));
+    let task_scopes = scope_changes(&task);
+    assert_eq!(task_scopes.len(), 6, "{task:?}");
+    assert!(task_scopes.iter().all(|s| s.2 == Delivery::Apply));
+    assert_eq!(
+        scope_changes(&task)[..2],
+        scopes[..2]
+            .iter()
+            .map(|s| (s.0, s.1, Delivery::Apply))
+            .collect::<Vec<_>>()[..]
     );
 }

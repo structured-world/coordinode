@@ -615,6 +615,149 @@ async fn stream_sends_only_applied_entries() {
     );
 }
 
+/// A subscription to a label a type implies receives a node of the type by
+/// the implication its unit committed under, and a change of what the type
+/// implies as one scope event naming the type, its activation and the
+/// labels before and after; a subscription to an unrelated label receives
+/// neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_label_a_type_implies_receives_its_nodes_and_scope_changes() {
+    use crate::proto::replication::cdc::{ChangeAction, ChangeDelivery};
+    use coordinode_core::txn::proposal::{Implication, NodeBasis, ScopeChange};
+    use coordinode_modality::SchemaStore as _;
+
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let applied = Arc::new(AtomicU64::new(2));
+    let frontier = Arc::clone(&applied);
+    // The log is written after the fixture binds the labels it names.
+    let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog");
+    let f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
+        Arc::new(move || frontier.load(Ordering::Acquire)),
+        None,
+        RegistryTuning::default(),
+    );
+    let schemas = coordinode_modality::LocalSchemaStore::new(&f.engine);
+    // Other is bound for the unrelated subscription, and stored by no node.
+    let [task, thing, _other] =
+        ["Task", "Thing", "Other"].map(|name| schemas.bind_label(name).expect("bind"));
+
+    // A Task written while Task implies Thing.
+    let key = encode_node_key(0, NodeId::from_raw(1));
+    let record = NodeRecord::with_labels(vec![task])
+        .to_msgpack()
+        .expect("record");
+    let mut written = UnitEffects::new();
+    written.nodes.push(NodeBasis {
+        key: key.clone(),
+        labels: vec![task],
+    });
+    written.implications.push(Implication {
+        label: task,
+        implies: vec![thing],
+    });
+    // Task stops implying Thing.
+    let mut altered = UnitEffects::new();
+    altered.scope_changes.push(ScopeChange {
+        label: task,
+        activation: 77,
+        before: vec![thing],
+        after: Vec::new(),
+    });
+    for (index, mutations) in [
+        vec![
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key,
+                value: record,
+            },
+            Mutation::Effects(written),
+        ],
+        vec![Mutation::Effects(altered)],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ts = 1_000 + index as u64;
+        let frame = coordinode_core::txn::frame::encode_unit(&mutations, Timestamp::from_raw(ts))
+            .expect("frame");
+        mgr.append(&OplogEntry {
+            ts,
+            term: 1,
+            index: index as u64,
+            shard: 0,
+            ops: vec![OplogOp::Unit { frame }],
+            is_migration: false,
+            pre_images: None,
+        })
+        .expect("append");
+    }
+    mgr.flush().expect("flush");
+
+    let subscribe = |id: &str, label: &str| SubscribeRequest {
+        cursor: f
+            .engine
+            .change_cursor_at(
+                0,
+                Interest::new(
+                    Some(vec![schemas.label_id(label).expect("id").expect("bound")]),
+                    Some(Vec::new()),
+                ),
+            )
+            .expect("cursor")
+            .to_bytes(),
+        interest: Some(ChangeInterest {
+            labels: Some(NameList {
+                names: vec![label.to_string()],
+            }),
+            edge_types: Some(NameList { names: Vec::new() }),
+        }),
+        ..register(id, strict())
+    };
+    let mut implied = f
+        .service
+        .subscribe(Request::new(subscribe("thing", "Thing")))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let mut events = Vec::new();
+    while let Some(batch) = next_batch(&mut implied, Duration::from_secs(5)).await {
+        events.extend(batch.units.into_iter().flat_map(|u| u.events));
+        if events.len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(matches!(
+        events[0].target,
+        Some(logical_change::Target::Node(_))
+    ));
+    assert_eq!(events[0].delivery, ChangeDelivery::Apply as i32);
+    assert_eq!(events[0].labels_after, ["Task", "Thing"]);
+    let Some(logical_change::Target::Scope(scope)) = &events[1].target else {
+        panic!("a scope change: {events:?}");
+    };
+    assert_eq!((scope.label.as_str(), scope.activation), ("Task", 77));
+    assert_eq!(events[1].action, ChangeAction::ScopeChange as i32);
+    assert_eq!(events[1].delivery, ChangeDelivery::Leave as i32);
+    assert_eq!(events[1].labels_before, ["Task", "Thing"]);
+    assert_eq!(events[1].labels_after, ["Task"]);
+
+    let mut unrelated = f
+        .service
+        .subscribe(Request::new(subscribe("other", "Other")))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let mut taken = 0;
+    while let Some(batch) = next_batch(&mut unrelated, Duration::from_millis(500)).await {
+        taken += batch.units.iter().map(|u| u.events.len()).sum::<usize>();
+    }
+    assert_eq!(taken, 0);
+}
+
 fn checkpoint_of(registry: &ShardConsumerRegistry, id: &str) -> Option<u64> {
     registry
         .list_consumers()

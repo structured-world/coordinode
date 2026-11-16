@@ -109,6 +109,10 @@ pub struct CatalogMembership<'a> {
     /// Whether a label's published candidate answers for it instead of the
     /// facts in force.
     candidates: bool,
+    /// Labels whose published candidate answers for them while every other
+    /// label's facts in force do: the interpretation one activation puts in
+    /// force, without a candidate of another one.
+    candidates_of: Vec<LabelId>,
     /// Where what the pass learns of the catalog is charged before it is
     /// kept, when it holds to a memory budget.
     budget: Option<&'a coordinode_core::budget::QueryBudget>,
@@ -153,7 +157,17 @@ impl<'a> CatalogMembership<'a> {
             implied: ImpliedCache::default(),
             ids: rustc_hash::FxHashMap::default(),
             candidates: false,
+            candidates_of: Vec::new(),
             budget: None,
+        }
+    }
+
+    /// The same view with the published candidates of `labels` put in force,
+    /// and only theirs.
+    pub fn with_candidates_of(self, labels: Vec<LabelId>) -> Self {
+        Self {
+            candidates_of: labels,
+            ..self
         }
     }
 
@@ -169,6 +183,7 @@ impl<'a> CatalogMembership<'a> {
             implied: ImpliedCache::default(),
             ids: rustc_hash::FxHashMap::default(),
             candidates: false,
+            candidates_of: Vec::new(),
             budget: None,
         }
     }
@@ -256,7 +271,8 @@ impl<'a> CatalogMembership<'a> {
         let store = LocalSchemaStore::new(self.engine);
         let (name, facts) = match self.view {
             CatalogView::Snapshot(snapshot) => {
-                store.implication_facts_at(snapshot, id, self.candidates, &mut charge)?
+                let candidate = self.candidates || self.candidates_of.contains(&id);
+                store.implication_facts_at(snapshot, id, candidate, &mut charge)?
             }
             CatalogView::KnownAt(known_at) => {
                 store.implication_facts_known_at(known_at, id, &mut charge)?
@@ -334,6 +350,24 @@ impl<'a> CatalogMembership<'a> {
             .implied
             .membership(stored)
             .unwrap_or_else(|| Membership::stored_only(stored)))
+    }
+
+    /// What type label `label` implies under the view, transitively, without
+    /// itself, in label order.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::of`].
+    pub fn implied_by(&mut self, label: LabelId) -> Result<Vec<LabelId>, StoreError> {
+        let stored = [label];
+        let mut implied: Vec<LabelId> = self
+            .of_stored(&stored)?
+            .iter()
+            .filter(|&l| l != label)
+            .collect();
+        implied.sort_unstable();
+        implied.dedup();
+        Ok(implied)
     }
 
     /// Whether `record` carries `label`.

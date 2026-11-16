@@ -92,6 +92,16 @@ fn effects_with(runs: Vec<u32>) -> Mutation {
             b"edgeprop:KNOWS:\0\0\0\0\0\0\0\x2a:\0\0\0\0\0\0\0\x2b:\x80\0\0\0\0\0\0\x01".to_vec(),
         ],
         runs,
+        implications: vec![crate::txn::proposal::Implication {
+            label: label(1),
+            implies: vec![label(2), label(70_000)],
+        }],
+        scope_changes: vec![crate::txn::proposal::ScopeChange {
+            label: label(1),
+            activation: u64::MAX,
+            before: vec![label(2)],
+            after: Vec::new(),
+        }],
     })
 }
 
@@ -785,8 +795,7 @@ fn an_effect_context_costs_little_beside_the_rows_it_describes() {
                 labels: vec![label(3), label(9)],
             })
             .collect(),
-        removed_edges: Vec::new(),
-        runs: Vec::new(),
+        ..UnitEffects::new()
     }));
     let bare = encode_proposal(&proposal(deletes)).expect("encode").len();
     let full = encode_proposal(&proposal(described.clone()))

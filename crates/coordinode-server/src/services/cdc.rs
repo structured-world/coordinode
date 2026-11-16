@@ -53,8 +53,8 @@ use crate::proto::replication::cdc::{
     AcknowledgeSubscriptionRequest, AcknowledgeSubscriptionResponse, CancelSubscriptionRequest,
     CancelSubscriptionResponse, ChangeAction, ChangeBatch, ChangeDelivery,
     ChangeInterest as ProtoInterest, ChangeUnit, ConsumerRetention, LogicalChange, NodeTarget,
-    RelationshipTarget, SubscribeRequest, change_stream_service_server::ChangeStreamService,
-    consumer_retention, logical_change,
+    RelationshipTarget, ScopeTarget, SubscribeRequest,
+    change_stream_service_server::ChangeStreamService, consumer_retention, logical_change,
 };
 
 /// One past the last Raft log entry this node has applied, `0` when none:
@@ -371,7 +371,6 @@ fn interest(engine: &StorageEngine, proto: Option<ProtoInterest>) -> Result<Inte
         .map_err(|e| Status::internal(format!("the catalog: {e}")))?;
     resolved.map_err(|refusal| match refusal {
         InterestRefusal::Unbound(_) => Status::invalid_argument(refusal.to_string()),
-        InterestRefusal::Implied(_) => Status::unimplemented(refusal.to_string()),
     })
 }
 
@@ -857,6 +856,16 @@ fn event_to_proto(
         OwnedTarget::RelationshipInstance(key) => {
             logical_change::Target::Instance(relationship(key)?)
         }
+        OwnedTarget::Scope { label, activation } => {
+            let label = names
+                .names(engine, &[*label])?
+                .pop()
+                .ok_or_else(|| malformed("scope label"))?;
+            logical_change::Target::Scope(ScopeTarget {
+                label,
+                activation: *activation,
+            })
+        }
     };
     let (labels_before, labels_after) = match &event.labels {
         Some((before, after)) => (names.names(engine, before)?, names.names(engine, after)?),
@@ -868,6 +877,7 @@ fn event_to_proto(
             feed::Action::Put => ChangeAction::Put,
             feed::Action::Patch => ChangeAction::Patch,
             feed::Action::Remove => ChangeAction::Remove,
+            feed::Action::ScopeChange => ChangeAction::ScopeChange,
         } as i32,
         target: Some(target),
         payload: event.payload.clone().unwrap_or_default(),

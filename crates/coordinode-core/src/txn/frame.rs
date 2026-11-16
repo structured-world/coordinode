@@ -30,8 +30,8 @@ use super::operation::{
     OperationId,
 };
 use super::proposal::{
-    DerivedIndexWork, DerivedSource, IndexBinding, Mutation, NodeBasis, PartitionId, ProposalId,
-    RaftProposal, UnitEffects,
+    DerivedIndexWork, DerivedSource, Implication, IndexBinding, Mutation, NodeBasis, PartitionId,
+    ProposalId, RaftProposal, ScopeChange, UnitEffects,
 };
 use super::timestamp::Timestamp;
 
@@ -56,6 +56,8 @@ const KIND_MASK: u8 = 0b111;
 const LABEL_BYTES: usize = core::mem::size_of::<crate::schema::label_id::LabelId>();
 /// Bytes a decoded run position holds.
 const RUN_BYTES: usize = core::mem::size_of::<u32>();
+/// Bytes a decoded activation identity holds.
+const ACTIVATION_BYTES: usize = core::mem::size_of::<u64>();
 
 /// The operation commands, as the byte after [`KIND_OPERATION`] numbers
 /// them.
@@ -434,11 +436,7 @@ impl<'a> Encoder<'a> {
         put_varint(effects.nodes.len() as u64, out);
         for basis in &effects.nodes {
             self.key(node, &basis.key, out);
-            put_varint(basis.labels.len() as u64, out);
-            for label in &basis.labels {
-                put_varint(u64::from(label.get()), out);
-            }
-            self.expanded += basis.labels.len() * LABEL_BYTES;
+            self.labels(&basis.labels, out);
         }
         let edge = usize::from(partition_number(PartitionId::EdgeProp));
         put_varint(effects.removed_edges.len() as u64, out);
@@ -450,6 +448,28 @@ impl<'a> Encoder<'a> {
             put_varint(u64::from(at), out);
         }
         self.expanded += effects.runs.len() * RUN_BYTES;
+        put_varint(effects.implications.len() as u64, out);
+        for implication in &effects.implications {
+            self.labels(core::slice::from_ref(&implication.label), out);
+            self.labels(&implication.implies, out);
+        }
+        put_varint(effects.scope_changes.len() as u64, out);
+        for change in &effects.scope_changes {
+            self.labels(core::slice::from_ref(&change.label), out);
+            put_varint(change.activation, out);
+            self.expanded += ACTIVATION_BYTES;
+            self.labels(&change.before, out);
+            self.labels(&change.after, out);
+        }
+    }
+
+    /// A list of label identities: its count, then each id.
+    fn labels(&mut self, labels: &[crate::schema::label_id::LabelId], out: &mut Vec<u8>) {
+        put_varint(labels.len() as u64, out);
+        for label in labels {
+            put_varint(u64::from(label.get()), out);
+        }
+        self.expanded += labels.len() * LABEL_BYTES;
     }
 
     /// [`Self::bytes`] for a slice encoded here rather than borrowed.
@@ -617,7 +637,21 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
                 // A position's varint takes at most one byte past the four it
                 // decodes to; the count is within the operation's overhead.
                 entries += 10 + effects.runs.len();
-                bytes + effects.runs.len() * RUN_BYTES
+                bytes += effects.runs.len() * RUN_BYTES;
+                // Each list of labels: its count, and a byte per id past the
+                // four it decodes to.
+                entries += 2 * 10;
+                for implication in &effects.implications {
+                    let labels = 1 + implication.implies.len();
+                    entries += 2 * 10 + labels;
+                    bytes += labels * LABEL_BYTES;
+                }
+                for change in &effects.scope_changes {
+                    let labels = 1 + change.before.len() + change.after.len();
+                    entries += 4 * 10 + labels + 2;
+                    bytes += labels * LABEL_BYTES + ACTIVATION_BYTES;
+                }
+                bytes
             }
         };
     }
@@ -1069,20 +1103,7 @@ impl<'a> Decoder<'a> {
         let mut nodes = Vec::with_capacity(count);
         for _ in 0..count {
             let key = self.key(node)?;
-            let labels = self.reader.len_at_most(self.limit, "label count")?;
-            if labels > self.reader.remaining() {
-                return Err(FrameError::Truncated { at: self.reader.at });
-            }
-            self.spend(labels * LABEL_BYTES)?;
-            let labels = (0..labels)
-                .map(|_| {
-                    let raw = self.reader.varint()?;
-                    u32::try_from(raw)
-                        .ok()
-                        .and_then(crate::schema::label_id::LabelId::new)
-                        .ok_or(FrameError::Effects("label id out of range"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let labels = self.labels()?;
             nodes.push(NodeBasis { key, labels });
         }
         let edge = usize::from(partition_number(PartitionId::EdgeProp));
@@ -1104,12 +1125,69 @@ impl<'a> Decoder<'a> {
                     .map_err(|_| FrameError::Effects("run position out of range"))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let count = self.reader.len_at_most(self.limit, "effect count")?;
+        if count > self.reader.remaining() / 2 {
+            return Err(FrameError::Truncated { at: self.reader.at });
+        }
+        let mut implications = Vec::with_capacity(count);
+        for _ in 0..count {
+            let label = self.label()?;
+            let implies = self.labels()?;
+            implications.push(Implication { label, implies });
+        }
+        let count = self.reader.len_at_most(self.limit, "effect count")?;
+        if count > self.reader.remaining() / 4 {
+            return Err(FrameError::Truncated { at: self.reader.at });
+        }
+        let mut scope_changes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let label = self.label()?;
+            let activation = self.reader.varint()?;
+            self.spend(ACTIVATION_BYTES)?;
+            let before = self.labels()?;
+            let after = self.labels()?;
+            scope_changes.push(ScopeChange {
+                label,
+                activation,
+                before,
+                after,
+            });
+        }
         Ok(UnitEffects {
             interpretation,
             nodes,
             removed_edges,
             runs,
+            implications,
+            scope_changes,
         })
+    }
+
+    /// A list of label identities [`Encoder::labels`] wrote, its count checked
+    /// against the bytes left before anything is allocated for it.
+    fn labels(&mut self) -> Result<Vec<crate::schema::label_id::LabelId>, FrameError> {
+        let count = self.reader.len_at_most(self.limit, "label count")?;
+        if count > self.reader.remaining() {
+            return Err(FrameError::Truncated { at: self.reader.at });
+        }
+        self.spend(count * LABEL_BYTES)?;
+        (0..count).map(|_| self.label_id()).collect()
+    }
+
+    /// A list of exactly one label identity: a label an entry is about.
+    fn label(&mut self) -> Result<crate::schema::label_id::LabelId, FrameError> {
+        match self.labels()?.as_slice() {
+            [label] => Ok(*label),
+            _ => Err(FrameError::Effects("an entry names not exactly one label")),
+        }
+    }
+
+    fn label_id(&mut self) -> Result<crate::schema::label_id::LabelId, FrameError> {
+        let raw = self.reader.varint()?;
+        u32::try_from(raw)
+            .ok()
+            .and_then(crate::schema::label_id::LabelId::new)
+            .ok_or(FrameError::Effects("label id out of range"))
     }
 
     fn issuer(&mut self) -> Result<IssuerId, FrameError> {

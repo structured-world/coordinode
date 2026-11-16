@@ -2551,18 +2551,28 @@ impl<'a> ExecutionContext<'a> {
     /// `SchemaViolation` for an implication cycle; a catalog read failure as
     /// it comes.
     pub fn compile_implied(&mut self, primary: LabelId) -> Result<(), ExecutionError> {
-        if self.labels.implied().implied(primary).is_some() {
-            return Ok(());
+        if self.labels.implied().implied(primary).is_none() {
+            let mut implied = std::mem::take(self.labels.implied_mut());
+            let compiled = implied.compile(primary, |label| self.label_facts(label));
+            *self.labels.implied_mut() = implied;
+            if let Err(e) = compiled? {
+                return Err(ExecutionError::SchemaViolation(
+                    self.describe_label_error(&e)?,
+                ));
+            }
         }
-        let mut implied = std::mem::take(self.labels.implied_mut());
-        let compiled = implied.compile(primary, |label| self.label_facts(label));
-        *self.labels.implied_mut() = implied;
-        match compiled? {
-            Ok(()) => Ok(()),
-            Err(e) => Err(ExecutionError::SchemaViolation(
-                self.describe_label_error(&e)?,
-            )),
+        // What the type implies is the interpretation the change feed routes
+        // this transaction's nodes of it by, after the catalog changes.
+        if !self.txn.implication_noted(primary) {
+            let implied: smallvec::SmallVec<[LabelId; 8]> = self
+                .labels
+                .implied()
+                .membership(&[primary])
+                .map(|m| m.iter().filter(|&l| l != primary).collect())
+                .unwrap_or_default();
+            self.txn.note_implication(primary, &implied);
         }
+        Ok(())
     }
 
     /// [`Self::label_facts`] under the candidate the label's schema carries,
@@ -4971,13 +4981,18 @@ impl<'a> ExecutionContext<'a> {
         operand: Vec<u8>,
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        if let Some(label) = self.schema_label_for_node(shard_id, node_id)?
-            && self.label_checks_writes(&label)?
-        {
-            self.txn
-                .note_post_state_check(&coordinode_core::graph::node::encode_node_key(
-                    shard_id, node_id,
-                ));
+        if let Some(label) = self.schema_label_for_node(shard_id, node_id)? {
+            // The delta is routed by the node's labels, its type's implied
+            // ones included.
+            if let Some(id) = self.label_id(&label)? {
+                self.compile_implied(id)?;
+            }
+            if self.label_checks_writes(&label)? {
+                self.txn
+                    .note_post_state_check(&coordinode_core::graph::node::encode_node_key(
+                        shard_id, node_id,
+                    ));
+            }
         }
         LocalNodeStore.buffer_node_delta(&mut self.txn, shard_id, node_id, operand)?;
         Ok(())

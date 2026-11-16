@@ -225,6 +225,37 @@ pub struct UnitEffects {
     /// (puts, deletes, merges and range removals), which a reader of rows
     /// keeps as they are. Ascending, all before the context.
     pub runs: Vec<u32>,
+    /// The labels each type label the unit routes by implied when it
+    /// committed, transitively, for each type implying any: the
+    /// interpretation the unit's node routing is read under, after the
+    /// catalog has changed. In label order.
+    pub implications: Vec<Implication>,
+    /// Changes of what a type implies the unit put in force: every node of
+    /// the type gains and loses labels without a row of its own changing.
+    pub scope_changes: Vec<ScopeChange>,
+}
+
+/// The labels a type label implies, transitively, without itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Implication {
+    /// The type label.
+    pub label: crate::schema::label_id::LabelId,
+    /// What it implies, in label order.
+    pub implies: Vec<crate::schema::label_id::LabelId>,
+}
+
+/// A change of what type `label` implies, put in force by one activation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeChange {
+    /// The type label.
+    pub label: crate::schema::label_id::LabelId,
+    /// The activation that put it in force: distinct for every change, a
+    /// change back to an earlier declaration included.
+    pub activation: u64,
+    /// What it implied before, transitively, in label order.
+    pub before: Vec<crate::schema::label_id::LabelId>,
+    /// What it implies after, transitively, in label order.
+    pub after: Vec<crate::schema::label_id::LabelId>,
 }
 
 impl UnitEffects {
@@ -235,12 +266,18 @@ impl UnitEffects {
             nodes: Vec::new(),
             removed_edges: Vec::new(),
             runs: Vec::new(),
+            implications: Vec::new(),
+            scope_changes: Vec::new(),
         }
     }
 
     /// Whether it says nothing beyond its interpretation.
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && self.removed_edges.is_empty() && self.runs.is_empty()
+        self.nodes.is_empty()
+            && self.removed_edges.is_empty()
+            && self.runs.is_empty()
+            && self.implications.is_empty()
+            && self.scope_changes.is_empty()
     }
 
     /// Approximate encoded size, for rate limiting and buffer accounting.
@@ -251,7 +288,17 @@ impl UnitEffects {
             .map(|n| n.key.len() + 1 + n.labels.len() * 4)
             .sum();
         let edges: usize = self.removed_edges.iter().map(|k| k.len() + 1).sum();
-        4 + nodes + edges + self.runs.len() * 4
+        let implications: usize = self
+            .implications
+            .iter()
+            .map(|i| 5 + i.implies.len() * 4)
+            .sum();
+        let scopes: usize = self
+            .scope_changes
+            .iter()
+            .map(|s| 14 + (s.before.len() + s.after.len()) * 4)
+            .sum();
+        4 + nodes + edges + self.runs.len() * 4 + implications + scopes
     }
 }
 

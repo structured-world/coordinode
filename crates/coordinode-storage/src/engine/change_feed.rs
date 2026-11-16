@@ -33,6 +33,10 @@ pub enum Action {
     Patch,
     /// The target ceases to exist.
     Remove,
+    /// What a type implies changed: every node of the type gains or loses
+    /// labels without a row of its own changing. A reader keeping state by
+    /// label reconciles the scope, or rebuilds it.
+    ScopeChange,
 }
 
 /// What an event changes. A key is the unit's own bytes, or owned when the
@@ -57,10 +61,18 @@ pub enum Target<'u> {
     /// One version or one discriminated instance of a relationship, its
     /// properties included: its edge property key.
     RelationshipInstance(Cow<'u, [u8]>),
+    /// The labels a type implies, as one activation changed them.
+    Scope {
+        /// The type label.
+        label: LabelId,
+        /// The activation, distinct for every change.
+        activation: u64,
+    },
 }
 
-/// The labels a node stored before and after its event: what routes the
-/// event to subscribers of a label.
+/// The labels a node carried before and after its event, its type's
+/// implied ones included: what routes the event to subscribers of a label.
+/// For a scope change, the type and what it implied before and after.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Routing<'u> {
     /// The labels it stored before the unit; none when it did not exist.
@@ -364,6 +376,31 @@ impl<'u> Projector<'u> {
             .map(|at| &nodes[at])
     }
 
+    /// Every label a node storing `stored` carries under the unit's
+    /// interpretation: its stored labels and what its type implied when the
+    /// unit committed.
+    fn carried(&self, stored: Cow<'u, [LabelId]>) -> Cow<'u, [LabelId]> {
+        let implications = &self.effects.implications;
+        let implied = stored.first().and_then(|primary| {
+            implications
+                .binary_search_by(|i| i.label.cmp(primary))
+                .ok()
+                .map(|at| &implications[at].implies)
+        });
+        match implied {
+            None => stored,
+            Some(implied) => {
+                let mut all = stored.into_owned();
+                for &label in implied {
+                    if !all.contains(&label) {
+                        all.push(label);
+                    }
+                }
+                Cow::Owned(all)
+            }
+        }
+    }
+
     /// The basis of a node whose change cannot state its own labels.
     fn required_basis(&self, key: &[u8], what: &str) -> Result<&'u NodeBasis, ProjectionError> {
         self.basis(key).ok_or_else(|| {
@@ -383,15 +420,13 @@ impl<'u> Projector<'u> {
             PartitionId::Node => {
                 let after = coordinode_core::graph::node::NodeRecord::labels_from_msgpack(value)
                     .map_err(|e| ProjectionError::Malformed(format!("a node record: {e}")))?;
+                let after = self.carried(Cow::Owned(after));
                 let before = match self.basis(key) {
-                    Some(basis) => Cow::Borrowed(basis.labels.as_slice()),
+                    Some(basis) => self.carried(Cow::Borrowed(basis.labels.as_slice())),
                     // Its labels are unchanged: the record states both.
-                    None => Cow::Owned(after.clone()),
+                    None => after.clone(),
                 };
-                let routing = Routing {
-                    before,
-                    after: Cow::Owned(after),
-                };
+                let routing = Routing { before, after };
                 let target = Target::Node(Cow::Borrowed(key));
                 self.emit(Action::Put, target, Some(value), Some(routing))
             }
@@ -433,7 +468,7 @@ impl<'u> Projector<'u> {
             PartitionId::Node => {
                 let basis = self.required_basis(&key, "removal")?;
                 let routing = Routing {
-                    before: Cow::Borrowed(basis.labels.as_slice()),
+                    before: self.carried(Cow::Borrowed(basis.labels.as_slice())),
                     after: Cow::Borrowed(&[]),
                 };
                 self.emit(Action::Remove, Target::Node(key), None, Some(routing))
@@ -463,10 +498,10 @@ impl<'u> Projector<'u> {
         match partition {
             PartitionId::Node => {
                 let basis = self.required_basis(key, "document delta")?;
-                let labels = basis.labels.as_slice();
+                let labels = self.carried(Cow::Borrowed(basis.labels.as_slice()));
                 let routing = Routing {
-                    before: Cow::Borrowed(labels),
-                    after: Cow::Borrowed(labels),
+                    before: labels.clone(),
+                    after: labels,
                 };
                 self.emit(
                     Action::Patch,
@@ -549,6 +584,29 @@ impl<'u> Projector<'u> {
                 },
                 None,
                 None,
+            )?;
+        }
+        // A change of what a type implies: one control for the whole type,
+        // routed to every label it reaches before or after, the type's own
+        // included, without a node of it enumerated.
+        for change in &effects.scope_changes {
+            let with_type = |implied: &[LabelId]| {
+                let mut all = Vec::with_capacity(implied.len() + 1);
+                all.push(change.label);
+                all.extend(implied.iter().copied().filter(|&l| l != change.label));
+                Cow::Owned(all)
+            };
+            self.emit(
+                Action::ScopeChange,
+                Target::Scope {
+                    label: change.label,
+                    activation: change.activation,
+                },
+                None,
+                Some(Routing {
+                    before: with_type(&change.before),
+                    after: with_type(&change.after),
+                }),
             )?;
         }
         Ok(())
@@ -721,7 +779,8 @@ impl Interest {
             Target::RelationshipProperties(key) | Target::RelationshipInstance(key) => {
                 edgeprop_key(key).map_or(&[][..], |((edge_type, _, _), _)| edge_type)
             }
-            Target::Node(_) => return Some(Delivery::Apply),
+            // Routed above: every node and scope event carries its labels.
+            Target::Node(_) | Target::Scope { .. } => return Some(Delivery::Apply),
         };
         let wanted = match &self.edge_types {
             None => true,
@@ -1000,6 +1059,13 @@ pub enum OwnedTarget {
     /// A relationship's version or discriminated instance: its edge property
     /// key.
     RelationshipInstance(Vec<u8>),
+    /// What a type implies, as one activation changed it.
+    Scope {
+        /// The type label.
+        label: LabelId,
+        /// The activation, distinct for every change.
+        activation: u64,
+    },
 }
 
 impl From<&Target<'_>> for OwnedTarget {
@@ -1017,6 +1083,10 @@ impl From<&Target<'_>> for OwnedTarget {
             },
             Target::RelationshipProperties(key) => Self::RelationshipProperties(key.to_vec()),
             Target::RelationshipInstance(key) => Self::RelationshipInstance(key.to_vec()),
+            Target::Scope { label, activation } => Self::Scope {
+                label: *label,
+                activation: *activation,
+            },
         }
     }
 }

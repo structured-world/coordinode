@@ -105,6 +105,9 @@ struct TtlTarget {
     /// The labels `label` implies, which every node of it carries without
     /// storing them, by name.
     implied: Vec<String>,
+    /// The same labels by identity: the interpretation a reaped node's change
+    /// is routed by.
+    implied_ids: Vec<LabelId>,
     /// The name of each label identity allocated when the pass began, to
     /// name the auxiliary labels a record stores.
     names: Arc<FxHashMap<LabelId, String>>,
@@ -113,6 +116,24 @@ struct TtlTarget {
 }
 
 impl TtlTarget {
+    /// Note what routes the change of `record`, read at `key`, for the change
+    /// feed: its stored labels, and what its type implies under the catalog
+    /// the pass read. The record read is the one changed, so the node store
+    /// need not read it again.
+    fn note_routing(
+        &self,
+        txn: &mut Transaction<'_>,
+        key: &[u8],
+        record: &NodeRecord,
+    ) -> Result<(), String> {
+        txn.note_node_basis(key, Some(&record.labels))
+            .map_err(|e| e.to_string())?;
+        if record.labels.first() == Some(&self.label_id) {
+            txn.note_implication(self.label_id, &self.implied_ids);
+        }
+        Ok(())
+    }
+
     /// Every label `record`, a node of this target's type, carries, by name;
     /// `None` when it stores a label allocated after the pass began, which
     /// leaves the row to the next pass rather than its entries behind.
@@ -451,8 +472,8 @@ fn discover_ttl_targets(
             .skip(1)
             .collect();
         let implied = implied_ids
-            .into_iter()
-            .map(|id| catalog.name_of(id))
+            .iter()
+            .map(|&id| catalog.name_of(id))
             .collect::<Result<Vec<String>, _>>()
             .map_err(|e| e.to_string())?;
         let key = match schema.key_columns() {
@@ -494,6 +515,7 @@ fn discover_ttl_targets(
                         RowKeyRelease::Unresolved => RowKeyRelease::Unresolved,
                     },
                     implied: implied.clone(),
+                    implied_ids: implied_ids.clone(),
                     names: Arc::clone(&names),
                     indexes: Arc::clone(&indexes),
                 });
@@ -1038,10 +1060,7 @@ fn stage_expired(
                 .stage_delete(engine, txn, node_id, record, carried.iter().copied())
                 .map_err(|e| e.to_string())?;
             stage_detach(txn, node_id, edge_types)?;
-            // The record read is the one removed: its labels route the
-            // removal, so the node store need not read it again.
-            txn.note_node_basis(key, Some(&record.labels))
-                .map_err(|e| e.to_string())?;
+            target.note_routing(txn, key, record)?;
             // Deleting through the node store states that the identity is
             // being destroyed, which excludes an edge attached to it before
             // this commit lands.
@@ -1061,10 +1080,7 @@ fn stage_expired(
                 return Ok(false);
             }
             let operand = removal_operand(record, target.anchor_field_id, &target.anchor_field)?;
-            // The record read is the one the delta lands on: its labels
-            // route the change, with no second read.
-            txn.note_node_basis(key, Some(&record.labels))
-                .map_err(|e| e.to_string())?;
+            target.note_routing(txn, key, record)?;
             txn.push_node_delta(key.to_vec(), operand)
                 .map_err(|e| e.to_string())?;
             result.fields_removed += 1;
@@ -1092,8 +1108,7 @@ fn stage_expired(
                 return Ok(false);
             }
             let operand = removal_operand(record, del_field_id, del_field_name)?;
-            txn.note_node_basis(key, Some(&record.labels))
-                .map_err(|e| e.to_string())?;
+            target.note_routing(txn, key, record)?;
             txn.push_node_delta(key.to_vec(), operand)
                 .map_err(|e| e.to_string())?;
             result.subtrees_removed += 1;

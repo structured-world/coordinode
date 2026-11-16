@@ -41,6 +41,7 @@ fn context(nodes: Vec<NodeBasis>, removed_edges: Vec<Vec<u8>>, runs: Vec<u32>) -
         nodes,
         removed_edges,
         runs,
+        ..UnitEffects::new()
     })
 }
 
@@ -94,6 +95,92 @@ fn shape<'u>(events: &[LogicalEvent<'u>]) -> Vec<(u32, Action, Target<'u>)> {
         .iter()
         .map(|e| (e.ordinal, e.action, e.target.clone()))
         .collect()
+}
+
+/// A node of a type that implied labels when its unit committed routes by
+/// them too: a put, a delta and a removal reach a subscriber of the implied
+/// label, by the unit's own interpretation, and a node of another type does
+/// not.
+#[test]
+fn a_node_routes_by_what_its_type_implied_at_commit() {
+    use coordinode_core::txn::proposal::Implication;
+    let implications = vec![Implication {
+        label: label(3),
+        implies: labels(&[7, 8]),
+    }];
+    let unit = vec![
+        put(PartitionId::Node, key(1), record(&[3])),
+        Mutation::Merge {
+            partition: PartitionId::Node,
+            key: key(2),
+            operand: b"delta".to_vec(),
+        },
+        delete(PartitionId::Node, key(4)),
+        put(PartitionId::Node, key(5), record(&[6])),
+        Mutation::Effects(UnitEffects {
+            interpretation: EFFECTS_INTERPRETATION,
+            nodes: vec![basis(2, &[3, 9]), basis(4, &[3])],
+            implications,
+            ..UnitEffects::new()
+        }),
+    ];
+    let events = project_unit(&unit).expect("project");
+    let delivered: Vec<Delivery> = events
+        .iter()
+        .map(|e| {
+            e.routing
+                .as_ref()
+                .expect("routing")
+                .delivery(|l| l == label(8))
+        })
+        .collect();
+    assert_eq!(
+        delivered,
+        [
+            Delivery::Apply,
+            Delivery::Apply,
+            Delivery::Leave,
+            Delivery::None
+        ]
+    );
+    // The stored labels stay first, the implied ones follow, each once.
+    let routing = events[1].routing.as_ref().expect("routing");
+    assert_eq!(routing.after.as_ref(), labels(&[3, 9, 7, 8]).as_slice());
+}
+
+/// A change of what a type implies is one scope event per type, at the
+/// context's position, routed by the type with what it implied before and
+/// after: entering a gained label, leaving a lost one, applying to the type.
+#[test]
+fn a_scope_change_is_one_event_routed_by_the_type() {
+    use coordinode_core::txn::proposal::ScopeChange;
+    let unit = vec![Mutation::Effects(UnitEffects {
+        interpretation: EFFECTS_INTERPRETATION,
+        scope_changes: vec![ScopeChange {
+            label: label(3),
+            activation: 41,
+            before: labels(&[7]),
+            after: labels(&[8]),
+        }],
+        ..UnitEffects::new()
+    })];
+    let events = project_unit(&unit).expect("project");
+    assert_eq!(
+        shape(&events),
+        vec![(
+            0,
+            Action::ScopeChange,
+            Target::Scope {
+                label: label(3),
+                activation: 41
+            }
+        )]
+    );
+    let routing = events[0].routing.as_ref().expect("routing");
+    assert_eq!(routing.delivery(|l| l == label(7)), Delivery::Leave);
+    assert_eq!(routing.delivery(|l| l == label(8)), Delivery::Enter);
+    assert_eq!(routing.delivery(|l| l == label(3)), Delivery::Apply);
+    assert_eq!(routing.delivery(|l| l == label(5)), Delivery::None);
 }
 
 /// A put whose labels did not change routes by its record before and after:

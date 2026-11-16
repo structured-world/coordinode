@@ -49,7 +49,6 @@ impl Database {
         .map_err(coordinode_query::executor::ExecutionError::from)?;
         resolved.map_err(|refusal| match refusal {
             InterestRefusal::Unbound(_) => DatabaseError::Semantic(refusal.to_string()),
-            InterestRefusal::Implied(_) => DatabaseError::Unsupported(refusal.to_string()),
         })
     }
 
@@ -58,7 +57,6 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// [`DatabaseError::Unsupported`] for a label a type implies;
     /// [`DatabaseError::Semantic`] for a label not bound; a catalog or log
     /// that cannot be read.
     pub fn change_cursor(&self, interest: &ChangeInterest) -> Result<ChangeCursor, DatabaseError> {

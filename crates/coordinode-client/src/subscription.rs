@@ -154,6 +154,10 @@ pub enum ChangeAction {
     Patch,
     /// The target ceases to exist.
     Remove,
+    /// What a type implies changed: its nodes enter and leave label scopes
+    /// with no node event of their own. A reader keeping state by label
+    /// reconciles the type's nodes, or rebuilds the scope.
+    ScopeChange,
     /// An action this driver does not know.
     Other(i32),
 }
@@ -203,6 +207,14 @@ pub enum ChangeTarget {
         relationship: Relationship,
         /// The version or discriminator, in its key encoding.
         instance: Vec<u8>,
+    },
+    /// A type whose implied labels changed: the event's labels before and
+    /// after name it and what it implied before and implies after.
+    Scope {
+        /// The type's name.
+        label: String,
+        /// The activation of the change, distinct for every change.
+        activation: u64,
     },
 }
 
@@ -278,6 +290,10 @@ impl ChangeEvent {
                     instance,
                 }
             }
+            logical_change::Target::Scope(s) => ChangeTarget::Scope {
+                label: s.label,
+                activation: s.activation,
+            },
         });
         Self {
             ordinal: event.ordinal,
@@ -285,6 +301,7 @@ impl ChangeEvent {
                 Ok(ProtoAction::Put) => ChangeAction::Put,
                 Ok(ProtoAction::Patch) => ChangeAction::Patch,
                 Ok(ProtoAction::Remove) => ChangeAction::Remove,
+                Ok(ProtoAction::ScopeChange) => ChangeAction::ScopeChange,
                 Ok(ProtoAction::Unspecified) | Err(_) => ChangeAction::Other(event.action),
             },
             target,

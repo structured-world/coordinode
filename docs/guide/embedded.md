@@ -378,7 +378,19 @@ scope, with the record written), `Apply`, or `Leave` (deleted, relabelled or
 retyped out of the scope). The labels before a deletion or relabelling come
 from the transaction itself, so a removal reaches its readers after the
 deleted record is gone. A reader of several labels gets each event once.
-A label some type implies is refused as an interest for now.
+
+A label a type implies is followed through the nodes of every type implying
+it: a node's labels in an event include its type's implied ones, as the type
+implied them when the change was committed, so a reader reading old changes
+after `ALTER NODE TYPE ... SET IMPLIES` routes them as they were. The change
+itself is one `ScopeChange` event per type whose implied labels it moves (a
+type implying the altered one included), with an `OwnedTarget::Scope` naming
+the type and the activation that put the change in force: `Enter` for a
+reader of a label the type comes to imply, `Leave` for one it stops
+implying, `Apply` for a reader of the type itself. No node event is written
+for the type's nodes. A reader keeping state by label reconciles the type's
+nodes once per activation, or rebuilds that scope; every activation has its
+own identity, a change back to an earlier declaration included.
 
 Each unit comes whole, with its position and commit timestamp, the events
 the interest takes and `projected`, the number of events the unit has in

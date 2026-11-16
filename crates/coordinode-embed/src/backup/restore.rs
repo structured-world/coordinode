@@ -1296,6 +1296,26 @@ fn write_node(
     for ((_, value), field_id) in props.into_iter().zip(ids.iter().copied()) {
         record.set(field_id, value);
     }
+    // What the type implies routes the node's change in the feed: bound once
+    // per type and commit, under the catalog the restore wrote before it. A
+    // label first bound by this commit has no declaration, and implies
+    // nothing.
+    if let Some(&primary) = record.labels.first()
+        && !txn.implication_noted(primary)
+    {
+        let declared = store
+            .label_name(primary)
+            .map_err(|e| RestoreError::Storage(e.to_string()))?
+            .is_some();
+        let implied = if declared {
+            coordinode_query::index::membership::CatalogMembership::current(target.engine)
+                .implied_by(primary)
+                .map_err(|e| RestoreError::Storage(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+        txn.note_implication(primary, &implied);
+    }
     let node_id = NodeId::from_raw(id);
     match valid_from {
         None => LocalNodeStore.put(txn, shard_id, node_id, &record),
