@@ -615,6 +615,97 @@ async fn stream_sends_only_applied_entries() {
     );
 }
 
+/// A transaction with more events than one read holds goes out in fragments
+/// covering consecutive ordinal ranges, every event once; a subscription
+/// started from the cursor of a fragment continues inside the transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog");
+    let record = NodeRecord::with_labels(Vec::new())
+        .to_msgpack()
+        .expect("record");
+    let mut mutations: Vec<Mutation> = (1..=60u64)
+        .map(|id| Mutation::Put {
+            partition: PartitionId::Node,
+            key: encode_node_key(0, NodeId::from_raw(id)),
+            value: record.clone(),
+        })
+        .collect();
+    mutations.push(Mutation::Effects(UnitEffects::new()));
+    let frame = coordinode_core::txn::frame::encode_unit(&mutations, Timestamp::from_raw(1_000))
+        .expect("frame");
+    mgr.append(&OplogEntry {
+        ts: 1_000,
+        term: 1,
+        index: 0,
+        shard: 0,
+        ops: vec![OplogOp::Unit { frame }],
+        is_migration: false,
+        pre_images: None,
+    })
+    .expect("append");
+    mgr.flush().expect("flush");
+    let mut f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
+        Arc::new(|| 1),
+        None,
+        RegistryTuning::default(),
+    );
+    // Room for a handful of events a read.
+    f.service = f.service.with_tuning(super::CdcStreamTuning {
+        buffer_bytes: 2_000,
+        ..super::CdcStreamTuning::default()
+    });
+
+    let mut stream = f
+        .service
+        .subscribe(Request::new(register("fragments", strict())))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let mut fragments = Vec::new();
+    let mut cursors = Vec::new();
+    let mut covered = 0;
+    while covered < 60 {
+        let batch = next_batch(&mut stream, Duration::from_secs(5))
+            .await
+            .expect("a fragment");
+        for unit in &batch.units {
+            assert_eq!(unit.projected, 60);
+            assert_eq!(unit.first_ordinal, covered, "consecutive ranges");
+            covered = unit.end_ordinal;
+            fragments.push(unit.clone());
+        }
+        cursors.push(batch.cursor);
+    }
+    assert!(fragments.len() > 2, "{} fragments", fragments.len());
+    let ordinals: Vec<u32> = fragments
+        .iter()
+        .flat_map(|u| u.events.iter().map(|e| e.ordinal))
+        .collect();
+    assert_eq!(ordinals, (0..60).collect::<Vec<_>>());
+
+    // A new subscription from the cursor after the first fragment starts
+    // where that fragment ended.
+    let mut resumed = f
+        .service
+        .subscribe(Request::new(SubscribeRequest {
+            cursor: cursors[0].clone(),
+            ..register("resumed", strict())
+        }))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let batch = next_batch(&mut resumed, Duration::from_secs(5))
+        .await
+        .expect("a fragment");
+    assert_eq!(batch.units[0].first_ordinal, fragments[0].end_ordinal);
+    assert_eq!(batch.units[0].events[0].ordinal, fragments[0].end_ordinal);
+}
+
 /// A subscription to a label a type implies receives a node of the type by
 /// the implication its unit committed under, and a change of what the type
 /// implies as one scope event naming the type, its activation and the

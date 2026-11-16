@@ -31,6 +31,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status};
 
+use coordinode_core::budget::QueryBudget;
 use coordinode_core::schema::label_id::LabelId;
 use coordinode_modality::change_interest::{InterestRefusal, resolve_change_interest};
 use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
@@ -190,7 +191,8 @@ pub struct CdcStreamTuning {
     pub batch_size: NonZeroUsize,
     /// Most bytes of log entries the streams' shared reader keeps in memory
     /// for streams that have not passed them yet (`cdc_buffer_bytes`); a
-    /// stream further behind reads from the log.
+    /// stream further behind reads from the log. It also bounds the events
+    /// one read of a stream holds: a larger unit is sent in fragments.
     pub buffer_bytes: usize,
 }
 
@@ -404,7 +406,7 @@ impl ChangeEventServiceImpl {
                     "the cursor was read with another interest than the request's",
                 ));
             }
-            Some(cursor.position())
+            Some(cursor)
         };
 
         let registry = self.registry.clone();
@@ -415,7 +417,11 @@ impl ChangeEventServiceImpl {
                 consumer_id,
                 kind: ConsumerKind::OplogEvents,
                 scope: TopologyScope::Shard(shard_id as u16),
-                initial_seqno: start.map_or(InitialSeqno::FromEarliestRetained, InitialSeqno::At),
+                initial_seqno: start
+                    .as_ref()
+                    .map_or(InitialSeqno::FromEarliestRetained, |c| {
+                        InitialSeqno::At(c.position())
+                    }),
                 retention,
             };
             let registry = registry.clone();
@@ -426,23 +432,23 @@ impl ChangeEventServiceImpl {
             blocking(move || registry.resume(&consumer_id, incarnation)).await?
         };
 
-        // Without a cursor a resumed stream starts where its registration
-        // stands; a registered one already started at the oldest retained
-        // entry, which is its checkpoint.
-        let from = match start {
-            Some(index) => index,
+        // A cursor continues where it stands, inside a transaction too.
+        // Without one a resumed stream starts where its registration stands;
+        // a registered one already started at the oldest retained entry,
+        // which is its checkpoint.
+        let cursor = match start {
+            Some(cursor) => cursor,
             None => {
                 let (registry, handle) = (registry.clone(), handle.clone());
-                blocking(move || registry.check_retention(&handle)).await?
+                let from = blocking(move || registry.check_retention(&handle)).await?;
+                self.engine
+                    .change_cursor_at(from, interest)
+                    .map_err(|e| Status::internal(format!("change cursor: {e}")))?
             }
         };
-        let cursor = self
-            .engine
-            .change_cursor_at(from, interest)
-            .map_err(|e| Status::internal(format!("change cursor: {e}")))?;
 
         let hub = self.hub()?;
-        let reader = hub.reader(from);
+        let reader = hub.reader(cursor.position());
         let incarnation = handle.incarnation();
         tokio::spawn(stream_consumer(StreamState {
             engine: Arc::clone(&self.engine),
@@ -605,14 +611,21 @@ async fn stream_consumer(mut s: StreamState) {
             let cursor = s.cursor.clone();
             let mut tailer = s.own_tailer.take();
             let mut taken = std::mem::take(&mut names);
+            let read_bytes = s.tuning.buffer_bytes as u64;
             tokio::task::spawn_blocking(move || {
                 let read = read_entries(&hub, &reader, &mut tailer, read_from, room, until)
                     .and_then(|(entries, next)| {
-                        let batch = engine.changes_of_entries(
+                        // The events one read holds: a unit larger than this
+                        // goes out in fragments, the cursor continuing inside
+                        // it.
+                        let budget = QueryBudget::new(read_bytes);
+                        let (batch, _events) = engine.changes_of_entries(
                             &cursor,
                             entries.iter().map(|e| &**e),
                             next,
+                            &budget,
                         )?;
+                        hub.passed(&reader, batch.cursor.position());
                         let proto = batch_to_proto(&engine, &batch, &mut taken)?;
                         Ok((proto, batch.cursor))
                     });
@@ -642,17 +655,21 @@ async fn stream_consumer(mut s: StreamState) {
             }
         };
         let read_to = next.position();
-        // Every entry read uses credit, whether or not it carried a unit.
-        let entries = read_to - read_from;
-        let caught_up = entries == 0;
-        // Applied entries left past the read: the room, not the log, ended it.
-        let more = read_to < until;
+        // A read stopped inside a transaction moves the cursor inside its
+        // entry, not past it.
+        let caught_up = next == s.cursor;
+        // Every entry read uses credit, whether or not it carried a unit; a
+        // fragment of one uses one.
+        let entries = (read_to - read_from).max(u64::from(!caught_up));
+        // Applied entries left past the read, or the rest of a transaction:
+        // the room, not the log, ended it.
+        let more = read_to < until || !next.at_entry_start();
         s.cursor = next;
         // Sending is not delivery: the registration moves only when the
         // client acknowledges. A batch whose entries carried no unit still
         // moves the cursor, so a client whose interest matches little can
         // acknowledge past them.
-        if entries > 0
+        if !caught_up
             && s.delivery
                 .send(
                     batch,
@@ -716,9 +733,11 @@ fn read_entries(
             Ok((entries, next))
         }
         HubRead::Behind(base) => {
+            // A tailer that has passed `position` is not reused: a read that
+            // stopped inside an entry reads that entry again.
             let tailer = match own_tailer {
-                Some(tailer) => tailer,
-                None => own_tailer.insert(hub.tailer_at(position)?),
+                Some(tailer) if tailer.next_index() == position => tailer,
+                _ => own_tailer.insert(hub.tailer_at(position)?),
             };
             let entries = tailer.read_next(max, &CdcFilters::default(), until.min(base))?;
             let next = tailer.next_index();
@@ -799,6 +818,8 @@ fn batch_to_proto(
             unit: unit.position.sub,
             projected: unit.projected,
             events,
+            first_ordinal: unit.first,
+            end_ordinal: unit.through,
         });
     }
     Ok(ChangeBatch {

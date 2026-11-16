@@ -4940,8 +4940,9 @@ impl StorageEngine {
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
         self.check_cursor_history(cursor)?;
-        let (read, charge) = self.change_read(cursor.position(), max_entries, budget)?;
-        Ok((Self::batch_of(cursor, &read)?, charge))
+        let (read, mut charge) = self.change_read(cursor.position(), max_entries, budget)?;
+        let batch = Self::batch_of(cursor, &read, &mut charge)?;
+        Ok((batch, charge))
     }
 
     /// [`Self::read_changes`] over the log segments in `dirs`, up to (not
@@ -4963,9 +4964,10 @@ impl StorageEngine {
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
         self.check_cursor_history(cursor)?;
-        let (read, charge) =
+        let (read, mut charge) =
             self.change_read_log(dirs, cursor.position(), until, max_entries, budget)?;
-        Ok((Self::batch_of(cursor, &read)?, charge))
+        let batch = Self::batch_of(cursor, &read, &mut charge)?;
+        Ok((batch, charge))
     }
 
     /// The batch a reader at `cursor` receives for `entries`, the log
@@ -4973,17 +4975,23 @@ impl StorageEngine {
     /// [`crate::oplog::tailer::OplogTailer::keeping_frames`]), read once for
     /// every reader, with `next` the position after the last of them. The
     /// entries are projected here for this reader's interest; a unit refused
-    /// by its operation binding has no events.
+    /// by its operation binding has no events. The events are charged to
+    /// `budget`, the batch stopping inside a unit when it is spent, and keep
+    /// their memory charged through the returned charge.
     ///
     /// # Errors
     ///
     /// As [`Self::read_changes`], for the units the entries carry.
-    pub fn changes_of_entries<'e>(
+    pub fn changes_of_entries<'e, 'b>(
         &self,
         cursor: &crate::engine::change_feed::ChangeCursor,
         entries: impl IntoIterator<Item = &'e crate::oplog::entry::OplogEntry>,
         next: u64,
-    ) -> StorageResult<crate::engine::change_feed::ChangeBatch> {
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::change_feed::ChangeBatch,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
         self.check_cursor_history(cursor)?;
         let mut units = Vec::new();
         let mut pool = crate::engine::fixed_cut::EntryPool::new(u64::MAX);
@@ -4996,10 +5004,13 @@ impl StorageEngine {
                     }
                 })?;
         }
-        Self::batch_of(
+        let mut charge = budget.empty_charge();
+        let batch = Self::batch_of(
             cursor,
             &crate::engine::change_feed::ChangeRead { units, next },
-        )
+            &mut charge,
+        )?;
+        Ok((batch, charge))
     }
 
     /// Refuse a cursor whose positions count another log than this store's.
@@ -5013,21 +5024,36 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// The batch `read` hands a reader at `cursor`.
+    /// The batch `read` hands a reader at `cursor`, its events charged to
+    /// `charge`: it stops inside a unit when the charge refuses an event, and
+    /// its cursor continues there.
     fn batch_of(
         cursor: &crate::engine::change_feed::ChangeCursor,
         read: &crate::engine::change_feed::ChangeRead,
+        charge: &mut coordinode_core::budget::MemoryCharge<'_>,
     ) -> StorageResult<crate::engine::change_feed::ChangeBatch> {
-        use crate::engine::change_feed::{
-            ChangeBatch, ChangeCursor, ProjectionError, unit_changes,
+        use crate::engine::change_feed::{ChangeBatch, ChangeCursor, ReadPlace, unit_changes};
+        let (units, stopped) = unit_changes(
+            &read.units,
+            cursor.interest(),
+            ReadPlace {
+                entry: cursor.position(),
+                within: cursor.within_entry(),
+            },
+            charge,
+        )?;
+        let next = match stopped {
+            Some(place) => ChangeCursor::within(
+                cursor.history(),
+                cursor.interest().clone(),
+                place.entry,
+                place.within,
+            ),
+            None => ChangeCursor::new(cursor.history(), cursor.interest().clone(), read.next),
         };
-        let units = unit_changes(&read.units, cursor.interest()).map_err(|e| match e {
-            ProjectionError::Unsupported(reason) => StorageError::ChangeFeedUnsupported { reason },
-            ProjectionError::Malformed(reason) => StorageError::Serialization(reason),
-        })?;
         Ok(ChangeBatch {
             units,
-            cursor: ChangeCursor::new(cursor.history(), cursor.interest().clone(), read.next),
+            cursor: next,
         })
     }
 

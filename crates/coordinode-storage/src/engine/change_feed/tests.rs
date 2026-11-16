@@ -541,3 +541,117 @@ fn ordinals_follow_the_units_order() {
     );
     assert_eq!(project_unit(&unit).expect("project"), first);
 }
+
+/// The place in entry 7 at unit `sub`, ordinal `ordinal`.
+fn at(sub: u32, ordinal: u32) -> ReadPlace {
+    ReadPlace {
+        entry: 7,
+        within: Within { sub, ordinal },
+    }
+}
+
+/// Two units of one entry, the first of `nodes` node puts, the second of one.
+fn entry_units(nodes: u64) -> Vec<ChangeUnit> {
+    use coordinode_core::txn::operation::LogPosition;
+    let unit = |sub: u32, ids: core::ops::RangeInclusive<u64>| ChangeUnit {
+        position: LogPosition { index: 7, sub },
+        commit_ts: 100 + u64::from(sub),
+        refused: false,
+        mutations: ids
+            .map(|id| put(PartitionId::Node, key(id), record(&[3])))
+            .chain([context(Vec::new(), Vec::new(), Vec::new())])
+            .collect(),
+    };
+    vec![unit(0, 1..=nodes), unit(1, 1000..=1000)]
+}
+
+/// The ordinals of `units`' events, by unit, and each unit's covered range.
+fn covered(units: &[UnitChanges]) -> Vec<(u32, u32, u32, Vec<u32>)> {
+    units
+        .iter()
+        .map(|u| {
+            (
+                u.position.sub,
+                u.first,
+                u.through,
+                u.events.iter().map(|e| e.id.ordinal).collect(),
+            )
+        })
+        .collect()
+}
+
+/// A read whose memory runs out inside a unit hands over a fragment and
+/// stops there; reads continuing from where it stopped deliver the rest in
+/// consecutive ranges, each event once, and the units after it whole.
+#[test]
+fn a_read_stops_inside_a_unit_and_continues_there() {
+    let units = entry_units(10);
+    let interest = Interest::all();
+    let whole = {
+        let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
+        let mut charge = budget.empty_charge();
+        let (whole, stopped) =
+            unit_changes(&units, &interest, at(0, 0), &mut charge).expect("read");
+        assert_eq!(stopped, None);
+        whole
+    };
+    // Room for the unit and a few of its events a read.
+    let event = whole[0].events.len();
+    let room = (core::mem::size_of::<UnitChanges>()
+        + 4 * core::mem::size_of::<ChangeEvent>()
+        + 4 * 64) as u64;
+    let mut from = at(0, 0);
+    let mut pieces = Vec::new();
+    for _ in 0..32 {
+        let budget = coordinode_core::budget::QueryBudget::new(room);
+        let mut charge = budget.empty_charge();
+        let (got, stopped) = unit_changes(&units, &interest, from, &mut charge).expect("read");
+        pieces.extend(got);
+        match stopped {
+            Some(next) => from = next,
+            None => break,
+        }
+    }
+    assert_eq!(event, 10);
+    let shape = covered(&pieces);
+    assert!(shape.len() > 2, "{shape:?}");
+    let mut next = 0;
+    for (sub, first, through, ordinals) in &shape[..shape.len() - 1] {
+        assert_eq!(*sub, 0);
+        assert_eq!(*first, next, "consecutive ranges: {shape:?}");
+        assert_eq!(*ordinals, (*first..*through).collect::<Vec<_>>());
+        next = *through;
+    }
+    assert_eq!(next, 10, "the first unit reaches its end");
+    assert_eq!(shape.last().expect("the second unit"), &(1, 0, 1, vec![0]));
+    let joined: Vec<ChangeEvent> = pieces
+        .iter()
+        .filter(|u| u.position.sub == 0)
+        .flat_map(|u| u.events.clone())
+        .collect();
+    assert_eq!(joined, whole[0].events);
+}
+
+/// A read starting inside an entry passes over the units before its place
+/// and starts its unit at its ordinal; a read that cannot keep one event
+/// refuses rather than hand over nothing.
+#[test]
+fn a_read_starts_at_its_place_inside_the_entry() {
+    let units = entry_units(5);
+    let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
+    let mut charge = budget.empty_charge();
+    let (got, _) = unit_changes(&units, &Interest::all(), at(0, 3), &mut charge).expect("read");
+    assert_eq!(
+        covered(&got),
+        vec![(0, 3, 5, vec![3, 4]), (1, 0, 1, vec![0])]
+    );
+    let (got, _) = unit_changes(&units, &Interest::all(), at(1, 0), &mut charge).expect("read");
+    assert_eq!(covered(&got), vec![(1, 0, 1, vec![0])]);
+
+    let tiny = coordinode_core::budget::QueryBudget::new(8);
+    let mut charge = tiny.empty_charge();
+    assert!(matches!(
+        unit_changes(&units, &Interest::all(), at(0, 0), &mut charge),
+        Err(crate::error::StorageError::Budget(_))
+    ));
+}

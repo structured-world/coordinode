@@ -838,34 +838,77 @@ const HISTORY_JOURNAL: u8 = 0;
 const HISTORY_GROUP: u8 = 1;
 
 /// Where a reader of the feed continues: the history it reads, the
-/// interpretation and interest it read under, and the next journal entry.
-/// Opaque to the reader; saved and handed back as bytes.
+/// interpretation and interest it read under, the next journal entry and,
+/// inside it, the next unit and event. Opaque to the reader; saved and
+/// handed back as bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeCursor {
     history: crate::engine::fixed_cut::CutHistory,
     interest: Interest,
     next: u64,
+    /// The first unit of entry `next` not wholly read, and the ordinal of its
+    /// first event not read: a read stopped inside a large unit continues
+    /// there. Both zero at the start of an entry.
+    within: Within,
+}
+
+/// Where a read starts or stopped: a journal entry and a place inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadPlace {
+    pub(crate) entry: u64,
+    pub(crate) within: Within,
+}
+
+/// A place inside one journal entry: a unit and an event ordinal of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Within {
+    pub(crate) sub: u32,
+    pub(crate) ordinal: u32,
 }
 
 impl ChangeCursor {
-    /// A cursor at `next` in `history`, for `interest`.
+    /// A cursor at the start of entry `next` in `history`, for `interest`.
     pub(crate) fn new(
         history: crate::engine::fixed_cut::CutHistory,
         interest: Interest,
         next: u64,
     ) -> Self {
+        Self::within(history, interest, next, Within::default())
+    }
+
+    /// A cursor inside entry `next`, at `within`.
+    pub(crate) fn within(
+        history: crate::engine::fixed_cut::CutHistory,
+        interest: Interest,
+        next: u64,
+        within: Within,
+    ) -> Self {
         Self {
             history,
             interest,
             next,
+            within,
         }
     }
 
     /// The journal entry the next read starts at: the position a flat
-    /// consumer acknowledges.
+    /// consumer acknowledges. Every entry before it is read whole; a read
+    /// stopped inside it has read part of it.
     #[must_use]
     pub fn position(&self) -> u64 {
         self.next
+    }
+
+    /// The unit and event ordinal inside [`Self::position`]'s entry the next
+    /// read starts at.
+    pub(crate) fn within_entry(&self) -> Within {
+        self.within
+    }
+
+    /// Whether this cursor is at the start of its entry: no part of it read.
+    #[must_use]
+    pub fn at_entry_start(&self) -> bool {
+        self.within == Within::default()
     }
 
     /// The history the cursor reads.
@@ -898,6 +941,8 @@ impl ChangeCursor {
         }
         out.extend_from_slice(&EFFECTS_INTERPRETATION.to_be_bytes());
         out.extend_from_slice(&self.next.to_be_bytes());
+        out.extend_from_slice(&self.within.sub.to_be_bytes());
+        out.extend_from_slice(&self.within.ordinal.to_be_bytes());
         self.interest.encode(&mut out);
         out
     }
@@ -933,6 +978,10 @@ impl ChangeCursor {
             return Err(CursorError::OtherInterpretation(interpretation));
         }
         let next = u64::from_be_bytes(r.array()?);
+        let within = Within {
+            sub: u32::from_be_bytes(r.array()?),
+            ordinal: u32::from_be_bytes(r.array()?),
+        };
         let labels = match r.u8()? {
             0 => None,
             1 => {
@@ -970,6 +1019,7 @@ impl ChangeCursor {
             history,
             interest,
             next,
+            within,
         })
     }
 }
@@ -1091,9 +1141,10 @@ impl From<&Target<'_>> for OwnedTarget {
     }
 }
 
-/// One committed unit as a reader receives it: every event of it the
-/// reader's interest takes, and the count of events its projection holds,
-/// so the reader can tell it got all of the unit it asked for.
+/// One committed unit, or a fragment of one, as a reader receives it: every
+/// event of it in the ordinal range `[first, through)` the reader's interest
+/// takes, and the count of events its projection holds, so the reader can
+/// tell when it has all of the unit it asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitChanges {
     /// The unit's journal entry and place in it.
@@ -1104,38 +1155,138 @@ pub struct UnitChanges {
     pub events: Vec<ChangeEvent>,
     /// How many events the unit's projection holds, taken or not.
     pub projected: u32,
+    /// The first ordinal this delivery covers: zero unless an earlier read
+    /// delivered the unit's start.
+    pub first: u32,
+    /// The ordinal after the last one this delivery covers, taken or not:
+    /// `projected` when the delivery reaches the unit's end.
+    pub through: u32,
 }
 
-/// A read of the feed: whole units in log order, and the cursor the next
-/// read continues from.
+impl UnitChanges {
+    /// Whether this delivery reaches the end of the unit.
+    #[must_use]
+    pub fn completes_unit(&self) -> bool {
+        self.through == self.projected
+    }
+
+    /// Whether this delivery is the whole unit.
+    #[must_use]
+    pub fn is_whole_unit(&self) -> bool {
+        self.first == 0 && self.completes_unit()
+    }
+}
+
+/// A read of the feed: units in log order, the last one possibly a fragment
+/// when the read's memory ran out inside it, and the cursor the next read
+/// continues from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeBatch {
-    /// The units read, each complete; a unit none of whose events the
-    /// reader takes is here too, with no events.
+    /// The units read; a unit none of whose events the reader takes is here
+    /// too, with no events. Every unit but the last is whole from where the
+    /// read started.
     pub units: Vec<UnitChanges>,
     /// Where the next read continues.
     pub cursor: ChangeCursor,
 }
 
-/// The changes of `units` that `interest` takes.
+/// Bytes one delivered event holds.
+fn event_bytes(event: &LogicalEvent<'_>) -> u64 {
+    let target = match &event.target {
+        Target::Node(key)
+        | Target::RelationshipProperties(key)
+        | Target::RelationshipInstance(key) => key.len(),
+        Target::Relationship { edge_type, .. } => edge_type.len(),
+        Target::Scope { .. } => 0,
+    };
+    let labels = event.routing.as_ref().map_or(0, |r| {
+        (r.before.len() + r.after.len()) * core::mem::size_of::<LabelId>()
+    });
+    (core::mem::size_of::<ChangeEvent>() + target + event.payload.map_or(0, <[u8]>::len) + labels)
+        as u64
+}
+
+/// The changes a reader at `from` receives of `units`, the units of the
+/// entries read from its entry on: units before `from` inside its entry are
+/// passed over, and the unit it stopped in continues at its ordinal. Every
+/// event and unit kept is charged to `charge` first; when the charge refuses
+/// one, the read stops there, and the place it stopped is returned. A read
+/// that cannot keep its first event refuses with the budget's stop.
 ///
 /// # Errors
 ///
-/// As [`project_unit`].
+/// [`StorageError::ChangeFeedUnsupported`] for a unit the feed cannot
+/// project, [`StorageError::Serialization`] for a malformed one, and
+/// [`StorageError::Budget`] as above.
 pub(crate) fn unit_changes(
     units: &[ChangeUnit],
     interest: &Interest,
-) -> Result<Vec<UnitChanges>, ProjectionError> {
-    let mut out = Vec::with_capacity(units.len());
+    from: ReadPlace,
+    charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+) -> Result<(Vec<UnitChanges>, Option<ReadPlace>), crate::error::StorageError> {
+    use crate::error::StorageError;
+    let projection = |e: ProjectionError| match e {
+        ProjectionError::Unsupported(reason) => StorageError::ChangeFeedUnsupported { reason },
+        ProjectionError::Malformed(reason) => StorageError::Serialization(reason),
+    };
+    let ReadPlace {
+        entry: from_entry,
+        within: from_within,
+    } = from;
+    let mut out: Vec<UnitChanges> = Vec::new();
+    let mut kept_any = false;
     for unit in units {
-        let events = unit.events()?;
-        let projected = u32::try_from(events.len())
-            .map_err(|_| ProjectionError::Malformed("the unit projects over 2^32 events".into()))?;
-        let taken = events
-            .iter()
-            .filter_map(|event| {
-                let delivery = interest.delivery(event)?;
-                Some(ChangeEvent {
+        let first = if unit.position.index == from_entry {
+            if unit.position.sub < from_within.sub {
+                continue;
+            }
+            if unit.position.sub == from_within.sub {
+                from_within.ordinal
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let events = unit.events().map_err(projection)?;
+        let projected = u32::try_from(events.len()).map_err(|_| {
+            StorageError::Serialization("the unit projects over 2^32 events".into())
+        })?;
+        let stopped = |ordinal: u32| {
+            Some(ReadPlace {
+                entry: unit.position.index,
+                within: Within {
+                    sub: unit.position.sub,
+                    ordinal,
+                },
+            })
+        };
+        if let Err(stop) = charge.grow(core::mem::size_of::<UnitChanges>() as u64) {
+            if !kept_any {
+                return Err(StorageError::Budget(stop));
+            }
+            return Ok((out, stopped(first)));
+        }
+        let mut taken = Vec::new();
+        let mut through = first;
+        for event in events.iter().skip(first as usize) {
+            if let Some(delivery) = interest.delivery(event) {
+                if let Err(stop) = charge.grow(event_bytes(event)) {
+                    if !kept_any {
+                        return Err(StorageError::Budget(stop));
+                    }
+                    out.push(UnitChanges {
+                        position: unit.position,
+                        commit_ts: unit.commit_ts,
+                        events: taken,
+                        projected,
+                        first,
+                        through,
+                    });
+                    return Ok((out, stopped(through)));
+                }
+                kept_any = true;
+                taken.push(ChangeEvent {
                     id: EventId {
                         position: unit.position,
                         ordinal: event.ordinal,
@@ -1148,17 +1299,21 @@ pub(crate) fn unit_changes(
                         .routing
                         .as_ref()
                         .map(|r| (r.before.to_vec(), r.after.to_vec())),
-                })
-            })
-            .collect();
+                });
+            }
+            through = event.ordinal + 1;
+        }
+        kept_any = true;
         out.push(UnitChanges {
             position: unit.position,
             commit_ts: unit.commit_ts,
             events: taken,
             projected,
+            first,
+            through: projected,
         });
     }
-    Ok(out)
+    Ok((out, None))
 }
 
 #[cfg(test)]

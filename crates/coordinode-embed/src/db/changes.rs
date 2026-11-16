@@ -86,17 +86,22 @@ impl Database {
 
     /// Read the changes after `cursor`: the units of up to `max_entries` log
     /// entries, within `budget`, only those this database applied and made
-    /// durable, each whole with the events of it the cursor's interest takes.
-    /// A unit with none of them is there too, with none: the reader sees
-    /// every unit it passed.
+    /// durable, with the events of each the cursor's interest takes. A unit
+    /// with none of them is there too, with none: the reader sees every unit
+    /// it passed. A unit whose events do not fit what is left of `budget`
+    /// is delivered in part, the returned cursor continuing inside it
+    /// ([`UnitChanges::first`](coordinode_storage::engine::change_feed::UnitChanges::first)
+    /// and [`UnitChanges::through`](coordinode_storage::engine::change_feed::UnitChanges::through) name the
+    /// ordinals each delivery covers).
     ///
     /// # Errors
     ///
-    /// [`DatabaseError::Storage`] carrying `RetentionLost` when the log no
-    /// longer holds the cursor's position, `ChangeCursor` for a cursor of
-    /// another history or interpretation, `ChangeFeedUnsupported` for a unit
-    /// the feed cannot read, `Budget` for a first entry that does not fit
-    /// the budget on its own. On each of them the cursor stays valid.
+    /// [`DatabaseError::Budget`] when the first entry, or the first event
+    /// read, does not fit the budget on its own; [`DatabaseError::Storage`]
+    /// carrying `RetentionLost` when the log no longer holds the cursor's
+    /// position, `ChangeCursor` for a cursor of another history or
+    /// interpretation, `ChangeFeedUnsupported` for a unit the feed cannot
+    /// read. On each of them the cursor stays valid.
     pub fn read_changes<'b>(
         &self,
         cursor: &ChangeCursor,

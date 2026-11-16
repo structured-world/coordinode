@@ -239,7 +239,8 @@ pub struct ChangeEvent {
     pub labels_after: Vec<String>,
 }
 
-/// One committed transaction: the events of it the subscription takes.
+/// One committed transaction, or a fragment of one: the events of it in the
+/// ordinal range `[first, end)` the subscription takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeUnit {
     /// Its commit timestamp (HLC microseconds).
@@ -252,6 +253,19 @@ pub struct ChangeUnit {
     pub projected: u32,
     /// The events the subscription takes, in ordinal order.
     pub events: Vec<ChangeEvent>,
+    /// The first ordinal this delivery covers.
+    pub first: u32,
+    /// The ordinal after the last one this delivery covers: `projected`
+    /// when it reaches the transaction's end.
+    pub end: u32,
+}
+
+impl ChangeUnit {
+    /// Whether this delivery reaches the end of the transaction.
+    #[must_use]
+    pub fn completes_transaction(&self) -> bool {
+        self.end == self.projected
+    }
 }
 
 /// Units read from the log and the cursor after them.
@@ -329,6 +343,8 @@ impl ChangeBatch {
                     log_index: unit.log_index,
                     unit: unit.unit,
                     projected: unit.projected,
+                    first: unit.first_ordinal,
+                    end: unit.end_ordinal,
                     events: unit
                         .events
                         .into_iter()

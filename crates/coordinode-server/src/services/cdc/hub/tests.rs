@@ -56,7 +56,9 @@ fn held(hub: &CdcHub) -> usize {
 }
 
 /// Two streams get the same entries from one read of the log, and an entry
-/// stays in memory until both have passed it.
+/// stays in memory until both have passed it: a stream handed entries still
+/// needs them until it says how far it got, since a read stopped inside an
+/// entry reads it again.
 #[test]
 fn streams_share_entries_until_every_one_has_passed_them() {
     let dir = log(5);
@@ -65,10 +67,15 @@ fn streams_share_entries_until_every_one_has_passed_them() {
 
     let (got, next) = indexes(hub.read(&a, 0, 100, 5).expect("read a"));
     assert_eq!((got, next), (vec![0, 1, 2, 3, 4], 5));
+    hub.passed(&a, next);
     assert_eq!(held(&hub), 5, "the other stream has not read them");
 
     let (got, _) = indexes(hub.read(&b, 0, 2, 5).expect("read b"));
     assert_eq!(got, [0, 1]);
+    assert_eq!(held(&hub), 5, "the stream may still read entry 1 again");
+    hub.passed(&b, 1);
+    assert_eq!(held(&hub), 4, "it stopped inside entry 1, which it keeps");
+    hub.passed(&b, 2);
     assert_eq!(held(&hub), 3, "entries both streams passed are released");
 
     drop(b);
@@ -100,8 +107,9 @@ fn the_byte_bound_releases_entries_a_slow_stream_still_needs() {
     // Room for about three entries.
     let hub = Arc::new(CdcHub::new(&[dir.path().to_path_buf()], 0, 0, 900).expect("hub"));
     let (fast, slow) = (hub.reader(0), hub.reader(0));
-    let (got, _) = indexes(hub.read(&fast, 0, 100, 10).expect("read fast"));
+    let (got, next) = indexes(hub.read(&fast, 0, 100, 10).expect("read fast"));
     assert_eq!(got.len(), 10);
+    hub.passed(&fast, next);
     assert!(held(&hub) < 10, "the bound holds");
     assert!(matches!(
         hub.read(&slow, 0, 100, 10).expect("read slow"),

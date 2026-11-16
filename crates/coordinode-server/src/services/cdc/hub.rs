@@ -229,9 +229,19 @@ impl CdcHub {
             next = shared.index + 1;
             entries.push(Arc::clone(shared));
         }
-        inner.readers.insert(reader.id, next);
+        // The stream still needs what it was handed until it says how far
+        // it got: a read stopped inside an entry reads that entry again.
+        inner.readers.insert(reader.id, position);
         inner.trim(self.max_bytes);
         Ok(HubRead::Entries { entries, next })
+    }
+
+    /// Record that the stream `reader` needs nothing before `position` any
+    /// more, releasing what no stream needs.
+    pub(crate) fn passed(&self, reader: &HubReader, position: u64) {
+        let mut inner = self.inner.lock();
+        inner.readers.insert(reader.id, position);
+        inner.trim(self.max_bytes);
     }
 }
 
