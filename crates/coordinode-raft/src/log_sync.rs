@@ -30,9 +30,9 @@ use crate::storage::{AppendNotifier, Entry, LogStore, TypeConfig};
 pub(crate) const TAIL_WRITTEN_ENTRIES: usize = 4096;
 
 /// A group whose oldest append waited this long from queued to answered has
-/// its phases logged, under stage timing.
+/// its phases logged, under stage timing: about the write tail's p99.
 #[cfg(feature = "stage-timing")]
-const SLOW_GROUP: std::time::Duration = std::time::Duration::from_millis(100);
+const SLOW_GROUP: std::time::Duration = std::time::Duration::from_millis(35);
 
 /// One append waiting to be written and made durable.
 pub(crate) struct Append {
@@ -285,6 +285,10 @@ impl Drop for LogSync {
 
 impl Shared {
     fn run(&self) {
+        // The group before this one: its sync, and when it was answered, to
+        // tell a wait behind it from a wait for the thread to take the group.
+        #[cfg(feature = "stage-timing")]
+        let mut previous: Option<(std::time::Duration, std::time::Instant)> = None;
         loop {
             // When each taken append was queued, taken with them.
             #[cfg(feature = "stage-timing")]
@@ -392,10 +396,25 @@ impl Shared {
                     && answered.duration_since(oldest) >= SLOW_GROUP
                 {
                     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+                    // The oldest append's wait split at the previous group's
+                    // answer: behind that group, then until this one was taken.
+                    let (prev_sync_ms, behind_ms, pickup_ms) = match previous {
+                        Some((sync, done)) if done > oldest => (
+                            ms(sync),
+                            ms(done.duration_since(oldest)),
+                            // Taken after the previous group was answered.
+                            ms(recording.duration_since(done)),
+                        ),
+                        Some((sync, _)) => (ms(sync), 0.0, ms(recording.duration_since(oldest))),
+                        None => (0.0, 0.0, ms(recording.duration_since(oldest))),
+                    };
                     tracing::warn!(
                         appends = queued_at.len(),
                         total_ms = ms(answered.duration_since(oldest)),
                         queue_ms = ms(recording.duration_since(oldest)),
+                        prev_sync_ms,
+                        behind_ms,
+                        pickup_ms,
                         record_ms = ms(writing.duration_since(recording)),
                         write_ms = ms(started.duration_since(writing)),
                         sync_ms = ms(answering.duration_since(started)),
@@ -403,6 +422,7 @@ impl Shared {
                         "slow raft log group"
                     );
                 }
+                previous = Some((answering.duration_since(started), answered));
             }
             let mut queue = self.queue.lock();
             if let Err(e) = &synced
