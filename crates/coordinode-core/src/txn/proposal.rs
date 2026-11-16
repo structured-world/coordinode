@@ -233,6 +233,9 @@ pub struct UnitEffects {
     /// Changes of what a type implies the unit put in force: every node of
     /// the type gains and loses labels without a row of its own changing.
     pub scope_changes: Vec<ScopeChange>,
+    /// Labels the unit dropped: each identity ends here, whether or not a
+    /// node of it was left to remove. In label order.
+    pub dropped: Vec<crate::schema::label_id::LabelId>,
 }
 
 /// The labels a type label implies, transitively, without itself.
@@ -268,6 +271,7 @@ impl UnitEffects {
             runs: Vec::new(),
             implications: Vec::new(),
             scope_changes: Vec::new(),
+            dropped: Vec::new(),
         }
     }
 
@@ -278,6 +282,7 @@ impl UnitEffects {
             && self.runs.is_empty()
             && self.implications.is_empty()
             && self.scope_changes.is_empty()
+            && self.dropped.is_empty()
     }
 
     /// Approximate encoded size, for rate limiting and buffer accounting.
@@ -298,7 +303,7 @@ impl UnitEffects {
             .iter()
             .map(|s| 14 + (s.before.len() + s.after.len()) * 4)
             .sum();
-        4 + nodes + edges + self.runs.len() * 4 + implications + scopes
+        4 + nodes + edges + self.runs.len() * 4 + implications + scopes + self.dropped.len() * 5
     }
 }
 

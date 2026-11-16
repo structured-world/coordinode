@@ -461,6 +461,7 @@ impl<'a> Encoder<'a> {
             self.labels(&change.before, out);
             self.labels(&change.after, out);
         }
+        self.labels(&effects.dropped, out);
     }
 
     /// A list of label identities: its count, then each id.
@@ -651,7 +652,8 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
                     entries += 4 * 10 + labels + 2;
                     bytes += labels * LABEL_BYTES + ACTIVATION_BYTES;
                 }
-                bytes
+                entries += 10 + effects.dropped.len();
+                bytes + effects.dropped.len() * LABEL_BYTES
             }
         };
     }
@@ -1153,6 +1155,7 @@ impl<'a> Decoder<'a> {
                 after,
             });
         }
+        let dropped = self.labels()?;
         Ok(UnitEffects {
             interpretation,
             nodes,
@@ -1160,6 +1163,7 @@ impl<'a> Decoder<'a> {
             runs,
             implications,
             scope_changes,
+            dropped,
         })
     }
 

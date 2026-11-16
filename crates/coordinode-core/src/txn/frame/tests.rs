@@ -102,6 +102,7 @@ fn effects_with(runs: Vec<u32>) -> Mutation {
             before: vec![label(2)],
             after: Vec::new(),
         }],
+        dropped: vec![label(70_000)],
     })
 }
 

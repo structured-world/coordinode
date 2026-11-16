@@ -1248,6 +1248,11 @@ impl SchemaStore for LocalSchemaStore<'_> {
 
     fn drop_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
         if let Some(binding) = binding_txn(txn, name)?.filter(|b| b.live_id().is_some()) {
+            // The identity ends here: the change feed tells the label's
+            // readers, rows left or not.
+            if let Some(id) = binding.live_id() {
+                txn.note_label_dropped(id);
+            }
             let retired = LabelBinding {
                 state: BindingState::Retired,
                 ..binding

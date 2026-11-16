@@ -890,6 +890,12 @@ fn event_to_proto(
             })
         }
         OwnedTarget::BlobOwner(key) => logical_change::Target::BlobOwner(key.clone()),
+        OwnedTarget::Label(label) => logical_change::Target::DroppedLabel(
+            names
+                .names(engine, &[*label])?
+                .pop()
+                .ok_or_else(|| malformed("dropped label"))?,
+        ),
     };
     let (labels_before, labels_after) = match &event.labels {
         Some((before, after)) => (names.names(engine, before)?, names.names(engine, after)?),
@@ -902,6 +908,7 @@ fn event_to_proto(
             feed::Action::Patch => ChangeAction::Patch,
             feed::Action::Remove => ChangeAction::Remove,
             feed::Action::ScopeChange => ChangeAction::ScopeChange,
+            feed::Action::Drop => ChangeAction::Drop,
         } as i32,
         target: Some(target),
         payload: event.payload.clone().unwrap_or_default(),

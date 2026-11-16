@@ -102,7 +102,7 @@ impl CutScope {
                 key.extend_from_slice(&source.to_be_bytes());
                 self.holds_key(&key)
             }
-            Target::Scope { .. } => self.partition == Partition::Node,
+            Target::Scope { .. } | Target::Label(_) => self.partition == Partition::Node,
             Target::BlobOwner(key) => self.partition == Partition::BlobRef && self.holds_key(key),
         }
     }

@@ -471,6 +471,8 @@ struct EffectContext {
     >,
     /// Changes of what a type implies this attempt puts in force.
     scope_changes: Vec<coordinode_core::txn::proposal::ScopeChange>,
+    /// Labels this attempt drops.
+    dropped: std::collections::BTreeSet<coordinode_core::schema::label_id::LabelId>,
 }
 
 impl EffectContext {
@@ -493,6 +495,7 @@ impl EffectContext {
             .map(|(label, implies)| coordinode_core::txn::proposal::Implication { label, implies })
             .collect();
         effects.scope_changes = std::mem::take(&mut self.scope_changes);
+        effects.dropped = std::mem::take(&mut self.dropped).into_iter().collect();
         Mutation::Effects(effects)
     }
 }
@@ -1326,6 +1329,13 @@ impl<'a> Transaction<'a> {
     /// work it out again.
     pub fn implication_noted(&self, label: coordinode_core::schema::label_id::LabelId) -> bool {
         self.effects.implications.contains_key(&label)
+    }
+
+    /// Record that this attempt drops label `label`: its identity ends,
+    /// which the change feed delivers to the label's readers whether or not
+    /// a node of it was left to remove.
+    pub fn note_label_dropped(&mut self, label: coordinode_core::schema::label_id::LabelId) {
+        self.effects.dropped.insert(label);
     }
 
     /// Record that this attempt puts `change` in force: what a type implies
@@ -2756,7 +2766,10 @@ impl<'a> Transaction<'a> {
         // binding. Every unit changing application data carries it, empty or
         // not, so a reader tells a unit sealed under an interpretation from
         // one sealed before there was any.
-        if changes_application_data(&mutations) || !self.effects.scope_changes.is_empty() {
+        if changes_application_data(&mutations)
+            || !self.effects.scope_changes.is_empty()
+            || !self.effects.dropped.is_empty()
+        {
             mutations.push(self.effects.seal());
         } else {
             self.effects = EffectContext::default();

@@ -37,6 +37,10 @@ pub enum Action {
     /// labels without a row of its own changing. A reader keeping state by
     /// label reconciles the scope, or rebuilds it.
     ScopeChange,
+    /// A label is dropped: its identity ends. Nodes of it removed in the
+    /// same transaction are removals of their own; a reader keeping state by
+    /// the label drops what is left of the scope.
+    Drop,
 }
 
 /// What an event changes. A key is the unit's own bytes, or owned when the
@@ -72,6 +76,8 @@ pub enum Target<'u> {
     /// an S3 object, by its owner key. A put carries the owner record (the
     /// blob it now holds), not the blob's bytes.
     BlobOwner(Cow<'u, [u8]>),
+    /// A label, by the identity it had.
+    Label(LabelId),
 }
 
 /// The labels a node carried before and after its event, its type's
@@ -758,6 +764,18 @@ impl<'u> Projector<'u> {
                 }),
             )?;
         }
+        // A dropped label: its scope ends, routed by the identity it had.
+        for &label in &effects.dropped {
+            self.emit(
+                Action::Drop,
+                Target::Label(label),
+                None,
+                Some(Routing {
+                    before: Cow::Owned(vec![label]),
+                    after: Cow::Borrowed(&[]),
+                }),
+            )?;
+        }
         Ok(())
     }
 }
@@ -961,8 +979,11 @@ impl Interest {
             Target::RelationshipProperties(key) | Target::RelationshipInstance(key) => {
                 edgeprop_key(key).map_or(&[][..], |((edge_type, _, _), _)| edge_type)
             }
-            // Routed above: every node and scope event carries its labels.
-            Target::Node(_) | Target::Scope { .. } => return Some(Delivery::Apply),
+            // Routed above: every node, scope and label event carries its
+            // labels.
+            Target::Node(_) | Target::Scope { .. } | Target::Label(_) => {
+                return Some(Delivery::Apply);
+            }
             Target::BlobOwner(_) => return self.blobs.then_some(Delivery::Apply),
         };
         let wanted = match &self.edge_types {
@@ -1341,6 +1362,8 @@ pub enum OwnedTarget {
     },
     /// What a blob owner holds, by its owner key.
     BlobOwner(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// A label, by the identity it had.
+    Label(LabelId),
 }
 
 impl From<&Target<'_>> for OwnedTarget {
@@ -1363,6 +1386,7 @@ impl From<&Target<'_>> for OwnedTarget {
                 activation: *activation,
             },
             Target::BlobOwner(key) => Self::BlobOwner(key.to_vec()),
+            Target::Label(label) => Self::Label(*label),
         }
     }
 }
@@ -1472,7 +1496,7 @@ pub(crate) fn event_bytes(event: &LogicalEvent<'_>) -> u64 {
         | Target::RelationshipInstance(key)
         | Target::BlobOwner(key) => key.len(),
         Target::Relationship { edge_type, .. } => edge_type.len(),
-        Target::Scope { .. } => 0,
+        Target::Scope { .. } | Target::Label(_) => 0,
     };
     let labels = event.routing.as_ref().map_or(0, |r| {
         (r.before.len() + r.after.len()) * core::mem::size_of::<LabelId>()

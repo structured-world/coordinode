@@ -167,6 +167,8 @@ pub enum ChangeAction {
     /// with no node event of their own. A reader keeping state by label
     /// reconciles the type's nodes, or rebuilds the scope.
     ScopeChange,
+    /// A label is dropped: its identity and scope end.
+    Drop,
     /// An action this driver does not know.
     Other(i32),
 }
@@ -220,6 +222,8 @@ pub enum ChangeTarget {
     /// What a blob owner holds, by its owner key; a put's payload is the
     /// owner record.
     BlobOwner(Vec<u8>),
+    /// A label a drop ended, by its name when the drop committed.
+    DroppedLabel(String),
     /// A type whose implied labels changed: the event's labels before and
     /// after name it and what it implied before and implies after.
     Scope {
@@ -321,6 +325,7 @@ impl ChangeEvent {
                 activation: s.activation,
             },
             logical_change::Target::BlobOwner(key) => ChangeTarget::BlobOwner(key),
+            logical_change::Target::DroppedLabel(name) => ChangeTarget::DroppedLabel(name),
         });
         Self {
             ordinal: event.ordinal,
@@ -329,6 +334,7 @@ impl ChangeEvent {
                 Ok(ProtoAction::Patch) => ChangeAction::Patch,
                 Ok(ProtoAction::Remove) => ChangeAction::Remove,
                 Ok(ProtoAction::ScopeChange) => ChangeAction::ScopeChange,
+                Ok(ProtoAction::Drop) => ChangeAction::Drop,
                 Ok(ProtoAction::Unspecified) | Err(_) => ChangeAction::Other(event.action),
             },
             target,

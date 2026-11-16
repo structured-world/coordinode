@@ -396,6 +396,12 @@ for the type's nodes. A reader keeping state by label reconciles the type's
 nodes once per activation, or rebuilds that scope; every activation has its
 own identity, a change back to an earlier declaration included.
 
+Dropping a label (`DROP TABLE`) delivers a `Drop` of `OwnedTarget::Label`,
+naming the identity the label had, to its readers as `Leave`, whether or not
+nodes of it were left; nodes the same transaction removes are removals of
+their own. A label declared again under the same name is another label: its
+readers do not receive the old one's drop.
+
 Each unit comes whole, with its position and commit timestamp, the events
 the interest takes and `projected`, the number of events the unit has in
 all; a unit with none of the reader's events is in the batch too. An event's

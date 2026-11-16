@@ -202,6 +202,7 @@ fn relationship_actions(units: &[UnitChanges]) -> Vec<Vec<(Action, &'static str)
                         OwnedTarget::Node(_) => "node",
                         OwnedTarget::Scope { .. } => "scope",
                         OwnedTarget::BlobOwner(_) => "blob",
+                        OwnedTarget::Label(_) => "label",
                     };
                     (e.action, kind)
                 })
@@ -352,6 +353,7 @@ fn old_changes_keep_the_label_they_were_committed_under() {
     let all = events(&read_all(&db, &mut start.clone()));
     let old_labels: Vec<_> = all
         .iter()
+        .filter(|e| matches!(e.target, OwnedTarget::Node(_)))
         .filter_map(|e| {
             e.labels
                 .as_ref()
@@ -360,6 +362,11 @@ fn old_changes_keep_the_label_they_were_committed_under() {
         .collect();
     assert_eq!(old_labels.len(), 2, "the put and the removal: {all:?}");
     let old = old_labels[0].1[0];
+    assert!(
+        all.iter()
+            .any(|e| e.action == Action::Drop && e.target == OwnedTarget::Label(old)),
+        "the drop names the old label: {all:?}"
+    );
     assert_eq!(old_labels[1].0, vec![old], "removed under the label it had");
 
     let again = db
@@ -395,6 +402,98 @@ fn dropping_a_table_with_rows_removes_each_row() {
     assert_eq!(
         node_deliveries(&dropping[0].events),
         vec![(Action::Remove, Delivery::Leave); 2]
+    );
+    let last = dropping[0].events.last().expect("the drop");
+    assert_eq!(
+        (last.action, last.delivery),
+        (Action::Drop, Delivery::Leave),
+        "{dropping:?}"
+    );
+}
+
+/// The label of `name` now.
+fn label_id(db: &Database, name: &str) -> coordinode_core::schema::label_id::LabelId {
+    db.change_cursor(&interest(Some(&[name]), None))
+        .expect("cursor")
+        .interest()
+        .labels()
+        .expect("labels")[0]
+}
+
+/// Dropping an empty table still reaches a reader of the table: the label
+/// it named ends, though no row goes with it.
+#[test]
+fn dropping_an_empty_table_reaches_its_reader() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    run(
+        &mut db,
+        "CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING)",
+    );
+    let acct = label_id(&db, "Acct");
+    let mut cursor = db
+        .change_cursor(&interest(Some(&["Acct"]), None))
+        .expect("cursor");
+    run(&mut db, "DROP TABLE Acct");
+    let events = events(&read_all(&db, &mut cursor));
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| (e.action, e.target.clone(), e.delivery))
+            .collect::<Vec<_>>(),
+        vec![(Action::Drop, OwnedTarget::Label(acct), Delivery::Leave)],
+        "{events:?}"
+    );
+}
+
+/// A drop rolled back delivers nothing; a drop of a table declared again
+/// reaches the readers of the label it dropped, not those of the one
+/// declared after it.
+#[test]
+fn a_rolled_back_drop_delivers_nothing_and_a_new_label_is_another() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    run(
+        &mut db,
+        "CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING)",
+    );
+    let first = label_id(&db, "Acct");
+    let mut all = db
+        .change_cursor(&ChangeInterest::default())
+        .expect("cursor");
+    let txn = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(txn, "DROP TABLE Acct", None)
+        .expect("drop");
+    db.rollback_transaction(txn).expect("rollback");
+    assert!(events(&read_all(&db, &mut all)).is_empty());
+
+    run(&mut db, "DROP TABLE Acct");
+    run(
+        &mut db,
+        "CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING)",
+    );
+    let second = label_id(&db, "Acct");
+    assert_ne!(first, second);
+    let mut new_reader = db
+        .change_cursor(&interest(Some(&["Acct"]), None))
+        .expect("cursor");
+    run(&mut db, "DROP TABLE Acct");
+    let dropped: Vec<OwnedTarget> = events(&read_all(&db, &mut all))
+        .into_iter()
+        .filter(|e| e.action == Action::Drop)
+        .map(|e| e.target)
+        .collect();
+    assert_eq!(
+        dropped,
+        vec![OwnedTarget::Label(first), OwnedTarget::Label(second)]
+    );
+    let new_events = events(&read_all(&db, &mut new_reader));
+    assert_eq!(
+        new_events
+            .iter()
+            .map(|e| e.target.clone())
+            .collect::<Vec<_>>(),
+        vec![OwnedTarget::Label(second)]
     );
 }
 
