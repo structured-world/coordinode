@@ -635,6 +635,7 @@ impl<'a> Transaction<'a> {
     /// Open a transaction at the latest complete state, its snapshot pinned
     /// in the same step it is taken. See [`StorageEngine::pin_latest_snapshot`]
     /// for why the two cannot be separate calls.
+    #[cfg_attr(feature = "stage-timing", track_caller)]
     pub fn begin(
         engine: &'a StorageEngine,
         oracle: Option<&'a TimestampOracle>,
@@ -647,6 +648,7 @@ impl<'a> Transaction<'a> {
     /// [`Self::begin`] reading a view that holds only durable effects
     /// ([`StorageEngine::durable_view`]), for a transaction under a read
     /// concern that must not see a write a crash can still take back.
+    #[cfg_attr(feature = "stage-timing", track_caller)]
     pub fn begin_durable(
         engine: &'a StorageEngine,
         oracle: Option<&'a TimestampOracle>,
@@ -1307,6 +1309,7 @@ impl<'a> Transaction<'a> {
     /// skipping). Reads the transaction's pinned snapshot when present, else the
     /// latest committed seqno. Untracked (no OCC read-set, no buffer overlay) —
     /// for committed-snapshot index scans, like [`Self::base_prefix_scan`].
+    #[cfg_attr(feature = "stage-timing", track_caller)]
     pub fn base_range_seekable(
         &self,
         part: Partition,

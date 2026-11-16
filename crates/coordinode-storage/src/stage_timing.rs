@@ -13,3 +13,15 @@ pub fn record(stage: &'static str, since: Instant) {
     metrics::histogram!("coordinode_stage_duration_seconds", "stage" => stage)
         .record(since.elapsed().as_secs_f64());
 }
+
+/// Record that `stage`, called from `caller`, took the time since `since`:
+/// the same stage told apart by where it is called from.
+pub fn record_from(stage: &'static str, caller: &std::panic::Location<'_>, since: Instant) {
+    let caller = format!("{}:{}", caller.file(), caller.line());
+    metrics::histogram!(
+        "coordinode_stage_duration_seconds",
+        "stage" => stage,
+        "caller" => caller
+    )
+    .record(since.elapsed().as_secs_f64());
+}

@@ -5729,8 +5729,14 @@ impl StorageEngine {
     }
 
     /// The latest complete snapshot, already pinned.
+    #[cfg_attr(feature = "stage-timing", track_caller)]
     pub fn pin_latest_snapshot(&self) -> (lsm_tree::SeqNo, Option<SnapshotPin>) {
-        self.pin_new_snapshot(|| self.snapshot())
+        #[cfg(feature = "stage-timing")]
+        let (caller, start) = (std::panic::Location::caller(), std::time::Instant::now());
+        let pinned = self.pin_new_snapshot(|| self.snapshot());
+        #[cfg(feature = "stage-timing")]
+        crate::stage_timing::record_from("snapshot.pin_latest", caller, start);
+        pinned
     }
 
     /// The cut an offline capture of the whole store reads every partition
@@ -5820,8 +5826,14 @@ impl StorageEngine {
     /// [`Self::pin_latest_snapshot`] for a read that must not see a write a
     /// crash can still take back: the latest complete snapshot, lowered to
     /// [`Self::durable_view`].
+    #[cfg_attr(feature = "stage-timing", track_caller)]
     pub fn pin_durable_snapshot(&self) -> (lsm_tree::SeqNo, Option<SnapshotPin>) {
-        self.pin_new_snapshot(|| self.durable_view(self.snapshot()))
+        #[cfg(feature = "stage-timing")]
+        let (caller, start) = (std::panic::Location::caller(), std::time::Instant::now());
+        let pinned = self.pin_new_snapshot(|| self.durable_view(self.snapshot()));
+        #[cfg(feature = "stage-timing")]
+        crate::stage_timing::record_from("snapshot.pin_durable", caller, start);
+        pinned
     }
 
     /// Hold the set of trees for an operation that changes them outside one
@@ -7903,14 +7915,20 @@ impl StorageEngine {
     /// conflict when it validates. The cost is that a snapshot taken during a
     /// commit lags by that commit, which is the definition of complete rather
     /// than a delay added on top of it.
+    #[cfg_attr(feature = "stage-timing", track_caller)]
     pub fn snapshot(&self) -> lsm_tree::SeqNo {
-        self.pending_commits.complete_snapshot(
+        #[cfg(feature = "stage-timing")]
+        let (caller, start) = (std::panic::Location::caller(), std::time::Instant::now());
+        let snapshot = self.pending_commits.complete_snapshot(
             || self.coordinator.snapshot(),
             std::time::Duration::from_millis(
                 self.snapshot_wait
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
-        )
+        );
+        #[cfg(feature = "stage-timing")]
+        crate::stage_timing::record_from("snapshot.call", caller, start);
+        snapshot
     }
 
     /// The last commit timestamp whose every write, and every write below
@@ -7923,6 +7941,7 @@ impl StorageEngine {
     /// a commit stamped lower can still be on its way behind one stamped
     /// higher. Its cut is bounded by the closed bound of the entries applied
     /// here, below which every commit is already in the log before them.
+    #[cfg_attr(feature = "stage-timing", track_caller)]
     pub fn complete_cut(&self) -> Option<u64> {
         let snapshot = self.snapshot();
         let bound = if self.raft_fence().is_some() {
