@@ -218,10 +218,11 @@ fn rig_with_stale_projection() -> (PowerRig, Destination) {
     (rig, destination)
 }
 
-/// A rebuild through a cut with a write inside the join and a create and a
-/// delete after the cut: nothing is publishable before the join completes,
-/// and the published replacement equals the source, holding neither the
-/// deleted row nor the destination's earlier rows.
+/// A rebuild through a cut with a write inside the join and a create, an
+/// update and a delete after the cut: nothing is publishable before the join
+/// completes, and the published replacement equals the source, holding the
+/// updated row's new state, neither the deleted row nor the destination's
+/// earlier rows.
 #[test]
 fn a_rebuild_through_a_cut_replaces_the_destination_with_the_source() {
     let dir = tempfile::tempdir().unwrap();
@@ -236,6 +237,14 @@ fn a_rebuild_through_a_cut_replaces_the_destination_with_the_source() {
     assert!(cut.join_end() > cut.first(), "the join holds a position");
     assert!(cut.joined().is_none(), "no publication before the join");
     db.execute_cypher("CREATE (:User {id: 4})").expect("create");
+    let before_update = source_rows(&db, NODES);
+    db.execute_cypher("MATCH (u:User {id: 2}) SET u.name = 'renamed'")
+        .expect("update");
+    assert_ne!(
+        source_rows(&db, NODES),
+        before_update,
+        "the update changed a row of the scope"
+    );
     db.execute_cypher("MATCH (u:User {id: 1}) DETACH DELETE u")
         .expect("delete");
     let mut rows = copy_view(&db, &cut);

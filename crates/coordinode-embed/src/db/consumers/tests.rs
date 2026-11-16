@@ -174,6 +174,83 @@ fn a_registration_holds_the_journal_across_a_restart() {
     assert_eq!(db.consumer_position(&h).expect("position"), from);
 }
 
+/// An ordinary registration taken up again after a restart is as stale as
+/// the journal made it while the database was closed and after: its handle
+/// resumes, and its position reports the loss with where the journal starts
+/// now, never the old position as if the history were still there.
+#[test]
+fn an_ordinary_registration_resumed_after_a_restart_learns_its_history_is_gone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (from, incarnation) = {
+        let mut db = Database::open(dir.path()).expect("open");
+        let h = db
+            .register_consumer(log_consumer(
+                "dashboard",
+                InitialSeqno::FromNow,
+                ConsumerRetentionPolicy::Ordinary,
+            ))
+            .expect("register");
+        write(&mut db, 4, "before");
+        (db.consumer_position(&h).expect("position"), h.incarnation())
+    };
+    let mut db = Database::open(dir.path()).expect("reopen");
+    write(&mut db, 4, "after");
+    reclaim_journal(&db);
+    let start = journal_start(&db);
+    assert!(
+        start > from,
+        "the reopened registration held the journal from {from}: it starts at {start}"
+    );
+    let h = db
+        .resume_consumer("dashboard", incarnation)
+        .expect("resume");
+    let position = db.consumer_position(&h);
+    assert!(
+        matches!(
+            position,
+            Err(DatabaseError::Consumer(RegistryError::RetentionLost { checkpoint, floor }))
+                if checkpoint == from && floor > from
+        ),
+        "a resumed registration whose history is gone must learn it, got {position:?}"
+    );
+}
+
+/// When only the state survives, the events are not replayed from it: a
+/// consumer whose history was reclaimed is refused its events with
+/// RetentionLost, while the state the events built is still recoverable
+/// through a fixed cut of the same scope.
+#[test]
+fn events_are_refused_when_only_the_state_survives() {
+    use crate::consumer::CutScope;
+    use coordinode_storage::engine::partition::Partition;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    let h = db
+        .register_consumer(log_consumer(
+            "projection",
+            InitialSeqno::FromNow,
+            ConsumerRetentionPolicy::Ordinary,
+        ))
+        .expect("register");
+    write(&mut db, 5, "built");
+    reclaim_journal(&db);
+
+    let events = db.consumer_position(&h);
+    assert!(
+        matches!(
+            events,
+            Err(DatabaseError::Consumer(RegistryError::RetentionLost { .. }))
+        ),
+        "events replayed from state alone: {events:?}"
+    );
+    let scope = CutScope::rows(Partition::Node, b"node:".to_vec()).expect("a row scope");
+    let cut = db
+        .state_cut(scope, Duration::from_secs(10))
+        .expect("the state is recoverable through a cut");
+    assert!(cut.join_end() >= cut.first(), "a cut with a continuation");
+}
+
 /// Registering at a position the journal no longer holds is refused with
 /// RetentionLost, naming where the journal starts now; nothing is
 /// registered.
