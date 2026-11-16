@@ -374,6 +374,14 @@ pub enum StorageError {
     /// checkpoints and its journal are left as they are.
     #[error("the Schema partition cannot be qualified for the open: {0}")]
     SchemaRecoveryRefused(crate::engine::rebuild::RebuildRefusal),
+
+    /// A commit ceiling read from the stored closure records was selected
+    /// from a ledger a Schema rebuild replaced while it was read: what it
+    /// read may belong to neither ledger. Nothing is answered; a new lookup
+    /// answers from the ledger in place, or is refused while a rebuild is
+    /// owed.
+    #[error("the closure ledger was replaced while a commit ceiling was read from it")]
+    ClosureLedgerReplaced,
 }
 
 /// `key` as text for a message: printable ASCII as it is, every other byte

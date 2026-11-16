@@ -231,6 +231,115 @@ fn a_stalled_stored_ceiling_read_holds_up_no_apply() {
     assert_eq!(reader.join().expect("read").expect("ceiling"), 10);
 }
 
+/// A store whose ledger answers position 5 from its stored records, under
+/// an anchor that retirement moved to position 3 (ceiling 30): entries
+/// `1..=n` committing at `index * 10`, closed at 31. Position 5's ceiling is
+/// 50, read from its record.
+fn retired_ledger(engine: &StorageEngine) {
+    let positions =
+        u64::try_from(crate::engine::closure_ledger::CACHED_BREAKPOINTS).expect("small") + 9;
+    for index in 1..=positions {
+        closure_entry(engine, index, &[index * 10], 0);
+    }
+    // No snapshot serves a read below the bound: the bound retires 1..=3.
+    engine.set_gc_watermark(1_000);
+    closure_entry(engine, positions + 1, &[], 31);
+    assert_eq!(engine.commit_ceiling_through(2).expect("ceiling"), 30);
+    assert!(
+        matches!(
+            engine.commit_ceiling_at(5).expect("ceiling"),
+            CommitCeiling::Stored(_)
+        ),
+        "position 5 is answered from memory"
+    );
+    assert_eq!(engine.commit_ceiling_through(5).expect("ceiling"), 50);
+}
+
+/// A copy of a Schema partition from another store whose ledger holds
+/// breakpoints at positions 1 and 2 only (ceilings 5 and 6): position 5's
+/// ceiling there is 6, from the record at 2.
+fn other_schema_copy() -> (tempfile::TempDir, PartitionCopy) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let source = StorageEngine::open(&config(dir.path())).expect("open source");
+    closure_entry(&source, 1, &[5], 0);
+    closure_entry(&source, 2, &[6], 0);
+    assert_eq!(source.commit_ceiling_through(5).expect("ceiling"), 6);
+    let copy = source.copy_partition(Partition::Schema).expect("copy");
+    (dir, copy)
+}
+
+/// Start `engine.commit_ceiling_through(5)` and hold its read of the stored
+/// record, as a disk that stopped answering would.
+fn stalled_read(
+    engine: &std::sync::Arc<StorageEngine>,
+) -> std::thread::JoinHandle<StorageResult<u64>> {
+    super::breakpoint_read_gate::hold();
+    let reader = std::thread::spawn({
+        let engine = std::sync::Arc::clone(engine);
+        move || engine.commit_ceiling_through(5)
+    });
+    while super::breakpoint_read_gate::waiting() == 0 {
+        std::thread::yield_now();
+    }
+    reader
+}
+
+/// A stored-ceiling read selected from one ledger and continued after a
+/// Schema transfer cleared that ledger's tree, before the transfer installed
+/// its own: it is refused. Answered, it read the transfer's records with the
+/// former ledger's anchor and returned 30 for a position whose ceiling was
+/// 50, a prefix shorter than the one applied.
+#[test]
+fn a_stored_ceiling_read_continued_into_an_unfinished_transfer_is_refused() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let engine = std::sync::Arc::new(StorageEngine::open(&config(dir.path())).expect("open"));
+    retired_ledger(&engine);
+    let (_source, copy) = other_schema_copy();
+
+    let reader = stalled_read(&engine);
+    let repair = engine
+        .begin_partition_rebuild(Partition::Schema, &copy.rows)
+        .expect("begin the transfer");
+    super::breakpoint_read_gate::release();
+    let answer = reader.join().expect("read");
+    assert!(
+        answer.is_err(),
+        "a ceiling answered from a ledger the transfer cleared: {answer:?}"
+    );
+    drop(repair);
+}
+
+/// A stored-ceiling read selected from one ledger and continued after a
+/// Schema transfer installed another one in full: it is refused, so its
+/// caller selects again from the ledger in place. Answered, it read the new
+/// tree's records with the former ledger's anchor and returned 30 for a
+/// position whose ceiling in the new ledger is 6.
+#[test]
+fn a_stored_ceiling_read_continued_past_a_finished_transfer_is_refused() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let engine = std::sync::Arc::new(StorageEngine::open(&config(dir.path())).expect("open"));
+    retired_ledger(&engine);
+    let (_source, copy) = other_schema_copy();
+
+    let reader = stalled_read(&engine);
+    let repair = engine
+        .begin_partition_rebuild(Partition::Schema, &copy.rows)
+        .expect("begin the transfer");
+    let finished = engine.finish_raft_rebuild(repair, 7, &[]);
+    super::breakpoint_read_gate::release();
+    finished.expect("finish the transfer");
+    let answer = reader.join().expect("read");
+    assert!(
+        answer.is_err(),
+        "a ceiling answered across the ledger's replacement: {answer:?}"
+    );
+    assert_eq!(
+        engine.commit_ceiling_through(5).expect("ceiling"),
+        6,
+        "the installed ledger answers"
+    );
+}
+
 /// A store holding the head where an earlier layout kept it, among the
 /// application's Schema rows, is refused when it opens and when its ledger
 /// is read: read as having no ledger, every prefix would look closed.

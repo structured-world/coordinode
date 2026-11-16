@@ -4027,9 +4027,13 @@ impl StorageEngine {
     /// partition, which no copy rebuilds.
     fn record_kept(&self, partition: Partition, kept: &Rows) -> StorageResult<()> {
         let kept = if partition == Partition::Schema {
-            // From the clear on, the ledger in memory is not the tree's.
+            // From the clear on, the ledger in memory is not the tree's: a
+            // stored record read for it from here on answers nothing.
+            let mut state = self.closure.lock();
+            state.installation += 1;
             self.ledger_owed
                 .store(true, std::sync::atomic::Ordering::Release);
+            drop(state);
             encode_kept_rows(kept)?
         } else {
             Vec::new()
@@ -8230,7 +8234,9 @@ impl StorageEngine {
         }
         Ok(match state.ledger.ceiling_at(index) {
             crate::engine::closure_ledger::Ceiling::Known(ceiling) => CommitCeiling::Known(ceiling),
-            crate::engine::closure_ledger::Ceiling::Stored(stored) => CommitCeiling::Stored(stored),
+            crate::engine::closure_ledger::Ceiling::Stored(stored) => {
+                CommitCeiling::Stored(stored.installed_in(state.installation))
+            }
         })
     }
 
@@ -8240,17 +8246,25 @@ impl StorageEngine {
     ///
     /// # Errors
     ///
-    /// The breakpoint records could not be read.
+    /// The breakpoint records could not be read, or
+    /// [`StorageError::ClosureLedgerReplaced`]: a Schema rebuild replaced the
+    /// ledger `stored` was selected from while it was read.
     pub fn read_stored_ceiling(&self, stored: StoredCeiling) -> StorageResult<u64> {
-        if let Some(ceiling) = stored.find(&StoredBreakpoints(self))? {
-            return Ok(ceiling);
-        }
-        // Found empty: perhaps retired under the read, which the ledger
-        // answers from memory.
+        let found = stored.find(&StoredBreakpoints(self))?;
+        // Checked once the read is done: a rebuild raises the installation
+        // before it clears the tree, under this lock, so a read that met any
+        // of its writes sees the installation moved.
         let state = self.closure.lock();
-        Ok(state
-            .ledger
-            .ceiling_unstored(stored, state.prepared.as_ref()))
+        if state.installation != stored.installation() {
+            return Err(StorageError::ClosureLedgerReplaced);
+        }
+        Ok(found.unwrap_or_else(|| {
+            // Found empty: perhaps retired under the read, which the ledger
+            // answers from memory.
+            state
+                .ledger
+                .ceiling_unstored(stored, state.prepared.as_ref())
+        }))
     }
 
     /// Read the closed bound and the commit ceilings of the log applied here
@@ -8272,8 +8286,11 @@ impl StorageEngine {
         );
         self.closure_held
             .store(ledger.held(), std::sync::atomic::Ordering::Release);
-        *self.closure.lock() = ClosureState {
+        let mut state = self.closure.lock();
+        let installation = state.installation + 1;
+        *state = ClosureState {
             ledger,
+            installation,
             ..ClosureState::default()
         };
         Ok(())
@@ -9670,6 +9687,10 @@ struct ClosureState {
     pending: Vec<(u64, u64)>,
     /// The plan of the entry whose records are being written.
     prepared: Option<crate::engine::closure_ledger::ClosurePlan>,
+    /// Which installation of the ledger this is: raised when a Schema rebuild
+    /// clears the tree and when a ledger is loaded into memory, so a stored
+    /// record read for one installation is not answered by another.
+    installation: u64,
 }
 
 /// The breakpoint records in the Schema tree's reserved namespace, read by

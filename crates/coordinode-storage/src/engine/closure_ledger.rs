@@ -392,6 +392,7 @@ impl ClosureLedger {
             from: self.anchor_through + 1,
             through: index,
             otherwise: self.anchor_ceiling,
+            installation: 0,
         })
     }
 }
@@ -413,15 +414,31 @@ pub(crate) enum Ceiling {
 /// by retirement, oldest first (breakpoints are added only past the cached
 /// ones): a record found is still the newest at or before the position, and
 /// a range found empty may have been retired under the read, which the
-/// ledger then answers itself from memory.
+/// ledger then answers itself from memory. The range and the anchor are the
+/// ones of a single installation of the ledger, which the read is bound to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoredCeiling {
     from: u64,
     through: u64,
     otherwise: u64,
+    installation: u64,
 }
 
 impl StoredCeiling {
+    /// This read, bound to `installation`, the ledger it was selected from.
+    #[must_use]
+    pub(crate) fn installed_in(self, installation: u64) -> Self {
+        Self {
+            installation,
+            ..self
+        }
+    }
+
+    /// The installation of the ledger this read was selected from.
+    pub(crate) fn installation(self) -> u64 {
+        self.installation
+    }
+
     /// Read the ceiling from `held`, with no retirement under the read.
     ///
     /// # Errors
