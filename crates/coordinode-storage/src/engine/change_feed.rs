@@ -68,6 +68,10 @@ pub enum Target<'u> {
         /// The activation, distinct for every change.
         activation: u64,
     },
+    /// What a blob owner holds: a node's large property, a stored object or
+    /// an S3 object, by its owner key. A put carries the owner record (the
+    /// blob it now holds), not the blob's bytes.
+    BlobOwner(Cow<'u, [u8]>),
 }
 
 /// The labels a node carried before and after its event, its type's
@@ -245,6 +249,14 @@ fn changes_application_data(m: &Mutation) -> bool {
 /// A relationship's identity: type name, source, target.
 type Pair<'u> = (&'u [u8], u64, u64);
 
+/// What a change outside nodes and relationships is.
+enum Component {
+    /// A blob owner's record: readers receive it.
+    BlobOwner,
+    /// A record kept for the engine's own work.
+    Internal,
+}
+
 struct Projector<'u> {
     mutations: &'u [Mutation],
     effects: &'u UnitEffects,
@@ -259,6 +271,9 @@ struct Projector<'u> {
     /// change: a later change of the same node in the unit starts from
     /// them, not from the labels it had before the unit.
     left: rustc_hash::FxHashMap<Cow<'u, [u8]>, Cow<'u, [LabelId]>>,
+    /// The node records and versions the unit writes or removes: a history
+    /// assertion stands for one of them.
+    versions: FxHashSet<&'u [u8]>,
     events: Vec<LogicalEvent<'u>>,
 }
 
@@ -270,6 +285,7 @@ impl<'u> Projector<'u> {
             removed: FxHashSet::default(),
             named: FxHashSet::default(),
             left: rustc_hash::FxHashMap::default(),
+            versions: FxHashSet::default(),
             events: Vec::new(),
         }
     }
@@ -334,6 +350,20 @@ impl<'u> Projector<'u> {
     /// last change removes them, read before any event so a property
     /// tombstone that comes before its pair's removal is classified right.
     fn collect_presence(&mut self) -> Result<(), ProjectionError> {
+        for mutation in self.mutations {
+            if let Mutation::Put {
+                partition: PartitionId::Node,
+                key,
+                ..
+            }
+            | Mutation::Delete {
+                partition: PartitionId::Node,
+                key,
+            } = mutation
+            {
+                self.versions.insert(key);
+            }
+        }
         for mutation in self.mutations {
             let Mutation::Merge {
                 partition: PartitionId::Adj,
@@ -478,7 +508,82 @@ impl<'u> Projector<'u> {
                 let target = edge_target(Cow::Borrowed(key))?;
                 self.emit(Action::Put, target, Some(value), None)
             }
-            _ => Ok(()),
+            _ => match self.component(partition, key)? {
+                Component::BlobOwner => self.emit(
+                    Action::Put,
+                    Target::BlobOwner(Cow::Borrowed(key)),
+                    Some(value),
+                    None,
+                ),
+                Component::Internal => Ok(()),
+            },
+        }
+    }
+
+    /// What a change of `key` in `partition`, outside nodes and
+    /// relationships, is: a blob owner's record, which readers receive, or
+    /// a record kept for the engine's own work, which they do not. A record
+    /// of neither kind is refused, never passed over.
+    fn component(&self, partition: PartitionId, key: &[u8]) -> Result<Component, ProjectionError> {
+        use coordinode_core::graph::blob;
+        match partition {
+            PartitionId::BlobRef => {
+                let owner = [
+                    blob::PROPERTY_OWNER_PREFIX,
+                    blob::DIRECT_OWNER_PREFIX,
+                    blob::S3_OWNER_PREFIX,
+                ];
+                // The catalog of copies, staged uploads, release candidates,
+                // retired copies and the collector's own records: how the
+                // blobs owners hold are kept, not what they hold.
+                let internal = [
+                    blob::CATALOG_PREFIX,
+                    blob::STAGING_PREFIX,
+                    blob::CANDIDATE_PREFIX,
+                    blob::RETIRED_PREFIX,
+                    blob::COMPACTION_PENDING_KEY,
+                    blob::COLLECTOR_STATE_KEY,
+                ];
+                if owner.iter().any(|p| key.starts_with(p)) {
+                    Ok(Component::BlobOwner)
+                } else if internal.iter().any(|p| key.starts_with(p)) {
+                    Ok(Component::Internal)
+                } else {
+                    Err(ProjectionError::Unsupported(
+                        "it changes a blob record of no known kind".into(),
+                    ))
+                }
+            }
+            // Bytes of blob contents, shared by every owner of the content
+            // and resolved through the catalog: their owners' records are the
+            // changes.
+            PartitionId::Blob => Ok(Component::Internal),
+            // A temporal version's history assertion is written with the
+            // version itself, whose change is the event.
+            PartitionId::NodeHistory => {
+                let id = coordinode_core::graph::node::decode_node_history_key(key)
+                    .ok_or_else(|| ProjectionError::Malformed("a history assertion key".into()))?;
+                let version = coordinode_core::graph::node::encode_temporal_node_key(
+                    id.shard_id,
+                    id.node_id,
+                    id.valid_from,
+                );
+                if self.versions.contains(version.as_slice()) {
+                    Ok(Component::Internal)
+                } else {
+                    Err(ProjectionError::Unsupported(
+                        "it asserts history of a version it does not change".into(),
+                    ))
+                }
+            }
+            // The f32 copy a vector index keeps beside the node's record is
+            // written outside transactions; one written in a unit is not a
+            // change the feed knows how to read.
+            PartitionId::VectorF32 => Err(ProjectionError::Unsupported(
+                "it writes a vector index's copy in a transaction".into(),
+            )),
+            // Index entries, counters, the catalog and consensus records.
+            _ => Ok(Component::Internal),
         }
     }
 
@@ -509,7 +614,13 @@ impl<'u> Projector<'u> {
             }
             // A whole adjacency list goes with its node: the relationships it
             // held are named by forward removals or the context.
-            _ => Ok(()),
+            PartitionId::Adj => Ok(()),
+            _ => match self.component(partition, &key)? {
+                Component::BlobOwner => {
+                    self.emit(Action::Remove, Target::BlobOwner(key), None, None)
+                }
+                Component::Internal => Ok(()),
+            },
         }
     }
 
@@ -552,7 +663,13 @@ impl<'u> Projector<'u> {
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            _ => match self.component(partition, key)? {
+                // A blob owner's record is written whole, never merged.
+                Component::BlobOwner => Err(ProjectionError::Unsupported(
+                    "it merges into a blob owner's record".into(),
+                )),
+                Component::Internal => Ok(()),
+            },
         }
     }
 
@@ -568,7 +685,16 @@ impl<'u> Projector<'u> {
             PartitionId::Node | PartitionId::EdgeProp | PartitionId::Adj
         );
         if !projected {
-            return Ok(());
+            // A range names no blob owner or history assertion it removes,
+            // and no writer removes those by range.
+            return match partition {
+                PartitionId::BlobRef | PartitionId::NodeHistory | PartitionId::VectorF32 => {
+                    Err(ProjectionError::Unsupported(format!(
+                        "it removes a {partition:?} key range that names no logical targets"
+                    )))
+                }
+                _ => Ok(()),
+            };
         }
         if !is_run {
             return Err(ProjectionError::Unsupported(
@@ -754,19 +880,40 @@ fn run_keys(start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>, ProjectionError> {
 }
 
 /// What a reader of the feed is interested in: nodes routed by some labels,
-/// relationships of some types. `None` takes every one of that kind; an
-/// empty list takes none.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// relationships of some types, and whether blob objects. `None` takes every
+/// one of that kind; an empty list takes none.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interest {
     labels: Option<Vec<LabelId>>,
     edge_types: Option<Vec<Vec<u8>>>,
+    /// Whether the reader follows the blob objects owners hold: a node's
+    /// large property, a stored object, an S3 object. They belong to no
+    /// label, so a label interest does not choose them.
+    blobs: bool,
 }
 
 impl Interest {
     /// Every event.
     #[must_use]
     pub fn all() -> Self {
-        Self::default()
+        Self {
+            labels: None,
+            edge_types: None,
+            blobs: true,
+        }
+    }
+
+    /// The same interest, following blob objects or not.
+    #[must_use]
+    pub fn with_blobs(mut self, blobs: bool) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
+    /// Whether it follows blob objects.
+    #[must_use]
+    pub fn blobs(&self) -> bool {
+        self.blobs
     }
 
     /// The label identities whose node events it takes, in identity order;
@@ -778,7 +925,8 @@ impl Interest {
 
     /// Node events routed by any of `labels` before or after them, and
     /// relationship events of any of `edge_types`; `None` for either takes
-    /// every event of that kind.
+    /// every event of that kind. No blob object: [`Self::with_blobs`] adds
+    /// them.
     #[must_use]
     pub fn new(labels: Option<Vec<LabelId>>, edge_types: Option<Vec<Vec<u8>>>) -> Self {
         let labels = labels.map(|mut l| {
@@ -791,7 +939,11 @@ impl Interest {
             t.dedup();
             t
         });
-        Self { labels, edge_types }
+        Self {
+            labels,
+            edge_types,
+            blobs: false,
+        }
     }
 
     /// How `event` reaches this reader: `None` when it does not.
@@ -811,6 +963,7 @@ impl Interest {
             }
             // Routed above: every node and scope event carries its labels.
             Target::Node(_) | Target::Scope { .. } => return Some(Delivery::Apply),
+            Target::BlobOwner(_) => return self.blobs.then_some(Delivery::Apply),
         };
         let wanted = match &self.edge_types {
             None => true,
@@ -842,6 +995,7 @@ impl Interest {
                 }
             }
         }
+        out.push(u8::from(self.blobs));
     }
 }
 
@@ -1070,10 +1224,15 @@ impl ChangeCursor {
             }
             _ => return Err(CursorError::Malformed("an unknown type interest")),
         };
+        let blobs = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(CursorError::Malformed("an unknown blob interest")),
+        };
         if !r.0.is_empty() {
             return Err(CursorError::Malformed("bytes after the cursor"));
         }
-        let interest = Interest::new(labels.clone(), edge_types.clone());
+        let interest = Interest::new(labels.clone(), edge_types.clone()).with_blobs(blobs);
         if interest.labels != labels || interest.edge_types != edge_types {
             return Err(CursorError::Malformed("an interest not in canonical order"));
         }
@@ -1180,6 +1339,8 @@ pub enum OwnedTarget {
         /// The activation, distinct for every change.
         activation: u64,
     },
+    /// What a blob owner holds, by its owner key.
+    BlobOwner(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 impl From<&Target<'_>> for OwnedTarget {
@@ -1201,6 +1362,7 @@ impl From<&Target<'_>> for OwnedTarget {
                 label: *label,
                 activation: *activation,
             },
+            Target::BlobOwner(key) => Self::BlobOwner(key.to_vec()),
         }
     }
 }
@@ -1307,7 +1469,8 @@ pub(crate) fn event_bytes(event: &LogicalEvent<'_>) -> u64 {
     let target = match &event.target {
         Target::Node(key)
         | Target::RelationshipProperties(key)
-        | Target::RelationshipInstance(key) => key.len(),
+        | Target::RelationshipInstance(key)
+        | Target::BlobOwner(key) => key.len(),
         Target::Relationship { edge_type, .. } => edge_type.len(),
         Target::Scope { .. } => 0,
     };

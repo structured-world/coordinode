@@ -103,6 +103,7 @@ impl CutScope {
                 self.holds_key(&key)
             }
             Target::Scope { .. } => self.partition == Partition::Node,
+            Target::BlobOwner(key) => self.partition == Partition::BlobRef && self.holds_key(key),
         }
     }
 

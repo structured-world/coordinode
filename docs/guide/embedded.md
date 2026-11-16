@@ -372,7 +372,11 @@ events of their own.
 
 A `ChangeInterest` names the labels whose nodes the reader follows and the
 relationship types it follows (`None` takes all of that kind, an empty list
-none). A node event reaches the reader when the node carries one of its
+none), and whether it follows blob objects (`blobs`): what each owner holds
+(an object from `upload_blob`, an S3 object, a node's large property), as a
+`Put` of `OwnedTarget::BlobOwner` with the owner record as its payload and
+a `Remove` when it goes; `BlobId::owner_key` names an uploaded object's
+owner. A blob's bytes are not in the event. A node event reaches the reader when the node carries one of its
 labels before or after the change, with its `delivery`: `Enter` (it joins the
 scope, with the record written), `Apply`, or `Leave` (deleted, relabelled or
 retyped out of the scope). The labels before a deletion or relabelling come

@@ -25,6 +25,10 @@ pub struct ChangeInterest {
     pub labels: Option<Vec<String>>,
     /// Relationship types whose relationships the reader follows.
     pub edge_types: Option<Vec<String>>,
+    /// Whether the reader follows blob objects: what each owner (a stored
+    /// object, an S3 object, a node's large property) holds, put and
+    /// removed. They belong to no label.
+    pub blobs: bool,
 }
 
 /// A read of committed changes: whole units with the events the reader's
@@ -47,9 +51,11 @@ impl Database {
             interest.edge_types.as_deref(),
         )
         .map_err(coordinode_query::executor::ExecutionError::from)?;
-        resolved.map_err(|refusal| match refusal {
-            InterestRefusal::Unbound(_) => DatabaseError::Semantic(refusal.to_string()),
-        })
+        resolved
+            .map(|resolved| resolved.with_blobs(interest.blobs))
+            .map_err(|refusal| match refusal {
+                InterestRefusal::Unbound(_) => DatabaseError::Semantic(refusal.to_string()),
+            })
     }
 
     /// A cursor after every change committed and durable now: a reader

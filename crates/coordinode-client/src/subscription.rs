@@ -47,6 +47,7 @@ pub struct SubscribeOptions {
     from: Option<Cursor>,
     labels: Option<Vec<String>>,
     edge_types: Option<Vec<String>>,
+    blobs: bool,
     window: u32,
 }
 
@@ -61,6 +62,7 @@ impl SubscribeOptions {
             from: None,
             labels: None,
             edge_types: None,
+            blobs: false,
             window: DEFAULT_WINDOW,
         }
     }
@@ -95,6 +97,12 @@ impl SubscribeOptions {
         self
     }
 
+    /// Follow blob objects too: what each owner holds, put and removed.
+    pub fn blobs(mut self, blobs: bool) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
     /// Grant the server `entries` log entries at a time (at least 1).
     pub fn window(mut self, entries: u32) -> Self {
         self.window = entries.max(1);
@@ -118,6 +126,7 @@ impl SubscribeOptions {
             interest: Some(ChangeInterest {
                 labels: names(&self.labels),
                 edge_types: names(&self.edge_types),
+                blobs: self.blobs,
             }),
             consumer_id: self.consumer_id.clone(),
             incarnation: self.incarnation,
@@ -208,6 +217,9 @@ pub enum ChangeTarget {
         /// The version or discriminator, in its key encoding.
         instance: Vec<u8>,
     },
+    /// What a blob owner holds, by its owner key; a put's payload is the
+    /// owner record.
+    BlobOwner(Vec<u8>),
     /// A type whose implied labels changed: the event's labels before and
     /// after name it and what it implied before and implies after.
     Scope {
@@ -308,6 +320,7 @@ impl ChangeEvent {
                 label: s.label,
                 activation: s.activation,
             },
+            logical_change::Target::BlobOwner(key) => ChangeTarget::BlobOwner(key),
         });
         Self {
             ordinal: event.ordinal,

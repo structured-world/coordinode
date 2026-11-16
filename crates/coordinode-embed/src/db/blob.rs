@@ -63,7 +63,10 @@ impl BlobId {
         Self(id)
     }
 
-    fn owner_key(&self) -> Vec<u8> {
+    /// The key of the blob's owner: what names it in a change event of a
+    /// reader following blob objects.
+    #[must_use]
+    pub fn owner_key(&self) -> Vec<u8> {
         direct_owner_key(&self.0)
     }
 }

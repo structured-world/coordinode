@@ -422,8 +422,8 @@ fn a_unit_without_a_readable_context_is_unsupported() {
 }
 
 /// A relationship's presence follows its forward adjacency change; the
-/// reverse twin, history rows and index entries are its physical forms and
-/// add nothing. A property record of the pair is its own component.
+/// reverse twin and index entries are its physical forms and add nothing. A
+/// property record of the pair is its own component.
 #[test]
 fn reverse_adjacency_and_derived_rows_add_no_events() {
     let props = vec![0x80];
@@ -433,7 +433,6 @@ fn reverse_adjacency_and_derived_rows_add_no_events() {
         adj("adj:KNOWS:in:3", encode_add(1)),
         put(PartitionId::EdgeProp, pair("KNOWS", 1, 2), props.clone()),
         put(PartitionId::Idx, b"idx:x".to_vec(), Vec::new()),
-        put(PartitionId::NodeHistory, b"nodehist:x".to_vec(), vec![1]),
         context(Vec::new(), Vec::new(), Vec::new()),
     ];
     let events = project_unit(&unit).expect("project");
@@ -633,6 +632,84 @@ fn ordinals_follow_the_units_order() {
         vec![0, 1, 2]
     );
     assert_eq!(project_unit(&unit).expect("project"), first);
+}
+
+/// Records outside nodes and relationships: a blob owner's record is a put
+/// and a removal of that owner; the catalog, staging and payload records
+/// add nothing; a history assertion goes with the version it states and is
+/// refused without it; a blob record of no known kind, a vector index copy
+/// and a range over owners are refused, never passed over.
+#[test]
+fn components_are_projected_or_refused_never_passed_over() {
+    use coordinode_core::graph::blob::{CATALOG_PREFIX, DIRECT_OWNER_PREFIX, STAGING_PREFIX};
+    use coordinode_core::graph::node::{encode_node_history_prefix, encode_temporal_node_key};
+    let owner = [DIRECT_OWNER_PREFIX, b"o1"].concat();
+    let unit = vec![
+        put(
+            PartitionId::BlobRef,
+            [STAGING_PREFIX, b"1"].concat(),
+            vec![1],
+        ),
+        put(
+            PartitionId::BlobRef,
+            [CATALOG_PREFIX, b"c"].concat(),
+            vec![2],
+        ),
+        put(PartitionId::Blob, b"blob:c".to_vec(), vec![3]),
+        put(PartitionId::BlobRef, owner.clone(), b"record".to_vec()),
+        delete(PartitionId::BlobRef, owner.clone()),
+        context(Vec::new(), Vec::new(), Vec::new()),
+    ];
+    assert_eq!(
+        shape(&project_unit(&unit).expect("project")),
+        vec![
+            (
+                0,
+                Action::Put,
+                Target::BlobOwner(Cow::Borrowed(owner.as_slice()))
+            ),
+            (
+                1,
+                Action::Remove,
+                Target::BlobOwner(Cow::Borrowed(owner.as_slice()))
+            ),
+        ]
+    );
+
+    let mut history = encode_node_history_prefix(0, NodeId::from_raw(4), 100);
+    history.extend_from_slice(&9u64.to_be_bytes());
+    let version = encode_temporal_node_key(0, NodeId::from_raw(4), 100);
+    let with_version = vec![
+        put(PartitionId::NodeHistory, history.clone(), vec![1]),
+        put(PartitionId::Node, version.clone(), record(&[3])),
+        context(
+            vec![NodeBasis {
+                key: version,
+                labels: labels(&[3]),
+            }],
+            Vec::new(),
+            Vec::new(),
+        ),
+    ];
+    assert_eq!(project_unit(&with_version).expect("project").len(), 1);
+
+    for refused in [
+        vec![put(PartitionId::NodeHistory, history, vec![1])],
+        vec![put(PartitionId::BlobRef, b"blobnew:x".to_vec(), vec![1])],
+        vec![put(PartitionId::VectorF32, b"vec:x".to_vec(), vec![1])],
+        vec![Mutation::RemoveRange {
+            partition: PartitionId::BlobRef,
+            start: DIRECT_OWNER_PREFIX.to_vec(),
+            end: b"blobmeta;".to_vec(),
+        }],
+    ] {
+        let mut unit = refused;
+        unit.push(context(Vec::new(), Vec::new(), Vec::new()));
+        assert!(
+            matches!(project_unit(&unit), Err(ProjectionError::Unsupported(_))),
+            "{unit:?}"
+        );
+    }
 }
 
 /// The place in entry 7 at unit `sub`, ordinal `ordinal`.

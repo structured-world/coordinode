@@ -34,6 +34,7 @@ fn interest(labels: Option<&[&str]>, edge_types: Option<&[&str]>) -> ChangeInter
     ChangeInterest {
         labels: labels.map(|l| l.iter().map(|s| (*s).to_string()).collect()),
         edge_types: edge_types.map(|t| t.iter().map(|s| (*s).to_string()).collect()),
+        blobs: false,
     }
 }
 
@@ -200,6 +201,7 @@ fn relationship_actions(units: &[UnitChanges]) -> Vec<Vec<(Action, &'static str)
                         OwnedTarget::RelationshipInstance(_) => "instance",
                         OwnedTarget::Node(_) => "node",
                         OwnedTarget::Scope { .. } => "scope",
+                        OwnedTarget::BlobOwner(_) => "blob",
                     };
                     (e.action, kind)
                 })
@@ -393,6 +395,53 @@ fn dropping_a_table_with_rows_removes_each_row() {
     assert_eq!(
         node_deliveries(&dropping[0].events),
         vec![(Action::Remove, Delivery::Leave); 2]
+    );
+}
+
+/// A stored object put and deleted through the blob API reaches a reader of
+/// blob objects as a put of its owner, carrying the owner record, and a
+/// removal; the upload's staging, the catalog and the reference counts add
+/// nothing; a reader of labels receives none of it.
+#[test]
+fn a_blob_owner_is_put_and_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    let start_blobs = db
+        .change_cursor(&ChangeInterest {
+            blobs: true,
+            ..ChangeInterest::default()
+        })
+        .expect("cursor");
+    let start_people = db
+        .change_cursor(&interest(Some(&["Person"]), None))
+        .expect("cursor");
+    let uploaded = db.upload_blob(&vec![7u8; 100_000], None).expect("upload");
+    let held = db.blob_record(&uploaded.id).expect("record").expect("held");
+    db.delete_blob(&uploaded.id).expect("delete");
+
+    let blobs = events(&read_all(&db, &mut start_blobs.clone()));
+    let owner = uploaded.id.owner_key();
+    assert_eq!(
+        blobs
+            .iter()
+            .map(|e| (e.action, e.target.clone(), e.payload.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                Action::Put,
+                OwnedTarget::BlobOwner(owner.clone()),
+                Some(held.to_msgpack().expect("record"))
+            ),
+            (Action::Remove, OwnedTarget::BlobOwner(owner), None),
+        ],
+        "{blobs:?}"
+    );
+    run(&mut db, "CREATE (:Person {name: 'after'})");
+    let people = events(&read_all(&db, &mut start_people.clone()));
+    assert_eq!(
+        node_deliveries(&people),
+        vec![(Action::Put, Delivery::Enter)],
+        "{people:?}"
     );
 }
 

@@ -289,6 +289,7 @@ fn a_batch_that_skips_or_reads_otherwise_is_refused() {
             &ChangeInterest {
                 labels: Some(vec!["Person".into()]),
                 edge_types: None,
+                blobs: false,
             },
         )
         .expect("cursor");

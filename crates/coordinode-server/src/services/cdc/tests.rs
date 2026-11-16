@@ -115,10 +115,11 @@ fn fixture(
 }
 
 impl Fixture {
-    /// A cursor at `position` following every change.
+    /// A cursor at `position` with the interest a request naming none has:
+    /// every node and relationship, no blob object.
     fn cursor_at(&self, position: u64) -> Vec<u8> {
         self.engine
-            .change_cursor_at(position, Interest::all())
+            .change_cursor_at(position, Interest::new(None, None))
             .expect("cursor")
             .to_bytes()
     }
@@ -411,6 +412,7 @@ async fn subscribe_refuses_requests_it_cannot_serve() {
         edge_types: Some(NameList {
             names: names.iter().map(|n| (*n).to_string()).collect(),
         }),
+        blobs: false,
     };
     let cases = [
         (register("", strict()), "no consumer id"),
@@ -441,6 +443,7 @@ async fn subscribe_refuses_requests_it_cannot_serve() {
                         names: vec!["NeverBound".into()],
                     }),
                     edge_types: None,
+                    blobs: false,
                 }),
                 ..register("c", strict())
             },
@@ -821,6 +824,7 @@ async fn a_label_a_type_implies_receives_its_nodes_and_scope_changes() {
                 names: vec![label.to_string()],
             }),
             edge_types: Some(NameList { names: Vec::new() }),
+            blobs: false,
         }),
         ..register(id, strict())
     };
@@ -906,6 +910,7 @@ async fn an_interest_taking_nothing_still_moves_a_cursor_the_client_can_acknowle
                 edge_types: Some(NameList {
                     names: vec!["NEVER_WRITTEN".to_string()],
                 }),
+                blobs: false,
             }),
             ..register("filtered", strict())
         }))

@@ -371,9 +371,11 @@ fn interest(engine: &StorageEngine, proto: Option<ProtoInterest>) -> Result<Inte
     let edge_types = proto.edge_types.map(|t| t.names);
     let resolved = resolve_change_interest(engine, labels.as_deref(), edge_types.as_deref())
         .map_err(|e| Status::internal(format!("the catalog: {e}")))?;
-    resolved.map_err(|refusal| match refusal {
-        InterestRefusal::Unbound(_) => Status::invalid_argument(refusal.to_string()),
-    })
+    resolved
+        .map(|resolved| resolved.with_blobs(proto.blobs))
+        .map_err(|refusal| match refusal {
+            InterestRefusal::Unbound(_) => Status::invalid_argument(refusal.to_string()),
+        })
 }
 
 impl ChangeEventServiceImpl {
@@ -887,6 +889,7 @@ fn event_to_proto(
                 activation: *activation,
             })
         }
+        OwnedTarget::BlobOwner(key) => logical_change::Target::BlobOwner(key.clone()),
     };
     let (labels_before, labels_after) = match &event.labels {
         Some((before, after)) => (names.names(engine, before)?, names.names(engine, after)?),
