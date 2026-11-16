@@ -55,8 +55,19 @@ impl Db {
         &self._fx.engine
     }
 
-    /// Run `stage` in one transaction and return the unit its commit sealed.
+    /// Run `stage` in one transaction, as a writer whose types (labels 1 to
+    /// 20) imply nothing, and return the unit its commit sealed.
     fn unit(&self, stage: impl FnOnce(&mut Transaction<'_>)) -> Vec<Mutation> {
+        self.unit_bare(|t| {
+            for raw in 1..=20 {
+                t.note_implication(label(raw), &[]);
+            }
+            stage(t);
+        })
+    }
+
+    /// [`Self::unit`] for a writer that records no implication.
+    fn unit_bare(&self, stage: impl FnOnce(&mut Transaction<'_>)) -> Vec<Mutation> {
         let engine = self.engine();
         let mut txn = Transaction::begin(engine, Some(&self.oracle), self.oracle.next());
         stage(&mut txn);
@@ -137,6 +148,42 @@ fn a_node_created_and_deleted_at_once_leaves_no_scope() {
             .expect("routing")
             .delivery(|l| l == label(3)),
         Delivery::None
+    );
+}
+
+/// A store writer giving an existing node another label, with no label
+/// lookup and no labels of its own at hand: the store binds the labels the
+/// node had, so a reader of the label gained sees the node enter and a
+/// reader of the type sees it stay.
+#[test]
+fn a_store_write_that_relabels_routes_by_the_labels_it_replaced() {
+    let db = Db::open();
+    db.unit(|t| LocalNodeStore.put(t, 0, id(5), &node(&[3])).expect("put"));
+    let unit = db.unit(|t| {
+        t.note_implication(label(3), &[]);
+        LocalNodeStore
+            .put(t, 0, id(5), &node(&[3, 9]))
+            .expect("put");
+    });
+    let events = project_unit(&unit).expect("project");
+    let routing = events[0].routing.as_ref().expect("routing");
+    assert_eq!(routing.delivery(|l| l == label(9)), Delivery::Enter);
+    assert_eq!(routing.delivery(|l| l == label(3)), Delivery::Apply);
+}
+
+/// A node change whose type's implication the unit does not record is
+/// refused by the projection, never routed as if the type implied nothing.
+#[test]
+fn a_node_change_without_its_types_implication_is_refused() {
+    let db = Db::open();
+    let unit = db.unit_bare(|t| LocalNodeStore.put(t, 0, id(6), &node(&[3])).expect("put"));
+    let projected = project_unit(&unit);
+    assert!(
+        matches!(
+            projected,
+            Err(coordinode_storage::engine::change_feed::ProjectionError::Malformed(_))
+        ),
+        "{projected:?}"
     );
 }
 

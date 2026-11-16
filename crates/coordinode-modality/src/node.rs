@@ -1064,6 +1064,10 @@ impl NodeStore for LocalNodeStore {
     ) -> StoreResult<()> {
         let key = encode_node_key(shard_id, node_id);
         let body = Self::encode_record(record)?;
+        // The labels the record replaces route the write to the subscribers
+        // of those it gains or loses: bound here once, unless the writer
+        // bound them already from its own read.
+        txn.note_node_basis(&key, None)?;
         txn.put(Partition::Node, &key, &body)?;
         Ok(())
     }
@@ -1223,6 +1227,8 @@ impl NodeStore for LocalNodeStore {
             }
             .encode(),
         )?;
+        // As for a non-temporal record: the version's labels before.
+        txn.note_node_basis(&key, None)?;
         txn.put(Partition::Node, &key, &body)?;
         Ok(())
     }

@@ -4163,7 +4163,33 @@ impl<'a> ExecutionContext<'a> {
         }
         self.sync_txn_state();
         self.stage_label_membership(shard_id, node_id, Some(&record.labels))?;
-        Ok(LocalNodeStore.put(&mut self.txn, shard_id, node_id, record)?)
+        LocalNodeStore.put(&mut self.txn, shard_id, node_id, record)?;
+        self.route_node_change(
+            &coordinode_core::graph::node::encode_node_key(shard_id, node_id),
+            Some(&record.labels),
+        )
+    }
+
+    /// Record, for the change feed, what the type of node `key` implies
+    /// before this transaction and after `after`, the labels it is written
+    /// with: the interpretation its change is routed by. Each type's
+    /// implications are compiled once per statement.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compile_implied`].
+    fn route_node_change(
+        &mut self,
+        key: &[u8],
+        after: Option<&[LabelId]>,
+    ) -> Result<(), ExecutionError> {
+        if let Some(&primary) = after.and_then(<[LabelId]>::first) {
+            self.compile_implied(primary)?;
+        }
+        if let Some(&primary) = self.txn.node_basis(key).and_then(<[LabelId]>::first) {
+            self.compile_implied(primary)?;
+        }
+        Ok(())
     }
 
     /// Whether `record` is checked before the commit under any label it
@@ -4246,6 +4272,9 @@ impl<'a> ExecutionContext<'a> {
             })?,
             None => Vec::new(),
         };
+        // The same read binds what routes the change in the feed, which the
+        // node store would otherwise read again.
+        self.txn.note_node_basis(&key, Some(&stored_before))?;
         let stored_after = labels.unwrap_or_default();
         if stored_before.len() == stored_after.len()
             && stored_before.iter().all(|l| stored_after.contains(l))
@@ -4566,14 +4595,22 @@ impl<'a> ExecutionContext<'a> {
             fields.valid_to,
             fields.deleted,
         );
-        Ok(LocalNodeStore.put_temporal(
+        LocalNodeStore.put_temporal(
             &mut self.txn,
             shard_id,
             node_id,
             valid_from_ms,
             record,
             bounds,
-        )?)
+        )?;
+        self.route_node_change(
+            &coordinode_core::graph::node::encode_temporal_node_key(
+                shard_id,
+                node_id,
+                valid_from_ms,
+            ),
+            Some(&record.labels),
+        )
     }
 
     /// Close the version of temporal node `node_id` that starts at
@@ -4629,7 +4666,15 @@ impl<'a> ExecutionContext<'a> {
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
         self.sync_txn_state();
-        Ok(LocalNodeStore.delete_temporal(&mut self.txn, shard_id, node_id, valid_from_ms)?)
+        LocalNodeStore.delete_temporal(&mut self.txn, shard_id, node_id, valid_from_ms)?;
+        self.route_node_change(
+            &coordinode_core::graph::node::encode_temporal_node_key(
+                shard_id,
+                node_id,
+                valid_from_ms,
+            ),
+            None,
+        )
     }
 
     /// MVCC-aware typed edge-property read. Hides the
@@ -4995,7 +5040,10 @@ impl<'a> ExecutionContext<'a> {
             }
         }
         LocalNodeStore.buffer_node_delta(&mut self.txn, shard_id, node_id, operand)?;
-        Ok(())
+        self.route_node_change(
+            &coordinode_core::graph::node::encode_node_key(shard_id, node_id),
+            None,
+        )
     }
 
     /// The node as this transaction leaves it, through a tracked read that
@@ -5083,7 +5131,11 @@ impl<'a> ExecutionContext<'a> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
         self.sync_txn_state();
         self.stage_label_membership(shard_id, node_id, None)?;
-        Ok(LocalNodeStore.delete(&mut self.txn, shard_id, node_id)?)
+        LocalNodeStore.delete(&mut self.txn, shard_id, node_id)?;
+        self.route_node_change(
+            &coordinode_core::graph::node::encode_node_key(shard_id, node_id),
+            None,
+        )
     }
 
     /// Flush MVCC write buffer to storage with a commit timestamp.

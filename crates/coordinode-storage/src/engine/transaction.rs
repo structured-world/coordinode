@@ -485,9 +485,11 @@ impl EffectContext {
             .into_iter()
             .collect();
         effects.runs = std::mem::take(&mut self.runs);
+        // A type implying nothing is recorded too: the projection refuses a
+        // node whose type the unit names no implication for, rather than
+        // read its absence as "nothing".
         effects.implications = std::mem::take(&mut self.implications)
             .into_iter()
-            .filter(|(_, implies)| !implies.is_empty())
             .map(|(label, implies)| coordinode_core::txn::proposal::Implication { label, implies })
             .collect();
         effects.scope_changes = std::mem::take(&mut self.scope_changes);
@@ -1274,6 +1276,12 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
+    /// The labels node `key` had before this attempt, as recorded for the
+    /// change feed; `None` before any writer bound them.
+    pub fn node_basis(&self, key: &[u8]) -> Option<&[coordinode_core::schema::label_id::LabelId]> {
+        self.effects.nodes.get(key).map(Vec::as_slice)
+    }
+
     /// Record that this attempt removes the relationship whose edge property
     /// key is `key` (a version's or discriminator's included) where no
     /// forward adjacency removal of the attempt names it: a whole adjacency
@@ -1290,8 +1298,10 @@ impl<'a> Transaction<'a> {
     /// Record what type label `label` implies, transitively (`implies`, its
     /// own label left out), as the writer routing a node of it read the
     /// catalog: the interpretation the change feed routes the attempt's node
-    /// effects by after the catalog changes. A type implying nothing is
-    /// recorded as such and sealed as nothing. The first record of a type
+    /// effects by after the catalog changes. Every type whose nodes the
+    /// attempt changes is recorded, one implying nothing included: the
+    /// change feed refuses a node change of a type it has no record for. The
+    /// first record of a type
     /// stands: a change of what it implies excludes the writers of the type,
     /// so one attempt reads one.
     pub fn note_implication(

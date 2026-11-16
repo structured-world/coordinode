@@ -105,9 +105,9 @@ struct TtlTarget {
     /// The labels `label` implies, which every node of it carries without
     /// storing them, by name.
     implied: Vec<String>,
-    /// The same labels by identity: the interpretation a reaped node's change
-    /// is routed by.
-    implied_ids: Vec<LabelId>,
+    /// What each type implies under the pass's catalog, by identity: the
+    /// interpretation a reaped node's change is routed by.
+    implied_of: Arc<FxHashMap<LabelId, Vec<LabelId>>>,
     /// The name of each label identity allocated when the pass began, to
     /// name the auxiliary labels a record stores.
     names: Arc<FxHashMap<LabelId, String>>,
@@ -128,8 +128,12 @@ impl TtlTarget {
     ) -> Result<(), String> {
         txn.note_node_basis(key, Some(&record.labels))
             .map_err(|e| e.to_string())?;
-        if record.labels.first() == Some(&self.label_id) {
-            txn.note_implication(self.label_id, &self.implied_ids);
+        if let Some(&primary) = record.labels.first() {
+            let implies = self
+                .implied_of
+                .get(&primary)
+                .ok_or_else(|| format!("node type {primary} was created after the pass began"))?;
+            txn.note_implication(primary, implies);
         }
         Ok(())
     }
@@ -457,6 +461,14 @@ fn discover_ttl_targets(
             .into_iter()
             .collect(),
     );
+    // What every type implies under the pass's catalog: a reaped node's
+    // type need not be the target's label, which it may carry as an
+    // auxiliary one, and its change is routed by its own type.
+    let mut implied_of = FxHashMap::default();
+    for &id in names.keys() {
+        implied_of.insert(id, catalog.implied_by(id).map_err(|e| e.to_string())?);
+    }
+    let implied_of: Arc<FxHashMap<LabelId, Vec<LabelId>>> = Arc::new(implied_of);
 
     let mut targets = Vec::new();
     for schema in schemas {
@@ -515,7 +527,7 @@ fn discover_ttl_targets(
                         RowKeyRelease::Unresolved => RowKeyRelease::Unresolved,
                     },
                     implied: implied.clone(),
-                    implied_ids: implied_ids.clone(),
+                    implied_of: Arc::clone(&implied_of),
                     names: Arc::clone(&names),
                     indexes: Arc::clone(&indexes),
                 });

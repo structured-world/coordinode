@@ -86,7 +86,7 @@ fn a_node_is_put_changed_and_removed() {
     assert_eq!(
         node_deliveries(&events),
         vec![
-            (Action::Put, Delivery::Apply),
+            (Action::Put, Delivery::Enter),
             (Action::Put, Delivery::Apply),
             (Action::Put, Delivery::Apply),
             (Action::Remove, Delivery::Leave),
@@ -632,13 +632,59 @@ fn a_label_a_type_implies_follows_the_nodes_of_the_type() {
     assert_eq!(
         node_deliveries(&person),
         vec![
-            (Action::Put, Delivery::Apply),
+            (Action::Put, Delivery::Enter),
             (Action::Put, Delivery::Apply),
             (Action::Remove, Delivery::Leave),
         ],
         "{person:?}"
     );
     assert!(events(&read_all(&db, &mut org)).is_empty());
+}
+
+/// A node of a type implying a label gains and loses an auxiliary label:
+/// the reader of the auxiliary label sees it enter and leave, the reader of
+/// the implied label sees every change apply until the node is removed.
+#[test]
+fn an_auxiliary_label_on_an_implying_type_routes_exactly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    run(
+        &mut db,
+        "CREATE NODE TYPE Manager IMPLIES (Person) WITH (name: STRING)",
+    );
+    run(&mut db, "CREATE (:Manager {name: 'm'})");
+    let mut person = db
+        .change_cursor(&interest(Some(&["Person"]), None))
+        .expect("cursor");
+    let mut admin = db
+        .change_cursor(&interest(Some(&["Admin"]), None))
+        .expect("cursor");
+    run(&mut db, "MATCH (n:Manager) SET n:Admin");
+    run(&mut db, "MATCH (n:Manager) REMOVE n:Admin");
+    run(&mut db, "MATCH (n:Manager) SET n:Admin");
+    run(&mut db, "MATCH (n:Manager) DELETE n");
+    let person = events(&read_all(&db, &mut person));
+    let admin = events(&read_all(&db, &mut admin));
+    assert_eq!(
+        node_deliveries(&person),
+        vec![
+            (Action::Put, Delivery::Apply),
+            (Action::Put, Delivery::Apply),
+            (Action::Put, Delivery::Apply),
+            (Action::Remove, Delivery::Leave),
+        ],
+        "{person:?}"
+    );
+    assert_eq!(
+        node_deliveries(&admin),
+        vec![
+            (Action::Put, Delivery::Enter),
+            (Action::Put, Delivery::Leave),
+            (Action::Put, Delivery::Enter),
+            (Action::Remove, Delivery::Leave),
+        ],
+        "{admin:?}"
+    );
 }
 
 /// The scope changes one reader receives: each one's type and activation,
@@ -705,10 +751,10 @@ fn a_change_of_what_a_type_implies_reaches_its_scopes() {
     activations.dedup();
     assert_eq!(activations.len(), 3, "one identity per activation");
     assert!(activations[0] != activations[2], "a change back is another");
-    // The one Task written while it implied Thing, routed as committed.
+    // The one Task created while it implied Thing, routed as committed.
     assert_eq!(
         node_deliveries(&thing),
-        vec![(Action::Put, Delivery::Apply)],
+        vec![(Action::Put, Delivery::Enter)],
         "{thing:?}"
     );
 

@@ -1296,36 +1296,64 @@ fn write_node(
     for ((_, value), field_id) in props.into_iter().zip(ids.iter().copied()) {
         record.set(field_id, value);
     }
-    // What the type implies routes the node's change in the feed: bound once
-    // per type and commit, under the catalog the restore wrote before it. A
-    // label first bound by this commit has no declaration, and implies
-    // nothing.
-    if let Some(&primary) = record.labels.first()
-        && !txn.implication_noted(primary)
-    {
-        let declared = store
-            .label_name(primary)
-            .map_err(|e| RestoreError::Storage(e.to_string()))?
-            .is_some();
-        let implied = if declared {
-            coordinode_query::index::membership::CatalogMembership::current(target.engine)
-                .implied_by(primary)
-                .map_err(|e| RestoreError::Storage(e.to_string()))?
-        } else {
-            Vec::new()
-        };
-        txn.note_implication(primary, &implied);
-    }
     let node_id = NodeId::from_raw(id);
-    match valid_from {
-        None => LocalNodeStore.put(txn, shard_id, node_id, &record),
+    let key = match valid_from {
+        None => {
+            LocalNodeStore
+                .put(txn, shard_id, node_id, &record)
+                .map_err(|e| RestoreError::Storage(e.to_string()))?;
+            coordinode_core::graph::node::encode_node_key(shard_id, node_id)
+        }
         Some(valid_from) => {
             let bounds =
                 coordinode_core::graph::node::VersionBounds::of(&record, valid_to, deleted);
-            LocalNodeStore.put_temporal(txn, shard_id, node_id, valid_from, &record, bounds)
+            LocalNodeStore
+                .put_temporal(txn, shard_id, node_id, valid_from, &record, bounds)
+                .map_err(|e| RestoreError::Storage(e.to_string()))?;
+            coordinode_core::graph::node::encode_temporal_node_key(shard_id, node_id, valid_from)
         }
+    };
+    // What the node's type implies, before the write and after it, routes
+    // the change in the feed: bound once per type and commit, under the
+    // catalog the restore wrote before it.
+    let before = txn
+        .node_basis(&key)
+        .and_then(|labels| labels.first().copied());
+    for primary in [record.labels.first().copied(), before]
+        .into_iter()
+        .flatten()
+    {
+        note_restored_implication(target, &store, txn, primary)?;
     }
-    .map_err(|e| RestoreError::Storage(e.to_string()))
+    Ok(())
+}
+
+/// Record what type `primary` implies for the change feed, unless this
+/// commit has. A label first bound by this commit has no declaration, and
+/// implies nothing.
+fn note_restored_implication(
+    target: &RestoreTarget<'_>,
+    store: &coordinode_modality::LocalSchemaStore<'_>,
+    txn: &mut Transaction<'_>,
+    primary: coordinode_core::schema::label_id::LabelId,
+) -> Result<(), RestoreError> {
+    use coordinode_modality::SchemaStore as _;
+    if txn.implication_noted(primary) {
+        return Ok(());
+    }
+    let declared = store
+        .label_name(primary)
+        .map_err(|e| RestoreError::Storage(e.to_string()))?
+        .is_some();
+    let implied = if declared {
+        coordinode_query::index::membership::CatalogMembership::current(target.engine)
+            .implied_by(primary)
+            .map_err(|e| RestoreError::Storage(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+    txn.note_implication(primary, &implied);
+    Ok(())
 }
 
 /// Stage one edge from a json property map.

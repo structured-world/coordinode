@@ -170,20 +170,35 @@ fn empty_log(dir: &std::path::Path) -> RetainedFloor {
         .retained_floor()
 }
 
+/// The effect context of a unit creating the unlabelled nodes `keys`.
+fn creating(keys: impl IntoIterator<Item = Vec<u8>>) -> UnitEffects {
+    let mut effects = UnitEffects::new();
+    effects.nodes = keys
+        .into_iter()
+        .map(|key| coordinode_core::txn::proposal::NodeBasis {
+            key,
+            labels: Vec::new(),
+        })
+        .collect();
+    effects.nodes.sort_by(|a, b| a.key.cmp(&b.key));
+    effects
+}
+
 /// The entry at `index` carrying one unit, as a commit writes it: a node
 /// record put and the unit's effect context.
 fn unit_entry(index: u64, ts: u64) -> OplogEntry {
     let record = NodeRecord::with_labels(Vec::new())
         .to_msgpack()
         .expect("record");
+    let key = encode_node_key(0, NodeId::from_raw(index + 1));
     let frame = coordinode_core::txn::frame::encode_unit(
         &[
             Mutation::Put {
                 partition: PartitionId::Node,
-                key: encode_node_key(0, NodeId::from_raw(index + 1)),
+                key: key.clone(),
                 value: record,
             },
-            Mutation::Effects(UnitEffects::new()),
+            Mutation::Effects(creating([key])),
         ],
         Timestamp::from_raw(ts),
     )
@@ -633,7 +648,9 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
             value: record.clone(),
         })
         .collect();
-    mutations.push(Mutation::Effects(UnitEffects::new()));
+    mutations.push(Mutation::Effects(creating(
+        (1..=60u64).map(|id| encode_node_key(0, NodeId::from_raw(id))),
+    )));
     let frame = coordinode_core::txn::frame::encode_unit(&mutations, Timestamp::from_raw(1_000))
         .expect("frame");
     mgr.append(&OplogEntry {
@@ -1415,7 +1432,7 @@ async fn stream_follows_a_raft_node() {
                         key: encode_node_key(0, NodeId::from_raw(100 + i)),
                         value: record.clone(),
                     },
-                    Mutation::Effects(UnitEffects::new()),
+                    Mutation::Effects(creating([encode_node_key(0, NodeId::from_raw(100 + i))])),
                 ],
                 commit_ts: Timestamp::from_raw(ts),
                 start_ts: Timestamp::from_raw(ts),

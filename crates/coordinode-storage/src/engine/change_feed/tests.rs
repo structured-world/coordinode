@@ -35,12 +35,24 @@ fn basis(id: u64, labels: &[u32]) -> NodeBasis {
     }
 }
 
+/// Implications recording that none of the types these tests use (labels
+/// 1 to 20) implies anything.
+fn implying_nothing() -> Vec<coordinode_core::txn::proposal::Implication> {
+    (1..=20)
+        .map(|raw| coordinode_core::txn::proposal::Implication {
+            label: label(raw),
+            implies: Vec::new(),
+        })
+        .collect()
+}
+
 fn context(nodes: Vec<NodeBasis>, removed_edges: Vec<Vec<u8>>, runs: Vec<u32>) -> Mutation {
     Mutation::Effects(UnitEffects {
         interpretation: EFFECTS_INTERPRETATION,
         nodes,
         removed_edges,
         runs,
+        implications: implying_nothing(),
         ..UnitEffects::new()
     })
 }
@@ -104,10 +116,16 @@ fn shape<'u>(events: &[LogicalEvent<'u>]) -> Vec<(u32, Action, Target<'u>)> {
 #[test]
 fn a_node_routes_by_what_its_type_implied_at_commit() {
     use coordinode_core::txn::proposal::Implication;
-    let implications = vec![Implication {
-        label: label(3),
-        implies: labels(&[7, 8]),
-    }];
+    let implications = vec![
+        Implication {
+            label: label(3),
+            implies: labels(&[7, 8]),
+        },
+        Implication {
+            label: label(6),
+            implies: Vec::new(),
+        },
+    ];
     let unit = vec![
         put(PartitionId::Node, key(1), record(&[3])),
         Mutation::Merge {
@@ -119,7 +137,12 @@ fn a_node_routes_by_what_its_type_implied_at_commit() {
         put(PartitionId::Node, key(5), record(&[6])),
         Mutation::Effects(UnitEffects {
             interpretation: EFFECTS_INTERPRETATION,
-            nodes: vec![basis(2, &[3, 9]), basis(4, &[3])],
+            nodes: vec![
+                basis(1, &[3]),
+                basis(2, &[3, 9]),
+                basis(4, &[3]),
+                basis(5, &[6]),
+            ],
             implications,
             ..UnitEffects::new()
         }),
@@ -189,7 +212,7 @@ fn a_scope_change_is_one_event_routed_by_the_type() {
 fn a_put_routes_by_its_record() {
     let unit = vec![
         put(PartitionId::Node, key(1), record(&[3, 9])),
-        context(Vec::new(), Vec::new(), Vec::new()),
+        context(vec![basis(1, &[3, 9])], Vec::new(), Vec::new()),
     ];
     let events = project_unit(&unit).expect("project");
     assert_eq!(events.len(), 1);
@@ -586,7 +609,7 @@ fn a_run_projects_to_its_deletes_and_a_range_is_refused() {
             end: b"idx:b".to_vec(),
         },
         put(PartitionId::Node, key(1), record(&[3])),
-        context(Vec::new(), Vec::new(), Vec::new()),
+        context(vec![basis(1, &[3])], Vec::new(), Vec::new()),
     ];
     assert_eq!(project_unit(&index).expect("project").len(), 1);
 }
@@ -602,7 +625,7 @@ fn ordinals_follow_the_units_order() {
         adj("adj:KNOWS:in:2", encode_add(1)),
         adj("adj:KNOWS:out:1", encode_add(2)),
         delete(PartitionId::Node, key(2)),
-        context(vec![basis(2, &[3])], Vec::new(), Vec::new()),
+        context(vec![basis(1, &[3]), basis(2, &[3])], Vec::new(), Vec::new()),
     ];
     let first = project_unit(&unit).expect("project");
     assert_eq!(
@@ -628,8 +651,13 @@ fn entry_units(nodes: u64) -> Vec<ChangeUnit> {
         commit_ts: 100 + u64::from(sub),
         refused: false,
         mutations: ids
+            .clone()
             .map(|id| put(PartitionId::Node, key(id), record(&[3])))
-            .chain([context(Vec::new(), Vec::new(), Vec::new())])
+            .chain([context(
+                ids.map(|id| basis(id, &[])).collect(),
+                Vec::new(),
+                Vec::new(),
+            )])
             .collect(),
     };
     vec![unit(0, 1..=nodes), unit(1, 1000..=1000)]

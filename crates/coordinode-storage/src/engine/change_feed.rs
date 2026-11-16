@@ -277,12 +277,13 @@ impl<'u> Projector<'u> {
     /// The labels node `key` carries before its next change in the unit:
     /// what its last change in the unit left, else what its context says it
     /// had before the unit; `None` when neither is known.
-    fn labels_before(&self, key: &[u8]) -> Option<Cow<'u, [LabelId]>> {
+    fn labels_before(&self, key: &[u8]) -> Result<Option<Cow<'u, [LabelId]>>, ProjectionError> {
         if let Some(left) = self.left.get(key) {
-            return Some(left.clone());
+            return Ok(Some(left.clone()));
         }
         self.basis(key)
             .map(|basis| self.carried(Cow::Borrowed(basis.labels.as_slice())))
+            .transpose()
     }
 
     fn run(mut self) -> Result<Vec<LogicalEvent<'u>>, ProjectionError> {
@@ -394,27 +395,31 @@ impl<'u> Projector<'u> {
 
     /// Every label a node storing `stored` carries under the unit's
     /// interpretation: its stored labels and what its type implied when the
-    /// unit committed.
-    fn carried(&self, stored: Cow<'u, [LabelId]>) -> Cow<'u, [LabelId]> {
+    /// unit committed. A type the unit records no implication for is refused:
+    /// its absence does not say the type implies nothing.
+    fn carried(&self, stored: Cow<'u, [LabelId]>) -> Result<Cow<'u, [LabelId]>, ProjectionError> {
+        let Some(&primary) = stored.first() else {
+            return Ok(stored);
+        };
         let implications = &self.effects.implications;
-        let implied = stored.first().and_then(|primary| {
-            implications
-                .binary_search_by(|i| i.label.cmp(primary))
-                .ok()
-                .map(|at| &implications[at].implies)
-        });
-        match implied {
-            None => stored,
-            Some(implied) => {
-                let mut all = stored.into_owned();
-                for &label in implied {
-                    if !all.contains(&label) {
-                        all.push(label);
-                    }
-                }
-                Cow::Owned(all)
+        let implied = implications
+            .binary_search_by(|i| i.label.cmp(&primary))
+            .map(|at| &implications[at].implies)
+            .map_err(|_| {
+                ProjectionError::Malformed(format!(
+                    "a node of type {primary} changes, and the unit records no implication for it"
+                ))
+            })?;
+        if implied.is_empty() {
+            return Ok(stored);
+        }
+        let mut all = stored.into_owned();
+        for &label in implied {
+            if !all.contains(&label) {
+                all.push(label);
             }
         }
+        Ok(Cow::Owned(all))
     }
 
     /// The basis of a node whose change cannot state its own labels.
@@ -423,7 +428,7 @@ impl<'u> Projector<'u> {
         key: &[u8],
         what: &str,
     ) -> Result<Cow<'u, [LabelId]>, ProjectionError> {
-        self.labels_before(key).ok_or_else(|| {
+        self.labels_before(key)?.ok_or_else(|| {
             ProjectionError::Malformed(format!(
                 "a node {what} carries no labels it stored before the unit"
             ))
@@ -440,10 +445,9 @@ impl<'u> Projector<'u> {
             PartitionId::Node => {
                 let after = coordinode_core::graph::node::NodeRecord::labels_from_msgpack(value)
                     .map_err(|e| ProjectionError::Malformed(format!("a node record: {e}")))?;
-                let after = self.carried(Cow::Owned(after));
-                // Without a context entry its labels are unchanged: the
-                // record states both.
-                let before = self.labels_before(key).unwrap_or_else(|| after.clone());
+                let after = self.carried(Cow::Owned(after))?;
+                // Its writer bound the labels the record replaces.
+                let before = self.required_labels(key, "write")?;
                 self.left.insert(Cow::Borrowed(key), after.clone());
                 let routing = Routing { before, after };
                 let target = Target::Node(Cow::Borrowed(key));
