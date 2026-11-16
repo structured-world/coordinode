@@ -2704,6 +2704,35 @@ impl coordinode_storage::engine::core::RaftApplyFence for LogApplied {
     }
 }
 
+/// A statement's receipt on a replicated member is taken at the view the
+/// statement read: a commit stamped after that view, still in flight, is no
+/// part of it, and the receipt does not wait for it to land.
+#[test]
+fn a_receipt_does_not_wait_for_a_commit_after_its_view() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    db.execute_cypher_shared("CREATE (:Seen {k: 1})", None, None, None, None)
+        .expect("seed");
+    db.engine().register_raft_fence(Arc::new(LogApplied));
+    db.engine().set_snapshot_wait_ms(2_000);
+    let view = db.oracle.next().as_raw();
+    let pending = Arc::clone(db.engine().pending_commits());
+    let (later, admission) = pending
+        .admit_allocated(|| db.oracle.next().as_raw(), Vec::new(), Vec::new(), None)
+        .expect("admit a later commit");
+    assert!(later > view, "{later} after the view {view}");
+
+    let started = Instant::now();
+    let ceiling = db.engine().observed_commit_ceiling(view);
+    let took = started.elapsed();
+    drop(admission);
+    assert!(ceiling.is_some(), "a replicated member gives a receipt");
+    assert!(
+        took < Duration::from_millis(500),
+        "the receipt waited {took:?} for a commit after its view"
+    );
+}
+
 /// A replicated member whose log has carried no closed bound yet (just
 /// joined, or reopened) knows no state complete: every read that must answer
 /// from a complete view is refused as not ready rather than answered from

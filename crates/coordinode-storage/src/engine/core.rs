@@ -8132,22 +8132,36 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// The latest commit a read here can have seen that a member applying
-    /// the same log can also be brought to see: on a Raft store, the larger
-    /// of the complete cut and the highest commit applied here, which the
-    /// leader's closed bound covers once it is handed out; `None` for a
-    /// store without Raft, whose own clock bounds every commit it holds.
+    /// The latest commit a read at snapshot `view` can have seen that a
+    /// member applying the same log can also be brought to see: on a Raft
+    /// store, the larger of the view's complete cut and the highest commit
+    /// applied here, which the leader's closed bound covers once it is
+    /// handed out; `None` for a store without Raft, whose own clock bounds
+    /// every commit it holds.
     ///
     /// A read's causal receipt stops here rather than at its snapshot
     /// timestamp: a snapshot taken from the clock can be later than any
     /// commit, and an idle group never closes a bound up to it, so a later
     /// read bounded by it would never be ready.
-    pub fn observed_commit_ceiling(&self) -> Option<u64> {
+    ///
+    /// The cut is the view's own: below every commit at or below `view`
+    /// still in flight and below the closed bound, read as it stands. A
+    /// commit stamped after the view is no part of what the read saw, and
+    /// the receipt neither waits for it nor for one below the view.
+    pub fn observed_commit_ceiling(&self, view: u64) -> Option<u64> {
         self.raft_fence()?;
         let applied = self
             .raft_applied_ts
             .load(std::sync::atomic::Ordering::Acquire);
-        Some(self.complete_cut().map_or(applied, |cut| cut.max(applied)))
+        let complete = self
+            .pending_commits
+            .snapshot_floor(|| view)
+            .min(self.closure_frontier());
+        Some(
+            complete
+                .checked_sub(1)
+                .map_or(applied, |cut| cut.max(applied)),
+        )
     }
 
     /// Whether a Raft entry applied here carries a commit the closed bound

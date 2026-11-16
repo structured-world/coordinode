@@ -3033,11 +3033,6 @@ impl Database {
                     });
                 }
             }
-            // The receipt: no commit the view holds is later than this, and
-            // nothing later than a member applying the same log can be
-            // brought to, so it can meet it as a later read's bound.
-            let ceiling = self.engine.observed_commit_ceiling();
-            let observed = view_through.map(|through| ceiling.map_or(through, |c| through.min(c)));
             let _retention_pin = retention_pin.take();
             // Build the transaction up front: a fresh one for auto-commit, or
             // the resumed parked state for an interactive statement. `interactive`
@@ -3182,7 +3177,14 @@ impl Database {
             let duration_us = start.elapsed().as_micros() as u64;
 
             let mut write_stats = ctx.write_stats.clone();
-            write_stats.read_ts = observed;
+            // The receipt: no commit the view holds is later than this, and
+            // nothing later than a member applying the same log can be
+            // brought to, so it can meet it as a later read's bound. Taken
+            // once the statement ran, from the same view, so commits under it
+            // that were landing meanwhile count.
+            let ceiling = self.engine.observed_commit_ceiling(view);
+            write_stats.read_ts =
+                view_through.map(|through| ceiling.map_or(through, |c| through.min(c)));
             // Hand the executor-updated keyset state (last_key + exhausted) back to
             // the caller through the in/out channel. `None` stays `None` for a
             // non-paged execution; the cursor path reads this to build the next
