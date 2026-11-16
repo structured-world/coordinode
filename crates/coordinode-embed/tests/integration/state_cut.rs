@@ -263,6 +263,90 @@ fn a_rebuild_through_a_cut_replaces_the_destination_with_the_source() {
     assert_eq!(destination.current(), Some((2, progress)));
 }
 
+/// The continuation's units carry their logical events in the scope under
+/// the identities the change feed gives them: numbered over the whole unit
+/// before the scope chose its rows, so a relationship outside a node scope
+/// leaves a gap in the ordinals rather than renumbering them. A unit written
+/// as raw rows, without the context the feed reads, carries none.
+#[test]
+fn a_continuation_carries_events_under_their_feed_identities() {
+    use coordinode_embed::changes::{ChangeInterest, OwnedTarget};
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = open_source(&dir.path().join("source"));
+    let mut cut = db
+        .state_cut(scope(NODES), Duration::from_secs(10))
+        .expect("cut");
+    let feed_start = db
+        .change_cursor(&ChangeInterest::default())
+        .expect("cursor");
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) \
+         CREATE (a)-[:KNOWS]->(b), (:User {id: 9})",
+    )
+    .expect("write");
+    let budget = budget();
+    // Read before the raw write below, which the feed refuses to project.
+    let feed = db.read_changes(&feed_start, 64, &budget).expect("feed");
+    let written = feed
+        .batch
+        .units
+        .iter()
+        .find(|u| !u.events.is_empty())
+        .expect("the write in the feed")
+        .clone();
+    drop(feed);
+    commit(
+        db.engine(),
+        &[Mutation::Put {
+            partition: PartitionId::Node,
+            key: b"node:raw".to_vec(),
+            value: b"raw".to_vec(),
+        }],
+    );
+
+    let mut units = Vec::new();
+    loop {
+        let before = cut.next();
+        let batch = db.state_cut_tail(&mut cut, 4, &budget).expect("tail");
+        units.extend(batch.units().iter().cloned());
+        if batch.joined().is_some() && cut.next() == before {
+            break;
+        }
+    }
+    let in_cut = units
+        .iter()
+        .find(|u| u.position == written.position)
+        .expect("the write in the continuation");
+    let events = in_cut
+        .events
+        .as_ref()
+        .expect("events of a unit with context");
+    assert_eq!(events.projected, written.projected);
+    let node_events: Vec<_> = written
+        .events
+        .iter()
+        .filter(|e| matches!(e.target, OwnedTarget::Node(_)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        events.events, node_events,
+        "the same events, same identities"
+    );
+    assert!(
+        (events.events.len() as u32) < events.projected,
+        "the relationship is outside the scope"
+    );
+    let raw = units
+        .iter()
+        .find(|u| {
+            u.mutations
+                .iter()
+                .any(|m| matches!(m, Mutation::Put { key, .. } if key == b"node:raw"))
+        })
+        .expect("the raw write");
+    assert!(raw.events.is_none(), "{raw:?}");
+}
+
 /// Power lost after the replacement is staged and before it is published
 /// leaves the previous projection and progress; lost after the publication,
 /// the new one, complete.

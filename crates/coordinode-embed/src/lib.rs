@@ -77,7 +77,7 @@ pub mod consumer {
         InitialSeqno, PriorIncarnation, RegisteredHandle, RegistrationState, RegistryError,
         RetentionPressure, RetentionSpace, RetentionSummary, TerminalReason, TopologyScope,
     };
-    pub use coordinode_storage::engine::fixed_cut::CutUnit;
+    pub use coordinode_storage::engine::fixed_cut::{CutEvents, CutUnit};
 }
 
 /// Committed changes as logical events ([`Database::read_changes`]): the

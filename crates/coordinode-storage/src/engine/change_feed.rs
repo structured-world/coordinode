@@ -1215,8 +1215,31 @@ pub struct ChangeBatch {
     pub cursor: ChangeCursor,
 }
 
+/// `event` of the unit at `position` as a reader receives it, reaching it
+/// as `delivery`.
+pub(crate) fn owned_event(
+    position: coordinode_core::txn::operation::LogPosition,
+    event: &LogicalEvent<'_>,
+    delivery: Delivery,
+) -> ChangeEvent {
+    ChangeEvent {
+        id: EventId {
+            position,
+            ordinal: event.ordinal,
+        },
+        action: event.action,
+        target: OwnedTarget::from(&event.target),
+        payload: event.payload.map(<[u8]>::to_vec),
+        delivery,
+        labels: event
+            .routing
+            .as_ref()
+            .map(|r| (r.before.to_vec(), r.after.to_vec())),
+    }
+}
+
 /// Bytes one delivered event holds.
-fn event_bytes(event: &LogicalEvent<'_>) -> u64 {
+pub(crate) fn event_bytes(event: &LogicalEvent<'_>) -> u64 {
     let target = match &event.target {
         Target::Node(key)
         | Target::RelationshipProperties(key)
@@ -1311,20 +1334,7 @@ pub(crate) fn unit_changes(
                     return Ok((out, stopped(through)));
                 }
                 kept_any = true;
-                taken.push(ChangeEvent {
-                    id: EventId {
-                        position: unit.position,
-                        ordinal: event.ordinal,
-                    },
-                    action: event.action,
-                    target: OwnedTarget::from(&event.target),
-                    payload: event.payload.map(<[u8]>::to_vec),
-                    delivery,
-                    labels: event
-                        .routing
-                        .as_ref()
-                        .map(|r| (r.before.to_vec(), r.after.to_vec())),
-                });
+                taken.push(owned_event(unit.position, event, delivery));
             }
             through = event.ordinal + 1;
         }

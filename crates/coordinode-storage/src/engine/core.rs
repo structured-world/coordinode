@@ -5618,6 +5618,35 @@ impl StorageEngine {
             if refused {
                 mutations.clear();
             }
+            // The unit's events in the scope, numbered over its whole
+            // projection before the scope chooses its rows below.
+            let events = match crate::engine::change_feed::project_unit(&mutations) {
+                Ok(projected_events) => {
+                    let projected = u32::try_from(projected_events.len()).map_err(|_| {
+                        EntryOutcome::Failed(StorageError::Serialization(
+                            "the unit projects over 2^32 events".into(),
+                        ))
+                    })?;
+                    let mut events = Vec::new();
+                    for event in projected_events
+                        .iter()
+                        .filter(|e| scope.holds_target(&e.target))
+                    {
+                        if !pool.retain(crate::engine::change_feed::event_bytes(event)) {
+                            return Err(EntryOutcome::NoRoom);
+                        }
+                        events.push(crate::engine::change_feed::owned_event(
+                            position,
+                            event,
+                            crate::engine::change_feed::Delivery::Apply,
+                        ));
+                    }
+                    Some(crate::engine::fixed_cut::CutEvents { events, projected })
+                }
+                // Rows without the context their meaning is read by: a
+                // consumer of rows applies them; one of events is told.
+                Err(_) => None,
+            };
             // Kept in place: no second list is built.
             let mut no_room = false;
             mutations.retain_mut(|m| match m {
@@ -5681,6 +5710,7 @@ impl StorageEngine {
                 mutations,
                 refused,
                 in_view: cut.in_view(position, commit_ts),
+                events,
             });
         }
         Ok(())

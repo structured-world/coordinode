@@ -77,6 +77,35 @@ impl CutScope {
         key.starts_with(&self.prefix)
     }
 
+    /// Whether the rows of this scope hold what `target` names: a node's
+    /// record in the node partition, a relationship's properties or instance
+    /// in the edge property partition, its presence in its forward adjacency
+    /// list. A change of what a type implies moves the membership of node
+    /// records, so every node scope takes it.
+    pub(crate) fn holds_target(&self, target: &crate::engine::change_feed::Target<'_>) -> bool {
+        use crate::engine::change_feed::Target;
+        match target {
+            Target::Node(key) => self.partition == Partition::Node && self.holds_key(key),
+            Target::RelationshipProperties(key) | Target::RelationshipInstance(key) => {
+                self.partition == Partition::EdgeProp && self.holds_key(key)
+            }
+            Target::Relationship {
+                edge_type, source, ..
+            } => {
+                if self.partition != Partition::Adj {
+                    return false;
+                }
+                let mut key = Vec::with_capacity(b"adj:".len() + edge_type.len() + 13);
+                key.extend_from_slice(b"adj:");
+                key.extend_from_slice(edge_type);
+                key.extend_from_slice(b":out:");
+                key.extend_from_slice(&source.to_be_bytes());
+                self.holds_key(&key)
+            }
+            Target::Scope { .. } => self.partition == Partition::Node,
+        }
+    }
+
     /// Whether some key of `[start, end)` is in it.
     pub(crate) fn meets_range(&self, start: &[u8], end: &[u8]) -> bool {
         self.clip_range(start, end).is_some()
@@ -454,6 +483,21 @@ pub struct CutUnit {
     pub refused: bool,
     /// Whether the cut's view already holds it.
     pub in_view: bool,
+    /// The unit's logical events whose targets are in the cut's scope,
+    /// numbered in the unit's whole projection before the scope chose them;
+    /// `None` for a unit recorded without the context the change feed reads
+    /// it by, which only its rows can be applied from.
+    pub events: Option<CutEvents>,
+}
+
+/// The logical events of one unit inside a cut's scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutEvents {
+    /// The events, in ordinal order, each delivered as applying to the scope.
+    pub events: Vec<crate::engine::change_feed::ChangeEvent>,
+    /// How many events the unit's whole projection holds, in the scope or
+    /// not.
+    pub projected: u32,
 }
 
 /// A read of a cut's continuation: its units, and the position the next
