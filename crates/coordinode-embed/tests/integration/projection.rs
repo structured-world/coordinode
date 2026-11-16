@@ -26,19 +26,35 @@ fn source(dir: &std::path::Path) -> Database {
     db
 }
 
-/// Mirror each node event of `unit` as a `Seen` node keyed by the node's
-/// key bytes: a put or patch merges it, a removal deletes it.
+/// Mirror each node and relationship event of `unit` as a `Seen` node keyed
+/// by its target: a put or patch merges it, a removal deletes it.
 fn mirror(tx: &ProjectionTransaction<'_>, unit: &UnitChanges) -> Result<(), DatabaseError> {
     for event in &unit.events {
-        let OwnedTarget::Node(key) = &event.target else {
-            continue;
+        let key = match &event.target {
+            OwnedTarget::Node(key) => format!("{key:02x?}"),
+            OwnedTarget::Relationship { source, target, .. } => format!("{source}->{target}"),
+            _ => continue,
         };
-        let params = HashMap::from([("key".to_string(), Value::String(format!("{key:02x?}")))]);
+        let params = HashMap::from([("key".to_string(), Value::String(key))]);
         let query = match event.action {
             coordinode_embed::changes::Action::Remove => "MATCH (s:Seen {key: $key}) DELETE s",
             _ => "MERGE (:Seen {key: $key})",
         };
         tx.execute(query, Some(params))?;
+    }
+    Ok(())
+}
+
+/// Record each event of `unit` as a `Seen` node keyed by its identity, what
+/// it does aside.
+fn record(tx: &ProjectionTransaction<'_>, unit: &UnitChanges) -> Result<(), DatabaseError> {
+    for event in &unit.events {
+        let key = format!(
+            "{}:{}:{}",
+            event.id.position.index, event.id.position.sub, event.id.ordinal
+        );
+        let params = HashMap::from([("key".to_string(), Value::String(key))]);
+        tx.execute("MERGE (:Seen {key: $key})", Some(params))?;
     }
     Ok(())
 }
@@ -49,10 +65,14 @@ fn seen(db: &mut Database) -> usize {
         .len()
 }
 
-/// The next batch from `cursor`, whole units.
+/// A copy of the next batch from `cursor`, whole units, which the test keeps
+/// as its own memory to hand over more than once.
 fn read(db: &Database, cursor: &ChangeCursor) -> ChangeBatch {
     let budget = QueryBudget::new(1 << 24);
-    db.read_changes(cursor, 64, &budget).expect("read").batch
+    db.read_changes(cursor, 64, &budget)
+        .expect("read")
+        .batch()
+        .clone()
 }
 
 /// A batch's effects and the projection's progress commit together: a batch
@@ -124,7 +144,6 @@ fn fragments(
     src: &Database,
     src_dir: &std::path::Path,
     cursor: &ChangeCursor,
-    budget_bytes: u64,
 ) -> Vec<(ChangeCursor, ChangeBatch)> {
     let mut tailer = OplogTailer::new(
         &[src_dir.join("oplog").join("0")],
@@ -140,6 +159,25 @@ fn fragments(
         .filter(|entry| entry.index >= cursor.position())
         .collect();
     let next = entries.last().expect("an entry").index + 1;
+    // The smallest budget every entry decodes within: what is left of it
+    // after the decoding does not hold the large transaction's events.
+    let budget_bytes = (1..)
+        .map(|step| step * 500)
+        .find(|&bytes| {
+            entries.iter().all(|entry| {
+                src.engine()
+                    .changes_of_entries(
+                        &src.engine()
+                            .change_cursor_at(entry.index, cursor.interest().clone())
+                            .expect("cursor"),
+                        [entry],
+                        entry.index + 1,
+                        &QueryBudget::new(bytes),
+                    )
+                    .is_ok()
+            })
+        })
+        .expect("a budget the entries decode within");
     let mut out = Vec::new();
     let mut at = cursor.clone();
     loop {
@@ -171,14 +209,8 @@ fn a_transaction_in_fragments_takes_effect_whole() {
     let src_dir = tempfile::tempdir().expect("tempdir");
     let dst_dir = tempfile::tempdir().expect("tempdir");
     let mut src = source(src_dir.path());
-    let start = src
-        .change_cursor(&ChangeInterest::default())
-        .expect("cursor");
-    run(
-        &mut src,
-        "UNWIND range(1, 40) AS i CREATE (:Person {name: 'p' + toString(i)})",
-    );
-    let pieces = fragments(&src, src_dir.path(), &start, 2_000);
+    let start = linked_hub(&mut src);
+    let pieces = fragments(&src, src_dir.path(), &start);
     let staged_pieces = pieces
         .iter()
         .filter(|(_, batch)| batch.units.iter().any(|u| !u.completes_unit()))
@@ -199,7 +231,7 @@ fn a_transaction_in_fragments_takes_effect_whole() {
             // handed to it: they stay staged, nothing takes effect, and the
             // same batch applies whole next.
             let failed = dst.apply_changes("people", batch, |tx, unit| {
-                mirror(tx, unit)?;
+                record(tx, unit)?;
                 if unit.completes_unit() {
                     return Err(DatabaseError::Other("the host stopped".into()));
                 }
@@ -217,25 +249,49 @@ fn a_transaction_in_fragments_takes_effect_whole() {
         let progress = dst
             .apply_changes("people", batch, |tx, unit| {
                 applied_calls.push((unit.first, unit.through));
-                mirror(tx, unit)
+                record(tx, unit)
             })
             .expect("apply");
         assert_eq!(progress.received, batch.cursor);
         if complete {
             assert_eq!(progress.applied, batch.cursor);
-            assert_eq!(seen(&mut dst), 40);
+            assert_eq!(seen(&mut dst), LINKS);
         } else {
             assert!(progress.has_staged());
             assert_eq!(seen(&mut dst), 0, "nothing takes effect before the end");
         }
     }
     // Every fragment applied once, in order, covering the transaction.
+    let projected = pieces
+        .iter()
+        .flat_map(|(_, batch)| batch.units.iter())
+        .find(|u| u.projected > 0)
+        .expect("the transaction")
+        .projected;
     let mut covered = 0;
     for (first, through) in &applied_calls {
         assert_eq!(*first, covered);
         covered = *through;
     }
-    assert_eq!(covered, 40);
+    assert_eq!(covered, projected);
+}
+
+/// Nodes the large transaction of these tests removes.
+const LINKS: usize = 300;
+
+/// Write [`LINKS`] people, then return a cursor before one transaction
+/// deleting them all, which the commit packs into runs of deletes: a
+/// transaction whose few stored operations project to many events.
+fn linked_hub(src: &mut Database) -> ChangeCursor {
+    run(
+        src,
+        &format!("UNWIND range(1, {LINKS}) AS i CREATE (:Person {{name: 'p' + toString(i)}})"),
+    );
+    let start = src
+        .change_cursor(&ChangeInterest::default())
+        .expect("cursor");
+    run(src, "MATCH (p:Person) DELETE p");
+    start
 }
 
 /// `projection`'s committed progress, which a refusal must leave as it was.
@@ -306,17 +362,15 @@ fn a_fragment_after_a_skipped_one_is_refused() {
     let dst_dir = tempfile::tempdir().expect("tempdir");
     let mut src = source(src_dir.path());
     let dst = Database::open(dst_dir.path()).expect("open destination");
-    let start = src
-        .change_cursor(&ChangeInterest::default())
-        .expect("cursor");
-    run(
-        &mut src,
-        "UNWIND range(1, 40) AS i CREATE (:Person {name: 'p' + toString(i)})",
+    let start = linked_hub(&mut src);
+    let pieces = fragments(&src, src_dir.path(), &start);
+    assert!(pieces.len() >= 3, "{} pieces", pieces.len());
+    assert!(
+        !pieces[0].1.units.iter().all(UnitChanges::completes_unit),
+        "the first piece stops inside the transaction"
     );
-    let pieces = fragments(&src, src_dir.path(), &start, 2_000);
-    assert!(pieces.len() > 3, "{} pieces", pieces.len());
     dst.start_projection("people", &start).expect("start");
-    dst.apply_changes("people", &pieces[0].1, mirror)
+    dst.apply_changes("people", &pieces[0].1, record)
         .expect("the first fragment");
     let before = stands(&dst, "people");
     // The third piece handed over in place of the second.

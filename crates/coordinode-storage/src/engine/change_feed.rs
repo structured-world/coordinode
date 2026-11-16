@@ -181,6 +181,34 @@ impl ChangeUnit {
         }
         project_unit(&self.mutations)
     }
+
+    /// Hand the unit's logical events to `take` one at a time, in canonical
+    /// order, as [`project_unit_with`] does; none for a refused unit.
+    /// Returns how many events the unit's projection holds.
+    ///
+    /// # Errors
+    ///
+    /// As [`project_unit`].
+    pub fn project_with<'u>(
+        &'u self,
+        take: impl FnMut(LogicalEvent<'u>) -> Take,
+    ) -> Result<u32, ProjectionError> {
+        if self.refused {
+            return Ok(0);
+        }
+        project_unit_with(&self.mutations, take)
+    }
+}
+
+/// Whether a consumer of a projection takes the events after the one it
+/// was handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// Hand over the next event too.
+    More,
+    /// Hand over no more: the projection still counts the rest, so the
+    /// unit's whole count is known, without building them for anyone.
+    Enough,
 }
 
 /// A read of the journal for a change feed: its units in log order, and the
@@ -208,6 +236,27 @@ const MAX_RUN_KEYS: u64 = coordinode_core::txn::frame::DecodeLimits::DEFAULT.max
 /// not a run of point deletes; [`ProjectionError::Malformed`] for one that
 /// contradicts its context.
 pub fn project_unit(mutations: &[Mutation]) -> Result<Vec<LogicalEvent<'_>>, ProjectionError> {
+    let mut events = Vec::new();
+    project_unit_with(mutations, |event| {
+        events.push(event);
+        Take::More
+    })?;
+    Ok(events)
+}
+
+/// [`project_unit`] handing each event to `take` as it is projected, rather
+/// than collecting the unit's events: a reader keeps only the events it
+/// takes, and a run of deletes is walked without listing its keys. Once
+/// `take` answers [`Take::Enough`] no event is built for it; the rest are
+/// counted. Returns how many events the unit's projection holds.
+///
+/// # Errors
+///
+/// As [`project_unit`].
+pub fn project_unit_with<'u>(
+    mutations: &'u [Mutation],
+    take: impl FnMut(LogicalEvent<'u>) -> Take,
+) -> Result<u32, ProjectionError> {
     let effects = mutations.iter().find_map(|m| match m {
         Mutation::Effects(effects) => Some(effects),
         _ => None,
@@ -218,7 +267,7 @@ pub fn project_unit(mutations: &[Mutation]) -> Result<Vec<LogicalEvent<'_>>, Pro
                 "it changes application data and carries no effect context".into(),
             ));
         }
-        return Ok(Vec::new());
+        return Ok(0);
     };
     if effects.interpretation != EFFECTS_INTERPRETATION {
         return Err(ProjectionError::Unsupported(format!(
@@ -226,7 +275,7 @@ pub fn project_unit(mutations: &[Mutation]) -> Result<Vec<LogicalEvent<'_>>, Pro
             effects.interpretation, EFFECTS_INTERPRETATION
         )));
     }
-    Projector::new(mutations, effects).run()
+    Projector::new(mutations, effects, take).run()
 }
 
 /// Whether `m` changes data the feed projects or must account for.
@@ -263,7 +312,7 @@ enum Component {
     Internal,
 }
 
-struct Projector<'u> {
+struct Projector<'u, F> {
     mutations: &'u [Mutation],
     effects: &'u UnitEffects,
     /// Pairs whose last forward adjacency change in the unit removes them,
@@ -280,11 +329,16 @@ struct Projector<'u> {
     /// The node records and versions the unit writes or removes: a history
     /// assertion stands for one of them.
     versions: FxHashSet<&'u [u8]>,
-    events: Vec<LogicalEvent<'u>>,
+    /// The consumer each event is handed to as it is projected.
+    take: F,
+    /// Whether the consumer takes more events.
+    taking: bool,
+    /// Events projected so far: the next one's ordinal.
+    count: u32,
 }
 
-impl<'u> Projector<'u> {
-    fn new(mutations: &'u [Mutation], effects: &'u UnitEffects) -> Self {
+impl<'u, F: FnMut(LogicalEvent<'u>) -> Take> Projector<'u, F> {
+    fn new(mutations: &'u [Mutation], effects: &'u UnitEffects, take: F) -> Self {
         Self {
             mutations,
             effects,
@@ -292,7 +346,9 @@ impl<'u> Projector<'u> {
             named: FxHashSet::default(),
             left: rustc_hash::FxHashMap::default(),
             versions: FxHashSet::default(),
-            events: Vec::new(),
+            take,
+            taking: true,
+            count: 0,
         }
     }
 
@@ -308,7 +364,7 @@ impl<'u> Projector<'u> {
             .transpose()
     }
 
-    fn run(mut self) -> Result<Vec<LogicalEvent<'u>>, ProjectionError> {
+    fn run(mut self) -> Result<u32, ProjectionError> {
         self.collect_presence()?;
         let mut runs = self.effects.runs.iter().copied().peekable();
         let mut row = 0u32;
@@ -349,7 +405,7 @@ impl<'u> Projector<'u> {
                 })?;
             }
         }
-        Ok(self.events)
+        Ok(self.count)
     }
 
     /// The pairs the unit's forward adjacency changes name, and those whose
@@ -408,15 +464,20 @@ impl<'u> Projector<'u> {
         payload: Option<&'u [u8]>,
         routing: Option<Routing<'u>>,
     ) -> Result<(), ProjectionError> {
-        let ordinal = u32::try_from(self.events.len())
-            .map_err(|_| ProjectionError::Malformed("the unit projects over 2^32 events".into()))?;
-        self.events.push(LogicalEvent {
-            ordinal,
-            action,
-            target,
-            payload,
-            routing,
-        });
+        let ordinal = self.count;
+        self.count = ordinal.checked_add(1).ok_or_else(|| {
+            ProjectionError::Malformed("the unit projects over 2^32 events".into())
+        })?;
+        if self.taking {
+            let event = LogicalEvent {
+                ordinal,
+                action,
+                target,
+                payload,
+                routing,
+            };
+            self.taking = (self.take)(event) == Take::More;
+        }
         Ok(())
     }
 
@@ -714,10 +775,7 @@ impl<'u> Projector<'u> {
         // The run's keys are every key of the start's length up to the end,
         // each projected as its own delete: the unit holds them only as the
         // run, so each event owns its key.
-        for key in run_keys(start, end)? {
-            self.delete(partition, Cow::Owned(key))?;
-        }
-        Ok(())
+        for_each_run_key(start, end, |key| self.delete(partition, Cow::Owned(key)))
     }
 
     /// The relationships removed with whole forward lists, which no forward
@@ -870,20 +928,27 @@ fn adj_operand(operand: &[u8]) -> Result<Vec<(bool, u64)>, ProjectionError> {
     }
 }
 
-/// Every key of `start`'s length from `start` up to `end`, both of one
-/// length: the point deletes a run stands for.
-fn run_keys(start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>, ProjectionError> {
+/// Hand `each` every key of `start`'s length from `start` up to `end`, both
+/// of one length, in order: the point deletes a run stands for, one at a
+/// time, never listed.
+fn for_each_run_key(
+    start: &[u8],
+    end: &[u8],
+    mut each: impl FnMut(Vec<u8>) -> Result<(), ProjectionError>,
+) -> Result<(), ProjectionError> {
     let bad = |what: &str| ProjectionError::Malformed(format!("a run of deletes {what}"));
     if start.len() != end.len() || start >= end {
         return Err(bad("with bounds of different lengths or out of order"));
     }
-    let mut keys = Vec::new();
     let mut key = start.to_vec();
+    let mut walked = 0u64;
     while key.as_slice() < end {
-        if keys.len() as u64 >= MAX_RUN_KEYS {
+        if walked >= MAX_RUN_KEYS {
             return Err(bad("longer than any unit"));
         }
-        keys.push(key.clone());
+        walked += 1;
+        let next = key.clone();
+        each(next)?;
         // Big-endian increment within the length; a key of all 0xFF bytes
         // has no successor of its length, and nothing of it is below `end`.
         let Some(at) = key.iter().rposition(|&b| b != 0xFF) else {
@@ -894,7 +959,7 @@ fn run_keys(start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>, ProjectionError> {
             *byte = 0;
         }
     }
-    Ok(keys)
+    Ok(())
 }
 
 /// What a reader of the feed is interested in: nodes routed by some labels,
@@ -1505,6 +1570,50 @@ pub(crate) fn event_bytes(event: &LogicalEvent<'_>) -> u64 {
         as u64
 }
 
+/// Bytes a read takes from its budget at a time for the events it keeps:
+/// the budget is asked once per block, not once per event.
+const CHARGE_BLOCK: u64 = 64 * 1024;
+
+/// A charge taken from its budget a block at a time, the events kept
+/// spending the block without asking the budget again.
+struct BlockCharge<'c, 'b> {
+    charge: &'c mut coordinode_core::budget::MemoryCharge<'b>,
+    /// Taken from the budget and not yet spent.
+    left: u64,
+}
+
+impl<'c, 'b> BlockCharge<'c, 'b> {
+    fn new(charge: &'c mut coordinode_core::budget::MemoryCharge<'b>) -> Self {
+        Self { charge, left: 0 }
+    }
+
+    /// Spend `bytes`, taking another block when the one held is spent; a
+    /// block the budget refuses is asked for again at exactly what is
+    /// missing, so the budget's last bytes are not lost to the block size.
+    fn take(&mut self, bytes: u64) -> Result<(), coordinode_core::budget::BudgetStop> {
+        if let Some(left) = self.left.checked_sub(bytes) {
+            self.left = left;
+            return Ok(());
+        }
+        let missing = bytes - self.left;
+        let block = missing.max(CHARGE_BLOCK);
+        if self.charge.grow(block).is_ok() {
+            // `block` covers what was missing: the rest stays held.
+            self.left = block - missing;
+            return Ok(());
+        }
+        self.charge.grow(missing)?;
+        self.left = 0;
+        Ok(())
+    }
+
+    /// Return what was taken and not spent.
+    fn release(&mut self) {
+        self.charge.shrink(self.left);
+        self.left = 0;
+    }
+}
+
 /// The changes a reader at `from` receives of `units`, the units of the
 /// entries read from its entry on: units before `from` inside its entry are
 /// passed over, and the unit it stopped in continues at its ordinal. Every
@@ -1532,6 +1641,7 @@ pub(crate) fn unit_changes(
         entry: from_entry,
         within: from_within,
     } = from;
+    let mut charged = BlockCharge::new(charge);
     let mut out: Vec<UnitChanges> = Vec::new();
     let mut kept_any = false;
     for unit in units {
@@ -1547,10 +1657,6 @@ pub(crate) fn unit_changes(
         } else {
             0
         };
-        let events = unit.events().map_err(projection)?;
-        let projected = u32::try_from(events.len()).map_err(|_| {
-            StorageError::Serialization("the unit projects over 2^32 events".into())
-        })?;
         let stopped = |ordinal: u32| {
             Some(ReadPlace {
                 entry: unit.position.index,
@@ -1560,34 +1666,50 @@ pub(crate) fn unit_changes(
                 },
             })
         };
-        if let Err(stop) = charge.grow(core::mem::size_of::<UnitChanges>() as u64) {
+        if let Err(stop) = charged.take(core::mem::size_of::<UnitChanges>() as u64) {
             if !kept_any {
                 return Err(StorageError::Budget(stop));
             }
+            charged.release();
             return Ok((out, stopped(first)));
         }
+        // Events are handed over one at a time: those before `first` were
+        // delivered already and are only counted, those after the one the
+        // budget refuses are not built.
         let mut taken = Vec::new();
         let mut through = first;
-        for event in events.iter().skip(first as usize) {
-            if let Some(delivery) = interest.delivery(event) {
-                if let Err(stop) = charge.grow(event_bytes(event)) {
-                    if !kept_any {
-                        return Err(StorageError::Budget(stop));
-                    }
-                    out.push(UnitChanges {
-                        position: unit.position,
-                        commit_ts: unit.commit_ts,
-                        events: taken,
-                        projected,
-                        first,
-                        through,
-                    });
-                    return Ok((out, stopped(through)));
+        let mut refused = None;
+        let projected = unit
+            .project_with(|event| {
+                if event.ordinal < first {
+                    return Take::More;
                 }
-                kept_any = true;
-                taken.push(owned_event(unit.position, event, delivery));
+                if let Some(delivery) = interest.delivery(&event) {
+                    if let Err(stop) = charged.take(event_bytes(&event)) {
+                        refused = Some(stop);
+                        return Take::Enough;
+                    }
+                    kept_any = true;
+                    taken.push(owned_event(unit.position, &event, delivery));
+                }
+                through = event.ordinal + 1;
+                Take::More
+            })
+            .map_err(projection)?;
+        if let Some(stop) = refused {
+            if !kept_any {
+                return Err(StorageError::Budget(stop));
             }
-            through = event.ordinal + 1;
+            out.push(UnitChanges {
+                position: unit.position,
+                commit_ts: unit.commit_ts,
+                events: taken,
+                projected,
+                first,
+                through,
+            });
+            charged.release();
+            return Ok((out, stopped(through)));
         }
         kept_any = true;
         out.push(UnitChanges {
@@ -1599,6 +1721,7 @@ pub(crate) fn unit_changes(
             through: projected,
         });
     }
+    charged.release();
     Ok((out, None))
 }
 

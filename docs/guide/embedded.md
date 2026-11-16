@@ -422,18 +422,19 @@ let db = Database::open("/var/lib/myapp/graph")?;
 let interest = ChangeInterest {
     labels: Some(vec!["Person".into()]),
     edge_types: Some(vec!["KNOWS".into()]),
+    blobs: false,
 };
 let mut cursor = db.change_cursor(&interest)?;
 let budget = QueryBudget::new(64 << 20);
 loop {
     let page = db.read_changes(&cursor, 256, &budget)?;
-    for unit in &page.batch.units {
+    for unit in &page.batch().units {
         for event in &unit.events {
             // ...apply `event` to the projection.
             let _ = (event.id, event.action, event.delivery);
         }
     }
-    let next = page.batch.cursor.clone();
+    let next = page.batch().cursor.clone();
     if next == cursor {
         break;
     }
@@ -483,7 +484,7 @@ let start = source.change_cursor(&ChangeInterest::default())?;
 let progress = projection.start_projection("people", &start)?;
 let budget = QueryBudget::new(64 << 20);
 let page = source.read_changes(&progress.received, 256, &budget)?;
-let progress = projection.apply_changes("people", &page.batch, |tx, unit| {
+let progress = projection.apply_changes("people", page.batch(), |tx, unit| {
     for event in &unit.events {
         if let OwnedTarget::Node(_) = &event.target {
             // ...the projection's writes for this event.

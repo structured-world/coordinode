@@ -31,13 +31,21 @@ pub struct ChangeInterest {
     pub blobs: bool,
 }
 
-/// A read of committed changes: whole units with the events the reader's
-/// interest takes, and the cursor to continue from. The units' memory stays
-/// charged to the read's budget while the batch is held.
+/// A read of committed changes: units with the events the reader's interest
+/// takes, and the cursor to continue from. The events' memory stays charged
+/// to the read's budget for as long as the page lives, and the batch is
+/// reached only through it: a copy the reader makes is its own memory.
 pub struct ChangePage<'b> {
-    /// The units read and the cursor to continue from.
-    pub batch: ChangeBatch,
+    batch: ChangeBatch,
     _charge: MemoryCharge<'b>,
+}
+
+impl ChangePage<'_> {
+    /// The units read and the cursor to continue from.
+    #[must_use]
+    pub fn batch(&self) -> &ChangeBatch {
+        &self.batch
+    }
 }
 
 impl Database {

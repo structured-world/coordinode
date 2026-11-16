@@ -329,7 +329,10 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let (tx, rx) = mpsc::channel::<Result<ChangeBatch, Status>>(64);
+        // One batch waits at most: the stream reads its next batch once this
+        // one is taken, so what a stream queues is bounded by one read's
+        // memory, not by a count of batches of any size.
+        let (tx, rx) = mpsc::channel::<Result<ChangeBatch, Status>>(1);
         let incarnation = self
             .open(request.into_inner(), Delivery::Stream { tx })
             .await?;
@@ -461,6 +464,7 @@ impl ChangeEventServiceImpl {
             hub,
             reader: Some(reader),
             own_tailer: None,
+            outgoing: QueryBudget::new(self.tuning.buffer_bytes as u64),
             delivery,
             applied: Arc::clone(&self.applied),
             applied_changes: self.applied_changes.clone(),
@@ -547,6 +551,9 @@ struct StreamState {
     reader: Option<HubReader>,
     /// Reads the log while the stream is behind what the hub holds.
     own_tailer: Option<OplogTailer>,
+    /// The memory a batch encoded for the delivery holds until it is taken:
+    /// one read's worth.
+    outgoing: QueryBudget,
     /// Where the batches go.
     delivery: Delivery,
     applied: AppliedFrontier,
@@ -667,12 +674,28 @@ async fn stream_consumer(mut s: StreamState) {
         // the room, not the log, ended it.
         let more = read_to < until || !next.at_entry_start();
         s.cursor = next;
+        // The encoded batch stays charged to the stream until the delivery
+        // takes it: the read's charge ended with the read.
+        let held = match s
+            .outgoing
+            .reserve(prost::Message::encoded_len(&batch) as u64)
+        {
+            Ok(held) => held,
+            Err(stop) => {
+                s.delivery
+                    .fail(Status::resource_exhausted(format!(
+                        "a change batch outgrew the stream's memory: {stop}"
+                    )))
+                    .await;
+                break;
+            }
+        };
         // Sending is not delivery: the registration moves only when the
         // client acknowledges. A batch whose entries carried no unit still
         // moves the cursor, so a client whose interest matches little can
         // acknowledge past them.
-        if !caught_up
-            && s.delivery
+        let sent = caught_up
+            || s.delivery
                 .send(
                     batch,
                     entries,
@@ -682,8 +705,9 @@ async fn stream_consumer(mut s: StreamState) {
                     s.tuning.heartbeat_interval,
                 )
                 .await
-                .is_err()
-        {
+                .is_ok();
+        drop(held);
+        if !sent {
             break;
         }
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use coordinode_core::budget::QueryBudget;
 use coordinode_core::graph::node::{NodeId, NodeRecord, encode_node_key};
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal, UnitEffects,
@@ -641,22 +642,21 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
     let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
         .expect("open oplog");
-    let record = NodeRecord::with_labels(Vec::new())
-        .to_msgpack()
-        .expect("record");
-    let mut mutations: Vec<Mutation> = (1..=60u64)
-        .map(|id| Mutation::Put {
+    // One run of deletes standing for 60 nodes: a frame of two operations
+    // whose projection is 60 events.
+    let mut context = creating((1..=60u64).map(|id| encode_node_key(0, NodeId::from_raw(id))));
+    context.runs = vec![0];
+    let mutations = vec![
+        Mutation::RemoveRange {
             partition: PartitionId::Node,
-            key: encode_node_key(0, NodeId::from_raw(id)),
-            value: record.clone(),
-        })
-        .collect();
-    mutations.push(Mutation::Effects(creating(
-        (1..=60u64).map(|id| encode_node_key(0, NodeId::from_raw(id))),
-    )));
+            start: encode_node_key(0, NodeId::from_raw(1)),
+            end: encode_node_key(0, NodeId::from_raw(61)),
+        },
+        Mutation::Effects(context),
+    ];
     let frame = coordinode_core::txn::frame::encode_unit(&mutations, Timestamp::from_raw(1_000))
         .expect("frame");
-    mgr.append(&OplogEntry {
+    let entry = OplogEntry {
         ts: 1_000,
         term: 1,
         index: 0,
@@ -664,8 +664,8 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
         ops: vec![OplogOp::Unit { frame }],
         is_migration: false,
         pre_images: None,
-    })
-    .expect("append");
+    };
+    mgr.append(&entry).expect("append");
     mgr.flush().expect("flush");
     let mut f = fixture(
         vec![oplog_dir.path().to_path_buf()],
@@ -674,9 +674,21 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
         None,
         RegistryTuning::default(),
     );
-    // Room for a handful of events a read.
+    // The smallest read the entry decodes within: what it leaves does not
+    // hold the 60 events.
+    let start = f.cursor_at(0);
+    let start =
+        coordinode_storage::engine::change_feed::ChangeCursor::from_bytes(&start).expect("cursor");
+    let buffer_bytes = (1..)
+        .map(|step| step * 250)
+        .find(|&bytes| {
+            f.engine
+                .changes_of_entries(&start, [&entry], 1, &QueryBudget::new(bytes as u64))
+                .is_ok()
+        })
+        .expect("a read the entry decodes within");
     f.service = f.service.with_tuning(super::CdcStreamTuning {
-        buffer_bytes: 2_000,
+        buffer_bytes,
         ..super::CdcStreamTuning::default()
     });
 

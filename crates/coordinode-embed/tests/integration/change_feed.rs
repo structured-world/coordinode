@@ -39,15 +39,16 @@ fn interest(labels: Option<&[&str]>, edge_types: Option<&[&str]>) -> ChangeInter
 }
 
 /// Every unit after `cursor` up to the end of what is committed, the cursor
-/// moved past them.
+/// moved past them: copies the test keeps, its own memory, each page's
+/// charge released as the page goes.
 fn read_all(db: &Database, cursor: &mut ChangeCursor) -> Vec<UnitChanges> {
     let budget = QueryBudget::new(1 << 24);
     let mut units = Vec::new();
     loop {
         let page = db.read_changes(cursor, 8, &budget).expect("read");
-        let next = page.batch.cursor.clone();
-        let moved = next.position() != cursor.position();
-        units.extend(page.batch.units);
+        let next = page.batch().cursor.clone();
+        let moved = next != *cursor;
+        units.extend(page.batch().units.iter().cloned());
         *cursor = next;
         if !moved {
             return units;
@@ -753,7 +754,7 @@ fn a_read_too_small_for_one_event_refuses() {
     match db.read_changes(&start, 8, &budget) {
         Err(coordinode_embed::DatabaseError::Budget(_)) => {}
         Err(other) => panic!("refused otherwise: {other}"),
-        Ok(page) => panic!("read within 64 bytes: {:?}", page.batch),
+        Ok(page) => panic!("read within 64 bytes: {:?}", page.batch()),
     }
 }
 

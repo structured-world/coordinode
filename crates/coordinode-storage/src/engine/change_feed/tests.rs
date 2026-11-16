@@ -712,6 +712,48 @@ fn components_are_projected_or_refused_never_passed_over() {
     }
 }
 
+/// A consumer that stops taking is handed no more events, while the unit's
+/// whole count is still returned; a run of deletes is handed over one key
+/// at a time, never listed first.
+#[test]
+fn a_projection_hands_over_events_one_at_a_time() {
+    let mut deletes: Vec<Mutation> = (1..=50)
+        .map(|id| delete(PartitionId::Node, key(id)))
+        .collect();
+    deletes.push(context(
+        (1..=50).map(|id| basis(id, &[3])).collect(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let mut handed = 0;
+    let projected = project_unit_with(&deletes, |_| {
+        handed += 1;
+        if handed == 3 {
+            Take::Enough
+        } else {
+            Take::More
+        }
+    })
+    .expect("project");
+    assert_eq!((handed, projected), (3, 50));
+}
+
+/// A read takes memory from its budget a block at a time: many small events
+/// cost one reservation, not one each.
+#[test]
+fn a_read_charges_its_events_by_the_block() {
+    let units = entry_units(20);
+    let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
+    let mut charge = budget.empty_charge();
+    let (got, _) = unit_changes(&units, &Interest::all(), at(0, 0), &mut charge).expect("read");
+    let events: usize = got.iter().map(|u| u.events.len()).sum();
+    assert_eq!(events, 21);
+    // What the events and units hold, the unspent rest of the block returned.
+    let held = budget.memory_used();
+    assert!(held > 0 && held <= CHARGE_BLOCK, "{held}");
+    assert_eq!(held, charge.bytes());
+}
+
 /// The place in entry 7 at unit `sub`, ordinal `ordinal`.
 fn at(sub: u32, ordinal: u32) -> ReadPlace {
     ReadPlace {

@@ -4993,23 +4993,54 @@ impl StorageEngine {
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
         self.check_cursor_history(cursor)?;
-        let mut units = Vec::new();
-        let mut pool = crate::engine::fixed_cut::EntryPool::new(u64::MAX);
-        for entry in entries {
-            self.change_units_of_entry(&entry.borrowed(), &mut pool, &mut units)
-                .map_err(|failed| match failed {
-                    EntryOutcome::Failed(e) => e,
-                    EntryOutcome::NoRoom | EntryOutcome::Unreadable => {
-                        StorageError::Serialization(format!("entry {} cannot be read", entry.index))
-                    }
-                })?;
-        }
+        // The entries are decoded within what the budget has left, the
+        // decoded units charged to it while the batch is projected from
+        // them: a read decodes no more than it can hold, and stops before an
+        // entry that does not fit, which the next read takes.
         let mut charge = budget.empty_charge();
-        let batch = Self::batch_of(
-            cursor,
-            &crate::engine::change_feed::ChangeRead { units, next },
-            &mut charge,
-        )?;
+        debug_assert!(budget.memory_used() <= budget.memory_limit());
+        // A budget refuses every reservation past its limit.
+        let room = budget.memory_limit() - budget.memory_used();
+        let mut pool = crate::engine::fixed_cut::EntryPool::new(room);
+        let mut units = Vec::new();
+        let mut read_to = next;
+        for entry in entries {
+            let before = units.len();
+            match self.change_units_of_entry(&entry.borrowed(), &mut pool, &mut units) {
+                Ok(()) => {}
+                Err(EntryOutcome::NoRoom) if entry.index > cursor.position() => {
+                    units.truncate(before);
+                    read_to = entry.index;
+                    break;
+                }
+                Err(EntryOutcome::NoRoom) => {
+                    return Err(StorageError::Budget(
+                        coordinode_core::budget::BudgetStop::Memory {
+                            requested: 0,
+                            used: budget.memory_used(),
+                            limit: budget.memory_limit(),
+                        },
+                    ));
+                }
+                Err(EntryOutcome::Failed(e)) => return Err(e),
+                Err(EntryOutcome::Unreadable) => {
+                    return Err(StorageError::Serialization(format!(
+                        "entry {} cannot be read",
+                        entry.index
+                    )));
+                }
+            }
+        }
+        let decoded = pool.kept();
+        charge.grow(decoded).map_err(StorageError::Budget)?;
+        let read = crate::engine::change_feed::ChangeRead {
+            units,
+            next: read_to,
+        };
+        let batch = Self::batch_of(cursor, &read, &mut charge)?;
+        // The decoded units go with the read; the batch keeps its events.
+        drop(read);
+        charge.shrink(decoded);
         Ok((batch, charge))
     }
 
@@ -5617,29 +5648,31 @@ impl StorageEngine {
             }
             // The unit's events in the scope, numbered over its whole
             // projection before the scope chooses its rows below.
-            let events = match crate::engine::change_feed::project_unit(&mutations) {
-                Ok(projected_events) => {
-                    let projected = u32::try_from(projected_events.len()).map_err(|_| {
-                        EntryOutcome::Failed(StorageError::Serialization(
-                            "the unit projects over 2^32 events".into(),
-                        ))
-                    })?;
-                    let mut events = Vec::new();
-                    for event in projected_events
-                        .iter()
-                        .filter(|e| scope.holds_target(&e.target))
-                    {
-                        if !pool.retain(crate::engine::change_feed::event_bytes(event)) {
-                            return Err(EntryOutcome::NoRoom);
-                        }
-                        events.push(crate::engine::change_feed::owned_event(
-                            position,
-                            event,
-                            crate::engine::change_feed::Delivery::Apply,
-                        ));
-                    }
-                    Some(crate::engine::fixed_cut::CutEvents { events, projected })
+            // Only the events in the scope are built, each kept within the
+            // pool as it is handed over.
+            let mut events = Vec::new();
+            let mut no_room = false;
+            let projection = crate::engine::change_feed::project_unit_with(&mutations, |event| {
+                use crate::engine::change_feed::Take;
+                if !scope.holds_target(&event.target) {
+                    return Take::More;
                 }
+                if !pool.retain(crate::engine::change_feed::event_bytes(&event)) {
+                    no_room = true;
+                    return Take::Enough;
+                }
+                events.push(crate::engine::change_feed::owned_event(
+                    position,
+                    &event,
+                    crate::engine::change_feed::Delivery::Apply,
+                ));
+                Take::More
+            });
+            if no_room {
+                return Err(EntryOutcome::NoRoom);
+            }
+            let events = match projection {
+                Ok(projected) => Some(crate::engine::fixed_cut::CutEvents { events, projected }),
                 // Rows without the context their meaning is read by: a
                 // consumer of rows applies them; one of events is told.
                 Err(_) => None,

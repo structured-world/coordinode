@@ -288,7 +288,7 @@ fn a_continuation_carries_events_under_their_feed_identities() {
     // Read before the raw write below, which the feed refuses to project.
     let feed = db.read_changes(&feed_start, 64, &budget).expect("feed");
     let written = feed
-        .batch
+        .batch()
         .units
         .iter()
         .find(|u| !u.events.is_empty())
