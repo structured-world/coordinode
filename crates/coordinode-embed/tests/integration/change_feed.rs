@@ -315,6 +315,24 @@ fn identities_hold_across_interests_and_reads() {
     );
 }
 
+/// A read whose memory cannot hold one event of the next unit refuses with
+/// the budget, the cursor staying where it was.
+#[test]
+fn a_read_too_small_for_one_event_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open(dir.path());
+    let start = db
+        .change_cursor(&ChangeInterest::default())
+        .expect("cursor");
+    run(&mut db, "CREATE (:Person {name: 'a'})");
+    let budget = QueryBudget::new(64);
+    match db.read_changes(&start, 8, &budget) {
+        Err(coordinode_embed::DatabaseError::Budget(_)) => {}
+        Err(other) => panic!("refused otherwise: {other}"),
+        Ok(page) => panic!("read within 64 bytes: {:?}", page.batch),
+    }
+}
+
 /// A reader of a label a type implies follows the nodes of that type, which
 /// carry the label without storing it, through every change of them.
 #[test]

@@ -774,6 +774,8 @@ impl From<StorageError> for DatabaseError {
                 oldest_readable: watermark - 1,
             },
             StorageError::IndexEntry(entry) => Self::IndexEntry(entry),
+            // A read stopped by its memory budget, as one through a store is.
+            StorageError::Budget(stop) => Self::Budget(stop),
             other => Self::Storage(StorageFailure {
                 message: other.to_string(),
                 cause: Some(Box::new(other)),
