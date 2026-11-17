@@ -102,11 +102,11 @@ fn as_of_accepts_an_rfc3339_timestamp() {
     advance_clock(&db, Duration::from_secs(60));
     commit_anchor(&mut db, 2);
 
-    let rfc3339 = |ts: u64| {
-        chrono::DateTime::from_timestamp_micros(i64::try_from(ts).expect("fits"))
-            .expect("in range")
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    let instant = |ts: u64| {
+        jiff::Timestamp::from_microsecond(i64::try_from(ts).expect("fits")).expect("in range")
     };
+    // The UTC form, `Z` for the offset.
+    let rfc3339 = |ts: u64| instant(ts).to_string();
     let count = |db: &mut Database, at: &str| {
         db.execute_cypher(&format!("MATCH (n:Anchor) RETURN n AS OF TIMESTAMP '{at}'"))
             .map(|rows| rows.len())
@@ -117,11 +117,17 @@ fn as_of_accepts_an_rfc3339_timestamp() {
     );
     assert_eq!(count(&mut db, &rfc3339(first - 1)).expect("before it"), 0);
     // A zone offset names the same instant as its UTC form.
-    let offset = chrono::DateTime::from_timestamp_micros(i64::try_from(first).expect("fits"))
-        .expect("in range")
-        .with_timezone(&chrono::FixedOffset::east_opt(3 * 3600).expect("offset"))
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+    let offset = instant(first)
+        .display_with_offset(jiff::tz::offset(3))
+        .to_string();
+    assert!(offset.ends_with("+03:00"), "the offset form: {offset}");
     assert_eq!(count(&mut db, &offset).expect("offset form"), 1);
+    // An RFC 9557 zone name after the offset: the offset names the instant.
+    let named = format!(
+        "{}[America/New_York]",
+        instant(first).display_with_offset(jiff::tz::offset(-4))
+    );
+    assert_eq!(count(&mut db, &named).expect("named zone form"), 1);
 }
 
 /// A string that is not an RFC 3339 timestamp is refused, never read as the

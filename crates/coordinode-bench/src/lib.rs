@@ -26,7 +26,7 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 pub mod error;
@@ -47,7 +47,7 @@ pub struct BenchReport {
     /// Schema version — bump on breaking changes.
     pub schema_version: u32,
     /// Wall-clock timestamp of the run (UTC).
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// Git metadata (commit SHA, branch, dirty flag).
     pub git: GitMetadata,
     /// Host hardware fingerprint.
@@ -91,7 +91,7 @@ impl BenchReport {
     ) -> BenchOpResult<Self> {
         Ok(Self {
             schema_version: SCHEMA_VERSION,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             git: git_metadata()?,
             hardware: hardware_fingerprint(),
             modality: modality.into(),
@@ -128,7 +128,7 @@ impl BenchReport {
     ) -> BenchOpResult<std::path::PathBuf> {
         let dir = base.as_ref().join(&self.modality).join(&self.dataset);
         std::fs::create_dir_all(&dir)?;
-        let stamp = self.timestamp.format("%Y%m%d-%H%M%S");
+        let stamp = self.timestamp.strftime("%Y%m%d-%H%M%S");
         let file_name = match tag {
             Some(t) if !t.is_empty() => {
                 format!(

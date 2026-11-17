@@ -406,6 +406,7 @@ RETURN u.name, u.email
 AS OF TIMESTAMP '2026-03-15T10:00:00Z'
 
 -- RFC 3339, zone offset required: '2026-03-15T10:00:00Z', '2026-03-15T13:00:00+03:00'
+-- An RFC 9557 zone name may follow the offset: '2026-03-15T06:00:00-04:00[America/New_York]'
 -- Microsecond precision: '2026-03-15T10:00:00.123456Z'
 -- Or the raw HLC value (microseconds since the Unix epoch) as an integer
 ```

@@ -4,7 +4,7 @@
 
 use std::process::Command;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
@@ -26,7 +26,7 @@ pub struct GitMetadata {
     /// measurements are still recorded but flagged in the chart.
     pub dirty: bool,
     /// Author commit date of the SHA (NOT the bench run time).
-    pub commit_date: DateTime<Utc>,
+    pub commit_date: Timestamp,
 }
 
 /// Hardware fingerprint of the host running the bench. Populated
@@ -61,9 +61,10 @@ pub fn git_metadata() -> BenchResult<GitMetadata> {
     let dirty_output = run_git(&["status", "--porcelain"])?;
     let dirty = !dirty_output.is_empty();
     let commit_date_raw = run_git(&["log", "-1", "--format=%cI"])?;
-    let commit_date = DateTime::parse_from_rfc3339(&commit_date_raw)
-        .map_err(|e| BenchError::Git(format!("parse commit date: {e}")))?
-        .with_timezone(&Utc);
+    // `%cI` is strict ISO 8601 with the committer's offset.
+    let commit_date: Timestamp = commit_date_raw
+        .parse()
+        .map_err(|e| BenchError::Git(format!("parse commit date: {e}")))?;
     Ok(GitMetadata {
         sha,
         sha_short,

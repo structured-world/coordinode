@@ -2490,10 +2490,11 @@ fn as_of_timestamp_string_is_parsed_as_rfc3339() {
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
         - 3600 * 1_000_000;
-    let rfc3339 = chrono::DateTime::from_timestamp_micros(recent_ts)
+    let rfc3339 = jiff::Timestamp::from_microsecond(recent_ts)
         .expect("in range")
-        .with_timezone(&chrono::FixedOffset::west_opt(5 * 3600).expect("offset"))
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+        .display_with_offset(jiff::tz::offset(-5))
+        .to_string();
+    assert!(rfc3339.ends_with("-05:00"), "the offset form: {rfc3339}");
 
     let plan = LogicalPlan {
         snapshot_ts: Some(nx(Expr::Literal(Value::String(rfc3339)))),

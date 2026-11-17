@@ -80,7 +80,8 @@ coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-h
 [dev-dependencies]
 # The crate's own tests pause its index workers.
 coordinode-embed = { path = ".", features = ["test-hooks"] }
-chrono = { workspace = true }
+# RFC 3339 instants the time-travel tests name.
+jiff = { workspace = true }
 # Failure injection into the text indexes this crate's tests drive.
 coordinode-search = { workspace = true, features = ["test-hooks"] }
 # A certification paused after its proof, for the races of its tests.

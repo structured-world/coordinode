@@ -131,7 +131,7 @@ hmac = "0.13"
 rand = "0.10"
 
 # RFC 3339 timestamps (`AS OF TIMESTAMP '...'`).
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+jiff = { version = "1", default-features = false, features = ["std"] }
 
 # Parallelism
 rayon = "1.12"

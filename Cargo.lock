@@ -777,8 +777,8 @@ dependencies = [
 name = "coordinode-bench"
 version = "0.9.0"
 dependencies = [
- "chrono",
  "clap",
+ "jiff",
  "serde",
  "serde_json",
  "sysinfo",
@@ -849,7 +849,6 @@ dependencies = [
 name = "coordinode-embed"
 version = "0.9.0"
 dependencies = [
- "chrono",
  "coordinode-core",
  "coordinode-embed",
  "coordinode-lsm-tree",
@@ -864,6 +863,7 @@ dependencies = [
  "coordinode-vector",
  "coordinode-wire",
  "coordinode-workspace-hack",
+ "jiff",
  "metrics",
  "metrics-util",
  "parking_lot 0.13.0",
@@ -986,7 +986,6 @@ dependencies = [
 name = "coordinode-query"
 version = "0.9.0"
 dependencies = [
- "chrono",
  "coordinode-cluster",
  "coordinode-core",
  "coordinode-embed",
@@ -997,6 +996,7 @@ dependencies = [
  "coordinode-vector",
  "coordinode-workspace-hack",
  "criterion",
+ "jiff",
  "metrics",
  "parking_lot 0.13.0",
  "pest",
@@ -1369,7 +1369,6 @@ dependencies = [
  "census",
  "cfg-if",
  "chacha20",
- "chrono",
  "ciborium",
  "ciborium-io",
  "ciborium-ll",
@@ -1443,6 +1442,8 @@ dependencies = [
  "itertools 0.13.0",
  "itertools 0.14.0",
  "itoa",
+ "jiff",
+ "jiff-core",
  "lazy_static",
  "levenshtein_automata",
  "libc",
@@ -2213,7 +2214,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3023,6 +3024,41 @@ dependencies = [
  "bytecount",
  "jieba-macros",
  "rustc-hash",
+]
+
+[[package]]
+name = "jiff"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cc767b5763de45e810109520123bb2829a653f3a7ed9be40b2bc4f81158f595"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "894f7ac42105f584100691b3bf6e6b92dd12fcfa225f6c397f95c8a94b47b68f"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "955491488dc99b572ea6d67b172dcd98787d00744b1fb44a5689b4e6413695a6"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -4095,6 +4131,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "postgres-protocol"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4883,7 +4928,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4940,7 +4985,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5773,10 +5818,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6755,7 +6800,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
