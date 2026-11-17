@@ -1238,7 +1238,11 @@ fn long_labels(
 ) -> Vec<coordinode_core::schema::label_id::LabelId> {
     let schemas = coordinode_modality::LocalSchemaStore::new(engine);
     (0..count)
-        .map(|i| schemas.bind_label(&format!("L{i:0>width$}")).expect("bind"))
+        .map(|i| {
+            let digits = i.to_string();
+            let name = format!("L{}{digits}", "0".repeat(width - digits.len()));
+            schemas.bind_label(&name).expect("bind")
+        })
         .collect()
 }
 
@@ -1257,10 +1261,7 @@ async fn a_reads_label_names_take_their_room_first() {
     );
     let labels = long_labels(&f.engine, 40, 1000);
     // Room for about half of the names.
-    let mut left: u64 = 24_000
-        + f.engine
-            .scan_hold_bytes(Partition::Schema, 32)
-            .expect("hold");
+    let mut left: u64 = 24_000;
     let mut taken = 0u64;
     let mut take = |bytes: u64| match left.checked_sub(bytes) {
         Some(rest) => {
@@ -1289,10 +1290,10 @@ async fn a_reads_label_names_take_their_room_first() {
     let kept: u64 = names
         .names
         .iter()
-        .map(|(_, record)| record.len() as u64)
+        .map(|(_, name)| name.capacity() as u64)
         .sum::<u64>()
         + (names.names.capacity()
-            * std::mem::size_of::<(coordinode_core::schema::label_id::LabelId, bytes::Bytes)>())
+            * std::mem::size_of::<(coordinode_core::schema::label_id::LabelId, String)>())
             as u64;
     assert!(kept <= taken, "keeps {kept} bytes, took {taken}");
     // A name already resolved is not looked up or charged again.
@@ -1305,6 +1306,61 @@ async fn a_reads_label_names_take_their_room_first() {
         .expect("resolve");
     assert!(again.is_some());
     assert_eq!(taken, before);
+}
+
+/// A label's name is copied out of its identity record only once its room
+/// is taken: a name far larger than what the read has left is refused
+/// without the read holding a copy of it at any moment.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_past_the_reads_room_is_never_copied() {
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        empty_log(oplog_dir.path()),
+        Arc::new(|| 0),
+        None,
+        RegistryTuning::default(),
+    );
+    // A name of sixty kilobytes, bound and readable in the catalog.
+    let label = long_labels(&f.engine, 1, 60_000)[0];
+    // What the read has left: less than the name.
+    let limit: u64 = 48 << 10;
+    let mut left = limit;
+    let mut take = |bytes: u64| match left.checked_sub(bytes) {
+        Some(rest) => {
+            left = rest;
+            true
+        }
+        None => false,
+    };
+    // What the store's own point read of the record holds, below this
+    // read: the bound the lookup is held to is that and the room given.
+    // The store's first read sets up what later reads share; the bound is
+    // what a read of the record holds after that.
+    let (snapshot, _pin) = f.engine.pin_latest_snapshot();
+    let key = coordinode_core::schema::label_id::label_id_key(label);
+    let read = || {
+        f.engine
+            .with_snapshot_value(&snapshot, Partition::Schema, &key, |record| {
+                record.map(<[u8]>::len)
+            })
+            .expect("read")
+    };
+    read();
+    let (_, store_read) = coordinode_test_fixtures::alloc_peak::peak_of(read);
+    let mut names = super::ReadNames::default();
+    let (resolved, peak) = coordinode_test_fixtures::alloc_peak::peak_of(|| {
+        names
+            .resolve(&f.engine, label, &mut take)
+            .expect("resolve")
+            .is_some()
+    });
+    assert!(!resolved, "refused for want of room");
+    assert!(
+        peak as u64 <= store_read as u64 + limit,
+        "held {peak} bytes at once looking the name up, the store's read \
+         holding {store_read}, within {limit}"
+    );
 }
 
 /// A stream following every label, whose nodes carry many labels of long
@@ -1396,6 +1452,77 @@ async fn labels_are_named_on_every_batch_by_its_own_read() {
             }]
         );
     }
+}
+
+/// A label whose name cannot be read ends the stream with that cause, not
+/// with what the read later made of the missing name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_that_cannot_be_read_ends_the_stream_with_its_cause() {
+    use coordinode_core::txn::proposal::{Implication, NodeBasis};
+
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog");
+    let f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
+        Arc::new(|| 1),
+        None,
+        RegistryTuning::default(),
+    );
+    // An identity no record names.
+    let unknown = coordinode_core::schema::label_id::LabelId::new(9_999).expect("label");
+    let key = encode_node_key(0, NodeId::from_raw(1));
+    let mut effects = UnitEffects::new();
+    effects.nodes.push(NodeBasis {
+        key: key.clone(),
+        labels: Vec::new(),
+    });
+    effects.implications.push(Implication {
+        label: unknown,
+        implies: Vec::new(),
+    });
+    let frame = coordinode_core::txn::frame::encode_unit(
+        &[
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key,
+                value: NodeRecord::with_labels(vec![unknown])
+                    .to_msgpack()
+                    .expect("record"),
+            },
+            Mutation::Effects(effects),
+        ],
+        Timestamp::from_raw(1_000),
+    )
+    .expect("frame");
+    mgr.append(&OplogEntry {
+        ts: 1_000,
+        term: 1,
+        index: 0,
+        shard: 0,
+        ops: vec![OplogOp::Unit { frame }],
+        is_migration: false,
+        pre_images: None,
+    })
+    .expect("append");
+    mgr.flush().expect("flush");
+    let mut stream = f
+        .service
+        .subscribe(Request::new(register("unknown", strict())))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let ended = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream ends")
+        .expect("with an error");
+    let status = ended.expect_err("the read fails");
+    assert!(
+        status.message().contains("has no identity record"),
+        "{}",
+        status.message()
+    );
 }
 
 fn checkpoint_of(registry: &ShardConsumerRegistry, id: &str) -> Option<u64> {

@@ -689,13 +689,20 @@ async fn stream_consumer(mut s: StreamState) {
                         let budget = QueryBudget::new(read_bytes);
                         let mut names = ReadNames::default();
                         let mut form = ProtoForm::new(&engine, &mut names, &cursor);
-                        let (batch, charge) = engine.changes_of_entries_encoded(
+                        let read = engine.changes_of_entries_encoded(
                             &cursor,
                             entries.iter().map(|e| &**e),
                             next,
                             &budget,
                             &mut form,
-                        )?;
+                        );
+                        // A name that could not be read stopped the read: its
+                        // cause is the read's, whatever the read made of the
+                        // stop.
+                        if let Some(failed) = form.failed.take() {
+                            return Err(failed);
+                        }
+                        let (batch, charge) = read?;
                         hub.passed(&reader, batch.cursor.position());
                         let proto = batch_to_proto(&batch, &names)?;
                         // The wire form goes on alone, in the stream's slot.
@@ -838,17 +845,29 @@ impl Drop for OpenStream {
 /// read's wire form takes its names from here, and they go with the read.
 #[derive(Default)]
 struct ReadNames {
-    /// Identity records read, by identity: the name each label was created
-    /// under, as stored.
-    names: Vec<(LabelId, bytes::Bytes)>,
-    /// Whether the read's room holds a catalog lookup's working state.
-    looking_up: bool,
+    /// The name each label was created under, by identity.
+    names: Vec<(LabelId, String)>,
+    /// The catalog snapshot the read names its labels at, pinned for the
+    /// read: taken at its first lookup.
+    snapshot: Option<(
+        u64,
+        Option<coordinode_storage::engine::coordinator::SnapshotPin>,
+    )>,
+}
+
+/// What one catalog lookup found, inside the read of the identity record.
+enum Found {
+    Name(String),
+    Refused,
+    Missing,
+    Unreadable(core::str::Utf8Error),
 }
 
 impl ReadNames {
     /// The name `label` was created under, looked up in the catalog the
     /// first time this read needs it; `None` when `take` refuses the room to
-    /// keep it.
+    /// keep it. The name is copied out of the record read only after its
+    /// room is taken.
     fn resolve(
         &mut self,
         engine: &StorageEngine,
@@ -856,59 +875,66 @@ impl ReadNames {
         take: &mut dyn FnMut(u64) -> bool,
     ) -> Result<Option<&str>, StorageError> {
         let at = match self.names.binary_search_by_key(&label, |(id, _)| *id) {
-            Ok(at) => return Ok(Some(name_of(label, &self.names[at].1)?)),
+            Ok(at) => return Ok(Some(self.names[at].1.as_str())),
             Err(at) => at,
         };
-        let key = coordinode_core::schema::label_id::label_id_key(label);
-        if !self.looking_up {
-            // One point read of the catalog at a time: its working state,
-            // taken once for the read.
-            let hold = engine.scan_hold_bytes(
-                coordinode_storage::engine::partition::Partition::Schema,
-                key.len() as u64,
-            )?;
-            if !take(hold) {
-                return Ok(None);
-            }
-            self.looking_up = true;
-        }
         if self.names.len() == self.names.capacity() {
-            let slot = core::mem::size_of::<(LabelId, bytes::Bytes)>();
+            let slot = core::mem::size_of::<(LabelId, String)>();
             let grown = self.names.capacity().max(2) * 2;
             if !take((grown * slot) as u64) {
                 return Ok(None);
             }
             self.names.reserve_exact(grown - self.names.len());
         }
-        let record = engine
-            .get(
-                coordinode_storage::engine::partition::Partition::Schema,
-                &key,
-            )?
-            .ok_or_else(|| {
-                StorageError::Serialization(format!("label {label} has no identity record"))
-            })?;
-        // The record the read returned is kept as it is, not copied.
-        if !take(record.len() as u64) {
-            return Ok(None);
-        }
-        name_of(label, &record)?;
-        self.names.insert(at, (label, record));
-        Ok(Some(name_of(label, &self.names[at].1)?))
+        // A label's identity record never changes once written: the latest
+        // complete snapshot names every label a committed unit carries.
+        let seqno = self
+            .snapshot
+            .get_or_insert_with(|| engine.pin_latest_snapshot())
+            .0;
+        let key = coordinode_core::schema::label_id::label_id_key(label);
+        let found = engine.with_snapshot_value(
+            &seqno,
+            coordinode_storage::engine::partition::Partition::Schema,
+            &key,
+            |record| match record {
+                None => Found::Missing,
+                Some(record) => match core::str::from_utf8(record) {
+                    Err(e) => Found::Unreadable(e),
+                    Ok(_) if !take(record.len() as u64) => Found::Refused,
+                    Ok(name) => Found::Name(name.to_owned()),
+                },
+            },
+        )?;
+        let name = match found {
+            Found::Name(name) => name,
+            Found::Refused => return Ok(None),
+            Found::Missing => {
+                return Err(StorageError::Serialization(format!(
+                    "label {label} has no identity record"
+                )));
+            }
+            Found::Unreadable(e) => {
+                return Err(StorageError::Serialization(format!(
+                    "the name of label {label}: {e}"
+                )));
+            }
+        };
+        self.names.insert(at, (label, name));
+        Ok(Some(self.names[at].1.as_str()))
     }
 
     /// `label` on the wire: its identity and the name this read resolved.
     fn label(&self, label: LabelId) -> Result<Label, StorageError> {
-        let name = self
+        let at = self
             .names
             .binary_search_by_key(&label, |(id, _)| *id)
             .map_err(|_| {
                 StorageError::Serialization(format!("label {label} was not resolved by the read"))
-            })
-            .and_then(|at| name_of(label, &self.names[at].1))?;
+            })?;
         Ok(Label {
             id: label.get(),
-            name: name.to_owned(),
+            name: self.names[at].1.clone(),
         })
     }
 
@@ -921,12 +947,6 @@ impl ReadNames {
     }
 }
 
-/// The name an identity record holds.
-fn name_of(label: LabelId, record: &[u8]) -> Result<&str, StorageError> {
-    core::str::from_utf8(record)
-        .map_err(|e| StorageError::Serialization(format!("the name of label {label}: {e}")))
-}
-
 /// What the wire form of a batch takes, unit by unit and event by event,
 /// charged to the read with the events it is built from.
 struct ProtoForm<'a> {
@@ -934,6 +954,9 @@ struct ProtoForm<'a> {
     names: &'a mut ReadNames,
     /// The batch's cursor, charged with its first unit.
     cursor: u64,
+    /// Why a label's name could not be read: the read stops there and
+    /// fails with it.
+    failed: Option<StorageError>,
 }
 
 impl<'a> ProtoForm<'a> {
@@ -941,6 +964,7 @@ impl<'a> ProtoForm<'a> {
         Self {
             engine,
             names,
+            failed: None,
             // The batch's cursor encodes as this one does; twice its length
             // covers the room its encoding grows into.
             cursor: 2 * cursor.to_bytes().len() as u64,
@@ -980,9 +1004,11 @@ impl feed::ChangeEncoding for ProtoForm<'_> {
             let name = match names.resolve(engine, label, take) {
                 Ok(Some(name)) => name.len(),
                 Ok(None) => return None,
-                // A label of no readable name: its conversion refuses the
-                // batch with the cause.
-                Err(_) => 0,
+                // The read stops here and fails with the cause.
+                Err(e) => {
+                    self.failed = Some(e);
+                    return None;
+                }
             };
             bytes += (core::mem::size_of::<Label>() + name) as u64;
         }

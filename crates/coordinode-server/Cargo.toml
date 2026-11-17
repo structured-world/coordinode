@@ -73,7 +73,6 @@ parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 tonic-prost = "0.14"
 prost = { workspace = true }
-bytes = { workspace = true }
 prost-types = { workspace = true }
 tower = "0.5"
 http = "1"
@@ -124,6 +123,8 @@ coordinode-search = { workspace = true, features = ["test-hooks"] }
 coordinode-client = { workspace = true }
 coordinode-modality = { workspace = true }
 coordinode-test-fixtures = { workspace = true }
+# Counts what a piece of work held at once (`alloc_peak`) in unit tests.
+tracking-allocator = { version = "0.4", default-features = false }
 # Exact index-membership/payload oracle for replication tests; does not
 # enable the optional vector service in production builds.
 coordinode-vector = { workspace = true }

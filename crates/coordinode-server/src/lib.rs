@@ -10,6 +10,14 @@
 //! - In CE 3-node HA: each node runs identical gRPC server.
 //! - Inter-node communication uses the same :7080 port (distributed mode).
 
+/// Unit tests only: the system allocator, its allocations attributed to
+/// groups so a test counts what a piece of work held at once
+/// (`coordinode_test_fixtures::alloc_peak`).
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: tracking_allocator::Allocator<std::alloc::System> =
+    tracking_allocator::Allocator::system();
+
 pub mod proto {
     pub mod common {
         tonic::include_proto!("coordinode.v1.common");
