@@ -1337,7 +1337,7 @@ async fn a_name_past_the_reads_room_is_never_copied() {
     // read: the bound the lookup is held to is that and the room given.
     // The store's first read sets up what later reads share; the bound is
     // what a read of the record holds after that.
-    let (snapshot, _pin) = f.engine.pin_latest_snapshot();
+    let (snapshot, _pin) = f.engine.pin_snapshot();
     let key = coordinode_core::schema::label_id::label_id_key(label);
     let read = || {
         f.engine
@@ -1523,6 +1523,90 @@ async fn a_name_that_cannot_be_read_ends_the_stream_with_its_cause() {
         "{}",
         status.message()
     );
+}
+
+/// A label created while an earlier, independent write is still landing is
+/// named on the wire at once: its name is read where its identity is, not
+/// at the last snapshot every write below it completed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_label_created_behind_a_pending_write_is_named_at_once() {
+    use coordinode_core::txn::proposal::{Implication, NodeBasis};
+
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog");
+    let f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
+        Arc::new(|| 1),
+        None,
+        RegistryTuning::default(),
+    );
+    // An earlier write, admitted and not landed, held for the whole read.
+    let oracle = f.engine.oracle().expect("clock");
+    let (_early, landing) = f
+        .engine
+        .pending_commits()
+        .admit_direct(|| oracle.next().as_raw());
+    // A label created after it, and a node of it in the log.
+    let late = coordinode_modality::LocalSchemaStore::new(&f.engine)
+        .bind_label("Late")
+        .expect("bind");
+    let key = encode_node_key(0, NodeId::from_raw(1));
+    let mut effects = UnitEffects::new();
+    effects.nodes.push(NodeBasis {
+        key: key.clone(),
+        labels: Vec::new(),
+    });
+    effects.implications.push(Implication {
+        label: late,
+        implies: Vec::new(),
+    });
+    let frame = coordinode_core::txn::frame::encode_unit(
+        &[
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key,
+                value: NodeRecord::with_labels(vec![late])
+                    .to_msgpack()
+                    .expect("record"),
+            },
+            Mutation::Effects(effects),
+        ],
+        Timestamp::from_raw(1_000),
+    )
+    .expect("frame");
+    mgr.append(&OplogEntry {
+        ts: 1_000,
+        term: 1,
+        index: 0,
+        shard: 0,
+        ops: vec![OplogOp::Unit { frame }],
+        is_migration: false,
+        pre_images: None,
+    })
+    .expect("append");
+    mgr.flush().expect("flush");
+
+    let mut stream = f
+        .service
+        .subscribe(Request::new(register("late", strict())))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let batch = next_batch(&mut stream, Duration::from_secs(5))
+        .await
+        .expect("a batch while the earlier write is still landing");
+    let events: Vec<_> = batch.units.into_iter().flat_map(|u| u.events).collect();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        events[0].labels_after,
+        vec![crate::proto::replication::cdc::Label {
+            id: late.get(),
+            name: "Late".into(),
+        }]
+    );
+    drop(landing);
 }
 
 fn checkpoint_of(registry: &ShardConsumerRegistry, id: &str) -> Option<u64> {

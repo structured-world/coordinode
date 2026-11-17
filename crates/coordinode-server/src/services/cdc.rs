@@ -849,10 +849,7 @@ struct ReadNames {
     names: Vec<(LabelId, String)>,
     /// The catalog snapshot the read names its labels at, pinned for the
     /// read: taken at its first lookup.
-    snapshot: Option<(
-        u64,
-        Option<coordinode_storage::engine::coordinator::SnapshotPin>,
-    )>,
+    snapshot: Option<(u64, coordinode_storage::engine::coordinator::SnapshotPin)>,
 }
 
 /// What one catalog lookup found, inside the read of the identity record.
@@ -886,12 +883,11 @@ impl ReadNames {
             }
             self.names.reserve_exact(grown - self.names.len());
         }
-        // A label's identity record never changes once written: the latest
-        // complete snapshot names every label a committed unit carries.
-        let seqno = self
-            .snapshot
-            .get_or_insert_with(|| engine.pin_latest_snapshot())
-            .0;
+        // Every label an applied unit carries had its identity record
+        // written before that unit, and the record never changes: the
+        // current seqno holds it, whether or not an independent earlier
+        // write is still landing. Only this immutable map is read here.
+        let seqno = self.snapshot.get_or_insert_with(|| engine.pin_snapshot()).0;
         let key = coordinode_core::schema::label_id::label_id_key(label);
         let found = engine.with_snapshot_value(
             &seqno,
