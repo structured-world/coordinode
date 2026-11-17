@@ -52,6 +52,12 @@ fn cost_of_writes(ordinary: u32, strict: u32) -> u64 {
         db.execute_cypher(&format!("CREATE (:Warm {{n: {i}}})"))
             .unwrap();
     }
+    // Every store starts the measured writes on empty memtables. A memtable
+    // takes a new arena segment (1.5 MiB) when one fills, on the write that
+    // crosses it; where that falls depends on the bytes written before and
+    // on whether a background flush has rotated the memtable yet, not on the
+    // write measured.
+    db.persist().unwrap();
     let ((), _) = alloc_peak::peak_of(|| {
         for i in 0..WRITES {
             db.execute_cypher(&format!("CREATE (:User {{n: {i}}})"))
