@@ -158,10 +158,24 @@ async fn hand_over_a_held_build(from: &Member, to: &Member, name: &str, property
     })
     .await;
 
-    from.node
-        .transfer_leadership_to(to.node.node_id())
-        .await
-        .unwrap();
+    // A transfer is a request: on a busy host it can outlive an election
+    // timeout, and `from`, which stops sending heartbeats while it hands
+    // over, then stands again and wins. It is asked again until `to` leads.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match from.node.transfer_leadership_to(to.node.node_id()).await {
+            Ok(()) => break,
+            Err(coordinode_raft::cluster::RaftNodeError::TransferSuperseded { leader, .. })
+                if leader == from.node.node_id() => {}
+            Err(coordinode_raft::cluster::RaftNodeError::TransferTimeout { .. }) => {}
+            Err(e) => panic!("handing the lead to {}: {e}", to.node.node_id()),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lead never reached {}",
+            to.node.node_id()
+        );
+    }
     await_build(to, name, is_published).await;
     from.db.read().rollback_transaction(older).unwrap();
     let statement = tokio::task::spawn_blocking(move || created.join().unwrap())
