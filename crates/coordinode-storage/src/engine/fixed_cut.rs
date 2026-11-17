@@ -35,14 +35,15 @@ impl CutScope {
     ///
     /// # Errors
     ///
-    /// [`StorageError::CutUnsupported`] for the index and schema partitions,
-    /// whose state follows from interpretations a row copy does not carry
-    /// (index installations, metadata decisions), and for the Raft
-    /// partition, which holds no rows of the history.
+    /// [`StorageError::CutUnsupported`] for the index and schema partitions
+    /// and the deployment's records, whose state follows from
+    /// interpretations a row copy does not carry (index installations,
+    /// metadata decisions), and for the Raft partition, which holds no rows
+    /// of the history.
     pub fn rows(partition: Partition, prefix: Vec<u8>) -> StorageResult<Self> {
         if matches!(
             partition,
-            Partition::Idx | Partition::Schema | Partition::Raft
+            Partition::Idx | Partition::Schema | Partition::Deployment | Partition::Raft
         ) {
             return Err(StorageError::CutUnsupported {
                 reason: format!("the {partition:?} partition is not a row scope"),

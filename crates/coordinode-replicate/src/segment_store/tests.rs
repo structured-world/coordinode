@@ -801,27 +801,77 @@ async fn a_repair_from_peers_with_different_copies_installs_one_of_them_whole() 
     }
 }
 
-/// Schema carries this node's own records (per-node routing, the state
-/// machine's membership and snapshot metadata): they neither travel nor
-/// get replaced by a peer's copy.
+/// The deployment's records carry this node's own (per-node routing, the
+/// state machine's membership and snapshot metadata): they neither travel
+/// nor get replaced by a peer's copy, while the replicated records do.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_schema_copy_keeps_the_node_local_records() {
+async fn a_records_copy_keeps_the_node_local_records() {
     let peer_dir = tempfile::tempdir().expect("tempdir");
     let (peer, _) = raft_engine(peer_dir.path(), 20);
-    peer.put(Partition::Schema, b"schema:label:A", b"peer")
+    peer.put(Partition::Deployment, b"catalog:A", b"peer")
         .expect("put");
-    peer.put(Partition::Schema, b"raft:sm:membership", b"peer-membership")
-        .expect("put");
+    peer.put(
+        Partition::Deployment,
+        b"raft:sm:membership",
+        b"peer-membership",
+    )
+    .expect("put");
     let uri = serve(&peer).await;
 
     let local_dir = tempfile::tempdir().expect("tempdir");
     let (local, _) = raft_engine(local_dir.path(), 10);
     local
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             b"raft:sm:membership",
             b"local-membership",
         )
+        .expect("put");
+    let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
+    installer
+        .repair_partition(
+            &links(),
+            &[uri],
+            Partition::Deployment,
+            256,
+            PieceEncoding::None,
+        )
+        .await
+        .expect("repair");
+
+    assert_eq!(
+        local
+            .get(Partition::Deployment, b"catalog:A")
+            .expect("get")
+            .as_deref(),
+        Some(b"peer".as_slice())
+    );
+    assert_eq!(
+        local
+            .get(Partition::Deployment, b"raft:sm:membership")
+            .expect("get")
+            .as_deref(),
+        Some(b"local-membership".as_slice())
+    );
+}
+
+/// A namespace's Schema tree carries this node's records about the
+/// namespace's indexes (`meta:`): they neither travel nor get replaced by a
+/// peer's copy, while the labels do.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_copy_keeps_the_nodes_index_records() {
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let (peer, _) = raft_engine(peer_dir.path(), 20);
+    peer.put(Partition::Schema, b"schema:label:A", b"peer")
+        .expect("put");
+    peer.put(Partition::Schema, b"meta:idxarmed:i", b"peer-armed")
+        .expect("put");
+    let uri = serve(&peer).await;
+
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let (local, _) = raft_engine(local_dir.path(), 10);
+    local
+        .put(Partition::Schema, b"meta:idxarmed:i", b"local-armed")
         .expect("put");
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
@@ -844,10 +894,10 @@ async fn a_schema_copy_keeps_the_node_local_records() {
     );
     assert_eq!(
         local
-            .get(Partition::Schema, b"raft:sm:membership")
+            .get(Partition::Schema, b"meta:idxarmed:i")
             .expect("get")
             .as_deref(),
-        Some(b"local-membership".as_slice())
+        Some(b"local-armed".as_slice())
     );
 }
 

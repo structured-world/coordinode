@@ -40,7 +40,7 @@ fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
 fn with_history(engine: &StorageEngine, id: u8) {
     engine
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             coordinode_core::group::DEPLOYMENT_KEY,
             &[id; 16],
         )
@@ -76,7 +76,7 @@ fn a_snapshot_is_one_cut_whatever_lands_while_it_streams() {
                 .map_err(|e| io::Error::other(e.to_string()))?;
             engine
                 .put(
-                    Partition::Schema,
+                    Partition::Deployment,
                     coordinode_core::group::DEPLOYMENT_KEY,
                     &[7; 16],
                 )
@@ -98,7 +98,7 @@ fn a_snapshot_is_one_cut_whatever_lands_while_it_streams() {
     };
     assert_eq!(keys(Partition::EdgeProp), vec![b"ep:early".to_vec()]);
     assert!(
-        !keys(Partition::Schema)
+        !keys(Partition::Deployment)
             .iter()
             .any(|key| key.as_slice() == coordinode_core::group::DEPLOYMENT_KEY),
         "a binding written after the cut is not in the image"
@@ -250,16 +250,23 @@ fn installing_columnar_rows_holds_no_more_than_the_limit() {
             .map_err(|e| e.to_string())
     });
     installed.unwrap();
-    // The table's tree the engine opens and keeps is the engine's memory,
-    // not the restore's: measured alone, and allowed for.
+    // The table's tree the engine opens and keeps, and the memtable the
+    // engine starts for a Schema tree no write reached yet, are the engine's
+    // memory, not the restore's: measured alone, and allowed for.
     let engine_tree = {
         let probe_dir = tempdir().unwrap();
         let probe = open_engine(probe_dir.path());
         peak_of(|| probe.reset_columnar_table("Probe").unwrap()).1 as u64
     };
+    let engine_memtable = {
+        let probe_dir = tempdir().unwrap();
+        let probe = open_engine(probe_dir.path());
+        peak_of(|| probe.put(Partition::Schema, b"meta:probe", b"").unwrap()).1 as u64
+    };
     assert!(
-        peak as u64 <= limit + engine_tree,
-        "held {peak} bytes under a {limit}-byte limit (the engine's tree takes {engine_tree})"
+        peak as u64 <= limit + engine_tree + engine_memtable,
+        "held {peak} bytes under a {limit}-byte limit (the engine's tree takes {engine_tree}, \
+         its first Schema memtable {engine_memtable})"
     );
     assert_eq!(target.columnar_tables_at(u64::MAX).unwrap()[0].1.len(), 12);
 }
@@ -443,7 +450,7 @@ fn a_snapshot_installs_history_only_into_its_domain() {
     let other = open_engine(other_dir.path());
     other
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             coordinode_core::group::DEPLOYMENT_KEY,
             &[2; 16],
         )
@@ -466,7 +473,7 @@ fn a_snapshot_installs_history_only_into_its_domain() {
     let same_dir = tempdir().unwrap();
     let same = open_engine(same_dir.path());
     same.put(
-        Partition::Schema,
+        Partition::Deployment,
         coordinode_core::group::DEPLOYMENT_KEY,
         &[1; 16],
     )
@@ -504,7 +511,7 @@ fn a_replaced_database_takes_the_images_domain() {
     let target = open_engine(target_dir.path());
     target
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             coordinode_core::group::DEPLOYMENT_KEY,
             &[2; 16],
         )
@@ -764,14 +771,20 @@ fn a_snapshot_with_a_contradictory_dictionary_is_refused() {
     );
 }
 
+/// The receiver keeps its own consensus records among the deployment's
+/// records (`raft:`), takes the replicated records and the labels from the
+/// snapshot, and drops what the snapshot does not hold.
 #[test]
-fn test_snapshot_preserves_raft_keys_in_schema() {
+fn test_snapshot_preserves_raft_keys_in_the_deployment_records() {
     let dir = tempdir().unwrap();
     let engine = open_engine(dir.path());
 
-    // Source has raft keys and application keys
+    // Source has raft keys, replicated records and application keys
     engine
-        .put(Partition::Schema, b"raft:vote", b"raft-data")
+        .put(Partition::Deployment, b"raft:vote", b"raft-data")
+        .unwrap();
+    engine
+        .put(Partition::Deployment, b"catalog:new", b"source")
         .unwrap();
     engine
         .put(Partition::Schema, b"schema:label:User", b"{}")
@@ -783,7 +796,10 @@ fn test_snapshot_preserves_raft_keys_in_schema() {
     let dir2 = tempdir().unwrap();
     let engine2 = open_engine(dir2.path());
     engine2
-        .put(Partition::Schema, b"raft:vote", b"target-raft-data")
+        .put(Partition::Deployment, b"raft:vote", b"target-raft-data")
+        .unwrap();
+    engine2
+        .put(Partition::Deployment, b"catalog:old", b"target")
         .unwrap();
     engine2
         .put(Partition::Schema, b"schema:label:Old", b"old")
@@ -794,10 +810,24 @@ fn test_snapshot_preserves_raft_keys_in_schema() {
     // Raft keys preserved (target's own raft data kept)
     assert_eq!(
         engine2
-            .get(Partition::Schema, b"raft:vote")
+            .get(Partition::Deployment, b"raft:vote")
             .unwrap()
             .map(|b| b.to_vec()),
         Some(b"target-raft-data".to_vec())
+    );
+    // Replicated records replaced from the snapshot
+    assert_eq!(
+        engine2
+            .get(Partition::Deployment, b"catalog:new")
+            .unwrap()
+            .map(|b| b.to_vec()),
+        Some(b"source".to_vec())
+    );
+    assert!(
+        engine2
+            .get(Partition::Deployment, b"catalog:old")
+            .unwrap()
+            .is_none()
     );
     // Application data replaced from snapshot
     assert_eq!(

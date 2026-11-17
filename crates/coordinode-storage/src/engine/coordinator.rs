@@ -969,7 +969,7 @@ impl LocalMultiModalCoordinator {
     /// Reserved for engine-internal call sites (cascade eviction,
     /// persist, capacity refresh).
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
-        let set = if part.is_system() {
+        let set = if part.is_deployment() {
             self.sets.system()
         } else {
             &self.store

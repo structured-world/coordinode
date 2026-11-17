@@ -1754,11 +1754,11 @@ fn a_fresh_store_holds_no_user_data() {
     );
     assert!(!engine.holds_user_data().expect("read the fresh store"));
 
-    // The engine's own state in the shared Schema tree stays invisible to the
-    // question: routing metadata is written at open, and the Raft state
-    // machine keeps its applied id beside it.
+    // The engine's own state among the deployment's records stays invisible
+    // to the question: routing metadata is written at open, and the Raft
+    // state machine keeps its applied id beside it.
     engine
-        .put(Partition::Schema, b"raft:sm:applied", b"7")
+        .put(Partition::Deployment, b"raft:sm:applied", b"7")
         .expect("put");
     assert!(
         !engine.holds_user_data().expect("read"),
@@ -2204,8 +2204,8 @@ fn every_position_keeps_its_ceiling_past_the_cache_and_a_restart() {
 fn stored_breakpoints(engine: &StorageEngine) -> u64 {
     use lsm_tree::AbstractTree;
     engine
-        .tree(Partition::Schema)
-        .expect("schema tree")
+        .tree(Partition::Deployment)
+        .expect("the deployment tree")
         .prefix(
             crate::engine::closure_ledger::BREAKPOINT_PREFIX,
             lsm_tree::SeqNo::MAX,
@@ -3391,13 +3391,15 @@ fn interrupted_cleanup_reopens_exact_and_completes() {
         "the landed batch is the state read back"
     );
     assert_eq!(stored_breakpoints(&engine), after_batch);
-    // The same entry applied again over records the Schema tree holds.
+    // The same entry applied again over records the deployment tree holds.
     if let Some((records, at)) = engine
         .closure_record(first + positions + 1, closing, true)
         .expect("plan")
     {
         engine
-            .apply_raft_proposal(&records, at, closing, 0, |part| part == Partition::Schema)
+            .apply_raft_proposal(&records, at, closing, 0, |part| {
+                part == Partition::Deployment
+            })
             .expect("skipped");
     }
     engine

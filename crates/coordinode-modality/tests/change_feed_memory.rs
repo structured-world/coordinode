@@ -48,7 +48,7 @@ fn open_engine(dir: &std::path::Path) -> (StorageEngine, Arc<TimestampOracle>) {
     .unwrap();
     engine
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             coordinode_core::group::ENROLLED_DEPLOYMENT_KEY,
             &[7; 16],
         )

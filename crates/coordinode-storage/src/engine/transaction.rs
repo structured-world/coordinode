@@ -252,6 +252,7 @@ fn partition_to_id(p: Partition) -> PartitionId {
         Partition::VectorF32 => PartitionId::VectorF32,
         Partition::Registry => PartitionId::Registry,
         Partition::NodeHistory => PartitionId::NodeHistory,
+        Partition::Deployment => PartitionId::Deployment,
     }
 }
 

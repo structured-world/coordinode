@@ -66,6 +66,15 @@ pub enum Partition {
     /// and the commit that stated it. Application data, kept past the
     /// time-travel window.
     NodeHistory,
+
+    /// The system set's Schema tree: the records that hold for the whole
+    /// deployment or its replication group rather than one namespace (the
+    /// namespace catalog and its policies, identifier leases, client
+    /// operation records, the consensus state machine's records, the group's
+    /// version and identity, the engine's own placement and recovery
+    /// records). Kept like a namespace's Schema tree: the same replication,
+    /// coverage, retention and backup.
+    Deployment,
 }
 
 impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
@@ -83,6 +92,7 @@ impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
             PartitionId::VectorF32 => Self::VectorF32,
             PartitionId::Registry => Self::Registry,
             PartitionId::NodeHistory => Self::NodeHistory,
+            PartitionId::Deployment => Self::Deployment,
         }
     }
 }
@@ -105,6 +115,7 @@ impl Partition {
             Self::VectorF32 => PartitionId::VectorF32,
             Self::Registry => PartitionId::Registry,
             Self::NodeHistory => PartitionId::NodeHistory,
+            Self::Deployment => PartitionId::Deployment,
         })
     }
 
@@ -123,6 +134,7 @@ impl Partition {
             Self::VectorF32 => "vec",
             Self::Registry => "registry",
             Self::NodeHistory => "nodehist",
+            Self::Deployment => "deployment",
         }
     }
 
@@ -149,22 +161,31 @@ impl Partition {
         matches!(self, Self::Registry | Self::Raft)
     }
 
+    /// Whether this partition's tree belongs to the deployment's system set
+    /// rather than to a namespace: the consensus log, the consumer registry
+    /// and the deployment's records. Every other partition has a tree in
+    /// each namespace's set.
+    pub const fn is_deployment(self) -> bool {
+        matches!(self, Self::Registry | Self::Raft | Self::Deployment)
+    }
+
     /// The key prefix under which this partition holds data a user put
     /// there, or `None` when the whole partition is state the deployment
     /// keeps about itself.
     ///
-    /// `Raft` is consensus state and `Registry` is internal bookkeeping, so
-    /// neither holds any. The `Schema` tree is shared: the operator's label
-    /// and edge-type definitions live under its own `schema:` prefix, while
-    /// the engine keeps partition routing under `meta:` and the Raft state
-    /// machine keeps its applied id, membership and snapshot under `raft:`.
-    /// Every other partition holds nothing but what was written to it.
+    /// `Raft` is consensus state, `Registry` internal bookkeeping and
+    /// `Deployment` the deployment's own records, so none of them holds
+    /// any. A namespace's `Schema` tree keeps the operator's label and
+    /// edge-type definitions under its own `schema:` prefix beside the
+    /// records the engine derives for the namespace (field bindings, index
+    /// state). Every other partition holds nothing but what was written to
+    /// it.
     ///
     /// This is what lets a node answer whether it holds anything of its own,
     /// which decides whether it may join a group that already has data.
     pub fn user_data_prefix(self) -> Option<&'static [u8]> {
         match self {
-            Self::Raft | Self::Registry => None,
+            Self::Raft | Self::Registry | Self::Deployment => None,
             Self::Schema => Some(b"schema:"),
             _ => Some(b""),
         }
@@ -193,11 +214,12 @@ impl Partition {
             Self::VectorF32 => 9,
             Self::Registry => 10,
             Self::NodeHistory => 11,
+            Self::Deployment => 12,
         }
     }
 
     /// The number of partitions.
-    pub(crate) const COUNT: usize = 12;
+    pub(crate) const COUNT: usize = 13;
 
     /// All partitions in creation order.
     pub fn all() -> &'static [Partition] {
@@ -214,6 +236,7 @@ impl Partition {
             Self::VectorF32,
             Self::Registry,
             Self::NodeHistory,
+            Self::Deployment,
         ]
     }
 }

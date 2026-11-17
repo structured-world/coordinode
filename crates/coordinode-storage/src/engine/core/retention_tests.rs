@@ -1168,7 +1168,7 @@ fn the_tree_metrics_are_published_per_partition() {
     }
 
     metrics::with_local_recorder(&GaugeCapture(Arc::clone(&sink)), || {
-        super::publish_tree_metrics(engine.coordinator.trees());
+        super::publish_tree_metrics(&engine.coordinator.trees());
     });
     let ratio = partition_gauge(
         &sink.lock(),

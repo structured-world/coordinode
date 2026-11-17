@@ -500,7 +500,7 @@ async fn await_self_election(raft: &RaftInstance) -> Result<(), RaftNodeError> {
 /// to before the deployment's own record reaches it.
 const KEY_ENROLLED_DEPLOYMENT: &[u8] = coordinode_core::group::ENROLLED_DEPLOYMENT_KEY;
 
-/// Schema-partition key recording the members a joining store was
+/// Key among the deployment's records recording the members a joining store was
 /// provisioned to trust, kept with its enrollment: a store restarted before
 /// its group's membership reached it still knows whom to ask who the members
 /// are, and so admits the leader that brings it the log.
@@ -541,10 +541,14 @@ fn bind_enrollment(
     let authorities = rmp_serde::to_vec(&authorities)
         .map_err(|e| RaftNodeError::Init(format!("encode the enrollment's authorities: {e}")))?;
     engine
-        .put(Partition::Schema, KEY_ENROLLED_AUTHORITIES, &authorities)
+        .put(
+            Partition::Deployment,
+            KEY_ENROLLED_AUTHORITIES,
+            &authorities,
+        )
         .and_then(|()| {
             engine.put(
-                Partition::Schema,
+                Partition::Deployment,
                 KEY_ENROLLED_DEPLOYMENT,
                 enrollment.deployment.as_bytes(),
             )
@@ -560,7 +564,7 @@ fn enrolled_authorities(
 ) -> Result<Vec<coordinode_wire::peer::PeerTarget>, RaftNodeError> {
     use coordinode_storage::engine::partition::Partition;
     let Some(bytes) = engine
-        .get(Partition::Schema, KEY_ENROLLED_AUTHORITIES)
+        .get(Partition::Deployment, KEY_ENROLLED_AUTHORITIES)
         .map_err(|e| RaftNodeError::Init(format!("read the enrollment's authorities: {e}")))?
     else {
         return Ok(Vec::new());
@@ -577,7 +581,7 @@ fn enrolled_authorities(
 fn enrolled_deployment(engine: &StorageEngine) -> Result<Option<DeploymentId>, RaftNodeError> {
     use coordinode_storage::engine::partition::Partition;
     let enrolled = engine
-        .get(Partition::Schema, KEY_ENROLLED_DEPLOYMENT)
+        .get(Partition::Deployment, KEY_ENROLLED_DEPLOYMENT)
         .map_err(|e| RaftNodeError::Init(format!("read the enrollment: {e}")))?;
     match enrolled.as_deref().map(DeploymentId::from_slice) {
         Some(Some(bound)) => Ok(Some(bound)),

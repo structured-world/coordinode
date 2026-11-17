@@ -395,16 +395,16 @@ pub enum StorageError {
         enrolled: coordinode_core::group::DeploymentId,
     },
 
-    /// The Schema tree the open reads first (the routes of every other tree,
-    /// the closure ledger, the member's own records) cannot be shown to hold
-    /// the store's state, and nothing at hand rebuilds it. Nothing was read
-    /// from it as an answer and nothing was initialised; the store, its
-    /// checkpoints and its journal are left as they are.
-    #[error("the Schema partition cannot be qualified for the open: {0}")]
-    SchemaRecoveryRefused(crate::engine::rebuild::RebuildRefusal),
+    /// The deployment's records the open reads first (the routes of every
+    /// other tree, the closure ledger, the member's own records) cannot be
+    /// shown to hold the store's state, and nothing at hand rebuilds them.
+    /// Nothing was read from them as an answer and nothing was initialised;
+    /// the store, its checkpoints and its journal are left as they are.
+    #[error("the deployment's records cannot be qualified for the open: {0}")]
+    DeploymentRecoveryRefused(crate::engine::rebuild::RebuildRefusal),
 
     /// A commit ceiling read from the stored closure records was selected
-    /// from a ledger a Schema rebuild replaced while it was read: what it
+    /// from a ledger a rebuild of the deployment's records replaced while it was read: what it
     /// read may belong to neither ledger. Nothing is answered; a new lookup
     /// answers from the ledger in place, or is refused while a rebuild is
     /// owed.

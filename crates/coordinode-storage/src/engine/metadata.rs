@@ -2,8 +2,10 @@
 //! identities and NodeId leases.
 //!
 //! A [`MetadataCommand`] is decided against the state the engine holds when it
-//! applies, under the engine's decision lock, and turned into plain Schema
-//! puts before anything else sees the proposal. Every record it writes is
+//! applies, under the engine's decision lock, and turned into plain puts
+//! before anything else sees the proposal: field bindings and label
+//! identities in a namespace's Schema tree, NodeId leases and the group's
+//! version and identity among the deployment's records. Every record it writes is
 //! write-once (one key per binding direction, one per lease), so which commit
 //! timestamp a record carries never changes what a reader finds; only the
 //! order of application does, and that order is the log's.
@@ -63,7 +65,10 @@ pub(crate) fn decide(
         MetadataCommand::RecordDeployment { id } => Ok(if recorded_deployment(engine)?.is_some() {
             Vec::new()
         } else {
-            vec![schema_put(DEPLOYMENT_KEY.to_vec(), id.as_bytes().to_vec())]
+            vec![deployment_put(
+                DEPLOYMENT_KEY.to_vec(),
+                id.as_bytes().to_vec(),
+            )]
         }),
         MetadataCommand::ConditionalRegistryWrite { expect, put } => {
             decide_registry_write(engine, expect, put)
@@ -103,7 +108,7 @@ fn decide_registry_write(
 ///
 /// The record does not decode.
 pub fn recorded_deployment(engine: &StorageEngine) -> StorageResult<Option<DeploymentId>> {
-    match engine.get(Partition::Schema, DEPLOYMENT_KEY)? {
+    match engine.get(Partition::Deployment, DEPLOYMENT_KEY)? {
         None => Ok(None),
         Some(bytes) => DeploymentId::from_slice(&bytes).map(Some).ok_or_else(|| {
             StorageError::Serialization("the deployment record does not decode".into())
@@ -124,7 +129,7 @@ pub fn recorded_deployment(engine: &StorageEngine) -> StorageResult<Option<Deplo
 pub fn bound_deployment(engine: &StorageEngine) -> StorageResult<Option<DeploymentId>> {
     binding_of(
         recorded_deployment(engine)?,
-        engine.get(Partition::Schema, ENROLLED_DEPLOYMENT_KEY)?,
+        engine.get(Partition::Deployment, ENROLLED_DEPLOYMENT_KEY)?,
     )
 }
 
@@ -137,7 +142,7 @@ pub fn bound_deployment_at(
     engine: &StorageEngine,
     snapshot: lsm_tree::SeqNo,
 ) -> StorageResult<Option<DeploymentId>> {
-    let recorded = match engine.snapshot_get(&snapshot, Partition::Schema, DEPLOYMENT_KEY)? {
+    let recorded = match engine.snapshot_get(&snapshot, Partition::Deployment, DEPLOYMENT_KEY)? {
         None => None,
         Some(bytes) => Some(DeploymentId::from_slice(&bytes).ok_or_else(|| {
             StorageError::Serialization("the deployment record does not decode".into())
@@ -145,7 +150,7 @@ pub fn bound_deployment_at(
     };
     binding_of(
         recorded,
-        engine.snapshot_get(&snapshot, Partition::Schema, ENROLLED_DEPLOYMENT_KEY)?,
+        engine.snapshot_get(&snapshot, Partition::Deployment, ENROLLED_DEPLOYMENT_KEY)?,
     )
 }
 
@@ -242,7 +247,7 @@ pub fn holds_history(engine: &StorageEngine) -> StorageResult<bool> {
 /// The record cannot be read.
 pub fn identity_retired(engine: &StorageEngine, identity: &[u8]) -> StorageResult<bool> {
     Ok(engine
-        .get(Partition::Schema, &retired_identity_key(identity))?
+        .get(Partition::Deployment, &retired_identity_key(identity))?
         .is_some())
 }
 
@@ -254,7 +259,7 @@ fn decide_group_pair(engine: &StorageEngine, pair: VersionPair) -> StorageResult
         return Ok(Vec::new());
     }
     let seq = last.map_or(1, |r| r.seq + 1);
-    Ok(vec![schema_put(group_pair_key(seq), encode_pair(pair))])
+    Ok(vec![deployment_put(group_pair_key(seq), encode_pair(pair))])
 }
 
 /// Every pair the group recorded, oldest first.
@@ -265,7 +270,7 @@ fn decide_group_pair(engine: &StorageEngine, pair: VersionPair) -> StorageResult
 pub fn group_pair_records(engine: &StorageEngine) -> StorageResult<Vec<RecordedPair>> {
     let malformed = || StorageError::Serialization("a group pair record does not decode".into());
     let mut records = Vec::new();
-    for guard in engine.prefix_scan(Partition::Schema, GROUP_PAIR_KEY_PREFIX)? {
+    for guard in engine.prefix_scan(Partition::Deployment, GROUP_PAIR_KEY_PREFIX)? {
         let (key, value) = guard.into_inner()?;
         records.push(RecordedPair {
             seq: decode_group_pair_key(&key).ok_or_else(malformed)?,
@@ -282,7 +287,7 @@ pub fn group_pair_records(engine: &StorageEngine) -> StorageResult<Vec<RecordedP
 /// The last record's key or value does not decode.
 pub fn recorded_group_pair(engine: &StorageEngine) -> StorageResult<Option<RecordedPair>> {
     let Some(guard) = engine
-        .prefix_scan_rev(Partition::Schema, GROUP_PAIR_KEY_PREFIX)?
+        .prefix_scan_rev(Partition::Deployment, GROUP_PAIR_KEY_PREFIX)?
         .next()
     else {
         return Ok(None);
@@ -297,6 +302,14 @@ pub fn recorded_group_pair(engine: &StorageEngine) -> StorageResult<Option<Recor
 fn schema_put(key: Vec<u8>, value: Vec<u8>) -> Mutation {
     Mutation::Put {
         partition: PartitionId::Schema,
+        key,
+        value,
+    }
+}
+
+fn deployment_put(key: Vec<u8>, value: Vec<u8>) -> Mutation {
+    Mutation::Put {
+        partition: PartitionId::Deployment,
         key,
         value,
     }
@@ -393,7 +406,10 @@ fn decide_lease(
         // Another grant moved the ceiling since this one read it.
         return Ok(Vec::new());
     }
-    Ok(vec![schema_put(node_lease_key(ceiling), token.to_vec())])
+    Ok(vec![deployment_put(
+        node_lease_key(ceiling),
+        token.to_vec(),
+    )])
 }
 
 /// The id `name` is bound to, if any.
@@ -683,7 +699,7 @@ pub fn label_binding_effects(
 /// The last lease record's key does not name a ceiling.
 pub fn node_lease_ceiling(engine: &StorageEngine) -> StorageResult<u64> {
     let Some(guard) = engine
-        .prefix_scan_rev(Partition::Schema, NODE_LEASE_KEY_PREFIX)?
+        .prefix_scan_rev(Partition::Deployment, NODE_LEASE_KEY_PREFIX)?
         .next()
     else {
         return Ok(0);
@@ -704,7 +720,7 @@ pub fn node_lease_holder(
     ceiling: u64,
 ) -> StorageResult<Option<[u8; NODE_LEASE_TOKEN_LEN]>> {
     Ok(engine
-        .get(Partition::Schema, &node_lease_key(ceiling))?
+        .get(Partition::Deployment, &node_lease_key(ceiling))?
         .and_then(|v| <[u8; NODE_LEASE_TOKEN_LEN]>::try_from(v.as_ref()).ok()))
 }
 

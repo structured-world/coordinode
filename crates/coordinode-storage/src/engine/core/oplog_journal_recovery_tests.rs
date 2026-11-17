@@ -19,7 +19,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
 
-mod schema_transfer;
+mod records_transfer;
 
 /// A persistent (oplog-eligible) single-endpoint config rooted at `dir`.
 fn durable_cfg(dir: &TempDir) -> StorageConfig {

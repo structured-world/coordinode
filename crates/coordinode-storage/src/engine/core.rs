@@ -221,10 +221,10 @@ pub struct StorageEngine {
     /// How the trees sync their files: under a barrier a flush is ordered,
     /// and durable once the device caches are flushed.
     tree_sync: lsm_tree::fs::SyncMode,
-    /// The version of the Schema tree whose blocks the open verified before
-    /// it read the tree, when it did.
-    schema_verified: Option<u64>,
-    /// The Schema tree is owed a rebuild (begun here, or cut short before
+    /// The version of the deployment tree whose blocks the open verified
+    /// before it read the tree, when it did.
+    deployment_verified: Option<u64>,
+    /// The deployment tree is owed a rebuild (begun here, or cut short before
     /// this open): the closure ledger in memory is not the tree's, so no
     /// commit ceiling is answered until the rebuild installs one.
     ledger_owed: std::sync::atomic::AtomicBool,
@@ -949,17 +949,18 @@ impl StorageEngine {
 
         // Two-pass open (per-LSM-level endpoint routing):
         //
-        // **Pass 1** — open the Schema partition with no per-level routing.
-        // Schema holds the routing metadata for every other partition, so
-        // it has to be reachable before we can decide where other partitions'
-        // SSTs should land. Schema itself stays single-tier on the primary
-        // endpoint by design; metadata is small and the bootstrap problem
+        // **Pass 1**: open the deployment's records tree with no per-level
+        // routing. It holds the routing of every other tree, so it has to be
+        // reachable before we can decide where other trees' SSTs should
+        // land. It stays single-tier on the primary endpoint by design: its
+        // records are small and the bootstrap problem
         // (routing-needed-to-open-the-routing-store) does not arise.
         //
-        // **Pass 2** — for each non-Schema partition, load the persisted
-        // [`PartitionRouting`] from Schema or initialise (compute + persist)
-        // on first open against this endpoint set. Open the partition tree
-        // with `level_routes` derived from the routing.
+        // **Pass 2**: for each other tree, load the persisted
+        // [`PartitionRouting`] from the deployment's records or initialise
+        // (compute + persist) it on first open against this endpoint set, and
+        // open the tree with `level_routes` derived from it. A namespace's
+        // Schema tree stays single-tier like the deployment's: metadata.
         let mut trees = HashMap::with_capacity(Partition::all().len());
         let mut open_repairs: Vec<OpenRepair> = Vec::new();
 
@@ -987,68 +988,66 @@ impl StorageEngine {
         // what the others still have to write rather than the same free bytes.
         let capacity_pool = Arc::new(lsm_tree::CapacityPool::default());
 
-        // Pass 1: Schema partition (single-tier, no routing).
-        let schema_config = config
-            .to_tree_config(store_tree(Partition::Schema), Arc::clone(&seqno))
+        // Pass 1: the deployment's records (single-tier, no routing).
+        let deployment_config = config
+            .to_tree_config(TreeId::system(Partition::Deployment), Arc::clone(&seqno))
             .use_cache(Arc::clone(&cache))
             .write_buffer_budget(Arc::clone(&write_buffer))
             .compaction_rate_limiter(Arc::clone(&maintenance))
             .compaction_capacity(Arc::clone(&capacity_pool));
-        let (schema_tree, schema_repair) = schema_config.open_or_repair(repair_policy)?;
-        let schema_repair = schema_repair.map(|report| {
+        let (deployment_tree, deployment_repair) =
+            deployment_config.open_or_repair(repair_policy)?;
+        let deployment_repair = deployment_repair.map(|report| {
             tracing::warn!(
-                partition = Partition::Schema.name(),
+                partition = Partition::Deployment.name(),
                 recovered = report.recovered,
                 salvaged = report.salvaged,
                 scope = ?report.wal_replay_scope(),
                 "partition tree structurally repaired at open"
             );
             OpenRepair {
-                partition: Partition::Schema,
+                partition: Partition::Deployment,
                 replay_scope: report.wal_replay_scope(),
                 report,
             }
         });
-        trees.insert(Partition::Schema, schema_tree.clone());
+        trees.insert(Partition::Deployment, deployment_tree.clone());
 
-        // Restore seqno from Schema BEFORE reading routing — the routing
-        // get() needs a fresh seqno bound so it observes prior persisted
-        // writes, and one above the tree's retention floor so it is served at
-        // all. The two differ most here: schema rows are as old as the
-        // database while the floor is as recent as the last compaction, so a
-        // clock that restarts behind that compaction would otherwise read
-        // below the floor and fail the open. Same seeding as the whole-engine
-        // restore below, for the one tree read before it.
+        // Restore seqno from the deployment's records BEFORE reading routing:
+        // the routing get() needs a fresh seqno bound so it observes prior
+        // persisted writes, and one above the tree's retention floor so it is
+        // served at all. The two differ most here: these rows are as old as
+        // the database while the floor is as recent as the last compaction,
+        // so a clock that restarts behind that compaction would otherwise
+        // read below the floor and fail the open. Same seeding as the
+        // whole-engine restore below, for the one tree read before it.
         {
             use lsm_tree::AbstractTree;
-            if let Some(max) = schema_tree.get_highest_seqno() {
+            if let Some(max) = deployment_tree.get_highest_seqno() {
                 seqno.fetch_max(max + 1);
             }
-            if let Some(first_servable) = schema_tree.retention_floor().checked_add(1) {
+            if let Some(first_servable) = deployment_tree.retention_floor().checked_add(1) {
                 seqno.fetch_max(first_servable);
             }
         }
-        // Nothing reads the Schema tree as an answer until its own records
-        // are proved; a rebuild it is owed runs once the journal is read.
-        let settled = schema_bootstrap::Bootstrap {
+        // Nothing reads the deployment's records as an answer until they are
+        // proved; a rebuild the tree is owed runs once the journal is read.
+        let settled = deployment_bootstrap::Bootstrap {
             config,
-            schema: &schema_tree,
-            repair: schema_repair.as_ref(),
+            records: &deployment_tree,
+            repair: deployment_repair.as_ref(),
             seqno: &seqno,
             journaled: journal_config.is_some() && config.select_oplog_endpoint(0).is_ok(),
             footprints: &footprints,
             maintenance: &maintenance,
         }
         .settle()?;
-        let schema_verified = settled.verified;
-        let mut schema_rebuild = settled.rebuild;
-        let mut schema_rebuilt = false;
+        let deployment_verified = settled.verified;
+        let mut deployment_rebuild = settled.rebuild;
+        let mut deployment_rebuilt = false;
         {
             use lsm_tree::AbstractTree;
-            // A store of the layout that kept the ledger among the Schema
-            // rows is refused before anything here writes to it.
-            refuse_earlier_closure_layout(&schema_tree, seqno.get())?;
-            let head = schema_tree
+            let head = deployment_tree
                 .get(crate::engine::closure_ledger::HEAD_KEY, seqno.get())
                 .map_err(|e| StorageError::Io(format!("schema get closed bound: {e}")))?;
             if let Some(head) = head {
@@ -1064,38 +1063,46 @@ impl StorageEngine {
             }
         }
 
-        // Pass 2: load/initialise routing for each non-Schema partition,
-        // then open it with `level_routes` wired. The node partition's
-        // routing also places the columnar tables' levels.
+        // Pass 2: load/initialise routing for each other partition, then
+        // open it with `level_routes` wired. The node partition's routing
+        // also places the columnar tables' levels.
         #[cfg(feature = "columnar")]
         let mut node_routing = None;
         // Where each partition's flushes land: the endpoint of its level 0.
-        // The Schema tree stays on the primary endpoint.
+        // The Schema trees stay on the primary endpoint.
         let mut flush_landing: HashMap<Partition, std::path::PathBuf> = HashMap::new();
-        flush_landing.insert(Partition::Schema, config.data_dir().to_path_buf());
+        for part in [Partition::Deployment, Partition::Schema] {
+            flush_landing.insert(part, config.data_dir().to_path_buf());
+        }
         // Intents live as files of the data directory itself: a store whose
         // directory is not one on disk (a memory filesystem) keeps none.
         let durable_intents = config.data_dir().is_dir();
         for &part in Partition::all() {
-            if part == Partition::Schema {
+            if part == Partition::Deployment {
                 continue;
             }
-            let routing = load_or_init_partition_routing(
-                &schema_tree,
-                &seqno,
-                &config.endpoints,
-                part,
-                config.relocated,
-            )?;
+            // A namespace's Schema tree stays single-tier, like the
+            // deployment's: metadata is small and read first.
+            let routing = if part == Partition::Schema {
+                None
+            } else {
+                Some(load_or_init_partition_routing(
+                    &deployment_tree,
+                    &seqno,
+                    &config.endpoints,
+                    part,
+                    config.relocated,
+                )?)
+            };
             if let Some(endpoint) = routing
-                .levels
-                .get(&0)
+                .as_ref()
+                .and_then(|routing| routing.levels.get(&0))
                 .and_then(|id| config.endpoints.iter().find(|e| &e.id == id))
             {
                 flush_landing.insert(part, endpoint.path.clone());
             }
             let tree_config = config
-                .to_tree_config_with_routing(store_tree(part), Arc::clone(&seqno), Some(&routing))
+                .to_tree_config_with_routing(store_tree(part), Arc::clone(&seqno), routing.as_ref())
                 .use_cache(Arc::clone(&cache))
                 .write_buffer_budget(Arc::clone(&write_buffer))
                 .compaction_rate_limiter(Arc::clone(&maintenance))
@@ -1118,7 +1125,7 @@ impl StorageEngine {
             trees.insert(part, tree);
             #[cfg(feature = "columnar")]
             if part == Partition::Node {
-                node_routing = Some(routing);
+                node_routing = routing;
             }
         }
 
@@ -1266,25 +1273,25 @@ impl StorageEngine {
                             .max()
                             .unwrap_or(0),
                     );
-                    // The Schema tree's rebuild, before the replay: every
-                    // entry below this index is applied, as the journal and
-                    // every other tree say, and the rebuilt tree holds them
-                    // all. The replay below leaves the tree to it.
-                    if let Some(rebuild) = schema_rebuild.take() {
-                        rebuild.run(schema_bootstrap::RebuildInputs {
+                    // The deployment records' rebuild, before the replay:
+                    // every entry below this index is applied, as the
+                    // journal and every other tree say, and the rebuilt tree
+                    // holds them all. The replay below leaves the tree to it.
+                    if let Some(rebuild) = deployment_rebuild.take() {
+                        rebuild.run(deployment_bootstrap::RebuildInputs {
                             config,
-                            schema: crate::engine::local_journal::tree_of(
+                            records: crate::engine::local_journal::tree_of(
                                 &trees,
-                                Partition::Schema,
+                                Partition::Deployment,
                             )?,
-                            repair: schema_repair.as_ref(),
+                            repair: deployment_repair.as_ref(),
                             seqno: &seqno,
                             footprints: &footprints,
                             repair_policy,
                             entries: &entries,
                             next: journal.next_index(),
                         })?;
-                        schema_rebuilt = true;
+                        deployment_rebuilt = true;
                     }
                     let mut replayed = 0usize;
                     for entry in &entries {
@@ -1357,9 +1364,9 @@ impl StorageEngine {
             },
             None => None,
         };
-        // A rebuilt Schema tree's repair is met; any other stays owed.
-        if let Some(repair) = schema_repair
-            && !schema_rebuilt
+        // A rebuilt deployment tree's repair is met; any other stays owed.
+        if let Some(repair) = deployment_repair
+            && !deployment_rebuilt
         {
             open_repairs.push(repair);
         }
@@ -1786,12 +1793,13 @@ impl StorageEngine {
             Ok(endpoint) => group_history_evidence(&endpoint.path, &trees)?.is_some(),
             Err(_) => false,
         };
-        // A Schema rebuild still owed after the open (a transfer from a peer
-        // cut short) leaves the tree without the ledger it is to install.
+        // A rebuild of the deployment's records still owed after the open (a
+        // transfer from a peer cut short) leaves the tree without the ledger
+        // it is to install.
         let schema_owed = durable_intents
             && read_rebuild_intents(config.data_dir())?
                 .partitions
-                .contains(&Partition::Schema);
+                .contains(&Partition::Deployment);
         let coordinator = LocalMultiModalCoordinator::new(
             sets,
             store_set,
@@ -1835,7 +1843,7 @@ impl StorageEngine {
             data_dir: config.data_dir().to_path_buf(),
             fs,
             tree_sync: config.oplog_sync_method.tree_sync_mode(),
-            schema_verified,
+            deployment_verified,
             ledger_owed: std::sync::atomic::AtomicBool::new(schema_owed),
             maintenance,
             write_slowdown,
@@ -2159,10 +2167,12 @@ impl StorageEngine {
         if self.footprints.is_empty() {
             return Ok(crate::engine::footprint::Admitted::default());
         }
-        let class = if parts
-            .into_iter()
-            .all(|part| matches!(part, Partition::Schema | Partition::Raft))
-        {
+        let class = if parts.into_iter().all(|part| {
+            matches!(
+                part,
+                Partition::Schema | Partition::Deployment | Partition::Raft
+            )
+        }) {
             Admit::Recovery
         } else {
             Admit::Client.on_this_thread()
@@ -3549,8 +3559,13 @@ impl StorageEngine {
         // or a member record changed since), so a live tree that cannot give
         // them leaves the rebuild refused. The consensus state (vote, log) is
         // not taken back from an older copy either: an older vote would let
-        // this node vote twice in one term, so none is reinstated.
-        let local = match self.node_local_rows(partition) {
+        // this node vote twice in one term, so none is reinstated. A rebuild
+        // a crash cut short after its clear kept them in its intent, which
+        // is read in place of the cleared tree.
+        let local = match read_kept_rows(&self.data_dir, partition)
+            .transpose()
+            .unwrap_or_else(|| self.node_local_rows(partition))
+        {
             Ok(local) => local,
             Err(e) if partition == Partition::Raft => {
                 tracing::warn!(
@@ -3935,7 +3950,8 @@ impl StorageEngine {
     fn node_local_rows(&self, partition: Partition) -> StorageResult<Rows> {
         let prefixes: &[&[u8]] = match partition {
             Partition::Raft => &[b""],
-            Partition::Schema => &[b"meta:", b"raft:"],
+            Partition::Deployment => &[b"meta:", b"raft:"],
+            Partition::Schema => &[b"meta:"],
             _ => &[],
         };
         let mut rows = Rows::new();
@@ -3980,14 +3996,14 @@ impl StorageEngine {
 
     /// Whether the open verified every block of `partition`'s tree, before
     /// it read it, at the version the tree still has: a verification now
-    /// would read the same blocks for the same answer. Only the Schema tree
-    /// is verified that early, where the open goes on to verify the trees a
-    /// checkpoint backs.
+    /// would read the same blocks for the same answer. Only the deployment's
+    /// records are verified that early, where the open goes on to verify the
+    /// trees a checkpoint backs.
     #[must_use]
     pub fn verified_at_open(&self, partition: Partition) -> bool {
         use lsm_tree::AbstractTree as _;
-        partition == Partition::Schema
-            && self.schema_verified.is_some_and(|version| {
+        partition == Partition::Deployment
+            && self.deployment_verified.is_some_and(|version| {
                 self.tree(partition)
                     .is_ok_and(|tree| tree.current_version().id() == version)
             })
@@ -4050,17 +4066,18 @@ impl StorageEngine {
 
     /// Write the rebuild intent of `partition`, under a repair taken, with
     /// the records of its own `kept` that the rebuild puts back after its
-    /// clear. Only the Schema tree has such records outside the consensus
+    /// clear. Only the Schema trees have such records outside the consensus
     /// partition, which no copy rebuilds.
     fn record_kept(&self, partition: Partition, kept: &Rows) -> StorageResult<()> {
-        let kept = if partition == Partition::Schema {
+        if partition == Partition::Deployment {
             // From the clear on, the ledger in memory is not the tree's: a
             // stored record read for it from here on answers nothing.
             let mut state = self.closure.lock();
             state.installation += 1;
             self.ledger_owed
                 .store(true, std::sync::atomic::Ordering::Release);
-            drop(state);
+        }
+        let kept = if matches!(partition, Partition::Deployment | Partition::Schema) {
             encode_kept_rows(kept)?
         } else {
             Vec::new()
@@ -4142,7 +4159,7 @@ impl StorageEngine {
             self.note_field_dictionary_change();
         }
         last()?;
-        if partition == Partition::Schema {
+        if partition == Partition::Deployment {
             // The rebuilt tree's ledger, whichever way it was rebuilt, is the
             // one answered from here on.
             self.reload_closure_frontier()?;
@@ -4152,7 +4169,7 @@ impl StorageEngine {
             RebuildTarget::Partition(partition),
             &self.footprints,
         )?;
-        if partition == Partition::Schema {
+        if partition == Partition::Deployment {
             self.ledger_owed
                 .store(false, std::sync::atomic::Ordering::Release);
         }
@@ -5338,15 +5355,15 @@ impl StorageEngine {
             limit: budget.memory_limit(),
         };
         // A segment's read buffer, the one path a search holds, and a point
-        // read of the Schema tree deciding a unit's operation binding: a
-        // marker of an empty value under a short key.
+        // read of the deployment's records deciding a unit's operation
+        // binding: a marker of an empty value under a short key.
         let marker = crate::engine::operations::skipped_unit_key(
             coordinode_core::txn::operation::LogPosition { index: 0, sub: 0 },
         )
         .len() as u64;
         let reader = FRAME_CURSOR_BUFFER as u64
             + READER_PATH_ROOM
-            + self.scan_hold_bytes(Partition::Schema, marker)?;
+            + self.scan_hold_bytes(Partition::Deployment, marker)?;
         charge.grow(reader).map_err(StorageError::Budget)?;
         'log: while next < until && taken < max_entries {
             let at = next;
@@ -7685,11 +7702,12 @@ impl StorageEngine {
         tree: &lsm_tree::AnyTree,
         cleared: impl FnOnce() -> StorageResult<()>,
     ) -> StorageResult<()> {
-        // The Schema tree's own records (its routes, its member records) are
+        // A Schema tree's own records (the deployment's routes and member
+        // records, a namespace's records of this node about its indexes) are
         // the store's, not the partition's data: read under the repair, kept
         // in its intent, and put back after the clear.
         let repair = self.enter_repair(part)?;
-        let kept = if part == Partition::Schema {
+        let kept = if matches!(part, Partition::Schema | Partition::Deployment) {
             self.node_local_rows(part)?
         } else {
             Rows::new()
@@ -8650,7 +8668,7 @@ impl StorageEngine {
             .0
             .plan(commits, below, index, 0, &StoredBreakpoints(self))?;
         if !held && let Some((records, at)) = closure_writes(&replay.0, &plan, below) {
-            self.apply_raft_proposal(&records, at, index, sub, |p| p != Partition::Schema)?;
+            self.apply_raft_proposal(&records, at, index, sub, |p| p != Partition::Deployment)?;
         }
         replay.0.install(&plan);
         Ok(())
@@ -8868,7 +8886,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// The ledger the Schema tree holds: its head with the newest
+    /// The ledger the deployment tree holds: its head with the newest
     /// breakpoints, read from the top (never the whole window), and the
     /// first one after its anchor; empty when the tree holds no head.
     fn stored_closure_ledger(&self) -> StorageResult<crate::engine::closure_ledger::ClosureLedger> {
@@ -8876,8 +8894,7 @@ impl StorageEngine {
             BREAKPOINT_PREFIX, Breakpoint, ClosureLedger, HEAD_KEY,
         };
         use lsm_tree::{AbstractTree, Guard as _};
-        let tree = self.tree(Partition::Schema)?;
-        refuse_earlier_closure_layout(tree, lsm_tree::SeqNo::MAX)?;
+        let tree = self.tree(Partition::Deployment)?;
         let Some(bytes) = tree.get(HEAD_KEY, lsm_tree::SeqNo::MAX)? else {
             return Ok(ClosureLedger::default());
         };
@@ -8893,14 +8910,14 @@ impl StorageEngine {
         )
     }
 
-    /// The ledger's records as the Schema tree holds them at `seqno`: what a
-    /// copy of the partition carries beside its rows, from the same cut. Only
-    /// these of the reserved records: coverage and installation records keep
-    /// their own rules.
+    /// The ledger's records as the deployment tree holds them at `seqno`:
+    /// what a copy of the partition carries beside its rows, from the same
+    /// cut. Only these of the reserved records: coverage and installation
+    /// records keep their own rules.
     pub(crate) fn closure_rows_at(&self, seqno: lsm_tree::SeqNo) -> StorageResult<Rows> {
         use crate::engine::closure_ledger::{BREAKPOINT_PREFIX, HEAD_KEY};
         use lsm_tree::{AbstractTree, Guard as _};
-        let tree = self.tree(Partition::Schema)?;
+        let tree = self.tree(Partition::Deployment)?;
         let mut rows = Vec::new();
         if let Some(head) = tree.get(HEAD_KEY, seqno)? {
             rows.push((HEAD_KEY.to_vec(), head.to_vec()));
@@ -9419,9 +9436,9 @@ fn run_cascade_evict(
         )));
     }
 
-    let schema_tree = sets.tree(store_tree(Partition::Schema)).ok_or_else(|| {
+    let records = sets.system().get(Partition::Deployment).ok_or_else(|| {
         StorageError::PartitionNotFound {
-            name: Partition::Schema.name().to_string(),
+            name: Partition::Deployment.name().to_string(),
         }
     })?;
     let read_seqno = seqno.get();
@@ -9429,13 +9446,18 @@ fn run_cascade_evict(
     let mut compacted_partitions = 0u32;
     for (id, tree) in sets.list() {
         let part = id.part;
-        if part == Partition::Schema || part == Partition::Raft {
+        // The Schema trees stay single-tier, with no routing of their own,
+        // and the consensus log is never evicted.
+        if matches!(
+            part,
+            Partition::Schema | Partition::Deployment | Partition::Raft
+        ) {
             continue;
         }
         let key = routing_key_for(part);
-        let bytes = match schema_tree
+        let bytes = match records
             .get(&key, read_seqno)
-            .map_err(|e| StorageError::Io(format!("schema get routing {}: {e}", part.name())))?
+            .map_err(|e| StorageError::Io(format!("get routing {}: {e}", part.name())))?
         {
             Some(b) => b,
             None => continue,
@@ -9758,8 +9780,8 @@ fn routing_key_for(partition: Partition) -> Vec<u8> {
 }
 
 /// Load the persisted [`PartitionRouting`] for a partition from
-/// the Schema tree, or initialise (compute default + persist) on first
-/// open against this endpoint set.
+/// the deployment's records, or initialise (compute default + persist) on
+/// first open against this endpoint set.
 ///
 /// **Validation:** persisted routings are validated against the current
 /// `endpoints` list. If a previously-referenced endpoint id is missing,
@@ -9774,7 +9796,7 @@ fn routing_key_for(partition: Partition) -> Vec<u8> {
 /// `relocated`: the store's tables were gathered into `endpoints` from
 /// another layout, so the persisted routing is replaced by the default.
 fn load_or_init_partition_routing(
-    schema_tree: &lsm_tree::AnyTree,
+    records: &lsm_tree::AnyTree,
     seqno: &lsm_tree::SharedSequenceNumberGenerator,
     endpoints: &[EndpointConfig],
     partition: Partition,
@@ -9786,9 +9808,9 @@ fn load_or_init_partition_routing(
     let persisted = if relocated {
         None
     } else {
-        schema_tree.get(&key, read_seqno).map_err(|e| {
-            StorageError::Io(format!("schema get routing for {}: {e}", partition.name()))
-        })?
+        records
+            .get(&key, read_seqno)
+            .map_err(|e| StorageError::Io(format!("get routing for {}: {e}", partition.name())))?
     };
     match persisted {
         Some(bytes) => {
@@ -9818,7 +9840,7 @@ fn load_or_init_partition_routing(
             let write_seqno = seqno.next();
             let mut batch = lsm_tree::WriteBatch::with_capacity(1);
             batch.insert(key.as_slice(), encoded.as_slice());
-            schema_tree.apply_batch(batch, write_seqno).map_err(|e| {
+            records.apply_batch(batch, write_seqno).map_err(|e| {
                 StorageError::Io(format!("persist routing for {}: {e}", partition.name()))
             })?;
             tracing::info!(
@@ -10217,32 +10239,7 @@ const REBUILD_INTENT_DIR: &str = "rebuild";
 /// [`StorageEngine::replay_closure_record`].
 pub struct ClosureReplay(crate::engine::closure_ledger::ClosureLedger);
 
-/// Refuse a Schema tree holding the closure ledger where an earlier layout
-/// kept it, among the application's rows: this build reads the ledger only
-/// from the reserved namespace and would take that store for one without a
-/// ledger, every prefix closed.
-fn refuse_earlier_closure_layout(
-    tree: &lsm_tree::AnyTree,
-    seqno: lsm_tree::SeqNo,
-) -> StorageResult<()> {
-    use crate::engine::closure_ledger::{REFUSED_BREAKPOINT_PREFIX, REFUSED_HEAD_KEY};
-    use lsm_tree::AbstractTree;
-    let earlier = tree.get(REFUSED_HEAD_KEY, seqno)?.is_some()
-        || tree
-            .prefix(REFUSED_BREAKPOINT_PREFIX, seqno, None)
-            .next()
-            .is_some();
-    if earlier {
-        return Err(StorageError::InvalidConfig(
-            "this store keeps the Raft closure ledger among its Schema rows, a layout this \
-             release does not read; it was written by an earlier build"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-/// The Schema writes `plan` makes against `ledger`, with the timestamp to
+/// The writes to the deployment's records `plan` makes against `ledger`, with the timestamp to
 /// write them at, or `None` when it changes nothing: the head as the plan
 /// leaves it, a record per breakpoint it adds and the removal of each it
 /// retires, all in the reserved namespace. The timestamp is the larger of the
@@ -10261,17 +10258,17 @@ fn closure_writes(
     }
     let mut mutations = Vec::with_capacity(1 + plan.added().len() + plan.retired().len());
     mutations.push(Mutation::Put {
-        partition: PartitionId::Schema,
+        partition: PartitionId::Deployment,
         key: HEAD_KEY.to_vec(),
         value: head,
     });
     mutations.extend(plan.added().iter().map(|b| Mutation::Put {
-        partition: PartitionId::Schema,
+        partition: PartitionId::Deployment,
         key: b.key(),
         value: b.value().to_vec(),
     }));
     mutations.extend(plan.retired().iter().map(|b| Mutation::Delete {
-        partition: PartitionId::Schema,
+        partition: PartitionId::Deployment,
         key: b.key(),
     }));
     let ceiling = plan
@@ -10296,15 +10293,16 @@ struct ClosureState {
     pending: Vec<(u64, u64)>,
     /// The plan of the entry whose records are being written.
     prepared: Option<crate::engine::closure_ledger::ClosurePlan>,
-    /// Which installation of the ledger this is: raised when a Schema rebuild
-    /// clears the tree and when a ledger is loaded into memory, so a stored
-    /// record read for one installation is not answered by another.
+    /// Which installation of the ledger this is: raised when a rebuild of the
+    /// deployment's records clears the tree and when a ledger is loaded into
+    /// memory, so a stored record read for one installation is not answered
+    /// by another.
     installation: u64,
 }
 
-/// The breakpoint records in the Schema tree's reserved namespace, read by
-/// bounded seeks of the tree itself: the application's scans never reach
-/// that namespace.
+/// The breakpoint records in the deployment tree's reserved key space, read
+/// by bounded seeks of the tree itself: the application's scans never reach
+/// that key space.
 struct StoredBreakpoints<'a>(&'a StorageEngine);
 
 impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
@@ -10321,7 +10319,7 @@ impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
         #[cfg(any(test, feature = "test-faults"))]
         breakpoint_read_gate::pass();
         self.0
-            .tree(Partition::Schema)?
+            .tree(Partition::Deployment)?
             .range(
                 breakpoint_key(from)..=breakpoint_key(through),
                 lsm_tree::SeqNo::MAX,
@@ -10346,7 +10344,7 @@ impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
             return Ok(Vec::new());
         };
         self.0
-            .tree(Partition::Schema)?
+            .tree(Partition::Deployment)?
             .range(
                 breakpoint_key(from)..=breakpoint_key(u64::MAX),
                 lsm_tree::SeqNo::MAX,
@@ -10648,13 +10646,13 @@ fn put_rebuild_intent(
     sync_dir(data_dir)
 }
 
-/// The Schema tree's own records its pending rebuild keeps
+/// The node's own records of `partition` its pending rebuild keeps
 /// ([`write_rebuild_intent_with`]): `None` when no rebuild of it is pending,
 /// or its intent holds none to prove them by.
-fn read_kept_rows(data_dir: &Path) -> StorageResult<Option<Rows>> {
+fn read_kept_rows(data_dir: &Path, partition: Partition) -> StorageResult<Option<Rows>> {
     let path = data_dir
         .join(REBUILD_INTENT_DIR)
-        .join(RebuildTarget::Partition(Partition::Schema).file_name());
+        .join(RebuildTarget::Partition(partition).file_name());
     // no-std: StoragePort trait, caller-injected
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -10666,7 +10664,7 @@ fn read_kept_rows(data_dir: &Path) -> StorageResult<Option<Rows>> {
     }
     // Records that do not read back whole prove nothing.
     let Ok(payload) = open_record(KEPT_ROWS_MAGIC, &bytes) else {
-        tracing::error!(path = %path.display(), "the records a Schema rebuild kept are damaged");
+        tracing::error!(path = %path.display(), "the records a rebuild kept are damaged");
         return Ok(None);
     };
     rmp_serde::from_slice(payload)
@@ -10771,14 +10769,14 @@ fn apply_columnar_row(
     Ok(tree.apply_batch(batch, seqno)?)
 }
 
+mod deployment_bootstrap;
 mod raft_coverage;
-mod schema_bootstrap;
+#[cfg(any(test, feature = "test-faults"))]
+pub use deployment_bootstrap::CUT_AFTER_CLEAR as DEPLOYMENT_REBUILD_CUT_AFTER_CLEAR;
 pub use raft_coverage::{
     PartitionCopy, RaftApplyFence, RaftApplyState, RaftCoverage, RaftHeld, RaftPosition,
     is_node_local,
 };
-#[cfg(any(test, feature = "test-faults"))]
-pub use schema_bootstrap::CUT_AFTER_CLEAR as SCHEMA_REBUILD_CUT_AFTER_CLEAR;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
@@ -10806,7 +10804,7 @@ mod closure_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
-mod schema_bootstrap_tests;
+mod deployment_bootstrap_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]

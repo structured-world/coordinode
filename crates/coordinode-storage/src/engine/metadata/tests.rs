@@ -601,7 +601,7 @@ fn a_joined_store_belongs_to_the_deployment_it_was_enrolled_in() {
     let (engine, oracle) = open(&dir);
     assert_eq!(bound_deployment(&engine).unwrap(), None);
     engine
-        .put(Partition::Schema, ENROLLED_DEPLOYMENT_KEY, &[3; 16])
+        .put(Partition::Deployment, ENROLLED_DEPLOYMENT_KEY, &[3; 16])
         .unwrap();
     assert_eq!(
         bound_deployment(&engine).unwrap(),
@@ -623,7 +623,7 @@ fn a_retired_identity_is_retired_alone() {
     assert!(!identity_retired(&engine, b"spiffe://td/a").unwrap());
     engine
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             &coordinode_core::group::retired_identity_key(b"spiffe://td/a"),
             &[],
         )

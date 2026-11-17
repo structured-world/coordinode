@@ -1,8 +1,8 @@
-//! The open settles the Schema tree before it reads the routes, the closure
-//! ledger or anything else the rest of the open depends on: a tree whose
-//! rebuild was cut short, or that an open salvaged with loss, is rebuilt or
-//! its own records proved, and refused otherwise. An absent key in such a
-//! tree is never read as a fresh store.
+//! The open settles the deployment's records before it reads the routes, the
+//! closure ledger or anything else the rest of the open depends on: a tree
+//! whose rebuild was cut short, or that an open salvaged with loss, is
+//! rebuilt or its own records proved, and refused otherwise. An absent key in
+//! such a tree is never read as a fresh store.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -58,28 +58,28 @@ fn read(engine: &StorageEngine, part: Partition, key: &[u8]) -> Option<Vec<u8>> 
         .map(|value| value.to_vec())
 }
 
-/// The directory of the Schema tree under an endpoint or a checkpoint.
-fn schema_dir() -> std::path::PathBuf {
-    crate::engine::scope::store_tree(Partition::Schema).dir()
+/// The directory of the deployment tree under an endpoint or a checkpoint.
+fn records_dir() -> std::path::PathBuf {
+    TreeId::system(Partition::Deployment).dir()
 }
 
-/// The ids of the tables the open Schema tree's version holds. A table's
+/// The ids of the tables the open deployment tree's version holds. A table's
 /// file is named by its id; a file name alone is reused across opens.
-fn schema_table_ids(engine: &StorageEngine) -> HashSet<u64> {
+fn records_table_ids(engine: &StorageEngine) -> HashSet<u64> {
     engine
-        .tree(Partition::Schema)
-        .expect("schema")
+        .tree(Partition::Deployment)
+        .expect("the deployment tree")
         .current_version()
         .iter_tables()
         .map(lsm_tree::Table::id)
         .collect()
 }
 
-/// Flip a byte of the data section of each Schema table under `endpoint`
-/// named in `victims`, writing a new file in its place, so a checkpoint
-/// sharing the old one by a hard link keeps it whole.
-fn damage_schema_tables(endpoint: &Path, victims: &HashSet<u64>) -> usize {
-    let dir = endpoint.join(schema_dir()).join("tables");
+/// Flip a byte of the data section of each deployment table under
+/// `endpoint` named in `victims`, writing a new file in its place, so a
+/// checkpoint sharing the old one by a hard link keeps it whole.
+fn damage_records_tables(endpoint: &Path, victims: &HashSet<u64>) -> usize {
+    let dir = endpoint.join(records_dir()).join("tables");
     let mut damaged = 0;
     for id in victims {
         let path = dir.join(id.to_string());
@@ -97,16 +97,16 @@ fn damage_schema_tables(endpoint: &Path, victims: &HashSet<u64>) -> usize {
     damaged
 }
 
-/// Remove the Schema tree's manifest snapshots and edit logs under
+/// Remove the deployment tree's manifest snapshots and edit logs under
 /// `endpoint`, its tables left in place: the next open repairs the tree.
-fn lose_schema_manifest(endpoint: &Path) {
-    let dir = endpoint.join(schema_dir());
+fn lose_records_manifest(endpoint: &Path) {
+    let dir = endpoint.join(records_dir());
     let numbered = |rest: Option<&str>| {
         rest.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
     };
     let mut lost = 0;
     for entry in std::fs::read_dir(&dir)
-        .expect("read the Schema dir")
+        .expect("read the deployment tree's dir")
         .flatten()
     {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -118,15 +118,16 @@ fn lose_schema_manifest(endpoint: &Path) {
     assert!(lost > 0, "no manifest file in {}", dir.display());
 }
 
-/// A Schema rebuild cut short after its clear leaves the routes of the other
-/// trees nowhere in the tree. The next open takes them from what the rebuild
-/// kept before the clear, so every tree opens where its tables are and the
-/// store's own records written last are there: a store whose routes differ
-/// from the default for its endpoints (an endpoint added after the store was
-/// created) finds its node row again. Read from the cleared tree, the routes
-/// were absent and the open wrote the default in their place.
+/// A rebuild of the deployment's records cut short after its clear leaves
+/// the routes of the other trees nowhere in the tree. The next open takes
+/// them from what the rebuild kept before the clear, so every tree opens
+/// where its tables are and the store's own records written last are there:
+/// a store whose routes differ from the default for its endpoints (an
+/// endpoint added after the store was created) finds its node row again.
+/// Read from the cleared tree, the routes were absent and the open wrote the
+/// default in their place.
 #[test]
-fn an_interrupted_schema_rebuild_keeps_the_routes_of_the_other_trees() {
+fn an_interrupted_records_rebuild_keeps_the_routes_of_the_other_trees() {
     let root = tempfile::TempDir::new().expect("tempdir");
     let (a, b) = (root.path().join("a"), root.path().join("b"));
     std::fs::create_dir_all(&a).expect("dir a");
@@ -144,7 +145,7 @@ fn an_interrupted_schema_rebuild_keeps_the_routes_of_the_other_trees() {
     let routes = {
         let engine = open_journaled(&both).expect("open with an endpoint added");
         let routes = engine
-            .get(Partition::Schema, &routing_key(Partition::Node))
+            .get(Partition::Deployment, &routing_key(Partition::Node))
             .expect("read the node routes")
             .expect("the node routes are stored");
         let default = rmp_serde::to_vec(&PartitionRouting::default_for_endpoints(&both.endpoints))
@@ -155,12 +156,15 @@ fn an_interrupted_schema_rebuild_keeps_the_routes_of_the_other_trees() {
             "the store's routes must differ from the default for this to test anything"
         );
         engine
-            .put(Partition::Schema, b"meta:probe", b"written last")
+            .put(Partition::Deployment, b"meta:probe", b"written last")
             .expect("a record of the store's own");
-        let schema = engine.tree(Partition::Schema).expect("schema").clone();
+        let records = engine
+            .tree(Partition::Deployment)
+            .expect("the deployment tree")
+            .clone();
         assert!(
             engine
-                .clear_partition_with(Partition::Schema, &schema, || {
+                .clear_partition_with(Partition::Deployment, &records, || {
                     Err(StorageError::Io("cut short".into()))
                 })
                 .is_err()
@@ -171,7 +175,7 @@ fn an_interrupted_schema_rebuild_keeps_the_routes_of_the_other_trees() {
     let engine = open_journaled(&both).expect("reopen");
     assert_eq!(
         engine
-            .get(Partition::Schema, &routing_key(Partition::Node))
+            .get(Partition::Deployment, &routing_key(Partition::Node))
             .expect("read the node routes")
             .as_deref(),
         Some(routes.as_ref()),
@@ -179,7 +183,7 @@ fn an_interrupted_schema_rebuild_keeps_the_routes_of_the_other_trees() {
     );
     assert_eq!(
         engine
-            .get(Partition::Schema, b"meta:probe")
+            .get(Partition::Deployment, b"meta:probe")
             .expect("read the record")
             .as_deref(),
         Some(&b"written last"[..]),
@@ -195,7 +199,7 @@ fn an_interrupted_schema_rebuild_keeps_the_routes_of_the_other_trees() {
     );
     assert_eq!(
         engine.pending_rebuilds().expect("intents"),
-        [Partition::Schema],
+        [Partition::Deployment],
         "with no checkpoint the rebuild stays owed"
     );
 }
@@ -220,7 +224,7 @@ fn closure_entry(engine: &StorageEngine, index: u64, commits: &[u64], below: u64
         .expect("install the plan");
 }
 
-/// An open whose salvage of the Schema tree lost the closure ledger's
+/// An open whose salvage of the deployment tree lost the closure ledger's
 /// records, the store's routes intact in an older table, is refused: the
 /// ledger is not read as absent, and nothing the open would initialise is
 /// written. Read from the salvaged tree, the head was absent and the store
@@ -235,7 +239,7 @@ fn a_salvage_that_lost_the_closure_ledger_refuses_the_open() {
     }
     let ledger_tables = {
         let engine = StorageEngine::open(&config).expect("open");
-        let with_routes = schema_table_ids(&engine);
+        let with_routes = records_table_ids(&engine);
         assert!(!with_routes.is_empty(), "the routes are in a table");
         for index in 1..=5 {
             closure_entry(&engine, index, &[index * 10], 0);
@@ -243,39 +247,39 @@ fn a_salvage_that_lost_the_closure_ledger_refuses_the_open() {
         closure_entry(&engine, 6, &[], 51);
         assert_eq!(engine.closure_frontier(), 51, "the ledger closed the log");
         engine.persist().expect("persist the ledger");
-        &schema_table_ids(&engine) - &with_routes
+        &records_table_ids(&engine) - &with_routes
     };
     assert_eq!(
-        damage_schema_tables(dir.path(), &ledger_tables),
+        damage_records_tables(dir.path(), &ledger_tables),
         1,
         "the ledger is in a table of its own"
     );
-    lose_schema_manifest(dir.path());
+    lose_records_manifest(dir.path());
 
     match StorageEngine::open(&config) {
         Ok(engine) => panic!(
             "opened without its closure ledger: frontier {}",
             engine.closure_frontier()
         ),
-        Err(StorageError::SchemaRecoveryRefused(RebuildRefusal::LocalStateLost)) => {}
+        Err(StorageError::DeploymentRecoveryRefused(RebuildRefusal::LocalStateLost)) => {}
         Err(e) => panic!("refused for another reason: {e}"),
     }
     // The salvage that ran before the refusal set the unreadable table
     // aside; the refusal itself writes nothing, so the next open finds the
     // tree's tables as this one left them (the tree rewrites only its own
     // manifest when it opens) and refuses again.
-    let tables = dir.path().join(schema_dir()).join("tables");
+    let tables = dir.path().join(records_dir()).join("tables");
     let refused = tree_files(&tables);
     assert!(matches!(
         StorageEngine::open(&config),
-        Err(StorageError::SchemaRecoveryRefused(
+        Err(StorageError::DeploymentRecoveryRefused(
             RebuildRefusal::LocalStateLost
         ))
     ));
     assert_eq!(
         tree_files(&tables),
         refused,
-        "a refused open changed the Schema tables"
+        "a refused open changed the deployment tree's tables"
     );
 }
 
@@ -299,8 +303,9 @@ fn tree_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 /// A journaled store whose routes differ from the default for its endpoints
 /// (a hot endpoint `b` added to a store created on a warm `a`), with a
-/// checkpoint between two Schema writes, journaled writes after it and, when
-/// `late_record`, a record of its own written after it as well.
+/// checkpoint between two writes of the deployment's records, journaled
+/// writes after it and, when `late_record`, a record of its own written after
+/// it as well.
 struct Checkpointed {
     root: tempfile::TempDir,
     config: StorageConfig,
@@ -333,33 +338,43 @@ impl Checkpointed {
         ));
         let routes = {
             let engine = open_journaled(&config).expect("open with an endpoint added");
-            let routes = read(&engine, Partition::Schema, &routing_key(Partition::Node))
-                .expect("the node routes are stored");
+            let routes = read(
+                &engine,
+                Partition::Deployment,
+                &routing_key(Partition::Node),
+            )
+            .expect("the node routes are stored");
             let default =
                 rmp_serde::to_vec(&PartitionRouting::default_for_endpoints(&config.endpoints))
                     .expect("encode the default");
             assert_ne!(routes, default, "the routes must differ from the default");
-            commit_to(&engine, PartitionId::Schema, 20, b"schema:x", b"before");
+            commit_to(
+                &engine,
+                PartitionId::Deployment,
+                20,
+                b"catalog:x",
+                b"before",
+            );
             engine.create_checkpoint(&checkpoint).expect("checkpoint");
-            commit_to(&engine, PartitionId::Schema, 30, b"schema:x", b"after");
-            commit_to(&engine, PartitionId::Schema, 40, b"schema:y", b"tail");
+            commit_to(&engine, PartitionId::Deployment, 30, b"catalog:x", b"after");
+            commit_to(&engine, PartitionId::Deployment, 40, b"catalog:y", b"tail");
             commit(&engine, 50, b"node:0:00000002", b"second");
             if late_record {
                 engine
-                    .put(Partition::Schema, b"meta:probe", b"written last")
+                    .put(Partition::Deployment, b"meta:probe", b"written last")
                     .expect("a record of the store's own");
             }
             engine.persist().expect("persist");
             routes
         };
         let mut rows = vec![
-            (Partition::Schema, &b"schema:x"[..], &b"after"[..]),
-            (Partition::Schema, b"schema:y", b"tail"),
+            (Partition::Deployment, &b"catalog:x"[..], &b"after"[..]),
+            (Partition::Deployment, b"catalog:y", b"tail"),
             (Partition::Node, b"node:0:00000001", b"first"),
             (Partition::Node, b"node:0:00000002", b"second"),
         ];
         if late_record {
-            rows.push((Partition::Schema, b"meta:probe", b"written last"));
+            rows.push((Partition::Deployment, b"meta:probe", b"written last"));
         }
         Self {
             root,
@@ -374,13 +389,16 @@ impl Checkpointed {
         self.root.path().join("a")
     }
 
-    /// Clear the Schema tree as a rebuild does, and stop right after.
-    fn cut_a_schema_rebuild_short(&self) {
+    /// Clear the deployment tree as a rebuild does, and stop right after.
+    fn cut_a_records_rebuild_short(&self) {
         let engine = open_journaled(&self.config).expect("open");
-        let schema = engine.tree(Partition::Schema).expect("schema").clone();
+        let records = engine
+            .tree(Partition::Deployment)
+            .expect("the deployment tree")
+            .clone();
         assert!(
             engine
-                .clear_partition_with(Partition::Schema, &schema, || {
+                .clear_partition_with(Partition::Deployment, &records, || {
                     Err(StorageError::Io("cut short".into()))
                 })
                 .is_err()
@@ -391,7 +409,7 @@ impl Checkpointed {
     /// and no repair, and left no staged copy behind.
     fn assert_whole(&self, engine: &StorageEngine) {
         assert_eq!(
-            read(engine, Partition::Schema, &routing_key(Partition::Node)).as_deref(),
+            read(engine, Partition::Deployment, &routing_key(Partition::Node)).as_deref(),
             Some(self.routes.as_slice()),
             "the store's routes"
         );
@@ -410,22 +428,22 @@ impl Checkpointed {
             "{:?}",
             engine.open_repairs()
         );
-        assert!(!self.primary().join("schema-source").exists());
+        assert!(!self.primary().join("deployment-source").exists());
     }
 }
 
-/// A Schema rebuild cut short after its clear is finished by the next open
-/// from the latest checkpoint and the journal, before anything reads the
-/// tree: the routes (which differ from the default) and the record of its
-/// own written after the checkpoint come from what the rebuild kept, the
-/// rows from the checkpoint and the journal. The checkpoint is read, not
-/// opened: its files are as they were. A second open finds a whole tree and
-/// nothing owed.
+/// A rebuild of the deployment's records cut short after its clear is
+/// finished by the next open from the latest checkpoint and the journal,
+/// before anything reads the tree: the routes (which differ from the
+/// default) and the record of its own written after the checkpoint come from
+/// what the rebuild kept, the rows from the checkpoint and the journal. The
+/// checkpoint is read, not opened: its files are as they were. A second open
+/// finds a whole tree and nothing owed.
 #[test]
-fn a_cut_short_schema_rebuild_is_finished_from_the_checkpoint() {
+fn a_cut_short_records_rebuild_is_finished_from_the_checkpoint() {
     let store = Checkpointed::new(true);
     let checkpoint = tree_files(&store.checkpoint);
-    store.cut_a_schema_rebuild_short();
+    store.cut_a_records_rebuild_short();
 
     {
         let engine = open_journaled(&store.config).expect("reopen");
@@ -445,9 +463,9 @@ fn a_cut_short_schema_rebuild_is_finished_from_the_checkpoint() {
 #[test]
 fn a_rebuild_at_the_open_cut_short_is_finished_by_the_next_open() {
     let store = Checkpointed::new(true);
-    store.cut_a_schema_rebuild_short();
+    store.cut_a_records_rebuild_short();
 
-    super::schema_bootstrap::CUT_AFTER_CLEAR.store(true, std::sync::atomic::Ordering::Release);
+    super::deployment_bootstrap::CUT_AFTER_CLEAR.store(true, std::sync::atomic::Ordering::Release);
     assert!(
         open_journaled(&store.config).is_err(),
         "the cut did not stop the open"
@@ -456,21 +474,21 @@ fn a_rebuild_at_the_open_cut_short_is_finished_by_the_next_open() {
         read_rebuild_intents(&store.primary())
             .expect("intents")
             .partitions,
-        [Partition::Schema],
+        [Partition::Deployment],
         "the rebuild is no longer owed"
     );
     let engine = open_journaled(&store.config).expect("open after the cut");
     store.assert_whole(&engine);
 }
 
-/// A Schema rebuild owed when the journal no longer holds entries the other
-/// trees hold (and the checkpoint lacks) is refused: the tree is not
-/// rebuilt without them, and the rebuild stays owed with the records it
-/// keeps, the checkpoint as it was.
+/// A rebuild of the deployment's records owed when the journal no longer
+/// holds entries the other trees hold (and the checkpoint lacks) is refused:
+/// the tree is not rebuilt without them, and the rebuild stays owed with the
+/// records it keeps, the checkpoint as it was.
 #[test]
 fn a_rebuild_the_journal_cannot_cover_is_refused() {
     let store = Checkpointed::new(true);
-    store.cut_a_schema_rebuild_short();
+    store.cut_a_records_rebuild_short();
     let checkpoint = tree_files(&store.checkpoint);
     let journal = store.primary().join("oplog").join("0");
     for entry in std::fs::read_dir(&journal).expect("journal").flatten() {
@@ -478,11 +496,11 @@ fn a_rebuild_the_journal_cannot_cover_is_refused() {
     }
 
     match open_journaled(&store.config) {
-        Err(StorageError::SchemaRecoveryRefused(RebuildRefusal::UncoveredEntry { .. })) => {}
+        Err(StorageError::DeploymentRecoveryRefused(RebuildRefusal::UncoveredEntry { .. })) => {}
         Err(e) => panic!("refused for another reason: {e}"),
-        Ok(_) => panic!("opened without the entries the Schema tree lacks"),
+        Ok(_) => panic!("opened without the entries the deployment tree lacks"),
     }
-    let kept = read_kept_rows(&store.primary())
+    let kept = read_kept_rows(&store.primary(), Partition::Deployment)
         .expect("read the intent")
         .expect("the rebuild keeps its records");
     assert!(
@@ -495,35 +513,35 @@ fn a_rebuild_the_journal_cannot_cover_is_refused() {
     assert_eq!(tree_files(&store.checkpoint), checkpoint);
 }
 
-/// A Schema rebuild owed from a checkpoint whose own Schema tree opens only
-/// by a salvage that drops data is refused, and the checkpoint is left as
-/// it was.
+/// A rebuild of the deployment's records owed from a checkpoint whose own
+/// deployment tree opens only by a salvage that drops data is refused, and
+/// the checkpoint is left as it was.
 #[test]
 fn a_rebuild_from_a_damaged_checkpoint_is_refused() {
     let store = Checkpointed::new(true);
-    store.cut_a_schema_rebuild_short();
-    let schema = store.checkpoint.join(schema_dir());
+    store.cut_a_records_rebuild_short();
+    let records = store.checkpoint.join(records_dir());
     // An empty file is one a tree created ahead for its next table, not a
     // table: the checkpoint's trees were opened where they were built.
-    let tables: HashSet<u64> = std::fs::read_dir(schema.join("tables"))
+    let tables: HashSet<u64> = std::fs::read_dir(records.join("tables"))
         .expect("checkpoint tables")
         .flatten()
         .filter(|entry| entry.metadata().is_ok_and(|meta| meta.len() > 0))
         .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
         .collect();
-    assert!(damage_schema_tables(&store.checkpoint, &tables) > 0);
-    lose_schema_manifest(&store.checkpoint);
+    assert!(damage_records_tables(&store.checkpoint, &tables) > 0);
+    lose_records_manifest(&store.checkpoint);
     let checkpoint = tree_files(&store.checkpoint);
 
     match open_journaled(&store.config) {
-        Err(StorageError::SchemaRecoveryRefused(RebuildRefusal::CheckpointDamaged)) => {}
+        Err(StorageError::DeploymentRecoveryRefused(RebuildRefusal::CheckpointDamaged)) => {}
         Err(e) => panic!("refused for another reason: {e}"),
         Ok(_) => panic!("rebuilt from a damaged checkpoint"),
     }
     assert_eq!(tree_files(&store.checkpoint), checkpoint);
 }
 
-/// A salvage of the Schema tree that lost a table whose key range is not
+/// A salvage of the deployment tree that lost a table whose key range is not
 /// known cannot show the store's own records survived: the open is refused
 /// with a checkpoint at hand, since nothing but the tree holds the routes.
 #[test]
@@ -532,48 +550,48 @@ fn a_salvage_with_an_unknown_loss_refuses_the_open() {
     let primary = store.primary();
     let newest = {
         let engine = open_journaled(&store.config).expect("open");
-        schema_table_ids(&engine)
+        records_table_ids(&engine)
             .into_iter()
             .max()
-            .expect("a Schema table")
+            .expect("a table of the deployment tree")
     };
     let path = primary
-        .join(schema_dir())
+        .join(records_dir())
         .join("tables")
         .join(newest.to_string());
     let bytes = std::fs::read(&path).expect("read the table");
     std::fs::remove_file(&path).expect("unlink the table");
     std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("write half of it");
-    lose_schema_manifest(&primary);
+    lose_records_manifest(&primary);
 
     match open_journaled(&store.config) {
-        Err(StorageError::SchemaRecoveryRefused(RebuildRefusal::LocalStateLost)) => {}
+        Err(StorageError::DeploymentRecoveryRefused(RebuildRefusal::LocalStateLost)) => {}
         Err(e) => panic!("refused for another reason: {e}"),
         Ok(engine) => panic!("opened after an unknown loss: {:?}", engine.open_repairs()),
     }
 }
 
-/// A Schema tree whose tables the open finds damaged is rebuilt from the
+/// A deployment tree whose tables the open finds damaged is rebuilt from the
 /// checkpoint and the journal before anything reads it. A clean one is not
 /// read in full at the open, checkpoint or not: a full pass is the scrub's.
 #[test]
-fn a_corrupt_schema_tree_is_rebuilt_and_a_clean_one_is_not_read_in_full() {
+fn a_corrupt_records_tree_is_rebuilt_and_a_clean_one_is_not_read_in_full() {
     let store = Checkpointed::new(false);
     {
         let engine = open_journaled(&store.config).expect("open");
         assert!(
-            !engine.verified_at_open(Partition::Schema),
+            !engine.verified_at_open(Partition::Deployment),
             "a clean tree was verified in full at the open"
         );
         // The tables written after the checkpoint: those whose bytes no file
         // of the checkpoint holds. Ids do not tell, since the checkpoint's
         // tree numbers the tables it builds itself.
         let held: HashSet<Vec<u8>> =
-            tree_files(&store.checkpoint.join(schema_dir()).join("tables"))
+            tree_files(&store.checkpoint.join(records_dir()).join("tables"))
                 .into_values()
                 .collect();
-        let tables = store.primary().join(schema_dir()).join("tables");
-        let after_checkpoint: HashSet<u64> = schema_table_ids(&engine)
+        let tables = store.primary().join(records_dir()).join("tables");
+        let after_checkpoint: HashSet<u64> = records_table_ids(&engine)
             .into_iter()
             .filter(|id| {
                 let bytes = std::fs::read(tables.join(id.to_string())).expect("read a table");
@@ -581,13 +599,13 @@ fn a_corrupt_schema_tree_is_rebuilt_and_a_clean_one_is_not_read_in_full() {
             })
             .collect();
         drop(engine);
-        assert!(damage_schema_tables(&store.primary(), &after_checkpoint) > 0);
+        assert!(damage_records_tables(&store.primary(), &after_checkpoint) > 0);
     }
 
     let engine = open_journaled(&store.config).expect("reopen");
     store.assert_whole(&engine);
     assert!(
-        !engine.verified_at_open(Partition::Schema),
+        !engine.verified_at_open(Partition::Deployment),
         "a rebuilt tree is verified again by the repair pass"
     );
 }
@@ -603,14 +621,14 @@ fn dir_len(dir: &Path) -> u64 {
         .sum()
 }
 
-/// The copy of a checkpoint's Schema tree a rebuild at the open stages is
-/// charged to the endpoint's footprint before it is written: an endpoint
+/// The copy of a checkpoint's deployment tree a rebuild at the open stages
+/// is charged to the endpoint's footprint before it is written: an endpoint
 /// with less room than the copy refuses the open, grows by nothing past its
 /// allowance, keeps the checkpoint as it was and the rebuild owed, and the
 /// next open with room finishes it. Copied unmetered, the open passed the
 /// endpoint's limit.
 #[test]
-fn a_schema_copy_that_does_not_fit_the_endpoint_is_refused() {
+fn a_records_copy_that_does_not_fit_the_endpoint_is_refused() {
     let store = Checkpointed::new(true);
     let primary = store.primary();
     {
@@ -628,11 +646,11 @@ fn a_schema_copy_that_does_not_fit_the_endpoint_is_refused() {
                 .collect();
             engine
                 .put(
-                    Partition::Schema,
-                    format!("schema:big:{i:06}").as_bytes(),
+                    Partition::Deployment,
+                    format!("catalog:big:{i:06}").as_bytes(),
                     &value,
                 )
-                .expect("a schema row");
+                .expect("a record of the deployment");
         }
         engine.persist().expect("persist");
         engine
@@ -645,16 +663,16 @@ fn a_schema_copy_that_does_not_fit_the_endpoint_is_refused() {
             )
             .expect("checkpoint");
     }
-    store.cut_a_schema_rebuild_short();
+    store.cut_a_records_rebuild_short();
     let latest = crate::engine::rebuild::latest_checkpoint(
         &crate::engine::rebuild::checkpoint_root(&primary),
     )
     .expect("list")
     .expect("a checkpoint");
-    let schema_copy = dir_len(&latest.join(schema_dir()));
+    let records_copy = dir_len(&latest.join(records_dir()));
     assert!(
-        schema_copy > 4 * crate::engine::footprint::OVER_LIMIT_ALLOWANCE,
-        "the Schema copy ({schema_copy} bytes) must not fit the room left"
+        records_copy > 4 * crate::engine::footprint::OVER_LIMIT_ALLOWANCE,
+        "the copy of the deployment tree ({records_copy} bytes) must not fit the room left"
     );
     let checkpoint = tree_files(&latest);
 
@@ -666,24 +684,24 @@ fn a_schema_copy_that_does_not_fit_the_endpoint_is_refused() {
             .max(held + crate::engine::footprint::OVER_LIMIT_ALLOWANCE),
     );
     let opened = open_journaled(&tight);
-    let staged = dir_len(&primary.join("schema-source"));
+    let staged = dir_len(&primary.join("deployment-source"));
     assert!(
         staged <= crate::engine::footprint::OVER_LIMIT_ALLOWANCE,
         "the refused open wrote {staged} bytes of the copy, past its allowance"
     );
     assert!(
-        !primary.join("schema-source").exists(),
+        !primary.join("deployment-source").exists(),
         "the refused copy was left behind"
     );
     match opened {
         Err(StorageError::CapacityExhausted { .. }) => {}
         Err(e) => panic!("refused for another reason: {e}"),
-        Ok(_) => panic!("the open copied the Schema tree past the endpoint's limit"),
+        Ok(_) => panic!("the open copied the deployment tree past the endpoint's limit"),
     }
     assert_eq!(tree_files(&latest), checkpoint, "the checkpoint changed");
     assert_eq!(
         read_rebuild_intents(&primary).expect("intents").partitions,
-        [Partition::Schema],
+        [Partition::Deployment],
         "the rebuild is no longer owed"
     );
 
@@ -741,7 +759,11 @@ fn a_replay_floor_of_another_store_is_refused() {
     let bound = |store: &Checkpointed, id: u8| {
         let engine = open_journaled(&store.config).expect("open");
         engine
-            .put(Partition::Schema, DEPLOYMENT_KEY, &DeploymentId([id; 16]).0)
+            .put(
+                Partition::Deployment,
+                DEPLOYMENT_KEY,
+                &DeploymentId([id; 16]).0,
+            )
             .expect("bind the deployment");
         let checkpoint = store.checkpoint.with_file_name(format!(
             "{}{:020}",
@@ -769,9 +791,9 @@ fn a_replay_floor_of_another_store_is_refused() {
     );
 }
 
-/// A Schema rebuild owed with records naming this store's deployment is
-/// refused from a checkpoint of another deployment's store placed as the
-/// latest, rather than rebuilt from its rows.
+/// A rebuild of the deployment's records owed with records naming this
+/// store's deployment is refused from a checkpoint of another deployment's
+/// store placed as the latest, rather than rebuilt from its rows.
 #[test]
 fn a_rebuild_from_another_stores_checkpoint_is_refused() {
     use coordinode_core::group::{DEPLOYMENT_KEY, DeploymentId};
@@ -779,15 +801,23 @@ fn a_rebuild_from_another_stores_checkpoint_is_refused() {
     {
         let engine = open_journaled(&ours.config).expect("open");
         engine
-            .put(Partition::Schema, DEPLOYMENT_KEY, &DeploymentId([1; 16]).0)
+            .put(
+                Partition::Deployment,
+                DEPLOYMENT_KEY,
+                &DeploymentId([1; 16]).0,
+            )
             .expect("bind the deployment");
     }
-    ours.cut_a_schema_rebuild_short();
+    ours.cut_a_records_rebuild_short();
     let theirs = Checkpointed::new(false);
     let foreign = {
         let engine = open_journaled(&theirs.config).expect("open");
         engine
-            .put(Partition::Schema, DEPLOYMENT_KEY, &DeploymentId([2; 16]).0)
+            .put(
+                Partition::Deployment,
+                DEPLOYMENT_KEY,
+                &DeploymentId([2; 16]).0,
+            )
             .expect("bind the deployment");
         let at = theirs.checkpoint.with_file_name(format!(
             "{}{:020}",
@@ -809,44 +839,95 @@ fn a_rebuild_from_another_stores_checkpoint_is_refused() {
     }
 
     match open_journaled(&ours.config) {
-        Err(StorageError::SchemaRecoveryRefused(RebuildRefusal::OtherDeployment)) => {}
+        Err(StorageError::DeploymentRecoveryRefused(RebuildRefusal::OtherDeployment)) => {}
         Err(e) => panic!("refused for another reason: {e}"),
         Ok(_) => panic!("rebuilt from another store's checkpoint"),
     }
 }
 
-/// The records a cut-short Schema rebuild keeps in its intent are refused
-/// when they do not read back whole, and the open with them: a changed byte
-/// would otherwise put a route the store never had in place of its own.
+/// The records a cut-short rebuild of the deployment's records keeps in its
+/// intent are refused when they do not read back whole, and the open with
+/// them: a changed byte would otherwise put a route the store never had in
+/// place of its own.
 #[test]
 fn damaged_kept_records_refuse_the_open() {
     let store = Checkpointed::new(true);
-    store.cut_a_schema_rebuild_short();
+    store.cut_a_records_rebuild_short();
     let intent = store
         .primary()
         .join(REBUILD_INTENT_DIR)
-        .join(Partition::Schema.name());
+        .join(Partition::Deployment.name());
     let whole = std::fs::read(&intent).expect("read the intent");
     assert!(!whole.is_empty(), "the intent keeps the records");
 
     // A change inside the last record's value keeps the encoding decodable.
     damage_file(&intent, whole.len() - 1, false);
     match open_journaled(&store.config) {
-        Err(StorageError::SchemaRecoveryRefused(RebuildRefusal::LocalStateLost)) => {}
+        Err(StorageError::DeploymentRecoveryRefused(RebuildRefusal::LocalStateLost)) => {}
         Err(e) => panic!("refused for another reason: {e}"),
         Ok(engine) => panic!(
             "opened with changed records: routes {:?}",
-            read(&engine, Partition::Schema, &routing_key(Partition::Node))
+            read(
+                &engine,
+                Partition::Deployment,
+                &routing_key(Partition::Node)
+            )
         ),
     }
     std::fs::write(&intent, &whole[..whole.len() / 2]).expect("cut the intent");
     assert!(
         matches!(
             open_journaled(&store.config),
-            Err(StorageError::SchemaRecoveryRefused(
+            Err(StorageError::DeploymentRecoveryRefused(
                 RebuildRefusal::LocalStateLost
             ))
         ),
         "opened with a cut intent"
+    );
+}
+
+/// A namespace's Schema tree keeps this node's records about its indexes
+/// (`meta:`) through a rebuild a crash cut short after its clear: the redo
+/// takes them from the intent the clear left, never from the cleared tree.
+/// Read from the cleared tree, they were gone.
+#[test]
+fn a_cut_short_schema_rebuild_keeps_the_nodes_index_records() {
+    let store = Checkpointed::new(false);
+    {
+        let engine = open_journaled(&store.config).expect("open");
+        engine
+            .put(Partition::Schema, b"meta:idxarmed:probe", b"armed")
+            .expect("a record of this node about an index");
+        engine.persist().expect("persist");
+        let schema = engine.tree(Partition::Schema).expect("schema").clone();
+        assert!(
+            engine
+                .clear_partition_with(Partition::Schema, &schema, || {
+                    Err(StorageError::Io("cut short".into()))
+                })
+                .is_err()
+        );
+    }
+    let engine = open_journaled(&store.config).expect("reopen");
+    assert_eq!(
+        engine.pending_rebuilds().expect("intents"),
+        [Partition::Schema],
+        "the cut-short rebuild is owed"
+    );
+    let journal = engine
+        .oplog_read_since(0)
+        .expect("read the journal")
+        .expect("a journal");
+    match engine
+        .repair_partition_from_checkpoint(&store.checkpoint, &journal, Partition::Schema)
+        .expect("the redo")
+    {
+        Rebuild::Rebuilt { .. } => {}
+        other => panic!("the redo was refused: {other:?}"),
+    }
+    assert_eq!(
+        read(&engine, Partition::Schema, b"meta:idxarmed:probe").as_deref(),
+        Some(&b"armed"[..]),
+        "the node's record about an index was lost"
     );
 }

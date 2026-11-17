@@ -638,7 +638,7 @@ fn a_store_that_applied_entries_without_coverage_is_refused() {
     let (_dir, engine) = test_engine();
     engine
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             KEY_SM_APPLIED,
             &rmp_serde::to_vec(&log_id(1, 42)).unwrap(),
         )
@@ -664,7 +664,11 @@ fn a_store_that_applied_entries_without_coverage_is_refused() {
 fn an_unreadable_applied_membership_refuses_the_open() {
     let (_dir, engine) = test_engine();
     engine
-        .put(Partition::Schema, KEY_SM_MEMBERSHIP, b"not-msgpack-bytes")
+        .put(
+            Partition::Deployment,
+            KEY_SM_MEMBERSHIP,
+            b"not-msgpack-bytes",
+        )
         .unwrap();
 
     let err = CoordinodeStateMachine::new(Arc::clone(&engine))

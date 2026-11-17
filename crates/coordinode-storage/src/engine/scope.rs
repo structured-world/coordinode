@@ -81,15 +81,15 @@ impl Scope {
         }
     }
 
-    /// Whether `part` has a tree in a set of this kind: the consensus log
-    /// and the consumer registry are the deployment's alone, every data
-    /// partition is a namespace's alone, and each set has a Schema tree of
-    /// its own.
+    /// Whether `part` has a tree in a set of this kind: the consensus log,
+    /// the consumer registry and the deployment's records are the
+    /// deployment's alone ([`Partition::is_deployment`]), every other
+    /// partition is a namespace's alone.
     #[must_use]
     pub fn holds(self, part: Partition) -> bool {
         match self {
-            Self::System => part.is_system() || part == Partition::Schema,
-            Self::Namespace(_) => !part.is_system(),
+            Self::System => part.is_deployment(),
+            Self::Namespace(_) => !part.is_deployment(),
         }
     }
 
@@ -190,7 +190,7 @@ pub const STORE_NAMESPACE: NamespaceId = NamespaceId(1);
 /// [`TreeId::dir`] is where the tree lies under each endpoint.
 #[must_use]
 pub const fn store_tree(part: Partition) -> TreeId {
-    if part.is_system() {
+    if part.is_deployment() {
         TreeId::system(part)
     } else {
         TreeId::namespace(STORE_NAMESPACE, part)

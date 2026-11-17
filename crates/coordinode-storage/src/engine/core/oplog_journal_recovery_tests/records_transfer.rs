@@ -1,5 +1,5 @@
-//! A member's Schema tree replaced by a copy from a peer, cut short by a
-//! power loss after its clear and before the copy's closure ledger is
+//! A member's deployment records replaced by a copy from a peer, cut short
+//! by a power loss after their clear and before the copy's closure ledger is
 //! installed: the next open keeps the transfer owed, with the member's own
 //! records, and answers no closure ledger, neither the one the member held
 //! before (another apply cut) nor the copy's (not installed). A transfer run
@@ -34,7 +34,7 @@ fn ledger(engine: &StorageEngine, base: u64, n: u64) {
 }
 
 #[test]
-fn a_schema_transfer_cut_short_after_its_clear_stays_owed() {
+fn a_records_transfer_cut_short_after_its_clear_stays_owed() {
     let source_dir = TempDir::new().expect("tempdir");
     let source = StorageEngine::open_with_oracle(
         &durable_cfg(&source_dir),
@@ -42,7 +42,7 @@ fn a_schema_transfer_cut_short_after_its_clear_stays_owed() {
     )
     .expect("open the source");
     ledger(&source, 1_000, 5);
-    let copy = source.copy_partition(Partition::Schema).expect("copy");
+    let copy = source.copy_partition(Partition::Deployment).expect("copy");
 
     let rig = PowerRig::new();
     let config = rig.config();
@@ -53,11 +53,11 @@ fn a_schema_transfer_cut_short_after_its_clear_stays_owed() {
         target.persist().expect("persist");
         assert_eq!(target.closure_frontier(), 100 + 2 * 10 + 1);
         let routes = target
-            .get(Partition::Schema, b"meta:routing:node")
+            .get(Partition::Deployment, b"meta:routing:node")
             .expect("read the routes")
             .expect("the member's routes");
         let repair = target
-            .begin_partition_rebuild(Partition::Schema, &copy.rows)
+            .begin_partition_rebuild(Partition::Deployment, &copy.rows)
             .expect("begin the transfer");
         // Lost with the power: nothing after the clear reached the disk.
         drop(repair);
@@ -68,12 +68,12 @@ fn a_schema_transfer_cut_short_after_its_clear_stays_owed() {
     let target = rig.open_group(&config).expect("reopen the member");
     assert_eq!(
         target.pending_rebuilds().expect("intents"),
-        [Partition::Schema],
+        [Partition::Deployment],
         "the transfer is no longer owed"
     );
     assert_eq!(
         target
-            .get(Partition::Schema, b"meta:routing:node")
+            .get(Partition::Deployment, b"meta:routing:node")
             .expect("read the routes")
             .as_deref(),
         Some(routes.as_ref()),
@@ -92,7 +92,7 @@ fn a_schema_transfer_cut_short_after_its_clear_stays_owed() {
     );
 
     let repair = target
-        .begin_partition_rebuild(Partition::Schema, &copy.rows)
+        .begin_partition_rebuild(Partition::Deployment, &copy.rows)
         .expect("transfer again");
     target
         .finish_raft_rebuild(repair, 7, &[])

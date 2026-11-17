@@ -135,6 +135,7 @@ fn partition_tag(p: Partition) -> u8 {
         Partition::VectorF32 => 9,
         Partition::Registry => 10,
         Partition::NodeHistory => 11,
+        Partition::Deployment => 12,
     }
 }
 
@@ -153,6 +154,7 @@ fn tag_to_partition(tag: u8) -> Option<Partition> {
         9 => Some(Partition::VectorF32),
         10 => Some(Partition::Registry),
         11 => Some(Partition::NodeHistory),
+        12 => Some(Partition::Deployment),
         _ => None,
     }
 }
@@ -246,11 +248,13 @@ where
             let (key, value) = guard
                 .into_inner()
                 .map_err(|e| io::Error::other(format!("snapshot iter {}: {e}", part.name())))?;
-            // Schema `meta:*` keys are this node's own configuration (routing
-            // computed against its endpoint set) and never replicate. `raft:*`
-            // keys travel and receivers drop them, so the checksum covers
-            // exactly what was built.
-            if part == Partition::Schema && key.starts_with(b"meta:") {
+            // `meta:*` keys of the Schema trees are this node's own records
+            // (routing computed against its endpoint set, its records about
+            // indexes) and never replicate. `raft:*` keys travel and receivers
+            // drop them, so the checksum covers exactly what was built.
+            if matches!(part, Partition::Schema | Partition::Deployment)
+                && key.starts_with(b"meta:")
+            {
                 continue;
             }
             put_bytes(&mut w, &key)?;
@@ -347,15 +351,16 @@ where
 /// and catches up either through another install (whose step 2 finishes the
 /// cleanup) or through the log, whose deletes remove the same keys.
 ///
-/// **Important:** Raft keys (`raft:*`) in the Schema partition are
-/// always preserved — they're managed by openraft, not application data.
+/// **Important:** Raft keys (`raft:*`) among the deployment's records are
+/// always preserved: they're managed by openraft, not application data.
 pub fn install_full_snapshot(engine: &StorageEngine, data: &[u8]) -> io::Result<()> {
     apply_full(engine, parse_verified_slice(data)?, Install::SameDomain)
 }
 
 /// A parsed snapshot, checksum already verified, with the entries a
-/// receiver must never overwrite (the Raft partition, Schema `raft:` and
-/// `meta:` keys) left out.
+/// receiver must never overwrite (the Raft partition, the `raft:` and
+/// `meta:` keys of the deployment's records, the `meta:` keys of a Schema
+/// tree) left out.
 struct ParsedSnapshot {
     partitions: Vec<(Partition, PartitionEntries)>,
     /// `None` for a version 1 snapshot, which says nothing about tables.
@@ -368,12 +373,12 @@ struct ParsedSnapshot {
     domain: Option<coordinode_core::group::DeploymentId>,
 }
 
-/// Whether a receiver installs `key` of `partition` from a snapshot. Raft
-/// state is openraft's, routing (`meta:`) is per node.
+/// Whether a receiver installs `key` of `partition` from a snapshot: none of
+/// this node's own records
+/// ([`is_node_local`](coordinode_storage::engine::core::is_node_local)). Raft
+/// state is openraft's, routing and index records (`meta:`) are per node.
 fn installable(partition: Partition, key: &[u8]) -> bool {
-    partition != Partition::Raft
-        && !(partition == Partition::Schema
-            && (key.starts_with(b"raft:") || key.starts_with(b"meta:")))
+    !coordinode_storage::engine::core::is_node_local(partition, key)
 }
 
 /// Verify `data`'s trailing checksum, then parse the body. The whole buffer
@@ -702,7 +707,7 @@ fn install_verified(
                 .is_none())
     {
         batch.put(
-            Partition::Schema,
+            Partition::Deployment,
             coordinode_core::group::DEPLOYMENT_KEY.to_vec(),
             domain.as_bytes().to_vec(),
         );
@@ -1279,7 +1284,7 @@ pub fn install_image(
         };
         if let Some(domain) = check.domain {
             installing.batch.put(
-                Partition::Schema,
+                Partition::Deployment,
                 coordinode_core::group::DEPLOYMENT_KEY.to_vec(),
                 domain.as_bytes().to_vec(),
             );
@@ -1529,7 +1534,7 @@ pub fn install_received(
         if let Some(domain) = adopt {
             engine
                 .put(
-                    Partition::Schema,
+                    Partition::Deployment,
                     coordinode_core::group::DEPLOYMENT_KEY,
                     domain.as_bytes(),
                 )

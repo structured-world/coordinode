@@ -1,14 +1,15 @@
 use super::*;
 
-/// The system set holds the consensus log, the consumer registry and a
-/// Schema tree, and nothing of a namespace's data; a namespace set holds
-/// every data partition and a Schema tree, and neither of the deployment's.
+/// The system set holds the consensus log, the consumer registry and the
+/// deployment's records, and nothing of a namespace's; a namespace set holds
+/// every data partition and its own Schema tree, and none of the
+/// deployment's. Every partition is in exactly one kind of set.
 #[test]
 fn each_set_holds_its_own_partitions() {
     let system: Vec<_> = Scope::System.partitions().collect();
     assert_eq!(
         system,
-        vec![Partition::Schema, Partition::Raft, Partition::Registry]
+        vec![Partition::Raft, Partition::Registry, Partition::Deployment]
     );
 
     let ns = Scope::Namespace(NamespaceId::from_raw(7));
@@ -18,7 +19,8 @@ fn each_set_holds_its_own_partitions() {
     assert!(data.contains(&Partition::NodeHistory));
     assert!(!data.contains(&Partition::Raft));
     assert!(!data.contains(&Partition::Registry));
-    assert_eq!(data.len() + system.len(), Partition::all().len() + 1);
+    assert!(!data.contains(&Partition::Deployment));
+    assert_eq!(data.len() + system.len(), Partition::all().len());
 }
 
 /// A namespace's trees live under its own directory, the system set's under
@@ -43,7 +45,7 @@ fn tree_names_round_trip_and_refuse_others() {
     let ns = NamespaceId::from_raw(0xab);
     for tree in [
         TreeId::system(Partition::Raft),
-        TreeId::system(Partition::Schema),
+        TreeId::system(Partition::Deployment),
         TreeId::namespace(ns, Partition::Node),
         TreeId::namespace(ns, Partition::Schema),
     ] {
@@ -53,7 +55,9 @@ fn tree_names_round_trip_and_refuse_others() {
         "node",
         "raft",
         "system/node",
+        "system/schema",
         "ns/00000000000000ab/raft",
+        "ns/00000000000000ab/deployment",
         "ns/ab/node",
         "ns/00000000000000ab",
         "ns/00000000000000ab/node/extra",

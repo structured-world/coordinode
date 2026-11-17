@@ -464,7 +464,7 @@ impl AppliedFeed {
                         }
                     }
                     Mutation::Operation(_) => {
-                        if subscriber.partition == Partition::Schema {
+                        if subscriber.partition == Partition::Deployment {
                             replaced = true;
                         }
                     }

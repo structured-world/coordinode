@@ -228,6 +228,14 @@ fn checkpoint_round_trips_all_partitions() {
         "Raft partition dir in checkpoint"
     );
     assert!(
+        target.join("system/deployment").exists(),
+        "the deployment's records in checkpoint"
+    );
+    assert!(
+        !target.join("system/schema").exists(),
+        "no namespace Schema tree in the system set"
+    );
+    assert!(
         !target.join(Partition::Node.name()).exists(),
         "no tree at the checkpoint's root"
     );

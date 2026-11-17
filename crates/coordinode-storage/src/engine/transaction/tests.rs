@@ -1393,7 +1393,7 @@ fn an_enrolled_store_binds_history_to_its_enrollment() {
     let enrolled = DeploymentId([7; 16]);
     engine
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             ENROLLED_DEPLOYMENT_KEY,
             enrolled.as_bytes(),
         )
@@ -1420,11 +1420,11 @@ fn a_conflicting_binding_refuses_history() {
     let (engine, oracle, _d) = test_engine();
     let (recorded, enrolled) = (DeploymentId([1; 16]), DeploymentId([2; 16]));
     engine
-        .put(Partition::Schema, DEPLOYMENT_KEY, recorded.as_bytes())
+        .put(Partition::Deployment, DEPLOYMENT_KEY, recorded.as_bytes())
         .unwrap();
     engine
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             ENROLLED_DEPLOYMENT_KEY,
             enrolled.as_bytes(),
         )
@@ -1455,7 +1455,9 @@ fn a_lost_binding_is_not_refounded_over_history() {
     use coordinode_core::group::DEPLOYMENT_KEY;
     let (engine, oracle, _d) = test_engine();
     commit_stamped(&engine, &oracle, b"h:1:").expect("first history");
-    engine.delete(Partition::Schema, DEPLOYMENT_KEY).unwrap();
+    engine
+        .delete(Partition::Deployment, DEPLOYMENT_KEY)
+        .unwrap();
     let refused = commit_stamped(&engine, &oracle, b"h:2:");
     assert!(
         matches!(

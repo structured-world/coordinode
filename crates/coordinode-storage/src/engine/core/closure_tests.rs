@@ -1,8 +1,7 @@
-//! The closure ledger is engine protocol metadata kept in the Schema tree's
-//! reserved namespace: application scans, change enumeration, range
-//! deletion and consumers never see it, a copy of the
-//! partition carries it explicitly, and a store holding it where an earlier
-//! layout kept it is refused.
+//! The closure ledger is engine protocol metadata kept in the deployment
+//! tree's reserved key space: scans, change enumeration, range deletion and
+//! consumers never see it, and a copy of the partition carries it
+//! explicitly.
 
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
@@ -46,25 +45,25 @@ fn ledger(engine: &StorageEngine, n: u64) {
     closure_entry(engine, n + 1, &[], n * 10 + 1);
 }
 
-/// No application read of the Schema partition meets a ledger record: a
-/// scan of every row, a scan from the empty key, the keys changed since the
-/// start, and an application range deletion of the whole partition leaves
-/// the ledger answering. Kept among application rows, a scan returned the
-/// head and the breakpoints and a range deletion erased them.
+/// No read of the deployment's records meets a ledger record: a scan of
+/// every row, a scan from the empty key, the keys changed since the start,
+/// and a range deletion of the whole partition leaves the ledger answering.
+/// Kept among the records, a scan returned the head and the breakpoints and
+/// a range deletion erased them.
 #[test]
 fn ledger_records_are_not_application_rows() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let engine = StorageEngine::open(&config(dir.path())).expect("open");
     let rows = || -> Vec<Vec<u8>> {
         engine
-            .prefix_scan(Partition::Schema, &[])
+            .prefix_scan(Partition::Deployment, &[])
             .expect("scan")
             .map(|guard| guard.into_inner().expect("row").0.to_vec())
             .collect()
     };
     let changed = || {
         engine
-            .changed_keys_since(Partition::Schema, 0)
+            .changed_keys_since(Partition::Deployment, 0)
             .expect("changed keys")
     };
     // The rows the store keeps of its own (its routing) before the ledger.
@@ -77,13 +76,13 @@ fn ledger_records_are_not_application_rows() {
     engine
         .apply_proposal_at(
             &[Mutation::RemoveRange {
-                partition: PartitionId::Schema,
+                partition: PartitionId::Deployment,
                 start: Vec::new(),
                 end: vec![0xff; 16],
             }],
             engine.next_seqno(),
         )
-        .expect("remove every application row");
+        .expect("remove every record");
     engine.persist().expect("persist");
     engine.reload_closure_frontier().expect("reload");
     for index in 1..=5 {
@@ -96,17 +95,17 @@ fn ledger_records_are_not_application_rows() {
     assert_eq!(engine.closure_frontier(), 51);
 }
 
-/// The ledger's writes owe consumers nothing: a follower of the Schema
-/// partition is handed no keys for them. Written as application rows, each
-/// entry handed its keys to the follower.
+/// The ledger's writes owe consumers nothing: a follower of the deployment's
+/// records is handed no keys for them. Written as records, each entry handed
+/// its keys to the follower.
 #[test]
 fn ledger_writes_owe_consumers_nothing() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let engine = StorageEngine::open(&config(dir.path())).expect("open");
-    let schema = engine.subscribe_applied(Partition::Schema, 64);
+    let records = engine.subscribe_applied(Partition::Deployment, 64);
     ledger(&engine, 5);
 
-    while let Some(event) = schema.try_next() {
+    while let Some(event) = records.try_next() {
         if let crate::engine::applied::AppliedEvent::Keys { keys, .. } = &event {
             assert!(keys.is_empty(), "keys handed to a consumer: {keys:?}");
         } else {
@@ -115,9 +114,9 @@ fn ledger_writes_owe_consumers_nothing() {
     }
 }
 
-/// A copy of the Schema partition carries the ledger from the same cut: the
-/// store it is installed in answers every position's ceiling and the closed
-/// bound as the source does, and holds exactly the source's records.
+/// A copy of the deployment's records carries the ledger from the same cut:
+/// the store it is installed in answers every position's ceiling and the
+/// closed bound as the source does, and holds exactly the source's records.
 #[test]
 fn a_partition_copy_carries_the_ledger() {
     let source_dir = tempfile::TempDir::new().expect("tempdir");
@@ -125,14 +124,14 @@ fn a_partition_copy_carries_the_ledger() {
     let positions =
         u64::try_from(crate::engine::closure_ledger::CACHED_BREAKPOINTS).expect("small") + 9;
     ledger(&source, positions);
-    let copy = source.copy_partition(Partition::Schema).expect("copy");
+    let copy = source.copy_partition(Partition::Deployment).expect("copy");
 
     let target_dir = tempfile::TempDir::new().expect("tempdir");
     let target = StorageEngine::open(&config(target_dir.path())).expect("open target");
     // Answered from the installed ledger once the install returns: no
     // separate reload.
     target
-        .install_partition(Partition::Schema, &copy, true)
+        .install_partition(Partition::Deployment, &copy, true)
         .expect("install");
     for index in 1..=positions {
         assert_eq!(
@@ -144,16 +143,17 @@ fn a_partition_copy_carries_the_ledger() {
     assert_eq!(target.closure_frontier(), source.closure_frontier());
 }
 
-/// A Schema copy whose ledger cannot be read leaves the partition owed a
-/// rebuild, through a consensus member's finish and a whole-copy install
-/// alike: the intent stays and the install fails, rather than the repair
-/// ending with readers answered from the ledger the store held before.
+/// A copy of the deployment's records whose ledger cannot be read leaves the
+/// partition owed a rebuild, through a consensus member's finish and a
+/// whole-copy install alike: the intent stays and the install fails, rather
+/// than the repair ending with readers answered from the ledger the store
+/// held before.
 #[test]
 fn a_ledger_that_cannot_be_read_leaves_the_rebuild_owed() {
     let source_dir = tempfile::TempDir::new().expect("tempdir");
     let source = StorageEngine::open(&config(source_dir.path())).expect("open source");
     ledger(&source, 5);
-    let mut copy = source.copy_partition(Partition::Schema).expect("copy");
+    let mut copy = source.copy_partition(Partition::Deployment).expect("copy");
     let head = copy
         .rows
         .iter_mut()
@@ -164,7 +164,7 @@ fn a_ledger_that_cannot_be_read_leaves_the_rebuild_owed() {
     let target_dir = tempfile::TempDir::new().expect("tempdir");
     let target = StorageEngine::open(&config(target_dir.path())).expect("open target");
     let repair = target
-        .begin_partition_rebuild(Partition::Schema, &copy.rows)
+        .begin_partition_rebuild(Partition::Deployment, &copy.rows)
         .expect("begin");
     assert!(
         target.finish_raft_rebuild(repair, 7, &[]).is_err(),
@@ -172,7 +172,7 @@ fn a_ledger_that_cannot_be_read_leaves_the_rebuild_owed() {
     );
     assert_eq!(
         target.pending_rebuilds().expect("intents"),
-        [Partition::Schema],
+        [Partition::Deployment],
         "the rebuild is no longer owed"
     );
 
@@ -180,13 +180,13 @@ fn a_ledger_that_cannot_be_read_leaves_the_rebuild_owed() {
     let other = StorageEngine::open(&config(other_dir.path())).expect("open other");
     assert!(
         other
-            .install_partition(Partition::Schema, &copy, true)
+            .install_partition(Partition::Deployment, &copy, true)
             .is_err(),
         "the install finished over a ledger it cannot read"
     );
     assert_eq!(
         other.pending_rebuilds().expect("intents"),
-        [Partition::Schema],
+        [Partition::Deployment],
         "the install is no longer owed"
     );
 }
@@ -255,16 +255,16 @@ fn retired_ledger(engine: &StorageEngine) {
     assert_eq!(engine.commit_ceiling_through(5).expect("ceiling"), 50);
 }
 
-/// A copy of a Schema partition from another store whose ledger holds
+/// A copy of the deployment's records from another store whose ledger holds
 /// breakpoints at positions 1 and 2 only (ceilings 5 and 6): position 5's
 /// ceiling there is 6, from the record at 2.
-fn other_schema_copy() -> (tempfile::TempDir, PartitionCopy) {
+fn other_records_copy() -> (tempfile::TempDir, PartitionCopy) {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let source = StorageEngine::open(&config(dir.path())).expect("open source");
     closure_entry(&source, 1, &[5], 0);
     closure_entry(&source, 2, &[6], 0);
     assert_eq!(source.commit_ceiling_through(5).expect("ceiling"), 6);
-    let copy = source.copy_partition(Partition::Schema).expect("copy");
+    let copy = source.copy_partition(Partition::Deployment).expect("copy");
     (dir, copy)
 }
 
@@ -285,20 +285,20 @@ fn stalled_read(
 }
 
 /// A stored-ceiling read selected from one ledger and continued after a
-/// Schema transfer cleared that ledger's tree, before the transfer installed
-/// its own: it is refused. Answered, it read the transfer's records with the
-/// former ledger's anchor and returned 30 for a position whose ceiling was
-/// 50, a prefix shorter than the one applied.
+/// transfer of the deployment's records cleared that ledger's tree, before
+/// the transfer installed its own: it is refused. Answered, it read the
+/// transfer's records with the former ledger's anchor and returned 30 for a
+/// position whose ceiling was 50, a prefix shorter than the one applied.
 #[test]
 fn a_stored_ceiling_read_continued_into_an_unfinished_transfer_is_refused() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let engine = std::sync::Arc::new(StorageEngine::open(&config(dir.path())).expect("open"));
     retired_ledger(&engine);
-    let (_source, copy) = other_schema_copy();
+    let (_source, copy) = other_records_copy();
 
     let reader = stalled_read(&engine);
     let repair = engine
-        .begin_partition_rebuild(Partition::Schema, &copy.rows)
+        .begin_partition_rebuild(Partition::Deployment, &copy.rows)
         .expect("begin the transfer");
     super::breakpoint_read_gate::release();
     let answer = reader.join().expect("read");
@@ -310,20 +310,20 @@ fn a_stored_ceiling_read_continued_into_an_unfinished_transfer_is_refused() {
 }
 
 /// A stored-ceiling read selected from one ledger and continued after a
-/// Schema transfer installed another one in full: it is refused, so its
-/// caller selects again from the ledger in place. Answered, it read the new
-/// tree's records with the former ledger's anchor and returned 30 for a
-/// position whose ceiling in the new ledger is 6.
+/// transfer of the deployment's records installed another one in full: it
+/// is refused, so its caller selects again from the ledger in place.
+/// Answered, it read the new tree's records with the former ledger's anchor
+/// and returned 30 for a position whose ceiling in the new ledger is 6.
 #[test]
 fn a_stored_ceiling_read_continued_past_a_finished_transfer_is_refused() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let engine = std::sync::Arc::new(StorageEngine::open(&config(dir.path())).expect("open"));
     retired_ledger(&engine);
-    let (_source, copy) = other_schema_copy();
+    let (_source, copy) = other_records_copy();
 
     let reader = stalled_read(&engine);
     let repair = engine
-        .begin_partition_rebuild(Partition::Schema, &copy.rows)
+        .begin_partition_rebuild(Partition::Deployment, &copy.rows)
         .expect("begin the transfer");
     let finished = engine.finish_raft_rebuild(repair, 7, &[]);
     super::breakpoint_read_gate::release();
@@ -338,28 +338,4 @@ fn a_stored_ceiling_read_continued_past_a_finished_transfer_is_refused() {
         6,
         "the installed ledger answers"
     );
-}
-
-/// A store holding the head where an earlier layout kept it, among the
-/// application's Schema rows, is refused when it opens and when its ledger
-/// is read: read as having no ledger, every prefix would look closed.
-#[test]
-fn a_head_kept_among_application_rows_is_refused() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    {
-        let engine = StorageEngine::open(&config(dir.path())).expect("open");
-        engine
-            .put(Partition::Schema, b"closure:below", &[0u8; 8])
-            .expect("write the earlier layout's head");
-        assert!(
-            engine.reload_closure_frontier().is_err(),
-            "the earlier layout's head was read"
-        );
-        engine.persist().expect("persist");
-    }
-    let reopened = StorageEngine::open(&config(dir.path()));
-    let Err(err) = reopened else {
-        panic!("a store of the earlier layout opened");
-    };
-    assert!(err.to_string().contains("layout"), "{err}");
 }

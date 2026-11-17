@@ -432,12 +432,12 @@ impl MetadataCommand {
     /// writes.
     pub fn partition(&self) -> PartitionId {
         match self {
-            Self::RegisterFields { .. }
-            | Self::AdoptFields { .. }
-            | Self::BindLabels { .. }
-            | Self::GrantNodeLease { .. }
+            Self::RegisterFields { .. } | Self::AdoptFields { .. } | Self::BindLabels { .. } => {
+                PartitionId::Schema
+            }
+            Self::GrantNodeLease { .. }
             | Self::RecordGroupPair { .. }
-            | Self::RecordDeployment { .. } => PartitionId::Schema,
+            | Self::RecordDeployment { .. } => PartitionId::Deployment,
             Self::ConditionalRegistryWrite { .. } => PartitionId::Registry,
         }
     }
@@ -536,6 +536,10 @@ pub enum PartitionId {
     /// record per assertion, keyed by the version it states and the commit
     /// that stated it.
     NodeHistory,
+
+    /// The records that hold for the whole deployment or its replication
+    /// group rather than one namespace: the deployment's own Schema tree.
+    Deployment,
 }
 
 /// A batch of mutations to be proposed through Raft.

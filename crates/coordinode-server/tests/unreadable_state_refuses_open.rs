@@ -115,7 +115,7 @@ async fn a_member_refuses_an_unreadable_applied_membership() {
     let engine = open_engine(dir.path(), &oracle);
     engine
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             b"raft:sm:membership",
             b"not-msgpack-bytes",
         )

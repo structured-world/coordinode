@@ -14,17 +14,13 @@
 //! - `raft:purged` — last purged log id
 //! - `raft:oplog:last_log_id` — oplog-based last log id
 //!
-//! **`Partition::Schema`** — shared with user schema data (`schema:*` keys):
+//! **`Partition::Deployment`**, among the deployment's other records (leases,
+//! operation records), each under a prefix of its own:
 //! - `raft:sm:applied`: last applied log id (state machine)
 //! - `raft:sm:membership`: last applied membership config
 //! - `raft:snapshot:meta`: snapshot metadata
 //! - `raft:snapshot:file`: the snapshot's file name; the bytes live in the
 //!   engine's `raft-snapshot` directory, outside the store
-//!
-//! User schema uses `schema:label:*`, `schema:edge_type:*`, `schema:meta:*`
-//! keys in the same `Partition::Schema`. No collision occurs because prefixes
-//! don't overlap (`raft:` vs `schema:`) and write methods differ (Raft uses
-//! raw puts, schema uses MVCC puts with timestamp suffix).
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -515,7 +511,7 @@ pub enum LostCommitted {
 /// The stored membership cannot be read or decoded.
 pub(crate) fn has_other_voters(engine: &StorageEngine, node_id: u64) -> Result<bool, io::Error> {
     let stored: Option<StoredMembership> =
-        load_stored(engine, Partition::Schema, KEY_SM_MEMBERSHIP)?;
+        load_stored(engine, Partition::Deployment, KEY_SM_MEMBERSHIP)?;
     Ok(stored.is_some_and(|m| m.membership().voter_ids().any(|id| id != node_id)))
 }
 
@@ -601,10 +597,11 @@ pub fn rebuild_partition_from_checkpoint(
                 )));
             }
             let repair = engine.begin_partition_rebuild(partition, &rows)?;
-            // The checkpoint's Schema rows carried its closure ledger; each
-            // entry replayed after it writes its closure record as its apply
-            // did, or the rebuilt tree would answer with the checkpoint's.
-            let mut closure = if partition == Partition::Schema {
+            // The checkpoint's deployment records carried its closure ledger;
+            // each entry replayed after it writes its closure record as its
+            // apply did, or the rebuilt tree would answer with the
+            // checkpoint's.
+            let mut closure = if partition == Partition::Deployment {
                 Some(engine.closure_replay()?)
             } else {
                 None
@@ -1089,7 +1086,7 @@ impl LogStore {
         // group, before the log opens on them and before the consensus engine
         // reads them.
         let history = committed.is_some()
-            || load_stored::<StoredMembership>(&engine, Partition::Schema, KEY_SM_MEMBERSHIP)?
+            || load_stored::<StoredMembership>(&engine, Partition::Deployment, KEY_SM_MEMBERSHIP)?
                 .is_some()
             || holds_segments(&recovery_dirs)?;
         let (incarnation, promises) = settle_promises(&engine, history)?;
@@ -2299,17 +2296,18 @@ impl CoordinodeStateMachine {
     ) -> Result<Option<openraft::type_config::alias::LogIdOf<TypeConfig>>, io::Error> {
         debug_assert!(
             key.starts_with(b"raft:"),
-            "Raft state machine keys in Schema partition must use raft: prefix, got {:?}",
+            "Raft state machine keys among the deployment's records use the raft: prefix, \
+             got {:?}",
             String::from_utf8_lossy(key)
         );
-        load_stored(engine, Partition::Schema, key)
+        load_stored(engine, Partition::Deployment, key)
     }
 
     /// The membership the state machine last applied, the initial one when
     /// none was. A stored one that cannot be read or decoded fails the open:
     /// taken as the initial membership, the member would forget its group.
     fn load_membership(engine: &StorageEngine) -> Result<StoredMembership, io::Error> {
-        Ok(load_stored(engine, Partition::Schema, KEY_SM_MEMBERSHIP)?.unwrap_or_default())
+        Ok(load_stored(engine, Partition::Deployment, KEY_SM_MEMBERSHIP)?.unwrap_or_default())
     }
 
     /// Record every node identity that `previous` binds and `next` no longer
@@ -2331,7 +2329,7 @@ impl CoordinodeStateMachine {
             tracing::info!(%identity, "a member left: its node identity is retired");
             self.engine
                 .put(
-                    Partition::Schema,
+                    Partition::Deployment,
                     &coordinode_core::group::retired_identity_key(&identity.canonical()),
                     &[],
                 )
@@ -2343,7 +2341,7 @@ impl CoordinodeStateMachine {
     fn save_membership(&self, membership: &StoredMembership) -> Result<(), io::Error> {
         let bytes = rmp_serde::to_vec(membership).map_err(|e| io::Error::other(e.to_string()))?;
         self.engine
-            .put(Partition::Schema, KEY_SM_MEMBERSHIP, &bytes)
+            .put(Partition::Deployment, KEY_SM_MEMBERSHIP, &bytes)
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
@@ -2470,11 +2468,11 @@ impl CoordinodeStateMachine {
             .filter(|_| index < self.skip_until);
         let held =
             |part| applies.skips(part, index) || replay.is_some_and(|c| c.holds(part, index, sub));
-        // Records the Schema tree already holds are not written again, so an
-        // entry applied again retires nothing: its removals would not land.
+        // Records the deployment tree already holds are not written again, so
+        // an entry applied again retires nothing: its removals would not land.
         let records = self
             .engine
-            .closure_record(closed_below, index, held(Partition::Schema))
+            .closure_record(closed_below, index, held(Partition::Deployment))
             .map_err(|e| io::Error::other(format!("plan the closed bound: {e}")))?;
         if let Some((records, at)) = records {
             self.engine

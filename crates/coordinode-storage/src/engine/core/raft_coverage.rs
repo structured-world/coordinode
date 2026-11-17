@@ -173,9 +173,11 @@ pub struct PartitionCopy {
 }
 
 /// Keys that belong to this node rather than to the replicated data: the
-/// Raft partition (vote, log metadata) and, in Schema, the per-node routing
-/// (`meta:`) and the state machine's own records (`raft:`). They never
-/// travel between nodes and survive a partition's replacement.
+/// Raft partition (vote, log metadata), in the deployment's records the
+/// per-node routing and records (`meta:`) and the state machine's own
+/// (`raft:`), and in a namespace's Schema tree this node's records about the
+/// namespace's indexes (`meta:`). They never travel between nodes and
+/// survive a partition's replacement.
 #[must_use]
 pub fn is_node_local(partition: Partition, key: &[u8]) -> bool {
     match partition {
@@ -190,7 +192,8 @@ pub fn is_node_local(partition: Partition, key: &[u8]) -> bool {
 /// partition (which is node-local whole).
 fn node_local_prefixes(partition: Partition) -> &'static [&'static [u8]] {
     match partition {
-        Partition::Schema => &[b"meta:", b"raft:"],
+        Partition::Deployment => &[b"meta:", b"raft:"],
+        Partition::Schema => &[b"meta:"],
         _ => &[],
     }
 }
@@ -302,7 +305,7 @@ impl StorageEngine {
                     crate::engine::operations::decide(self, command, rest, commit_ts, at)?;
                 decided = if outcome.skipped {
                     vec![Mutation::Put {
-                        partition: coordinode_core::txn::proposal::PartitionId::Schema,
+                        partition: coordinode_core::txn::proposal::PartitionId::Deployment,
                         key: crate::engine::operations::skipped_unit_key(at),
                         value: Vec::new(),
                     }]
@@ -326,7 +329,7 @@ impl StorageEngine {
             | Mutation::RemoveRange { partition, .. } => Partition::from(*partition),
             // A command's effects are records of the partition it names.
             Mutation::Command(command) => Partition::from(command.partition()),
-            Mutation::Operation(_) => Partition::Schema,
+            Mutation::Operation(_) => Partition::Deployment,
             // Resolved above; its entries are index records.
             Mutation::Derive(_) => Partition::Idx,
             // Writes nothing; it goes with the node rows it describes.
@@ -432,7 +435,7 @@ impl StorageEngine {
 
     /// The replicated rows of `partition` in this engine: every key but the
     /// node-local ones ([`is_node_local`]), and, of the reserved records,
-    /// only the Schema tree's closure ledger, read at the same cut: the
+    /// only the deployment tree's closure ledger, read at the same cut: the
     /// position authority a copy of the same history carries. Coverage and
     /// installation records keep their own rules.
     ///
@@ -447,7 +450,7 @@ impl StorageEngine {
             .filter(|(key, _)| !is_node_local(partition, key))
             .map(|(key, value)| (key, value.to_vec()))
             .collect();
-        if partition == Partition::Schema {
+        if partition == Partition::Deployment {
             rows.extend(self.closure_rows_at(snapshot)?);
         }
         Ok(rows)

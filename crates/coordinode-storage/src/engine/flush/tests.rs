@@ -29,7 +29,7 @@ fn sets_of(trees: &HashMap<Partition, lsm_tree::AnyTree>) -> Arc<OpenSets> {
     let mut system = SetTrees::new(Scope::System);
     let mut namespace = SetTrees::new(Scope::Namespace(NamespaceId::from_raw(1)));
     for (&part, tree) in trees {
-        if part.is_system() {
+        if part.is_deployment() {
             system.insert(part, tree.clone());
         } else {
             namespace.insert(part, tree.clone());

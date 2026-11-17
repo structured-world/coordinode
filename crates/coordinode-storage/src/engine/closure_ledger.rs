@@ -34,21 +34,15 @@ pub(crate) const CACHED_BREAKPOINTS: usize = 256;
 /// The most breakpoints one entry retires.
 pub(crate) const RETIRE_BATCH: usize = 64;
 
-/// The head record's key, in the Schema tree's engine-reserved namespace:
-/// protocol metadata of the engine, not an application row. Application
-/// scans, change enumeration and range deletion never reach it.
+/// The head record's key, in the deployment tree's engine-reserved key
+/// space: protocol metadata of the engine, not a record of the deployment's
+/// catalog. Scans, change enumeration and range deletion never reach it.
 pub(crate) const HEAD_KEY: &[u8] = b"\x00clh";
 
 /// The key prefix of the breakpoint records, beside the head record in the
-/// reserved namespace; the index follows big-endian, so keys sort by
+/// reserved key space; the index follows big-endian, so keys sort by
 /// position.
 pub(crate) const BREAKPOINT_PREFIX: &[u8] = b"\x00clb";
-
-/// Where an earlier layout kept the head and the breakpoints, among the
-/// application's Schema rows. A store holding either is of a layout this
-/// build does not read: it is refused, never read as having no ledger.
-pub(crate) const REFUSED_HEAD_KEY: &[u8] = b"closure:below";
-pub(crate) const REFUSED_BREAKPOINT_PREFIX: &[u8] = b"closure:bp:";
 
 /// The head record's leading byte.
 const FORMAT: u8 = 2;

@@ -32,7 +32,7 @@ fn open_with(config: &StorageConfig) -> Arc<StorageEngine> {
     // A cut names the history it is of: the store's deployment.
     engine
         .put(
-            Partition::Schema,
+            Partition::Deployment,
             coordinode_core::group::ENROLLED_DEPLOYMENT_KEY,
             &[7; 16],
         )

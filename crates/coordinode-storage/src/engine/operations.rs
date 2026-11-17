@@ -2,7 +2,9 @@
 //!
 //! A unit carrying an [`OperationCommand`] is decided against the records the
 //! engine holds when it applies, under the decision lock of its issuer, and
-//! turned into plain Schema writes before anything else sees it. A `Bind`
+//! turned into plain writes of the deployment's records before anything else
+//! sees it: an operation's records hold for the deployment, whichever
+//! namespaces its unit writes. A `Bind`
 //! decides the whole unit: the first attempt of an operation applies its
 //! effects with the operation's record, any later attempt applies nothing.
 //! The decision reads nothing but the records earlier decisions wrote, so it
@@ -122,7 +124,7 @@ pub(crate) fn decide(
                 commit_ts,
                 at,
             ) {
-                BindDecision::Apply(record) => with(vec![schema_put(
+                BindDecision::Apply(record) => with(vec![record_put(
                     operation_key(&binding.op),
                     record.encode(),
                 )]),
@@ -147,9 +149,9 @@ pub(crate) fn decide(
     })
 }
 
-fn schema_put(key: Vec<u8>, value: Vec<u8>) -> Mutation {
+fn record_put(key: Vec<u8>, value: Vec<u8>) -> Mutation {
     Mutation::Put {
-        partition: PartitionId::Schema,
+        partition: PartitionId::Deployment,
         key,
         value,
     }
@@ -177,7 +179,7 @@ fn decide_enrollment(
             open: false,
             ..record
         };
-        effects.push(schema_put(incarnation_key(issuer, number), closed.encode()));
+        effects.push(record_put(incarnation_key(issuer, number), closed.encode()));
     }
     let opened = IncarnationRecord {
         open: true,
@@ -185,7 +187,7 @@ fn decide_enrollment(
         retired_below: 1,
         window,
     };
-    effects.push(schema_put(
+    effects.push(record_put(
         incarnation_key(issuer, incarnation),
         opened.encode(),
     ));
@@ -212,7 +214,7 @@ fn decide_exclusion(engine: &StorageEngine, op: &OperationId) -> StorageResult<V
         intent: IntentDigest([0; INTENT_DIGEST_LEN]),
         state: OperationState::Excluded,
     };
-    Ok(vec![schema_put(operation_key(op), excluded.encode())])
+    Ok(vec![record_put(operation_key(op), excluded.encode())])
 }
 
 /// Release the outcome of `op` when it is settled (committed or excluded),
@@ -228,7 +230,7 @@ fn decide_release(engine: &StorageEngine, op: &OperationId) -> StorageResult<Vec
                 intent,
                 state: OperationState::Released,
             };
-            Ok(vec![schema_put(operation_key(op), released.encode())])
+            Ok(vec![record_put(operation_key(op), released.encode())])
         }
         _ => Ok(Vec::new()),
     }
@@ -250,7 +252,7 @@ fn decide_retirement(
     }
     let mut effects = Vec::new();
     let prefix = incarnation_operations_prefix(issuer, incarnation);
-    for guard in engine.prefix_scan(Partition::Schema, &prefix)? {
+    for guard in engine.prefix_scan(Partition::Deployment, &prefix)? {
         let (key, value) = guard.into_inner()?;
         let op = decode_operation_key(&key).ok_or_else(|| malformed("operation key"))?;
         if op.sequence >= below {
@@ -259,11 +261,11 @@ fn decide_retirement(
         // A record that does not decode is not released blind.
         OperationRecord::decode(&value).ok_or_else(|| malformed("operation record"))?;
         effects.push(Mutation::Delete {
-            partition: PartitionId::Schema,
+            partition: PartitionId::Deployment,
             key: key.to_vec(),
         });
     }
-    effects.push(schema_put(
+    effects.push(record_put(
         incarnation_key(issuer, incarnation),
         IncarnationRecord {
             retired_below: below,
@@ -288,7 +290,7 @@ pub fn operation_record(
     op: &OperationId,
 ) -> StorageResult<Option<OperationRecord>> {
     engine
-        .get(Partition::Schema, &operation_key(op))?
+        .get(Partition::Deployment, &operation_key(op))?
         .map(|bytes| OperationRecord::decode(&bytes).ok_or_else(|| malformed("operation record")))
         .transpose()
 }
@@ -304,7 +306,7 @@ pub fn incarnation_record(
     incarnation: u64,
 ) -> StorageResult<Option<IncarnationRecord>> {
     engine
-        .get(Partition::Schema, &incarnation_key(issuer, incarnation))?
+        .get(Partition::Deployment, &incarnation_key(issuer, incarnation))?
         .map(|bytes| {
             IncarnationRecord::decode(&bytes).ok_or_else(|| malformed("incarnation record"))
         })
@@ -321,7 +323,7 @@ pub fn incarnations(
     issuer: &IssuerId,
 ) -> StorageResult<Vec<(u64, IncarnationRecord)>> {
     let mut out = Vec::new();
-    for guard in engine.prefix_scan(Partition::Schema, &issuer_incarnations_prefix(issuer))? {
+    for guard in engine.prefix_scan(Partition::Deployment, &issuer_incarnations_prefix(issuer))? {
         let (key, value) = guard.into_inner()?;
         let number = decode_incarnation_key(&key).ok_or_else(|| malformed("incarnation key"))?;
         let record =
@@ -355,7 +357,7 @@ pub fn admission_fences(
     engine: &StorageEngine,
 ) -> StorageResult<Vec<(IssuerId, u64, IncarnationRecord)>> {
     let mut out = Vec::new();
-    for guard in engine.prefix_scan(Partition::Schema, INCARNATION_KEY_PREFIX)? {
+    for guard in engine.prefix_scan(Partition::Deployment, INCARNATION_KEY_PREFIX)? {
         let (key, value) = guard.into_inner()?;
         let issuer = key
             .get(INCARNATION_KEY_PREFIX.len()..)
@@ -405,7 +407,7 @@ pub fn fence_restored(
             ..record
         };
         engine.put(
-            Partition::Schema,
+            Partition::Deployment,
             &incarnation_key(&IssuerId(issuer), number),
             &closed.encode(),
         )?;
@@ -436,7 +438,7 @@ pub(crate) fn skipped_unit_key(at: LogPosition) -> Vec<u8> {
 /// The mark cannot be read.
 pub fn unit_skipped(engine: &StorageEngine, at: LogPosition) -> StorageResult<bool> {
     Ok(engine
-        .get(Partition::Schema, &skipped_unit_key(at))?
+        .get(Partition::Deployment, &skipped_unit_key(at))?
         .is_some())
 }
 
@@ -448,7 +450,7 @@ pub fn unit_decisions(
     std::sync::Arc::new(move |at| unit_skipped(&engine, at))
 }
 
-/// Whether `key` of the Schema partition is an operation or incarnation
+/// Whether `key` of the deployment's records is an operation or incarnation
 /// record.
 #[must_use]
 pub fn is_operation_record(key: &[u8]) -> bool {
