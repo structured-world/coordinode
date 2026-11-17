@@ -438,6 +438,63 @@ fn a_damaged_marker_is_an_error() {
     assert!(read_marker(root.path()).is_err());
 }
 
+/// Every file under `dir` with its bytes.
+fn contents(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(at) = dirs.pop() {
+        for entry in std::fs::read_dir(&at).expect("list").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).expect("read"));
+            }
+        }
+    }
+    out
+}
+
+/// A store whose trees lie at the top level of an endpoint, as a store
+/// written before trees had sets keeps them, is refused by name at every
+/// endpoint: a partition's tree or the columnar tables' directory, on the
+/// primary or on a secondary. Not one byte of it changes, the lock file the
+/// refused open would have created included.
+#[test]
+fn the_engine_refuses_a_store_with_trees_at_its_top_level() {
+    use crate::engine::config::{EndpointConfig, Media, Tier};
+    use crate::engine::core::StorageEngine;
+    for (on_secondary, tree) in [(false, "schema"), (false, "tables"), (true, "node")] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (primary, secondary) = (root.path().join("p"), root.path().join("s"));
+        let config = StorageConfig::with_endpoints(vec![
+            EndpointConfig::new("p", &primary, Media::Hdd, Durability::Durable, Tier::Hot),
+            EndpointConfig::new("s", &secondary, Media::Hdd, Durability::Durable, Tier::Cold),
+        ]);
+        drop(StorageEngine::open(&config).expect("open"));
+        let flat = if on_secondary { &secondary } else { &primary };
+        touch(&flat.join(tree), "table");
+        let before = contents(root.path());
+
+        let err = StorageEngine::open(&config).err().expect("refused");
+        assert!(
+            matches!(&err, StorageError::UnsupportedLayout { tree: t, .. } if t == tree),
+            "{tree}: {err}"
+        );
+        assert!(err.to_string().contains(tree), "{err}");
+        assert_eq!(contents(root.path()), before, "{tree}: the store changed");
+    }
+}
+
+/// A file at an endpoint's top level named like a tree is no tree: the
+/// store opens.
+#[test]
+fn a_file_named_like_a_tree_is_not_a_flat_layout() {
+    let root = tempfile::tempdir().expect("tempdir");
+    touch(root.path(), "node");
+    refuse_flat_layout(root.path()).expect("a file is no tree");
+}
+
 /// Every engine open goes through the marker: a directory written by a
 /// newer format fails the open without being touched.
 #[test]

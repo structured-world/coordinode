@@ -458,7 +458,10 @@ fn cascade_evict_strategy_fires_at_emergency_threshold() {
     // minimum, under half of the data the hot endpoint holds, puts it at
     // Full at once. The reserve left above the client share is the room the
     // cascade's own work uses.
-    let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
+    let cold_tables = cold
+        .path()
+        .join(coordinode_storage::engine::scope::store_tree(Partition::Node).dir())
+        .join("tables");
     let hot_before = engine.footprints().get("ep-hot").expect("capped").charged();
     let reserve = coordinode_storage::engine::footprint::OVER_LIMIT_ALLOWANCE;
     engine

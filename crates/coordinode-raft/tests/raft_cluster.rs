@@ -24,6 +24,11 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::metadata::{field_frontier, load_field_dictionary};
 use coordinode_storage::engine::partition::Partition;
+
+/// The directory of the consensus log's tree under the endpoint `dir`.
+fn raft_tree(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(coordinode_storage::engine::scope::store_tree(Partition::Raft).dir())
+}
 use coordinode_wire::peer::PeerIdentity;
 use openraft::async_runtime::watch::WatchReceiver as _;
 
@@ -3591,8 +3596,7 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
         // Member 3's Raft tree is lost, and with it every record its local
         // journal no longer holds: the state after a fold and purge.
         let lose_tree = || {
-            std::fs::remove_dir_all(dirs[2].path().join(Partition::Raft.name()))
-                .expect("lose the tree");
+            std::fs::remove_dir_all(raft_tree(dirs[2].path())).expect("lose the tree");
             std::fs::remove_dir_all(dirs[2].path().join("local-journal"))
                 .expect("lose the local journal");
         };
@@ -3773,8 +3777,7 @@ async fn a_member_without_its_promise_is_replaced_under_a_new_identity() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         drop(e3);
-        std::fs::remove_dir_all(dirs[2].path().join(Partition::Raft.name()))
-            .expect("lose the tree");
+        std::fs::remove_dir_all(raft_tree(dirs[2].path())).expect("lose the tree");
         std::fs::remove_dir_all(dirs[2].path().join("local-journal")).expect("lose the journal");
         lose_the_copy(dirs[2].path());
         let listing = |dir: &std::path::Path| {
@@ -4005,8 +4008,7 @@ async fn a_replacement_cut_short_in_its_catch_up_is_resumed_by_the_next_leader()
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         drop(e3);
-        std::fs::remove_dir_all(dirs[2].path().join(Partition::Raft.name()))
-            .expect("lose the tree");
+        std::fs::remove_dir_all(raft_tree(dirs[2].path())).expect("lose the tree");
         std::fs::remove_dir_all(dirs[2].path().join("local-journal")).expect("lose the journal");
         lose_the_copy(dirs[2].path());
 
@@ -4198,8 +4200,7 @@ async fn a_replacement_cut_short_in_its_joint_configuration_is_completed_by_the_
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         drop(e3);
-        std::fs::remove_dir_all(dirs[2].path().join(Partition::Raft.name()))
-            .expect("lose the tree");
+        std::fs::remove_dir_all(raft_tree(dirs[2].path())).expect("lose the tree");
         std::fs::remove_dir_all(dirs[2].path().join("local-journal")).expect("lose the journal");
         lose_the_copy(dirs[2].path());
 
@@ -4999,7 +5000,7 @@ async fn a_group_that_lost_a_quorum_of_promises_stays_unavailable() {
         drop((e2, e3));
         for at in [1usize, 2] {
             let dir = dirs[at].path();
-            std::fs::remove_dir_all(dir.join(Partition::Raft.name())).expect("lose the tree");
+            std::fs::remove_dir_all(raft_tree(dir)).expect("lose the tree");
             std::fs::remove_dir_all(dir.join("local-journal")).expect("lose the journal");
             lose_the_copy(dir);
         }

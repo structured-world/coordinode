@@ -1200,7 +1200,8 @@ async fn a_member_without_its_vote_is_refused_and_replaced() {
     let (p1, p2, p3) = (n1.port, n2.port, n3.port);
     let data_dir = n3.stop_keeping_data().await;
     let dir = data_dir.path();
-    std::fs::remove_dir_all(dir.join("raft")).expect("lose the Raft tree");
+    // The consensus log's tree, in the deployment's own set.
+    std::fs::remove_dir_all(dir.join("system").join("raft")).expect("lose the Raft tree");
     std::fs::remove_dir_all(dir.join("local-journal")).expect("lose the journal");
     for entry in std::fs::read_dir(dir).expect("list the store") {
         let path = entry.expect("an entry").path();

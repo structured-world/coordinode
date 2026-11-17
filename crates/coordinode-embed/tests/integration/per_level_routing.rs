@@ -16,6 +16,11 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use tempfile::TempDir;
 
+/// The Node partition's tree directory under the endpoint `root`.
+fn node_dir(root: &std::path::Path) -> std::path::PathBuf {
+    root.join(coordinode_storage::engine::scope::store_tree(Partition::Node).dir())
+}
+
 /// Tables in the tables folder `dir`, 0 when it does not exist. Empty files
 /// are the engine's reserve of files for tables yet to be written, not
 /// tables, and their number moves with no data moving.
@@ -90,7 +95,7 @@ fn major_compaction_writes_ssts_to_cold_endpoint() {
         .expect("major compact");
 
     // Manifests live at primary (first) endpoint.
-    let primary_node_dir = hot.path().join(Partition::Node.name());
+    let primary_node_dir = node_dir(hot.path());
     assert!(
         primary_node_dir.exists(),
         "primary endpoint must hold the Node partition manifest dir, expected {primary_node_dir:?}",
@@ -99,7 +104,7 @@ fn major_compaction_writes_ssts_to_cold_endpoint() {
     // After major compaction, the cold endpoint must contain SST files
     // (the bottom-level table folder is created lazily by lsm-tree only
     // when SSTs actually land there).
-    let cold_node_tables = cold.path().join(Partition::Node.name()).join("tables");
+    let cold_node_tables = node_dir(cold.path()).join("tables");
     assert!(
         cold_node_tables.exists(),
         "cold endpoint must host bottom-level SSTs after major compaction \
@@ -265,7 +270,7 @@ fn single_endpoint_skips_level_routes() {
         .major_compact(Partition::Node)
         .expect("major compact");
 
-    let primary_tables = dir.path().join(Partition::Node.name()).join("tables");
+    let primary_tables = node_dir(dir.path()).join("tables");
     assert!(
         primary_tables.exists(),
         "single-endpoint config: tables dir must exist at primary path {primary_tables:?}",
@@ -312,7 +317,7 @@ fn cascade_eviction_moves_data_to_cooler_endpoint() {
     }
     engine.persist().expect("persist");
 
-    let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
+    let cold_tables = node_dir(cold.path()).join("tables");
     let before = tables_in(&cold_tables);
 
     let report = engine
@@ -507,7 +512,7 @@ fn reopen_with_added_endpoint_preserves_routing() {
 
     // SST tables snapshot before the topology change. After reopen
     // with the same routing they MUST be byte-stable (no migration).
-    let warm_tables_path = warm.path().join(Partition::Node.name()).join("tables");
+    let warm_tables_path = node_dir(warm.path()).join("tables");
     assert!(
         !warm_tables_path.exists(),
         "warm endpoint had no role in first open — must have no tables dir",
@@ -638,7 +643,7 @@ fn oplog_replay_through_multi_tier_routing() {
         .major_compact(Partition::Node)
         .expect("major compact");
 
-    let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
+    let cold_tables = node_dir(cold.path()).join("tables");
     assert!(
         cold_tables.exists(),
         "cold endpoint tables dir must exist after WAL replay + flush + compaction; \
@@ -705,7 +710,7 @@ fn cascade_eviction_of_primary_endpoint_is_data_motion_noop() {
     // table replaced by compaction stays listed until its last handle
     // closes (on Windows the file cannot go before that), and the reopen
     // sweeps whatever no manifest names.
-    let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
+    let cold_tables = node_dir(cold.path()).join("tables");
     let reopen_and_count = |engine: StorageEngine| {
         drop(engine);
         let engine = StorageEngine::open(&config).expect("reopen");

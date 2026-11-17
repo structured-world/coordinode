@@ -45,13 +45,19 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::engine::core::{RaftApplyState, RaftPosition, StorageEngine};
 use crate::engine::coverage::{Domain, TreeCoverage};
 use crate::engine::partition::Partition;
+use crate::engine::scope::{
+    NAMESPACES_DIR, NamespaceId, STORE_NAMESPACE, Scope, TreeId, store_tree,
+};
 use crate::error::{StorageError, StorageResult};
 
 /// What a transfer stream starts with.
 const MAGIC: [u8; 4] = *b"CNST";
 /// The stream's shape after its magic; a receiver refuses any other.
 const VERSION: u8 = 1;
-/// The name prefix of a `STORAGE COLUMNAR` table's tree.
+/// The directory of a namespace's `STORAGE COLUMNAR` table trees.
+const TABLES_DIR: &str = "tables";
+/// The name prefix of a `STORAGE COLUMNAR` table's tree within its
+/// namespace.
 const TABLE_PREFIX: &str = "tables/";
 /// How long a checkpoint of a store no Raft log orders waits for the commits
 /// below its cut to land before it is refused as not ready: they are
@@ -97,34 +103,44 @@ impl FileKind {
 /// Which tree of the store a pin is of.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TreeName {
-    Partition(Partition),
-    Table(String),
+    Partition(TreeId),
+    /// A `STORAGE COLUMNAR` table of a namespace, by its id.
+    Table(NamespaceId, String),
 }
 
 impl TreeName {
     fn encode(&self) -> String {
         match self {
-            Self::Partition(part) => part.name().to_owned(),
-            Self::Table(id) => format!("{TABLE_PREFIX}{id}"),
+            Self::Partition(tree) => tree.name(),
+            Self::Table(ns, id) => {
+                format!("{NAMESPACES_DIR}/{}/{TABLE_PREFIX}{id}", ns.dir_name())
+            }
         }
     }
 
-    /// The tree a received name stands for. A table id must be one path
+    /// The tree a received name stands for: a partition or a table named
+    /// with its set, so a stream naming bare partitions or tables, made
+    /// before trees had sets, is refused before anything is written. The
+    /// node-local consensus log never travels. A table id must be one path
     /// component: the stream decides where its files land.
     fn decode(name: &str) -> StorageResult<Self> {
-        if let Some(id) = name.strip_prefix(TABLE_PREFIX) {
+        let table = name
+            .strip_prefix(NAMESPACES_DIR)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(ns, rest)| Some((NamespaceId::from_dir_name(ns)?, rest)))
+            .and_then(|(ns, rest)| Some((ns, rest.strip_prefix(TABLE_PREFIX)?)));
+        if let Some((ns, id)) = table {
             let valid =
                 !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', '\0']);
             return if valid {
-                Ok(Self::Table(id.to_owned()))
+                Ok(Self::Table(ns, id.to_owned()))
             } else {
                 Err(malformed(format!("table name {name:?}")))
             };
         }
-        Partition::all()
-            .iter()
-            .copied()
-            .find(|part| *part != Partition::Raft && part.name() == name)
+        TreeId::parse(name)
+            .filter(|tree| tree.part != Partition::Raft)
             .map(Self::Partition)
             .ok_or_else(|| malformed(format!("tree name {name:?}")))
     }
@@ -132,8 +148,11 @@ impl TreeName {
     /// Where the tree lies in a directory laid out as a checkpoint.
     fn dir(&self, root: &Path) -> PathBuf {
         match self {
-            Self::Partition(part) => root.join(part.name()),
-            Self::Table(id) => root.join("tables").join(id),
+            Self::Partition(tree) => root.join(tree.dir()),
+            Self::Table(ns, id) => root
+                .join(Scope::Namespace(*ns).dir())
+                .join(TABLES_DIR)
+                .join(id),
         }
     }
 }
@@ -541,7 +560,7 @@ impl StorageEngine {
                 _ => None,
             };
             trees.push(PinnedTree {
-                name: TreeName::Partition(part),
+                name: TreeName::Partition(store_tree(part)),
                 position,
                 pin: tree.pin(),
                 _held: None,
@@ -553,7 +572,7 @@ impl StorageEngine {
         }
         for (table_id, tree) in tables {
             trees.push(PinnedTree {
-                name: TreeName::Table(table_id),
+                name: TreeName::Table(STORE_NAMESPACE, table_id),
                 position: None,
                 pin: tree.pin(),
                 _held: (scope == PinScope::Whole).then_some(tree),
@@ -674,7 +693,7 @@ impl StorageEngine {
         let pinned: std::collections::BTreeSet<String> = trees
             .iter()
             .filter_map(|tree| match &tree.name {
-                TreeName::Table(id) => Some(id.clone()),
+                TreeName::Table(_, id) => Some(id.clone()),
                 TreeName::Partition(_) => None,
             })
             .collect();
@@ -720,7 +739,7 @@ impl StorageEngine {
             lsm_tree::SequenceNumberCounter::default(),
         );
         let config = match &tree.name {
-            TreeName::Partition(part) => {
+            TreeName::Partition(tree) => {
                 use crate::engine::config::{
                     Durability, EndpointConfig, Media, StorageConfig, Tier,
                 };
@@ -733,10 +752,12 @@ impl StorageEngine {
                 )])
                 .relocated()
                 .with_fs(std::sync::Arc::clone(self.tree_fs()))
-                .to_tree_config(*part, seqno)
+                .to_tree_config(*tree, seqno)
             }
-            TreeName::Table(_) => lsm_tree::Config::new_with_generators(&dir, seqno.clone(), seqno)
-                .with_shared_fs(std::sync::Arc::clone(self.tree_fs())),
+            TreeName::Table(..) => {
+                lsm_tree::Config::new_with_generators(&dir, seqno.clone(), seqno)
+                    .with_shared_fs(std::sync::Arc::clone(self.tree_fs()))
+            }
         };
         // A checkpoint is a base other code reads file by file: no empty
         // table file created ahead lies beside its tables.
@@ -882,8 +903,8 @@ pub fn receive_store(reader: &mut impl Read, dir: &Path) -> StorageResult<Receiv
     }
 
     for tree in trees {
-        if let (TreeName::Partition(part), Some(position)) = (&tree.name, &tree.position) {
-            received.positions.push((*part, position.clone()));
+        if let (TreeName::Partition(id), Some(position)) = (&tree.name, &tree.position) {
+            received.positions.push((id.part, position.clone()));
         }
         restore_tree(dir, tree)?;
     }
@@ -992,7 +1013,7 @@ fn restore_tree(root: &Path, tree: ReceivedTree) -> StorageResult<()> {
     let seqno =
         lsm_tree::SharedSequenceNumberGenerator::from(lsm_tree::SequenceNumberCounter::default());
     let config = match &tree.name {
-        TreeName::Partition(part) => {
+        TreeName::Partition(id) => {
             use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
             StorageConfig::with_endpoints(vec![EndpointConfig::new(
                 "default",
@@ -1002,11 +1023,11 @@ fn restore_tree(root: &Path, tree: ReceivedTree) -> StorageResult<()> {
                 Tier::Warm,
             )])
             .relocated()
-            .to_tree_config(*part, seqno)
+            .to_tree_config(*id, seqno)
         }
         // A columnar table's memtable contents land as row tables beside its
         // columnar ones; its projected scan reads both.
-        TreeName::Table(_) => {
+        TreeName::Table(..) => {
             lsm_tree::Config::new_with_generators(tree.name.dir(root), seqno.clone(), seqno)
         }
     };

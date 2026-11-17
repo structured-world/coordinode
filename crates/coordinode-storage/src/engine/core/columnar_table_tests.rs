@@ -2,6 +2,15 @@ use crate::columnar::{ColumnarRow, write_columnar_rows};
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use crate::engine::core::StorageEngine;
 
+/// The directory of table `id`'s tree under an endpoint root: in its
+/// namespace's directory of tables.
+fn table_dir(root: &std::path::Path, id: &str) -> std::path::PathBuf {
+    use crate::engine::scope::{STORE_NAMESPACE, Scope};
+    root.join(Scope::Namespace(STORE_NAMESPACE).dir())
+        .join(crate::columnar::TABLES_DIR)
+        .join(id)
+}
+
 fn persistent_config(dir: &std::path::Path) -> StorageConfig {
     StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -571,15 +580,15 @@ fn a_dropped_table_leaves_no_maintenance_behind() {
             Tier::Cold,
         ),
     ]);
-    let dirs = || {
-        [hot.path(), cold.path()].map(|root| root.join(crate::columnar::TABLES_DIR).join("scratch"))
-    };
+    let dirs = || [hot.path(), cold.path()].map(|root| table_dir(root, "scratch"));
     {
         let engine = StorageEngine::open(&config).unwrap();
         for round in 0..3u32 {
             for i in 0..40 {
                 flushed_row(&engine, "scratch", round * 40 + i);
             }
+            // The drop is seen removing a directory that was there.
+            assert!(dirs()[0].exists(), "the table's directory before the drop");
             // The flushes woke the compaction monitor: its requests are
             // queued or running when the table goes.
             engine.drop_columnar_table("scratch").unwrap();
@@ -653,7 +662,7 @@ fn a_table_with_a_lost_manifest_is_salvaged_at_open() {
             flushed_row(&engine, "trades", i);
         }
     }
-    super::tests::lose_manifest(&dir.path().join(crate::columnar::TABLES_DIR).join("trades"));
+    super::tests::lose_manifest(&table_dir(dir.path(), "trades"));
 
     let engine = StorageEngine::open(&persistent_config(dir.path())).unwrap();
     assert_eq!(engine.columnar_scan("trades", u64::MAX).unwrap().len(), 6);

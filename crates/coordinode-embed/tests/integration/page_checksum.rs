@@ -67,7 +67,10 @@ fn corrupt_sst_block_surfaces_checksum_mismatch() {
     // lsm-tree's tables folder convention is `<endpoint>/<partition>/tables/`;
     // the folder also keeps a reserve of empty files for tables yet to be
     // written, which hold no block to corrupt.
-    let tables_dir = dir.path().join(Partition::Node.name()).join("tables");
+    let tables_dir = dir
+        .path()
+        .join(coordinode_storage::engine::scope::store_tree(Partition::Node).dir())
+        .join("tables");
     assert!(
         tables_dir.exists(),
         "expected tables dir at {tables_dir:?} after persist",

@@ -58,6 +58,11 @@ fn read(engine: &StorageEngine, part: Partition, key: &[u8]) -> Option<Vec<u8>> 
         .map(|value| value.to_vec())
 }
 
+/// The directory of the Schema tree under an endpoint or a checkpoint.
+fn schema_dir() -> std::path::PathBuf {
+    crate::engine::scope::store_tree(Partition::Schema).dir()
+}
+
 /// The ids of the tables the open Schema tree's version holds. A table's
 /// file is named by its id; a file name alone is reused across opens.
 fn schema_table_ids(engine: &StorageEngine) -> HashSet<u64> {
@@ -74,7 +79,7 @@ fn schema_table_ids(engine: &StorageEngine) -> HashSet<u64> {
 /// named in `victims`, writing a new file in its place, so a checkpoint
 /// sharing the old one by a hard link keeps it whole.
 fn damage_schema_tables(endpoint: &Path, victims: &HashSet<u64>) -> usize {
-    let dir = endpoint.join(Partition::Schema.name()).join("tables");
+    let dir = endpoint.join(schema_dir()).join("tables");
     let mut damaged = 0;
     for id in victims {
         let path = dir.join(id.to_string());
@@ -95,7 +100,7 @@ fn damage_schema_tables(endpoint: &Path, victims: &HashSet<u64>) -> usize {
 /// Remove the Schema tree's manifest snapshots and edit logs under
 /// `endpoint`, its tables left in place: the next open repairs the tree.
 fn lose_schema_manifest(endpoint: &Path) {
-    let dir = endpoint.join(Partition::Schema.name());
+    let dir = endpoint.join(schema_dir());
     let numbered = |rest: Option<&str>| {
         rest.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
     };
@@ -259,7 +264,7 @@ fn a_salvage_that_lost_the_closure_ledger_refuses_the_open() {
     // aside; the refusal itself writes nothing, so the next open finds the
     // tree's tables as this one left them (the tree rewrites only its own
     // manifest when it opens) and refuses again.
-    let tables = dir.path().join(Partition::Schema.name()).join("tables");
+    let tables = dir.path().join(schema_dir()).join("tables");
     let refused = tree_files(&tables);
     assert!(matches!(
         StorageEngine::open(&config),
@@ -497,7 +502,7 @@ fn a_rebuild_the_journal_cannot_cover_is_refused() {
 fn a_rebuild_from_a_damaged_checkpoint_is_refused() {
     let store = Checkpointed::new(true);
     store.cut_a_schema_rebuild_short();
-    let schema = store.checkpoint.join(Partition::Schema.name());
+    let schema = store.checkpoint.join(schema_dir());
     // An empty file is one a tree created ahead for its next table, not a
     // table: the checkpoint's trees were opened where they were built.
     let tables: HashSet<u64> = std::fs::read_dir(schema.join("tables"))
@@ -533,7 +538,7 @@ fn a_salvage_with_an_unknown_loss_refuses_the_open() {
             .expect("a Schema table")
     };
     let path = primary
-        .join(Partition::Schema.name())
+        .join(schema_dir())
         .join("tables")
         .join(newest.to_string());
     let bytes = std::fs::read(&path).expect("read the table");
@@ -563,18 +568,11 @@ fn a_corrupt_schema_tree_is_rebuilt_and_a_clean_one_is_not_read_in_full() {
         // The tables written after the checkpoint: those whose bytes no file
         // of the checkpoint holds. Ids do not tell, since the checkpoint's
         // tree numbers the tables it builds itself.
-        let held: HashSet<Vec<u8>> = tree_files(
-            &store
-                .checkpoint
-                .join(Partition::Schema.name())
-                .join("tables"),
-        )
-        .into_values()
-        .collect();
-        let tables = store
-            .primary()
-            .join(Partition::Schema.name())
-            .join("tables");
+        let held: HashSet<Vec<u8>> =
+            tree_files(&store.checkpoint.join(schema_dir()).join("tables"))
+                .into_values()
+                .collect();
+        let tables = store.primary().join(schema_dir()).join("tables");
         let after_checkpoint: HashSet<u64> = schema_table_ids(&engine)
             .into_iter()
             .filter(|id| {
@@ -653,7 +651,7 @@ fn a_schema_copy_that_does_not_fit_the_endpoint_is_refused() {
     )
     .expect("list")
     .expect("a checkpoint");
-    let schema_copy = dir_len(&latest.join(Partition::Schema.name()));
+    let schema_copy = dir_len(&latest.join(schema_dir()));
     assert!(
         schema_copy > 4 * crate::engine::footprint::OVER_LIMIT_ALLOWANCE,
         "the Schema copy ({schema_copy} bytes) must not fit the room left"

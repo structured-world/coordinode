@@ -210,17 +210,26 @@ fn checkpoint_round_trips_all_partitions() {
         Partition::all().len(),
         "every partition tree must be checkpointed"
     );
-    // Partition directories are named by `Partition::name()`, which is
-    // lower-case ("node", "schema"). Assert the exact names: a capitalised
-    // path silently passes on case-insensitive filesystems (macOS) and
-    // fails on case-sensitive ones (Linux CI).
+    // A checkpoint lays its trees out as the store does: the deployment's
+    // own under `system`, the data's under its namespace's directory. Assert
+    // the exact lower-case paths: a capitalised path silently passes on
+    // case-insensitive filesystems (macOS) and fails on case-sensitive ones
+    // (Linux CI).
     assert!(
-        target.join(Partition::Node.name()).exists(),
+        target.join("ns/0000000000000001/node").exists(),
         "Node partition dir in checkpoint"
     );
     assert!(
-        target.join(Partition::Schema.name()).exists(),
+        target.join("ns/0000000000000001/schema").exists(),
         "Schema partition dir in checkpoint"
+    );
+    assert!(
+        target.join("system/raft").exists(),
+        "Raft partition dir in checkpoint"
+    );
+    assert!(
+        !target.join(Partition::Node.name()).exists(),
+        "no tree at the checkpoint's root"
     );
 
     // Drop the source engine, then open a brand-new engine against the

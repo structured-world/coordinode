@@ -5,6 +5,11 @@ use coordinode_core::txn::proposal::PartitionId;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 
+/// The directory of the consensus log's tree under the endpoint `dir`.
+fn raft_tree(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(coordinode_storage::engine::scope::store_tree(Partition::Raft).dir())
+}
+
 fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -1822,7 +1827,7 @@ async fn member_whose_raft_tree_was_lost(dir: &std::path::Path, vote: Vote) -> S
         let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
         log.save_vote(&vote).await.expect("save vote");
     }
-    std::fs::remove_dir_all(dir.join(Partition::Raft.name())).expect("lose the Raft tree");
+    std::fs::remove_dir_all(raft_tree(dir)).expect("lose the Raft tree");
     config
 }
 
@@ -1899,7 +1904,7 @@ fn damage_the_copy(dir: &std::path::Path) {
 /// from its tables, and every table lost its second half, which that
 /// salvage cannot read.
 fn salvage_the_raft_tree_with_loss(dir: &std::path::Path) {
-    let tree = dir.join(Partition::Raft.name());
+    let tree = raft_tree(dir);
     for entry in std::fs::read_dir(&tree).expect("read the tree") {
         let path = entry.expect("entry").path();
         let name = path
@@ -1967,7 +1972,7 @@ async fn a_lossy_salvage_of_the_raft_tree_keeps_the_vote() {
 /// every record the journal no longer holds is gone with the tree, as after
 /// a fold and a purge.
 fn lose_the_tree_and_its_journal(dir: &std::path::Path) {
-    std::fs::remove_dir_all(dir.join(Partition::Raft.name())).expect("lose the tree");
+    std::fs::remove_dir_all(raft_tree(dir)).expect("lose the tree");
     std::fs::remove_dir_all(dir.join("local-journal")).expect("lose the local journal");
 }
 
@@ -2108,7 +2113,7 @@ async fn a_damaged_copy_is_restored_from_the_other() {
         assert_eq!(log.read_vote().await.expect("read"), Some(vote));
     }
     // The copy was rewritten: now the tree may go too.
-    std::fs::remove_dir_all(dir.path().join(Partition::Raft.name())).expect("lose the tree");
+    std::fs::remove_dir_all(raft_tree(dir.path())).expect("lose the tree");
     let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
     let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
     assert_eq!(log.read_vote().await.expect("read"), Some(vote));
@@ -2201,7 +2206,7 @@ async fn another_stores_copy_is_never_taken_for_the_promise() {
             .write_promise_copy(&[0xee; 16], &promises_of(Some(Vote::new(50, 9))))
             .expect("foreign copy again");
     }
-    std::fs::remove_dir_all(dir.path().join(Partition::Raft.name())).expect("lose the tree");
+    std::fs::remove_dir_all(raft_tree(dir.path())).expect("lose the tree");
     let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
     let err = LogStore::open(Arc::clone(&engine))
         .err()
@@ -2244,7 +2249,7 @@ async fn a_store_bound_before_incarnations_is_converted_or_refused() {
     // The same layout with the tree's record lost as well.
     std::fs::write(dir.path().join("consensus-log"), b"").expect("empty marker");
     lose_the_copy(dir.path());
-    std::fs::remove_dir_all(dir.path().join(Partition::Raft.name())).expect("lose the tree");
+    std::fs::remove_dir_all(raft_tree(dir.path())).expect("lose the tree");
     let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
     let err = LogStore::open(Arc::clone(&engine))
         .err()
@@ -2280,8 +2285,7 @@ async fn a_conversion_cut_short_before_the_marker_is_finished_by_the_next_open()
                 .expect("the conversion's copy");
         }
         if lose_the_tree {
-            std::fs::remove_dir_all(dir.path().join(Partition::Raft.name()))
-                .expect("lose the tree");
+            std::fs::remove_dir_all(raft_tree(dir.path())).expect("lose the tree");
         }
 
         let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));

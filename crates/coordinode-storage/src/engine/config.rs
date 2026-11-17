@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::cache::config::TieredCacheConfig;
 use crate::engine::merge::{CounterMerge, DocumentMerge, PostingListMerge};
 use crate::engine::partition::Partition;
+use crate::engine::scope::TreeId;
 
 // ── Storage endpoint types (storage stack Layer 1) ──────────────────────
 
@@ -1353,9 +1354,10 @@ impl std::fmt::Display for EndpointSelectionError {
 impl std::error::Error for EndpointSelectionError {}
 
 impl StorageConfig {
-    /// Build an lsm-tree `Config` for a specific partition.
+    /// Build an lsm-tree `Config` for one tree of the deployment.
     ///
-    /// Each partition opens its own `AnyTree` in `data_dir/<partition_name>/`.
+    /// Each tree opens its own `AnyTree` in the directory its set and
+    /// partition name under every endpoint ([`TreeId::dir`]).
     /// - Shared `seqno` generator (oracle or counter) for cross-tree MVCC ordering.
     /// - No compaction filter on any partition: MVCC retention is the merge
     ///   stream's own fold at the watermark each compaction is handed, and a
@@ -1367,10 +1369,10 @@ impl StorageConfig {
     /// - KV separation (BlobTree) for the `Blob` partition.
     pub(crate) fn to_tree_config(
         &self,
-        part: Partition,
+        tree: TreeId,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
     ) -> lsm_tree::Config {
-        self.to_tree_config_with_routing(part, seqno, None)
+        self.to_tree_config_with_routing(tree, seqno, None)
     }
 
     /// As [`Self::to_tree_config`] but with explicit per-LSM-level
@@ -1383,11 +1385,12 @@ impl StorageConfig {
     /// opened without persistence.
     pub(crate) fn to_tree_config_with_routing(
         &self,
-        part: Partition,
+        tree: TreeId,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         routing: Option<&crate::engine::routing::PartitionRouting>,
     ) -> lsm_tree::Config {
-        let mut config = self.base_tree_config(part, part.name(), seqno, routing);
+        let part = tree.part;
+        let mut config = self.base_tree_config(part, &tree.dir(), seqno, routing);
 
         // Merge operators, per partition:
         //
@@ -1440,20 +1443,25 @@ impl StorageConfig {
         }
     }
 
-    /// The tree config of `STORAGE COLUMNAR` table `table_id`, built as a
-    /// partition's: a table holds node rows kept apart, so it takes the node
-    /// partition's compression and per-level `routing` (its levels land on
-    /// the endpoints the node partition's do, under `tables/<table_id>`),
-    /// with the engine's sync mode, filesystem and page ECC.
+    /// The tree config of `STORAGE COLUMNAR` table `table_id` of namespace
+    /// `ns`, built as a partition's: a table holds node rows kept apart, so
+    /// it takes the node partition's compression and per-level `routing`
+    /// (its levels land on the endpoints the node partition's do, under the
+    /// namespace's `tables/<table_id>`), with the engine's sync mode,
+    /// filesystem and page ECC.
     #[cfg(feature = "columnar")]
     pub(crate) fn to_table_tree_config(
         &self,
+        ns: crate::engine::scope::NamespaceId,
         table_id: &str,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         routing: Option<&crate::engine::routing::PartitionRouting>,
     ) -> lsm_tree::Config {
-        let dir = std::path::Path::new(crate::columnar::TABLES_DIR).join(table_id);
-        self.base_tree_config(Partition::Node, &dir.to_string_lossy(), seqno, routing)
+        let dir = crate::engine::scope::Scope::Namespace(ns)
+            .dir()
+            .join(crate::columnar::TABLES_DIR)
+            .join(table_id);
+        self.base_tree_config(Partition::Node, &dir, seqno, routing)
             .prefix_extractor(Arc::new(ColonSeparatedPrefix))
     }
 
@@ -1463,7 +1471,7 @@ impl StorageConfig {
     fn base_tree_config(
         &self,
         part: Partition,
-        dir: &str,
+        dir: &Path,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         routing: Option<&crate::engine::routing::PartitionRouting>,
     ) -> lsm_tree::Config {

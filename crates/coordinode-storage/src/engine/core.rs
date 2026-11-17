@@ -31,6 +31,9 @@ use crate::engine::oplog_journal::{
 use crate::engine::partition::Partition;
 use crate::engine::rebuild::{self, Rebuild, RebuildRefusal};
 use crate::engine::routing::PartitionRouting;
+use crate::engine::scope::store_tree;
+#[cfg(feature = "columnar")]
+use crate::engine::scope::{STORE_NAMESPACE, Scope};
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp};
 
@@ -985,7 +988,7 @@ impl StorageEngine {
 
         // Pass 1: Schema partition (single-tier, no routing).
         let schema_config = config
-            .to_tree_config(Partition::Schema, Arc::clone(&seqno))
+            .to_tree_config(store_tree(Partition::Schema), Arc::clone(&seqno))
             .use_cache(Arc::clone(&cache))
             .write_buffer_budget(Arc::clone(&write_buffer))
             .compaction_rate_limiter(Arc::clone(&maintenance))
@@ -1091,7 +1094,7 @@ impl StorageEngine {
                 flush_landing.insert(part, endpoint.path.clone());
             }
             let tree_config = config
-                .to_tree_config_with_routing(part, Arc::clone(&seqno), Some(&routing))
+                .to_tree_config_with_routing(store_tree(part), Arc::clone(&seqno), Some(&routing))
                 .use_cache(Arc::clone(&cache))
                 .write_buffer_budget(Arc::clone(&write_buffer))
                 .compaction_rate_limiter(Arc::clone(&maintenance))
@@ -1526,7 +1529,12 @@ impl StorageEngine {
                 let config = config.clone();
                 let seqno = Arc::clone(&seqno);
                 move |table_id: &str| {
-                    config.to_table_tree_config(table_id, Arc::clone(&seqno), node_routing.as_ref())
+                    config.to_table_tree_config(
+                        STORE_NAMESPACE,
+                        table_id,
+                        Arc::clone(&seqno),
+                        node_routing.as_ref(),
+                    )
                 }
             };
             let (registry, repairs) = crate::columnar::ColumnarTableRegistry::open(
@@ -1536,7 +1544,12 @@ impl StorageEngine {
                     roots: config
                         .endpoints
                         .iter()
-                        .map(|endpoint| endpoint.path.join(crate::columnar::TABLES_DIR))
+                        .map(|endpoint| {
+                            endpoint
+                                .path
+                                .join(Scope::Namespace(STORE_NAMESPACE).dir())
+                                .join(crate::columnar::TABLES_DIR)
+                        })
                         .collect(),
                     cache: Arc::clone(&cache),
                     maintenance: Arc::clone(&maintenance),

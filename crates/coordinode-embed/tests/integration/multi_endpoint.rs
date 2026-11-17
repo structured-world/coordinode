@@ -109,8 +109,9 @@ fn multi_endpoint_opens_data_pinned_to_first() {
     // (bootstrap rule — Schema holds the routing metadata itself, so
     // it cannot have multi-tier placement of its own).
     for part in Partition::all() {
-        let first_partition_dir = nvme.path().join(part.name());
-        let second_partition_dir = hdd.path().join(part.name());
+        let tree = coordinode_storage::engine::scope::store_tree(*part).dir();
+        let first_partition_dir = nvme.path().join(&tree);
+        let second_partition_dir = hdd.path().join(&tree);
         if *part == Partition::Raft {
             // Raft partition does not get its own dir in the LSM stack
             // (handled by the Raft snapshot pipeline separately).
@@ -274,15 +275,21 @@ fn unrelated_directory_untouched_by_engine() {
     // Sentinel survives intact.
     let content = std::fs::read(&sentinel).expect("sentinel still readable");
     assert_eq!(&content[..], b"do-not-touch");
-    // Used directory has partition subdirs.
+    // Used directory has the partition's tree.
+    let node = coordinode_storage::engine::scope::store_tree(Partition::Node).dir();
     assert!(
-        used.path().join(Partition::Node.name()).exists(),
+        used.path().join(&node).exists(),
         "engine populated the used endpoint"
     );
-    // Unused has nothing engine-created.
-    let unused_node = unused.path().join(Partition::Node.name());
-    assert!(
-        !unused_node.exists(),
-        "engine did not touch endpoint not in config"
-    );
+    // Unused has nothing engine-created, under the new layout or the old.
+    for created in [
+        node.as_path(),
+        std::path::Path::new("ns"),
+        std::path::Path::new("system"),
+    ] {
+        assert!(
+            !unused.path().join(created).exists(),
+            "engine did not touch endpoint not in config"
+        );
+    }
 }

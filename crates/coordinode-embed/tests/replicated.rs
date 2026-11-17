@@ -28,6 +28,7 @@ use coordinode_raft::cluster::nemesis;
 use coordinode_raft::read_fence::ReadPreference;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::scope::store_tree;
 use coordinode_test_fixtures::alloc_port;
 
 /// The CA the members of these tests are issued their identities by.
@@ -694,7 +695,7 @@ async fn a_member_without_its_vote_is_refused_and_replaced_through_the_handle() 
         let lost = members.remove(2);
         lost.shutdown().await.unwrap();
         let dir = dirs[2].path();
-        std::fs::remove_dir_all(dir.join(Partition::Raft.name())).unwrap();
+        std::fs::remove_dir_all(dir.join(store_tree(Partition::Raft).dir())).unwrap();
         std::fs::remove_dir_all(dir.join("local-journal")).unwrap();
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -829,7 +830,7 @@ async fn an_operation_keeps_its_outcome_across_a_replacement() {
         let lost = members.remove(2);
         lost.shutdown().await.unwrap();
         let dir = dirs[2].path();
-        std::fs::remove_dir_all(dir.join(Partition::Raft.name())).unwrap();
+        std::fs::remove_dir_all(dir.join(store_tree(Partition::Raft).dir())).unwrap();
         std::fs::remove_dir_all(dir.join("local-journal")).unwrap();
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();

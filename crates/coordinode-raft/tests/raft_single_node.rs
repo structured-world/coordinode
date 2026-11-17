@@ -828,7 +828,10 @@ async fn a_sole_voter_recovers_from_one_copy_and_refuses_with_none() {
             .expect("propose");
     };
     let lose_tree = || {
-        std::fs::remove_dir_all(path.join(Partition::Raft.name())).expect("lose the tree");
+        std::fs::remove_dir_all(
+            path.join(coordinode_storage::engine::scope::store_tree(Partition::Raft).dir()),
+        )
+        .expect("lose the tree");
         std::fs::remove_dir_all(path.join("local-journal")).expect("lose the journal");
     };
     {

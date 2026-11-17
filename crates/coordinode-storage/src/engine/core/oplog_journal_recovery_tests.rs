@@ -1233,7 +1233,9 @@ fn a_lost_tree_is_rebuilt_from_a_complete_journal() {
     commit_at(&engine, &oracle, &two_tree_commit("a", 1), Journal::Journal);
     engine.persist().expect("persist");
     commit_at(&engine, &oracle, &two_tree_commit("b", 2), Journal::Journal);
-    let adj = rig.config().endpoints[0].path.join(Partition::Adj.name());
+    let adj = rig.config().endpoints[0]
+        .path
+        .join(crate::engine::scope::store_tree(Partition::Adj).dir());
     rig.cut(engine);
     std::fs::remove_dir_all(&adj).expect("remove the adjacency tree");
     let (engine, _) = rig.open();
@@ -1305,7 +1307,9 @@ fn a_lost_tree_behind_a_purged_journal_is_refused() {
         .oplog_purge_expired(4_000_000_000, u64::MAX)
         .expect("purge");
     assert!(purged > 0, "the journal kept every segment");
-    let adj = config.endpoints[0].path.join(Partition::Adj.name());
+    let adj = config.endpoints[0]
+        .path
+        .join(crate::engine::scope::store_tree(Partition::Adj).dir());
     rig.cut(engine);
     std::fs::remove_dir_all(&adj).expect("remove the adjacency tree");
     let oracle = Arc::new(TimestampOracle::new());

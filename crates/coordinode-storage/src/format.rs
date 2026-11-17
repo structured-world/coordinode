@@ -225,7 +225,47 @@ fn prepare_held(
             }
         }
     }
-    prepare_primary(config)
+    // The format first: a store of another format is refused for that,
+    // whatever its layout. One of this format whose trees lie outside the
+    // sets is refused before the engine opens anything in it.
+    let format = prepare_primary(config)?;
+    for &dir in dirs {
+        refuse_flat_layout(dir)?;
+    }
+    Ok(format)
+}
+
+/// Refuse `dir` when it keeps a tree at its top level: a partition's tree
+/// or the directory of the columnar tables, which a store keeps under the
+/// system set and its namespaces' sets. Only a store written before trees
+/// had sets lays them out there, and nothing is changed in it.
+///
+/// # Errors
+///
+/// [`StorageError::UnsupportedLayout`] naming the first such tree; a
+/// directory that cannot be listed.
+fn refuse_flat_layout(dir: &Path) -> StorageResult<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_at("list", dir, e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| io_at("list", dir, e))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let is_tree = name == crate::columnar::TABLES_DIR
+            || crate::engine::partition::Partition::all()
+                .iter()
+                .any(|part| part.name() == name);
+        if is_tree && entry.path().is_dir() {
+            return Err(StorageError::UnsupportedLayout {
+                path: dir.display().to_string(),
+                tree: name.to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// [`prepare`] for the open a restore makes of the directories `claim`

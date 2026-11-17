@@ -33,6 +33,7 @@ pub mod promise;
 pub mod rebuild;
 pub mod retention_stats;
 pub mod routing;
+pub mod scope;
 pub mod space;
 pub mod stats;
 pub mod store_transfer;

@@ -142,11 +142,12 @@ impl PartitionRouting {
     /// omitted from the LevelRoute list — they implicitly fall through
     /// to `Config.path`. Consecutive levels mapped to the same non-primary
     /// endpoint are coalesced into one route (lsm-tree requires
-    /// non-overlapping ranges).
+    /// non-overlapping ranges). Each route lands the tree's levels at
+    /// `tree_dir` under the endpoint it names.
     pub fn to_level_routes(
         &self,
         endpoints: &[EndpointConfig],
-        partition_name: &str,
+        tree_dir: &std::path::Path,
         primary_endpoint_id: &str,
         fs: Arc<dyn Fs>,
     ) -> Vec<LevelRoute> {
@@ -167,7 +168,7 @@ impl PartitionRouting {
             if let Some(path) = id_to_path.get(id) {
                 routes.push(LevelRoute {
                     levels: start..end_exclusive,
-                    path: path.join(partition_name),
+                    path: path.join(tree_dir),
                     fs: Arc::clone(fs),
                 });
             }

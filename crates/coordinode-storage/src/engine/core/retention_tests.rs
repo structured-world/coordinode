@@ -828,15 +828,20 @@ fn files_in(dir: &std::path::Path) -> u64 {
         .sum()
 }
 
+/// The directory of `part`'s tree under an endpoint root.
+fn tree_dir(part: Partition) -> std::path::PathBuf {
+    crate::engine::scope::store_tree(part).dir()
+}
+
 /// Physical bytes of a partition across every endpoint root it may have
-/// been routed to: `<root>/<partition>/tables` on each plus `blobs` on the
+/// been routed to: `<root>/<tree>/tables` on each plus `blobs` on the
 /// primary.
 fn partition_bytes(roots: &[&std::path::Path], part: Partition) -> u64 {
     let mut total = 0;
     for root in roots {
-        total += files_in(&root.join(part.name()).join("tables"));
+        total += files_in(&root.join(tree_dir(part)).join("tables"));
     }
-    total + files_in(&roots[0].join(part.name()).join("blobs"))
+    total + files_in(&roots[0].join(tree_dir(part)).join("blobs"))
 }
 
 /// With per-level routing the partition's tables live under several
@@ -884,7 +889,7 @@ fn retained_history_spans_level_routed_endpoints() {
         .major_compact(Partition::Node)
         .expect("major compact");
 
-    let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
+    let cold_tables = cold.path().join(tree_dir(Partition::Node)).join("tables");
     assert!(
         files_in(&cold_tables) > 0,
         "precondition: the bottom level landed on the cold endpoint"
@@ -938,7 +943,7 @@ fn retained_history_of_a_blob_partition_counts_blob_files() {
     }
     engine.persist().expect("persist");
 
-    let blobs = dir.path().join(Partition::Blob.name()).join("blobs");
+    let blobs = dir.path().join(tree_dir(Partition::Blob)).join("blobs");
     assert!(
         files_in(&blobs) > 0,
         "precondition: blob files were written"
@@ -957,7 +962,7 @@ fn retained_history_of_a_blob_partition_counts_blob_files() {
         partition_bytes(&[dir.path()], Partition::Blob)
     );
     assert!(
-        history.live_bytes > files_in(&dir.path().join(Partition::Blob.name()).join("tables")),
+        history.live_bytes > files_in(&dir.path().join(tree_dir(Partition::Blob)).join("tables")),
         "the live figure includes the blob files, not the index tables alone"
     );
 }
@@ -1033,8 +1038,11 @@ fn retained_history_reports_an_unreadable_tables_folder() {
         .expect("put");
     flush(&engine);
 
-    let tables = dir.path().join(Partition::Node.name()).join("tables");
-    let aside = dir.path().join(Partition::Node.name()).join("tables.aside");
+    let tables = dir.path().join(tree_dir(Partition::Node)).join("tables");
+    let aside = dir
+        .path()
+        .join(tree_dir(Partition::Node))
+        .join("tables.aside");
     std::fs::rename(&tables, &aside).expect("move the folder aside");
     let _restore = Restore {
         tables: tables.clone(),

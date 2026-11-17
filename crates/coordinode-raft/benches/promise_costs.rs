@@ -598,7 +598,10 @@ impl Loss {
     fn inflict(self, dir: &std::path::Path) -> bool {
         let slots = copy_slot_paths(dir);
         let lose_tree = || {
-            std::fs::remove_dir_all(dir.join(Partition::Raft.name())).expect("lose the Raft tree");
+            std::fs::remove_dir_all(
+                dir.join(coordinode_storage::engine::scope::store_tree(Partition::Raft).dir()),
+            )
+            .expect("lose the Raft tree");
             let journal = dir.join("local-journal");
             if journal.exists() {
                 std::fs::remove_dir_all(journal).expect("lose the member-local journal");

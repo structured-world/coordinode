@@ -180,6 +180,20 @@ pub enum StorageError {
         runs: u32,
     },
 
+    /// The data directory keeps a tree outside the system set and the
+    /// namespace sets: it was written before trees had sets, a layout this
+    /// release does not open. Opening it changes nothing.
+    #[error(
+        "data directory {path} keeps the tree {tree} at its top level; this release opens only \
+         stores whose trees lie in the system set and the namespace sets"
+    )]
+    UnsupportedLayout {
+        /// The endpoint directory refused.
+        path: String,
+        /// The tree directory found at its top level.
+        tree: String,
+    },
+
     /// A restore into the data directory began and has not finished: the
     /// image there may be partial, so nothing opens it but the restore of
     /// the same image, run again. Opening it changes nothing.

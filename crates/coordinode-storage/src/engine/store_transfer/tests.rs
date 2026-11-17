@@ -210,25 +210,50 @@ fn a_damaged_stream_is_refused_and_leaves_nothing() {
 /// only: one that names another place is refused.
 #[test]
 fn a_table_name_cannot_leave_the_received_directory() {
-    for name in [
-        "tables/",
-        "tables/..",
-        "tables/.",
-        "tables/a/b",
-        "tables/a\\b",
-    ] {
+    let ns = "ns/0000000000000001/";
+    for id in ["", "..", ".", "a/b", "a\\b"] {
+        let name = format!("{ns}tables/{id}");
+        assert!(TreeName::decode(&name).is_err(), "{name}");
+    }
+    // A table named without its namespace, as before tables had one, or
+    // under a name that is no namespace's, is refused too.
+    for name in ["tables/t1", "ns/1/tables/t1", "ns//tables/t1"] {
         assert!(TreeName::decode(name).is_err(), "{name}");
     }
     assert!(
-        TreeName::decode("raft").is_err(),
+        TreeName::decode("system/raft").is_err(),
         "the Raft partition never travels"
     );
+    let table = TreeName::Table(NamespaceId::from_raw(1), "t1".into());
+    assert_eq!(table.encode(), format!("{ns}tables/t1"));
+    assert_eq!(TreeName::decode(&table.encode()).expect("table"), table);
+    let node = crate::engine::scope::store_tree(Partition::Node);
     assert_eq!(
-        TreeName::decode("tables/t1").expect("table"),
-        TreeName::Table("t1".into())
+        TreeName::decode(&node.name()).expect("partition"),
+        TreeName::Partition(node)
     );
-    assert_eq!(
-        TreeName::decode("node").expect("partition"),
-        TreeName::Partition(Partition::Node)
+}
+
+/// A stream naming its partitions without their set, as a copy made before
+/// trees had sets did, is refused at its first tree: nothing of it is
+/// written and the directory it was received into is removed.
+#[test]
+fn a_stream_naming_bare_partitions_is_refused_before_anything_lands() {
+    for name in ["node", "schema", "registry"] {
+        assert!(TreeName::decode(name).is_err(), "{name}");
+    }
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&MAGIC);
+    stream.push(VERSION);
+    stream.extend_from_slice(&1u32.to_le_bytes());
+    stream.extend_from_slice(&4u16.to_le_bytes());
+    stream.extend_from_slice(b"node");
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("received");
+    let err = receive_store(&mut stream.as_slice(), &dir).expect_err("a bare partition name");
+    assert!(
+        matches!(&err, StorageError::Serialization(m) if m.contains("tree name")),
+        "{err}"
     );
+    assert!(!dir.exists(), "nothing of the stream is left");
 }

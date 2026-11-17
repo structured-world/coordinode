@@ -145,7 +145,7 @@ impl Partition {
     /// registry, this node's consensus state) rather than data. Its records
     /// are read only as they stand now, so the time-travel window keeps no
     /// history of them: compaction holds back only for live snapshot pins.
-    pub fn is_system(self) -> bool {
+    pub const fn is_system(self) -> bool {
         matches!(self, Self::Registry | Self::Raft)
     }
 

@@ -828,7 +828,10 @@ fn configured_codecs_are_written_into_the_tables() {
 
     let codecs_of = |part: Partition| -> Vec<lsm_tree::CompressionType> {
         let mut found = Vec::new();
-        let mut dirs = vec![dir.path().join(part.name())];
+        let mut dirs = vec![
+            dir.path()
+                .join(crate::engine::scope::store_tree(part).dir()),
+        ];
         while let Some(at) = dirs.pop() {
             for entry in std::fs::read_dir(&at).expect("read dir").flatten() {
                 let path = entry.path();
@@ -984,7 +987,9 @@ fn a_torn_manifest_tail_opens_without_a_repair() {
         Durability::Durable,
         Tier::Warm,
     )]);
-    let tree_dir = dir.path().join(Partition::Node.name());
+    let tree_dir = dir
+        .path()
+        .join(crate::engine::scope::store_tree(Partition::Node).dir());
     // The edit logs of the tree with their sizes.
     let logs = || -> Vec<(std::path::PathBuf, u64)> {
         std::fs::read_dir(&tree_dir)
@@ -1081,7 +1086,10 @@ fn open_repairs_partition_with_lost_manifest() {
     }
 
     // Manifest loss: tables present, every snapshot and edit log gone.
-    lose_manifest(&dir.path().join(Partition::Node.name()));
+    lose_manifest(
+        &dir.path()
+            .join(crate::engine::scope::store_tree(Partition::Node).dir()),
+    );
 
     // Reopen: the engine must come up (repairing the Node tree), the data
     // must still be readable, and the repair must be reported.
@@ -1150,7 +1158,10 @@ fn open_repairs_partition_with_more_than_255_tables() {
         }
     }
 
-    lose_manifest(&dir.path().join(Partition::Node.name()));
+    lose_manifest(
+        &dir.path()
+            .join(crate::engine::scope::store_tree(Partition::Node).dir()),
+    );
 
     {
         let engine = StorageEngine::open(&config).expect("open after manifest loss");

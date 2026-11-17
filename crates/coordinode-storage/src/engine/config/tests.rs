@@ -12,9 +12,10 @@ fn the_default_recovery_reserve_is_a_sixteenth_of_the_limit() {
     assert_eq!(endpoint.recovery_reserve(), 512 << 10);
 }
 
-/// A columnar table's tree lands its levels where the node partition's land,
-/// under `tables/<id>` on each endpoint instead of `node`, with its manifest
-/// on the primary endpoint and a prefix extractor for its node keys.
+/// A columnar table's tree lands its levels where its namespace's node
+/// partition's land, under the namespace's `tables/<id>` on each endpoint
+/// instead of `node`, with its manifest on the primary endpoint and a prefix
+/// extractor for its node keys.
 #[cfg(feature = "columnar")]
 #[test]
 fn a_table_tree_lands_its_levels_where_the_node_partition_does() {
@@ -38,8 +39,13 @@ fn a_table_tree_lands_its_levels_where_the_node_partition_does() {
         })
     };
 
-    let table = config.to_table_tree_config("trades", Arc::clone(&seqno), Some(&routing));
-    let node = config.to_tree_config_with_routing(Partition::Node, seqno, Some(&routing));
+    let ns = crate::engine::scope::NamespaceId::from_raw(4);
+    let table = config.to_table_tree_config(ns, "trades", Arc::clone(&seqno), Some(&routing));
+    let node = config.to_tree_config_with_routing(
+        crate::engine::scope::TreeId::namespace(ns, Partition::Node),
+        seqno,
+        Some(&routing),
+    );
     // Compared absolute: the tree config makes its own path absolute, which
     // on Windows gives `/hot` the current drive.
     let absolute = |path: &PathBuf| std::path::absolute(path).expect("absolute path");
@@ -47,8 +53,7 @@ fn a_table_tree_lands_its_levels_where_the_node_partition_does() {
         absolute(
             &config.endpoints[endpoint]
                 .path
-                .join("tables")
-                .join("trades"),
+                .join("ns/0000000000000004/tables/trades"),
         )
     };
     assert_eq!(absolute(&table.path), under(0));
@@ -160,16 +165,28 @@ fn storage_config_defaults() {
     assert!(config.partition_compression.is_none());
 }
 
+/// Every tree of either set gets a config rooted at its own directory under
+/// the primary endpoint: the system set's under `system`, a namespace's
+/// under its directory in `ns`.
 #[test]
-fn to_tree_config_builds_for_each_partition() {
+fn to_tree_config_roots_each_tree_in_its_sets_directory() {
+    use crate::engine::scope::{NamespaceId, Scope, TreeId};
     use std::sync::Arc;
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![default_disk_endpoint(dir.path())]);
     let seqno: lsm_tree::SharedSequenceNumberGenerator =
         Arc::new(lsm_tree::SequenceNumberCounter::default());
-    for &part in Partition::all() {
-        let tree_config = config.to_tree_config(part, Arc::clone(&seqno));
-        let _ = tree_config;
+    let absolute = |path: &std::path::Path| std::path::absolute(path).expect("absolute path");
+    for scope in [Scope::System, Scope::Namespace(NamespaceId::from_raw(3))] {
+        for part in scope.partitions() {
+            let tree = TreeId { scope, part };
+            let tree_config = config.to_tree_config(tree, Arc::clone(&seqno));
+            assert_eq!(
+                absolute(&tree_config.path),
+                absolute(&dir.path().join(tree.dir())),
+                "{tree}"
+            );
+        }
     }
 }
 
@@ -184,7 +201,7 @@ fn the_vector_locality_depth_reaches_only_the_truth_tier() {
         Arc::new(lsm_tree::SequenceNumberCounter::default());
     let relocation = |config: &StorageConfig, part: Partition| {
         config
-            .to_tree_config(part, Arc::clone(&seqno))
+            .to_tree_config(crate::engine::scope::store_tree(part), Arc::clone(&seqno))
             .kv_separation_opts
             .expect("a separated tree")
             .locality_relocation
@@ -850,7 +867,10 @@ fn to_tree_config_uses_first_endpoint_path() {
         Arc::new(lsm_tree::SequenceNumberCounter::default());
     // Without explicit per-level routing every partition uses the
     // first endpoint. This test pins the single-tier fallback path.
-    let _ = config.to_tree_config(Partition::Node, Arc::clone(&seqno));
+    let _ = config.to_tree_config(
+        crate::engine::scope::store_tree(Partition::Node),
+        Arc::clone(&seqno),
+    );
     // Verify the first endpoint's path is the one we picked.
     assert!(dir1.path().exists(), "first endpoint dir is the active one");
 }

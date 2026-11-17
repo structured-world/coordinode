@@ -112,13 +112,21 @@ fn to_level_routes_groups_consecutive_levels() {
         ep("cold", Tier::Cold, Media::Hdd, Durability::Durable),
     ];
     let routing = PartitionRouting::default_for_endpoints(&endpoints);
-    // Primary = hot → L0-L1 omitted (implicit), L2-L3 → warm, L4-L6 → cold.
-    let routes = routing.to_level_routes(&endpoints, "node", "hot", Arc::new(StdFs));
+    // Primary = hot → L0-L1 omitted (implicit), L2-L3 → warm, L4-L6 → cold,
+    // each at the tree's own directory under the endpoint.
+    let tree = std::path::Path::new("ns/0000000000000001/node");
+    let routes = routing.to_level_routes(&endpoints, tree, "hot", Arc::new(StdFs));
     assert_eq!(routes.len(), 2);
     assert_eq!(routes[0].levels, 2..4);
-    assert_eq!(routes[0].path, PathBuf::from("/warm/node"));
+    assert_eq!(
+        routes[0].path,
+        PathBuf::from("/warm/ns/0000000000000001/node")
+    );
     assert_eq!(routes[1].levels, 4..7);
-    assert_eq!(routes[1].path, PathBuf::from("/cold/node"));
+    assert_eq!(
+        routes[1].path,
+        PathBuf::from("/cold/ns/0000000000000001/node")
+    );
 }
 
 #[test]
@@ -130,10 +138,11 @@ fn to_level_routes_primary_excludes_self_routes() {
     ];
     let routing = PartitionRouting::default_for_endpoints(&endpoints);
     // Primary = cold → only L0-L3 (which map to hot per fallback chain) appear.
-    let routes = routing.to_level_routes(&endpoints, "node", "cold", Arc::new(StdFs));
+    let tree = std::path::Path::new("system/registry");
+    let routes = routing.to_level_routes(&endpoints, tree, "cold", Arc::new(StdFs));
     assert_eq!(routes.len(), 1);
     assert_eq!(routes[0].levels, 0..4, "L0-L1+L2-L3 both → hot, coalesced");
-    assert_eq!(routes[0].path, PathBuf::from("/hot/node"));
+    assert_eq!(routes[0].path, PathBuf::from("/hot/system/registry"));
 }
 
 #[test]
@@ -141,7 +150,8 @@ fn to_level_routes_single_endpoint_no_routes() {
     use lsm_tree::fs::StdFs;
     let endpoints = vec![ep("only", Tier::Warm, Media::Hdd, Durability::Durable)];
     let routing = PartitionRouting::default_for_endpoints(&endpoints);
-    let routes = routing.to_level_routes(&endpoints, "node", "only", Arc::new(StdFs));
+    let tree = std::path::Path::new("ns/0000000000000001/node");
+    let routes = routing.to_level_routes(&endpoints, tree, "only", Arc::new(StdFs));
     assert!(
         routes.is_empty(),
         "single-endpoint config: all levels at primary → no routes",

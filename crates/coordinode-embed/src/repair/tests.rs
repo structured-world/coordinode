@@ -12,6 +12,20 @@ use tempfile::TempDir;
 
 use super::*;
 
+/// The directory of `part`'s tree under the endpoint or checkpoint `root`.
+fn tree_dir(root: &Path, part: Partition) -> std::path::PathBuf {
+    root.join(coordinode_storage::engine::scope::store_tree(part).dir())
+}
+
+/// The directory of table `id`'s tree under the endpoint or checkpoint
+/// `root`: in its namespace's directory of tables.
+fn table_dir(root: &Path, id: &str) -> std::path::PathBuf {
+    use coordinode_storage::engine::scope::{STORE_NAMESPACE, Scope};
+    root.join(Scope::Namespace(STORE_NAMESPACE).dir())
+        .join("tables")
+        .join(id)
+}
+
 /// Remove every manifest snapshot (`v{id}`) and edit log (`edits-{id}`) of
 /// the tree at `tree_dir`, its tables left in place: the structural damage
 /// that makes the next open repair the tree.
@@ -188,7 +202,7 @@ fn the_corruption_fixture_hits_data_in_a_small_table() {
     let engine = open(&dir);
     put(&engine, 1, PartitionId::Node, b"node:0:0001", b"v");
     engine.persist().expect("persist");
-    let tables = dir.path().join(Partition::Node.name()).join("tables");
+    let tables = tree_dir(dir.path(), Partition::Node).join("tables");
     let version = engine
         .tree(Partition::Node)
         .expect("node tree")
@@ -419,7 +433,7 @@ fn repair_rebuilds_corrupt_partition_from_checkpoint_plus_oplog() {
     // Corrupt every post-checkpoint Node table (not the checkpoint-shared base),
     // so the scrub flags Node while the repair base A stays a clean source.
     let corrupted = corrupt_post_checkpoint_tables(
-        &dir.path().join(Partition::Node.name()).join("tables"),
+        &tree_dir(dir.path(), Partition::Node).join("tables"),
         &root,
     );
     assert!(
@@ -494,10 +508,8 @@ fn repair_rebuilds_a_partition_with_a_corrupt_blob_file() {
     }
     engine.persist().expect("persist tail");
 
-    let corrupted = corrupt_post_checkpoint_tables(
-        &dir.path().join(Partition::Blob.name()).join("blobs"),
-        &root,
-    );
+    let corrupted =
+        corrupt_post_checkpoint_tables(&tree_dir(dir.path(), Partition::Blob).join("blobs"), &root);
     assert!(
         corrupted > 0,
         "test must corrupt a post-checkpoint blob file"
@@ -550,7 +562,7 @@ fn database_open_auto_repairs_corrupt_partition() {
     // stays a clean source for the rebuild.
     let root = checkpoint_root(dir.path());
     let corrupted = corrupt_post_checkpoint_tables(
-        &dir.path().join(Partition::Node.name()).join("tables"),
+        &tree_dir(dir.path(), Partition::Node).join("tables"),
         &root,
     );
     assert!(
@@ -645,7 +657,7 @@ fn only_a_full_check_finds_damage_nothing_has_read() {
     // Damaged once the store is open, so the open read none of it.
     let engine = open(&dir);
     let corrupted = corrupt_post_checkpoint_tables(
-        &dir.path().join(Partition::Node.name()).join("tables"),
+        &tree_dir(dir.path(), Partition::Node).join("tables"),
         &root,
     );
     assert!(corrupted > 0, "a post-checkpoint Node table is damaged");
@@ -705,7 +717,7 @@ fn a_repaired_schema_keeps_operation_outcomes_and_fences() {
 
     let root = checkpoint_root(dir.path());
     let corrupted = corrupt_post_checkpoint_tables(
-        &dir.path().join(Partition::Schema.name()).join("tables"),
+        &tree_dir(dir.path(), Partition::Schema).join("tables"),
         &root,
     );
     assert!(
@@ -818,7 +830,7 @@ fn lossy_open_repair_forces_checkpoint_rebuild() {
     // Structural damage + content damage: the lost manifest makes the next
     // open run a repair, and the corrupt post-checkpoint tables force that
     // repair's salvage to drop blocks (a lossy replay scope).
-    let node_dir = dir.path().join(Partition::Node.name());
+    let node_dir = tree_dir(dir.path(), Partition::Node);
     let corrupted = corrupt_post_checkpoint_tables(&node_dir.join("tables"), &root);
     assert!(corrupted > 0, "test must corrupt a post-checkpoint table");
     lose_manifest(&node_dir);
@@ -906,7 +918,7 @@ fn a_lossy_table_repair_rebuilds_the_table_from_the_checkpoint() {
         engine.persist().expect("persist");
     }
 
-    let table_dir = dir.path().join("tables").join("trades");
+    let table_dir = table_dir(dir.path(), "trades");
     let corrupted = corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root);
     assert!(corrupted > 0, "test must corrupt a post-checkpoint table");
     lose_manifest(&table_dir);
@@ -1139,7 +1151,7 @@ fn a_lossy_table_repair_without_a_checkpoint_reports_not_clean() {
         }
         engine.persist().expect("persist");
     }
-    let table_dir = dir.path().join("tables").join("trades");
+    let table_dir = table_dir(dir.path(), "trades");
     assert!(corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root) > 0);
     lose_manifest(&table_dir);
 
@@ -1213,7 +1225,7 @@ fn a_table_rebuild_keeps_the_checkpoints_history() {
     assert_ne!(expected[1], expected[2]);
     assert_ne!(expected[2], expected[3]);
 
-    let table_dir = dir.path().join("tables").join("trades");
+    let table_dir = table_dir(dir.path(), "trades");
     assert!(corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root) > 0);
     lose_manifest(&table_dir);
 
@@ -1291,10 +1303,10 @@ fn a_table_rebuild_from_a_damaged_checkpoint_copy_is_refused() {
     // The checkpoint's copy loses its manifest over a damaged table, so it
     // opens only by salvage; the live tree is damaged the same way.
     let no_checkpoint = TempDir::new().expect("tempdir");
-    let copy_dir = checkpoint.join("tables").join("trades");
+    let copy_dir = table_dir(&checkpoint, "trades");
     assert!(corrupt_post_checkpoint_tables(&copy_dir.join("tables"), no_checkpoint.path()) > 0);
     lose_manifest(&copy_dir);
-    let table_dir = dir.path().join("tables").join("trades");
+    let table_dir = table_dir(dir.path(), "trades");
     corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root);
     lose_manifest(&table_dir);
 
@@ -1337,7 +1349,7 @@ fn a_table_missing_from_the_checkpoint_is_refused() {
         }
         engine.persist().expect("persist");
     }
-    let table_dir = dir.path().join("tables").join("late");
+    let table_dir = table_dir(dir.path(), "late");
     assert!(corrupt_post_checkpoint_tables(&table_dir.join("tables"), &root) > 0);
     lose_manifest(&table_dir);
 
@@ -1418,7 +1430,7 @@ fn a_table_rebuild_across_a_catalog_change_is_refused() {
     // The re-created tree numbers its tables from the start again, under the
     // names the checkpoint's copy has: every one of them is the new table's.
     let no_checkpoint = TempDir::new().expect("tempdir");
-    let table_dir = dir.path().join("tables").join("trades");
+    let table_dir = table_dir(dir.path(), "trades");
     assert!(corrupt_post_checkpoint_tables(&table_dir.join("tables"), no_checkpoint.path()) > 0);
     lose_manifest(&table_dir);
 
@@ -1714,7 +1726,7 @@ fn lossy_open_repair_without_checkpoint_reports_not_clean() {
 
     // No checkpoint exists; damage the tree structurally + corrupt its
     // tables so the open-time salvage is lossy.
-    let node_dir = dir.path().join(Partition::Node.name());
+    let node_dir = tree_dir(dir.path(), Partition::Node);
     let corrupted = corrupt_post_checkpoint_tables(&node_dir.join("tables"), &root);
     assert!(corrupted > 0, "test must corrupt a table");
     lose_manifest(&node_dir);
@@ -2380,7 +2392,7 @@ fn lossy_open_repair_losing_the_coverage_record_rebuilds_in_full() {
         engine.snapshot()
     };
 
-    let node_dir = dir.path().join(Partition::Node.name());
+    let node_dir = tree_dir(dir.path(), Partition::Node);
     let corrupted = corrupt_post_checkpoint_tables(&node_dir.join("tables"), &root);
     assert!(corrupted > 0, "test must corrupt a post-checkpoint table");
     lose_manifest(&node_dir);
@@ -2464,7 +2476,7 @@ fn unscopable_loss_falls_back_to_full_rebuild() {
 
     // Obliterate every post-checkpoint table wholesale: no readable
     // metadata, no coverage, an unknowable loss.
-    let node_dir = dir.path().join(Partition::Node.name());
+    let node_dir = tree_dir(dir.path(), Partition::Node);
     let tables_dir = node_dir.join("tables");
     let ckpt = latest_checkpoint(&root)
         .expect("list")

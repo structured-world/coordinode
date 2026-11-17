@@ -374,12 +374,13 @@ fn open_source(
 ) -> StorageResult<AnyTree> {
     // A copy an earlier open left behind is of no use.
     remove_staging(staging, footprints)?;
-    let tree_dir = Partition::Schema.name();
+    let tree = crate::engine::scope::store_tree(Partition::Schema);
+    let tree_dir = tree.dir();
     // Charged file by file before it is written; a copy cut short by the
     // limit or a failure is removed with what it charged.
     if let Err(e) = copy_dir(
-        &checkpoint.join(tree_dir),
-        &staging.join(tree_dir),
+        &checkpoint.join(&tree_dir),
+        &staging.join(&tree_dir),
         footprints,
     ) {
         remove_staging(staging, footprints)?;
@@ -396,7 +397,7 @@ fn open_source(
     let seqno =
         lsm_tree::SharedSequenceNumberGenerator::from(lsm_tree::SequenceNumberCounter::default());
     let (source, repair) = config
-        .to_tree_config(Partition::Schema, seqno)
+        .to_tree_config(tree, seqno)
         .open_or_repair(repair_policy)?;
     if repair.is_some_and(|report| {
         !matches!(

@@ -147,7 +147,11 @@ fn scrub_reports_disk_corruption_without_aborting() {
     // Flip bytes across the largest table of the Node partition, simulating
     // silent bit rot. Several offsets, so one lands in a data block whatever
     // the table's layout puts around it.
-    let victim = largest_file(&dir.path().join(Partition::Node.name()).join("tables"));
+    let victim = largest_file(
+        &dir.path()
+            .join(crate::engine::scope::store_tree(Partition::Node).dir())
+            .join("tables"),
+    );
     let mut bytes = std::fs::read(&victim).expect("read sst");
     let n = bytes.len();
     for at in [n / 8, n / 4, n / 2] {
@@ -182,7 +186,11 @@ fn scrub_reports_a_corrupt_blob_file() {
     engine.persist().expect("persist");
 
     // The values went to the partition's blob files, not its tables.
-    let victim = largest_file(&dir.path().join(Partition::Blob.name()).join("blobs"));
+    let victim = largest_file(
+        &dir.path()
+            .join(crate::engine::scope::store_tree(Partition::Blob).dir())
+            .join("blobs"),
+    );
     let mut bytes = std::fs::read(&victim).expect("read blob file");
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;

@@ -581,7 +581,12 @@ async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
     local.persist().expect("persist");
     // The largest table of the Node partition, several offsets flipped so
     // one lands in a data block whatever the table's layout puts around it.
-    let victim = largest_file(&local_dir.path().join(Partition::Node.name()).join("tables"));
+    let victim = largest_file(
+        &local_dir
+            .path()
+            .join(coordinode_storage::engine::scope::store_tree(Partition::Node).dir())
+            .join("tables"),
+    );
     let mut bytes = std::fs::read(&victim).expect("read sst");
     let n = bytes.len();
     for at in [n / 8, n / 4, n / 2] {
