@@ -1656,9 +1656,11 @@ fn a_crash_inside_a_member_local_compaction_keeps_every_record() {
             .local_journal
             .as_ref()
             .expect("a member-local journal")
-            .compact(engine.coordinator.trees(), engine.next_seqno(), |tree| {
-                engine.flush_memtables(tree)
-            })
+            .compact(
+                &engine.coordinator.partition_trees(),
+                engine.next_seqno(),
+                |tree| engine.flush_memtables(tree),
+            )
             .expect("compact");
         assert!(
             saved.iter().all(|(path, _)| !path.exists()),

@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use super::*;
 
-fn make_test_trees() -> (HashMap<Partition, lsm_tree::AnyTree>, tempfile::TempDir) {
+/// A system set with no tree and one namespace set holding a node tree, which
+/// is returned too.
+fn make_test_trees() -> (Arc<OpenSets>, lsm_tree::AnyTree, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let seqno: lsm_tree::SharedSequenceNumberGenerator =
         Arc::new(lsm_tree::SequenceNumberCounter::default());
-    let mut trees = HashMap::new();
     let tree = lsm_tree::Config::new_with_generators(
         dir.path().join("node"),
         Arc::clone(&seqno),
@@ -16,17 +17,24 @@ fn make_test_trees() -> (HashMap<Partition, lsm_tree::AnyTree>, tempfile::TempDi
     )
     .open()
     .expect("open tree");
-    trees.insert(Partition::Node, tree);
-    (trees, dir)
+    let mut set = crate::engine::open_sets::SetTrees::new(crate::engine::scope::Scope::Namespace(
+        crate::engine::scope::NamespaceId::from_raw(1),
+    ));
+    set.insert(Partition::Node, tree.clone());
+    let sets = OpenSets::new(
+        crate::engine::open_sets::SetTrees::new(crate::engine::scope::Scope::System),
+        [Arc::new(set)],
+    );
+    (Arc::new(sets), tree, dir)
 }
 
 #[test]
 fn compaction_scheduler_starts_and_stops() {
-    let (trees, _dir) = make_test_trees();
+    let (trees, _tree, _dir) = make_test_trees();
     let gc_watermark = Arc::new(AtomicU64::new(0));
 
     let sched = CompactionScheduler::start(
-        &trees,
+        trees,
         GcWatermarks::uniform(&gc_watermark),
         1,                       // 1 worker
         8,                       // l0_urgent_threshold
@@ -151,8 +159,7 @@ fn a_compaction_that_did_work_is_counted_for_its_partition() {
         }
     }
 
-    let (trees, _dir) = make_test_trees();
-    let tree = trees.get(&Partition::Node).expect("node tree").clone();
+    let (_trees, tree, _dir) = make_test_trees();
     let seqno = lsm_tree::SequenceNumberCounter::default();
     // Overlapping L0 tables, enough for the leveled strategy to merge them.
     for round in 0_u64..8 {
@@ -175,7 +182,10 @@ fn a_compaction_that_did_work_is_counted_for_its_partition() {
         sender
             .send(CompactionRequest {
                 tree: TreeRef::Partition(tree.clone()),
-                source: CompactionSource::Partition(Partition::Node),
+                source: CompactionSource::Partition(crate::engine::scope::TreeId::namespace(
+                    crate::engine::scope::NamespaceId::from_raw(1),
+                    Partition::Node,
+                )),
                 strategy: CompactionStrategyKind::Leveled.for_tree(),
                 priority: CompactionPriority::Urgent,
                 gc_watermark: seqno.get(),
@@ -222,12 +232,11 @@ fn compaction_priority_ordering() {
 
 #[test]
 fn compaction_scheduler_no_panic_with_l0_data() {
-    let (trees, _dir) = make_test_trees();
+    let (trees, tree, _dir) = make_test_trees();
     let gc_watermark = Arc::new(AtomicU64::new(0));
 
     let seqno: lsm_tree::SharedSequenceNumberGenerator =
         Arc::new(lsm_tree::SequenceNumberCounter::default());
-    let tree = trees.get(&Partition::Node).expect("node tree").clone();
 
     // Write + flush to produce an L0 SST file.
     for i in 0_u64..20 {
@@ -242,7 +251,7 @@ fn compaction_scheduler_no_panic_with_l0_data() {
     let _ = tree.flush(&lock, 0);
 
     let sched = CompactionScheduler::start(
-        &trees,
+        trees,
         GcWatermarks::uniform(&gc_watermark),
         1,
         8,
@@ -264,8 +273,7 @@ fn compaction_scheduler_no_panic_with_l0_data() {
 /// 500 tables, the guard it shares with the leveled strategy.
 #[test]
 fn the_planned_strategy_compacts_a_tree() {
-    let (trees, _dir) = make_test_trees();
-    let tree = trees.get(&Partition::Node).expect("node tree").clone();
+    let (trees, tree, _dir) = make_test_trees();
     let seqno = lsm_tree::SequenceNumberCounter::default();
     for round in 0_u64..510 {
         tree.insert(b"key", round.to_le_bytes(), seqno.next());
@@ -276,7 +284,7 @@ fn the_planned_strategy_compacts_a_tree() {
     let runs = tree.l0_run_count();
     let gc_watermark = Arc::new(AtomicU64::new(0));
     let sched = CompactionScheduler::start(
-        &trees,
+        trees,
         GcWatermarks::uniform(&gc_watermark),
         1,
         8,
@@ -342,7 +350,7 @@ fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
         }
     }
 
-    let (trees, dir) = make_test_trees();
+    let (trees, _tree, dir) = make_test_trees();
     let seqno: lsm_tree::SharedSequenceNumberGenerator =
         Arc::new(lsm_tree::SequenceNumberCounter::default());
     let table_metrics = Arc::new(crate::engine::owned_metrics::TableMetrics::default());
@@ -405,15 +413,6 @@ fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
     let wake = Arc::new(Wake::default());
     let monitor = {
         let recorder = Capture(Arc::clone(&gauges));
-        let monitored = trees
-            .iter()
-            .map(|(&p, t)| MonitoredTree {
-                tree: TreeRef::Partition(t.clone()),
-                source: CompactionSource::Partition(p),
-                strategy: CompactionStrategyKind::Leveled.for_tree(),
-                table: None,
-            })
-            .collect();
         let cfg = MonitorConfig {
             sender,
             gc_watermarks: GcWatermarks::uniform(&Arc::new(AtomicU64::new(0))),
@@ -426,9 +425,7 @@ fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
         };
         let wake = Arc::clone(&wake);
         std::thread::spawn(move || {
-            metrics::with_local_recorder(&recorder, || {
-                compaction_monitor_loop(monitored, cfg, &wake)
-            });
+            metrics::with_local_recorder(&recorder, || compaction_monitor_loop(&trees, cfg, &wake));
         })
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -497,11 +494,11 @@ fn the_monitor_judges_each_table_into_its_own_verdict_and_one_series() {
 
 #[test]
 fn compaction_scheduler_multiple_workers_no_panic() {
-    let (trees, _dir) = make_test_trees();
+    let (trees, _tree, _dir) = make_test_trees();
     let gc_watermark = Arc::new(AtomicU64::new(0));
 
     let sched = CompactionScheduler::start(
-        &trees,
+        trees,
         GcWatermarks::uniform(&gc_watermark),
         4, // 4 workers
         8,

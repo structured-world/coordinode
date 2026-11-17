@@ -23,6 +23,7 @@ pub mod local_pipeline;
 pub mod merge;
 pub mod metadata;
 pub mod metered_fs;
+pub mod open_sets;
 pub mod open_txns;
 pub mod operations;
 pub mod oplog_journal;

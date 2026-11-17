@@ -32,7 +32,9 @@ use lsm_tree::AbstractTree;
 
 use crate::engine::coordinator::GcWatermarks;
 use crate::engine::flush::{TableSource, TableTree, TreeRef};
+use crate::engine::open_sets::OpenSets;
 use crate::engine::partition::Partition;
+use crate::engine::scope::TreeId;
 use crate::error::{StorageError, StorageResult};
 use coordinode_core::txn::wake::Wake;
 
@@ -75,17 +77,27 @@ impl CompactionStrategyKind {
 /// Which tree a compaction request is for.
 #[derive(Clone)]
 enum CompactionSource {
-    Partition(Partition),
+    Partition(TreeId),
     Table,
 }
 
 impl CompactionSource {
-    /// The `partition` label of its metrics and log lines: the columnar
-    /// tables share one, so their number does not grow the label set.
+    /// The `partition` label of its metrics: every set's tree of a partition
+    /// shares one, and the columnar tables share one, so the number of sets
+    /// and tables does not grow the label set.
     fn name(&self) -> &'static str {
         match self {
-            Self::Partition(partition) => partition.name(),
+            Self::Partition(tree) => tree.part.name(),
             Self::Table => "tables",
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Partition(tree) => write!(f, "{tree}"),
+            Self::Table => f.write_str("tables"),
         }
     }
 }
@@ -129,7 +141,7 @@ impl CompactionScheduler {
     /// Returns `Err` if any background thread fails to spawn (OS resource limit).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
-        trees: &HashMap<Partition, lsm_tree::AnyTree>,
+        trees: Arc<OpenSets>,
         gc_watermarks: GcWatermarks,
         num_workers: usize,
         l0_urgent_threshold: usize,
@@ -159,18 +171,6 @@ impl CompactionScheduler {
             workers.push(handle);
         }
 
-        // Clone tree handles for the monitor, each with the strategy it
-        // compacts under for as long as the engine runs.
-        let monitored: Vec<MonitoredTree> = trees
-            .iter()
-            .map(|(&p, t)| MonitoredTree {
-                tree: TreeRef::Partition(t.clone()),
-                source: CompactionSource::Partition(p),
-                strategy: strategy.for_tree(),
-                table: None,
-            })
-            .collect();
-
         let tx = sender.clone();
         let shutdown_m = Arc::clone(&shutdown);
         let wake_m = Arc::clone(&wake);
@@ -178,7 +178,7 @@ impl CompactionScheduler {
             .name("coord-compact-monitor".to_string())
             .spawn(move || {
                 compaction_monitor_loop(
-                    monitored,
+                    &trees,
                     MonitorConfig {
                         sender: tx,
                         gc_watermarks,
@@ -280,11 +280,24 @@ struct MonitorConfig {
 /// latches the backpressure verdicts (0/1/2 = none/slowdown/stop): the worst
 /// partition's into `write_pressure` for the commit-path check, each table's
 /// into its own, which that table's writes check.
-fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: &Wake) {
+fn compaction_monitor_loop(sets: &OpenSets, cfg: MonitorConfig, wake: &Wake) {
     wake.bind();
-    // A table's strategy lives as long as the table, as a partition's does.
+    // A tree's strategy lives as long as its set or table: one dropped since
+    // the last pass loses it, one opened gets its own at the pass that finds
+    // it.
+    let mut trees: HashMap<TreeId, MonitoredTree> = HashMap::new();
     let mut tables: HashMap<String, MonitoredTree> = HashMap::new();
     while !cfg.shutdown.load(Ordering::Relaxed) {
+        let listed = sets.list();
+        trees.retain(|id, _| listed.iter().any(|(listed, _)| listed == id));
+        for (id, tree) in listed {
+            trees.entry(id).or_insert_with(|| MonitoredTree {
+                tree: TreeRef::Partition(tree),
+                source: CompactionSource::Partition(id),
+                strategy: cfg.strategy.for_tree(),
+                table: None,
+            });
+        }
         if let Some(source) = &cfg.tables {
             let listed = source();
             tables.retain(|table, _| listed.iter().any(|t| &t.id == table));
@@ -324,8 +337,11 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
         let mut worst_tier: u8 = 0;
         let mut tables_tier: u8 = 0;
         let mut tables_debt: u64 = 0;
+        // Per partition label, across every set holding one: the worst tier
+        // and the total debt, so the label set does not grow with the sets.
+        let mut by_label: HashMap<&'static str, (u8, u64)> = HashMap::new();
         let mut requests: Vec<CompactionRequest> = trees
-            .iter()
+            .values()
             .chain(tables.values())
             .filter_map(|monitored| {
                 let MonitoredTree {
@@ -353,7 +369,7 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                 // The tables are node rows kept apart: they keep the
                 // versions the node partition keeps.
                 let partition = match source {
-                    CompactionSource::Partition(partition) => *partition,
+                    CompactionSource::Partition(tree) => tree.part,
                     CompactionSource::Table => Partition::Node,
                 };
                 let priority = compaction_priority(
@@ -367,7 +383,7 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                     // An operator seeing WRITE_BACKPRESSURE rejections needs
                     // to know which tree tripped it and on which axis.
                     tracing::warn!(
-                        partition = source.name(),
+                        tree = %source,
                         table = table.as_ref().map(|t| t.id.as_str()),
                         l0_run_count = l0,
                         compaction_debt_bytes = debt,
@@ -384,7 +400,10 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
                     }
                     None => {
                         worst_tier = worst_tier.max(tier);
-                        record_pressure(source.name(), tier, debt);
+                        let label = by_label.entry(source.name()).or_insert((0, 0));
+                        label.0 = label.0.max(tier);
+                        // Bytes on the endpoints' disks: far below u64::MAX.
+                        label.1 += debt;
                     }
                 }
                 Some(CompactionRequest {
@@ -397,6 +416,9 @@ fn compaction_monitor_loop(trees: Vec<MonitoredTree>, cfg: MonitorConfig, wake: 
             })
             .collect();
         cfg.write_pressure.store(worst_tier, Ordering::Relaxed);
+        for (label, (tier, debt)) in by_label {
+            record_pressure(label, tier, debt);
+        }
         if cfg.tables.is_some() {
             record_pressure(CompactionSource::Table.name(), tables_tier, tables_debt);
         }

@@ -21,6 +21,23 @@ fn make_test_trees() -> (HashMap<Partition, lsm_tree::AnyTree>, tempfile::TempDi
     (trees, dir)
 }
 
+/// `trees` as an engine holds them: the deployment's own partitions in the
+/// system set, the rest in one namespace's.
+fn sets_of(trees: &HashMap<Partition, lsm_tree::AnyTree>) -> Arc<OpenSets> {
+    use crate::engine::open_sets::SetTrees;
+    use crate::engine::scope::{NamespaceId, Scope};
+    let mut system = SetTrees::new(Scope::System);
+    let mut namespace = SetTrees::new(Scope::Namespace(NamespaceId::from_raw(1)));
+    for (&part, tree) in trees {
+        if part.is_system() {
+            system.insert(part, tree.clone());
+        } else {
+            namespace.insert(part, tree.clone());
+        }
+    }
+    Arc::new(OpenSets::new(system, [Arc::new(namespace)]))
+}
+
 /// `threshold` for every partition, none on a capped endpoint.
 fn uniform(threshold: u64) -> Arc<FlushThresholds> {
     Arc::new(FlushThresholds::new(threshold, |_| None))
@@ -38,7 +55,7 @@ fn start(
 ) -> (FlushManager, Arc<Wake>) {
     let wake = Arc::new(Wake::default());
     let mgr = FlushManager::start(
-        trees,
+        sets_of(trees),
         GcWatermarks::uniform(gc_watermark),
         uniform(threshold),
         max_sealed,
@@ -93,7 +110,7 @@ fn unflushed_memtable_bytes_past_the_stop_level_stop_writes_until_flushed() {
     // A flush threshold no write reaches and the age trigger off: only the
     // pressure moves, so the stop level is reached by the writes alone.
     let mgr = FlushManager::start(
-        &trees,
+        sets_of(&trees),
         GcWatermarks::uniform(&gc_watermark),
         uniform(u64::MAX),
         usize::MAX,

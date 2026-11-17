@@ -28,8 +28,10 @@ use std::time::{Duration, Instant};
 use lsm_tree::AbstractTree;
 
 use crate::engine::coordinator::GcWatermarks;
+use crate::engine::open_sets::OpenSets;
 use crate::engine::oplog_journal::{EmbeddedOplog, sync_journal};
 use crate::engine::partition::Partition;
+use crate::engine::scope::TreeId;
 use crate::error::{StorageError, StorageResult};
 use coordinode_core::txn::wake::Wake;
 
@@ -224,15 +226,15 @@ pub(crate) type TableSource = Box<dyn Fn() -> Vec<TableTree> + Send>;
 
 /// Which tree a flush request is for: the name its log lines carry.
 enum FlushSource {
-    Partition(Partition),
+    Partition(TreeId),
     Table(String),
 }
 
-impl FlushSource {
-    fn name(&self) -> &str {
+impl std::fmt::Display for FlushSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Partition(partition) => partition.name(),
-            Self::Table(table) => table,
+            Self::Partition(tree) => write!(f, "{tree}"),
+            Self::Table(table) => f.write_str(table),
         }
     }
 }
@@ -290,7 +292,7 @@ impl FlushManager {
     /// covers may then go ([`crate::engine::journal_reclaim`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
-        trees: &HashMap<Partition, lsm_tree::AnyTree>,
+        trees: Arc<OpenSets>,
         gc_watermarks: GcWatermarks,
         thresholds: Arc<FlushThresholds>,
         max_sealed: usize,
@@ -338,11 +340,8 @@ impl FlushManager {
             workers.push(handle);
         }
 
-        // Clone tree handles for the monitor (cheap: AnyTree is Clone via Arc).
-        let monitored: Vec<(Partition, lsm_tree::AnyTree)> =
-            trees.iter().map(|(&p, t)| (p, t.clone())).collect();
-
-        // Spawn monitor thread.
+        // Spawn monitor thread. It lists the trees afresh on every pass: a
+        // namespace's set comes and goes while the engine runs.
         let tx = sender.clone();
         let shutdown_m = Arc::clone(&shutdown);
         let wake_m = Arc::clone(&wake);
@@ -350,7 +349,7 @@ impl FlushManager {
             .name("coord-flush-monitor".to_string())
             .spawn(move || {
                 flush_monitor_loop(
-                    monitored,
+                    &trees,
                     FlushMonitorConfig {
                         sender: tx,
                         gc_watermarks,
@@ -507,12 +506,12 @@ fn consider_tree(
 ///    grow the oplog unbounded waiting for size-based flush to fire.
 ///    The clock starts at startup and resets on every rotation; an empty
 ///    active memtable is never rotated (no data to lose).
-fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMonitorConfig) {
+fn flush_monitor_loop(trees: &OpenSets, cfg: FlushMonitorConfig) {
     cfg.wake.bind();
-    let start = Instant::now();
-    let mut states: Vec<TreeState> = trees.iter().map(|_| TreeState::new(start)).collect();
-    // A table's state lives as long as the table: one dropped since the last
-    // pass loses it, one created starts its age at the pass that finds it.
+    // A tree's state lives as long as its set or table: one dropped since
+    // the last pass loses it, one opened starts its age at the pass that
+    // finds it.
+    let mut states: HashMap<TreeId, TreeState> = HashMap::new();
     let mut table_states: HashMap<String, TreeState> = HashMap::new();
 
     while !cfg.shutdown.load(Ordering::Relaxed) {
@@ -524,16 +523,19 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
         // A hard limit refused a write: every memtable holding data goes.
         let squeezed = cfg.footprints.take_squeeze();
 
-        for ((partition, tree), state) in trees.iter().zip(&mut states) {
+        let listed = trees.list();
+        states.retain(|id, _| listed.iter().any(|(listed, _)| listed == id));
+        for (id, tree) in &listed {
+            let state = states.entry(*id).or_insert_with(|| TreeState::new(now));
             let source = || {
                 (
-                    FlushSource::Partition(*partition),
-                    cfg.gc_watermarks.for_partition(*partition),
+                    FlushSource::Partition(*id),
+                    cfg.gc_watermarks.for_partition(id.part),
                 )
             };
             consider_tree(
                 tree,
-                *partition,
+                id.part,
                 state,
                 source,
                 now,
@@ -642,7 +644,7 @@ fn flush_worker_loop(
         match result {
             Ok(Some(bytes)) => {
                 tracing::debug!(
-                    tree = source.name(),
+                    tree = %source,
                     flushed_bytes = bytes,
                     "memtable flushed to SST"
                 );
@@ -656,7 +658,7 @@ fn flush_worker_loop(
             }
             Err(e) => {
                 tracing::error!(
-                    tree = source.name(),
+                    tree = %source,
                     error = %e,
                     "memtable flush failed"
                 );

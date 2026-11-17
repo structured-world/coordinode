@@ -45,7 +45,7 @@
 //! [`MultiModalCoordinator::set_gc_watermark`]. Neither hook requires
 //! API changes; the seam is the existing accessor surface.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -53,8 +53,10 @@ use lsm_tree::AbstractTree;
 
 use super::{RawSeekableIter, StorageIter};
 use crate::engine::coverage;
+use crate::engine::open_sets::{OpenSets, SetTrees};
 use crate::engine::partition::Partition;
 use crate::engine::pending::PendingCommits;
+use crate::engine::scope::TreeId;
 use crate::error::{StorageError, StorageResult};
 
 /// OCC read scope — Layer-3 owned read-set tracker for optimistic
@@ -793,13 +795,11 @@ impl Drop for WatermarkHold {
 /// (cascade eviction, persist, capacity refresh) uses the concrete
 /// `pub` accessors below — those are NOT part of the trait contract.
 pub struct LocalMultiModalCoordinator {
-    /// Per-partition LSM tree handles, opened at engine bootstrap.
-    /// `Partition::all()` keys every entry; `tree(part)` is the
-    /// only sanctioned access path.
-    trees: HashMap<Partition, lsm_tree::AnyTree>,
-    /// The same handles by partition discriminant: every read and write
-    /// finds its tree here, an index instead of a hash of the partition.
-    by_partition: Vec<Option<lsm_tree::AnyTree>>,
+    /// Every open tree, by set.
+    sets: Arc<OpenSets>,
+    /// The namespace set the partition-addressed methods below read and
+    /// write, held so that each finds its tree by an index.
+    store: Arc<SetTrees>,
     /// Shared LSM seqno generator. All `Coordinator` writes pull
     /// from this counter; readers pin to `seqno.get()` for
     /// snapshot consistency across partitions.
@@ -848,26 +848,17 @@ impl LocalMultiModalCoordinator {
     }
 
     pub(crate) fn new(
-        trees: HashMap<Partition, lsm_tree::AnyTree>,
+        sets: Arc<OpenSets>,
+        store: Arc<SetTrees>,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         cache: Arc<lsm_tree::Cache>,
         gc_watermark: Arc<AtomicU64>,
         gc_controller: Arc<GcWatermarkController>,
         flush_trigger: Arc<crate::engine::flush::FlushTrigger>,
     ) -> Self {
-        // A fieldless enum: its discriminants index the handles. The trees
-        // are opened once here and never replaced, so the two views agree.
-        let mut by_partition = Vec::new();
-        for (&part, tree) in &trees {
-            let at = part as usize;
-            if by_partition.len() <= at {
-                by_partition.resize(at + 1, None);
-            }
-            by_partition[at] = Some(tree.clone());
-        }
         Self {
-            trees,
-            by_partition,
+            sets,
+            store,
             seqno,
             cache,
             gc_watermark,
@@ -978,19 +969,40 @@ impl LocalMultiModalCoordinator {
     /// Reserved for engine-internal call sites (cascade eviction,
     /// persist, capacity refresh).
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
-        self.by_partition
-            .get(part as usize)
-            .and_then(Option::as_ref)
+        let set = if part.is_system() {
+            self.sets.system()
+        } else {
+            &self.store
+        };
+        set.get(part)
             .ok_or_else(|| StorageError::PartitionNotFound {
                 name: part.name().to_string(),
             })
     }
 
-    /// Iterator over every (partition, tree) pair. Used by lifecycle
-    /// helpers (cascade eviction, persist, disk-space aggregation)
-    /// that need to act over all partitions uniformly. Engine-internal.
-    pub(crate) fn trees(&self) -> &HashMap<Partition, lsm_tree::AnyTree> {
-        &self.trees
+    /// Every open tree now, with its address. Used by lifecycle helpers
+    /// (cascade eviction, persist, disk-space aggregation) that act over all
+    /// trees uniformly. Engine-internal.
+    pub(crate) fn trees(&self) -> Vec<(TreeId, lsm_tree::AnyTree)> {
+        self.sets.list()
+    }
+
+    /// The engine's open sets.
+    pub(crate) fn sets(&self) -> &Arc<OpenSets> {
+        &self.sets
+    }
+
+    /// The trees the partition-addressed methods reach, by partition: the
+    /// system set's and the store namespace's.
+    pub(crate) fn partition_trees(
+        &self,
+    ) -> std::collections::HashMap<Partition, lsm_tree::AnyTree> {
+        self.sets
+            .system()
+            .iter()
+            .chain(self.store.iter())
+            .map(|(id, tree)| (id.part, tree.clone()))
+            .collect()
     }
 
     /// Shared block cache reference (DRAM-backed). Single physical

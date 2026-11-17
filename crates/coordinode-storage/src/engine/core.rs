@@ -25,6 +25,8 @@ use crate::engine::config::{FlushPolicy, StorageConfig};
 use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator, SnapshotPin};
 use crate::engine::coverage::{self, Coverage, Domain, TreeCoverage};
 use crate::engine::flush::FlushManager;
+#[cfg(feature = "columnar")]
+use crate::engine::open_sets::{OpenSets, SetTrees};
 use crate::engine::oplog_journal::{
     EmbeddedOplog, OplogJournalConfig, apply_oplog_ops_at, op_partition,
 };
@@ -32,8 +34,7 @@ use crate::engine::partition::Partition;
 use crate::engine::rebuild::{self, Rebuild, RebuildRefusal};
 use crate::engine::routing::PartitionRouting;
 use crate::engine::scope::store_tree;
-#[cfg(feature = "columnar")]
-use crate::engine::scope::{STORE_NAMESPACE, Scope};
+use crate::engine::scope::{STORE_NAMESPACE, Scope, TreeId};
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp};
 
@@ -1578,8 +1579,11 @@ impl StorageEngine {
         let flushed_tables = table_source();
         let table_landed = Arc::new(coordinode_core::txn::wake::Wake::default());
 
+        // From here on the trees are found by set: the background services
+        // list them afresh on every pass.
+        let (sets, store_set) = open_sets_of(&trees);
         let flush_manager = FlushManager::start(
-            &trees,
+            Arc::clone(&sets),
             gc_controller.watermarks(),
             Arc::clone(&flush_thresholds),
             config.max_sealed_memtables,
@@ -1615,7 +1619,7 @@ impl StorageEngine {
         // cycle; the commit path reads it as a single atomic load.
         let write_pressure = Arc::new(AtomicU8::new(0));
         let compaction_scheduler = CompactionScheduler::start(
-            &trees,
+            Arc::clone(&sets),
             gc_controller.watermarks(),
             config.compaction_workers,
             config.compaction_l0_urgent_threshold,
@@ -1667,14 +1671,15 @@ impl StorageEngine {
             let tracked = config.endpoints.iter().any(|ep| ep.hard_limit_bytes > 0);
             let tracker_c = Arc::clone(&capacity_arc);
             let endpoints_c = config.endpoints.clone();
-            let trees_c = trees.clone();
+            let sets_c = Arc::clone(&sets);
             let seqno_c = Arc::clone(&seqno);
             let footprints_c = footprints.clone();
             let gc_controller_c = Arc::clone(&gc_controller);
             let interval = std::time::Duration::from_secs(5);
             Some(
                 crate::engine::capacity::CapacityScanner::start(interval, move || {
-                    publish_label_counts(&trees_c, &seqno_c, &node_counts_c);
+                    publish_label_counts(&sets_c, &seqno_c, &node_counts_c);
+                    let trees_c = sets_c.list();
                     #[cfg(feature = "lsm-metrics")]
                     publish_tree_metrics(&trees_c);
                     if !tracked {
@@ -1684,7 +1689,7 @@ impl StorageEngine {
                     run_capacity_refresh(&tracker_c, &endpoints_c, &trees_c, &footprints_c, |id| {
                         run_cascade_evict(
                             &endpoints_c,
-                            &trees_c,
+                            &sets_c,
                             &seqno_c,
                             &|part| gc_controller_c.maintenance_compaction_threshold_for(part),
                             id,
@@ -1788,7 +1793,8 @@ impl StorageEngine {
                 .partitions
                 .contains(&Partition::Schema);
         let coordinator = LocalMultiModalCoordinator::new(
-            trees,
+            sets,
+            store_set,
             Arc::clone(&seqno),
             cache,
             gc_watermark,
@@ -2010,7 +2016,7 @@ impl StorageEngine {
         // synced first, so no table takes an entry it could still lose.
         local.sync()?;
         let at = self.next_seqno();
-        local.compact(self.coordinator.trees(), at, |tree| {
+        local.compact(&self.coordinator.partition_trees(), at, |tree| {
             self.flush_memtables(tree)
         })?;
         // Every tree now covers it durably, so a later open has nothing to
@@ -6873,7 +6879,7 @@ impl StorageEngine {
         run_capacity_refresh(
             &self.capacity,
             &self.endpoints,
-            self.coordinator.trees(),
+            &self.coordinator.trees(),
             &self.footprints,
             |id| self.cascade_evict_endpoint(id),
         );
@@ -7333,7 +7339,7 @@ impl StorageEngine {
             let (seqno, _held) = self.pending_commits.obligate_local(|| self.next_seqno());
             local.commit(
                 crate::engine::local_journal::Targets {
-                    trees: self.coordinator.trees(),
+                    trees: &self.coordinator.partition_trees(),
                     installations: &self.installations,
                 },
                 writes,
@@ -7345,9 +7351,11 @@ impl StorageEngine {
         // Written past the coordinator, so the flush monitor is told.
         self.coordinator.flush_trigger().wrote_unmeasured();
         if compact_due {
-            local.compact(self.coordinator.trees(), self.next_seqno(), |tree| {
-                self.flush_memtables(tree)
-            })?;
+            local.compact(
+                &self.coordinator.partition_trees(),
+                self.next_seqno(),
+                |tree| self.flush_memtables(tree),
+            )?;
         }
         Ok(())
     }
@@ -7461,7 +7469,8 @@ impl StorageEngine {
         // Above every marker below `next`: each of those entries drew its
         // commit_ts from this generator before it was applied.
         let at = self.next_seqno();
-        for (&part, tree) in self.coordinator.trees() {
+        for (part, tree) in &self.coordinator.partition_trees() {
+            let part = *part;
             let based = coverage.based(part);
             // A tree no entry since the last fold reached holds no marker
             // there; skipping it leaves its old base, which a later fold of
@@ -7871,7 +7880,7 @@ impl StorageEngine {
     pub fn cascade_evict_endpoint(&self, endpoint_id: &str) -> StorageResult<CascadeReport> {
         run_cascade_evict(
             &self.endpoints,
-            self.coordinator.trees(),
+            self.coordinator.sets(),
             self.coordinator.seqno_generator(),
             &|part| self.coordinator.maintenance_compaction_threshold_for(part),
             endpoint_id,
@@ -7886,8 +7895,8 @@ impl StorageEngine {
     /// performed after the SST flush.  This keeps the WAL small: all data
     /// that was in the WAL is now in SST, so the journal can be truncated.
     pub fn persist(&self) -> StorageResult<()> {
-        for tree in self.coordinator.trees().values() {
-            self.flush_memtables_in_order(tree)?;
+        for (_, tree) in self.coordinator.trees() {
+            self.flush_memtables_in_order(&tree)?;
         }
         // A table dropped meanwhile has nothing left to persist.
         #[cfg(feature = "columnar")]
@@ -7912,8 +7921,8 @@ impl StorageEngine {
     ///
     /// A flush or device flush failure.
     pub(crate) fn flush_partition_trees(&self) -> StorageResult<()> {
-        for tree in self.coordinator.trees().values() {
-            self.flush_memtables_in_order(tree)?;
+        for (_, tree) in self.coordinator.trees() {
+            self.flush_memtables_in_order(&tree)?;
         }
         self.sync_endpoint_devices()
     }
@@ -8152,8 +8161,8 @@ impl StorageEngine {
         Ok(self
             .coordinator
             .trees()
-            .values()
-            .map(|t| t.disk_space())
+            .iter()
+            .map(|(_, t)| t.disk_space())
             .sum())
     }
 
@@ -9397,7 +9406,7 @@ impl StorageEngine {
 /// contract.
 fn run_cascade_evict(
     endpoints: &[crate::engine::config::EndpointConfig],
-    trees: &HashMap<Partition, lsm_tree::AnyTree>,
+    sets: &OpenSets,
     seqno: &lsm_tree::SharedSequenceNumberGenerator,
     gc_watermark: &dyn Fn(Partition) -> u64,
     endpoint_id: &str,
@@ -9410,16 +9419,16 @@ fn run_cascade_evict(
         )));
     }
 
-    let schema_tree =
-        trees
-            .get(&Partition::Schema)
-            .ok_or_else(|| StorageError::PartitionNotFound {
-                name: Partition::Schema.name().to_string(),
-            })?;
+    let schema_tree = sets.tree(store_tree(Partition::Schema)).ok_or_else(|| {
+        StorageError::PartitionNotFound {
+            name: Partition::Schema.name().to_string(),
+        }
+    })?;
     let read_seqno = seqno.get();
 
     let mut compacted_partitions = 0u32;
-    for &part in Partition::all() {
+    for (id, tree) in sets.list() {
+        let part = id.part;
         if part == Partition::Schema || part == Partition::Raft {
             continue;
         }
@@ -9438,14 +9447,9 @@ fn run_cascade_evict(
         }
         tracing::info!(
             endpoint = endpoint_id,
-            partition = part.name(),
+            tree = %id,
             "cascade eviction: triggering major compaction"
         );
-        let tree = trees
-            .get(&part)
-            .ok_or_else(|| StorageError::PartitionNotFound {
-                name: part.name().to_string(),
-            })?;
         // The engine's GC watermark for this partition, not `SeqNo::MAX`:
         // eviction moves data between endpoints and must not collect history
         // the retention policy still holds. See `StorageEngine::major_compact`
@@ -9461,26 +9465,53 @@ fn run_cascade_evict(
     })
 }
 
+/// The sets the trees an open put up form: the deployment's own partitions
+/// in the system set, the rest in the one namespace the engine holds, which
+/// is also returned.
+fn open_sets_of(trees: &HashMap<Partition, lsm_tree::AnyTree>) -> (Arc<OpenSets>, Arc<SetTrees>) {
+    let mut system = SetTrees::new(Scope::System);
+    let mut store = SetTrees::new(Scope::Namespace(STORE_NAMESPACE));
+    for (&part, tree) in trees {
+        let set = if store_tree(part).scope == Scope::System {
+            &mut system
+        } else {
+            &mut store
+        };
+        set.insert(part, tree.clone());
+    }
+    let store = Arc::new(store);
+    (Arc::new(OpenSets::new(system, [Arc::clone(&store)])), store)
+}
+
 /// Publish each partition's footprint: the live version (in-window key
 /// versions included, so this is where the retention window shows) next to
 /// what is on disk beside it. A folder walk, sampled on the capacity-scan
 /// cadence whether or not any endpoint has a capacity limit.
-fn publish_footprint(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
-    for (part, tree) in trees {
+fn publish_footprint(trees: &[(TreeId, lsm_tree::AnyTree)]) {
+    // One series per partition, summed over the sets holding one, so the
+    // label set does not grow with the namespaces.
+    let mut by_partition: HashMap<Partition, (u64, u64)> = HashMap::new();
+    for (id, tree) in trees {
         match crate::engine::retention_stats::retained_history(tree) {
             Ok(history) => {
-                metrics::gauge!("coordinode_storage_live_bytes", "partition" => part.name())
-                    .set(history.live_bytes as f64);
-                metrics::gauge!(
-                    "coordinode_storage_retained_history_bytes",
-                    "partition" => part.name()
-                )
-                .set(history.retained_bytes as f64);
+                let sums = by_partition.entry(id.part).or_insert((0, 0));
+                // Bytes on the endpoints' disks: far below u64::MAX.
+                sums.0 += history.live_bytes;
+                sums.1 += history.retained_bytes;
             }
             Err(e) => {
-                tracing::warn!(partition = part.name(), error = %e, "retained-history scan failed");
+                tracing::warn!(tree = %id, error = %e, "retained-history scan failed");
             }
         }
+    }
+    for (part, (live, retained)) in by_partition {
+        metrics::gauge!("coordinode_storage_live_bytes", "partition" => part.name())
+            .set(live as f64);
+        metrics::gauge!(
+            "coordinode_storage_retained_history_bytes",
+            "partition" => part.name()
+        )
+        .set(retained as f64);
     }
 }
 
@@ -9489,13 +9520,23 @@ fn publish_footprint(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
 /// incidental payload of projected scans, the block cache hit ratio, and the
 /// bytes compactions read, wrote, carried without decoding and relocated.
 #[cfg(feature = "lsm-metrics")]
-fn publish_tree_metrics(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
+fn publish_tree_metrics(trees: &[(TreeId, lsm_tree::AnyTree)]) {
     use lsm_tree::AbstractTree;
 
-    for (part, tree) in trees {
+    // Summed over the sets holding a partition, so the label set does not
+    // grow with the namespaces; the hit ratio is the one of the partition's
+    // busiest tree.
+    let mut sums: HashMap<(&'static str, &'static str), u64> = HashMap::new();
+    let mut hit_ratio: HashMap<&'static str, (u64, f64)> = HashMap::new();
+    for (id, tree) in trees {
         let m = tree.metrics();
-        let name = part.name();
+        let name = id.part.name();
         let work = m.compaction_work_measured();
+        let read = m.bytes_read();
+        let busiest = hit_ratio.entry(name).or_insert((0, 0.0));
+        if read >= busiest.0 {
+            *busiest = (read, m.block_cache_hit_rate());
+        }
         for (metric, value) in [
             ("coordinode_storage_read_bytes_total", m.bytes_read()),
             ("coordinode_storage_decoded_bytes_total", m.bytes_decoded()),
@@ -9522,10 +9563,15 @@ fn publish_tree_metrics(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
                 m.blob_bytes_relocated(),
             ),
         ] {
-            metrics::counter!(metric, "partition" => name).absolute(value);
+            // Counts of bytes: far below u64::MAX summed.
+            *sums.entry((metric, name)).or_insert(0) += value;
         }
-        metrics::gauge!("coordinode_storage_block_cache_hit_ratio", "partition" => name)
-            .set(m.block_cache_hit_rate());
+    }
+    for ((metric, name), value) in sums {
+        metrics::counter!(metric, "partition" => name).absolute(value);
+    }
+    for (name, (_, ratio)) in hit_ratio {
+        metrics::gauge!("coordinode_storage_block_cache_hit_ratio", "partition" => name).set(ratio);
     }
 }
 
@@ -9536,14 +9582,14 @@ fn publish_tree_metrics(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
 /// counter below zero is not published; no sequence of committed writes
 /// leaves one. A scan that fails keeps the last sample.
 fn publish_label_counts(
-    trees: &HashMap<Partition, lsm_tree::AnyTree>,
+    sets: &OpenSets,
     seqno: &lsm_tree::SharedSequenceNumberGenerator,
     published: &crate::engine::owned_metrics::NodeCounts,
 ) {
     use coordinode_core::graph::stats::LABEL_KEY_PREFIX;
     use lsm_tree::{AbstractTree, Guard as _};
 
-    let Some(tree) = trees.get(&Partition::Counter) else {
+    let Some(tree) = sets.tree(store_tree(Partition::Counter)) else {
         return;
     };
     let mut counts = std::collections::BTreeMap::new();
@@ -9588,7 +9634,7 @@ fn publish_label_counts(
 fn run_capacity_refresh<F>(
     capacity: &crate::engine::capacity::CapacityTracker,
     endpoints: &[crate::engine::config::EndpointConfig],
-    trees: &HashMap<Partition, lsm_tree::AnyTree>,
+    trees: &[(TreeId, lsm_tree::AnyTree)],
     footprints: &crate::engine::footprint::Footprints,
     mut cascade_fn: F,
 ) where
@@ -9879,8 +9925,8 @@ impl Drop for StorageEngine {
         // Step 4: best-effort final flush of any remaining active memtable
         // data. A tree whose flush fails (the journal could not be synced
         // among others) keeps its data in the journal for the next open.
-        for tree in self.coordinator.trees().values() {
-            if let Err(e) = self.flush_memtables(tree) {
+        for (_, tree) in self.coordinator.trees() {
+            if let Err(e) = self.flush_memtables(&tree) {
                 tracing::debug!(error = %e, "final memtable flush skipped");
             }
         }

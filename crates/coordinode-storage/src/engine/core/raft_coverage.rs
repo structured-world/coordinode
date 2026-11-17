@@ -261,8 +261,8 @@ impl StorageEngine {
     /// A tree read failure, or a malformed record.
     pub fn raft_coverage(&self) -> StorageResult<RaftCoverage> {
         let mut trees = HashMap::with_capacity(Partition::all().len());
-        for (&part, tree) in self.coordinator.trees() {
-            trees.insert(part, TreeCoverage::read(tree, Domain::Raft)?);
+        for (part, tree) in &self.coordinator.partition_trees() {
+            trees.insert(*part, TreeCoverage::read(tree, Domain::Raft)?);
         }
         Ok(RaftCoverage { trees })
     }
@@ -377,8 +377,8 @@ impl StorageEngine {
         // Above every marker below `next`: those proposals were applied, and
         // the oracle advanced past their commit_ts, before this call.
         let at = self.next_seqno();
-        for (&part, tree) in self.coordinator.trees() {
-            if !ahead(part) {
+        for (part, tree) in &self.coordinator.partition_trees() {
+            if !ahead(*part) {
                 coverage::write_fold(tree, Domain::Raft, from, next, payload, at);
             }
         }
@@ -778,8 +778,8 @@ impl StorageEngine {
     /// A flush failure.
     pub fn reset_raft_coverage(&self, next: u64, payload: &[u8]) -> StorageResult<()> {
         let at = self.next_seqno();
-        for tree in self.coordinator.trees().values() {
-            coverage::write_fold(tree, Domain::Raft, 0, next, payload, at);
+        for (_, tree) in self.coordinator.trees() {
+            coverage::write_fold(&tree, Domain::Raft, 0, next, payload, at);
         }
         self.flush_partition_trees()?;
         // A snapshot now stands in the store in place of whatever the
@@ -828,8 +828,8 @@ impl StorageEngine {
     pub fn checkpoint_raft_floor(checkpoint_dir: &Path) -> StorageResult<u64> {
         let ckpt = Self::open_checkpoint(checkpoint_dir)?;
         let mut floor = u64::MAX;
-        for tree in ckpt.coordinator.trees().values() {
-            let held = TreeCoverage::read(tree, Domain::Raft)?;
+        for (_, tree) in ckpt.coordinator.trees() {
+            let held = TreeCoverage::read(&tree, Domain::Raft)?;
             floor = floor.min(held.base().map_or(0, |(next, _)| next));
         }
         Ok(if floor == u64::MAX { 0 } else { floor })
