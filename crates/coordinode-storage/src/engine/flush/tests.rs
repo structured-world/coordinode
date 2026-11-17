@@ -194,6 +194,21 @@ fn flush_manager_starts_and_stops() {
     drop(mgr);
 }
 
+/// Whether `done` holds before a deadline far past any healthy flush. A
+/// loaded host can take hundreds of milliseconds to rotate and write a table,
+/// so the deadline only bounds a manager that never flushes; a passing run
+/// returns as soon as `done` holds.
+fn flushed_within_deadline(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    done()
+}
+
 #[test]
 fn flush_manager_flushes_when_sealed_count_exceeded() {
     let (trees, _dir) = make_test_trees();
@@ -214,15 +229,7 @@ fn flush_manager_flushes_when_sealed_count_exceeded() {
     // age trigger disabled, isolating the sealed-count gate.
     let (mgr, _wake) = start(&trees, &gc_watermark, u64::MAX, 0, 1, 0);
 
-    // Wait up to 500ms for the flush to complete.
-    let mut flushed = false;
-    for _ in 0..25 {
-        std::thread::sleep(Duration::from_millis(20));
-        if tree.sealed_memtable_count() == 0 {
-            flushed = true;
-            break;
-        }
-    }
+    let flushed = flushed_within_deadline(|| tree.sealed_memtable_count() == 0);
 
     drop(mgr);
     assert!(
@@ -247,16 +254,10 @@ fn flush_manager_flushes_when_size_threshold_exceeded() {
     // size trigger fires; age trigger disabled.
     let (mgr, _wake) = start(&trees, &gc_watermark, 1, 100, 1, 0);
 
-    // Wait up to 500ms for rotate + flush to complete.
-    let mut flushed = false;
-    for _ in 0..25 {
-        std::thread::sleep(Duration::from_millis(20));
-        // After flush: sealed=0 AND active size reset to 0.
-        if tree.sealed_memtable_count() == 0 && tree.active_memtable().size() == 0 {
-            flushed = true;
-            break;
-        }
-    }
+    // After the flush: nothing sealed and the active memtable empty again.
+    let flushed = flushed_within_deadline(|| {
+        tree.sealed_memtable_count() == 0 && tree.active_memtable().size() == 0
+    });
 
     drop(mgr);
     assert!(
@@ -284,14 +285,9 @@ fn a_write_through_the_trigger_wakes_the_sleeping_monitor() {
     let (added, memtable) = tree.insert(b"key1", b"a value longer than eight bytes", seqno.next());
     trigger.wrote(Partition::Node, added, memtable);
 
-    let mut flushed = false;
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(20));
-        if tree.sealed_memtable_count() == 0 && tree.active_memtable().size() == 0 {
-            flushed = true;
-            break;
-        }
-    }
+    let flushed = flushed_within_deadline(|| {
+        tree.sealed_memtable_count() == 0 && tree.active_memtable().size() == 0
+    });
     drop(mgr);
     assert!(flushed, "the triggered write was not flushed");
 }
@@ -333,14 +329,9 @@ fn flush_manager_age_trigger_rotates_idle_memtable() {
     // monitor sleeps until the age deadline, with no other wakeup.
     let (mgr, _wake) = start(&trees, &gc_watermark, u64::MAX, usize::MAX, 1, 1);
 
-    let mut flushed = false;
-    for _ in 0..150 {
-        std::thread::sleep(Duration::from_millis(20));
-        if tree.sealed_memtable_count() == 0 && tree.active_memtable().size() == 0 {
-            flushed = true;
-            break;
-        }
-    }
+    let flushed = flushed_within_deadline(|| {
+        tree.sealed_memtable_count() == 0 && tree.active_memtable().size() == 0
+    });
 
     drop(mgr);
     assert!(
