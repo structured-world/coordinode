@@ -7,6 +7,13 @@
 //! prefix's exact ceiling, and reads given up meanwhile leave a bounded
 //! number of reads behind.
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -118,7 +125,7 @@ async fn member() -> (
             commit_ts: Timestamp::from_raw(ts),
             start_ts: Timestamp::from_raw(ts - 1),
             bypass_rate_limiter: false,
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:00:cold{i:04}").into_bytes(),
                 value: b"v".to_vec(),
@@ -434,7 +441,7 @@ async fn a_stalled_cold_ceiling_holds_up_no_apply_and_leaves_bounded_reads() {
             commit_ts: Timestamp::from_raw(ts),
             start_ts: Timestamp::from_raw(ts - 1),
             bypass_rate_limiter: false,
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:00:during".to_vec(),
                 value: b"v".to_vec(),

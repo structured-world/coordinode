@@ -6,6 +6,13 @@
 //! replicate independently, and a message for a group the server does not
 //! host, or one whose parts name different groups, is refused by name.
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -201,7 +208,7 @@ async fn await_value(engine: &StorageEngine, key: &[u8], expected: &[u8]) -> boo
 fn put(key: &[u8], value: &[u8]) -> RaftProposal {
     RaftProposal {
         id: ProposalIdGenerator::with_base(1u64 << 48).next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.to_vec(),
             value: value.to_vec(),

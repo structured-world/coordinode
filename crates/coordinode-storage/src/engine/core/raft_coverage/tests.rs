@@ -20,8 +20,9 @@ fn open(dir: &TempDir) -> (StorageEngine, Arc<TimestampOracle>) {
     (engine, oracle)
 }
 
+/// A unit of the store's namespace writing the node and adjacency trees.
 fn node_and_adj() -> Vec<Mutation> {
-    vec![
+    crate::engine::scope::store_unit([
         Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:00:0001".to_vec(),
@@ -32,7 +33,7 @@ fn node_and_adj() -> Vec<Mutation> {
             key: b"adj:R:out:1".to_vec(),
             operand: crate::engine::merge::encode_add(2),
         },
-    ]
+    ])
 }
 
 #[test]

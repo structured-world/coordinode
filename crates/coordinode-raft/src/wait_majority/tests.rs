@@ -8,6 +8,13 @@ use coordinode_storage::engine::partition::Partition;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 fn test_engine() -> (TempDir, Arc<StorageEngine>) {
     let dir = TempDir::new().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -24,7 +31,7 @@ fn test_engine() -> (TempDir, Arc<StorageEngine>) {
 fn make_proposal(id_gen: &ProposalIdGenerator, key: &str, value: &str, ts: u64) -> RaftProposal {
     RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
@@ -290,7 +297,7 @@ async fn bypass_proposals_skip_rate_limiter() {
     // Submit a bypass proposal — should succeed even with capacity=1
     let bypass = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:bypass".to_vec(),
             value: b"delta-data".to_vec(),
@@ -371,7 +378,7 @@ async fn mixed_bypass_and_normal_batch() {
         handles.push(tokio::spawn(async move {
             let p = RaftProposal {
                 id: ids.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:mix-b{i}").into_bytes(),
                     value: format!("b{i}").into_bytes(),
@@ -436,10 +443,10 @@ fn request_batch_roundtrip() {
     assert_eq!(request.proposals[0], p1);
     assert_eq!(request.proposals[1], p2);
 
-    // Display shows batch stats
+    // Display shows batch stats: each unit's namespace marker and its put.
     let display = format!("{request}");
     assert!(display.contains("proposals=2"), "display: {display}");
-    assert!(display.contains("mutations=2"), "display: {display}");
+    assert!(display.contains("mutations=4"), "display: {display}");
 }
 
 /// Request::single wraps a single proposal.

@@ -144,7 +144,8 @@ fn unit(id_gen: &ProposalIdGenerator, n: u64, derived: bool) -> RaftProposal {
             node_id: n,
             valid_from: None,
             old: None,
-            new: DerivedSource::UnitRecord(0),
+            // The record follows the unit's namespace marker.
+            new: DerivedSource::UnitRecord(1),
         })
     } else {
         let effect = binding()
@@ -166,7 +167,7 @@ fn unit(id_gen: &ProposalIdGenerator, n: u64, derived: bool) -> RaftProposal {
     let ts = 1_000_000 + n;
     RaftProposal {
         id: id_gen.next(),
-        mutations: vec![node, index],
+        mutations: coordinode_storage::engine::scope::store_unit([node, index]),
         commit_ts: Timestamp::from_raw(ts),
         start_ts: Timestamp::from_raw(ts - 1),
         bypass_rate_limiter: false,

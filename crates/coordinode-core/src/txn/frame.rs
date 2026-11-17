@@ -20,8 +20,10 @@
 //!                     v odd: the (v/2)-th literal of at least MIN_SHARED bytes)
 //! ```
 //!
-//! Decoding checks the version, the checksum, every length and reference and
-//! the expansion budget before it allocates for them.
+//! An operation on a namespace's data follows a namespace marker naming the
+//! namespace; a frame holding one before any marker is refused, encoded or
+//! decoded. Decoding checks the version, the checksum, every length and
+//! reference and the expansion budget before it allocates for them.
 
 use rustc_hash::FxHashMap;
 
@@ -51,6 +53,9 @@ const KIND_DERIVE: u8 = 5;
 const KIND_OPERATION: u8 = 6;
 const KIND_EFFECTS: u8 = 7;
 const KIND_MASK: u8 = 0b111;
+/// A [`Mutation::Namespace`] marker: the command kind with a partition
+/// number no command carries, the namespace id following as a varint.
+const TAG_NAMESPACE: u8 = KIND_COMMAND | (1 << 3);
 
 /// Bytes a decoded label identity holds.
 const LABEL_BYTES: usize = core::mem::size_of::<crate::schema::label_id::LabelId>();
@@ -58,6 +63,8 @@ const LABEL_BYTES: usize = core::mem::size_of::<crate::schema::label_id::LabelId
 const RUN_BYTES: usize = core::mem::size_of::<u32>();
 /// Bytes a decoded activation identity holds.
 const ACTIVATION_BYTES: usize = core::mem::size_of::<u64>();
+/// Bytes a decoded namespace marker holds.
+const NAMESPACE_BYTES: usize = core::mem::size_of::<u64>();
 
 /// The operation commands, as the byte after [`KIND_OPERATION`] numbers
 /// them.
@@ -212,6 +219,9 @@ pub enum FrameError {
     /// Bytes after the last operation and before the checksum.
     #[error("{0} bytes follow the last operation")]
     Trailing(usize),
+    /// An operation on a namespace's data with no namespace named before it.
+    #[error(transparent)]
+    Unscoped(#[from] super::proposal::Unscoped),
 }
 
 fn put_varint(mut value: u64, out: &mut Vec<u8>) {
@@ -297,6 +307,7 @@ fn encode_within<'a>(
             limit: limits.max_ops,
         });
     }
+    super::proposal::check_scoped(unit.mutations)?;
     let mut out = Vec::with_capacity(64 + unit.mutations.len() * 48);
     out.push(FRAME_VERSION);
     put_varint(unit.id, &mut out);
@@ -424,6 +435,11 @@ impl<'a> Encoder<'a> {
                 encode_operation(command, out);
             }
             Mutation::Effects(effects) => self.effects(effects, out),
+            Mutation::Namespace(namespace) => {
+                out.push(TAG_NAMESPACE);
+                put_varint(namespace.as_raw(), out);
+                self.expanded += NAMESPACE_BYTES;
+            }
         }
         Ok(())
     }
@@ -605,6 +621,7 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
             limit: limits.max_ops,
         });
     }
+    super::proposal::check_scoped(unit.mutations)?;
     // Each addend is the length of a slice held in memory for this unit.
     let mut expanded = 0usize;
     // Lengths and counts an effect context adds per entry, beyond the one
@@ -631,6 +648,7 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
                     + new
             }
             Mutation::Operation(command) => command.size_estimate(),
+            Mutation::Namespace(_) => NAMESPACE_BYTES,
             Mutation::Effects(effects) => {
                 check_runs(&effects.runs, &unit.mutations[..at])?;
                 // The slots of each list, as the decoder counts them.
@@ -863,10 +881,18 @@ fn decode_with(
         expanded: 0,
         limit: limits.max_expanded_bytes,
         objects,
+        named: false,
+        at: 0,
     };
     let mut mutations = Vec::with_capacity(op_count);
-    for _ in 0..op_count {
+    for at in 0..op_count {
+        decoder.at = at;
         if let Some(op) = decoder.op(&mutations)? {
+            // A namespace's data before any namespace is named is refused
+            // here, before anything reads the unit.
+            if op.requires_namespace() && !decoder.named {
+                return Err(super::proposal::Unscoped { at }.into());
+            }
             mutations.push(op);
         }
     }
@@ -949,6 +975,10 @@ struct Decoder<'a> {
     expanded: usize,
     limit: usize,
     objects: Objects,
+    /// Whether a namespace marker came before the operation being read.
+    named: bool,
+    /// The position of the operation being read.
+    at: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -975,6 +1005,10 @@ impl<'a> Decoder<'a> {
             if tag != KIND_DERIVE {
                 return Err(FrameError::UnknownTag(tag));
             }
+            // DERIVED work is a namespace's, whether or not it is read.
+            if !self.named {
+                return Err(super::proposal::Unscoped { at: self.at }.into());
+            }
             if self.objects == Objects::Skip {
                 self.skip_derive()?;
                 return Ok(None);
@@ -982,6 +1016,12 @@ impl<'a> Decoder<'a> {
             return self
                 .derive(earlier)
                 .map(|work| Some(Mutation::Derive(work)));
+        }
+        if tag == TAG_NAMESPACE {
+            let namespace = crate::namespace::NamespaceId::from_raw(self.reader.varint()?);
+            self.spend(NAMESPACE_BYTES)?;
+            self.named = true;
+            return Ok(Some(Mutation::Namespace(namespace)));
         }
         if kind == KIND_COMMAND {
             if tag != KIND_COMMAND {

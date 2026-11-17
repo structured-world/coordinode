@@ -10,14 +10,14 @@ use super::{CdcHub, HubRead};
 /// The entry at `index` carrying one unit frame.
 fn entry(index: u64) -> OplogEntry {
     let frame = coordinode_core::txn::frame::encode_unit(
-        &[
+        &coordinode_storage::engine::scope::store_unit([
             Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:k{index}").into_bytes(),
                 value: b"v".to_vec(),
             },
             Mutation::Effects(UnitEffects::new()),
-        ],
+        ]),
         Timestamp::from_raw(1000 + index),
     )
     .expect("frame");

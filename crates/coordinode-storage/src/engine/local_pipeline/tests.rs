@@ -27,11 +27,11 @@ fn local_pipeline_put_and_read() {
 
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: crate::engine::scope::store_unit([Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:1".to_vec(),
             value: b"test-data".to_vec(),
-        }],
+        }]),
         commit_ts: Timestamp::from_raw(100),
         start_ts: Timestamp::from_raw(99),
         bypass_rate_limiter: false,
@@ -55,11 +55,11 @@ fn local_pipeline_delete() {
     // First write a value
     let put = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: crate::engine::scope::store_unit([Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:2".to_vec(),
             value: b"data".to_vec(),
-        }],
+        }]),
         commit_ts: Timestamp::from_raw(100),
         start_ts: Timestamp::from_raw(99),
         bypass_rate_limiter: false,
@@ -72,10 +72,10 @@ fn local_pipeline_delete() {
     // Then delete
     let del = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Delete {
+        mutations: crate::engine::scope::store_unit([Mutation::Delete {
             partition: PartitionId::Node,
             key: b"node:1:2".to_vec(),
-        }],
+        }]),
         commit_ts: Timestamp::from_raw(200),
         start_ts: Timestamp::from_raw(199),
         bypass_rate_limiter: false,
@@ -101,7 +101,7 @@ fn local_pipeline_multi_mutation_proposal() {
 
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![
+        mutations: crate::engine::scope::store_unit([
             Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:10".to_vec(),
@@ -122,7 +122,7 @@ fn local_pipeline_multi_mutation_proposal() {
                 key: b"edgeprop:KNOWS:10:11".to_vec(),
                 value: b"since:2024".to_vec(),
             },
-        ],
+        ]),
         commit_ts: Timestamp::from_raw(500),
         start_ts: Timestamp::from_raw(499),
         bypass_rate_limiter: false,
@@ -189,11 +189,11 @@ fn local_pipeline_propose_with_timeout_succeeds() {
 
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: crate::engine::scope::store_unit([Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:timeout-local".to_vec(),
             value: b"value".to_vec(),
-        }],
+        }]),
         commit_ts: Timestamp::from_raw(100),
         start_ts: Timestamp::from_raw(99),
         bypass_rate_limiter: false,
@@ -221,11 +221,11 @@ fn local_pipeline_has_no_committed_index() {
     let outcome = pipeline
         .propose_and_wait(&RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: crate::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:local-idx".to_vec(),
                 value: b"v".to_vec(),
-            }],
+            }]),
             commit_ts: Timestamp::from_raw(100),
             start_ts: Timestamp::from_raw(99),
             bypass_rate_limiter: false,

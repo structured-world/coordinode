@@ -1914,7 +1914,7 @@ fn apply_proposal_at_stamps_every_mutation_with_the_commit_ts() {
 
     engine
         .apply_proposal_at(
-            &[
+            &crate::engine::scope::store_unit([
                 Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"node:0:1".to_vec(),
@@ -1930,7 +1930,7 @@ fn apply_proposal_at_stamps_every_mutation_with_the_commit_ts() {
                     key: b"schema:label:X".to_vec(),
                     value: b"{}".to_vec(),
                 },
-            ],
+            ]),
             commit_ts,
         )
         .expect("apply");
@@ -2003,11 +2003,11 @@ fn apply_proposal_at_follower_timestamp_advances_the_oracle() {
     let leader_ts = oracle.current().as_raw() + 5_000_000;
     engine
         .apply_proposal_at(
-            &[Mutation::Put {
+            &crate::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:0:7".to_vec(),
                 value: b"from-leader".to_vec(),
-            }],
+            }]),
             leader_ts,
         )
         .expect("apply");
@@ -2042,11 +2042,11 @@ fn apply_proposal_at_without_oracle_allocates_a_fresh_seqno() {
     let stale_ts = 1u64;
     engine
         .apply_proposal_at(
-            &[Mutation::Put {
+            &crate::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:0:3".to_vec(),
                 value: b"newer".to_vec(),
-            }],
+            }]),
             stale_ts,
         )
         .expect("apply");
@@ -2114,10 +2114,10 @@ fn apply_proposal_at_out_of_order_commit_ts_land_at_their_own_seqnos() {
         value: b"v".to_vec(),
     };
     engine
-        .apply_proposal_at(&[put(b"node:0:t2")], t2)
+        .apply_proposal_at(&crate::engine::scope::store_unit([put(b"node:0:t2")]), t2)
         .expect("apply t2 first");
     engine
-        .apply_proposal_at(&[put(b"node:0:t1")], t1)
+        .apply_proposal_at(&crate::engine::scope::store_unit([put(b"node:0:t1")]), t1)
         .expect("apply t1 second");
 
     // Snapshot at S sees seqnos strictly below S.
@@ -2184,16 +2184,18 @@ fn apply_proposal_at_range_delete_lands_at_the_commit_ts() {
         value: b"p".to_vec(),
     })
     .collect();
-    engine.apply_proposal_at(&puts, seed_ts).expect("seed");
+    engine
+        .apply_proposal_at(&crate::engine::scope::store_unit(puts), seed_ts)
+        .expect("seed");
 
     let del_ts = oracle.next().as_raw();
     engine
         .apply_proposal_at(
-            &[Mutation::RemoveRange {
+            &crate::engine::scope::store_unit([Mutation::RemoveRange {
                 partition: PartitionId::EdgeProp,
                 start: b"edgeprop:E:a".to_vec(),
                 end: b"edgeprop:E:d".to_vec(), // half-open: `d` survives
-            }],
+            }]),
             del_ts,
         )
         .expect("range delete");
@@ -2233,7 +2235,7 @@ fn apply_proposal_at_rejects_mixed_operations_on_one_key() {
     let (engine, _dir) = test_engine();
     let err = engine
         .apply_proposal_at(
-            &[
+            &crate::engine::scope::store_unit([
                 Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"node:0:5".to_vec(),
@@ -2243,7 +2245,7 @@ fn apply_proposal_at_rejects_mixed_operations_on_one_key() {
                     partition: PartitionId::Node,
                     key: b"node:0:5".to_vec(),
                 },
-            ],
+            ]),
             0,
         )
         .expect_err("mixed kinds on one key");

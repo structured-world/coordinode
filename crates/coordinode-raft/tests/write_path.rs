@@ -21,6 +21,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,7 +73,7 @@ fn open_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
 fn make_proposal(id_raw: u64, key: &str, value: &str, ts: u64) -> RaftProposal {
     RaftProposal {
         id: ProposalId::from_raw(id_raw),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
@@ -207,7 +214,7 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
         for i in 1u64..=5 {
             let proposal = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("crash-key-{i}").into_bytes(),
                     value: format!("crash-val-{i}").into_bytes(),
@@ -318,7 +325,7 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
         let id_gen = ProposalIdGenerator::with_base(1000);
         let new_proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"crash-key-new".to_vec(),
                 value: b"crash-val-new".to_vec(),
@@ -372,7 +379,7 @@ async fn a_stopped_node_leaves_its_directory_free_while_the_trigger_probes() {
         .expect("open the node");
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("probe-{round}").into_bytes(),
                 value: b"v".to_vec(),
@@ -411,7 +418,7 @@ async fn an_applied_proposal_is_recorded_in_its_tree() {
 
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"apply-order-key".to_vec(),
             value: b"apply-order-val".to_vec(),

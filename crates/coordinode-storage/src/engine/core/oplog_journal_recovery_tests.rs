@@ -33,16 +33,21 @@ fn durable_cfg(dir: &TempDir) -> StorageConfig {
 }
 
 /// Write a batch the way the embedded pipeline does: draw a commit_ts from the
-/// oracle, journal the mutations at that ts, then apply them all at that ts.
-/// Returns the commit_ts.
+/// oracle, journal the mutations at that ts in the store's namespace (unless
+/// they name theirs), then apply them all at that ts. Returns the commit_ts.
 fn write_batch(
     engine: &StorageEngine,
     oracle: &Arc<TimestampOracle>,
     mutations: &[Mutation],
 ) -> u64 {
     let commit_ts = oracle.next().as_raw();
+    let unit = if matches!(mutations.first(), Some(Mutation::Namespace(_))) {
+        mutations.to_vec()
+    } else {
+        crate::engine::scope::store_unit(mutations.iter().cloned())
+    };
     engine
-        .commit_journaled(mutations, commit_ts)
+        .commit_journaled(&unit, commit_ts)
         .expect("commit_journaled");
     commit_ts
 }
@@ -473,7 +478,10 @@ fn cut_journal(point: Option<(std::path::PathBuf, u64)>) {
 /// already landed, so the physical apply follows a larger timestamp.
 fn write_batch_at(engine: &StorageEngine, mutations: &[Mutation], commit_ts: u64) {
     engine
-        .commit_journaled(mutations, commit_ts)
+        .commit_journaled(
+            &crate::engine::scope::store_unit(mutations.iter().cloned()),
+            commit_ts,
+        )
         .expect("commit_journaled");
 }
 
@@ -2266,7 +2274,7 @@ fn folded_columnar_coverage_hides_its_record_and_replays_nothing_twice() {
 /// One commit of the crash campaign: a put naming it, an edge carrying its
 /// number and a +1 on a shared counter, across three trees.
 fn campaign_commit(i: u64) -> Vec<Mutation> {
-    vec![
+    crate::engine::scope::store_unit([
         Mutation::Put {
             partition: PartitionId::Node,
             key: format!("node:00:c{i:04}").into_bytes(),
@@ -2282,7 +2290,7 @@ fn campaign_commit(i: u64) -> Vec<Mutation> {
             key: b"counter:campaign".to_vec(),
             operand: crate::engine::merge::encode_counter_delta(1),
         },
-    ]
+    ])
 }
 
 const CAMPAIGN_COMMITS: u64 = 24;
@@ -2433,9 +2441,9 @@ fn a_power_cut_at_any_write_leaves_every_commit_once() {
 }
 
 /// A commit writing `name` into the node tree and an edge numbered `n` into
-/// the adjacency tree: one entry, two trees.
+/// the adjacency tree: one entry, two trees, in the store's namespace.
 fn two_tree_commit(name: &str, n: u64) -> Vec<Mutation> {
-    vec![
+    crate::engine::scope::store_unit([
         Mutation::Put {
             partition: PartitionId::Node,
             key: format!("node:00:{name}").into_bytes(),
@@ -2446,7 +2454,7 @@ fn two_tree_commit(name: &str, n: u64) -> Vec<Mutation> {
             key: b"adj:V:out:1".to_vec(),
             operand: crate::engine::merge::encode_add(n),
         },
-    ]
+    ])
 }
 
 /// Whether `name`'s node row is there, and the edges the adjacency tree holds.
@@ -2684,7 +2692,7 @@ fn a_journaled_retry_of_a_volatile_operation_makes_it_durable() {
         sequence: 1,
     };
     let bound = |attempt| {
-        vec![
+        crate::engine::scope::store_unit([
             Mutation::Merge {
                 partition: PartitionId::Counter,
                 key: b"counter:retry".to_vec(),
@@ -2695,7 +2703,7 @@ fn a_journaled_retry_of_a_volatile_operation_makes_it_durable() {
                 intent: IntentDigest([7; INTENT_DIGEST_LEN]),
                 attempt,
             })),
-        ]
+        ])
     };
     let rig = PowerRig::new();
     {
@@ -2815,11 +2823,12 @@ mod derived {
     }
 
     /// A node record put for `email`, then the DERIVED work moving the node's
-    /// entry from `old` to what that record holds.
+    /// entry from `old` to what that record holds: a unit of the store's
+    /// namespace, the record at position 1 after the marker.
     fn unit(node_id: u64, email: &str, old: Option<&str>) -> Vec<Mutation> {
         let mut record = NodeRecord::new(coordinode_core::schema::label_id::FIRST_LABEL_ID);
         record.set(1, Value::String(email.into()));
-        vec![
+        crate::engine::scope::store_unit([
             Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:00:{node_id:04}").into_bytes(),
@@ -2833,9 +2842,9 @@ mod derived {
                 node_id,
                 valid_from: None,
                 old: old.map(|o| vec![Value::String(o.into())]),
-                new: DerivedSource::UnitRecord(0),
+                new: DerivedSource::UnitRecord(1),
             }),
-        ]
+        ])
     }
 
     fn has(engine: &StorageEngine, key: &[u8]) -> bool {

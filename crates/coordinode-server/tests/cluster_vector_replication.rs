@@ -952,11 +952,11 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
         .pipeline()
         .propose_and_wait(&RaftProposal {
             id: ProposalIdGenerator::with_base(fresh_proposal_id_base()).next(),
-            mutations: vec![Mutation::Put {
+            mutations: coordinode_storage::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: held_key.clone(),
                 value: record.to_msgpack().unwrap(),
-            }],
+            }]),
             commit_ts: Timestamp::from_raw(held_ts),
             start_ts: Timestamp::from_raw(held_ts),
             bypass_rate_limiter: false,

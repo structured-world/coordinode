@@ -16,6 +16,13 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 fn init_test_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("coordinode_raft=info,openraft=off")
@@ -53,7 +60,7 @@ async fn e2e_propose_multi_partition_and_read() {
     // Create a proposal with mutations across multiple partitions
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![
+        mutations: unit![
             Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:100".to_vec(),
@@ -109,7 +116,7 @@ async fn a_stopped_node_records_every_entry_it_applied() {
     let ids = Arc::new(ProposalIdGenerator::new());
     let put = |id, key: &[u8], ts: u64| RaftProposal {
         id,
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.to_vec(),
             value: b"v".to_vec(),
@@ -162,7 +169,7 @@ async fn a_node_stopped_with_work_still_running_claims_no_final_prefix() {
     node.pipeline()
         .propose_and_wait(&RaftProposal {
             id: ProposalIdGenerator::new().next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:held".to_vec(),
                 value: b"v".to_vec(),
@@ -210,7 +217,7 @@ async fn an_apply_stopped_through_shutdown_is_not_recorded_and_reopens() {
     )]);
     let put = |id, key: &[u8], ts: u64| RaftProposal {
         id,
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.to_vec(),
             value: b"v".to_vec(),
@@ -326,7 +333,7 @@ async fn e2e_applied_watermark_tracking() {
     for i in 1..=3u64 {
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:1:{i}").into_bytes(),
                 value: format!("val-{i}").into_bytes(),
@@ -370,7 +377,7 @@ async fn e2e_delete_through_raft() {
     // Put
     let put = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:50".to_vec(),
             value: b"to-delete".to_vec(),
@@ -384,7 +391,7 @@ async fn e2e_delete_through_raft() {
     // Delete
     let del = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Delete {
+        mutations: unit![Mutation::Delete {
             partition: PartitionId::Node,
             key: b"node:1:50".to_vec(),
         }],
@@ -419,7 +426,7 @@ async fn e2e_empty_proposal_noop() {
 
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![],
+        mutations: Vec::new(),
         commit_ts: Timestamp::from_raw(100),
         start_ts: Timestamp::from_raw(99),
         bypass_rate_limiter: false,
@@ -453,7 +460,7 @@ async fn e2e_dedup_same_id_same_size_different_value() {
     // First proposal: value = "AAAA" (4 bytes)
     let proposal1 = RaftProposal {
         id: fixed_id,
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:dedup".to_vec(),
             value: b"AAAA".to_vec(),
@@ -467,7 +474,7 @@ async fn e2e_dedup_same_id_same_size_different_value() {
     // But value = "BBBB" (different content)
     let proposal2 = RaftProposal {
         id: fixed_id,
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:dedup".to_vec(),
             value: b"BBBB".to_vec(),
@@ -523,7 +530,7 @@ async fn e2e_all_partitions() {
     // Write to ALL 7 partitions in a single proposal
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![
+        mutations: unit![
             Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:1".to_vec(),
@@ -641,7 +648,7 @@ async fn e2e_schema_partition_no_raft_collision() {
     // Write user data to Schema partition
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![
+        mutations: unit![
             Mutation::Put {
                 partition: PartitionId::Schema,
                 key: b"schema:label:User".to_vec(),
@@ -673,7 +680,7 @@ async fn e2e_schema_partition_no_raft_collision() {
     // Submit another proposal to prove the raft state machine still works
     let proposal2 = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:after-schema".to_vec(),
             value: b"still-working".to_vec(),
@@ -716,7 +723,7 @@ async fn e2e_wait_for_future_applied() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let proposal = RaftProposal {
             id: id_gen_bg.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:future".to_vec(),
                 value: b"arrived".to_vec(),
@@ -779,7 +786,7 @@ async fn e2e_propose_after_shutdown_returns_error() {
     // Now try to propose — should return error, NOT panic
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:after-shutdown".to_vec(),
             value: b"should-fail".to_vec(),
@@ -816,7 +823,7 @@ async fn a_sole_voter_recovers_from_one_copy_and_refuses_with_none() {
         node.pipeline()
             .propose_and_wait(&RaftProposal {
                 id: ProposalIdGenerator::with_base(i << 40).next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:{i}").into_bytes(),
                     value: b"v".to_vec(),
@@ -1005,7 +1012,7 @@ async fn e2e_crash_recovery_data_survives_restart() {
         for i in 1..=3u64 {
             let proposal = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![
+                mutations: unit![
                     Mutation::Put {
                         partition: PartitionId::Node,
                         key: format!("node:1:{i}").into_bytes(),
@@ -1077,7 +1084,7 @@ async fn e2e_crash_recovery_data_survives_restart() {
 
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:after-restart".to_vec(),
                 value: b"new-data".to_vec(),
@@ -1132,7 +1139,7 @@ async fn e2e_watermark_survives_restart() {
         for i in 1..=5u64 {
             let proposal = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:{i}").into_bytes(),
                     value: b"x".to_vec(),
@@ -1193,7 +1200,7 @@ async fn e2e_concurrent_proposals() {
         handles.push(tokio::task::spawn_blocking(move || {
             let proposal = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:c{i}").into_bytes(),
                     value: format!("concurrent-{i}").into_bytes(),

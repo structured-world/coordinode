@@ -6,6 +6,13 @@ use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::partition::Partition;
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -149,7 +156,7 @@ async fn a_checkpoint_returns_once_the_snapshot_covers_the_applied_log() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let proposal = RaftProposal {
         id: ProposalIdGenerator::new().next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:checkpoint".to_vec(),
             value: b"v".to_vec(),
@@ -312,7 +319,7 @@ async fn single_node_propose_and_read() {
 
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:42".to_vec(),
             value: b"hello-raft".to_vec(),
@@ -351,7 +358,7 @@ async fn applied_watermark_advances() {
     // Submit a proposal
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:1".to_vec(),
             value: b"data".to_vec(),
@@ -394,7 +401,7 @@ async fn multiple_proposals_sequential() {
     for i in 1..=5u64 {
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:1:{i}").into_bytes(),
                 value: format!("value-{i}").into_bytes(),

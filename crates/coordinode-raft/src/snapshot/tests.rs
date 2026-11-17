@@ -651,8 +651,15 @@ fn test_snapshot_roundtrip_with_data() {
     );
 }
 
+/// The unit of `command` as its proposer builds it: a namespace's command
+/// names the store's namespace first, the deployment's needs none.
 fn command(command: coordinode_core::txn::proposal::MetadataCommand) -> Vec<Mutation> {
-    vec![Mutation::Command(command)]
+    let command = Mutation::Command(command);
+    if command.requires_namespace() {
+        coordinode_storage::engine::scope::store_unit([command])
+    } else {
+        vec![command]
+    }
 }
 
 fn grant(base: u64, ceiling: u64, token: u8) -> Vec<Mutation> {

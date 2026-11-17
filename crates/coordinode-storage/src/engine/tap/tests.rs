@@ -70,7 +70,10 @@ fn a_tap_delivers_the_keys_of_an_applied_proposal() {
     let engine = StorageEngine::open_with_oracle(&config(&dir), Arc::clone(&oracle)).expect("open");
     let (tap, _) = engine.tap_writes(Partition::Node).expect("tap");
     engine
-        .apply_proposal_at(&[put(b"x"), put(b"y")], oracle.next().as_raw())
+        .apply_proposal_at(
+            &crate::engine::scope::store_unit([put(b"x"), put(b"y")]),
+            oracle.next().as_raw(),
+        )
         .expect("apply");
     assert_eq!(keys(tap.take()), vec![b"x".to_vec(), b"y".to_vec()]);
 }
@@ -91,7 +94,7 @@ fn a_write_landing_below_the_tap_snapshot_is_delivered() {
     );
 
     engine
-        .apply_proposal_at(&[put(b"late")], early)
+        .apply_proposal_at(&crate::engine::scope::store_unit([put(b"late")]), early)
         .expect("apply");
 
     assert_eq!(keys(tap.take()), vec![b"late".to_vec()]);
@@ -198,7 +201,9 @@ fn concurrent_writes_are_visible_at_the_snapshot_or_delivered() {
                 while !stop.load(Ordering::Relaxed) {
                     let key = format!("w{w}-{i:08}").into_bytes();
                     let ts = oracle.next().as_raw();
-                    engine.apply_proposal_at(&[put(&key)], ts).expect("apply");
+                    engine
+                        .apply_proposal_at(&crate::engine::scope::store_unit([put(&key)]), ts)
+                        .expect("apply");
                     written.push(key);
                     i += 1;
                 }

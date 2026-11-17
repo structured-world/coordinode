@@ -218,8 +218,10 @@ fn a_coalesced_run_of_deletes_is_named_a_run() {
         t.delete(Partition::Node, &key(id)).expect("stage");
     }
     let unit = sealed(&engine, t);
+    // Runs name row positions: the unit's namespace marker is not a row.
     let ranges: Vec<usize> = unit
         .iter()
+        .filter(|m| !matches!(m, Mutation::Namespace(_)))
         .enumerate()
         .filter(|(_, m)| matches!(m, Mutation::RemoveRange { .. }))
         .map(|(at, _)| at)

@@ -6,6 +6,13 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use tempfile::TempDir;
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 /// A timestamp for a data write, held as not yet logged.
 fn held_write(
     engine: &StorageEngine,
@@ -64,7 +71,7 @@ async fn closed_by_its_own_entry(
         let (ts, held) = held_write(engine, oracle);
         let proposal = RaftProposal {
             id: ids.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: key.to_vec(),
                 value: b"v".to_vec(),
@@ -176,7 +183,7 @@ async fn rate_limiter_bypass_succeeds_when_exhausted() {
 
     let normal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:normal".to_vec(),
             value: b"data".to_vec(),
@@ -194,7 +201,7 @@ async fn rate_limiter_bypass_succeeds_when_exhausted() {
 
     let bypass = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:bypass".to_vec(),
             value: b"delta".to_vec(),
@@ -234,7 +241,7 @@ async fn rate_limiter_bypass_holds_below_majority() {
 
     let bypass = |key: &[u8], ts: u64| RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.to_vec(),
             value: b"delta".to_vec(),
@@ -315,7 +322,7 @@ async fn raft_pipeline_propose_with_timeout_succeeds() {
 
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:timeout-raft".to_vec(),
             value: b"raft-val".to_vec(),
@@ -356,7 +363,7 @@ async fn raft_pipeline_returns_committed_index() {
 
     let mk = |key: &[u8], ts: u64| RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.to_vec(),
             value: b"v".to_vec(),
@@ -427,7 +434,7 @@ async fn propose_and_wait_works_from_a_plain_thread() {
 
     let proposal = RaftProposal {
         id: ProposalIdGenerator::new().next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:9001".to_vec(),
             value: b"drain-thread".to_vec(),
@@ -468,7 +475,7 @@ async fn a_retry_below_the_closed_bound_is_not_a_refusal() {
     let (ts, held) = held_write(&engine, &oracle);
     let proposal = RaftProposal {
         id: ProposalIdGenerator::new().next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:retried".to_vec(),
             value: b"v".to_vec(),
@@ -530,7 +537,7 @@ async fn a_sealed_commit_is_closed_by_its_own_entry() {
     let ids = ProposalIdGenerator::new();
     let put = |ts: u64, key: &[u8]| RaftProposal {
         id: ids.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.to_vec(),
             value: b"v".to_vec(),
@@ -632,7 +639,7 @@ async fn a_sealed_write_retried_after_an_unknown_outcome_lands_once() {
     let (ts, held) = held_write(&engine, &oracle);
     let proposal = RaftProposal {
         id: ids.next(),
-        mutations: vec![Mutation::Merge {
+        mutations: unit![Mutation::Merge {
             partition: PartitionId::Counter,
             key: key.clone(),
             operand: coordinode_storage::engine::merge::encode_counter_delta(1),
@@ -731,7 +738,7 @@ async fn an_earlier_hold_keeps_the_bound_below_a_later_write() {
     let (ts, held) = held_write(&engine, &oracle);
     let proposal = RaftProposal {
         id: ProposalIdGenerator::new().next(),
-        mutations: vec![Mutation::Merge {
+        mutations: unit![Mutation::Merge {
             partition: PartitionId::Counter,
             key: b"counter:held-below".to_vec(),
             operand: coordinode_storage::engine::merge::encode_counter_delta(1),

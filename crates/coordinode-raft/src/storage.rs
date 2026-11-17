@@ -1367,12 +1367,15 @@ impl LogStore {
                     // follows a record the same unit or an earlier one wrote,
                     // and an operation record describes the unit's own data,
                     // as an effect context describes its rows.
+                    // A namespace marker names where the data after it
+                    // goes and writes nothing itself.
                     Mutation::Delete { .. }
                     | Mutation::RemoveRange { .. }
                     | Mutation::Command(_)
                     | Mutation::Derive(_)
                     | Mutation::Operation(_)
-                    | Mutation::Effects(_) => false,
+                    | Mutation::Effects(_)
+                    | Mutation::Namespace(_) => false,
                 });
             if writes {
                 return Ok(true);

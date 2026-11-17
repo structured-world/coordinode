@@ -5,6 +5,13 @@ use coordinode_core::txn::proposal::PartitionId;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 /// The directory of the consensus log's tree under the endpoint `dir`.
 fn raft_tree(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join(coordinode_storage::engine::scope::store_tree(Partition::Raft).dir())
@@ -95,7 +102,7 @@ async fn only_user_writes_in_the_log_count_as_data() {
 
     let bookkeeping = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
-        mutations: vec![
+        mutations: unit![
             Mutation::Command(
                 coordinode_core::txn::proposal::MetadataCommand::RegisterFields {
                     names: vec!["name".to_string()],
@@ -747,7 +754,7 @@ async fn installing_a_snapshot_rebinds_every_tree_to_it() {
 fn node_put(id: u64, commit_ts: u64, value: &[u8]) -> RaftProposal {
     RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(id),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: format!("node:1:{id}").into_bytes(),
             value: value.to_vec(),
@@ -766,7 +773,7 @@ fn dedup_skips_duplicate_proposal() {
 
     let proposal = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(42),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: coordinode_core::txn::proposal::PartitionId::Node,
             key: b"node:1:100".to_vec(),
             value: b"data".to_vec(),
@@ -795,7 +802,7 @@ fn dedup_allows_different_size_same_id() {
 
     let proposal_v1 = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(42),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: coordinode_core::txn::proposal::PartitionId::Node,
             key: b"node:1:100".to_vec(),
             value: b"short".to_vec(),
@@ -807,7 +814,7 @@ fn dedup_allows_different_size_same_id() {
 
     let proposal_v2 = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(42),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: coordinode_core::txn::proposal::PartitionId::Node,
             key: b"node:1:100".to_vec(),
             value: b"much-longer-value-that-changes-size".to_vec(),
@@ -867,7 +874,7 @@ fn two_tree_merge_entry(index: u64, commit_ts: u64) -> Entry {
     use openraft::entry::RaftEntry;
     let proposal = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
-        mutations: vec![
+        mutations: unit![
             Mutation::Merge {
                 partition: PartitionId::Adj,
                 key: b"adj:R:out:1".to_vec(),
@@ -1204,7 +1211,9 @@ fn bound_entry(index: u64, id: u64, commit_ts: u64, intent: u8) -> Entry {
             window: DEFAULT_ADMISSION_WINDOW,
         })]
     } else {
-        vec![
+        // The increment is the store's namespace's data, the enrollment above
+        // the deployment's.
+        unit![
             Mutation::Merge {
                 partition: PartitionId::Counter,
                 key: b"counter:bound".to_vec(),
@@ -1497,7 +1506,7 @@ async fn an_entry_after_the_snapshot_wins_over_the_installed_value() {
             log_id(1, index),
             Request::single(RaftProposal {
                 id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"node:1:k".to_vec(),
                     value: value.to_vec(),
@@ -1548,7 +1557,7 @@ fn node_key_entry(index: u64, ts: u64, key: &[u8], value: &[u8]) -> Entry {
         log_id(1, index),
         Request::single(RaftProposal {
             id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: key.to_vec(),
                 value: value.to_vec(),
@@ -1569,7 +1578,7 @@ fn index_entry(index: u64, ts: u64, rest: &[u8], value: &[u8]) -> Entry {
         log_id(1, index),
         Request::single(RaftProposal {
             id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Idx,
                 key: generation_key(rest),
                 value: value.to_vec(),
@@ -2498,7 +2507,7 @@ async fn a_registration_lost_before_flush_replays_to_the_same_ids() {
             log_id(1, index),
             Request::single(RaftProposal {
                 id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
-                mutations: vec![Mutation::Command(MetadataCommand::RegisterFields {
+                mutations: unit![Mutation::Command(MetadataCommand::RegisterFields {
                     names: names.iter().map(|n| (*n).to_owned()).collect(),
                 })],
                 commit_ts: Timestamp::from_raw(ts),
@@ -2574,11 +2583,19 @@ fn capture_entry(
         Request {
             proposals: vec![RaftProposal {
                 id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
-                mutations: vec![Mutation::Put {
-                    partition,
-                    key: key.to_vec(),
-                    value: value.to_vec(),
-                }],
+                // The deployment's registry names no namespace.
+                mutations: {
+                    let put = Mutation::Put {
+                        partition,
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                    };
+                    if put.requires_namespace() {
+                        unit![put]
+                    } else {
+                        Vec::from([put])
+                    }
+                },
                 commit_ts: Timestamp::from_raw(ts),
                 start_ts: Timestamp::from_raw(ts - 1),
                 bypass_rate_limiter: false,
@@ -2778,7 +2795,7 @@ fn raft_campaign_entry(index: u64, commit_ts: u64) -> Entry {
     use openraft::entry::RaftEntry;
     let proposal = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
-        mutations: vec![
+        mutations: unit![
             Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:00:c{index:04}").into_bytes(),
@@ -3285,7 +3302,7 @@ fn make_entry(index: u64, term: u64, title: &str) -> Entry {
 
     let proposal = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: format!("node:1:{index}").into_bytes(),
             value: title.as_bytes().to_vec(),
@@ -3415,7 +3432,7 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
     // Apply at commit_ts=base+500
     let proposal = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:1".to_vec(),
             value: b"first".to_vec(),
@@ -3429,7 +3446,7 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
     // Apply at commit_ts=base+700
     let proposal2 = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(2),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"node:1:1".to_vec(),
             value: b"second".to_vec(),
@@ -3507,14 +3524,13 @@ fn multi_mutation_entry_is_atomic_at_its_commit_ts() {
         .collect();
     let proposal = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
-        mutations: keys
-            .iter()
-            .map(|k| Mutation::Put {
+        mutations: coordinode_storage::engine::scope::store_unit(keys.iter().map(|k| {
+            Mutation::Put {
                 partition: PartitionId::Node,
                 key: k.clone(),
                 value: b"v".to_vec(),
-            })
-            .collect(),
+            }
+        })),
         commit_ts: Timestamp::from_raw(commit_ts),
         start_ts: Timestamp::from_raw(commit_ts - 1),
         bypass_rate_limiter: false,

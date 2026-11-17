@@ -286,11 +286,11 @@ fn over_its_own_journal_the_source_holds_what_it_admits() {
     for i in 0..6u64 {
         engine
             .commit_journaled(
-                &[Mutation::Put {
+                &coordinode_storage::engine::scope::store_unit([Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:j:{i}").into_bytes(),
                     value: b"v".to_vec(),
-                }],
+                }]),
                 oracle.next().as_raw(),
             )
             .expect("commit");

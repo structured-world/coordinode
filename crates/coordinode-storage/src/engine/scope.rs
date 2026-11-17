@@ -18,49 +18,7 @@ pub const SYSTEM_DIR: &str = "system";
 /// namespace.
 pub const NAMESPACES_DIR: &str = "ns";
 
-/// A namespace incarnation of one deployment. Allocated by the deployment's
-/// catalog and never reused within it: a namespace dropped and created again
-/// under the same name is a new incarnation with a new id, so nothing bound
-/// to the old one (a dictionary handle, a tree, a delayed worker) can reach
-/// the new one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NamespaceId(u64);
-
-impl NamespaceId {
-    /// The id from its number.
-    #[must_use]
-    pub const fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// The id's number.
-    #[must_use]
-    pub const fn as_raw(self) -> u64 {
-        self.0
-    }
-
-    /// The name of the namespace's directory under [`NAMESPACES_DIR`]:
-    /// fixed width, so a listing sorts by id.
-    #[must_use]
-    pub fn dir_name(self) -> String {
-        format!("{:016x}", self.0)
-    }
-
-    /// The id a directory under [`NAMESPACES_DIR`] is named for, `None` for
-    /// a name no namespace directory has.
-    #[must_use]
-    pub fn from_dir_name(name: &str) -> Option<Self> {
-        (name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| u64::from_str_radix(name, 16).ok().map(Self))
-            .flatten()
-    }
-}
-
-impl core::fmt::Display for NamespaceId {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "namespace {}", self.0)
-    }
-}
+pub use coordinode_core::namespace::NamespaceId;
 
 /// The set of trees a tree belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -183,7 +141,15 @@ impl core::fmt::Display for TreeId {
 
 /// The namespace an engine's data partitions open in while it holds one set
 /// of them.
-pub const STORE_NAMESPACE: NamespaceId = NamespaceId(1);
+pub const STORE_NAMESPACE: NamespaceId = NamespaceId::from_raw(1);
+
+/// The unit of `mutations` in [`STORE_NAMESPACE`], the marker naming it
+/// first.
+pub fn store_unit(
+    mutations: impl IntoIterator<Item = coordinode_core::txn::proposal::Mutation>,
+) -> Vec<coordinode_core::txn::proposal::Mutation> {
+    coordinode_core::txn::proposal::in_namespace(STORE_NAMESPACE, mutations)
+}
 
 /// The tree an engine holding one data set keeps `part` in: the deployment's
 /// own partitions in the system set, the rest in [`STORE_NAMESPACE`]. Its

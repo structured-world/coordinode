@@ -522,7 +522,8 @@ fn changes_application_data(mutations: &[Mutation]) -> bool {
         Mutation::Command(_)
         | Mutation::Derive(_)
         | Mutation::Operation(_)
-        | Mutation::Effects(_) => false,
+        | Mutation::Effects(_)
+        | Mutation::Namespace(_) => false,
     })
 }
 
@@ -3102,6 +3103,12 @@ impl<'a> Transaction<'a> {
             // refused before the log.
             .filter_map(|(at, _)| u32::try_from(at).ok())
             .collect();
+        // The unit names the namespace its rows belong to before them; the
+        // positions DERIVED work names count it, so it goes in first.
+        mutations.insert(
+            0,
+            Mutation::Namespace(crate::engine::scope::STORE_NAMESPACE),
+        );
         if !derived.is_empty() {
             derived.seal(&mut mutations);
         }

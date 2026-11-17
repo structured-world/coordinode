@@ -74,6 +74,9 @@ pub fn mutation_to_op(m: &Mutation) -> StorageResult<OplogOp> {
                 "an effect context has no raw op: only its unit's frame carries it".into(),
             ));
         }
+        Mutation::Namespace(namespace) => OplogOp::Namespace {
+            id: namespace.as_raw(),
+        },
     })
 }
 
@@ -135,6 +138,9 @@ fn op_to_mutation(op: &OplogOp) -> StorageResult<Mutation> {
             rmp_serde::from_slice(work)
                 .map_err(|e| StorageError::Serialization(format!("derived index work: {e}")))?,
         ),
+        OplogOp::Namespace { id } => {
+            Mutation::Namespace(coordinode_core::namespace::NamespaceId::from_raw(*id))
+        }
         OplogOp::Noop
         | OplogOp::RaftEntry { .. }
         | OplogOp::RaftTruncation { .. }

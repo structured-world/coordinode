@@ -37,11 +37,11 @@ fn commit(engine: &StorageEngine, ts: u64, key: &[u8], value: &[u8]) {
 fn commit_to(engine: &StorageEngine, partition: PartitionId, ts: u64, key: &[u8], value: &[u8]) {
     engine
         .commit_journaled(
-            &[Mutation::Put {
+            &crate::engine::scope::store_unit([Mutation::Put {
                 partition,
                 key: key.to_vec(),
                 value: value.to_vec(),
-            }],
+            }]),
             ts,
         )
         .expect("commit");

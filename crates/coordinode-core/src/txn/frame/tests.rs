@@ -12,7 +12,16 @@ fn put(partition: PartitionId, key: &[u8], value: &[u8]) -> Mutation {
     }
 }
 
+/// The namespace the units of these tests write.
+const NS: crate::namespace::NamespaceId = crate::namespace::NamespaceId::from_raw(1);
+
+/// A proposal of `mutations`, in [`NS`].
 fn proposal(mutations: Vec<Mutation>) -> RaftProposal {
+    unnamed(crate::txn::proposal::in_namespace(NS, mutations))
+}
+
+/// A proposal of `mutations` exactly as given, no namespace named for them.
+fn unnamed(mutations: Vec<Mutation>) -> RaftProposal {
     RaftProposal {
         id: ProposalId::from_raw(0xDEAD_BEEF_0042),
         mutations,
@@ -221,7 +230,8 @@ fn unknown_flags_and_tags_are_refused() {
     for tag in [
         // One past the last partition a frame numbers.
         KIND_PUT | ((PARTITIONS.len() as u8) << 3),
-        KIND_COMMAND | (1 << 3),
+        // The one past the namespace marker.
+        KIND_COMMAND | (2 << 3),
         KIND_DERIVE | (1 << 3),
         KIND_OPERATION | (1 << 3),
         KIND_EFFECTS | (1 << 3),
@@ -283,14 +293,17 @@ fn operation_commands_round_trip() {
     ] {
         let proposal = RaftProposal {
             id: ProposalId::from_raw(4),
-            mutations: vec![
-                Mutation::Put {
-                    partition: PartitionId::Node,
-                    key: b"node:1:7".to_vec(),
-                    value: b"record".to_vec(),
-                },
-                Mutation::Operation(command),
-            ],
+            mutations: crate::txn::proposal::in_namespace(
+                NS,
+                [
+                    Mutation::Put {
+                        partition: PartitionId::Node,
+                        key: b"node:1:7".to_vec(),
+                        value: b"record".to_vec(),
+                    },
+                    Mutation::Operation(command),
+                ],
+            ),
             commit_ts: Timestamp::from_raw(10),
             start_ts: Timestamp::from_raw(9),
             bypass_rate_limiter: false,
@@ -442,6 +455,7 @@ fn a_reader_of_rows_leaves_commands_and_derived_work_out() {
         intent: IntentDigest([6; INTENT_DIGEST_LEN]),
         attempt: 1,
     }));
+    // Positions count the namespace marker: the first record put is at 3.
     let full = proposal(vec![
         derive(1, DerivedSource::Values(None)),
         derive(2, DerivedSource::Values(None)),
@@ -449,7 +463,7 @@ fn a_reader_of_rows_leaves_commands_and_derived_work_out() {
         Mutation::Command(MetadataCommand::RegisterFields {
             names: vec!["email".into(); 64],
         }),
-        derive(42, DerivedSource::UnitRecord(2)),
+        derive(42, DerivedSource::UnitRecord(3)),
         put(PartitionId::Node, b"node:1:43", b"record-bytes"),
         effects(),
         bind.clone(),
@@ -462,6 +476,7 @@ fn a_reader_of_rows_leaves_commands_and_derived_work_out() {
     assert_eq!(
         rows.mutations,
         vec![
+            Mutation::Namespace(NS),
             put(PartitionId::Node, b"node:1:42", b"record-bytes"),
             put(PartitionId::Node, b"node:1:43", b"record-bytes"),
             effects(),
@@ -484,10 +499,12 @@ fn an_unknown_owner_tag_is_refused() {
         unreachable!("derive builds a Derive mutation")
     };
     work.valid_from = Some(MARK);
-    let mut body = header(1);
-    Encoder::default()
-        .op(&Mutation::Derive(work), &mut body)
-        .expect("op");
+    let mut body = header(2);
+    let mut encoder = Encoder::default();
+    encoder
+        .op(&Mutation::Namespace(NS), &mut body)
+        .expect("marker");
+    encoder.op(&Mutation::Derive(work), &mut body).expect("op");
     let at = body
         .windows(8)
         .position(|w| w == MARK.to_be_bytes())
@@ -525,9 +542,10 @@ fn version_work_round_trips_its_valid_from() {
 /// binding every effect of one index repeats is written once.
 #[test]
 fn derived_work_round_trips_and_shares_its_binding() {
+    // The record put follows the namespace marker.
     let one = proposal(vec![
         put(PartitionId::Node, b"node:1:42", b"record-bytes"),
-        derive(42, DerivedSource::UnitRecord(0)),
+        derive(42, DerivedSource::UnitRecord(1)),
     ]);
     let frame_one = encode_proposal(&one).expect("encode");
     assert_eq!(decode(&frame_one).expect("decode"), one);
@@ -564,21 +582,36 @@ fn unchecked_frame(mutations: &[Mutation]) -> Vec<u8> {
 /// carries one anyway.
 #[test]
 fn a_source_that_is_not_an_earlier_record_is_refused() {
+    // Whole units, the namespace marker at position 0.
+    let ns = Mutation::Namespace(NS);
     let cases = [
-        vec![derive(1, DerivedSource::UnitRecord(0))],
+        // Itself.
+        vec![ns.clone(), derive(1, DerivedSource::UnitRecord(1))],
+        // The marker.
         vec![
-            put(PartitionId::Idx, b"idx:x", b""),
+            ns.clone(),
+            put(PartitionId::Node, b"node:1:1", b"r"),
             derive(1, DerivedSource::UnitRecord(0)),
         ],
+        // Another kind of operation.
         vec![
+            ns.clone(),
+            put(PartitionId::Idx, b"idx:x", b""),
             derive(1, DerivedSource::UnitRecord(1)),
+        ],
+        // A later record.
+        vec![
+            ns.clone(),
+            derive(1, DerivedSource::UnitRecord(2)),
             put(PartitionId::Node, b"node:1:1", b"r"),
         ],
+        // Past the unit.
+        vec![ns, derive(1, DerivedSource::UnitRecord(9))],
     ];
     for mutations in cases {
         assert!(
             matches!(
-                encode_proposal(&proposal(mutations.clone())),
+                encode_proposal(&unnamed(mutations.clone())),
                 Err(FrameError::BadSource { .. })
             ),
             "encode {mutations:?}"
@@ -608,11 +641,12 @@ fn a_unit_beyond_the_decode_bounds_is_not_encoded() {
     let decoded = decode_proposal(&frame, &DecodeLimits::DEFAULT).expect("decode");
     assert_eq!(decoded, unit);
 
-    // Two keys of 8 bytes and two values of 16, the second a reference.
-    let expanded = 2 * 8 + 2 * 16;
+    // The namespace marker, two keys of 8 bytes and two values of 16, the
+    // second a reference.
+    let expanded = NAMESPACE_BYTES + 2 * 8 + 2 * 16;
     let exact = DecodeLimits {
         max_frame_bytes: frame.len(),
-        max_ops: 2,
+        max_ops: 3,
         max_expanded_bytes: expanded,
     };
     assert_eq!(encode_within(&unit, &exact).expect("at the bounds"), frame);
@@ -621,7 +655,7 @@ fn a_unit_beyond_the_decode_bounds_is_not_encoded() {
     for (limits, what) in [
         (
             DecodeLimits {
-                max_ops: 1,
+                max_ops: 2,
                 ..exact
             },
             "operation count",
@@ -669,11 +703,12 @@ fn a_journal_unit_round_trips() {
 /// bound.
 #[test]
 fn the_admission_check_agrees_with_the_encoder() {
+    // The node put follows the namespace marker.
     let mut derived = mixed().mutations;
-    derived.push(derive(42, DerivedSource::UnitRecord(0)));
+    derived.push(derive(42, DerivedSource::UnitRecord(1)));
     derived.push(derive(43, DerivedSource::Values(None)));
     let bad_source = vec![derive(1, DerivedSource::UnitRecord(0))];
-    let units = [mixed(), proposal(derived), proposal(bad_source)];
+    let units = [mixed(), unnamed(derived), proposal(bad_source)];
     for unit in &units {
         let frame_len = encode_proposal(unit).map_or(64, |f| f.len());
         let expanded = (0..=frame_len * 64)
@@ -717,8 +752,9 @@ fn the_admission_check_agrees_with_the_encoder() {
 /// included: the smallest budget each accepts is the same.
 #[test]
 fn the_encoder_counts_expansion_as_the_decoder_does() {
+    // The node put follows the namespace marker.
     let mut derived = mixed().mutations;
-    derived.push(derive(42, DerivedSource::UnitRecord(0)));
+    derived.push(derive(42, DerivedSource::UnitRecord(1)));
     derived.push(derive(43, DerivedSource::Values(None)));
     derived.push(derive(
         44,
@@ -726,7 +762,7 @@ fn the_encoder_counts_expansion_as_the_decoder_does() {
             "new@x".into(),
         )])),
     ));
-    for unit in [mixed(), proposal(derived)] {
+    for unit in [mixed(), unnamed(derived)] {
         let frame = encode_proposal(&unit).expect("encode");
         let within = |max_expanded_bytes| DecodeLimits {
             max_expanded_bytes,
@@ -764,7 +800,10 @@ fn an_unsupported_interpretation_is_refused() {
         Err(FrameError::Unsupported(_))
     ));
     assert!(matches!(
-        decode(&unchecked_frame(&[work])),
+        decode(&unchecked_frame(&crate::txn::proposal::in_namespace(
+            NS,
+            [work]
+        ))),
         Err(FrameError::Unsupported(_))
     ));
 }
@@ -803,10 +842,8 @@ fn an_effect_context_costs_little_beside_the_rows_it_describes() {
         .expect("encode")
         .len();
     assert_eq!(
-        decode(&encode_proposal(&proposal(described.clone())).expect("encode"))
-            .expect("decode")
-            .mutations,
-        described
+        decode(&encode_proposal(&proposal(described.clone())).expect("encode")).expect("decode"),
+        proposal(described)
     );
     // Shared and suffix lengths, a short suffix, a count and two ids.
     assert!(
@@ -839,11 +876,17 @@ fn a_run_must_name_an_earlier_range_removal() {
         effects_with(vec![1]),
     ];
     let frame = encode_proposal(&proposal(good.clone())).expect("encode");
-    assert_eq!(decode(&frame).expect("decode").mutations, good);
+    assert_eq!(decode(&frame).expect("decode"), proposal(good.clone()));
     let (rows, _) = decode_proposal_rows(&frame, &DecodeLimits::DEFAULT).expect("rows");
+    // The marker is kept and, like the command, not counted as a row.
     assert_eq!(
         rows.mutations,
-        vec![good[0].clone(), good[2].clone(), good[3].clone()]
+        vec![
+            Mutation::Namespace(NS),
+            good[0].clone(),
+            good[2].clone(),
+            good[3].clone()
+        ]
     );
 
     for bad in [
@@ -868,7 +911,13 @@ fn a_run_must_name_an_earlier_range_removal() {
             "encoded {bad:?}"
         );
         assert!(
-            matches!(decode(&unchecked_frame(&bad)), Err(FrameError::Effects(_))),
+            matches!(
+                decode(&unchecked_frame(&crate::txn::proposal::in_namespace(
+                    NS,
+                    bad.clone()
+                ))),
+                Err(FrameError::Effects(_))
+            ),
             "decoded {bad:?}"
         );
     }
@@ -936,4 +985,136 @@ fn trailing_bytes_are_refused() {
     let mut body = header(0);
     body.push(0);
     assert_eq!(decode(&signed(body)), Err(FrameError::Trailing(1)));
+}
+
+/// A unit that writes several namespaces names each before its writes, and
+/// decodes with every marker where it was: what belongs to which namespace
+/// is in the frame, in order.
+#[test]
+fn a_unit_spanning_namespaces_keeps_each_marker_in_place() {
+    let other = crate::namespace::NamespaceId::from_raw(0x1234_5678_9abc);
+    let original = unnamed(vec![
+        Mutation::Namespace(NS),
+        put(PartitionId::Node, b"node:1:1", b"first"),
+        Mutation::Namespace(other),
+        put(PartitionId::Node, b"node:1:1", b"second"),
+        put(PartitionId::Schema, b"schema:label:A", b"{}"),
+    ]);
+    let frame = encode_proposal(&original).expect("encode");
+    assert_eq!(decode(&frame).expect("decode"), original);
+}
+
+/// The deployment's own writes and operation commands name no namespace,
+/// and need none.
+#[test]
+fn the_deployments_writes_need_no_namespace() {
+    let original = unnamed(vec![
+        put(PartitionId::Registry, b"registry:c", b"v"),
+        put(PartitionId::Deployment, b"catalog:x", b"v"),
+        Mutation::Command(MetadataCommand::GrantNodeLease {
+            base: 0,
+            ceiling: 10,
+            token: [1; crate::graph::node::NODE_LEASE_TOKEN_LEN],
+        }),
+    ]);
+    let frame = encode_proposal(&original).expect("encode");
+    assert_eq!(decode(&frame).expect("decode"), original);
+}
+
+/// A namespace's data with no namespace named before it is refused by the
+/// encoder, and a frame holding it (as a frame written before units named
+/// their namespaces does) is refused by the decoder, before anything reads
+/// the unit: a row change, a namespace's metadata command and DERIVED work
+/// alike, whether or not a reader of rows decodes the work.
+#[test]
+fn a_namespaces_data_before_any_namespace_is_refused() {
+    let unscoped = [
+        put(PartitionId::Node, b"node:1:1", b"v"),
+        Mutation::Command(MetadataCommand::RegisterFields {
+            names: vec!["email".into()],
+        }),
+    ];
+    for mutation in unscoped {
+        let unit = unnamed(vec![
+            put(PartitionId::Deployment, b"catalog:x", b"v"),
+            mutation.clone(),
+        ]);
+        assert_eq!(
+            encode_proposal(&unit),
+            Err(FrameError::Unscoped(crate::txn::proposal::Unscoped {
+                at: 1
+            })),
+            "{mutation:?}"
+        );
+        assert!(check_proposal(&unit).is_err(), "{mutation:?}");
+
+        // The same unit, written by an encoder that named no namespace.
+        let mut body = header(2);
+        let mut encoder = Encoder::default();
+        for m in &unit.mutations {
+            encoder.op(m, &mut body).expect("encode the op");
+        }
+        let frame = signed(body);
+        assert_eq!(
+            decode(&frame),
+            Err(FrameError::Unscoped(crate::txn::proposal::Unscoped {
+                at: 1
+            })),
+            "{mutation:?}"
+        );
+    }
+
+    // The tag and a byte of its body: every operation takes two bytes, and
+    // the refusal comes before the body is read.
+    let mut body = header(1);
+    body.extend_from_slice(&[KIND_DERIVE, 0]);
+    let frame = signed(body);
+    for decoded in [
+        decode(&frame).map(drop),
+        decode_proposal_rows(&frame, &DecodeLimits::DEFAULT).map(drop),
+    ] {
+        assert_eq!(
+            decoded,
+            Err(FrameError::Unscoped(crate::txn::proposal::Unscoped {
+                at: 0
+            }))
+        );
+    }
+}
+
+/// A proposal in the field-wise form proposals were written in before
+/// frames, as a map or as a sequence, is refused: a proposal deserializes
+/// from its frame and nothing else.
+#[test]
+fn a_field_wise_proposal_is_refused() {
+    #[derive(serde::Serialize)]
+    struct FieldWise {
+        id: u64,
+        mutations: Vec<Mutation>,
+        commit_ts: u64,
+        start_ts: u64,
+        bypass_rate_limiter: bool,
+    }
+    let field_wise = FieldWise {
+        id: 1,
+        mutations: vec![put(PartitionId::Node, b"node:1:1", b"v")],
+        commit_ts: 2,
+        start_ts: 1,
+        bypass_rate_limiter: false,
+    };
+    for bytes in [
+        rmp_serde::to_vec_named(&field_wise).expect("as a map"),
+        rmp_serde::to_vec(&field_wise).expect("as a sequence"),
+    ] {
+        assert!(
+            rmp_serde::from_slice::<RaftProposal>(&bytes).is_err(),
+            "a field-wise proposal was read"
+        );
+    }
+    // The frame form still reads.
+    let framed = rmp_serde::to_vec(&mixed()).expect("framed");
+    assert_eq!(
+        rmp_serde::from_slice::<RaftProposal>(&framed).expect("a frame"),
+        mixed()
+    );
 }

@@ -615,11 +615,11 @@ fn oplog_replay_through_multi_tier_routing() {
         let ts = oracle.next().as_raw();
         engine
             .commit_journaled(
-                &[Mutation::Put {
+                &coordinode_storage::engine::scope::store_unit([Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"survives-multi-tier".to_vec(),
                     value: b"replay-me".to_vec(),
-                }],
+                }]),
                 ts,
             )
             .expect("commit_journaled");

@@ -83,15 +83,13 @@ fn group_log(dir: &std::path::Path, index: u64, ts: u64, units: &[Vec<Mutation>]
     manager.flush().unwrap();
 }
 
-/// `n` deletes of keys sharing a long prefix: a few encoded bytes each, far
-/// more once decoded.
+/// A unit of `n` deletes of keys sharing a long prefix: a few encoded bytes
+/// each, far more once decoded.
 fn deletes(n: u32, from: u32) -> Vec<Mutation> {
-    (from..from + n)
-        .map(|i| Mutation::Delete {
-            partition: PartitionId::Counter,
-            key: format!("counter:{i:0>64}").into_bytes(),
-        })
-        .collect()
+    coordinode_storage::engine::scope::store_unit((from..from + n).map(|i| Mutation::Delete {
+        partition: PartitionId::Counter,
+        key: format!("counter:{i:0>64}").into_bytes(),
+    }))
 }
 
 /// One log entry carrying several units, each of whose decoding fits the
@@ -197,12 +195,10 @@ fn a_unit_at_both_decode_bounds_stays_within_the_budget() {
     let ops = limit * 8 / 10 / slot;
     // Each key as long as an operation slot: the keys fill the budget too.
     let width = usize::try_from(slot).unwrap() - "counter:".len();
-    let many: Vec<Mutation> = (0..ops)
-        .map(|i| Mutation::Delete {
-            partition: PartitionId::Counter,
-            key: format!("counter:{i:0>width$}").into_bytes(),
-        })
-        .collect();
+    let many = coordinode_storage::engine::scope::store_unit((0..ops).map(|i| Mutation::Delete {
+        partition: PartitionId::Counter,
+        key: format!("counter:{i:0>width$}").into_bytes(),
+    }));
     engine
         .commit_logged(&many, oracle.next().as_raw(), Journal::Journal)
         .unwrap();
@@ -263,13 +259,11 @@ fn a_small_page_holds_no_more_than_its_budget() {
     alloc_peak::install();
     let dir = tempfile::tempdir().unwrap();
     let (engine, oracle, _) = cut_engine(dir.path());
-    let rows: Vec<Mutation> = (0..3u32)
-        .map(|i| Mutation::Put {
-            partition: PartitionId::Counter,
-            key: format!("counter:{i}").into_bytes(),
-            value: vec![0; 100],
-        })
-        .collect();
+    let rows = coordinode_storage::engine::scope::store_unit((0..3u32).map(|i| Mutation::Put {
+        partition: PartitionId::Counter,
+        key: format!("counter:{i}").into_bytes(),
+        value: vec![0; 100],
+    }));
     engine
         .commit_logged(&rows, oracle.next().as_raw(), Journal::Journal)
         .unwrap();
@@ -302,6 +296,8 @@ fn units_held(units: &[coordinode_storage::engine::fixed_cut::CutUnit]) -> u64 {
         Mutation::Delete { key, .. } => key.capacity(),
         Mutation::Merge { key, operand, .. } => key.capacity() + operand.capacity(),
         Mutation::RemoveRange { start, end, .. } => start.capacity() + end.capacity(),
+        // The namespace the rows belong to owns no bytes.
+        Mutation::Namespace(_) => 0,
         other => panic!("a row read carries no {other:?}"),
     };
     let bytes: usize = units
@@ -333,11 +329,11 @@ fn clipped_bounds_are_charged_before_they_are_copied() {
             .unwrap()
     };
     let (short_cut, long_cut) = (cut_of(&short), cut_of(&long));
-    let wide = vec![Mutation::RemoveRange {
+    let wide = coordinode_storage::engine::scope::store_unit([Mutation::RemoveRange {
         partition: PartitionId::Counter,
         start: b"counter:a".to_vec(),
         end: b"counter:z".to_vec(),
-    }];
+    }]);
     let read = |cut: &FixedCut, budget: &QueryBudget| {
         let log = dir.path().join(format!("log-{}", cut.first()));
         if !log.exists() {
@@ -355,7 +351,8 @@ fn clipped_bounds_are_charged_before_they_are_copied() {
 
     let ample = QueryBudget::new(4 << 20);
     let (held, charged, units) = read(&long_cut, &ample).expect("read");
-    let Mutation::RemoveRange { start, end, .. } = &units[0].mutations[0] else {
+    // After the namespace marker the unit carries.
+    let Mutation::RemoveRange { start, end, .. } = &units[0].mutations[1] else {
         panic!("a range delete")
     };
     assert_eq!(start.len(), long.len(), "clipped to the long prefix");
@@ -388,7 +385,7 @@ fn a_command_left_out_by_the_scope_is_never_built() {
     alloc_peak::install();
     let dir = tempfile::tempdir().unwrap();
     let (engine, _, cut) = cut_engine(dir.path());
-    let unit = vec![
+    let unit = coordinode_storage::engine::scope::store_unit([
         Mutation::Put {
             partition: PartitionId::Counter,
             key: b"counter:row".to_vec(),
@@ -400,7 +397,7 @@ fn a_command_left_out_by_the_scope_is_never_built() {
                 names: vec![String::new(); 400_000],
             },
         ),
-    ];
+    ]);
     let log = dir.path().join("group-log");
     group_log(&log, cut.first(), cut.bound() + 1, &[unit]);
     let limit = 2 << 20;
@@ -417,7 +414,11 @@ fn a_command_left_out_by_the_scope_is_never_built() {
             )
             .map(|(read, _)| read.units.iter().map(|u| u.mutations.len()).sum::<usize>())
     });
-    assert_eq!(read.expect("read"), 1, "the row change is taken");
+    assert_eq!(
+        read.expect("read"),
+        2,
+        "the row change is taken, with the namespace it belongs to"
+    );
     assert!(
         peak <= limit,
         "held {peak} bytes at once within a {limit}-byte budget"
@@ -434,13 +435,12 @@ fn a_cold_page_over_several_runs_keeps_its_budget() {
     {
         let (engine, oracle) = open_engine(dir.path());
         for run in 0..4u32 {
-            let mut rows: Vec<Mutation> = (0..50u32)
-                .map(|i| Mutation::Put {
+            let mut rows =
+                coordinode_storage::engine::scope::store_unit((0..50u32).map(|i| Mutation::Put {
                     partition: PartitionId::Counter,
                     key: format!("counter:{run}:{i:04}").into_bytes(),
                     value: vec![1; 64],
-                })
-                .collect();
+                }));
             rows.push(Mutation::Put {
                 partition: PartitionId::Counter,
                 key: format!("counter:{run}:big").into_bytes(),

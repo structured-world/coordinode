@@ -710,10 +710,13 @@ pub(crate) fn op_partition(op: &OplogOp) -> Option<Partition> {
         OplogOp::Unit { .. } => return Some(Partition::Node),
         // ColumnarInsert is routed to the columnar table registry by table_id,
         // not to a partition tree — see the columnar replay pass in `finish_open`.
+        // A namespace marker names where the ops after it go, and writes
+        // nothing itself.
         OplogOp::Noop
         | OplogOp::RaftEntry { .. }
         | OplogOp::RaftTruncation { .. }
-        | OplogOp::ColumnarInsert { .. } => return None,
+        | OplogOp::ColumnarInsert { .. }
+        | OplogOp::Namespace { .. } => return None,
     };
     partition_from_wire_tag(tag)
 }
@@ -773,7 +776,8 @@ pub(crate) fn apply_oplog_ops_at(
             OplogOp::Noop
             | OplogOp::RaftEntry { .. }
             | OplogOp::RaftTruncation { .. }
-            | OplogOp::ColumnarInsert { .. } => {}
+            | OplogOp::ColumnarInsert { .. }
+            | OplogOp::Namespace { .. } => {}
             OplogOp::Derive { .. } | OplogOp::Unit { .. } => {
                 return Err(StorageError::InvalidConfig(
                     "a journal entry replayed without its unit resolved".into(),

@@ -10,6 +10,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::sync::Arc;
 
 use coordinode_core::txn::proposal::{Mutation, PartitionId, ProposalId, RaftProposal};
@@ -36,7 +43,7 @@ fn open_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
 fn make_entry(index: u64, term: u64) -> Entry {
     let proposal = RaftProposal {
         id: ProposalId::from_raw(index),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: format!("node:1:{index}").into_bytes(),
             value: format!("val-{index}").into_bytes(),

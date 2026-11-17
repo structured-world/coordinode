@@ -609,7 +609,7 @@ fn a_unit_frame_streams_as_its_operations() {
     use coordinode_core::txn::proposal::{Mutation, PartitionId};
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mgr = open_manager(dir.path());
-    let mutations = vec![
+    let mutations = crate::engine::scope::store_unit([
         Mutation::Put {
             partition: PartitionId::Adj,
             key: b"adj:FOLLOWS:out:1".to_vec(),
@@ -619,7 +619,7 @@ fn a_unit_frame_streams_as_its_operations() {
             partition: PartitionId::Counter,
             key: b"c".to_vec(),
         },
-    ];
+    ]);
     let frame = coordinode_core::txn::frame::encode_unit(
         &mutations,
         coordinode_core::txn::timestamp::Timestamp::from_raw(1000),

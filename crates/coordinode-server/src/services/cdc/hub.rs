@@ -39,7 +39,7 @@ fn entry_bytes(entry: &OplogEntry) -> usize {
                 OplogOp::Unit { frame } => frame.len(),
                 OplogOp::Derive { work } => work.len(),
                 OplogOp::ColumnarInsert { key, value, .. } => key.len() + value.len(),
-                OplogOp::Noop | OplogOp::RaftTruncation { .. } => 0,
+                OplogOp::Noop | OplogOp::RaftTruncation { .. } | OplogOp::Namespace { .. } => 0,
             }
         })
         .sum::<usize>()

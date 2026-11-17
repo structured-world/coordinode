@@ -52,9 +52,9 @@ fn enroll(incarnation: u64) -> Mutation {
 }
 
 /// One increment of the test counter, bound to `op` with `intent` as
-/// `attempt`.
+/// `attempt`: a unit of the store's namespace.
 fn increment(op: OperationId, intent: u8, attempt: u64) -> Vec<Mutation> {
-    vec![
+    crate::engine::scope::store_unit([
         Mutation::Merge {
             partition: PartitionId::Counter,
             key: COUNTER.to_vec(),
@@ -65,7 +65,7 @@ fn increment(op: OperationId, intent: u8, attempt: u64) -> Vec<Mutation> {
             intent: IntentDigest([intent; INTENT_DIGEST_LEN]),
             attempt,
         })),
-    ]
+    ])
 }
 
 fn counter(engine: &StorageEngine) -> i64 {
@@ -382,15 +382,16 @@ fn a_retransmitted_unit_in_the_log_applies_once() {
 fn a_misplaced_operation_command_is_refused() {
     let dir = TempDir::new().unwrap();
     let (engine, oracle) = open(&dir);
+    // The operations after the namespace marker reversed: the command first.
     let mut reversed = increment(op(1, 1), 7, 1);
-    reversed.reverse();
+    reversed[1..].reverse();
     assert!(
         engine
             .apply_proposal_at(&reversed, oracle.next().as_raw())
             .is_err()
     );
     let mut two = increment(op(1, 1), 7, 1);
-    two.insert(0, enroll(1));
+    two.insert(1, enroll(1));
     assert!(
         engine
             .apply_proposal_at(&two, oracle.next().as_raw())

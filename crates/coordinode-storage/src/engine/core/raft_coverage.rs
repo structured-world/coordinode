@@ -326,32 +326,37 @@ impl StorageEngine {
             Mutation::Put { partition, .. }
             | Mutation::Delete { partition, .. }
             | Mutation::Merge { partition, .. }
-            | Mutation::RemoveRange { partition, .. } => Partition::from(*partition),
+            | Mutation::RemoveRange { partition, .. } => Some(Partition::from(*partition)),
             // A command's effects are records of the partition it names.
-            Mutation::Command(command) => Partition::from(command.partition()),
-            Mutation::Operation(_) => Partition::Deployment,
+            Mutation::Command(command) => Some(Partition::from(command.partition())),
+            Mutation::Operation(_) => Some(Partition::Deployment),
             // Resolved above; its entries are index records.
-            Mutation::Derive(_) => Partition::Idx,
+            Mutation::Derive(_) => Some(Partition::Idx),
             // Writes nothing; it goes with the node rows it describes.
-            Mutation::Effects(_) => Partition::Node,
+            Mutation::Effects(_) => Some(Partition::Node),
+            // Names the namespace of what follows: kept whatever is skipped.
+            Mutation::Namespace(_) => None,
+        };
+        let skipped = |m: &Mutation| partition_of(m).is_some_and(&skip);
+        let writes = |ms: &[Mutation]| {
+            ms.iter()
+                .filter(|m| !matches!(m, Mutation::Namespace(_)))
+                .count()
         };
         // A committed entry: a read that sees any of its writes is not ahead
         // of the ceiling, which is raised before the first lands.
         self.note_raft_effects(commit_ts);
-        if mutations.iter().any(|m| skip(partition_of(m))) {
+        if mutations.iter().any(skipped) {
             // A partition that already holds the entry takes none of it.
-            let kept: Vec<Mutation> = mutations
-                .iter()
-                .filter(|m| !skip(partition_of(m)))
-                .cloned()
-                .collect();
+            let kept: Vec<Mutation> = mutations.iter().filter(|m| !skipped(m)).cloned().collect();
+            let landed = writes(&kept);
             let staged = self.applied_feed.stage(index, commit_ts, &kept);
-            if !kept.is_empty() {
+            if landed > 0 {
                 self.apply_proposal_covered(&kept, commit_ts, Some(mark))?;
             }
             staged.publish();
             self.note_raft_applied(index, commit_ts);
-            Ok(kept.len())
+            Ok(landed)
         } else {
             // Staged before the write lands: a reader that sees it is told
             // the derived indexes may not hold it yet.
@@ -361,7 +366,7 @@ impl StorageEngine {
             self.applied_feed.pause_after_write();
             staged.publish();
             self.note_raft_applied(index, commit_ts);
-            Ok(mutations.len())
+            Ok(writes(mutations))
         }
     }
 

@@ -15,6 +15,13 @@
 //! - `applied_index()` returns 0 on fresh node, advances after commit
 //! - `from_proto()` round-trips for ReadPreference and ReadConcern
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -403,7 +410,7 @@ async fn applied_index_advances_after_commit() {
         commit_ts: Timestamp::from_raw(1),
         start_ts: Timestamp::from_raw(0),
         bypass_rate_limiter: false,
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"test:key".to_vec(),
             value: b"value".to_vec(),
@@ -440,7 +447,7 @@ async fn a_causal_position_already_applied_is_met_at_once() {
         commit_ts: Timestamp::from_raw(1),
         start_ts: Timestamp::from_raw(0),
         bypass_rate_limiter: false,
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: b"wait:test".to_vec(),
             value: b"v".to_vec(),
@@ -654,7 +661,7 @@ async fn secondary_preference_passes_on_follower() {
             commit_ts: Timestamp::from_raw(1),
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: false,
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"r141:secondary:key".to_vec(),
                 value: b"v".to_vec(),

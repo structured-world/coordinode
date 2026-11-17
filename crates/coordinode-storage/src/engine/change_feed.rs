@@ -380,7 +380,8 @@ fn changes_application_data(m: &Mutation) -> bool {
         Mutation::Command(_)
         | Mutation::Derive(_)
         | Mutation::Operation(_)
-        | Mutation::Effects(_) => false,
+        | Mutation::Effects(_)
+        | Mutation::Namespace(_) => false,
     }
 }
 
@@ -505,6 +506,7 @@ fn for_each_operation<'u>(
                 | Mutation::Derive(_)
                 | Mutation::Operation(_)
                 | Mutation::Effects(_)
+                | Mutation::Namespace(_)
         );
         let is_run = is_row && runs.next_if_eq(&row).is_some();
         each(at, mutation, is_run)?;
@@ -911,7 +913,10 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
                     end,
                 } => self.remove_range(*partition, start, end, is_run),
                 Mutation::Effects(effects) => self.removed_with_lists(effects),
-                Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => Ok(()),
+                Mutation::Command(_)
+                | Mutation::Derive(_)
+                | Mutation::Operation(_)
+                | Mutation::Namespace(_) => Ok(()),
             }
         })
     }

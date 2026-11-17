@@ -123,7 +123,10 @@ impl Fixture {
 
     fn apply_at(&self, mutation: Mutation, commit_ts: u64) {
         self.engine
-            .apply_proposal_at(&[mutation], commit_ts)
+            .apply_proposal_at(
+                &coordinode_storage::engine::scope::store_unit([mutation]),
+                commit_ts,
+            )
             .expect("apply");
     }
 
@@ -536,9 +539,9 @@ fn a_scan_refused_for_released_history_starts_over_without_the_tap() {
 fn a_build_that_scans_again_ends_ready() {
     let fx = fixture();
     let doc = fx.label("Doc");
-    let nodes: Vec<Mutation> = (1..=1_500u64)
-        .map(|id| put(0, id, &record(doc, fx.field, [id as f32, 1.0, 0.0])))
-        .collect();
+    let nodes = coordinode_storage::engine::scope::store_unit(
+        (1..=1_500u64).map(|id| put(0, id, &record(doc, fx.field, [id as f32, 1.0, 0.0]))),
+    );
     fx.engine
         .apply_proposal_at(&nodes, fx.oracle.next().as_raw())
         .expect("apply");

@@ -1270,11 +1270,11 @@ fn oplog_purge_never_drops_entries_not_yet_durable() {
         let key = format!("node:purge:{i}");
         engine
             .oplog_append(
-                &[Mutation::Put {
+                &crate::engine::scope::store_unit([Mutation::Put {
                     partition: PartitionId::Node,
                     key: key.into_bytes(),
                     value: b"journal-only".to_vec(),
-                }],
+                }]),
                 i + 1,
             )
             .expect("oplog_append")
@@ -1331,11 +1331,11 @@ fn oplog_purge_collects_durable_expired_segments() {
         // coverage that makes these entries durable.
         engine
             .commit_journaled(
-                &[Mutation::Put {
+                &crate::engine::scope::store_unit([Mutation::Put {
                     partition: PartitionId::Node,
                     key: key.into_bytes(),
                     value: b"applied".to_vec(),
-                }],
+                }]),
                 oracle.next().as_raw(),
             )
             .expect("commit_journaled");
@@ -1378,11 +1378,11 @@ fn journal_with_six_collectable_entries() -> (StorageEngine, TempDir) {
     for i in 0..6u64 {
         engine
             .commit_journaled(
-                &[Mutation::Put {
+                &crate::engine::scope::store_unit([Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:kept:{i}").into_bytes(),
                     value: b"applied".to_vec(),
-                }],
+                }]),
                 oracle.next().as_raw(),
             )
             .expect("commit_journaled");
@@ -1510,11 +1510,11 @@ fn power_loss_recovery_replays_journal_over_rolled_back_trees() {
         let key = format!("node:crash:{i}");
         engine
             .commit_journaled(
-                &[Mutation::Put {
+                &crate::engine::scope::store_unit([Mutation::Put {
                     partition: PartitionId::Node,
                     key: key.into_bytes(),
                     value: value.to_vec(),
-                }],
+                }]),
                 oracle.next().as_raw(),
             )
             .expect("commit_journaled");
@@ -2273,11 +2273,11 @@ fn admitted_write(
             state.to_le_bytes()[0]
         })
         .collect();
-    let write = [Mutation::Put {
+    let write = crate::engine::scope::store_unit([Mutation::Put {
         partition: PartitionId::Node,
         key: format!("node:1:w{index}").into_bytes(),
         value,
-    }];
+    }]);
     let Ok(admitted) = engine.admit_proposal(&write, crate::engine::footprint::Admit::Client)
     else {
         return false;
@@ -2896,13 +2896,13 @@ fn a_checkpoint_journal_copy_ends_at_a_whole_entry() {
         StorageEngine::open_embedded(&test_config(dir.path()), Arc::clone(&oracle)).expect("open");
     assert!(engine.has_journal());
     for i in 0..WRITES {
-        let write = [Mutation::Put {
+        let write = crate::engine::scope::store_unit([Mutation::Put {
             partition: PartitionId::Node,
             key: format!("node:1:m{i:06}").into_bytes(),
             // Entries of uneven length, so the buffer's flushes fall inside
             // them.
             value: vec![b'v'; 37 + (i as usize % 61)],
-        }];
+        }]);
         engine
             .commit_logged(&write, oracle.next().as_raw(), Journal::Memory)
             .expect("commit");

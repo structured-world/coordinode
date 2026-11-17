@@ -115,11 +115,11 @@ struct Step {
 fn entry(engine: &StorageEngine, index: u64, ts: u64, below: u64) -> Step {
     engine
         .apply_raft_proposal(
-            &[Mutation::Put {
+            &coordinode_storage::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:00:{index:012}").into_bytes(),
                 value: b"v".to_vec(),
-            }],
+            }]),
             ts,
             index,
             0,

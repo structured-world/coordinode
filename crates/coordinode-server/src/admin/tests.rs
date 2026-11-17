@@ -64,11 +64,11 @@ fn single_endpoint(path: &std::path::Path) -> StorageConfig {
 fn put_at(engine: &StorageEngine, key: &[u8], value: &[u8], commit_ts: u64) {
     engine
         .apply_proposal_at(
-            &[Mutation::Put {
+            &coordinode_storage::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: key.to_vec(),
                 value: value.to_vec(),
-            }],
+            }]),
             commit_ts,
         )
         .expect("apply");

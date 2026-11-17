@@ -503,9 +503,10 @@ impl Database {
             .engine
             .pending_commits()
             .obligate(|| self.oracle.next().as_raw());
+        // The queue is the namespace's: the unit names it before its rows.
         let proposal = RaftProposal {
             id: self.proposal_id_gen.next(),
-            mutations,
+            mutations: coordinode_storage::engine::scope::store_unit(mutations),
             commit_ts: Timestamp::from_raw(commit_ts),
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: true,

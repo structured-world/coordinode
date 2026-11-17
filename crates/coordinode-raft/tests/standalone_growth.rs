@@ -6,6 +6,13 @@
 //!
 //! Every test has a hard timeout so a stalled election fails instead of hanging.
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,7 +97,7 @@ async fn await_value(engine: &StorageEngine, key: &[u8], expected: &[u8]) -> boo
 fn put(node: &RaftNode, ids: &ProposalIdGenerator, key: &str, value: &str, commit_ts: u64) {
     let proposal = RaftProposal {
         id: ids.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
@@ -521,7 +528,7 @@ async fn an_embedded_directory_opens_as_the_first_member_of_a_group() {
             for i in 1..=3u64 {
                 engine
                     .apply_proposal_at(
-                        &[Mutation::Put {
+                        &unit![Mutation::Put {
                             partition: PartitionId::Node,
                             key: format!("node:1:embedded-{i}").into_bytes(),
                             value: format!("embedded-{i}").into_bytes(),

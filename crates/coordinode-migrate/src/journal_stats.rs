@@ -329,5 +329,6 @@ fn describe(m: &Mutation) -> (String, &[u8], u64) {
             rmp_serde::to_vec(work).map_or(0, |b| b.len() as u64),
         ),
         Mutation::Effects(effects) => ("effects".to_string(), &[], effects.size_estimate() as u64),
+        Mutation::Namespace(_) => ("namespace".to_string(), &[], 0),
     }
 }

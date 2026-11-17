@@ -213,9 +213,10 @@ impl FieldDictionary {
             .engine
             .pending_commits()
             .obligate(|| self.oracle.next().as_raw());
+        // A namespace's dictionary: the unit names the namespace first.
         let proposal = RaftProposal {
             id: self.proposal_ids.next(),
-            mutations: vec![Mutation::Command(command)],
+            mutations: coordinode_storage::engine::scope::store_unit([Mutation::Command(command)]),
             commit_ts: Timestamp::from_raw(commit_ts),
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: false,

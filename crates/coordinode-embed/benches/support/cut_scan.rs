@@ -31,14 +31,12 @@ pub fn case(rows: usize, value: usize, around: &mut dyn FnMut(&mut dyn FnMut()))
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Database::open(dir.path()).expect("open");
     for chunk in (0..rows).collect::<Vec<_>>().chunks(1000) {
-        let batch: Vec<Mutation> = chunk
-            .iter()
-            .map(|i| Mutation::Put {
+        let batch =
+            coordinode_storage::engine::scope::store_unit(chunk.iter().map(|i| Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:{i:08}").into_bytes(),
                 value: vec![(i % 251) as u8; value],
-            })
-            .collect();
+            }));
         let engine = db.engine();
         let ts = engine.oracle().expect("an embedded engine").next().as_raw();
         engine

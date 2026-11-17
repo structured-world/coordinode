@@ -233,7 +233,10 @@ fn a_history_ending_before_the_registration_is_refused() {
             value: value.to_vec(),
         };
         engine
-            .commit_journaled(&[mutation], oracle.next().as_raw())
+            .commit_journaled(
+                &crate::engine::scope::store_unit([mutation]),
+                oracle.next().as_raw(),
+            )
             .expect("commit");
     };
     let a = entry(b"a");
@@ -310,7 +313,10 @@ fn a_proposal_over_two_generations_reaches_only_the_replaced_ones_staging() {
     let other = 41;
     engine
         .commit_journaled(
-            &[put(&entry(b"a"), b"a1"), put(&entry_of(other, b"a"), b"o1")],
+            &crate::engine::scope::store_unit([
+                put(&entry(b"a"), b"a1"),
+                put(&entry_of(other, b"a"), b"o1"),
+            ]),
             oracle.next().as_raw(),
         )
         .expect("commit");
@@ -319,7 +325,10 @@ fn a_proposal_over_two_generations_reaches_only_the_replaced_ones_staging() {
     engine.stage_generation(GENERATION).expect("stage");
     engine
         .commit_journaled(
-            &[put(&entry(b"b"), b"b1"), put(&entry_of(other, b"b"), b"o2")],
+            &crate::engine::scope::store_unit([
+                put(&entry(b"b"), b"b1"),
+                put(&entry_of(other, b"b"), b"o2"),
+            ]),
             oracle.next().as_raw(),
         )
         .expect("commit");
@@ -357,11 +366,17 @@ fn a_late_low_timestamp_write_lands_in_the_replacement_at_its_timestamp() {
     let between = oracle.next().as_raw();
     let current = oracle.next().as_raw();
     engine
-        .commit_journaled(&[put(&entry(b"k"), b"current")], current)
+        .commit_journaled(
+            &crate::engine::scope::store_unit([put(&entry(b"k"), b"current")]),
+            current,
+        )
         .expect("commit");
     engine.stage_generation(GENERATION).expect("stage");
     engine
-        .commit_journaled(&[put(&entry(b"k"), b"late")], late)
+        .commit_journaled(
+            &crate::engine::scope::store_unit([put(&entry(b"k"), b"late")]),
+            late,
+        )
         .expect("late commit");
     let history = engine
         .export_generation_history(GENERATION)
@@ -390,7 +405,7 @@ fn a_range_delete_during_preparation_reaches_the_replacement() {
     let (engine, oracle) = journaled(dir.path());
     engine
         .commit_journaled(
-            &[put(&entry(b"a"), b"a1"), put(&entry(b"b"), b"b1")],
+            &crate::engine::scope::store_unit([put(&entry(b"a"), b"a1"), put(&entry(b"b"), b"b1")]),
             oracle.next().as_raw(),
         )
         .expect("commit");
@@ -400,11 +415,13 @@ fn a_range_delete_during_preparation_reaches_the_replacement() {
         .expect("export");
     engine
         .commit_journaled(
-            &[coordinode_core::txn::proposal::Mutation::RemoveRange {
-                partition: coordinode_core::txn::proposal::PartitionId::Idx,
-                start: prefix(TAG_ENTRIES, GENERATION.as_raw()),
-                end: prefix(TAG_ENTRIES, GENERATION.as_raw() + 1),
-            }],
+            &crate::engine::scope::store_unit([
+                coordinode_core::txn::proposal::Mutation::RemoveRange {
+                    partition: coordinode_core::txn::proposal::PartitionId::Idx,
+                    start: prefix(TAG_ENTRIES, GENERATION.as_raw()),
+                    end: prefix(TAG_ENTRIES, GENERATION.as_raw() + 1),
+                },
+            ]),
             oracle.next().as_raw(),
         )
         .expect("drop");

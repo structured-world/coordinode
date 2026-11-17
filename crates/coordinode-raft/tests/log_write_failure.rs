@@ -8,6 +8,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +51,7 @@ fn write(key: &str, id: u64) -> Request {
     .expect("fits");
     Request::single(RaftProposal {
         id: ProposalId::from_raw(id),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.as_bytes().to_vec(),
             value: b"v".to_vec(),

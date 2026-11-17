@@ -9,6 +9,13 @@
 //! process, and a move of it goes through the same handshake, record and
 //! refusal.
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,7 +87,7 @@ fn write(
 ) -> Result<(), ProposalError> {
     let proposal = RaftProposal {
         id: ids.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.as_bytes().to_vec(),
             value: b"v".to_vec(),
@@ -624,7 +631,7 @@ async fn try_write(
     let pipeline = node.pipeline();
     let proposal = RaftProposal {
         id: ids.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.as_bytes().to_vec(),
             value: b"v".to_vec(),

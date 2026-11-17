@@ -3827,6 +3827,8 @@ impl<'a> ExecutionContext<'a> {
         &mut self,
         mutations: Vec<coordinode_core::txn::proposal::Mutation>,
     ) -> Result<(), ExecutionError> {
+        // The statement's namespace, named before its effects.
+        let mutations = coordinode_storage::engine::scope::store_unit(mutations);
         let (Some(pipeline), Some(id_gen)) = (self.proposal_pipeline, self.proposal_id_gen) else {
             // A context without a log (unit tests) has nothing to replicate to.
             use coordinode_modality::{IndexStore as _, LocalIndexStore};

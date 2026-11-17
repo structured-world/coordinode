@@ -27,6 +27,11 @@ fn put(partition: PartitionId, key: &[u8]) -> Mutation {
     }
 }
 
+/// The unit of `mutations` in the store's namespace, as the log carries it.
+fn unit<const N: usize>(mutations: [Mutation; N]) -> Vec<Mutation> {
+    crate::engine::scope::store_unit(mutations)
+}
+
 const NO_WAIT: Option<Duration> = Some(Duration::from_millis(0));
 
 /// Closing history wakes idle consumers of every partition after the bound
@@ -87,7 +92,7 @@ fn a_waiting_subscriber_wakes_on_an_apply() {
     let waiter = std::thread::spawn(move || sub.next(None));
     std::thread::sleep(Duration::from_millis(50));
     engine
-        .apply_raft_proposal(&[put(PartitionId::Node, b"a")], 11, 1, 0, |_| false)
+        .apply_raft_proposal(&unit([put(PartitionId::Node, b"a")]), 11, 1, 0, |_| false)
         .expect("apply");
 
     assert!(matches!(
@@ -110,9 +115,13 @@ fn events_are_numbered_and_the_position_counts_dropped_ones() {
     for (i, key) in [b"a", b"b", b"c"].into_iter().enumerate() {
         let index = i as u64 + 1;
         engine
-            .apply_raft_proposal(&[put(PartitionId::Node, key)], 10 + index, index, 0, |_| {
-                false
-            })
+            .apply_raft_proposal(
+                &unit([put(PartitionId::Node, key)]),
+                10 + index,
+                index,
+                0,
+                |_| false,
+            )
             .expect("apply");
     }
     // A queue of one held the first event; the next two were dropped.
@@ -132,7 +141,7 @@ fn events_are_numbered_and_the_position_counts_dropped_ones() {
     ));
 
     engine
-        .apply_raft_proposal(&[put(PartitionId::Node, b"d")], 20, 4, 0, |_| false)
+        .apply_raft_proposal(&unit([put(PartitionId::Node, b"d")]), 20, 4, 0, |_| false)
         .expect("apply");
     assert!(matches!(
         sub.try_next(),
@@ -183,7 +192,7 @@ fn a_nudge_ends_one_wait_and_events_keep_coming() {
     nudge.nudge();
     std::thread::sleep(Duration::from_millis(50));
     engine
-        .apply_proposal_at(&[put(PartitionId::Node, b"after")], 0)
+        .apply_proposal_at(&unit([put(PartitionId::Node, b"after")]), 0)
         .expect("apply");
 
     let (nudged, next) = waiter.join().expect("waiter");
@@ -205,14 +214,14 @@ fn an_applied_entry_reports_its_keys_in_the_partition() {
 
     engine
         .apply_raft_proposal(
-            &[
+            &unit([
                 put(PartitionId::Node, b"a"),
                 put(PartitionId::EdgeProp, b"elsewhere"),
                 Mutation::Delete {
                     partition: PartitionId::Node,
                     key: b"b".to_vec(),
                 },
-            ],
+            ]),
             42,
             7,
             0,
@@ -220,7 +229,9 @@ fn an_applied_entry_reports_its_keys_in_the_partition() {
         )
         .expect("apply");
     engine
-        .apply_raft_proposal(&[put(PartitionId::EdgeProp, b"x")], 43, 8, 0, |_| false)
+        .apply_raft_proposal(&unit([put(PartitionId::EdgeProp, b"x")]), 43, 8, 0, |_| {
+            false
+        })
         .expect("apply");
 
     assert_eq!(
@@ -244,7 +255,7 @@ fn a_skipped_partition_reports_nothing() {
     let sub = engine.subscribe_applied(Partition::Node, 16);
 
     engine
-        .apply_raft_proposal(&[put(PartitionId::Node, b"a")], 5, 1, 0, |p| {
+        .apply_raft_proposal(&unit([put(PartitionId::Node, b"a")]), 5, 1, 0, |p| {
             p == Partition::Node
         })
         .expect("apply");
@@ -274,11 +285,11 @@ fn a_range_removed_reports_the_partition_replaced() {
 
     engine
         .apply_raft_proposal(
-            &[Mutation::RemoveRange {
+            &unit([Mutation::RemoveRange {
                 partition: PartitionId::Node,
                 start: b"a".to_vec(),
                 end: b"z".to_vec(),
-            }],
+            }]),
             9,
             3,
             0,
@@ -321,7 +332,13 @@ fn a_full_queue_is_reported_as_replaced_without_blocking_the_applies() {
 
     for index in 1..=3u64 {
         engine
-            .apply_raft_proposal(&[put(PartitionId::Node, b"k")], index, index, 0, |_| false)
+            .apply_raft_proposal(
+                &unit([put(PartitionId::Node, b"k")]),
+                index,
+                index,
+                0,
+                |_| false,
+            )
             .expect("apply never waits on the subscriber");
     }
 
@@ -333,7 +350,7 @@ fn a_full_queue_is_reported_as_replaced_without_blocking_the_applies() {
     assert_eq!(sub.try_next(), None);
 
     engine
-        .apply_raft_proposal(&[put(PartitionId::Node, b"k")], 4, 4, 0, |_| false)
+        .apply_raft_proposal(&unit([put(PartitionId::Node, b"k")]), 4, 4, 0, |_| false)
         .expect("apply");
     assert!(matches!(
         sub.next(NO_WAIT),
@@ -366,9 +383,13 @@ fn a_retained_subscription_reports_unreleased_keys() {
 
     for (index, key) in [(1u64, b"a"), (2, b"b"), (3, b"c")] {
         engine
-            .apply_raft_proposal(&[put(PartitionId::Node, key)], 10 + index, index, 0, |_| {
-                false
-            })
+            .apply_raft_proposal(
+                &unit([put(PartitionId::Node, key)]),
+                10 + index,
+                index,
+                0,
+                |_| false,
+            )
             .expect("apply");
     }
     let all = || Some(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
@@ -440,7 +461,7 @@ fn an_entry_is_pending_before_a_reader_can_see_it() {
         }));
     }
     engine
-        .apply_raft_proposal(&[put(PartitionId::Node, b"k")], 11, 1, 0, |_| false)
+        .apply_raft_proposal(&unit([put(PartitionId::Node, b"k")]), 11, 1, 0, |_| false)
         .expect("apply");
     assert_eq!(
         seen.load(Ordering::SeqCst),
@@ -499,7 +520,7 @@ fn a_receipt_covers_a_raft_write_a_read_already_sees() {
         }));
     }
     engine
-        .apply_raft_proposal(&[put(PartitionId::Node, b"k")], 11, 1, 0, |_| false)
+        .apply_raft_proposal(&unit([put(PartitionId::Node, b"k")]), 11, 1, 0, |_| false)
         .expect("apply");
     let seen = receipt_when_seen.load(Ordering::SeqCst);
     assert_ne!(seen, NOT_SEEN, "the hook read the write");
@@ -526,9 +547,13 @@ fn a_dropped_event_makes_the_pending_keys_unknown_until_released() {
 
     for (index, key) in [(1u64, b"a"), (2, b"b")] {
         engine
-            .apply_raft_proposal(&[put(PartitionId::Node, key)], 10 + index, index, 0, |_| {
-                false
-            })
+            .apply_raft_proposal(
+                &unit([put(PartitionId::Node, key)]),
+                10 + index,
+                index,
+                0,
+                |_| false,
+            )
             .expect("apply");
     }
     assert_eq!(pending_keys(&position), None, "event 2 was dropped");
@@ -569,6 +594,6 @@ fn a_dropped_subscription_is_forgotten() {
     drop(sub);
     assert_eq!(engine.applied_subscriptions(), 0);
     engine
-        .apply_raft_proposal(&[put(PartitionId::Node, b"a")], 1, 1, 0, |_| false)
+        .apply_raft_proposal(&unit([put(PartitionId::Node, b"a")]), 1, 1, 0, |_| false)
         .expect("apply with no subscriber");
 }

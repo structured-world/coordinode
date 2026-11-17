@@ -1109,11 +1109,11 @@ fn a_journal_purge_racing_a_registration_never_passes_its_position() {
     for i in 0..6u64 {
         engine
             .commit_journaled(
-                &[Mutation::Put {
+                &coordinode_storage::engine::scope::store_unit([Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:r:{i}").into_bytes(),
                     value: b"v".to_vec(),
-                }],
+                }]),
                 oracle.next().as_raw(),
             )
             .expect("commit");

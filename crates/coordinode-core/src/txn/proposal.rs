@@ -196,6 +196,50 @@ pub enum Mutation {
     /// At most one per unit, after its row changes and before its operation
     /// command.
     Effects(UnitEffects),
+    /// The namespace the operations after it, up to the next one, belong to.
+    /// Every operation on a namespace's data
+    /// ([`Mutation::requires_namespace`]) follows one; the deployment's own
+    /// writes need none. A unit writing several namespaces names each before
+    /// its writes, and applies as one.
+    Namespace(crate::namespace::NamespaceId),
+}
+
+/// An operation on a namespace's data with no namespace named before it, at
+/// this position of its unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("operation {at} of the unit writes a namespace's data and names no namespace")]
+pub struct Unscoped {
+    /// The operation's position in its unit.
+    pub at: usize,
+}
+
+/// The unit of `mutations` in `namespace`: the marker naming it, then the
+/// operations.
+pub fn in_namespace(
+    namespace: crate::namespace::NamespaceId,
+    mutations: impl IntoIterator<Item = Mutation>,
+) -> Vec<Mutation> {
+    core::iter::once(Mutation::Namespace(namespace))
+        .chain(mutations)
+        .collect()
+}
+
+/// Refuse `mutations` when an operation on a namespace's data comes before
+/// any namespace is named.
+///
+/// # Errors
+///
+/// [`Unscoped`] at the first such operation.
+pub fn check_scoped(mutations: &[Mutation]) -> Result<(), Unscoped> {
+    let mut named = false;
+    for (at, mutation) in mutations.iter().enumerate() {
+        match mutation {
+            Mutation::Namespace(_) => named = true,
+            m if m.requires_namespace() && !named => return Err(Unscoped { at }),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The projection interpretation this build seals a unit's
@@ -500,6 +544,25 @@ impl Mutation {
             Self::Derive(work) => 1 + work.size_estimate(),
             Self::Operation(command) => 1 + command.size_estimate(),
             Self::Effects(effects) => 1 + effects.size_estimate(),
+            Self::Namespace(_) => 1 + 8,
+        }
+    }
+
+    /// Whether the operation acts on a namespace's data, and so must follow
+    /// a [`Mutation::Namespace`] naming it: a row change or metadata command
+    /// of a namespace's partition, DERIVED index work and an effect context.
+    /// The deployment's own writes, operation commands and the marker itself
+    /// need none.
+    #[must_use]
+    pub fn requires_namespace(&self) -> bool {
+        match self {
+            Self::Put { partition, .. }
+            | Self::Delete { partition, .. }
+            | Self::Merge { partition, .. }
+            | Self::RemoveRange { partition, .. } => !partition.is_deployment(),
+            Self::Command(command) => !command.partition().is_deployment(),
+            Self::Derive(_) | Self::Effects(_) => true,
+            Self::Operation(_) | Self::Namespace(_) => false,
         }
     }
 }
@@ -542,6 +605,15 @@ pub enum PartitionId {
     Deployment,
 }
 
+impl PartitionId {
+    /// Whether the partition belongs to the deployment rather than to a
+    /// namespace: the consumer registry and the deployment's records.
+    #[must_use]
+    pub const fn is_deployment(self) -> bool {
+        matches!(self, Self::Registry | Self::Deployment)
+    }
+}
+
 /// A batch of mutations to be proposed through Raft.
 ///
 /// Created after OCC validation succeeds. Contains all buffered writes
@@ -551,9 +623,8 @@ pub enum PartitionId {
 /// ## Serialization
 ///
 /// Serializes as one [compact frame](super::frame), the encoding the log,
-/// replication and recovery share. Deserialization also reads the field-wise
-/// form proposals were written in before frames, so a log tail written by an
-/// earlier release replays; nothing writes that form any more.
+/// replication and recovery share, and deserializes from nothing else: a
+/// proposal in any other form is refused before anything reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RaftProposal {
     /// Unique proposal ID for deduplication.
@@ -587,33 +658,11 @@ impl Serialize for RaftProposal {
 
 impl<'de> Deserialize<'de> for RaftProposal {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(ProposalVisitor)
+        deserializer.deserialize_bytes(ProposalVisitor)
     }
 }
 
-/// The field-wise form of a proposal written before frames.
-#[derive(Deserialize)]
-struct FieldWiseProposal {
-    id: ProposalId,
-    mutations: Vec<Mutation>,
-    commit_ts: Timestamp,
-    start_ts: Timestamp,
-    #[serde(default)]
-    bypass_rate_limiter: bool,
-}
-
-impl From<FieldWiseProposal> for RaftProposal {
-    fn from(p: FieldWiseProposal) -> Self {
-        Self {
-            id: p.id,
-            mutations: p.mutations,
-            commit_ts: p.commit_ts,
-            start_ts: p.start_ts,
-            bypass_rate_limiter: p.bypass_rate_limiter,
-        }
-    }
-}
-
+/// Reads a proposal from its frame, and from nothing else.
 struct ProposalVisitor;
 
 impl<'de> serde::de::Visitor<'de> for ProposalVisitor {
@@ -626,16 +675,6 @@ impl<'de> serde::de::Visitor<'de> for ProposalVisitor {
     fn visit_bytes<E: serde::de::Error>(self, frame: &[u8]) -> Result<RaftProposal, E> {
         super::frame::decode_proposal(frame, &super::frame::DecodeLimits::DEFAULT)
             .map_err(E::custom)
-    }
-
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<RaftProposal, A::Error> {
-        FieldWiseProposal::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
-            .map(Into::into)
-    }
-
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<RaftProposal, A::Error> {
-        FieldWiseProposal::deserialize(serde::de::value::MapAccessDeserializer::new(map))
-            .map(Into::into)
     }
 }
 

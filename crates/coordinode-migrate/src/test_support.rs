@@ -14,11 +14,11 @@ use rmpv::Value;
 pub(crate) fn proposal(id: u64, commit_ts: u64) -> RaftProposal {
     RaftProposal {
         id: ProposalId::from_raw(id),
-        mutations: vec![Mutation::Put {
+        mutations: coordinode_storage::engine::scope::store_unit([Mutation::Put {
             partition: PartitionId::Node,
             key: format!("node:1:{id}").into_bytes(),
             value: b"v".to_vec(),
-        }],
+        }]),
         commit_ts: Timestamp::from_raw(commit_ts),
         start_ts: Timestamp::from_raw(commit_ts - 1),
         bypass_rate_limiter: false,

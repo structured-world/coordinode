@@ -10,6 +10,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -253,7 +260,7 @@ async fn cdc_tailer_delivers_raft_proposals() {
     for i in 1..=n_proposals {
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("cdc-key-{i}").into_bytes(),
                 value: format!("cdc-val-{i}").into_bytes(),
@@ -348,7 +355,7 @@ async fn cdc_tailer_resume_after_partial_read() {
     for i in 1u64..=10 {
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("resume-key-{i}").into_bytes(),
                 value: format!("resume-val-{i}").into_bytes(),
@@ -421,7 +428,7 @@ async fn cdc_filter_edge_type_through_raft() {
     pipeline
         .propose_and_wait(&RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Merge {
+            mutations: unit![Mutation::Merge {
                 partition: PartitionId::Adj,
                 key: b"adj:FOLLOWS:out:00000001".to_vec(),
                 operand: b"add:42".to_vec(),
@@ -436,7 +443,7 @@ async fn cdc_filter_edge_type_through_raft() {
     pipeline
         .propose_and_wait(&RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Merge {
+            mutations: unit![Mutation::Merge {
                 partition: PartitionId::Adj,
                 key: b"adj:LIKES:out:00000001".to_vec(),
                 operand: b"add:99".to_vec(),
@@ -451,7 +458,7 @@ async fn cdc_filter_edge_type_through_raft() {
     pipeline
         .propose_and_wait(&RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:0:1".to_vec(),
                 value: b"data".to_vec(),
@@ -541,7 +548,7 @@ async fn a_fixed_cut_of_a_group_member_joins_its_log_once() {
         let ts = clock.next();
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Merge {
+            mutations: unit![Mutation::Merge {
                 partition: PartitionId::Counter,
                 key: KEY.to_vec(),
                 operand: coordinode_storage::engine::merge::encode_counter_delta(delta),
@@ -638,7 +645,7 @@ async fn a_cut_of_a_partition_installed_ahead_or_replaced_is_refused() {
         let ts = clock.next();
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:{n}").into_bytes(),
                 value: b"n".to_vec(),
@@ -749,7 +756,7 @@ async fn an_offline_cut_of_a_tree_behind_the_closure_is_refused() {
             pipeline
                 .propose_and_wait(&RaftProposal {
                     id: ids.next(),
-                    mutations: vec![Mutation::Merge {
+                    mutations: unit![Mutation::Merge {
                         partition: PartitionId::Counter,
                         key: b"counter:degree:9".to_vec(),
                         operand: coordinode_storage::engine::merge::encode_counter_delta(delta),

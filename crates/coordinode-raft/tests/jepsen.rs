@@ -33,6 +33,13 @@
 //!   converges, since HLC gossip (advance-to-max on apply) keeps apply-seqnos
 //!   monotonic regardless of wall-clock divergence.
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -188,7 +195,7 @@ fn write(
 ) -> Result<u64, ProposalError> {
     let proposal = RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
@@ -429,7 +436,7 @@ async fn partition_minority_cannot_commit_majority_can() {
         let mino_pipeline = n1.node.pipeline();
         let mino_proposal = RaftProposal {
             id: ProposalIdGenerator::with_base(9u64 << 48).next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:p-mino".to_vec(),
                 value: b"minority".to_vec(),
@@ -502,7 +509,7 @@ async fn an_early_answered_volatile_write_is_lost_whole_on_failover() {
         let pipeline = n1.node.pipeline();
         let volatile = RaftProposal {
             id: ProposalIdGenerator::with_base(9u64 << 48).next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:v-early".to_vec(),
                 value: b"early".to_vec(),
@@ -705,7 +712,7 @@ async fn change_stream_never_delivers_what_an_isolated_leader_cannot_commit() {
         let mino_pipeline = n1.node.pipeline();
         let mino_proposal = RaftProposal {
             id: ProposalIdGenerator::with_base(9u64 << 48).next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:c-mino".to_vec(),
                 value: b"minority".to_vec(),
@@ -1030,7 +1037,7 @@ async fn linearizability_workload(
             for v in 0..5u64 {
                 let proposal = RaftProposal {
                     id: id_gen.next(),
-                    mutations: vec![Mutation::Put {
+                    mutations: unit![Mutation::Put {
                         partition: PartitionId::Node,
                         key: key.as_bytes().to_vec(),
                         value: v.to_string().into_bytes(),

@@ -55,11 +55,11 @@ const SUBJECTS: [Subject; 2] = [
 fn put_in(engine: &StorageEngine, pid: PartitionId, key: &[u8], value: &[u8], commit_ts: u64) {
     engine
         .apply_proposal_at(
-            &[Mutation::Put {
+            &crate::engine::scope::store_unit([Mutation::Put {
                 partition: pid,
                 key: key.to_vec(),
                 value: value.to_vec(),
-            }],
+            }]),
             commit_ts,
         )
         .expect("apply");
@@ -68,10 +68,10 @@ fn put_in(engine: &StorageEngine, pid: PartitionId, key: &[u8], value: &[u8], co
 fn delete_in(engine: &StorageEngine, pid: PartitionId, key: &[u8], commit_ts: u64) {
     engine
         .apply_proposal_at(
-            &[Mutation::Delete {
+            &crate::engine::scope::store_unit([Mutation::Delete {
                 partition: pid,
                 key: key.to_vec(),
-            }],
+            }]),
             commit_ts,
         )
         .expect("apply");
@@ -295,11 +295,11 @@ fn time_travel_over_a_merge_chain_keeps_its_steps() {
     let bump = |commit_ts: u64| {
         engine
             .apply_proposal_at(
-                &[Mutation::Merge {
+                &crate::engine::scope::store_unit([Mutation::Merge {
                     partition: PartitionId::Counter,
                     key: key.to_vec(),
                     operand: crate::engine::merge::encode_counter_delta(1),
-                }],
+                }]),
                 commit_ts,
             )
             .expect("apply the operand");

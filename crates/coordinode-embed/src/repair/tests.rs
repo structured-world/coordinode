@@ -74,11 +74,11 @@ fn open(dir: &TempDir) -> Arc<StorageEngine> {
 fn put(engine: &StorageEngine, commit_ts: u64, part: PartitionId, key: &[u8], value: &[u8]) {
     engine
         .commit_journaled(
-            &[Mutation::Put {
+            &coordinode_storage::engine::scope::store_unit([Mutation::Put {
                 partition: part,
                 key: key.to_vec(),
                 value: value.to_vec(),
-            }],
+            }]),
             commit_ts,
         )
         .expect("commit_journaled");

@@ -1027,6 +1027,7 @@ pub fn write_footprint(mutations: &[coordinode_core::txn::proposal::Mutation]) -
             // Journaled with the unit; its encoded bytes are bounded by its
             // estimate.
             Mutation::Effects(effects) => effects.size_estimate() as u64,
+            Mutation::Namespace(_) => mutation.size_estimate() as u64,
         })
         .sum::<u64>();
     footprint_of(data, mutations.len())

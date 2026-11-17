@@ -41,8 +41,21 @@ fn adopt(bindings: &[(&str, u32)]) -> Mutation {
     })
 }
 
+/// The unit of `mutations` as a proposer builds it: a namespace's work names
+/// the store's namespace first, the deployment's own needs none.
+fn unit(mutations: impl IntoIterator<Item = Mutation>) -> Vec<Mutation> {
+    let mutations: Vec<Mutation> = mutations.into_iter().collect();
+    if mutations.iter().any(Mutation::requires_namespace) {
+        crate::engine::scope::store_unit(mutations)
+    } else {
+        mutations
+    }
+}
+
 fn apply(engine: &StorageEngine, commit_ts: u64, mutation: Mutation) {
-    engine.apply_proposal_at(&[mutation], commit_ts).unwrap();
+    engine
+        .apply_proposal_at(&unit([mutation]), commit_ts)
+        .unwrap();
 }
 
 fn conditional(expect: &[(&[u8], Option<&[u8]>)], put: &[(&[u8], &[u8])]) -> Mutation {
@@ -321,7 +334,7 @@ fn a_second_command_in_one_proposal_is_refused() {
     let (engine, oracle) = open(&dir);
     engine
         .apply_proposal_at(
-            &[register(&["a"]), register(&["b"])],
+            &unit([register(&["a"]), register(&["b"])]),
             oracle.next().as_raw(),
         )
         .unwrap();
@@ -339,10 +352,10 @@ fn journalled_bindings_replay_as_decided() {
         let oracle = Arc::new(TimestampOracle::new());
         let engine = StorageEngine::open_embedded(&durable_cfg(&dir), oracle.clone()).unwrap();
         engine
-            .commit_journaled(&[register(&["x", "y"])], oracle.next().as_raw())
+            .commit_journaled(&unit([register(&["x", "y"])]), oracle.next().as_raw())
             .unwrap();
         engine
-            .commit_journaled(&[register(&["z"])], oracle.next().as_raw())
+            .commit_journaled(&unit([register(&["z"])]), oracle.next().as_raw())
             .unwrap();
         // Dropped without a flush: only the journal holds the bindings.
     }
@@ -370,7 +383,7 @@ fn concurrent_journalled_registrations_get_distinct_ids() {
                     for i in 0..20 {
                         let name = format!("t{t}_{i}");
                         engine
-                            .commit_journaled(&[register(&[&name])], oracle.next().as_raw())
+                            .commit_journaled(&unit([register(&[&name])]), oracle.next().as_raw())
                             .unwrap();
                     }
                 });
@@ -477,14 +490,14 @@ fn a_command_touches_only_the_schema_partition() {
     let (engine, oracle) = open(&dir);
     engine
         .apply_proposal_at(
-            &[
+            &unit([
                 register(&["a"]),
                 Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"node:x".to_vec(),
                     value: b"v".to_vec(),
                 },
-            ],
+            ]),
             oracle.next().as_raw(),
         )
         .unwrap();
@@ -505,16 +518,19 @@ fn a_journaled_command_that_decides_nothing_appends_nothing() {
     let journaled = |engine: &StorageEngine| engine.oplog_read_since(0).unwrap().unwrap().len();
 
     engine
-        .commit_journaled(&[register(&["a"])], oracle.next().as_raw())
+        .commit_journaled(&unit([register(&["a"])]), oracle.next().as_raw())
         .unwrap();
     let after_binding = journaled(&engine);
 
     engine
-        .commit_journaled(&[register(&["a"])], oracle.next().as_raw())
+        .commit_journaled(&unit([register(&["a"])]), oracle.next().as_raw())
         .unwrap();
     let too_long = "x".repeat(usize::from(u16::MAX) + 1);
     engine
-        .commit_journaled(&[register(&[too_long.as_str()])], oracle.next().as_raw())
+        .commit_journaled(
+            &unit([register(&[too_long.as_str()])]),
+            oracle.next().as_raw(),
+        )
         .unwrap();
     assert_eq!(
         journaled(&engine),
@@ -523,7 +539,7 @@ fn a_journaled_command_that_decides_nothing_appends_nothing() {
     );
 
     engine
-        .commit_journaled(&[register(&["a", "b"])], oracle.next().as_raw())
+        .commit_journaled(&unit([register(&["a", "b"])]), oracle.next().as_raw())
         .unwrap();
     assert_eq!(journaled(&engine), after_binding + 1, "a new binding does");
     assert_eq!(bound_id(&engine, "b").unwrap(), Some(2));
@@ -696,11 +712,11 @@ fn a_retired_label_is_rebound_only_above_its_retirement() {
     };
     engine
         .apply_proposal_at(
-            &[Mutation::Put {
+            &unit([Mutation::Put {
                 partition: PartitionId::Schema,
                 key: coordinode_core::schema::definition::encode_label_current_revision_key("Goal"),
                 value: retired.encode().to_vec(),
-            }],
+            }]),
             oracle.next().as_raw(),
         )
         .unwrap();

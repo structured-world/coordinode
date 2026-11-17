@@ -478,6 +478,8 @@ impl AppliedFeed {
                     // Writes nothing: the keys it names are written by the
                     // unit's own row changes, staged above.
                     Mutation::Effects(_) => {}
+                    // Writes nothing; the store holds one namespace's data.
+                    Mutation::Namespace(_) => {}
                 }
             }
             let seq = if replaced {

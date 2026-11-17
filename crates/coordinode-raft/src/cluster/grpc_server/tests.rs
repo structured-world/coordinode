@@ -17,11 +17,11 @@ fn client_entry(index: u64, value_bytes: usize) -> crate::storage::Entry {
         ),
         crate::storage::Request::single(RaftProposal {
             id: ProposalId::from_raw(index),
-            mutations: vec![Mutation::Put {
+            mutations: coordinode_storage::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:1:{index}").into_bytes(),
                 value: vec![7u8; value_bytes],
-            }],
+            }]),
             commit_ts: Timestamp::from_raw(0),
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: false,

@@ -164,7 +164,8 @@ fn write_email(
     record.set(1, Value::String(email.into()));
     RaftProposal {
         id: id_gen.next(),
-        mutations: vec![
+        // The store's namespace first, the record after it at position 1.
+        mutations: coordinode_storage::engine::scope::store_unit([
             Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:0:{node_id}").into_bytes(),
@@ -175,9 +176,9 @@ fn write_email(
                 node_id,
                 valid_from: None,
                 old: old.map(|o| vec![Value::String(o.into())]),
-                new: DerivedSource::UnitRecord(0),
+                new: DerivedSource::UnitRecord(1),
             }),
-        ],
+        ]),
         commit_ts: Timestamp::from_raw(ts),
         start_ts: Timestamp::from_raw(ts - 1),
         bypass_rate_limiter: false,

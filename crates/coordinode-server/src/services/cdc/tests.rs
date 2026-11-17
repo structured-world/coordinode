@@ -194,14 +194,14 @@ fn unit_entry(index: u64, ts: u64) -> OplogEntry {
         .expect("record");
     let key = encode_node_key(0, NodeId::from_raw(index + 1));
     let frame = coordinode_core::txn::frame::encode_unit(
-        &[
+        &coordinode_storage::engine::scope::store_unit([
             Mutation::Put {
                 partition: PartitionId::Node,
                 key: key.clone(),
                 value: record,
             },
             Mutation::Effects(creating([key])),
-        ],
+        ]),
         Timestamp::from_raw(ts),
     )
     .expect("frame");
@@ -757,8 +757,9 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
         .map(|i| schemas.bind_label(&format!("L{i}")).expect("bind"))
         .collect();
     // One run of deletes standing for 60 nodes of a type implying many
-    // labels: a frame of two operations whose projection is 60 events, each
-    // routed by far more labels than the frame stores for it.
+    // labels: a frame of two operations after its namespace marker, whose
+    // projection is 60 events, each routed by far more labels than the frame
+    // stores for it.
     let mut context = creating((1..=60u64).map(|id| encode_node_key(0, NodeId::from_raw(id))));
     for basis in &mut context.nodes {
         basis.labels = vec![labels[0]];
@@ -770,14 +771,14 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
         implies: implied,
     }];
     context.runs = vec![0];
-    let mutations = vec![
+    let mutations = coordinode_storage::engine::scope::store_unit([
         Mutation::RemoveRange {
             partition: PartitionId::Node,
             start: encode_node_key(0, NodeId::from_raw(1)),
             end: encode_node_key(0, NodeId::from_raw(61)),
         },
         Mutation::Effects(context),
-    ];
+    ]);
     let frame = coordinode_core::txn::frame::encode_unit(&mutations, Timestamp::from_raw(1_000))
         .expect("frame");
     let entry = OplogEntry {
@@ -929,8 +930,11 @@ async fn a_label_a_type_implies_receives_its_nodes_and_scope_changes() {
     .enumerate()
     {
         let ts = 1_000 + index as u64;
-        let frame = coordinode_core::txn::frame::encode_unit(&mutations, Timestamp::from_raw(ts))
-            .expect("frame");
+        let frame = coordinode_core::txn::frame::encode_unit(
+            &coordinode_storage::engine::scope::store_unit(mutations),
+            Timestamp::from_raw(ts),
+        )
+        .expect("frame");
         mgr.append(&OplogEntry {
             ts,
             term: 1,
@@ -1120,8 +1124,11 @@ async fn a_label_dropped_and_created_again_is_another_label_on_the_wire() {
     ];
     for (index, mutations) in units.iter().enumerate() {
         let ts = 1_000 + index as u64;
-        let frame = coordinode_core::txn::frame::encode_unit(mutations, Timestamp::from_raw(ts))
-            .expect("frame");
+        let frame = coordinode_core::txn::frame::encode_unit(
+            &coordinode_storage::engine::scope::store_unit(mutations.iter().cloned()),
+            Timestamp::from_raw(ts),
+        )
+        .expect("frame");
         mgr.append(&OplogEntry {
             ts,
             term: 1,
@@ -1386,7 +1393,8 @@ async fn labels_are_named_on_every_batch_by_its_own_read() {
     // One unit, a node of each label.
     let key = |id: u64| encode_node_key(0, NodeId::from_raw(id));
     let mut effects = UnitEffects::new();
-    let mut unit = Vec::new();
+    // A unit of the store's namespace: the marker first.
+    let mut unit = coordinode_storage::engine::scope::store_unit([]);
     for (i, &label) in labels.iter().enumerate() {
         let id = i as u64 + 1;
         unit.push(Mutation::Put {
@@ -1483,7 +1491,7 @@ async fn a_name_that_cannot_be_read_ends_the_stream_with_its_cause() {
         implies: Vec::new(),
     });
     let frame = coordinode_core::txn::frame::encode_unit(
-        &[
+        &coordinode_storage::engine::scope::store_unit([
             Mutation::Put {
                 partition: PartitionId::Node,
                 key,
@@ -1492,7 +1500,7 @@ async fn a_name_that_cannot_be_read_ends_the_stream_with_its_cause() {
                     .expect("record"),
             },
             Mutation::Effects(effects),
-        ],
+        ]),
         Timestamp::from_raw(1_000),
     )
     .expect("frame");
@@ -1563,7 +1571,7 @@ async fn a_label_created_behind_a_pending_write_is_named_at_once() {
         implies: Vec::new(),
     });
     let frame = coordinode_core::txn::frame::encode_unit(
-        &[
+        &coordinode_storage::engine::scope::store_unit([
             Mutation::Put {
                 partition: PartitionId::Node,
                 key,
@@ -1572,7 +1580,7 @@ async fn a_label_created_behind_a_pending_write_is_named_at_once() {
                     .expect("record"),
             },
             Mutation::Effects(effects),
-        ],
+        ]),
         Timestamp::from_raw(1_000),
     )
     .expect("frame");
@@ -1862,13 +1870,13 @@ async fn a_unit_without_its_context_ends_the_stream_explicitly() {
         .expect("open oplog");
     mgr.append(&unit_entry(0, 1000)).expect("append");
     let bare = coordinode_core::txn::frame::encode_unit(
-        &[Mutation::Put {
+        &coordinode_storage::engine::scope::store_unit([Mutation::Put {
             partition: PartitionId::Node,
             key: encode_node_key(0, NodeId::from_raw(9)),
             value: NodeRecord::with_labels(Vec::new())
                 .to_msgpack()
                 .expect("record"),
-        }],
+        }]),
         Timestamp::from_raw(1001),
     )
     .expect("frame");
@@ -2170,14 +2178,14 @@ async fn stream_follows_a_raft_node() {
         raft_pipeline
             .propose_and_wait(&RaftProposal {
                 id: ids.next(),
-                mutations: vec![
+                mutations: coordinode_storage::engine::scope::store_unit([
                     Mutation::Put {
                         partition: PartitionId::Node,
                         key: encode_node_key(0, NodeId::from_raw(100 + i)),
                         value: record.clone(),
                     },
                     Mutation::Effects(creating([encode_node_key(0, NodeId::from_raw(100 + i))])),
-                ],
+                ]),
                 commit_ts: Timestamp::from_raw(ts),
                 start_ts: Timestamp::from_raw(ts),
                 bypass_rate_limiter: false,

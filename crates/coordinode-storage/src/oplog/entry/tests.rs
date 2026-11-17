@@ -55,6 +55,7 @@ fn the_in_place_view_reads_what_an_entry_encodes() {
         OplogOp::Unit {
             frame: b"frame".to_vec(),
         },
+        OplogOp::Namespace { id: 7 },
     ]);
     entry.pre_images = Some(vec![PreImage {
         partition: 1,
@@ -134,6 +135,7 @@ fn the_in_place_view_reads_what_an_entry_encodes() {
             OplogOpRef::Unit { frame } => OplogOp::Unit {
                 frame: frame.to_vec(),
             },
+            OplogOpRef::Namespace { id } => OplogOp::Namespace { id },
         })
         .collect();
     assert_eq!(owned, entry.ops);

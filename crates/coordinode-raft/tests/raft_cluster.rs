@@ -25,6 +25,13 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::metadata::{field_frontier, load_field_dictionary};
 use coordinode_storage::engine::partition::Partition;
 
+/// A unit of the store's namespace: its marker, then the operations listed.
+macro_rules! unit {
+    ($($mutation:expr),* $(,)?) => {
+        coordinode_storage::engine::scope::store_unit([$($mutation),*])
+    };
+}
+
 /// The directory of the consensus log's tree under the endpoint `dir`.
 fn raft_tree(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join(coordinode_storage::engine::scope::store_tree(Partition::Raft).dir())
@@ -205,7 +212,7 @@ async fn cluster_3_node_bootstrap() {
 
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:cluster-test".to_vec(),
                 value: b"replicated!".to_vec(),
@@ -290,7 +297,7 @@ async fn a_member_added_by_host_and_port_receives_the_log() {
 
         let proposal = RaftProposal {
             id: ProposalIdGenerator::with_base(1u64 << 48).next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:bare-addr".to_vec(),
                 value: b"arrived".to_vec(),
@@ -421,7 +428,7 @@ async fn a_full_group_commits_its_own_work_through_a_majority() {
         let ids = ProposalIdGenerator::with_base(7u64 << 48);
         let proposal = |key: &[u8], own_work: bool| RaftProposal {
             id: ids.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: key.to_vec(),
                 value: b"v".to_vec(),
@@ -491,7 +498,7 @@ async fn a_client_write_waits_for_follower_room_and_then_commits() {
         let ids = ProposalIdGenerator::with_base(11u64 << 48);
         let proposal = |key: &[u8], bytes: usize| RaftProposal {
             id: ids.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: key.to_vec(),
                 value: vec![7u8; bytes],
@@ -576,7 +583,7 @@ async fn a_member_with_a_stopped_journal_keeps_answering_and_catches_up() {
             async move {
                 let p = RaftProposal {
                     id: ids.next(),
-                    mutations: vec![Mutation::Put {
+                    mutations: unit![Mutation::Put {
                         partition: PartitionId::Node,
                         key: key.into_bytes(),
                         value: vec![7u8; 4 << 10],
@@ -673,7 +680,7 @@ async fn cluster_propose_on_follower_returns_error() {
 
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:follower-write".to_vec(),
                 value: b"should-fail".to_vec(),
@@ -726,7 +733,7 @@ async fn cluster_committed_index_advances_and_replicates() {
         for i in 1..=3u64 {
             let proposal = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:xrepl-{i}").into_bytes(),
                     value: format!("v{i}").into_bytes(),
@@ -815,7 +822,7 @@ async fn cluster_merge_chain_folds_identically_on_every_member() {
 
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![
+            mutations: unit![
                 Mutation::Merge {
                     partition: PartitionId::Adj,
                     key: key.clone(),
@@ -900,7 +907,7 @@ async fn cluster_multiple_proposals_replicate() {
         for i in 1..=10u64 {
             let proposal = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:multi-{i}").into_bytes(),
                     value: format!("v{i}").into_bytes(),
@@ -975,7 +982,7 @@ async fn cluster_voter_learner_transitions() {
         // receives the replicated write.
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:after-demote".to_vec(),
                 value: b"committed".to_vec(),
@@ -1098,7 +1105,7 @@ async fn cluster_remove_node() {
 
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:after-remove".to_vec(),
                 value: b"still-works".to_vec(),
@@ -1167,7 +1174,7 @@ async fn cluster_leader_failover() {
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:before-failover".to_vec(),
                 value: b"pre-failover".to_vec(),
@@ -1205,7 +1212,7 @@ async fn cluster_leader_failover() {
 
         let proposal2 = RaftProposal {
             id: id_gen2.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:after-failover".to_vec(),
                 value: b"post-failover".to_vec(),
@@ -1366,7 +1373,7 @@ async fn cluster_crash_recovery() {
             for i in 1..=3u64 {
                 let p = RaftProposal {
                     id: id_gen.next(),
-                    mutations: vec![Mutation::Put {
+                    mutations: unit![Mutation::Put {
                         partition: PartitionId::Node,
                         key: format!("node:1:recovery-{i}").into_bytes(),
                         value: format!("val-{i}").into_bytes(),
@@ -1497,7 +1504,7 @@ async fn cluster_crash_recovery() {
             let id_gen = ProposalIdGenerator::with_base(99u64 << 48);
             let p = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"node:1:post-recovery".to_vec(),
                     value: b"works!".to_vec(),
@@ -1561,7 +1568,7 @@ async fn cluster_snapshot_build_and_purge() {
         for i in 1..=5u64 {
             let proposal = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:snap-test-{i}").into_bytes(),
                     value: format!("data-{i}").into_bytes(),
@@ -1684,7 +1691,7 @@ async fn cluster_snapshot_install_restores_data() {
         // Node data
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![
+            mutations: unit![
                 Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"node:0:100".to_vec(),
@@ -1836,7 +1843,7 @@ async fn cluster_background_snapshot_trigger() {
         for i in 1..=3u64 {
             let proposal = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:bg-trigger-{i}").into_bytes(),
                     value: format!("val-{i}").into_bytes(),
@@ -1911,7 +1918,7 @@ async fn a_log_grown_past_its_size_threshold_is_snapshotted() {
         for i in 1..=8u64 {
             let proposal = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:size-trigger-{i}").into_bytes(),
                     value: vec![b'x'; 32 * 1024],
@@ -1990,7 +1997,7 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
         let id_gen = ProposalIdGenerator::with_base(2u64 << 48);
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:snap-skip".to_vec(),
                 value: b"v".to_vec(),
@@ -2021,7 +2028,7 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
         // A new entry re-arms the trigger.
         let proposal = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:snap-skip-2".to_vec(),
                 value: b"v2".to_vec(),
@@ -2124,7 +2131,7 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
         for i in 1..=5u64 {
             let p = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:xfer-{i}").into_bytes(),
                     value: format!("val-{i}").into_bytes(),
@@ -2338,7 +2345,7 @@ async fn a_snapshot_carries_the_sealed_index_inventory() {
             pipeline
                 .propose_and_wait(&RaftProposal {
                     id: id_gen.next(),
-                    mutations: vec![Mutation::Put {
+                    mutations: unit![Mutation::Put {
                         partition: PartitionId::Node,
                         key: format!("node:1:inv-{i}").into_bytes(),
                         value: b"v".to_vec(),
@@ -2487,7 +2494,7 @@ async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
             last = pipeline
                 .propose_and_wait(&RaftProposal {
                     id: id_gen.next(),
-                    mutations: vec![Mutation::Put {
+                    mutations: unit![Mutation::Put {
                         partition: PartitionId::Node,
                         key: format!("node:1:idle-{i}").into_bytes(),
                         value: b"v".to_vec(),
@@ -2929,13 +2936,13 @@ async fn cluster_snapshot_multi_chunk_transfer() {
         let value_4kb = vec![0xABu8; 4096];
 
         for batch_start in (0..1200u64).step_by(50) {
-            let mutations: Vec<Mutation> = (batch_start..batch_start + 50)
-                .map(|i| Mutation::Put {
+            let mutations = coordinode_storage::engine::scope::store_unit(
+                (batch_start..batch_start + 50).map(|i| Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:1:big-{i:05}").into_bytes(),
                     value: value_4kb.clone(),
-                })
-                .collect();
+                }),
+            );
             let p = RaftProposal {
                 id: id_gen.next(),
                 mutations,
@@ -3153,7 +3160,7 @@ async fn cluster_follower_restart_reconnection() {
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
         let p_before = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:before-restart".to_vec(),
                 value: b"pre".to_vec(),
@@ -3257,7 +3264,7 @@ async fn cluster_follower_restart_reconnection() {
         let id_gen2 = ProposalIdGenerator::with_base(10u64 << 48);
         let p_after = RaftProposal {
             id: id_gen2.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:1:after-restart".to_vec(),
                 value: b"post".to_vec(),
@@ -3417,7 +3424,7 @@ async fn a_member_that_lost_committed_entries_votes_again_only_once_caught_up() 
             pipeline
                 .propose_and_wait(&RaftProposal {
                     id: id_gen.next(),
-                    mutations: vec![Mutation::Put {
+                    mutations: unit![Mutation::Put {
                         partition: PartitionId::Node,
                         key: key(i),
                         value: b"v".to_vec(),
@@ -3754,7 +3761,7 @@ async fn a_member_without_its_promise_is_replaced_under_a_new_identity() {
         pipeline
             .propose_and_wait(&RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: key.clone(),
                     value: b"v".to_vec(),
@@ -3985,7 +3992,7 @@ async fn a_replacement_cut_short_in_its_catch_up_is_resumed_by_the_next_leader()
             node.pipeline()
                 .propose_and_wait(&RaftProposal {
                     id: id_gen.next(),
-                    mutations: vec![Mutation::Put {
+                    mutations: unit![Mutation::Put {
                         partition: PartitionId::Node,
                         key: format!("node:1:replace-{i}").into_bytes(),
                         value: b"v".to_vec(),
@@ -4179,7 +4186,7 @@ async fn a_replacement_cut_short_in_its_joint_configuration_is_completed_by_the_
         n1.pipeline()
             .propose_and_wait(&RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: key.clone(),
                     value: b"v".to_vec(),
@@ -4402,7 +4409,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_promote_another_memb
             n1.pipeline()
                 .propose_and_wait(&RaftProposal {
                     id: id_gen.next(),
-                    mutations: vec![Mutation::Put {
+                    mutations: unit![Mutation::Put {
                         partition: PartitionId::Node,
                         key: format!("node:1:fence-{i}").into_bytes(),
                         value: b"v".to_vec(),
@@ -4598,7 +4605,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_remove_another_membe
             node.pipeline()
                 .propose_and_wait(&RaftProposal {
                     id: id_gen.next(),
-                    mutations: vec![Mutation::Put {
+                    mutations: unit![Mutation::Put {
                         partition: PartitionId::Node,
                         key: format!("node:1:old-side-{i}").into_bytes(),
                         value: b"v".to_vec(),
@@ -5169,7 +5176,7 @@ async fn cluster_graceful_leader_transfer() {
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
         let p = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:0:before-transfer".to_vec(),
                 value: b"pre-transfer".to_vec(),
@@ -5205,7 +5212,7 @@ async fn cluster_graceful_leader_transfer() {
         let id_gen2 = ProposalIdGenerator::with_base(2u64 << 48);
         let p2_prop = RaftProposal {
             id: id_gen2.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:0:after-transfer".to_vec(),
                 value: b"post-transfer".to_vec(),
@@ -5603,7 +5610,7 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         for i in 1..=5u64 {
             let p = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:0:pre-{i}").into_bytes(),
                     value: format!("pre-val-{i}").into_bytes(),
@@ -5631,7 +5638,7 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         for i in 1..=5u64 {
             let p = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:0:post-{i}").into_bytes(),
                     value: format!("post-val-{i}").into_bytes(),
@@ -5813,7 +5820,7 @@ async fn cluster_replication_status_tracking() {
         for i in 1..=10u64 {
             let p = RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: format!("node:0:status-{i}").into_bytes(),
                     value: format!("val-{i}").into_bytes(),
@@ -6001,7 +6008,7 @@ async fn cluster_read_concern_levels() {
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
         let p = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:0:rc-test".to_vec(),
                 value: b"read-concern-data".to_vec(),
@@ -6167,7 +6174,7 @@ async fn cluster_write_concern_w0_vs_majority() {
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
         let p_majority = RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:0:majority-write".to_vec(),
                 value: b"replicated".to_vec(),
@@ -6319,7 +6326,7 @@ async fn cluster_write_concern_acks_counts_members() {
         let id_gen = ProposalIdGenerator::with_base(2u64 << 48);
         let proposal = |key: &[u8], value: &[u8], ts: u64| RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: key.to_vec(),
                 value: value.to_vec(),
@@ -7244,7 +7251,7 @@ async fn a_partition_rebuilt_from_a_checkpoint_holds_each_entry_once() {
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
         let edge = |uid: u64, ts: u64| RaftProposal {
             id: id_gen.next(),
-            mutations: vec![Mutation::Merge {
+            mutations: unit![Mutation::Merge {
                 partition: PartitionId::Adj,
                 key: b"adj:R:out:1".to_vec(),
                 operand: coordinode_storage::engine::merge::encode_add(uid),
@@ -7319,7 +7326,7 @@ async fn open_cluster_rejects_busy_port() {
 fn register_fields(id_gen: &ProposalIdGenerator, names: &[&str], ts: u64) -> RaftProposal {
     RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Command(MetadataCommand::RegisterFields {
+        mutations: unit![Mutation::Command(MetadataCommand::RegisterFields {
             names: names.iter().map(|n| (*n).to_owned()).collect(),
         })],
         commit_ts: Timestamp::from_raw(ts),
@@ -7483,6 +7490,7 @@ fn conditional_write(
 ) -> RaftProposal {
     RaftProposal {
         id: id_gen.next(),
+        // The deployment's registry: no namespace.
         mutations: vec![Mutation::Command(
             MetadataCommand::ConditionalRegistryWrite {
                 expect: expect
@@ -7502,7 +7510,7 @@ fn conditional_write(
 fn marker(id_gen: &ProposalIdGenerator, key: &[u8], ts: u64) -> RaftProposal {
     RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.to_vec(),
             value: b"m".to_vec(),
@@ -7567,7 +7575,7 @@ async fn conditional_registry_writes_decide_alike_across_restart_and_leader_loss
             .pipeline()
             .propose_and_wait(&RaftProposal {
                 id: id_gen.next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"node:1:joined".to_vec(),
                     value: b"v".to_vec(),
@@ -8090,7 +8098,7 @@ fn try_propose_held_at(
     held.seal(id);
     let written = node.pipeline().propose_and_wait(&RaftProposal {
         id,
-        mutations: vec![Mutation::Put {
+        mutations: unit![Mutation::Put {
             partition: PartitionId::Node,
             key: key.to_vec(),
             value: b"v".to_vec(),
@@ -8278,7 +8286,7 @@ fn spawn_writes(
                 let outcome = pipeline
                     .propose_and_wait(&RaftProposal {
                         id,
-                        mutations: vec![Mutation::Put {
+                        mutations: unit![Mutation::Put {
                             partition: PartitionId::Node,
                             key: key.clone(),
                             value: b"v".to_vec(),
@@ -8726,7 +8734,7 @@ async fn a_timestamp_below_the_closed_bound_is_refused() {
         // already lie above the one read here, never below it.
         let refused = node.pipeline().propose_and_wait(&RaftProposal {
             id: ProposalIdGenerator::new().next(),
-            mutations: vec![Mutation::Put {
+            mutations: unit![Mutation::Put {
                 partition: PartitionId::Node,
                 key: b"node:late".to_vec(),
                 value: b"v".to_vec(),
@@ -9080,7 +9088,7 @@ async fn a_stale_stream_with_a_later_commit_does_not_apply_an_overwritten_entry(
             },
             payload: openraft::impls::EntryPayload::Normal(Request::single(RaftProposal {
                 id: ProposalIdGenerator::with_base(9 << 48).next(),
-                mutations: vec![Mutation::Put {
+                mutations: unit![Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"node:overwritten".to_vec(),
                     value: b"v".to_vec(),

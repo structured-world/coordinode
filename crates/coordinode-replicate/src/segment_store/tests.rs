@@ -1020,7 +1020,12 @@ async fn a_generation_replaced_from_a_peer_drops_local_damage_and_keeps_history(
                 key: key.to_vec(),
                 value: value.to_vec(),
             };
-            engine.commit_journaled(&[mutation], ts).expect("commit");
+            engine
+                .commit_journaled(
+                    &coordinode_storage::engine::scope::store_unit([mutation]),
+                    ts,
+                )
+                .expect("commit");
         }
         ts
     };
@@ -1173,7 +1178,12 @@ async fn a_generation_pull_carries_the_peers_standing_proof() {
             key: index_entry(GEN, b"a"),
             value: b"a1".to_vec(),
         };
-        engine.commit_journaled(&[mutation], ts).expect("commit");
+        engine
+            .commit_journaled(
+                &coordinode_storage::engine::scope::store_unit([mutation]),
+                ts,
+            )
+            .expect("commit");
     }
     let layer = std::sync::Arc::new(PeerProof {
         proved: std::sync::atomic::AtomicBool::new(true),

@@ -13,6 +13,7 @@ pub mod budget;
 pub mod graph;
 pub mod group;
 pub mod index;
+pub mod namespace;
 pub mod operations;
 pub mod schema;
 pub mod txn;

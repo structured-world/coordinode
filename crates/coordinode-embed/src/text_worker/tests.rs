@@ -20,11 +20,11 @@ fn engine(dir: &tempfile::TempDir) -> StorageEngine {
 fn apply(engine: &StorageEngine, index: u64, shard: u16, id: u64) {
     engine
         .apply_raft_proposal(
-            &[Mutation::Put {
+            &coordinode_storage::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: encode_node_key(shard, NodeId::from_raw(id)),
                 value: b"v".to_vec(),
-            }],
+            }]),
             10 + index,
             index,
             0,
@@ -126,11 +126,11 @@ fn apply_article(engine: &StorageEngine, index: u64, id: u64, body_field: u32, b
     );
     engine
         .apply_raft_proposal(
-            &[Mutation::Put {
+            &coordinode_storage::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: encode_node_key(1, NodeId::from_raw(id)),
                 value: record.to_msgpack().expect("encode"),
-            }],
+            }]),
             10 + index,
             index,
             0,
@@ -260,11 +260,11 @@ fn apply_titled(
     );
     engine
         .apply_raft_proposal(
-            &[Mutation::Put {
+            &coordinode_storage::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Node,
                 key: encode_node_key(1, NodeId::from_raw(id)),
                 value: record.to_msgpack().expect("encode"),
-            }],
+            }]),
             10 + index,
             index,
             0,

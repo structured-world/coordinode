@@ -138,11 +138,11 @@ fn put(id_gen: &ProposalIdGenerator, n: u64) -> RaftProposal {
     let ts = 1_000_000 + n;
     RaftProposal {
         id: id_gen.next(),
-        mutations: vec![Mutation::Put {
+        mutations: coordinode_storage::engine::scope::store_unit([Mutation::Put {
             partition: PartitionId::Node,
             key: format!("node:1:{n}").into_bytes(),
             value: vec![7; 64],
-        }],
+        }]),
         commit_ts: Timestamp::from_raw(ts),
         start_ts: Timestamp::from_raw(ts - 1),
         bypass_rate_limiter: false,

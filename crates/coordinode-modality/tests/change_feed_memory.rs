@@ -98,12 +98,14 @@ fn context(nodes: core::ops::RangeInclusive<u64>, runs: Vec<u32>, implied: u32) 
     })
 }
 
-/// An engine whose journal holds `unit`, and a cursor before it.
+/// An engine whose journal holds `unit`, in the store's namespace, and a
+/// cursor before it.
 fn journal_with(dir: &std::path::Path, unit: &[Mutation]) -> (StorageEngine, ChangeCursor) {
     let (engine, oracle) = open_engine(dir);
     let start = engine.change_cursor_at_end(Interest::all()).unwrap();
+    let unit = coordinode_storage::engine::scope::store_unit(unit.iter().cloned());
     engine
-        .commit_logged(unit, oracle.next().as_raw(), Journal::Journal)
+        .commit_logged(&unit, oracle.next().as_raw(), Journal::Journal)
         .unwrap();
     (engine, start)
 }
@@ -181,6 +183,9 @@ fn a_read_stopping_inside_a_large_unit_holds_its_budget() {
             (unit.events.len(), unit.projected)
         })
     };
+    // A first read sets up what the process keeps for every later one (its
+    // log statements' registrations): not memory any read holds.
+    read(&QueryBudget::new(u64::MAX)).expect("warm-up read");
     // Near the least budget the unit is read in, in part, at all: fixed, so
     // a change of the read does not move the condition it is held to.
     let limit: u64 = 9_222_996;
@@ -236,6 +241,8 @@ fn held_by(units: &[coordinode_storage::engine::change_feed::ChangeUnit]) -> u64
                     .map(|i| labels(&i.implies))
                     .sum::<usize>()
         }
+        // The namespace the rows belong to owns no bytes.
+        Mutation::Namespace(_) => 0,
         other => panic!("the test writes no {other:?}"),
     };
     let bytes = std::mem::size_of_val(units)

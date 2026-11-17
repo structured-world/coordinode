@@ -126,10 +126,12 @@ impl Fixture {
         }
     }
 
-    /// Apply `mutations` as Raft entry `index` at commit timestamp `index`.
+    /// Apply `mutations` as Raft entry `index` at commit timestamp `index`, a
+    /// unit of the store's namespace.
     fn apply(&self, index: u64, mutations: &[Mutation]) {
+        let unit = coordinode_storage::engine::scope::store_unit(mutations.iter().cloned());
         self.engine
-            .apply_raft_proposal(mutations, index, index, 0, |_| false)
+            .apply_raft_proposal(&unit, index, index, 0, |_| false)
             .unwrap();
     }
 
@@ -299,7 +301,10 @@ fn every_entry_applied_across_a_build_reaches_the_index() {
     // Enough nodes that the build is still scanning when the applies start.
     for id in 1..=3000u64 {
         fx.engine
-            .apply_proposal_at(&[fx.put_item(id, id as f32)], id)
+            .apply_proposal_at(
+                &coordinode_storage::engine::scope::store_unit([fx.put_item(id, id as f32)]),
+                id,
+            )
             .unwrap();
     }
     let worker = fx.spawn(1024);
@@ -517,7 +522,10 @@ fn the_watermark_stays_below_a_commit_still_in_flight() {
     // A later commit lands and is folded.
     let late = oracle.next().as_raw();
     fx.engine
-        .apply_proposal_at(&[fx.put_item(1, 1.0)], late)
+        .apply_proposal_at(
+            &coordinode_storage::engine::scope::store_unit([fx.put_item(1, 1.0)]),
+            late,
+        )
         .unwrap();
     assert_eq!(fx.await_indexed(1), 1);
     // Give a wrongly advanced watermark the time to show.
@@ -529,13 +537,19 @@ fn the_watermark_stays_below_a_commit_still_in_flight() {
     );
 
     fx.engine
-        .apply_proposal_at(&[fx.put_item(5, 5.0)], early)
+        .apply_proposal_at(
+            &coordinode_storage::engine::scope::store_unit([fx.put_item(5, 5.0)]),
+            early,
+        )
         .unwrap();
     drop(admission);
     // Another commit wakes the worker after the early one is visible.
     let after = oracle.next().as_raw();
     fx.engine
-        .apply_proposal_at(&[fx.put_item(6, 6.0)], after)
+        .apply_proposal_at(
+            &coordinode_storage::engine::scope::store_unit([fx.put_item(6, 6.0)]),
+            after,
+        )
         .unwrap();
     assert_eq!(fx.await_indexed(3), 3);
     for _ in 0..100 {

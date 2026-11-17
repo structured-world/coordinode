@@ -71,11 +71,11 @@ fn a_reclamation_failed_with_nothing_to_flush_runs_again_when_room_comes_back() 
                 state.to_le_bytes()[0]
             })
             .collect();
-        let write = [Mutation::Put {
+        let write = crate::engine::scope::store_unit([Mutation::Put {
             partition: PartitionId::Node,
             key: format!("node:1:w{index}").into_bytes(),
             value,
-        }];
+        }]);
         engine
             .commit_logged(&write, oracle.next().as_raw(), Journal::Journal)
             .expect("commit");

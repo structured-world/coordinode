@@ -120,6 +120,13 @@ pub enum OplogOp {
         #[serde(with = "serde_bytes")]
         frame: Vec<u8>,
     },
+    /// The namespace the ops after it, up to the next one, belong to: an op
+    /// on a namespace's data follows one, the deployment's own need none.
+    /// Last in the enum, for the same reason as above.
+    Namespace {
+        /// The namespace's id.
+        id: u64,
+    },
 }
 
 /// One logical unit written to the oplog: a batch of ops at a Raft index/term.
@@ -223,6 +230,9 @@ pub enum OplogOpRef<'a> {
         #[serde(borrow, with = "serde_bytes")]
         frame: &'a [u8],
     },
+    Namespace {
+        id: u64,
+    },
 }
 
 impl<'a> OplogEntryRef<'a> {
@@ -313,6 +323,7 @@ impl OplogOp {
             },
             Self::Derive { work } => OplogOpRef::Derive { work },
             Self::Unit { frame } => OplogOpRef::Unit { frame },
+            Self::Namespace { id } => OplogOpRef::Namespace { id: *id },
         }
     }
 }

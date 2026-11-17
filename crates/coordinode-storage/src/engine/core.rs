@@ -515,7 +515,8 @@ fn mutation_partition(mutation: &Mutation) -> Option<Partition> {
         Mutation::Command(_)
         | Mutation::Derive(_)
         | Mutation::Operation(_)
-        | Mutation::Effects(_) => None,
+        | Mutation::Effects(_)
+        | Mutation::Namespace(_) => None,
     }
 }
 
@@ -4220,7 +4221,8 @@ impl StorageEngine {
             OplogOp::Noop
             | OplogOp::RaftEntry { .. }
             | OplogOp::RaftTruncation { .. }
-            | OplogOp::ColumnarInsert { .. } => Ok(()),
+            | OplogOp::ColumnarInsert { .. }
+            | OplogOp::Namespace { .. } => Ok(()),
             OplogOp::Derive { .. } | OplogOp::Unit { .. } => Err(unresolved_unit()),
         }
     }
@@ -4369,7 +4371,8 @@ impl StorageEngine {
                     OplogOp::Noop
                     | OplogOp::RaftEntry { .. }
                     | OplogOp::RaftTruncation { .. }
-                    | OplogOp::ColumnarInsert { .. } => {}
+                    | OplogOp::ColumnarInsert { .. }
+                    | OplogOp::Namespace { .. } => {}
                     OplogOp::Derive { .. } | OplogOp::Unit { .. } => {
                         return Err(unresolved_unit());
                     }
@@ -5212,7 +5215,8 @@ impl StorageEngine {
                 OplogOpRef::Derive { .. }
                 | OplogOpRef::Noop
                 | OplogOpRef::RaftTruncation { .. }
-                | OplogOpRef::RaftEntry { .. } => continue,
+                | OplogOpRef::RaftEntry { .. }
+                | OplogOpRef::Namespace { .. } => continue,
             };
             let position = LogPosition {
                 index: entry.index,
@@ -5700,6 +5704,9 @@ impl StorageEngine {
                 OplogOpRef::Noop
                 | OplogOpRef::RaftTruncation { .. }
                 | OplogOpRef::RaftEntry { .. } => continue,
+                // Names the namespace of the raw ops after it, which carry
+                // none of their own.
+                OplogOpRef::Namespace { .. } => continue,
             };
             let position = LogPosition {
                 index: entry.index,
@@ -5838,6 +5845,8 @@ impl StorageEngine {
                 Mutation::Operation(_) => false,
                 // What the rows mean, not a row: a copy of rows applies none.
                 Mutation::Effects(_) => false,
+                // Names the namespace of the rows after it: kept with them.
+                Mutation::Namespace(_) => true,
             });
             if no_room {
                 return Err(EntryOutcome::NoRoom);
@@ -7019,12 +7028,17 @@ impl StorageEngine {
                 start,
                 end,
             } => self.remove_range(Partition::from(*partition), start, end),
-            // Each is resolved by the unit it belongs to.
+            // Each is resolved by the unit it belongs to: one of the store's
+            // namespace for a namespace's work.
             Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => {
-                self.apply_proposal_at(std::slice::from_ref(mutation), 0)
+                if mutation.requires_namespace() {
+                    self.apply_proposal_at(&crate::engine::scope::store_unit([mutation.clone()]), 0)
+                } else {
+                    self.apply_proposal_at(std::slice::from_ref(mutation), 0)
+                }
             }
-            // Writes nothing.
-            Mutation::Effects(_) => Ok(()),
+            // Write nothing.
+            Mutation::Effects(_) | Mutation::Namespace(_) => Ok(()),
         }
     }
 
@@ -7245,8 +7259,9 @@ impl StorageEngine {
             let (effects, dictionary) = self.decide_commands(mutations, commit_ts)?;
             // Nothing decided (names already bound, or a refusal) leaves the
             // state as it is, so there is nothing to journal or replay; the
-            // bindings it found may still be unsynced.
-            if effects.is_empty() {
+            // bindings it found may still be unsynced. The namespace markers
+            // the unit carried change nothing on their own.
+            if effects.iter().all(|m| matches!(m, Mutation::Namespace(_))) {
                 return self.sync_for(level);
             }
             self.journal_and_apply(&effects, commit_ts, level)?;
@@ -7321,6 +7336,13 @@ impl StorageEngine {
             .into_iter()
             .map(LocalWrite::into_mutation)
             .collect::<StorageResult<Vec<_>>>()?;
+        // A record of a namespace's tree (an index guard) names the namespace
+        // first; the consensus state is the deployment's and names none.
+        let mutations = if mutations.iter().any(Mutation::requires_namespace) {
+            crate::engine::scope::store_unit(mutations)
+        } else {
+            mutations
+        };
         let level = match sync {
             LocalSync::BeforeUse => Journal::Journal,
             LocalSync::Deferred => Journal::Cache,
@@ -7550,7 +7572,11 @@ impl StorageEngine {
             return Ok(());
         }
         let mut batch = WriteBatch::with_capacity(self, mutations.len());
-        for mutation in mutations {
+        let mut named = false;
+        for (at, mutation) in mutations.iter().enumerate() {
+            if mutation.requires_namespace() && !named {
+                return Err(coordinode_core::txn::proposal::Unscoped { at }.into());
+            }
             match mutation {
                 Mutation::Put {
                     partition,
@@ -7588,6 +7614,16 @@ impl StorageEngine {
                 // What the unit's rows mean for the change feed; it writes
                 // nothing of its own.
                 Mutation::Effects(_) => {}
+                // The rows after it are of this namespace: one whose trees
+                // this store holds.
+                Mutation::Namespace(namespace) => {
+                    if self.coordinator.sets().namespace(*namespace).is_none() {
+                        return Err(StorageError::UnknownNamespace {
+                            namespace: *namespace,
+                        });
+                    }
+                    named = true;
+                }
             }
         }
         let seqno = match (&self.oracle, commit_ts) {

@@ -410,6 +410,19 @@ pub enum StorageError {
     /// owed.
     #[error("the closure ledger was replaced while a commit ceiling was read from it")]
     ClosureLedgerReplaced,
+
+    /// A unit names a namespace this store holds no trees of. Nothing of
+    /// the unit is applied.
+    #[error("{namespace} is not a namespace of this store")]
+    UnknownNamespace {
+        /// The namespace named.
+        namespace: crate::engine::scope::NamespaceId,
+    },
+
+    /// A unit writes a namespace's data before naming any namespace. Nothing
+    /// of the unit is applied.
+    #[error(transparent)]
+    Unscoped(#[from] coordinode_core::txn::proposal::Unscoped),
 }
 
 /// `key` as text for a message: printable ASCII as it is, every other byte

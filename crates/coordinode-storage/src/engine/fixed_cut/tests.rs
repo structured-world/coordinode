@@ -423,12 +423,10 @@ fn a_frame_expanding_past_the_budget_is_refused_before_it_is_decoded() {
     let engine = open(&dir);
     let cut = cut(&engine);
     // Keys sharing a long prefix encode to a few bytes each.
-    let many: Vec<Mutation> = (0..2000u32)
-        .map(|i| Mutation::Delete {
-            partition: PartitionId::Counter,
-            key: format!("counter:{:0>64}", i).into_bytes(),
-        })
-        .collect();
+    let many = crate::engine::scope::store_unit((0..2000u32).map(|i| Mutation::Delete {
+        partition: PartitionId::Counter,
+        key: format!("counter:{:0>64}", i).into_bytes(),
+    }));
     let frame = coordinode_core::txn::frame::encode_unit(
         &many,
         coordinode_core::txn::timestamp::Timestamp::from_raw(1),
@@ -458,11 +456,11 @@ fn a_page_keeps_to_its_budget() {
     let engine = open(&dir);
     engine
         .commit_logged(
-            &[Mutation::Put {
+            &crate::engine::scope::store_unit([Mutation::Put {
                 partition: PartitionId::Counter,
                 key: b"counter:big".to_vec(),
                 value: vec![0; 4096],
-            }],
+            }]),
             engine.next_seqno(),
             Journal::Journal,
         )
@@ -490,13 +488,11 @@ fn a_page_charges_its_blocks_and_stops_where_the_budget_ends() {
     use coordinode_core::budget::QueryBudget;
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = open(&dir);
-    let rows: Vec<Mutation> = (0..400u32)
-        .map(|i| Mutation::Put {
-            partition: PartitionId::Counter,
-            key: format!("counter:{i:04}").into_bytes(),
-            value: vec![7; 1000],
-        })
-        .collect();
+    let rows = crate::engine::scope::store_unit((0..400u32).map(|i| Mutation::Put {
+        partition: PartitionId::Counter,
+        key: format!("counter:{i:04}").into_bytes(),
+        value: vec![7; 1000],
+    }));
     engine
         .commit_logged(&rows, engine.next_seqno(), Journal::Journal)
         .expect("rows");
@@ -617,13 +613,11 @@ fn a_cut_hands_over_its_scope_and_refuses_what_it_cannot_carry() {
 fn a_far_page_reads_only_from_where_the_last_ended() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = open(&dir);
-    let rows: Vec<Mutation> = (0..64u32)
-        .map(|i| Mutation::Put {
-            partition: PartitionId::Counter,
-            key: format!("counter:{i:04}").into_bytes(),
-            value: crate::engine::merge::encode_counter_delta(1),
-        })
-        .collect();
+    let rows = crate::engine::scope::store_unit((0..64u32).map(|i| Mutation::Put {
+        partition: PartitionId::Counter,
+        key: format!("counter:{i:04}").into_bytes(),
+        value: crate::engine::merge::encode_counter_delta(1),
+    }));
     engine
         .commit_logged(&rows, engine.next_seqno(), Journal::Journal)
         .expect("rows");
@@ -662,11 +656,11 @@ fn a_range_delete_is_clipped_to_the_scope() {
     let cut = engine
         .fixed_cut(scope, Duration::from_secs(10))
         .expect("cut");
-    let delete = vec![Mutation::RemoveRange {
+    let delete = crate::engine::scope::store_unit([Mutation::RemoveRange {
         partition: PartitionId::Counter,
         start: b"counter:a".to_vec(),
         end: b"counter:z".to_vec(),
-    }];
+    }]);
     let entry = crate::oplog::OplogEntry {
         ts: cut.bound() + 1,
         term: 0,
@@ -686,7 +680,12 @@ fn a_range_delete_is_clipped_to_the_scope() {
     let [unit] = units.as_slice() else {
         panic!("one unit: {units:?}")
     };
-    let [Mutation::RemoveRange { start, end, .. }] = unit.mutations.as_slice() else {
+    // The namespace the rows belong to is handed over with them.
+    let [
+        Mutation::Namespace(_),
+        Mutation::RemoveRange { start, end, .. },
+    ] = unit.mutations.as_slice()
+    else {
         panic!("one range delete: {:?}", unit.mutations)
     };
     assert_eq!(
@@ -733,12 +732,13 @@ fn a_scope_without_a_successor_clips_to_the_end_of_the_key_space() {
     );
 }
 
+/// A unit of the store's namespace adding `delta` to the test's counter.
 fn add(delta: i64) -> Vec<Mutation> {
-    vec![Mutation::Merge {
+    crate::engine::scope::store_unit([Mutation::Merge {
         partition: PartitionId::Counter,
         key: COUNTER.to_vec(),
         operand: crate::engine::merge::encode_counter_delta(delta),
-    }]
+    }])
 }
 
 fn counter(value: Option<bytes::Bytes>) -> i64 {

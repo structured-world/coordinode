@@ -109,11 +109,13 @@ impl Destination {
     }
 }
 
-/// Commit `mutations` to `engine`'s own journal at its clock's next stamp.
+/// Commit `mutations` to `engine`'s own journal at its clock's next stamp, a
+/// unit of the store's namespace.
 fn commit(engine: &StorageEngine, mutations: &[Mutation]) {
     let ts = engine.oracle().expect("an embedded engine").next().as_raw();
+    let unit = coordinode_storage::engine::scope::store_unit(mutations.iter().cloned());
     engine
-        .commit_logged(mutations, ts, Journal::Journal)
+        .commit_logged(&unit, ts, Journal::Journal)
         .expect("commit");
 }
 
@@ -169,6 +171,9 @@ fn read_continuation(db: &Database, cut: &mut StateCut, rows: &mut Rows) -> CutR
                     Mutation::Delete { key, .. } => {
                         rows.remove(key);
                     }
+                    // Names the namespace of the rows after it: the one the
+                    // destination's rows belong to.
+                    Mutation::Namespace(_) => {}
                     other => panic!("a node scope carries no {other:?}"),
                 }
             }

@@ -155,7 +155,11 @@ pub fn run(pattern: Pattern, shape: Shape, window_rounds: u64, dir: &Path) -> Ru
     let mut rng = 0x9E37_79B9_7F4A_7C15u64;
     for round in 0..shape.rounds {
         let round_ts = base + (round + 1) * ROUND_US;
-        let mut batch = Vec::with_capacity(BATCH as usize);
+        // Each batch is a unit of the store's namespace: the marker first.
+        let mut batch = Vec::with_capacity(BATCH as usize + 1);
+        batch.push(Mutation::Namespace(
+            coordinode_storage::engine::scope::STORE_NAMESPACE,
+        ));
         for i in 0..shape.keys {
             let record = match pattern {
                 Pattern::Overwrite => i,
@@ -170,15 +174,15 @@ pub fn run(pattern: Pattern, shape: Shape, window_rounds: u64, dir: &Path) -> Ru
                 key,
                 value: value.clone(),
             });
-            if batch.len() as u64 == BATCH {
+            if batch.len() as u64 - 1 == BATCH {
                 let commit_ts = round_ts + i / BATCH;
                 engine
                     .apply_proposal_at(&batch, commit_ts)
                     .expect("apply proposal");
-                batch.clear();
+                batch.truncate(1);
             }
         }
-        if !batch.is_empty() {
+        if batch.len() > 1 {
             let commit_ts = round_ts + shape.keys / BATCH + 1;
             engine
                 .apply_proposal_at(&batch, commit_ts)

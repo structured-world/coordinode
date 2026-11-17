@@ -3133,11 +3133,11 @@ async fn a_member_rebuilds_a_counter_through_a_state_cut() {
         pipeline
             .propose_and_wait(&RaftProposal {
                 id: ids.next(),
-                mutations: vec![Mutation::Merge {
+                mutations: coordinode_storage::engine::scope::store_unit([Mutation::Merge {
                     partition: PartitionId::Counter,
                     key: KEY.to_vec(),
                     operand: encode_counter_delta(delta),
-                }],
+                }]),
                 commit_ts: ts,
                 start_ts: ts,
                 bypass_rate_limiter: false,
