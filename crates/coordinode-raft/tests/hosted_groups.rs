@@ -574,6 +574,71 @@ async fn a_stream_message_of_another_group_ends_the_stream() {
     );
 }
 
+/// A request in an append stream that does not decode ends the stream with
+/// INVALID_ARGUMENT before it reaches the consensus: it is refused, never
+/// skipped while the stream goes on as if the leader had not sent it. The
+/// heartbeat before it is still answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undecodable_stream_message_ends_the_stream() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (r, port, server) = one_group_server().await;
+
+        let record = r.node.version().local_handshake();
+        let heartbeat = openraft::raft::AppendEntriesRequest::<TypeConfig> {
+            vote: openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, 1),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        };
+        let group = GroupId::FORMING.raw();
+        let mut request = tonic::Request::new(futures_util::stream::iter([
+            RaftPayload {
+                data: rmp_serde::to_vec(&heartbeat).expect("encode"),
+                group,
+            },
+            RaftPayload {
+                data: vec![0xc1, 0xff, 0x00],
+                group,
+            },
+        ]));
+        write_handshake(request.metadata_mut(), &record);
+        stamp(&mut request, &r.node);
+
+        let mut replies = client(port)
+            .stream_append(request)
+            .await
+            .expect("the stream opens")
+            .into_inner();
+        let mut answered = 0;
+        let mut last = None;
+        while let Some(reply) = replies.next().await {
+            if reply.is_ok() {
+                answered += 1;
+            }
+            let failed = reply.is_err();
+            last = Some(reply);
+            if failed {
+                break;
+            }
+        }
+        assert_eq!(answered, 1, "the heartbeat before it is answered");
+        assert!(
+            matches!(&last, Some(Err(status))
+                if status.code() == tonic::Code::InvalidArgument
+                    && status.message().contains("decode")),
+            "an undecodable request must end the stream, got {last:?}"
+        );
+
+        r.node.shutdown().await.expect("shutdown");
+        server.abort();
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: an_undecodable_stream_message_ends_the_stream"
+    );
+}
+
 /// A server cannot host two replicas of one group: adding one for a group
 /// already hosted is refused and leaves the hosted set as it was.
 #[tokio::test(flavor = "multi_thread")]

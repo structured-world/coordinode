@@ -561,25 +561,33 @@ impl RaftService for RaftGrpcHandler {
             futures_util::future::ready(pass)
         });
 
-        // Deserialize incoming RaftPayload stream → AppendEntriesRequest stream
-        let input_stream = input.filter_map(|result| async move {
-            match result {
-                Ok(payload) => match rmp_serde::from_slice::<
-                    openraft::raft::AppendEntriesRequest<TypeConfig>,
-                >(&payload.data)
-                {
-                    Ok(req) => Some(req),
-                    Err(e) => {
-                        tracing::warn!("stream_append deserialize error: {e}");
-                        None
+        // A request that cannot be received or decoded ends the stream with
+        // the refusal before anything after it reaches the consensus: the
+        // leader sent it, so skipping it would let the stream go on as if
+        // the leader had not.
+        let unreadable: Arc<parking_lot::Mutex<Option<Status>>> = Arc::default();
+        let unreadable_in = Arc::clone(&unreadable);
+        let input_stream = input
+            .map(|result| {
+                let payload = result.map_err(|e| Status::aborted(format!("receive: {e}")))?;
+                rmp_serde::from_slice::<openraft::raft::AppendEntriesRequest<TypeConfig>>(
+                    &payload.data,
+                )
+                .map_err(|e| Status::invalid_argument(format!("decode an append request: {e}")))
+            })
+            .take_while(move |decoded| {
+                let pass = match decoded {
+                    Ok(_) => true,
+                    Err(status) => {
+                        *unreadable_in.lock() = Some(status.clone());
+                        false
                     }
-                },
-                Err(e) => {
-                    tracing::warn!("stream_append receive error: {e}");
-                    None
-                }
-            }
-        });
+                };
+                futures_util::future::ready(pass)
+            })
+            .filter_map(|decoded| futures_util::future::ready(decoded.ok()));
+        let unreadable = futures_util::stream::once(async move { unreadable.lock().take() })
+            .filter_map(|status| async move { status.map(Err) });
 
         // Each request is admitted again before it reaches the consensus:
         // the caller must still be the member it opened the stream as,
@@ -721,6 +729,7 @@ impl RaftService for RaftGrpcHandler {
         Ok(replica.answer(Box::pin(
             output_stream
                 .chain(stopped)
+                .chain(unreadable)
                 .chain(refusal)
                 .chain(no_space)
                 .chain(wrong_group),
