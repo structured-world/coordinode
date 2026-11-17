@@ -246,12 +246,11 @@ impl CoordinodeClient {
     ///     .await
     ///     .unwrap();
     /// while let Some(batch) = sub.next().await.unwrap() {
-    ///     for event in &batch {
-    ///         println!("{} ops at {}", event.ops.len(), event.log_index);
+    ///     for unit in &batch.units {
+    ///         println!("{} events at {}", unit.events.len(), unit.log_index);
     ///     }
-    ///     if let Some(last) = batch.last() {
-    ///         sub.acknowledge(last.position).await.unwrap();
-    ///     }
+    ///     // Held: the stream may release what comes before the cursor.
+    ///     sub.acknowledge(&batch.cursor).await.unwrap();
     /// }
     /// # })
     /// ```

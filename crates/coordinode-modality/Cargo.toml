@@ -31,6 +31,8 @@ tempfile = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 coordinode-test-fixtures = { workspace = true }
+# The change feed's memory tests count allocations by group (`alloc_peak`).
+tracking-allocator = { version = "0.4", default-features = false }
 
 [[bench]]
 name = "store_throughput"
