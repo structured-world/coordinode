@@ -283,27 +283,23 @@ pub struct HnswConfig {
     ///
     /// Ignored when `rerank_mode != RerankMode::EndOfSearch`.
     pub rerank_oversample_factor: f32,
-    /// α parameter for the RobustPrune neighbour-selection heuristic
-    /// (Vamana paper / DiskANN, Algorithm 3). When `alpha_pruning > 1.0`,
-    /// the construction phase replaces "take M closest" with α-pruning:
-    /// for each kept neighbour `p*`, drop any candidate `p'` where
-    /// `α · d(p*, p') ≤ d(p, p')` — i.e. p' is closer to p* than (1/α)×
-    /// to the inserted node. This produces a sparser, more *diverse*
-    /// graph: fewer redundant edges → lower fanout per query → fewer
-    /// hops to reach the same recall → higher QPS at fixed recall.
+    /// α parameter of the neighbour-selection heuristic (RobustPrune,
+    /// Vamana paper / DiskANN, Algorithm 3), which every insert and every
+    /// prune of a full list applies: for each kept neighbour `p*`, drop any
+    /// candidate `p'` where `α · d(p*, p') ≤ d(p, p')`, i.e. p' is closer
+    /// to p* than (1/α)× to the node whose list it is.
     ///
-    /// Vamana paper §3 recommends `α = 1.2` as the production default.
-    /// `α = 1.0` is a no-op (degenerates to "take M closest", the
-    /// original HNSW behaviour). The cost is O(R · |V|) extra
+    /// `α = 1.0` is HNSW's own heuristic (Malkov & Yashunin, Algorithm 4).
+    /// Larger values keep more long edges: a sparser, more *diverse*
+    /// graph, fewer hops to the same recall, higher QPS at fixed recall.
+    /// Vamana paper §3 recommends `α = 1.2`. The cost is O(R · |V|)
     /// `distance_between_nodes` calls per insert (R = max_conn,
-    /// |V| = ef_construction) — a build-time tax for a search-time
-    /// win.
+    /// |V| = ef_construction).
     ///
     /// Values below `1.0` (including the default `0.0`) mean AUTO:
     /// the metric-tuned default from [`HnswConfig::effective_alpha`]
     /// (Cosine = 1.15, measured +16% QPS at recall 0.95 on
-    /// glove-100; other metrics = 1.0 until measured). Set `1.0`
-    /// explicitly to force α-pruning off.
+    /// glove-100; other metrics = 1.0 until measured).
     pub alpha_pruning: f32,
     /// Expected upper bound on the number of vectors this index will hold.
     /// Used at construction to pre-allocate the `nodes` and
@@ -357,7 +353,8 @@ impl HnswConfig {
     /// win; anything below 1.0 (α < 1 is meaningless for the pruning
     /// rule) selects the metric-tuned default: 1.15 for Cosine
     /// (measured on glove-100: same recall at ~2/3 the ef budget),
-    /// 1.0 (off) for metrics where the gain is not yet measured.
+    /// 1.0 (HNSW's own heuristic) for metrics where the gain is not yet
+    /// measured.
     #[inline]
     pub fn effective_alpha(&self) -> f32 {
         if self.alpha_pruning >= 1.0 {
@@ -1510,17 +1507,14 @@ impl HnswIndex {
             } else {
                 self.config.m
             };
-            // RobustPrune when alpha > 1.0; legacy "take M closest"
-            // otherwise. Both feed the same downstream insert plan path.
-            let selected: Vec<usize> = if self.config.effective_alpha() > 1.0 {
-                self.select_neighbours_robust_prune(&candidates, max_conn, wide)
-            } else {
-                candidates
-                    .into_iter()
-                    .take(max_conn)
-                    .map(|c| c.idx as usize)
-                    .collect()
-            };
+            // The diversity heuristic on every metric (at α = 1 it is
+            // HNSW's own, Malkov & Yashunin algorithm 4): a candidate closer
+            // to one already kept than to the new node is left out. The
+            // closest `max_conn` alone fill a list from one region and name
+            // nothing toward a region apart, so a descent that stops beside
+            // such a list never reaches it.
+            let selected: Vec<usize> =
+                self.select_neighbours_robust_prune(&candidates, max_conn, wide);
 
             if !selected.is_empty() {
                 current_ep = selected[0];

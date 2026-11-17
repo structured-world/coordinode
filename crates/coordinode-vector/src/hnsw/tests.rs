@@ -409,11 +409,9 @@ fn rerank_mode_none_returns_results_on_cosine_rabitq() {
 }
 
 #[test]
-fn robust_prune_default_alpha_one_is_noop() {
-    // α=1.0 must degenerate to legacy "take M closest" — neighbour
-    // selection should be identical to the simple strategy. We
-    // smoke-test by running an insert + immediate search and
-    // verifying recall on a small known-good dataset.
+fn robust_prune_alpha_one_finds_exact_nearest() {
+    // α=1.0 is HNSW's own selection heuristic: an insert and an immediate
+    // search on a small known-good dataset return the exact nearest.
     let mut cfg = make_config(VectorMetric::L2);
     cfg.alpha_pruning = 1.0;
     let mut index = HnswIndex::new(cfg);
@@ -2643,10 +2641,15 @@ fn serial_inserts_leave_every_node_findable() {
 /// pool can interleave: every insert of each wave planned before any of
 /// them links, so none sees another. The bound a concurrent build of the
 /// same points cannot fall below.
+///
+/// Seed 383: these points hold a dense island of 116 near the same spot,
+/// 1.3 from the nearest other. Linking each insert to its closest `m`
+/// alone left the upper layers with no edge into the island, so the
+/// descent stopped 3.0 away and 29 points of it were never returned.
 #[test]
 fn a_blind_wave_build_leaves_every_node_findable() {
     let items = uniform_points(600, 20);
-    for seed in [7u64, 35, 38] {
+    for seed in [7u64, 35, 38, 383] {
         for bulk in [false, true] {
             let mut index = seeded_l2_index(seed);
             index
