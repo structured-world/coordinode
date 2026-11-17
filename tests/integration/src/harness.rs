@@ -127,7 +127,7 @@ impl CoordinodeProcess {
                 env: Vec::new(),
                 launch,
             };
-            match proc.ready_or_diagnose(Duration::from_secs(15)).await {
+            match proc.ready_or_diagnose().await {
                 Ok(()) => {
                     proc.data_dir = Some(data_dir);
                     return proc;
@@ -280,7 +280,7 @@ impl CoordinodeProcess {
         };
         // The port is fixed by the caller (peers already name it), so a
         // process that lost it cannot move to another one.
-        if let Err(status) = proc.ready_or_diagnose(Duration::from_secs(15)).await {
+        if let Err(status) = proc.ready_or_diagnose().await {
             panic!("cluster member {node_id} exited during startup on port {port}: {status}");
         }
         proc
@@ -348,7 +348,7 @@ impl CoordinodeProcess {
                 env: env.clone(),
                 launch,
             };
-            match proc.ready_or_diagnose(Duration::from_secs(30)).await {
+            match proc.ready_or_diagnose().await {
                 Ok(()) => {
                     proc.data_dir = Some(data_dir);
                     return proc;
@@ -758,11 +758,8 @@ impl CoordinodeProcess {
     /// ready in time diagnosed (see [`diagnose`](Self::diagnose)) and the test
     /// failed with both attempts reported; the exit status of a process that
     /// ended during startup.
-    async fn ready_or_diagnose(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<(), std::process::ExitStatus> {
-        match self.wait_until_ready(timeout).await {
+    async fn ready_or_diagnose(&mut self) -> Result<(), std::process::ExitStatus> {
+        match self.wait_until_ready(START_READY_TIMEOUT).await {
             Ok(()) => Ok(()),
             Err(StartFailure::Exited(status)) => Err(status),
             Err(StartFailure::NotReady(first)) => {
@@ -1198,6 +1195,12 @@ pub fn binary_path() -> PathBuf {
 /// How long the one diagnostic start of a process that was not ready in time
 /// may take: long enough to see where a slow start spends its time.
 const DIAGNOSTIC_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a start may take before it is diagnosed and the test failed: a
+/// bound on a hung start, not a measure of a quick one. Four servers started
+/// at once on a loaded host have taken over 15 s before even binding their
+/// ports, with the same command ready in 3 s on a second start.
+const START_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The log filter a diagnostic start adds: the server's start phases.
 const STARTUP_TRACE: &str = "coordinode::startup=debug";
