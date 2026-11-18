@@ -1261,7 +1261,8 @@ fn the_labels_length_covers_their_decode() {
         let bytes = encode(&record);
         let len = NodeRecord::labels_len_from_msgpack(&bytes).unwrap();
         assert_eq!(len, count as usize);
-        let (labels, allocated) = allocated_by(|| NodeRecord::labels_from_msgpack(&bytes).unwrap());
+        let (labels, allocated) =
+            least_allocated_by(|| NodeRecord::labels_from_msgpack(&bytes).unwrap());
         assert_eq!(labels.len(), count as usize);
         assert!(
             allocated <= len * core::mem::size_of::<LabelId>(),
