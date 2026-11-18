@@ -402,8 +402,9 @@ fn the_projection_bound_covers_its_decode() {
             (&[9u32][..], &["absent"][..]),
         ] {
             let bound = NodeRecord::projection_bound(&bytes, fields, names).unwrap();
-            let (decoded, allocated) =
-                allocated_by(|| NodeRecord::project_from_msgpack(&bytes, fields, names).unwrap());
+            let (decoded, allocated) = least_allocated_by(|| {
+                NodeRecord::project_from_msgpack(&bytes, fields, names).unwrap()
+            });
             assert!(
                 allocated <= bound,
                 "shape {n}, fields {fields:?}, names {names:?}: {allocated} allocated, {bound} bound"
@@ -497,7 +498,7 @@ fn the_record_bound_covers_its_decode() {
 fn assert_record_bound(record: &NodeRecord, what: &str) {
     let bytes = encode(record);
     let bound = NodeRecord::decode_bound(&bytes).unwrap();
-    let (decoded, allocated) = allocated_by(|| NodeRecord::from_msgpack(&bytes).unwrap());
+    let (decoded, allocated) = least_allocated_by(|| NodeRecord::from_msgpack(&bytes).unwrap());
     assert!(
         allocated <= bound,
         "{what}: {allocated} allocated, {bound} bound"
@@ -965,15 +966,23 @@ fn a_report_the_record_does_not_keep_allocates_nothing() {
         assert!(record.report(&extra(node)));
     }
     let held = extra(0);
-    let (again, allocated) = allocated_by(|| record.report(&held));
+    let (again, allocated) = least_allocated_by(|| record.report(&held));
     assert!(!again);
     assert_eq!(allocated, 0, "a disagreement held already was copied");
+    // A report past the evidence moves the record, so each measured call
+    // gets a copy of its own, made before the count; the least of them is
+    // what the report costs (see `least_allocated_by`).
     let past = extra(u64::MAX);
     let revision = record.evidence_revision;
-    let (new, allocated) = allocated_by(|| record.report(&past));
-    assert!(new);
-    assert_eq!(allocated, 0, "a disagreement past the evidence was copied");
-    assert_eq!(record.evidence_revision, revision + 1);
+    let mut copies = vec![record.clone(); 5];
+    let mut least = usize::MAX;
+    for copy in &mut copies {
+        let (new, allocated) = allocated_by(|| copy.report(&past));
+        assert!(new);
+        assert_eq!(copy.evidence_revision, revision + 1);
+        least = least.min(allocated);
+    }
+    assert_eq!(least, 0, "a disagreement past the evidence was copied");
 }
 
 /// What the registry takes from an integrity record is read without the
@@ -1003,7 +1012,7 @@ fn an_integrity_state_is_read_without_its_evidence() {
     });
     let bytes = rmp_serde::to_vec(&record).unwrap();
     let (state, allocated) =
-        allocated_by(|| IndexIntegrityRecord::state_from_msgpack(&bytes).unwrap());
+        least_allocated_by(|| IndexIntegrityRecord::state_from_msgpack(&bytes).unwrap());
     assert_eq!(state, record.state());
     assert_eq!(allocated, 0, "the evidence was decoded");
 }
@@ -1195,7 +1204,7 @@ fn the_definition_bounds_cover_their_decodes() {
 
     let parts_bound = IndexDefinition::selection_bound(&bytes).unwrap();
     let (parts, allocated) =
-        allocated_by(|| IndexDefinition::selection_from_msgpack(&bytes).unwrap());
+        least_allocated_by(|| IndexDefinition::selection_from_msgpack(&bytes).unwrap());
     assert_eq!(parts.len(), 600);
     assert!(
         allocated <= parts_bound,
@@ -1206,7 +1215,7 @@ fn the_definition_bounds_cover_their_decodes() {
         least_allocated_by(|| IndexDefinition::for_placement_bound(&bytes).unwrap());
     assert_eq!(measuring, 0, "measuring allocated");
     let (kept, allocated) =
-        allocated_by(|| IndexDefinition::for_placement_from_msgpack(&bytes).unwrap());
+        least_allocated_by(|| IndexDefinition::for_placement_from_msgpack(&bytes).unwrap());
     assert_eq!(kept, def);
     assert!(
         allocated <= kept_bound,
@@ -1239,8 +1248,9 @@ fn the_implication_facts_skip_the_rest_of_the_definition() {
         least_allocated_by(|| LabelSchema::implication_facts_bound(&bytes).expect("bound"));
     assert_eq!(measuring, 0, "measuring allocated");
     assert!(bound < 1024, "the bound counts the properties: {bound}");
-    let (facts, allocated) =
-        allocated_by(|| LabelSchema::implication_facts_from_msgpack(&bytes, false).expect("facts"));
+    let (facts, allocated) = least_allocated_by(|| {
+        LabelSchema::implication_facts_from_msgpack(&bytes, false).expect("facts")
+    });
     assert_eq!(facts.implies, ["Thing", "Work"]);
     assert!(allocated <= bound, "{allocated} allocated, {bound} bound");
     assert!(
