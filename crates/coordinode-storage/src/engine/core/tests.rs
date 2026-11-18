@@ -3141,7 +3141,10 @@ fn fill_to_the_limit(
 
 /// Persist `engine` as an operator of a full store does: a barrier short of
 /// room is refused as the limit, losing nothing it was to write; the limit
-/// is then raised, the barrier lands, and the limit goes back.
+/// is then raised, the barrier lands, and the limit goes back. The flushes
+/// and compactions the full store held back resume once the limit is raised
+/// and take room first; a compaction gives its inputs back when it ends, so
+/// a barrier refused meanwhile is asked again, as an operator would.
 fn persist_making_room(engine: &StorageEngine, limit: u64) {
     if let Err(short) = engine.persist() {
         assert!(
@@ -3151,7 +3154,18 @@ fn persist_making_room(engine: &StorageEngine, limit: u64) {
         engine
             .set_hard_limit("default", 4 * limit, None)
             .expect("raise the limit");
-        engine.persist().expect("the barrier lands with room");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while let Err(short) = engine.persist() {
+            assert!(
+                short.to_string().contains("limit"),
+                "a barrier fails only for want of room: {short}"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the barrier never found room under the raised limit: {short}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         engine
             .set_hard_limit("default", limit, None)
             .expect("restore the limit");

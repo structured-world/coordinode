@@ -46,8 +46,41 @@ static RESERVED: Mutex<Option<Reserved>> = Mutex::new(None);
 
 struct Peaks;
 
+/// Which thread made a traced allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Maker {
+    /// The thread running the traced work.
+    Traced,
+    /// A thread of the rayon pool, by its index.
+    Rayon(usize),
+    /// Any other thread: not counted.
+    Other,
+}
+
+impl Maker {
+    fn encode(self) -> u64 {
+        match self {
+            Self::Other => 0,
+            Self::Traced => 1,
+            Self::Rayon(index) => 2 + index as u64,
+        }
+    }
+
+    fn decode(word: u64) -> Self {
+        match word {
+            0 => Self::Other,
+            1 => Self::Traced,
+            index => Self::Rayon((index - 2) as usize),
+        }
+    }
+
+    fn counted(self) -> bool {
+        self != Self::Other
+    }
+}
+
 impl Peaks {
-    fn log(addr: usize, size: isize, counted: bool) {
+    fn log(addr: usize, size: isize, maker: Maker) {
         let Some(log) = LOG.get() else {
             return;
         };
@@ -65,7 +98,7 @@ impl Peaks {
         let slot = &log[at * 4..at * 4 + 4];
         slot[0].store(addr as u64, Ordering::Relaxed);
         slot[1].store(size as u64, Ordering::Relaxed);
-        slot[2].store(u64::from(counted), Ordering::Relaxed);
+        slot[2].store(maker.encode(), Ordering::Relaxed);
         slot[3].store(reserved, Ordering::Relaxed);
     }
 }
@@ -78,9 +111,12 @@ impl AllocationTracker for Peaks {
             PEAK.fetch_max(live, Ordering::Relaxed);
         }
         if TRACING.load(Ordering::Relaxed) {
-            let counted =
-                group == TRACED.load(Ordering::Relaxed) || rayon::current_thread_index().is_some();
-            Self::log(addr, size.cast_signed(), counted);
+            let maker = if group == TRACED.load(Ordering::Relaxed) {
+                Maker::Traced
+            } else {
+                rayon::current_thread_index().map_or(Maker::Other, Maker::Rayon)
+            };
+            Self::log(addr, size.cast_signed(), maker);
         }
     }
 
@@ -96,7 +132,7 @@ impl AllocationTracker for Peaks {
             LIVE.fetch_sub(size.cast_signed(), Ordering::Relaxed);
         }
         if TRACING.load(Ordering::Relaxed) {
-            Self::log(addr, -size.cast_signed(), false);
+            Self::log(addr, -size.cast_signed(), Maker::Other);
         }
     }
 }
@@ -147,7 +183,7 @@ pub fn peak_and_kept_of<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
 
 /// What work held beyond its reservation over its whole run, by
 /// [`held_against`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     /// The most bytes held at once by allocations the work made and freed
     /// before it returned.
@@ -159,6 +195,9 @@ pub struct Held {
     /// reservation read at the same event, if they ever did: `(event, held,
     /// reserved)`.
     pub over: Option<(usize, usize, u64)>,
+    /// The transient allocations live at that event, `(event, bytes, maker)`:
+    /// what stood over the reservation, and which thread made it.
+    pub over_live: Vec<(usize, usize, Maker)>,
 }
 
 /// What `f` returns, and what its allocations held against `reserved`, read
@@ -201,13 +240,13 @@ pub fn held_against<T>(reserved: Reserved, f: impl FnOnce() -> T) -> (T, Held) {
         logged <= LOG_EVENTS,
         "the trace holds {LOG_EVENTS} events, the work made {logged}"
     );
-    let events: Vec<(usize, isize, bool, u64)> = (0..logged)
+    let events: Vec<(usize, isize, Maker, u64)> = (0..logged)
         .map(|at| {
             let slot = &log[at * 4..at * 4 + 4];
             (
                 slot[0].load(Ordering::Relaxed) as usize,
                 slot[1].load(Ordering::Relaxed) as i64 as isize,
-                slot[2].load(Ordering::Relaxed) == 1,
+                Maker::decode(slot[2].load(Ordering::Relaxed)),
                 slot[3].load(Ordering::Relaxed),
             )
         })
@@ -215,8 +254,8 @@ pub fn held_against<T>(reserved: Reserved, f: impl FnOnce() -> T) -> (T, Held) {
 
     // Which counted allocations were still live when `f` returned.
     let mut live: HashMap<usize, (usize, usize)> = HashMap::new();
-    for (at, &(addr, size, counted, _)) in events.iter().enumerate() {
-        if size > 0 && counted {
+    for (at, &(addr, size, maker, _)) in events.iter().enumerate() {
+        if size > 0 && maker.counted() {
             live.insert(addr, (at, size.cast_unsigned()));
         } else if size < 0 {
             live.remove(&addr);
@@ -225,16 +264,18 @@ pub fn held_against<T>(reserved: Reserved, f: impl FnOnce() -> T) -> (T, Held) {
     let kept_at: std::collections::HashSet<usize> = live.values().map(|&(at, _)| at).collect();
     let kept = live.values().map(|&(_, size)| size).sum();
 
-    let mut transient_live: HashMap<usize, usize> = HashMap::new();
+    // Each transient allocation live now: its address, event, size and maker.
+    let mut transient_live: HashMap<usize, (usize, usize, Maker)> = HashMap::new();
     let mut held = 0usize;
     let mut transient = 0usize;
     let mut over: Option<(usize, usize, u64)> = None;
-    for (at, &(addr, size, counted, reserved)) in events.iter().enumerate() {
-        if size > 0 && counted && !kept_at.contains(&at) {
-            transient_live.insert(addr, size.cast_unsigned());
+    let mut over_live = Vec::new();
+    for (at, &(addr, size, maker, reserved)) in events.iter().enumerate() {
+        if size > 0 && maker.counted() && !kept_at.contains(&at) {
+            transient_live.insert(addr, (at, size.cast_unsigned(), maker));
             held += size.cast_unsigned();
         } else if size < 0
-            && let Some(freed) = transient_live.remove(&addr)
+            && let Some((_, freed, _)) = transient_live.remove(&addr)
         {
             held -= freed;
         }
@@ -244,6 +285,8 @@ pub fn held_against<T>(reserved: Reserved, f: impl FnOnce() -> T) -> (T, Held) {
             && over.is_none_or(|(_, h, r)| excess > (h as u64) - r)
         {
             over = Some((at, held, reserved));
+            over_live = transient_live.values().copied().collect();
+            over_live.sort_unstable_by_key(|&(event, _, _)| event);
         }
     }
     (
@@ -252,6 +295,7 @@ pub fn held_against<T>(reserved: Reserved, f: impl FnOnce() -> T) -> (T, Held) {
             transient,
             kept,
             over,
+            over_live,
         },
     )
 }
