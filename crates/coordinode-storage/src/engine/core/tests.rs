@@ -3197,8 +3197,9 @@ fn persist_making_room(engine: &StorageEngine, limit: u64) {
 /// only close retire the ledger's breakpoints in bounded batches, the files
 /// never passing what the endpoint may hold, and a restart reads every
 /// breakpoint back. A barrier the full store has no room for may be refused
-/// and lands once room is made: nothing it was to write is lost.
-#[test]
+/// and lands once room is made: nothing it was to write is lost. The store's
+/// own log is captured, so a failing run shows what its maintenance reported.
+#[test_log::test]
 fn closing_entries_clean_up_within_the_limit_client_writes_are_refused_at() {
     use crate::engine::closure_ledger::RETIRE_BATCH;
 
