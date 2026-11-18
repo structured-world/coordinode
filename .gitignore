@@ -75,6 +75,8 @@ Thumbs.db
 *.profraw
 *.profdata
 data/
+# openraft's documentation module of that name, in the vendored source
+!vendor/openraft/src/docs/data/
 
 # Node.js / VitePress docs
 node_modules/
