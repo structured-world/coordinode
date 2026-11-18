@@ -17,12 +17,18 @@ mod alloc_peak;
 static ALLOCATOR: tracking_allocator::Allocator<std::alloc::System> =
     tracking_allocator::Allocator::system();
 
-/// The writes measured.
+/// The writes measured in one round.
 const WRITES: u32 = 200;
 
-/// The bytes `WRITES` ordinary writes allocate on the writing thread, in a
-/// database with `ordinary` registered consumers holding no history and
-/// `strict` ones holding it.
+/// Rounds measured per database; the least of them is its cost. A background
+/// flush that rotates a memtable inside a round makes that round's writes
+/// take arena segments the write itself does not need; a cost every write
+/// carries shows in every round.
+const ROUNDS: u32 = 3;
+
+/// The least bytes `WRITES` ordinary writes allocate on the writing thread
+/// over `ROUNDS` rounds, in a database with `ordinary` registered consumers
+/// holding no history and `strict` ones holding it.
 fn cost_of_writes(ordinary: u32, strict: u32) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Database::open(dir.path()).unwrap();
@@ -52,19 +58,23 @@ fn cost_of_writes(ordinary: u32, strict: u32) -> u64 {
         db.execute_cypher(&format!("CREATE (:Warm {{n: {i}}})"))
             .unwrap();
     }
-    // Every store starts the measured writes on empty memtables. A memtable
-    // takes a new arena segment (1.5 MiB) when one fills, on the write that
-    // crosses it; where that falls depends on the bytes written before and
-    // on whether a background flush has rotated the memtable yet, not on the
-    // write measured.
-    db.persist().unwrap();
-    let ((), _) = alloc_peak::peak_of(|| {
-        for i in 0..WRITES {
-            db.execute_cypher(&format!("CREATE (:User {{n: {i}}})"))
-                .unwrap();
-        }
-    });
-    alloc_peak::sample_allocated()
+    let mut least = u64::MAX;
+    for round in 0..ROUNDS {
+        // Every store starts the measured writes on empty memtables. A
+        // memtable takes a new arena segment (1.5 MiB) when one fills, on the
+        // write that crosses it; where that falls depends on the bytes written
+        // before and on whether a background flush has rotated the memtable
+        // yet, not on the write measured.
+        db.persist().unwrap();
+        let ((), _) = alloc_peak::peak_of(|| {
+            for i in 0..WRITES {
+                db.execute_cypher(&format!("CREATE (:User {{round: {round}, n: {i}}})"))
+                    .unwrap();
+            }
+        });
+        least = least.min(alloc_peak::sample_allocated());
+    }
+    least
 }
 
 /// Ordinary writes allocate the same with no consumer, with many consumers
