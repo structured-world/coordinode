@@ -1,0 +1,208 @@
+use std::fmt;
+
+use display_more::DisplayOptionExt;
+
+use crate::RaftTypeConfig;
+use crate::StorageError;
+use crate::core::NotificationName;
+use crate::core::sm;
+use crate::progress::inflight_id::InflightId;
+use crate::progress::stream_id::StreamId;
+use crate::proposer::SendStamp;
+use crate::raft::VoteResponse;
+use crate::raft_state::IOId;
+use crate::replication;
+use crate::type_config::alias::CommittedVoteOf;
+use crate::type_config::alias::InstantOf;
+use crate::type_config::alias::LogIdOf;
+use crate::type_config::alias::UncommittedVoteOf;
+use crate::type_config::alias::VoteOf;
+
+/// A message coming from the internal components.
+pub(crate) enum Notification<C>
+where C: RaftTypeConfig
+{
+    VoteResponse {
+        target: C::NodeId,
+        resp: VoteResponse<C>,
+
+        /// The candidate that sent the vote request.
+        ///
+        /// A vote identifies a unique server state.
+        candidate_vote: UncommittedVoteOf<C>,
+    },
+
+    /// Response to a Pre-Vote request sent by a pre-candidate.
+    ///
+    /// Unlike [`VoteResponse`](Self::VoteResponse), receiving this does not change any persistent
+    /// state; it only advances the pre-vote tally that decides whether to start a real election.
+    PreVoteResponse {
+        target: C::NodeId,
+        resp: VoteResponse<C>,
+
+        /// The pre-candidate vote (the hypothetical next-term vote) this response answers.
+        candidate_vote: UncommittedVoteOf<C>,
+    },
+
+    /// A Leader sees a higher `vote` when replicating.
+    HigherVote {
+        /// The ID of the target node from which the new term was observed.
+        target: C::NodeId,
+
+        /// The higher vote observed.
+        higher: VoteOf<C>,
+
+        /// The Leader that sent the replication request.
+        leader_vote: CommittedVoteOf<C>,
+    },
+
+    /// [`StorageError`] error has taken place locally(not on remote node),
+    /// and [`RaftCore`](`crate::core::RaftCore`) needs to shutdown.
+    StorageError { error: StorageError<C> },
+
+    /// Completion of an IO operation to local store.
+    LocalIO { io_id: IOId<C> },
+
+    /// Completion of purging log entries from storage.
+    LogPurged { upto: LogIdOf<C> },
+
+    /// Result of executing a command sent from network worker.
+    ReplicationProgress {
+        /// Identifies the replication stream that produced this progress.
+        stream_id: StreamId,
+
+        progress: replication::Progress<C>,
+
+        /// The `InflightId` of the replication request that produced this response.
+        ///
+        /// - `Some(id)`: This response corresponds to a replication request that carries log
+        ///   payload. The `id` is used to match the response to the correct inflight state,
+        ///   allowing the leader to update `matching` or handle conflicts properly.
+        ///
+        /// - `None`: This response is from an RPC without log payload (e.g., a heartbeat to
+        ///   synchronize commit index). Such RPCs don't have corresponding inflight records, so no
+        ///   inflight state update is needed.
+        inflight_id: Option<InflightId>,
+    },
+
+    HeartbeatProgress {
+        stream_id: StreamId,
+        sending_time: SendStamp<InstantOf<C>>,
+        target: C::NodeId,
+    },
+
+    /// Result of executing a command sent from a state machine worker.
+    StateMachine { command_result: sm::CommandResult<C> },
+
+    /// A tick event to wake up RaftCore to check timeout etc.
+    Tick {
+        /// ith tick
+        i: u64,
+    },
+
+    /// The earliest pending linearizable read reached its deadline.
+    PendingReadDeadlineReached,
+}
+
+impl<C> Notification<C>
+where C: RaftTypeConfig
+{
+    pub(crate) fn sm(command_result: sm::CommandResult<C>) -> Self {
+        Self::StateMachine { command_result }
+    }
+
+    /// Returns the name of this notification variant.
+    pub(crate) fn name(&self) -> NotificationName {
+        match self {
+            Self::VoteResponse { .. } => NotificationName::VoteResponse,
+            Self::PreVoteResponse { .. } => NotificationName::PreVoteResponse,
+            Self::HigherVote { .. } => NotificationName::HigherVote,
+            Self::StorageError { .. } => NotificationName::StorageError,
+            Self::LocalIO { .. } => NotificationName::LocalIO,
+            Self::LogPurged { .. } => NotificationName::LogPurged,
+            Self::ReplicationProgress { .. } => NotificationName::ReplicationProgress,
+            Self::HeartbeatProgress { .. } => NotificationName::HeartbeatProgress,
+            Self::StateMachine { .. } => NotificationName::StateMachine,
+            Self::Tick { .. } => NotificationName::Tick,
+            Self::PendingReadDeadlineReached => NotificationName::PendingReadDeadlineReached,
+        }
+    }
+}
+
+impl<C> fmt::Display for Notification<C>
+where C: RaftTypeConfig
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::VoteResponse {
+                target,
+                resp,
+                candidate_vote,
+            } => {
+                write!(
+                    f,
+                    "VoteResponse: from target={}, to candidate_vote: {}, {}",
+                    target, candidate_vote, resp
+                )
+            }
+            Self::PreVoteResponse {
+                target,
+                resp,
+                candidate_vote,
+            } => {
+                write!(
+                    f,
+                    "PreVoteResponse: from target={}, to pre_candidate_vote: {}, {}",
+                    target, candidate_vote, resp
+                )
+            }
+            Self::HigherVote {
+                target,
+                higher: new_vote,
+                leader_vote: vote,
+            } => {
+                write!(
+                    f,
+                    "Seen a higher vote: target: {}, vote: {}, server_state_vote: {}",
+                    target, new_vote, vote
+                )
+            }
+            Self::StorageError { error } => write!(f, "StorageError: {}", error),
+            Self::LocalIO { io_id } => write!(f, "IOFlushed: {}", io_id),
+            Self::LogPurged { upto } => write!(f, "LogPurged: {}", upto),
+            Self::ReplicationProgress {
+                stream_id,
+                progress,
+                inflight_id,
+            } => {
+                write!(
+                    f,
+                    "{}, stream_id: {}, inflight_id: {}",
+                    progress,
+                    stream_id,
+                    inflight_id.display()
+                )
+            }
+            Self::HeartbeatProgress {
+                stream_id: leader_vote,
+                sending_time,
+                target,
+            } => {
+                write!(
+                    f,
+                    "HeartbeatProgress: target={}, leader_vote: {}, sending_time: {}",
+                    target, leader_vote, sending_time,
+                )
+            }
+            Self::StateMachine { command_result } => {
+                write!(f, "{}", command_result)
+            }
+            Self::Tick { i } => {
+                write!(f, "Tick {}", i)
+            }
+            Self::PendingReadDeadlineReached => {
+                write!(f, "PendingReadDeadlineReached")
+            }
+        }
+    }
+}

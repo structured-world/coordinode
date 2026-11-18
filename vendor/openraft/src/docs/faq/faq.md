@@ -1,0 +1,1250 @@
+## Getting Started
+
+### How to initialize a cluster?
+
+The simplest and most appropriate way to initialize a cluster is to call
+`Raft::initialize()` on **exactly one node**. The other nodes should remain
+empty and wait for the initialized node to replicate logs to them.
+
+Assuming there are three nodes `n1, n2, n3`, there are two approaches:
+
+1. **Single-step method**:
+   Call `Raft::initialize()` on one node (e.g., `n1`) with the configuration of
+   all three nodes: `n1.initialize(btreeset! {1,2,3})`.
+   The initialized node will then replicate the membership to the other nodes.
+
+2. **Incremental method**:
+   First, call `Raft::initialize()` on `n1` with configuration containing only `n1`
+   itself: `n1.initialize(btreeset! {1})`.
+   Subsequently use `Raft::change_membership()` on `n1` to add `n2` and `n3`
+   into the cluster.
+
+The incremental method provides flexibility to start with a single-node
+cluster for testing and expand it later for production.
+
+
+### Are there any issues with running a single node service?
+
+Not at all.
+
+Running a cluster with just one node is a standard approach for testing or as an initial step in setting up a cluster.
+
+A single node functions exactly the same as cluster mode.
+It will consistently maintain the `Leader` status and never transition to `Candidate` or `Follower` states.
+
+
+### Can I call `initialize()` on multiple nodes?
+
+Calling `initialize()` on multiple nodes with **identical configuration** is
+acceptable and will not cause consistency issues — the Raft voting protocol
+ensures that only one leader will be elected.
+
+However, calling `initialize()` with **different configurations** on different
+nodes may lead to a split-brain condition and must be avoided.
+
+
+## Core Concepts
+
+### What are the differences between Openraft and standard Raft?
+
+These are protocol-level departures from the Raft paper. API conveniences
+(extensible type config, split storage, manual triggers, lifecycle callbacks,
+etc.) are covered elsewhere.
+
+
+#### Election and `Vote`
+
+- **`Vote` unifies `term` and `voted_for`.** Standard Raft tracks `currentTerm`
+  and `votedFor` separately. Openraft combines them into a single
+  partially-ordered [`Vote`][] value that drives every election and replication
+  decision: a node grants a request iff the incoming `Vote` is greater than or
+  equal to the last `Vote` it has seen. See [`Vote`][`Vote doc`].
+
+- **Advanced-mode leader-id (default): multiple leaders per term.** Standard
+  Raft elects at most one leader per term. Openraft's default leader-id is
+  `(term, node_id)` and totally ordered, so multiple candidates may be granted
+  in the same term — the last one wins. This minimizes election conflicts at
+  the cost of embedding `node_id` in every [`LogId`][]. A standard-mode
+  leader-id is available if the extra bytes matter. See [`leader_id`][].
+
+
+#### Leader is not tied to voter role
+
+Standard Raft requires the leader to be a voter in the current configuration.
+In Openraft, leadership is determined solely by a committed [`Vote`][] —
+Paxos-style — so a leader may be a learner or even a node outside the
+membership. Voter/learner status only affects quorum counting, never the right
+to lead.
+
+This generalization rolls out in phases:
+
+- **Phase A — supported.** A committed membership change demotes the leader to
+  a learner or removes it from the membership entirely. The leader keeps
+  replicating and committing until it steps down, and does not count itself in
+  any quorum while non-voting. It also replicates the `membership-is-committed`
+  message before stepping down, so the new configuration can operate without
+  re-committing the membership log. See `RaftCore::current_leader` in
+  `openraft/src/core/raft_core.rs`.
+
+- **Phase B — not yet implemented.** A node that was never in the membership
+  becomes a leader. This completes the generalization and is tracked on the
+  roadmap.
+
+
+#### Membership change
+
+- **Extended joint consensus.** Standard Raft alternates uniform and two-config
+  joint memberships (`c1 → c1c2 → c2`). Openraft's extended algorithm accepts
+  arbitrary joint configs and reversion (`c1 → c1c2c3 → c3c4 → c4`, or
+  `c1c2c3 → c1`), as long as the **old-new-intersect** constraint holds between
+  adjacent memberships. See [`extended membership`][].
+
+- **Single-step change.** [`Raft::change_membership()`][] writes its target in
+  one log entry when Openraft can prove that every old quorum intersects every
+  new quorum, such as when it adds or removes one voter. Otherwise it goes
+  through joint consensus. [`Raft::append_membership()`][] writes the caller's
+  exact membership as one log entry, when a voter set of the old membership and
+  a voter set of the new one have intersecting majorities. Both enforce
+  the corrected single-server rule, which requires the leader to commit a log
+  entry of its own term before it appends a configuration entry. See
+  [`extended membership`][].
+
+- **`change_membership` is concurrency-safe.** Parallel calls may interleave
+  and leave the cluster in a valid joint state. This is by design — it
+  simplifies leader-crash recovery and lets the leader pivot if a target node
+  becomes unreliable mid-transition.
+
+  A membership log entry also takes effect the moment it appears in the log,
+  not when it commits (the **use-at-once** constraint in
+  [`extended membership`][]). This is what lets a leader keep serving after it
+  has been demoted or removed by an uncommitted membership change.
+
+
+#### Log and state
+
+- **Committed log id is persisted.** Openraft lets the log storage persist the
+  committed log id via [`RaftLogStorage::save_committed()`][]. On startup,
+  previously-committed entries can be re-applied to the state machine without
+  a fresh commit round. Standard Raft does not persist commit progress.
+
+- **Restarted leaders can campaign immediately.** With
+  [`Config::enable_leader_restore`][] enabled, the default, an eligible former leader
+  starts a higher-term election at startup. It still needs election quorum
+  approval and follows leader-lease checks. Standard Raft restarts as a
+  follower and waits for its normal election timeout.
+
+
+#### Read
+
+- **`ReadIndex` without the blank-log round-trip.** Standard Raft requires the
+  leader to commit a blank log entry at the start of its term before serving
+  linearizable reads. Openraft uses the term's initial blank log id as
+  `read_log_id` directly, skipping the extra round-trip. See
+  [`Linearizable Read`][].
+
+- **Lease-based linearizable read.** In addition to `ReadIndex`, Openraft
+  offers [`ReadPolicy::LeaseRead`][], which confirms leadership via lease
+  instead of a quorum heartbeat. See [`leader lease`][].
+
+- **Linearizable follower read.** A follower may obtain `read_log_id` from the
+  leader via application RPC, wait for its local state machine to catch up,
+  then read locally — distributing read load without losing linearizability.
+  See [`Linearizable Read`][].
+
+
+[`Vote`]: `crate::vote::Vote`
+[`Vote doc`]: `crate::docs::data::vote`
+[`LogId`]: `crate::LogId`
+[`leader_id`]: `crate::docs::data::leader_id`
+[`extended membership`]: `crate::docs::data::extended_membership`
+[`Raft::change_membership()`]: `crate::Raft::change_membership`
+[`Raft::append_membership()`]: `crate::Raft::append_membership`
+[`leader lease`]: `crate::docs::protocol::replication::leader_lease`
+[`Linearizable Read`]: `crate::docs::protocol::read`
+[`RaftLogStorage::save_committed()`]: `crate::storage::RaftLogStorage::save_committed`
+[`ReadPolicy::LeaseRead`]: `crate::raft::ReadPolicy::LeaseRead`
+[`Config::enable_leader_restore`]: `field@crate::Config::enable_leader_restore`
+
+
+### Why is log id a tuple of `(term, node_id, log_index)`?
+
+In standard Raft log id is `(term, log_index)`, in Openraft he log id `(term,
+node_id, log_index)` is used to minimize the chance of election conflicts.
+This way in every term there could be more than one leader elected, and the last one is valid.
+See: [`leader-id`](`crate::docs::data::leader_id`) for details.
+
+[`leader-id`]: `crate::docs::data::leader_id`
+
+
+## Configuration & Tuning
+
+### How do leader elections get triggered?
+
+**Question**: When a leader node fails or is terminated, how do followers detect this and start a new election?
+
+**Answer**: Followers automatically trigger elections when they stop receiving messages from the leader for longer than the configured `election_timeout_max`.
+
+**How it works**:
+
+1. **Heartbeat mechanism**: The leader periodically sends `AppendEntries` messages (heartbeats) to all followers and learners at intervals defined by [`Config::heartbeat_interval`][].
+
+2. **Election timeout**: Each follower maintains an internal timer. When a follower receives an `AppendEntries` message from the leader, it resets this timer.
+
+3. **Entering candidate state**: If a follower does not receive any `AppendEntries` messages for longer than [`Config::election_timeout_max`][], it transitions to the `Candidate` state and begins a new election by requesting votes from other nodes.
+
+4. **Required configuration**: For elections to trigger automatically, ensure:
+   - [`Config::enable_tick`][] = `true` (enables time-based events)
+   - [`Config::enable_elect`][] = `true` (allows followers to become candidates)
+   - The leader's [`Config::enable_heartbeat`][] = `true` (enables heartbeat sending)
+
+**Common issues**:
+
+- **Elections not triggering**: If followers never enter candidate state after the leader fails:
+  - Verify `enable_tick = true` and `enable_elect = true` in your configuration
+  - Ensure at least a quorum of nodes are online and can communicate
+  - Check that network connectivity allows nodes to reach each other
+  - Confirm the election timeout is properly configured (typically `election_timeout_min` should be at least 3× `heartbeat_interval`)
+
+- **Environmental differences**: Elections may work in some environments (e.g., Docker) but not others (e.g., local tests) due to:
+  - Network configuration differences
+  - Insufficient nodes running (need a quorum: majority of nodes must be online)
+  - System clock issues or timing differences
+
+**Timing recommendations**:
+
+Follow the Raft timing inequality: `heartbeat_interval ≪ election_timeout ≪ MTBF` (mean time between failures)
+
+A typical configuration:
+```rust,ignore
+Config {
+    heartbeat_interval: 100,           // milliseconds
+    election_timeout_min: 300,         // 3× heartbeat_interval
+    election_timeout_max: 600,         // 2× election_timeout_min
+    enable_tick: true,
+    enable_heartbeat: true,
+    enable_elect: true,
+    ..Default::default()
+}
+```
+
+[`Config::heartbeat_interval`]: `crate::config::Config::heartbeat_interval`
+[`Config::election_timeout_max`]: `crate::config::Config::election_timeout_max`
+[`Config::enable_tick`]: `crate::config::Config::enable_tick`
+[`Config::enable_elect`]: `crate::config::Config::enable_elect`
+[`Config::enable_heartbeat`]: `crate::config::Config::enable_heartbeat`
+
+
+### How to customize snapshot-building policy?
+
+OpenRaft provides a default snapshot building policy that triggers snapshots
+when the log count exceeds a threshold. Configure this via [`Config::snapshot_policy`]
+set to [`SnapshotPolicy::LogsSinceLast(n)`][`SnapshotPolicy::LogsSinceLast`].
+
+To customize snapshot behavior:
+
+- **Disable automatic snapshots**: Set [`Config::snapshot_policy`] to [`SnapshotPolicy::Never`]
+- **Manual snapshot triggers**: Use [`Raft::trigger().snapshot()`][`Trigger::snapshot`] to build snapshots on demand
+
+This allows full control over when snapshots are created based on your application's specific requirements.
+
+[`Config::snapshot_policy`]: `crate::config::Config::snapshot_policy`
+[`SnapshotPolicy::LogsSinceLast`]: `crate::config::SnapshotPolicy::LogsSinceLast`
+[`SnapshotPolicy::Never`]: `crate::config::SnapshotPolicy::Never`
+[`Trigger::snapshot`]: `crate::raft::trigger::Trigger::snapshot`
+
+
+### Frequent leader elections and timeouts
+
+**Symptom**: Logs show repeated leader elections, or [`RaftMetrics::current_leader`][] changes frequently
+
+**Cause**: [`Config::election_timeout_min`][] is too small for your storage or network latency.
+If [`RaftLogStorage::append`][] takes longer than the election timeout, heartbeats time out and
+trigger elections.
+
+**Solution**: Increase both [`Config::election_timeout_min`][] and [`Config::election_timeout_max`][].
+Ensure `heartbeat_interval < election_timeout_min / 2` and that election timeout is at least
+10× your typical [`RaftLogStorage::append`][] latency.
+
+[`RaftMetrics::current_leader`]: `crate::metrics::RaftMetrics::current_leader`
+[`Config::election_timeout_min`]: `crate::config::Config::election_timeout_min`
+[`Config::election_timeout_max`]: `crate::config::Config::election_timeout_max`
+[`RaftLogStorage::append`]: `crate::storage::RaftLogStorage::append`
+
+
+### Slow replication performance with RocksDB or disk storage
+
+**Symptom**: Write throughput is much lower than expected when using disk-based [`RaftLogStorage`][]
+
+**Cause**: Synchronous writes to disk block the Raft thread. Additionally, HTTP client connection
+pooling (in libraries like `reqwest`) can add 40ms+ latency spikes.
+
+**Solution**:
+- Use non-blocking I/O in your [`RaftLogStorage::append`][] implementation
+- Consider batching writes in your storage layer
+- For network layer, prefer WebSocket or connection pooling that doesn't introduce latency
+- With RocksDB: disable `sync` on writes if you can tolerate some data loss on crash
+
+[`RaftLogStorage`]: `crate::storage::RaftLogStorage`
+[`RaftLogStorage::append`]: `crate::storage::RaftLogStorage::append`
+
+
+### Can I use a custom serialization format like bitcode instead of serde?
+
+Yes. OpenRaft uses abstract types via [`RaftTypeConfig`][], so you can use any
+serialization format — bitcode, bincode, flatbuffers, or anything else — without
+changes to OpenRaft itself.
+
+**How it works**:
+
+OpenRaft does not dictate how data is serialized on the wire or in storage. The
+associated types on [`RaftTypeConfig`][] — [`D`][`RaftTypeConfig::D`],
+[`R`][`RaftTypeConfig::R`], [`NodeId`][`RaftTypeConfig::NodeId`],
+[`Node`][`RaftTypeConfig::Node`], [`LeaderId`][`RaftTypeConfig::LeaderId`],
+[`Vote`][`RaftTypeConfig::Vote`], and [`Entry`][`RaftTypeConfig::Entry`] — only
+require trait bounds like `Debug`, `Clone`, and `Send`. Serialization is entirely
+your responsibility.
+
+**Steps**:
+
+1. Define your own types that derive your serialization framework's traits
+   (e.g., bitcode's `Encode`/`Decode`).
+
+2. Assign them to the [`RaftTypeConfig`][] associated types.
+
+3. In your [`RaftNetworkV2`][] implementation, serialize and deserialize
+   request/response types using your chosen format. The network layer is fully
+   under your control.
+
+The `serde` feature flag in OpenRaft only adds `serde::Serialize`/`serde::Deserialize`
+derives to the built-in types. If you provide your own types, you don't need to
+enable the `serde` feature at all.
+
+[`RaftTypeConfig`]: `crate::RaftTypeConfig`
+[`RaftTypeConfig::D`]: `crate::RaftTypeConfig::D`
+[`RaftTypeConfig::R`]: `crate::RaftTypeConfig::R`
+[`RaftTypeConfig::NodeId`]: `crate::RaftTypeConfig::NodeId`
+[`RaftTypeConfig::Node`]: `crate::RaftTypeConfig::Node`
+[`RaftTypeConfig::LeaderId`]: `crate::RaftTypeConfig::LeaderId`
+[`RaftTypeConfig::Vote`]: `crate::RaftTypeConfig::Vote`
+[`RaftTypeConfig::Entry`]: `crate::RaftTypeConfig::Entry`
+[`RaftNetworkV2`]: `crate::network::RaftNetworkV2`
+
+
+### How do I use a quorum rule other than a majority?
+
+Select a membership from the [`openraft-membership`][] crate in your type
+config. [`RaftTypeConfig::Membership`][] decides the read quorums that elect a
+leader and the write quorums that commit an entry, and
+[`RaftTypeConfig::MembershipEdit`][] decides how [`Raft::change_membership()`][]
+describes a change. Both default to a majority: [`Membership`][] and
+[`ChangeMembers`][].
+
+The crate provides five memberships, each with its own change type:
+
+| Membership | Change | A config sets |
+|---|---|---|
+| [`ThresholdMembership`][] | `ThresholdChange` | the voters and a write size; the read size is derived |
+| [`WeightedMembership`][] | `WeightedChange` | a weight for each voter and a write weight |
+| [`HierarchicalMembership`][] | `HierarchicalChange` | a tree of voter groups, such as zones, with a write size for each |
+| [`GridMembership`][] | `GridChange` | a rectangular grid: a full row elects, a voter of each row commits |
+| [`ExplicitMembership`][] | `ExplicitChange` | the minimal read quorums and the minimal write quorums |
+
+Every membership makes each read quorum share a voter with each write quorum,
+so a new leader holds every committed entry. Its [guide][`membership docs`]
+compares them and explains when to pick each one.
+
+**Steps**:
+
+1. Add `openraft-membership` to your dependencies, with the same version as
+   `openraft`. Keep its default `serde` feature on whenever `openraft/serde` is
+   on anywhere in the build.
+
+2. Select the membership and its change type:
+
+   ```rust,ignore
+   openraft::declare_raft_types!(
+       pub TypeConfig:
+           D = Request,
+           R = Response,
+           Membership = openraft_membership::WeightedMembership<u64, BasicNode>,
+           MembershipEdit = openraft_membership::WeightedChange<Self::NodeId, Self::Node>,
+   );
+   ```
+
+3. Build the first membership with its `new()` and pass it to
+   [`Raft::initialize()`][]. A `BTreeMap` of nodes also converts into each
+   membership and makes every node a voter, but the quorums differ: a majority
+   write quorum for the threshold, weighted and hierarchical memberships, the
+   most square grid for the grid membership, and every voter for the explicit
+   membership:
+
+   ```rust,ignore
+   // Voter 1 weighs 2 of the total 5; a commit needs weight 3.
+   let weights = BTreeMap::from([(1, 2), (2, 1), (3, 1), (4, 1)]);
+   let membership = WeightedMembership::new(weights, 3, nodes)?;
+   raft.initialize(membership).await?;
+   ```
+
+4. Change it with a value of the change type. OpenRaft writes the change in
+   one log entry when it proves that every old read quorum intersects every
+   new write quorum, and every old write quorum intersects every new read
+   quorum. Otherwise it first writes a joint configuration:
+
+   ```rust,ignore
+   let change = WeightedChange::weights(BTreeMap::from([(1, 1), (2, 1), (3, 1), (4, 1)]));
+   raft.change_membership(change, false).await?;
+   ```
+
+[`Raft::add_learner()`][] works unchanged with every provided membership.
+
+The [`raft-kv-memstore-weighted-membership`][] example runs these steps over
+HTTP with a `WeightedMembership`. Its `/init` and `/change-membership` routes
+build the membership and the change from the weights in a JSON body, because
+the membership routes of the other examples take only a set of voter IDs.
+
+The weighted, hierarchical, grid and explicit memberships can also give a node
+a role other than its default, for example a voter that votes and stores logs
+but never starts an election. Set it with the membership's `with_roles()`, or
+with `with_roles()` on a change.
+
+To write a rule of your own, implement [`RaftMembership`][] and
+[`RaftMembershipEdit`][]. The [weighted guide][`weighted membership`] walks
+through how its types implement them.
+
+[`openraft-membership`]: https://docs.rs/openraft-membership/latest/openraft_membership/
+[`raft-kv-memstore-weighted-membership`]: https://github.com/databendlabs/openraft/tree/main/examples/raft-kv-memstore-weighted-membership
+[`membership docs`]: https://docs.rs/openraft-membership/latest/openraft_membership/docs/index.html
+[`weighted membership`]: https://docs.rs/openraft-membership/latest/openraft_membership/docs/weighted/index.html
+[`ThresholdMembership`]: https://docs.rs/openraft-membership/latest/openraft_membership/docs/threshold/index.html
+[`WeightedMembership`]: https://docs.rs/openraft-membership/latest/openraft_membership/docs/weighted/index.html
+[`HierarchicalMembership`]: https://docs.rs/openraft-membership/latest/openraft_membership/docs/hierarchical/index.html
+[`GridMembership`]: https://docs.rs/openraft-membership/latest/openraft_membership/docs/grid/index.html
+[`ExplicitMembership`]: https://docs.rs/openraft-membership/latest/openraft_membership/docs/explicit/index.html
+[`RaftTypeConfig::Membership`]: `crate::RaftTypeConfig::Membership`
+[`RaftTypeConfig::MembershipEdit`]: `crate::RaftTypeConfig::MembershipEdit`
+[`Membership`]: `crate::Membership`
+[`ChangeMembers`]: `crate::impls::ChangeMembers`
+[`RaftMembership`]: `crate::membership::RaftMembership`
+[`RaftMembershipEdit`]: `crate::membership::RaftMembershipEdit`
+[`Raft::initialize()`]: `crate::Raft::initialize`
+[`Raft::change_membership()`]: `crate::Raft::change_membership`
+[`Raft::add_learner()`]: `crate::Raft::add_learner`
+
+
+## Storage
+
+### Does the state machine need to be persisted to disk?
+
+**Question**: Should I persist the state machine to disk, or just rely on snapshots and log replay?
+
+**Answer**: The state machine does not need to be persisted separately, since snapshots are periodically saved. On startup, rebuild the state machine from the latest snapshot.
+
+Whether to re-apply raft logs after loading a snapshot depends on whether your application stores the committed log id using [`RaftLogStorage::save_committed()`][]:
+
+- **If `save_committed()` is implemented**: Re-apply logs from the snapshot's last included log up to the saved committed log id on startup
+- **If `save_committed()` is NOT implemented**: No log replay needed - the snapshot represents the committed state
+
+This avoids the redundancy of persisting both the full state machine and its snapshot representation.
+
+[`RaftLogStorage::save_committed()`]: `crate::storage::RaftLogStorage::save_committed`
+
+
+### How does Openraft handle snapshot building and transfer?
+
+Openraft calls [`RaftStateMachine::get_snapshot_builder`][] to create snapshots. The builder runs
+concurrently with [`RaftStateMachine::apply`][], so your implementation must handle concurrent access
+to the state machine data.
+
+When a follower is more than [`Config::replication_lag_threshold`][] entries behind, the leader
+sends a snapshot instead of individual log entries.
+
+For large snapshots that timeout during transfer, increase [`Config::install_snapshot_timeout`][].
+The snapshot is sent in chunks of [`Config::snapshot_max_chunk_size`][] bytes.
+
+[`RaftStateMachine::get_snapshot_builder`]: `crate::storage::RaftStateMachine::get_snapshot_builder`
+[`RaftStateMachine::apply`]: `crate::storage::RaftStateMachine::apply`
+[`Config::replication_lag_threshold`]: `crate::config::Config::replication_lag_threshold`
+[`Config::install_snapshot_timeout`]: `crate::config::Config::install_snapshot_timeout`
+[`Config::snapshot_max_chunk_size`]: `crate::config::Config::snapshot_max_chunk_size`
+
+
+### How to synchronize snapshots from leader to followers without rebuilding?
+
+By default, each node builds its own snapshots independently. If you want the leader to build
+a snapshot once and distribute it to followers (to save CPU/memory), you can implement this
+using [`Raft::with_state_machine`][] and custom state machine methods.
+
+**Why this isn't part of the core protocol:**
+
+The Raft protocol only sends snapshots when a follower is missing logs (after log compaction).
+In this case, the snapshot is always newer than the follower's state, so there's no need to
+"save without installing". The edge case of receiving an old snapshot (e.g., delayed network
+message) should simply be ignored.
+
+**Key insight: Your state machine, your methods**
+
+The [`RaftStateMachine`][] trait defines the minimum interface Openraft needs. Your
+implementation can (and should) include additional methods for application-specific operations.
+
+**Implementation approach:**
+
+1. **Add custom methods to your state machine:**
+
+```rust,ignore
+use std::io;
+use openraft::storage::RaftStateMachine;
+
+pub struct MyStateMachine {
+    // Your data
+}
+
+impl MyStateMachine {
+    /// Custom method: force save snapshot without version checks
+    /// This is YOUR method, not part of the RaftStateMachine trait
+    pub async fn force_save_snapshot(&mut self, data: Vec<u8>) -> Result<(), io::Error> {
+        // Your custom save logic - you control the rules
+        self.snapshot_store.write(&data).await
+    }
+}
+
+impl RaftStateMachine<TypeConfig> for MyStateMachine {
+    // Standard trait methods...
+}
+```
+
+2. **Use [`Raft::with_state_machine`][] to call your custom methods:**
+
+```rust,ignore
+// On follower: receive and save snapshot from leader
+let snapshot_data = receive_snapshot_from_leader().await?;
+
+raft.with_state_machine(|sm: &mut MyStateMachine| {
+    Box::pin(async move {
+        // Call YOUR custom method
+        sm.force_save_snapshot(snapshot_data).await
+    })
+}).await??;
+```
+
+**Example: Custom snapshot distribution:**
+
+```rust,ignore
+use std::io;
+use openraft::Raft;
+
+// Leader builds and distributes snapshot
+async fn distribute_snapshot(
+    leader: &Raft<TypeConfig, MyStateMachine>,
+    followers: Vec<NodeId>
+) -> Result<(), io::Error> {
+    // Build snapshot on leader
+    let snapshot = leader.trigger().snapshot().await?
+        .expect("snapshot built");
+
+    // Send to followers via custom RPC
+    for follower_id in followers {
+        let snapshot_data = read_snapshot_file(&snapshot).await?;
+        send_snapshot_rpc(follower_id, snapshot_data).await?;
+    }
+    Ok(())
+}
+
+// Follower receives and saves snapshot
+async fn receive_snapshot(
+    follower: &Raft<TypeConfig, MyStateMachine>,
+    snapshot_data: Vec<u8>
+) -> Result<(), io::Error> {
+    follower.with_state_machine(|sm: &mut MyStateMachine| {
+        Box::pin(async move {
+            sm.save_snapshot_data(&snapshot_data).await
+        })
+    }).await?
+}
+```
+
+**Note:** This optimization is application-specific. The core Raft protocol handles snapshot
+transfer automatically when needed for log replication.
+
+[`Raft::with_state_machine`]: `crate::Raft::with_state_machine`
+[`RaftStateMachine`]: `crate::storage::RaftStateMachine`
+
+
+## Monitoring & Observability
+
+### How to get notified when the server state changes?
+
+To monitor the state of a Raft node,
+it's recommended to subscribe to updates in the [`RaftMetrics`][]
+by calling [`Raft::metrics()`][].
+
+The following code snippet provides an example of how to wait for changes in `RaftMetrics` until a leader is elected:
+
+```ignore
+let mut rx = raft.metrics();
+loop {
+    if let Some(l) = rx.borrow().current_leader {
+        return Ok(Some(l));
+    }
+
+    rx.changed().await?;
+}
+```
+
+The second example calls a function when the current node becomes the leader:
+
+```ignore
+let mut rx = raft.metrics();
+loop {
+    if rx.borrow().state == ServerState::Leader {
+         app_init_leader();
+    }
+
+    rx.changed().await?;
+}
+```
+
+There is also:
+- a [`RaftServerMetrics`][] struct that provides only server/cluster related metrics,
+  including node id, vote, server state, current leader, etc.,
+- and a [`RaftDataMetrics`][] struct that provides only data related metrics,
+  such as log, snapshot, etc.
+
+If you are only interested in server metrics, but not data metrics,
+subscribe [`RaftServerMetrics`][] with [`Raft::server_metrics()`][] instead.
+For example:
+
+```ignore
+let mut rx = raft.server_metrics();
+loop {
+    if rx.borrow().state == ServerState::Leader {
+         app_init_leader();
+    }
+
+    rx.changed().await?;
+}
+```
+
+[`RaftMetrics`]: `crate::metrics::RaftMetrics`
+[`Raft::metrics()`]: `crate::Raft::metrics`
+[`RaftServerMetrics`]: `crate::metrics::RaftServerMetrics`
+[`RaftDataMetrics`]: `crate::metrics::RaftDataMetrics`
+[`Raft::server_metrics()`]: `crate::Raft::server_metrics`
+
+
+### How to detect if a leader is valid?
+
+**Problem**: In distributed systems, you can perceive multiple leaders at the
+same time. However, only one of them is the **legal leader** at any specific
+point in time - only one can actually commit logs successfully.
+
+This commonly happens when:
+- Network partitions occur
+- There are message delays or concurrent elections
+
+**Solution**: Use the [`RaftMetrics::last_quorum_acked`][] field to verify leadership validity.
+
+The `last_quorum_acked` field shows the most recently acknowledged timestamp by a quorum:
+
+```rust,ignore
+/// For a leader, it is the most recently acknowledged timestamp by a quorum.
+///
+/// It is `None` if this node is not leader, or the leader is not yet acknowledged by a quorum.
+/// Being acknowledged means receiving a reply of
+/// `AppendEntries`(`AppendEntriesRequest.vote.committed == true`).
+pub last_quorum_acked: Option<SerdeInstantOf<C>>,
+```
+
+**A valid leader must have `last_quorum_acked` as `Some` with a recent timestamp:**
+
+- **`None`**: Invalid leader (not acknowledged by quorum)
+- **`Some(old_timestamp)`**: Invalid leader (lost connection with cluster)
+- **`Some(recent_timestamp)`**: Valid leader
+
+**Example**:
+
+```rust,ignore
+let mut rx = self.raft.metrics();
+loop {
+    let m = rx.borrow();
+
+    // Only act if:
+    // 1. State shows Leader, AND
+    // 2. last_quorum_acked is Some with a recent timestamp
+    if m.state == ServerState::Leader {
+        if let Some(last_acked) = m.last_quorum_acked {
+            // Check if acknowledged recently (e.g., within 2× election timeout)
+            let election_timeout = Duration::from_millis(500); // your configured timeout
+            if last_acked.elapsed() < election_timeout * 2 {
+                do_critical_leader_operation();
+            }
+        }
+        // If last_quorum_acked is None, this is NOT a valid leader
+    }
+
+    rx.changed().await?;
+}
+```
+
+If you want to be extra careful, wait for metrics to flush by adding a small
+delay and checking again. However, **`None` itself means the leader is not
+valid**.
+
+[`RaftMetrics::last_quorum_acked`]: `crate::metrics::RaftMetrics::last_quorum_acked`
+
+
+### How to detect which nodes are currently down or unreachable?
+
+To monitor node availability in your Raft cluster, use [`RaftMetrics`][] from
+the leader node via [`Raft::metrics()`][]. This provides real-time visibility
+into node reachability without requiring membership changes.
+
+There are two primary approaches to detect unreachable nodes:
+
+**Method 1: Monitor replication lag**
+Check the field [`RaftMetrics::replication`][], which contains a
+`BTreeMap<NodeId, Option<LogId>>` showing the last replicated log for each node.
+If a node's replication significantly lags behind
+[`RaftMetrics::last_log_index`][], it indicates replication issues and the node
+may be down.
+
+**Method 2: Monitor heartbeat timestamps (since OpenRaft 0.10)**
+Use the field [`RaftMetrics::heartbeat`][], which stores `BTreeMap<NodeId, Option<SerdeInstant>>`
+containing the timestamp of the last acknowledgment from each node. If a
+timestamp is significantly behind the current time, the node is likely
+unreachable.
+
+Both methods provide "unreachable from leader" perspective, which is typically
+what matters for cluster health monitoring. This approach allows you to maintain
+a list of active nodes without modifying cluster membership.
+
+[`RaftMetrics`]: `crate::metrics::RaftMetrics`
+[`Raft::metrics()`]: `crate::Raft::metrics`
+[`RaftMetrics::replication`]: `crate::metrics::RaftMetrics::replication`
+[`RaftMetrics::last_log_index`]: `crate::metrics::RaftMetrics::last_log_index`
+[`RaftMetrics::heartbeat`]: `crate::metrics::RaftMetrics::heartbeat`
+
+
+### How to minimize error logging when a follower is offline
+
+Excessive error logging, like `ERROR openraft::replication: 248: RPCError err=NetworkError: ...`, occurs when a follower node becomes unresponsive. To alleviate this, implement a mechanism within [`RaftNetworkV2`][] that returns a [`Unreachable`][] error instead of a [`NetworkError`][] when immediate replication retries to the affected node are not advised.
+
+[`RaftNetworkV2`]: `crate::network::RaftNetworkV2`
+[`Unreachable`]: `crate::error::Unreachable`
+[`NetworkError`]: `crate::error::NetworkError`
+
+
+### How to start/stop services when a node becomes leader?
+
+**Problem**: You want to run certain services (e.g., cron jobs, cache warming,
+background tasks) only on the leader node, and stop them when the node loses
+leadership.
+
+**Solution**: Use [`Raft::on_leader_change()`][] to register callbacks that
+are invoked when this node becomes or stops being the leader.
+
+```rust,ignore
+let service_handle = Arc::new(Mutex::new(None));
+let service_handle_clone = service_handle.clone();
+
+let mut watch_handle = raft.on_leader_change(
+    // start: called when this node becomes leader
+    move |_leader_id| {
+        let service_handle = service_handle_clone.clone();
+        async move {
+            let mut handle = service_handle.lock().unwrap();
+            if handle.is_none() {
+                *handle = Some(start_cron_service().await);
+            }
+        }
+    },
+    // stop: called when this node is no longer leader
+    move |_old_leader_id| {
+        let service_handle = service_handle.clone();
+        async move {
+            let mut handle = service_handle.lock().unwrap();
+            if let Some(h) = handle.take() {
+                h.shutdown().await;
+            }
+        }
+    },
+);
+
+// Later, when shutting down:
+watch_handle.close().await;
+```
+
+For more fine-grained control over all leader changes in the cluster (not just
+this node), use [`Raft::on_cluster_leader_change()`][] instead.
+
+**Important considerations**:
+
+- **Committed leadership**: `on_start` only fires when the node is the
+  committed leader (acknowledged by a quorum), not when it's still a candidate.
+
+- **Alternating callbacks**: The `start` and `stop` callbacks are guaranteed
+  to be called in alternating order: `start` → `stop` → `start` → `stop` → ...
+  Even if a node transitions directly from leader in Term 1 to leader in Term 2,
+  `stop` will be called with the old `leader_id` before `start` is called with
+  the new one. This ensures proper resource cleanup between leadership terms.
+
+- **Idempotent operations**: Ensure your start/stop logic is idempotent.
+
+- **Async callbacks**: Callbacks return a `BoxFuture` that is awaited before
+  processing the next vote change. You can use `Box::pin(async { ... })` to
+  create async callbacks that perform I/O operations.
+
+[`Raft::on_leader_change()`]: `crate::Raft::on_leader_change`
+[`Raft::on_cluster_leader_change()`]: `crate::Raft::on_cluster_leader_change`
+
+
+## Operations & Maintenance
+
+### What actions are required when a node restarts?
+
+None. No calls, e.g., to either [`add_learner()`][] or [`change_membership()`][]
+are necessary.
+
+Openraft maintains the membership configuration in [`Membership`][] for all
+nodes in the cluster, including voters and non-voters (learners).  When a
+`follower` or `learner` restarts, the leader will automatically re-establish
+replication.
+
+An eligible former leader starts a higher-term election immediately after
+restart when [`Config::enable_leader_restore`] is enabled, as it is by default. It
+becomes leader only after winning the election quorum. With this setting
+disabled, the node follows normal follower or learner startup and election
+timing. A successful election appends a blank entry in the new term, so the log
+index advances before the next client write.
+
+If the state machine can lose applied state on restart, persist the committed
+log ID through [`RaftLogStorage::save_committed`] or call
+[`Raft::wait_for_recovery`] before serving reads.
+
+[`add_learner()`]: `crate::Raft::add_learner`
+[`change_membership()`]: `crate::Raft::change_membership`
+[`Membership`]: `crate::Membership`
+[`Config::enable_leader_restore`]: `field@crate::Config::enable_leader_restore`
+[`RaftLogStorage::save_committed`]: `crate::storage::RaftLogStorage::save_committed`
+[`Raft::wait_for_recovery`]: `crate::Raft::wait_for_recovery`
+
+
+### How to remove node-2 safely from a cluster `{1, 2, 3}`?
+
+Call `Raft::change_membership(btreeset!{1, 3})` to exclude node-2 from
+the cluster. Then wipe out node-2 data.
+**NEVER** modify/erase the data of any node that is still in a raft cluster, unless you know what you are doing.
+
+Do not give node-2's ID to a different node afterwards: reusing an ID can cause
+split-brain. See:
+[Can I reuse the ID of a removed node for a new node?](#can-i-reuse-the-id-of-a-removed-node-for-a-new-node)
+
+
+### Does OpenRaft support calling `change_membership` in parallel?
+
+Yes, OpenRaft does support this scenario, but with some important caveats.
+A `change_membership` call that needs a joint configuration is a two-step
+process—first transitioning to a joint configuration and then to a final
+uniform configuration. When multiple `change_membership` calls occur
+concurrently, their steps can interleave. The second step of a call requires
+the last membership log to still be the joint config of its first step, so a
+call whose joint config another call has replaced fails instead of finishing.
+A call that stops after its first step, for example because the leader
+crashes, leaves the cluster in a joint config state. This state is valid in
+OpenRaft.
+
+Here's an example of how such interleaving might play out, where `d` and `e`
+are learners:
+
+1. **Initial State**: `{a,b,c}`
+2. **Task 1** calls `change_membership(ReplaceAllVoters({a,b,d}))`
+   → Transitions to joint config `[{a,b,c}, {a,b,d}]`
+3. **Task 2** calls `change_membership(ReplaceAllVoters({a,b,e}))`
+   → Transitions from `[{a,b,c}, {a,b,d}]` to `[{a,b,c}, {a,b,d}, {a,b,e}]`
+4. **Task 1 (Step 2)** fails with `PreconditionFailed`, because the last
+   membership log is now Task 2's joint config
+5. **Task 2 (Step 2)** finalizes config to `{a,b,e}` and reports success to its
+   client
+
+Task 1's error does not mean that nothing was written: its joint config was
+committed, and Task 2 started from it. The cluster ends in Task 2's target
+`{a,b,e}` and never reaches Task 1's target `{a,b,d}`.
+
+This illustrates how concurrent changes can lead to a final configuration that
+may not reflect the intent of every request. However, this does **not**
+violate OpenRaft's consistency model, and joint configs are treated as valid
+operating states.
+
+If your system ensures only one process issues `change_membership` at a time,
+you're safe. If not, always validate the final config after changes to avoid
+surprises.
+For example, if two requests attempt to change the config to `{a,b,c}` and
+`{x,y,z}` respectively, the result may end up being one or the
+other—unpredictable from each individual caller's perspective.
+
+This behavior is by design, as it provides several advantages:
+
+- **Simplifies recovery**: If the leader crashes after the first step, a new
+  leader can continue operating from the joint state without requiring special
+  recovery procedures.
+
+- **Supports dynamic flexibility**: The cluster can adapt to changing conditions
+  without being locked into a specific membership transition.
+
+OpenRaft intentionally supports this behavior because:
+
+- When a leader crashes after establishing a joint configuration, the new leader
+  can seamlessly resume from this state and process new membership changes as
+  needed.
+
+- The system can adapt if nodes in the target configuration become unstable. For
+  example, if transitioning from `{a,b,c}` to `{b,c,d}` but node `d` becomes
+  unreliable when it finished phase-1 and the config is `[{a,b,c}, {b,c,d}]`,
+  the leader can pivot to include a different node (e.g., change membership
+  config to `[{a,b,c}, {b,c,d}, {b,c,x}]` then to `{b,c,x}`) or revert to the original
+  configuration `{a,b,c}`.
+
+
+### How do I store additional information about nodes in Openraft?
+
+By default, Openraft provide a [`BasicNode`] as the node type in a cluster.
+To store more information about each node in Openraft, define a custom struct
+with the desired fields and use it in place of `BasicNode`. Here's a brief
+guide:
+
+1. Define your custom node struct:
+
+```rust,ignore
+#[derive(...)]
+struct MyNode {
+    ipv4: String,
+    ipv6: String,
+    port: u16,
+    // Add additional fields as needed
+}
+```
+
+2. Register the custom node type with `declare_raft_types!` macro:
+
+```rust,ignore
+openraft::declare_raft_types!(
+   pub MyRaftConfig:
+       // ...
+       NodeId = u64,        // Use the appropriate type for NodeId
+       Node = MyNode,       // Replace BasicNode with your custom node type
+       // ... other associated types
+);
+```
+
+Use `MyRaftConfig` in your Raft setup to utilize the custom node structure.
+
+[`BasicNode`]: `crate::node::BasicNode`
+
+
+### Write returns `ForwardToLeader` but leader info is missing
+
+**Symptom**: [`ClientWriteError::ForwardToLeader`][] is returned but the `leader_id` field is `None`
+
+**Cause**: The current leader is no longer in the cluster's membership configuration.
+This occurs after a membership change that removes the leader node.
+
+**Solution**: If `leader_id` is `None`, query [`RaftMetrics::current_leader`][] to find the new
+leader, or retry the membership query after the new leader is elected.
+
+[`ClientWriteError::ForwardToLeader`]: `crate::error::ClientWriteError::ForwardToLeader`
+[`RaftMetrics::current_leader`]: `crate::metrics::RaftMetrics::current_leader`
+
+
+### Error logs after `raft.shutdown()` completes
+
+**Symptom**: After calling [`Raft::shutdown`][] which returns successfully, logs show
+`ERROR openraft::raft::raft_inner: failure sending RaftMsg to RaftCore; message: AppendEntries ... core_result=Err(Stopped)`
+
+**Cause**: Other nodes in the cluster continue sending RPCs to this node. The `Raft` handle still
+exists and receives these RPCs, but the internal Raft core has stopped, so forwarding fails.
+
+**Solution**: This is expected behavior. These errors are harmless - they indicate the node has
+shut down as requested. You can ignore them or filter these specific error logs after shutdown.
+
+Use [`Raft::try_shutdown`][] to receive `ShutdownError` when the core or tick task fails to join.
+It awaits both tasks and retains failures across repeated calls. Cancelled calls can be retried.
+The existing `shutdown()` API discards join errors.
+
+See: <https://github.com/databendlabs/openraft/issues/1357>
+
+[`Raft::shutdown`]: `crate::Raft::shutdown`
+
+[`Raft::try_shutdown`]: `crate::Raft::try_shutdown`
+
+
+### Why can a Leader reject a client write?
+
+A node may still report [`ServerState::Leader`][] while returning
+[`ForwardToLeader`][] with no target for a new write. This means its last quorum
+acknowledgement is older than the leader lease, so it cannot currently confirm
+that it still has authority to accept new proposals.
+
+The node does not step down. It continues heartbeat and replication traffic so
+that it can renew its lease if quorum communication recovers. Once a quorum
+acknowledges it again, new writes are accepted automatically.
+
+Writes accepted before the lease expired remain pending and may still commit.
+If an application times them out, it must treat their result as unknown.
+
+See [CheckQuorum][] for the protocol and its difference from conventional
+self-demotion.
+
+[`ServerState::Leader`]: crate::ServerState::Leader
+[`ForwardToLeader`]: crate::errors::ForwardToLeader
+[CheckQuorum]: crate::docs::protocol::check_quorum
+
+
+### How to restore a cluster from a snapshot backup?
+
+This recipe applies only when the cluster has **no running leader**, e.g.,
+every node is lost and only a snapshot backup remains. If a leader is still
+running, do not use it: the best way to bring a pristine node (a node with no
+logs and no vote) into a running cluster is ordinary log replication — start
+the node empty and let the leader replicate logs and snapshot to it, with
+[`Config::allow_log_reversion`][] enabled so that the leader accepts the
+node's log reversion in case the node previously held data.
+
+Without a running leader, no dedicated API is needed either: the protocol API
+[`Raft::install_full_snapshot()`][] already covers rebuilding from a backup.
+
+The `vote` argument is derived from the snapshot itself:
+`snapshot.meta.last_log_id` records the [`CommittedLeaderId`][] of the leader
+that proposed the last applied entry. Such a leader must have won an election
+in the original cluster, because only an established leader can propose log
+entries. That leader also applied this entry, so while it was alive it could
+have sent exactly this `(vote, snapshot)` pair via snapshot replication.
+Replaying the pair to a pristine node is therefore indistinguishable from
+receiving a long-delayed legitimate replication message, and Raft handles
+delayed messages by design.
+
+With the default [`leader_id_adv`][] mode, the committed leader id in a log
+id contains both the term and the node id, so the exact historical vote is
+reconstructed without trouble:
+
+```rust,ignore
+let snapshot: Snapshot<TypeConfig> = read_backup();
+let last = snapshot.meta.last_log_id.clone().unwrap();
+
+// The exact committed vote of the leader that proposed `last`.
+let leader = last.committed_leader_id();
+let vote = Vote::new_committed(leader.term(), leader.node_id().clone());
+
+raft.install_full_snapshot(vote, snapshot).await?;
+
+// Become leader in the next term and continue as a new cluster lineage.
+raft.trigger().elect(false).await?;
+```
+
+With [`leader_id_std`][] mode, the committed leader id keeps only the term,
+so the node-id part has to be supplied; use the local node id (or any chosen
+node id):
+
+```rust,ignore
+let term = last.committed_leader_id().term;
+let vote = Vote::new_committed(term, my_node_id);
+```
+
+Be aware that this std-mode vote is fabricated: it is legal but may be absent
+from history — the term is real, while its holder may not be the node that
+actually won that term. In std mode a committed leader identity is the term
+alone, so the protocol treats the fabricated vote and the historical one
+identically, and installing a snapshot on a pristine node tolerates it. This
+tolerance is necessary for repairing a node this way.
+
+Notes:
+
+- The vote must not be below the leader of `snapshot.meta.last_log_id`;
+  otherwise [`Raft::install_full_snapshot()`][] panics, per its documented
+  contract. Deriving the vote from the snapshot itself always satisfies the
+  contract.
+- To restore a multi-node cluster, replay the same snapshot on every node,
+  then trigger an election on one of them.
+- A node that is not in the snapshot's membership can be restored the same
+  way; it just remains a learner.
+
+[`Raft::install_full_snapshot()`]: `crate::Raft::install_full_snapshot`
+[`CommittedLeaderId`]: `crate::vote::RaftCommittedLeaderId`
+[`leader_id_adv`]: `crate::impls::leader_id_adv`
+[`leader_id_std`]: `crate::impls::leader_id_std`
+[`Config::allow_log_reversion`]: `crate::config::Config::allow_log_reversion`
+
+
+### Can I reuse the ID of a removed node for a new node?
+
+No. A node ID must identify the same node, holding the same log, for the entire
+lifetime of the cluster. Assigning the ID of a removed node to a node that
+starts from an empty log is equivalent to letting that node revert its log, and
+it can split the cluster into two independent quorums. Restarting a node with
+its data intact is not reuse; it keeps the same ID and the same log.
+
+The hazard is that the new node replays the log from the beginning and passes
+through every **historical** membership config on its way to the current one,
+adopting each as its effective membership as soon as it is appended. If a
+historical config contains the reused ID with a small quorum, for example the
+single-node config `{n3}` a cluster started from, the new node becomes a quorum
+of one under that config and can elect itself leader while the rest of the
+cluster still forms a quorum of its own.
+
+Openraft cannot detect this, because removing a node discards the leader's
+replication progress for it: the empty log of the re-added node does not look
+like a [log reversion][`Config::allow_log_reversion`]. Allocate a fresh,
+never-before-used ID for every node that joins the cluster. A good way to do so
+is to let the cluster's own log allocate it: propose a blank log entry with
+[`Raft::client_write()`] and use the index of that entry as the new node's ID.
+Log indices strictly increase and no committed index is ever assigned twice, so
+the ID is one that no node has ever held.
+
+See: [Node IDs Must Not Be Reused][`dynamic_membership`] for the full scenario.
+
+[`Config::allow_log_reversion`]: `crate::config::Config::allow_log_reversion`
+[`Raft::client_write()`]: `crate::Raft::client_write`
+[`dynamic_membership`]: `crate::docs::cluster_control::dynamic_membership#node-ids-must-not-be-reused`
+
+
+## Troubleshooting & Safety
+
+### Panic: "assertion failed: self.internal_server_state.is_following()"
+
+**Symptom**: Node crashes with `panicked at 'assertion failed: self.internal_server_state.is_following()'`
+
+**Cause**: [`RaftNetworkFactory`][] creates a connection from a node to itself. When this node
+becomes leader, it sends replication messages to itself, but Openraft expects only followers to
+receive replication messages.
+
+**Solution**: In [`RaftNetworkFactory::new_client`][], ensure the target node ID never equals
+the local node's ID. Each node ID in [`Membership`][] must map to a different node.
+
+[`RaftNetworkFactory`]: `crate::network::RaftNetworkFactory`
+[`RaftNetworkFactory::new_client`]: `crate::network::RaftNetworkFactory::new_client`
+[`Membership`]: `crate::Membership`
+
+
+### Holding `Raft::metrics()` reference blocks the Raft node
+
+**Symptom**: Raft node appears frozen or unresponsive. In single-threaded runtimes, everything stops.
+
+**Cause**: When using `watch` as [`AsyncRuntime::Watch`][], the `Ref` returned by
+`borrow_watched()` holds a synchronous `RwLock` read guard. If you hold this `Ref` while
+Openraft tries to send new metrics (needs write lock), it deadlocks.
+
+**Solution**: Clone the metrics immediately to drop the `Ref`. Never hold the `Ref` across operations.
+
+```rust,ignore
+// Bad - holds the Ref guard, blocks flush_metrics()
+let rx = raft.metrics();
+let metrics_ref = rx.borrow_watched(); // Ref guard held
+do_something().await; // Openraft may deadlock trying to flush_metrics()
+drop(metrics_ref);
+
+// Good - clone immediately, Ref guard dropped right away
+let metrics = raft.metrics().borrow_watched().clone();
+do_something().await; // Safe
+```
+
+Deadlock scenario:
+```text
+// Task 1 (on thread A)          |  // Task 2 (on thread B)
+let _ref1 = rx.borrow_watched(); |
+                                 |  // flush_metrics() blocks
+                                 |  let _ = tx.send(());
+// may deadlock                  |
+let _ref2 = rx.borrow_watched(); |
+```
+
+See: <https://github.com/databendlabs/openraft/issues/1238>
+
+[`AsyncRuntime::Watch`]: `crate::AsyncRuntime::Watch`
+
+
+### What will happen when data gets lost?
+
+Raft operates on the presumption that the storage medium (i.e., the disk) is
+secure and reliable.
+
+If this presumption is violated, e.g., the raft logs are lost or the snapshot is
+damaged, no predictable outcome can be assured. In other words, the resulting
+behavior is **undefined**.
+
+
+### Can I wipe out the data of ONE node and wait for the leader to replicate all data to it again?
+
+Avoid doing this. Doing so will panic the leader. But it is permitted
+with config [`Config::allow_log_reversion`] enabled.
+
+In a raft cluster, although logs are replicated to multiple nodes,
+wiping out a node and restarting it is still possible to cause data loss.
+Assumes the leader is `N1`, followers are `N2, N3, N4, N5`:
+- A log(`a`) that is replicated by `N1` to `N2, N3` is considered committed.
+- At this point, if `N3` is replaced with an empty node, and at once the leader
+  `N1` is crashed. Then `N5` may elected as a new leader with vote granted by
+  `N3, N4`;
+- Then the new leader `N5` will not have log `a`.
+
+```text
+Ni: Node i
+Lj: Leader   at term j
+Fj: Follower at term j
+
+N1 | L1  a  crashed
+N2 | F1  a
+N3 | F1  a  erased          F2
+N4 |                        F2
+N5 |                 elect  L2
+----------------------------+---------------> time
+                            Data loss: N5 does not have log `a`
+```
+
+But for even number nodes cluster, Erasing **exactly one** node won't cause data loss.
+Thus, in a special scenario like this, or for testing purpose, you can use
+[`Config::allow_log_reversion`] to permit erasing a node.
+
+Removing the node from the membership before wiping it does not make the
+sequence safe either, as long as the wiped node rejoins under its old ID. See:
+[Can I reuse the ID of a removed node for a new node?](#can-i-reuse-the-id-of-a-removed-node-for-a-new-node)
+
+[`Config::allow_log_reversion`]: `crate::config::Config::allow_log_reversion`
+
+
+### Is Openraft resilient to incorrectly configured clusters?
+
+No, Openraft, like standard raft, cannot identify errors in cluster configuration.
+
+A common error is the assigning incorrect network addresses to a node. In such
+a scenario, if this node becomes the leader, it will attempt to replicate
+logs to itself. This will cause Openraft to panic because replication
+messages can only be received by a follower.
+
+```text
+thread 'main' panicked at openraft/src/engine/engine_impl.rs:793:9:
+assertion failed: self.internal_server_state.is_following()
+```
+
+```ignore
+// openraft/src/engine/engine_impl.rs:793
+pub(crate) fn following_handler(&mut self) -> FollowingHandler<C> {
+    debug_assert!(self.internal_server_state.is_following());
+    // ...
+}
+```
+
+
+### Excessive "RPCError err=NetworkError" in logs when a node is offline
+
+**Symptom**: Continuous error logs `ERROR openraft::replication: RPCError err=NetworkError`
+when a follower is unreachable
+
+**Cause**: Openraft retries replication aggressively. Each failed RPC logs an error.
+
+**Solution**: In your [`RaftNetworkV2`][] implementation, when a node is known to be unreachable,
+return [`Unreachable`][] error instead of [`NetworkError`][]. Openraft backs off longer for
+`Unreachable` errors, reducing log spam.
+
+[`RaftNetworkV2`]: `crate::network::RaftNetworkV2`
+[`Unreachable`]: `crate::error::Unreachable`
+[`NetworkError`]: `crate::error::NetworkError`
+
+

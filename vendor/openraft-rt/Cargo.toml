@@ -1,0 +1,42 @@
+# openraft-rt from openraft's upstream main branch, unchanged; see
+# vendor/openraft/Cargo.toml.
+[package]
+name = "coordinode-openraft-rt"
+description = "openraft-rt (async runtime traits for Openraft) from openraft's upstream main branch, as CoordiNode uses it"
+version.workspace = true
+edition = "2024"
+authors = [
+    "Databend Authors <opensource@datafuselabs.com>",
+    "Anthony Dodd <Dodd.AnthonyJosiah@gmail.com>",
+]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/databendlabs/openraft"
+repository = "https://github.com/structured-world/coordinode"
+keywords = ["raft", "consensus"]
+categories = ["algorithms", "asynchronous", "data-structures"]
+publish = true
+include = ["/src/**", "/LICENSE", "/COPYRIGHT", "/NOTICES", "/Cargo.toml"]
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "openraft_rt"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[features]
+default = []
+single-threaded = ["openraft-macros/single-threaded"]
+
+[dependencies]
+futures-channel = "0.3"
+futures-util = "0.3"
+openraft-macros = { package = "coordinode-openraft-macros", version = "0.10.1", path = "../openraft-macros" }
+pin-project-lite = "0.2"
+rand = "0.10"
+
+# Upstream's code as it is: the workspace's own lints do not apply.
+[lints]

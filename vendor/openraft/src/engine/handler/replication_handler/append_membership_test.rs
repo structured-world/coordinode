@@ -1,0 +1,254 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use maplit::btreeset;
+use pretty_assertions::assert_eq;
+
+use crate::Membership;
+use crate::MembershipState;
+use crate::Vote;
+use crate::core::ServerState;
+use crate::engine::Command;
+use crate::engine::Engine;
+use crate::engine::LogIdList;
+use crate::engine::TargetProgress;
+use crate::engine::testing::UTConfig;
+use crate::engine::testing::log_id;
+use crate::progress::Inflight;
+use crate::progress::entry::ProgressEntry;
+use crate::progress::inflight_id::InflightId;
+use crate::progress::stream_id::StreamId;
+use crate::replication::payload::Payload;
+use crate::replication::replicate::Replicate;
+use crate::type_config::TypeConfigExt;
+use crate::type_config::alias::StoredMembershipOf;
+use crate::utime::Leased;
+use crate::vote::raft_vote::RaftVoteExt;
+
+fn m01() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {0,1}], [])
+}
+
+fn m2() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {2}], [])
+}
+
+fn m23() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {2,3}], [])
+}
+
+fn m23_45() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {2,3}], btreeset! {4,5})
+}
+
+fn m34() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {3,4}], [])
+}
+
+fn m4_356() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {4}], btreeset! {3,5,6})
+}
+
+fn eng() -> Engine<UTConfig> {
+    let mut eng = Engine::testing_default(0);
+    eng.config.id = 2;
+    eng.state.membership_state = MembershipState::new(
+        Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+        Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(2, 1, 3)), m23())),
+    );
+    eng.state.vote = Leased::new(
+        UTConfig::<()>::now(),
+        Duration::from_millis(500),
+        Vote::new_committed(6, 2),
+    );
+    eng.state.server_state = eng.calc_server_state();
+    eng
+}
+
+#[test]
+fn test_leader_append_membership_for_leader() -> anyhow::Result<()> {
+    let mut eng = eng();
+    // Make it a real leader: voted for itself and vote is committed.
+    eng.testing_new_leader();
+    eng.output.take_commands();
+
+    eng.replication_handler().append_membership(&log_id(3, 1, 4), &m34());
+
+    assert_eq!(
+        MembershipState::new(
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(2, 1, 3)), m23())),
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(3, 1, 4)), m34()))
+        ),
+        eng.state.membership_state
+    );
+    assert_eq!(
+        ServerState::Leader,
+        eng.state.server_state,
+        "Leader won't be affected by membership change"
+    );
+
+    assert_eq!(
+        vec![
+            //
+            Command::RebuildReplicationStreams {
+                leader_vote: Vote::new(6, 2).to_committed(),
+                targets: vec![
+                    TargetProgress {
+                        target: 3,
+                        target_node: (),
+                        progress: ProgressEntry::empty(3, StreamId::new(2), 0).with_probe_start(0),
+                    },
+                    TargetProgress {
+                        target: 4,
+                        target_node: (),
+                        progress: ProgressEntry::empty(4, StreamId::new(3), 0).with_probe_start(0),
+                    }
+                ], /* node-2 is leader,
+                    * won't be removed */
+                close_old_streams: false,
+            },
+            // Pipeline mode kicks in for new followers
+            Command::Replicate {
+                target: 3,
+                req: Replicate {
+                    inflight_id: InflightId::new(1),
+                    payload: Payload::LogsSince { prev: None },
+                },
+            },
+            Command::Replicate {
+                target: 4,
+                req: Replicate {
+                    inflight_id: InflightId::new(2),
+                    payload: Payload::LogsSince { prev: None },
+                },
+            },
+        ],
+        eng.output.take_commands()
+    );
+
+    let progress_4 = eng.leader.as_ref().unwrap().progress.try_get(&4).expect("progress for node 4");
+    assert_eq!(None, progress_4.matching(), "exists, but it is a None");
+
+    Ok(())
+}
+
+#[test]
+fn test_leader_append_membership_update_learner_process() -> anyhow::Result<()> {
+    // When updating membership, voter progress should inherit from learner progress, and
+    // learner process should inherit from voter process. If voter changes to
+    // learner or vice versa.
+
+    let mut eng = eng();
+    // Last-per-leader format: leader (0,0) last at 0, leader (1,1) last at 9, leader (5,1) last at 10
+    // This preserves the original ranges: (1,1) covers indices 1-9, (5,1) covers index 10
+    eng.state.log_ids = LogIdList::new(None, [log_id(0, 0, 0), log_id(1, 1, 9), log_id(5, 1, 10)]);
+
+    eng.state.membership_state.set_effective(Arc::new(StoredMembershipOf::<UTConfig>::new(
+        Some(log_id(2, 1, 3)),
+        m23_45(),
+    )));
+
+    // Make it a real leader: voted for itself and vote is committed.
+    eng.testing_new_leader();
+
+    if let Some(l) = &mut eng.leader.as_mut() {
+        assert_eq!(
+            Some(&ProgressEntry::empty(4, StreamId::new(3), 11).with_probe_start(11)),
+            l.progress.try_get(&4)
+        );
+        assert_eq!(
+            Some(&ProgressEntry::empty(5, StreamId::new(4), 11).with_probe_start(11)),
+            l.progress.try_get(&5)
+        );
+
+        let p = ProgressEntry::testing_new(4, Some(log_id(1, 1, 4)));
+        l.progress.update_entry_with(&4, |entry| *entry = p.clone());
+        assert_eq!(Some(&p), l.progress.try_get(&4));
+
+        let p = ProgressEntry::testing_new(5, Some(log_id(1, 1, 5)));
+        l.progress.update_entry_with(&5, |entry| *entry = p.clone());
+        assert_eq!(Some(&p), l.progress.try_get(&5));
+
+        let p = ProgressEntry::testing_new(3, Some(log_id(1, 1, 3)));
+        l.progress.update_entry_with(&3, |entry| *entry = p.clone());
+        assert_eq!(Some(&p), l.progress.try_get(&3));
+    } else {
+        unreachable!("leader should not be None");
+    }
+
+    eng.replication_handler().append_membership(&log_id(3, 1, 4), &m4_356());
+
+    assert_eq!(
+        MembershipState::new(
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(2, 1, 3)), m23_45())),
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(3, 1, 4)), m4_356()))
+        ),
+        eng.state.membership_state
+    );
+
+    if let Some(l) = &mut eng.leader.as_mut() {
+        // Progress entries with matching.next_index() == searching_end enter pipeline mode
+        let expected = ProgressEntry::testing_new(4, Some(log_id(1, 1, 4)))
+            .with_inflight(Inflight::logs_since(Some(log_id(1, 1, 4)), InflightId::new(1)));
+        assert_eq!(
+            Some(&expected),
+            l.progress.try_get(&4),
+            "learner-4 progress should be transferred to voter progress (pipeline mode)"
+        );
+
+        let expected = ProgressEntry::testing_new(3, Some(log_id(1, 1, 3)))
+            .with_inflight(Inflight::logs_since(Some(log_id(1, 1, 3)), InflightId::new(2)));
+        assert_eq!(
+            Some(&expected),
+            l.progress.try_get(&3),
+            "voter-3 progress should be transferred to learner progress (pipeline mode)"
+        );
+
+        let expected = ProgressEntry::testing_new(5, Some(log_id(1, 1, 5)))
+            .with_inflight(Inflight::logs_since(Some(log_id(1, 1, 5)), InflightId::new(3)));
+        assert_eq!(
+            Some(&expected),
+            l.progress.try_get(&5),
+            "learner-5 has previous value (pipeline mode)"
+        );
+
+        // Node 6 is new, with matching=None and searching_end=11
+        // matching.next_index()=0 != searching_end=11, so NOT pipeline mode
+        let expected = ProgressEntry::empty(6, StreamId::new(5), 11).with_inflight(Inflight::probe(
+            None,
+            Some(log_id(1, 1, 7)),
+            InflightId::new(4),
+        ));
+        assert_eq!(
+            Some(&expected),
+            l.progress.try_get(&6),
+            "node-6 is new, not pipeline mode"
+        );
+    } else {
+        unreachable!("leader should not be None");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_leader_append_membership_updates_self_quorum() -> anyhow::Result<()> {
+    let mut eng = eng();
+    eng.state.membership_state.set_effective(Arc::new(StoredMembershipOf::<UTConfig>::new(
+        Some(log_id(2, 1, 3)),
+        m2(),
+    )));
+
+    // Make it a real leader: voted for itself and vote is committed.
+    eng.testing_new_leader();
+
+    let self_quorum = eng.leader_ref().unwrap().is_self_quorum();
+    assert!(self_quorum, "node 2 alone is a majority of {{2}}");
+
+    eng.replication_handler().append_membership(&log_id(3, 1, 4), &m23());
+
+    let self_quorum = eng.leader_ref().unwrap().is_self_quorum();
+    assert!(!self_quorum, "node 2 alone is not a majority of {{2,3}}");
+
+    Ok(())
+}

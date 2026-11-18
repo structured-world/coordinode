@@ -1,0 +1,44 @@
+# openraft-macros from openraft's upstream main branch, unchanged; see
+# vendor/openraft/Cargo.toml.
+[package]
+name = "coordinode-openraft-macros"
+description = "openraft-macros from openraft's upstream main branch, as CoordiNode uses it"
+version.workspace = true
+edition = "2024"
+authors = [
+    "Databend Authors <opensource@datafuselabs.com>",
+    "Anthony Dodd <Dodd.AnthonyJosiah@gmail.com>",
+]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/databendlabs/openraft"
+repository = "https://github.com/structured-world/coordinode"
+readme = "README.md"
+keywords = ["raft", "consensus"]
+categories = ["algorithms", "asynchronous", "data-structures"]
+publish = true
+include = ["/src/**", "/README.md", "/LICENSE", "/COPYRIGHT", "/NOTICES", "/Cargo.toml"]
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "openraft_macros"
+path = "src/lib.rs"
+proc-macro = true
+test = false
+doctest = false
+
+[features]
+single-threaded = []
+singlethreaded = []
+
+[dependencies]
+chrono = "0.4"
+proc-macro2 = "1.0"
+quote = "1.0"
+semver = "1.0.14"
+syn = { version = "3.0", features = ["full", "extra-traits"] }
+
+# Upstream's code as it is: the workspace's own lints do not apply.
+[lints]

@@ -1,0 +1,266 @@
+use std::fmt::Debug;
+use std::time::Duration;
+
+use display_more::DisplayOptionExt;
+
+use crate::OptionalSend;
+use crate::RaftState;
+use crate::RaftTypeConfig;
+use crate::display_ext::display_instant::DisplayInstantExt;
+use crate::engine::Command;
+use crate::engine::Condition;
+use crate::engine::EngineConfig;
+use crate::engine::EngineOutput;
+use crate::engine::Respond;
+use crate::engine::ValueSender;
+use crate::engine::handler::leader_handler::LeaderHandler;
+use crate::engine::handler::replication_handler::ReplicationHandler;
+use crate::engine::handler::server_state_handler::ServerStateHandler;
+use crate::entry::RaftPayload;
+use crate::errors::RejectVote;
+use crate::proposer::CandidateState;
+use crate::proposer::LeaderState;
+use crate::raft_state::IOId;
+use crate::raft_state::LogStateReader;
+use crate::storage::RaftStateMachine;
+use crate::type_config::TypeConfigExt;
+use crate::type_config::alias::OneshotSenderOf;
+use crate::type_config::alias::VoteOf;
+use crate::vote::RaftVote;
+use crate::vote::raft_vote::RaftVoteExt;
+
+#[cfg(test)]
+mod accept_vote_test;
+#[cfg(test)]
+mod become_leader_test;
+#[cfg(test)]
+mod handle_message_vote_test;
+
+/// Handle raft vote-related operations
+///
+/// A `vote` defines the state of an openraft node.
+/// See [`RaftState::calc_server_state`].
+pub(crate) struct VoteHandler<'st, C, SM = ()>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    pub(crate) config: &'st mut EngineConfig<C>,
+    pub(crate) state: &'st mut RaftState<C>,
+    pub(crate) output: &'st mut EngineOutput<C, SM>,
+    pub(crate) leader: &'st mut LeaderState<C>,
+    pub(crate) candidate: &'st mut CandidateState<C>,
+    pub(crate) pre_candidate: &'st mut CandidateState<C>,
+}
+
+impl<C, SM> VoteHandler<'_, C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    /// Validate and accept the input `vote` and send the result via `tx`.
+    ///
+    /// If the vote is not GE the local vote, it sends a caller-defined response via `tx` and
+    /// returns `None` to inform the caller about the invalid vote.
+    ///
+    /// Otherwise, it returns `Some(tx)`.
+    ///
+    /// The `f` is used to create the error response.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn accept_vote<T, F>(
+        &mut self,
+        vote: &VoteOf<C>,
+        tx: OneshotSenderOf<C, T>,
+        f: F,
+    ) -> Option<OneshotSenderOf<C, T>>
+    where
+        T: Debug + Eq + OptionalSend,
+        Respond<C>: From<ValueSender<C, T>>,
+        F: Fn(&RaftState<C>, RejectVote<C>) -> T,
+    {
+        let vote_res = self.update_vote(vote);
+
+        if let Err(e) = vote_res {
+            let res = f(self.state, e);
+
+            let condition = Some(Condition::IOFlushed {
+                io_id: IOId::new(self.state.vote_ref()),
+            });
+
+            self.output.push_command(Command::Respond {
+                when: condition,
+                resp: Respond::new(res, tx),
+            });
+
+            return None;
+        }
+        Some(tx)
+    }
+
+    /// Check and update the local vote and related state for every message received.
+    ///
+    /// This is used by all incoming events, such as the three RPC append-entries, vote,
+    /// install-snapshot to check the `vote` field.
+    ///
+    /// It grants the input vote and persists it if `input_vote >= my_vote`.
+    ///
+    /// Note: This method does not check last-log-id. handle-vote-request has to deal with
+    /// last-log-id itself.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn update_vote(&mut self, vote: &VoteOf<C>) -> Result<(), RejectVote<C>> {
+        // Partial ord compare:
+        // Vote does not have to be total ord.
+        // `!(a >= b)` does not imply `a < b`.
+        if vote.as_ref_vote() >= self.state.vote_ref().as_ref_vote() {
+            // Ok
+        } else {
+            tracing::info!("vote {} is rejected by local vote: {}", vote, self.state.vote_ref());
+            return Err(RejectVote {
+                higher: self.state.vote_ref().clone(),
+            });
+        }
+        tracing::debug!(%vote, "vote is changing to" );
+
+        // Grant the vote
+
+        // If the vote is committed, it's an established Leader.
+        // Otherwise, it's a Candidate and does not have Leader lease.
+        let leader_lease = if vote.is_committed() {
+            self.config.timer_config.leader_lease
+        } else {
+            Duration::default()
+        };
+
+        if vote.as_ref_vote() > self.state.vote_ref().as_ref_vote() {
+            tracing::info!("vote is changing from {} to {}", self.state.vote_ref(), vote);
+
+            self.state.vote.update(C::now(), leader_lease, vote.clone());
+            self.state.accept_log_io(IOId::new(vote));
+            self.output.push_command(Command::SaveVote { vote: vote.clone() });
+        } else {
+            let now = C::now();
+            self.state.vote.touch(now, leader_lease);
+            tracing::debug!(
+                "vote does not change, just update lease, updated: {}; now: {}",
+                self.state.vote,
+                now.display()
+            );
+        }
+
+        self.update_internal_server_state();
+
+        Ok(())
+    }
+
+    /// Update to Leader or following state depending on `Engine.state.vote`.
+    pub(crate) fn update_internal_server_state(&mut self) {
+        if self.state.is_leader(&self.config.id) {
+            self.become_leader();
+        } else if self.state.is_leading(&self.config.id) {
+            // candidate, nothing to do
+        } else {
+            self.become_following();
+        }
+    }
+
+    /// Enter Leader state(vote.node_id == self.id && vote.committed == true).
+    ///
+    /// It keeps the Leader that an election established. Otherwise it builds a new Leader from the
+    /// vote in the **Acceptor** part, `engine.state.vote`. In a running cluster that happens only
+    /// if a request carries a committed vote that names this node, which a correct peer never
+    /// sends: startup demotes a former leader's vote, and vote responses are adopted only
+    /// uncommitted.
+    pub(crate) fn become_leader(&mut self) {
+        tracing::debug!(
+            "become leader: node-{}, my vote: {}, last-log-id: {}",
+            self.config.id,
+            self.state.vote_ref(),
+            self.state.last_log_id().display()
+        );
+
+        if let Some(l) = self.leader.as_mut() {
+            tracing::debug!("leading vote: {}", l.committed_vote,);
+
+            if l.committed_vote.leader_id() == self.state.vote_ref().leader_id() {
+                tracing::debug!(
+                    "vote still belongs to the same leader. Just updating vote is enough: node-{}, {}",
+                    self.config.id,
+                    self.state.vote_ref()
+                );
+                // Reached when an election win commits the vote, and when the server state is
+                // refreshed on an established leader, for example by
+                // `Trigger::refresh_server_state()`.
+                l.committed_vote = self.state.vote_ref().to_committed();
+                self.server_state_handler().update_server_state_if_changed();
+                return;
+            }
+        }
+
+        // It's a different leader that creates this vote.
+        // Re-create a new Leader instance.
+
+        let leader = self.state.new_leader();
+        let leader_vote = leader.committed_vote_ref().clone();
+        *self.leader = Some(Box::new(leader));
+
+        let last_log_id = self.leader.as_ref().unwrap().last_log_id().cloned();
+
+        let prev_accepted = self.state.accept_log_io(IOId::new_log_io(leader_vote.clone(), last_log_id.clone()));
+        // SaveVote currently finishes its I/O before the next command runs.
+        // Keep this dependency explicit if vote persistence becomes non-blocking.
+        let condition = prev_accepted.map(|io_id| Condition::IOFlushed { io_id });
+
+        self.output.push_command(Command::UpdateIOProgress {
+            when: condition,
+            io_id: IOId::new_log_io(leader_vote, last_log_id.clone()),
+        });
+
+        self.server_state_handler().update_server_state_if_changed();
+
+        let mut rh = self.replication_handler();
+        rh.rebuild_replication_streams(true);
+
+        // A new Leader has proposed no log yet. Proposing its blank log also initiates replication.
+        self.leader_handler().leader_append_entries([C::Payload::blank()]);
+    }
+
+    /// Clears campaign and leadership state when this node can no longer lead.
+    ///
+    /// Recalculates the server state as follower or learner from the effective membership.
+    pub(crate) fn become_following(&mut self) {
+        let is_leading = self.state.is_leading(&self.config.id);
+        debug_assert!(
+            !is_leading,
+            "this node must no longer lead under the current vote and membership"
+        );
+
+        let had_leading_state = self.leader.is_some() || self.candidate.is_some() || self.pre_candidate.is_some();
+
+        *self.leader = None;
+        *self.candidate = None;
+        *self.pre_candidate = None;
+
+        self.output.prepend_command(Command::FailPendingReads);
+        if had_leading_state {
+            self.output.push_command(Command::CloseReplicationStreams);
+        }
+
+        self.server_state_handler().update_server_state_if_changed();
+    }
+
+    pub(crate) fn server_state_handler(&mut self) -> ServerStateHandler<'_, C> {
+        ServerStateHandler::new(self.config, self.state)
+    }
+
+    pub(crate) fn replication_handler(&mut self) -> ReplicationHandler<'_, C, SM> {
+        let leader = self.leader.as_mut().unwrap();
+
+        ReplicationHandler::new(self.config, leader, self.state, self.output)
+    }
+
+    pub(crate) fn leader_handler(&mut self) -> LeaderHandler<'_, C, SM> {
+        let leader = self.leader.as_mut().unwrap();
+
+        LeaderHandler::new(self.config, leader, self.state, self.output)
+    }
+}

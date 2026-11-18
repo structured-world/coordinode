@@ -1,0 +1,2352 @@
+//! Public Raft interface and data types.
+//!
+//! [`Raft`] serves as the primary interface to a Raft node,
+//! facilitating all interactions with the underlying RaftCore.
+//!
+//! While `RaftCore` operates as a singleton within an application, [`Raft`] instances are designed
+//! to be cheaply cloneable.
+//! This allows multiple components within the application that require interaction with `RaftCore`
+//! to efficiently share access.
+
+pub(crate) mod api;
+#[cfg(test)]
+mod declare_raft_types_test;
+mod impl_raft_blocking_write;
+pub mod linearizable_read;
+pub(crate) mod message;
+mod raft_inner;
+pub mod responder;
+mod runtime_config_handle;
+pub(crate) mod stream_append;
+pub mod trigger;
+mod watch_handle;
+
+pub(crate) use api::app::AppApi;
+pub(crate) use api::management::ManagementApi;
+pub(crate) use api::protocol::ProtocolApi;
+
+pub(in crate::raft) mod core_state;
+mod leader;
+
+use std::fmt::Debug;
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use core_state::CoreState;
+use derive_more::Display;
+use futures_util::FutureExt;
+use linearizable_read::Linearizer;
+use linearizable_read::LinearizerOption;
+use linearizable_read::ReadLogId;
+pub use message::AppendEntriesRequest;
+pub use message::AppendEntriesResponse;
+pub use message::AppendError;
+pub use message::AppendResult;
+pub use message::ChangeMembershipOutcome;
+pub use message::ChangeMembershipRequest;
+pub use message::ClientWriteResponse;
+pub use message::ClientWriteResult;
+pub use message::ConflictHint;
+#[allow(deprecated)]
+pub use message::InstallSnapshotRequest;
+#[allow(deprecated)]
+pub use message::InstallSnapshotResponse;
+pub use message::LogSegment;
+pub use message::Precondition;
+pub use message::SnapshotResponse;
+pub use message::StreamAppendError;
+pub use message::TransferLeaderError;
+pub use message::TransferLeaderRequest;
+pub use message::TransferLeaderResponse;
+pub use message::VoteRequest;
+pub use message::VoteResponse;
+pub use message::WriteManyRequest;
+pub use message::WriteOption;
+pub use message::WriteRequest;
+pub use message::WriteResponse;
+pub use message::WriteResult;
+use openraft_macros::since;
+pub use stream_append::StreamAppendResult;
+use tracing::Instrument;
+use tracing::Level;
+use tracing::trace_span;
+
+pub use self::leader::Leader;
+pub use self::watch_handle::WatchChangeHandle;
+use crate::Extensions;
+use crate::OptionalSend;
+use crate::RaftNetworkFactory;
+use crate::RaftState;
+pub use crate::RaftTypeConfig;
+use crate::StorageError;
+use crate::StorageHelper;
+use crate::async_runtime::MpscWeakSender;
+use crate::async_runtime::OneshotSender;
+use crate::async_runtime::Select2;
+use crate::async_runtime::mpsc::MpscSender;
+use crate::async_runtime::watch::WatchReceiver;
+use crate::async_runtime::watch::WatchSender;
+use crate::base::BoxFuture;
+use crate::base::BoxOnce;
+use crate::base::BoxStream;
+use crate::config::Config;
+use crate::config::RuntimeConfig;
+use crate::core::ClientResponderQueue;
+use crate::core::IoBroadcast;
+use crate::core::LeaseReadStatePublisher;
+use crate::core::MetricsChannels;
+use crate::core::PendingReadDeadlineNotifier;
+use crate::core::PendingReadQueue;
+use crate::core::RaftCore;
+use crate::core::SharedReplicateBatch;
+use crate::core::StepDownWatcher;
+use crate::core::Tick;
+use crate::core::heartbeat::handle::HeartbeatWorkersHandle;
+use crate::core::io_flush_tracking::AppliedProgress;
+use crate::core::io_flush_tracking::CommitProgress;
+pub use crate::core::io_flush_tracking::FlushPoint;
+use crate::core::io_flush_tracking::IoProgressWatcher;
+use crate::core::io_flush_tracking::LogProgress;
+use crate::core::io_flush_tracking::SnapshotProgress;
+use crate::core::io_flush_tracking::VoteProgress;
+use crate::core::merged_raft_msg_receiver::BatchRaftMsgReceiver;
+use crate::core::notification::Notification;
+use crate::core::notification_channel::NotificationChannel;
+use crate::core::raft_msg::RaftMsg;
+use crate::core::raft_msg::external_command::ExternalCommand;
+use crate::core::raft_msg::install_full_snapshot_request::InstallFullSnapshotRequest;
+use crate::core::runtime_stats::RuntimeStats;
+use crate::core::sm;
+use crate::core::sm::worker;
+use crate::engine::Engine;
+use crate::engine::EngineConfig;
+use crate::engine::INITIAL_QUEUE_CAPACITY;
+use crate::entry::RaftPayload;
+use crate::errors::ClientWriteError;
+use crate::errors::Fatal;
+use crate::errors::ForwardReason;
+use crate::errors::ForwardToLeader;
+use crate::errors::InitializeError;
+use crate::errors::LinearizableReadError;
+use crate::errors::RaftError;
+use crate::errors::ShutdownError;
+use crate::errors::into_raft_result::IntoRaftResult;
+use crate::membership::RaftMembership;
+use crate::membership::RaftMembershipExt;
+use crate::metrics::MetricsRecorder;
+use crate::metrics::RaftDataMetrics;
+use crate::metrics::RaftMetrics;
+use crate::metrics::RaftServerMetrics;
+use crate::metrics::Wait;
+use crate::metrics::WaitError;
+use crate::network::NetSnapshot;
+use crate::raft::raft_inner::RaftInner;
+pub use crate::raft::runtime_config_handle::RuntimeConfigHandle;
+use crate::raft::trigger::Trigger;
+use crate::raft_state::IOId;
+use crate::storage::RaftLogStorage;
+use crate::storage::RaftStateMachine;
+use crate::type_config::TypeConfigExt;
+use crate::type_config::alias::JoinErrorOf;
+use crate::type_config::alias::LogIdOf;
+use crate::type_config::alias::MpscSenderOf;
+use crate::type_config::alias::MpscWeakSenderOf;
+use crate::type_config::alias::NodeIdOf;
+use crate::type_config::alias::SnapshotOf;
+use crate::type_config::alias::VoteOf;
+use crate::type_config::alias::WatchReceiverOf;
+use crate::type_config::alias::WriteResponderOf;
+use crate::vote::Vote;
+use crate::vote::leader_id::raft_leader_id::RaftLeaderId;
+use crate::vote::leader_id::raft_leader_id::RaftLeaderIdExt;
+use crate::vote::non_committed::UncommittedVote;
+use crate::vote::raft_vote::RaftVote;
+use crate::vote::raft_vote::RaftVoteExt;
+
+/// Define types for a Raft type configuration.
+///
+/// Since Rust has some limitations when deriving traits for types with generic arguments
+/// and most types are parameterized by [`RaftTypeConfig`], we need to add supertraits to
+/// a type implementing [`RaftTypeConfig`].
+///
+/// This macro does exactly that.
+///
+/// Example:
+/// ```ignore
+/// openraft::declare_raft_types!(
+///    pub TypeConfig:
+///        D            = ClientRequest,
+///        R            = ClientResponse,
+///        NodeId       = u64,
+///        Node         = openraft::impls::BasicNode,
+///        Term         = u64,
+///        LeaderId     = openraft::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId>,
+///        Vote           = openraft::impls::Vote<Self::LeaderId>,
+///        Membership     = openraft::impls::Membership<Self::NodeId, Self::Node>,
+///        Payload        = openraft::impls::EntryPayload<Self::D, Self::Membership>,
+///        Entry          = openraft::impls::Entry<
+///            <Self::LeaderId as openraft::vote::RaftLeaderId>::Committed,
+///            Self::Payload,
+///        >,
+///        Responder<T>   = openraft::impls::OneshotResponder<Self, T>,
+///        AsyncRuntime   = openraft::impls::TokioRuntime,
+/// );
+/// ```
+///
+/// Types can be omitted, and the following default type will be used:
+/// - `D`:            `String`
+/// - `R`:            `String`
+/// - `NodeId`:       `u64`
+/// - `Node`:         `::openraft::impls::BasicNode`
+/// - `Term`:         `u64`
+/// - `LeaderId`:     `::openraft::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId>`
+/// - `Vote`:           `::openraft::impls::Vote<Self::LeaderId>`
+/// - `Membership`:     `::openraft::impls::Membership<Self::NodeId, Self::Node>`
+/// - `Payload`:        `::openraft::impls::EntryPayload<Self::D, Self::Membership>`
+/// - `Entry`:          `::openraft::impls::Entry<CommittedLeaderId, Self::Payload>`
+/// - `Responder<T>`:   `::openraft::impls::OneshotResponder<Self, T>`
+/// - `AsyncRuntime`:   `::openraft::impls::TokioRuntime`
+/// - `ErrorSource`:    `::anyerror::AnyError`
+///
+/// For example, to declare with only `D` and `R` types:
+/// ```ignore
+/// openraft::declare_raft_types!(
+///    pub TypeConfig:
+///        D = ClientRequest,
+///        R = ClientResponse,
+/// );
+/// ```
+///
+/// Or just use the default type config:
+/// ```ignore
+/// openraft::declare_raft_types!(pub TypeConfig);
+/// ```
+#[macro_export]
+macro_rules! declare_raft_types {
+    // Add a trailing colon to    `declare_raft_types(MyType)`,
+    // Make it the standard form: `declare_raft_types(MyType:)`.
+    ($(#[$outer:meta])* $visibility:vis $id:ident) => {
+        $crate::declare_raft_types!($(#[$outer])* $visibility $id:);
+    };
+
+    // The main entry of this macro
+    ($(#[$outer:meta])* $visibility:vis $id:ident: $($(#[$inner:meta])* $type_id:ident = $type:ty),* $(,)? ) => {
+        $(#[$outer])*
+        #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd)]
+        $visibility struct $id {}
+
+        impl $crate::RaftTypeConfig for $id {
+            // `expand!(KEYED, ...)` ignores the duplicates.
+            // Thus by appending default types after user defined types,
+            // the absent user defined types are filled with default types.
+            $crate::macros::expand!(
+                KEYED,
+                (T, ATTR, V) => {ATTR type T = V;},
+                $(($type_id, $(#[$inner])*, $type),)*
+
+                // Default types:
+                (D            , , String                                       ),
+                (R            , , String                                       ),
+                (NodeId       , , u64                                          ),
+                (Node         , , $crate::impls::BasicNode                     ),
+                (Term         , , u64                                          ),
+                (LeaderId     , , $crate::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId> ),
+                (Vote           , , $crate::impls::Vote<Self::LeaderId>            ),
+                (Membership     , , $crate::impls::Membership<Self::NodeId, Self::Node> ),
+                (MembershipEdit , , $crate::impls::ChangeMembers<Self::NodeId, Self::Node> ),
+                (Payload        , , $crate::impls::EntryPayload<Self::D, Self::Membership> ),
+                (Entry          , , $crate::impls::Entry<<Self::LeaderId as $crate::vote::RaftLeaderId>::Committed, Self::Payload> ),
+                (Responder<T>   , , $crate::impls::ProgressResponder<Self, T> where T: $crate::OptionalSend + 'static     ),
+                (Batch<T>       , , $crate::impls::InlineBatch<T> where T: $crate::OptionalSend + 'static     ),
+                (AsyncRuntime   , , $crate::impls::TokioRuntime                  ),
+                (ErrorSource    , , $crate::impls::BoxedErrorSource               ),
+            );
+
+        }
+    };
+}
+
+/// Policy that determines how to handle read operations in a Raft cluster.
+///
+/// This enum defines strategies for ensuring linearizable reads in distributed systems
+/// while balancing between consistency guarantees and performance.
+#[derive(Clone, Debug, Display, PartialEq, Eq)]
+pub enum ReadPolicy {
+    /// Uses leader lease to avoid network round-trips for read operations.
+    ///
+    /// With `LeaseRead`, the leader can serve reads locally without contacting followers
+    /// as long as it believes its leadership lease is still valid. This provides better
+    /// performance compared to `ReadIndex` but assumes clock drift between nodes is negligible.
+    /// It returns an error immediately when the lease is stale.
+    ///
+    /// Note: This offers slightly weaker consistency guarantees than `ReadIndex` in exchange
+    /// for lower latency.
+    LeaseRead,
+
+    /// Implements the ReadIndex protocol to ensure linearizable reads.
+    ///
+    /// With `ReadIndex`, the leader confirms its leadership status by contacting a quorum
+    /// of followers before serving read requests. This ensures strong consistency but incurs
+    /// the cost of network communication for each read operation.
+    ///
+    /// This is the safer option that provides the strongest consistency guarantees.
+    ReadIndex,
+}
+
+/// Primary interface to a Raft node.
+///
+/// `Raft` provides the complete implementation of the Raft consensus protocol and serves as the
+/// main interface for interacting with a Raft node in the cluster. Applications built on Raft use
+/// this type to spawn a Raft task and communicate with it.
+///
+/// # Architecture
+///
+/// The `Raft` handle is a lightweight wrapper around an `Arc<RaftInner>`, making it cheap to clone.
+/// The actual work is performed by an internal core task, which runs separately processing
+/// requests through message channels.
+///
+/// # Lifecycle
+///
+/// 1. **Creation**: Use [`Raft::new`] to create and spawn a new Raft node, or use [`Raft::build`]
+///    followed by [`Raft::run`] when application setup must finish before Raft starts
+/// 2. **Initialization**: Call [`initialize`](Raft::initialize) on pristine nodes to form a cluster
+/// 3. **Operation**: Use various methods to interact with the node:
+///    - Protocol RPCs: [`append_entries`](Raft::append_entries), [`vote`](Raft::vote)
+///    - Client operations: [`client_write`](Raft::client_write),
+///      [`ensure_linearizable`](Raft::ensure_linearizable)
+///    - Management: [`trigger`](Raft::trigger), [`metrics`](Raft::metrics)
+/// 4. **Shutdown**: Call [`shutdown`](Raft::shutdown) to gracefully stop the node
+///
+/// # Cloning
+///
+/// `Raft` implements [`Clone`] with very low cost, allowing multiple components in your application
+/// to hold handles to the same Raft node. All clones reference the same underlying Raft instance.
+///
+/// # Error Handling
+///
+/// Methods return [`RaftError::Fatal`] when the Raft node encounters unrecoverable errors or is
+/// shutting down. Applications should monitor for fatal errors and initiate shutdown if needed.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Create a new Raft node
+/// let raft = Raft::new(node_id, config, network, log_store, state_machine).await?;
+///
+/// // Initialize a new cluster
+/// raft.initialize(btreeset![1, 2, 3]).await?;
+///
+/// // Write to the cluster
+/// let response = raft.client_write(my_request).await?;
+///
+/// // Read linearizably
+/// raft.ensure_linearizable(ReadPolicy::ReadIndex).await?;
+/// let data = raft.with_state_machine(|sm| { sm.read("key") }).await?;
+///
+/// // Monitor metrics
+/// let metrics = raft.metrics().borrow_watched();
+/// println!("Current leader: {:?}", metrics.current_leader);
+/// ```
+///
+/// # See Also
+///
+/// - [Raft specification](https://raft.github.io/raft.pdf) for protocol details
+/// - [`Config`] for configuration options
+/// - [`RaftMetrics`] for monitoring cluster state
+#[since(version = "0.10.0", change = "added SM state machine type parameter")]
+pub struct Raft<C, SM = ()>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    inner: Arc<RaftInner<C>>,
+    sm_cmd_tx: MpscWeakSenderOf<C, sm::Command<C, SM>>,
+
+    /// Sender of the dedicated channel that delivers a full snapshot to RaftCore.
+    ///
+    /// The snapshot data type is defined by the state machine, thus it does not go through
+    /// the [`RaftMsg`] channel, which is independent of the state machine type.
+    ///
+    /// [`RaftMsg`]: crate::core::raft_msg::RaftMsg
+    install_snapshot_tx: MpscSenderOf<C, InstallFullSnapshotRequest<C, SM>>,
+}
+
+impl<C, SM> Clone for Raft<C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            sm_cmd_tx: self.sm_cmd_tx.clone(),
+            install_snapshot_tx: self.install_snapshot_tx.clone(),
+        }
+    }
+}
+
+impl<C, SM> Debug for Raft<C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Raft").field("id", &self.inner.id).finish()
+    }
+}
+
+/// Forwarder task that bridges IO completion Watch channel to notification channel.
+///
+/// This task reads IO completion results from a Watch channel and forwards them
+/// to the RaftCore notification channel, translating IOId and storage errors to notifications.
+///
+/// To reduce wakeup overhead, notifications are batched: at most one notification
+/// is forwarded per `BATCH_INTERVAL`. When a change arrives, the forwarder waits
+/// until the interval expires before reading and forwarding the latest value.
+async fn io_completion_forwarder<C>(
+    mut rx_io: WatchReceiverOf<C, Result<IOId<C>, StorageError<C>>>,
+    weak_tx_notify: MpscWeakSenderOf<C, Notification<C>>,
+) where
+    C: RaftTypeConfig,
+{
+    const BATCH_INTERVAL: Duration = Duration::from_micros(1);
+
+    loop {
+        let deadline = C::now() + BATCH_INTERVAL;
+
+        // Wait for IO completion notification
+        if rx_io.changed().await.is_err() {
+            // Watch sender dropped, exit forwarder
+            tracing::debug!("IO completion watch channel closed, forwarder exiting");
+            break;
+        }
+
+        let now = C::now();
+        if now < deadline {
+            C::sleep_until(deadline).await;
+
+            // Drain all the changed events.
+            let _ = rx_io.changed().now_or_never();
+        }
+
+        // Read the latest value after batching interval
+        let result = {
+            let borrowed = rx_io.borrow_watched();
+            borrowed.clone()
+        };
+
+        // Try to upgrade weak sender
+        let Some(tx) = weak_tx_notify.upgrade() else {
+            tracing::debug!("Notification channel closed, forwarder exiting");
+            break;
+        };
+
+        // Forward the result to notification channel
+        let notification = match result {
+            Ok(io_id) => Notification::LocalIO { io_id },
+            Err(storage_error) => Notification::StorageError { error: storage_error },
+        };
+
+        if let Err(e) = tx.send(notification).await {
+            tracing::warn!("failed to forward IO completion: {}", e.0);
+            break;
+        }
+    }
+}
+
+impl<C, SM> Raft<C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    /// Create and spawn a new Raft task.
+    ///
+    /// ### `id`
+    /// The ID which the spawned Raft task will use to identify itself within the cluster.
+    /// Applications must guarantee that the ID provided to this function is stable, and should be
+    /// persisted in a well known location, probably alongside the Raft log and the application's
+    /// state machine. This ensures that restarts of the node will yield the same ID every time.
+    ///
+    /// ### `config`
+    /// Raft's runtime config. See the docs on the `Config` object for more details.
+    ///
+    /// ### `network`
+    /// An implementation of the [`RaftNetworkFactory`] trait which will be used by Raft for
+    /// sending RPCs to peer nodes within the cluster.
+    ///
+    /// ### `storage`
+    /// An implementation of the [`RaftLogStorage`] and [`RaftStateMachine`] trait which will be
+    /// used by Raft for data storage.
+    ///
+    /// ### Recovering committed state on startup
+    /// `new()` returns as soon as the node task is spawned, but the state machine may still lag the
+    /// state it had before a restart — see [`RaftLogStorage::save_committed`]. An
+    /// application that serves reads immediately (especially when `committed` is not persisted) may
+    /// then observe a reverted state. To prevent that, await
+    /// [`wait_for_recovery`](Self::wait_for_recovery) before serving reads:
+    ///
+    /// ```ignore
+    /// let raft = Raft::new(id, config, network, log_store, sm).await?;
+    /// raft.wait_for_recovery(Some(Duration::from_secs(5))).await?;
+    /// // The state machine has recovered at least its pre-restart committed state.
+    /// ```
+    #[since(
+        version = "0.10.0",
+        change = "require N::Network: NetSnapshot<SnapshotData = SM::SnapshotData>"
+    )]
+    #[tracing::instrument(level="debug", skip_all, fields(cluster=%config.cluster_name))]
+    pub async fn new<LS, N>(
+        id: C::NodeId,
+        config: Arc<Config>,
+        network: N,
+        log_store: LS,
+        state_machine: SM,
+    ) -> Result<Self, Fatal<C>>
+    where
+        N: RaftNetworkFactory<C>,
+        N::Network: NetSnapshot<C, SnapshotData = SM::SnapshotData>,
+        LS: RaftLogStorage<C>,
+    {
+        let raft = Self::build(id, config, network, log_store, state_machine).await?;
+        raft.run();
+        Ok(raft)
+    }
+
+    /// Build a Raft node without spawning its tasks.
+    ///
+    /// This two-phase alternative to [`new`](Self::new) lets an application construct data-serving
+    /// components that depend on the [`Raft`] handle before the node can campaign for leadership.
+    /// Call [`run`](Self::run) after those components are ready.
+    ///
+    /// Storage is inspected and the initial Raft state is recovered during this call, but
+    /// No Raft background task starts until [`run`](Self::run) is called.
+    ///
+    /// ```ignore
+    /// let raft = Raft::build(id, config, network, log_store, sm).await?;
+    /// let server = DataServer::new(raft.clone());
+    /// raft.run();
+    /// server.serve().await?;
+    /// ```
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level="debug", skip_all, fields(cluster=%config.cluster_name))]
+    pub async fn build<LS, N>(
+        id: C::NodeId,
+        config: Arc<Config>,
+        network: N,
+        mut log_store: LS,
+        mut state_machine: SM,
+    ) -> Result<Self, Fatal<C>>
+    where
+        N: RaftNetworkFactory<C>,
+        N::Network: NetSnapshot<C, SnapshotData = SM::SnapshotData>,
+        LS: RaftLogStorage<C>,
+    {
+        let api_channel_size = config.api_channel_size();
+        let notification_channel_size = config.notification_channel_size();
+
+        let (tx_api, rx_api) = C::mpsc(api_channel_size);
+        let (tx_install_snapshot, rx_install_snapshot) = C::mpsc(api_channel_size);
+        let (tx_notify, rx_notify) = C::mpsc(notification_channel_size);
+        let (tx_metrics, rx_metrics) = C::watch_channel(RaftMetrics::new_initial(id.clone()));
+        let (tx_data_metrics, rx_data_metrics) = C::watch_channel(RaftDataMetrics::default());
+        let (tx_server_metrics, rx_server_metrics) = C::watch_channel(RaftServerMetrics::new_initial(id.clone()));
+        let (tx_lease_read_state, rx_lease_read_state) = C::watch_channel(None);
+        let lease_read_state_publisher = LeaseReadStatePublisher::new(tx_lease_read_state);
+
+        // Watch channel for IO completion notifications from storage callbacks.
+        // Initial value is a dummy IOId with this node's ID.
+        let leader_id = C::LeaderId::new_with_default_term(id.clone());
+        let dummy_io_id = IOId::Vote(UncommittedVote::new(leader_id));
+        let (tx_io_completed, rx_io_completed) = C::watch_channel(Ok(dummy_io_id));
+
+        // Create weak sender for forwarder before moving tx_notify into RaftCore
+        let weak_tx_notify = tx_notify.downgrade();
+
+        let (tx_progress, progress_watcher) = IoProgressWatcher::new();
+        let (tx_shutdown, rx_shutdown) = C::oneshot();
+
+        let runtime_config = Arc::new(RuntimeConfig::new(&config));
+
+        let core_span = tracing::span!(
+            parent: tracing::Span::current(),
+            Level::DEBUG,
+            "RaftCore",
+            id = display(&id),
+            cluster = display(&config.cluster_name)
+        );
+
+        let eng_config = EngineConfig::new(id.clone(), config.as_ref());
+
+        let state = {
+            let mut helper = StorageHelper::new(&mut log_store, &mut state_machine).with_id(id.clone());
+            helper.get_initial_state().await?
+        };
+
+        let engine = Engine::new(state, eng_config);
+
+        let sm_span = tracing::span!(parent: &core_span, Level::DEBUG, "sm_worker");
+
+        let log_reader = log_store.get_log_reader().await;
+        let (sm_cmd_tx, sm_cmd_rx) = C::mpsc(config.state_machine_channel_size());
+        let weak_sm_cmd_tx = sm_cmd_tx.downgrade();
+
+        let default_io_id = IOId::new_vote_io(UncommittedVote::new_with_default_term(id.clone()));
+        let (io_accepted_tx, _io_accepted_rx) = C::watch_channel(default_io_id.clone());
+        let (io_submitted_tx, _io_submitted_rx) = C::watch_channel(default_io_id);
+        let (committed_tx, _committed_rx) = C::watch_channel(None);
+        let (quorum_loss_probe_tx, _quorum_loss_probe_rx) = C::watch_channel(None);
+
+        let shared_replicate_batch = SharedReplicateBatch::new();
+
+        let start = {
+            let id = id.clone();
+            let config = config.clone();
+            let runtime_config = runtime_config.clone();
+            let tx_api = tx_api.clone();
+            let tx_install_snapshot = tx_install_snapshot.clone();
+            let rx_metrics = rx_metrics.clone();
+            let rx_server_metrics = rx_server_metrics.clone();
+
+            Box::new(move |inner: &RaftInner<C>| {
+                let tick_tx = tx_notify.clone();
+                let buffered = config.enable_unbounded_state_machine_buffer();
+                let sm_cmd_rx = sm::command_receiver::CommandReceiver::new(sm_cmd_rx, buffered);
+                let sm_handle = worker::Worker::spawn(
+                    id.clone(),
+                    state_machine,
+                    log_reader,
+                    tx_notify.clone(),
+                    (sm_cmd_tx, sm_cmd_rx),
+                    sm_span,
+                );
+
+                let core: RaftCore<C, N, LS, SM> = RaftCore {
+                    id: id.clone(),
+                    config: config.clone(),
+                    runtime_config: runtime_config.clone(),
+                    core_state: Default::default(),
+                    network_factory: Arc::new(C::mutex(network)),
+                    log_store,
+                    sm_handle,
+
+                    engine,
+                    lease_read_state_publisher,
+
+                    // Start small like the engine queues; the queue grows on demand
+                    // and keeps its capacity after draining.
+                    client_responders: ClientResponderQueue::with_capacity(INITIAL_QUEUE_CAPACITY),
+
+                    pending_reads: PendingReadQueue::default(),
+                    pending_read_deadline_notifier: PendingReadDeadlineNotifier::spawn(tx_notify.clone()),
+                    replications: Default::default(),
+
+                    heartbeat_handle: HeartbeatWorkersHandle::new(id.clone(), config.clone()),
+                    tx_api: tx_api.clone(),
+                    rx_api: BatchRaftMsgReceiver::new(
+                        rx_api,
+                        config.api_batch_capacity(),
+                        Duration::from_millis(config.api_batch_linger_ms()),
+                    ),
+                    tx_install_snapshot: tx_install_snapshot.clone(),
+                    rx_install_snapshot,
+                    rx_shutdown,
+
+                    notifications: NotificationChannel::new(tx_notify, rx_notify),
+
+                    io_broadcast: IoBroadcast {
+                        completed: tx_io_completed,
+                        accepted: io_accepted_tx,
+                        submitted: io_submitted_tx,
+                        committed: committed_tx,
+                    },
+                    quorum_loss_probe_tx,
+
+                    metrics: MetricsChannels {
+                        all: tx_metrics,
+                        data: tx_data_metrics,
+                        server: tx_server_metrics,
+                        progress: tx_progress,
+                    },
+
+                    runtime_stats: RuntimeStats::new(&config),
+                    shared_replicate_batch,
+
+                    metrics_recorder: None,
+
+                    span: core_span,
+                };
+
+                // Spawn forwarder task to bridge Watch channel to notification channel
+                let _forwarder_handle = C::spawn(io_completion_forwarder::<C>(rx_io_completed, weak_tx_notify));
+
+                StepDownWatcher::<C>::spawn(
+                    rx_server_metrics.clone(),
+                    rx_metrics.clone(),
+                    tx_api.downgrade(),
+                    &config,
+                );
+
+                let core = Box::new(core);
+                let core_fut = core.main().instrument(trace_span!("spawn").or_current());
+                let join_handle = C::spawn(core_fut);
+
+                let tick_period = Duration::from_millis(config.tick_interval());
+                let enabled = {
+                    let enable_tick = inner.runtime_config.enable_tick.lock().unwrap();
+                    enable_tick.subscribe()
+                };
+                let tick_handle = Tick::spawn(tick_period, tick_tx, enabled);
+                *inner.tick_handle.lock().unwrap() = Some(tick_handle);
+                join_handle
+            })
+        };
+
+        let inner = RaftInner {
+            id,
+            config,
+            runtime_config,
+            tick_handle: Mutex::new(None),
+            tx_api,
+            rx_lease_read_state,
+            rx_metrics,
+            rx_data_metrics,
+            rx_server_metrics,
+            progress_watcher,
+            tx_shutdown: Mutex::new(Some(tx_shutdown)),
+            core_state: Mutex::new(CoreState::Unstarted(Some(start))),
+            extensions: Extensions::default(),
+        };
+
+        Ok(Self {
+            inner: Arc::new(inner),
+            sm_cmd_tx: weak_sm_cmd_tx,
+            install_snapshot_tx: tx_install_snapshot,
+        })
+    }
+
+    /// Start the Raft core task built by [`build`](Self::build).
+    ///
+    /// This method is idempotent: calling it on an already running or stopped node has no effect.
+    #[since(version = "0.10.0")]
+    pub fn run(&self) {
+        let mut state = self.inner.core_state.lock().unwrap();
+        let CoreState::Unstarted(start) = &mut *state else {
+            return;
+        };
+
+        let start = start.take().expect("unstarted Raft must have a start function");
+        let join_handle = start(self.inner.as_ref());
+        *state = CoreState::started(join_handle);
+    }
+}
+
+impl<C, SM> Raft<C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    /// Return a handle to update runtime config.
+    ///
+    /// Such enabling/disabling heartbeat, election, etc.
+    ///
+    /// Example:
+    /// ```ignore
+    /// let raft = Raft::new(...).await?;
+    /// raft.runtime_config().heartbeat(true);
+    /// raft.runtime_config().tick(true);
+    /// raft.runtime_config().elect(true);
+    /// ```
+    pub fn runtime_config(&self) -> RuntimeConfigHandle<'_, C> {
+        RuntimeConfigHandle::new(self.inner.as_ref())
+    }
+
+    /// Return the config of this Raft node.
+    pub fn config(&self) -> &Arc<Config> {
+        &self.inner.config
+    }
+
+    /// Access the underlying extensions map.
+    ///
+    /// For most use cases, prefer [`extension()`](Self::extension) which provides
+    /// a simpler API for getting values.
+    ///
+    /// This method is useful when you need direct access to the [`Extensions`] type,
+    /// such as checking if a value exists with [`contains()`](Extensions::contains)
+    /// or removing a value with [`remove()`](Extensions::remove).
+    #[since(version = "0.10.0")]
+    pub fn extensions(&self) -> &Extensions {
+        &self.inner.extensions
+    }
+
+    /// Get a clone of a user-defined extension value.
+    ///
+    /// If no value exists, `T::default()` is inserted and a clone is returned.
+    /// Values must implement `Clone` and `Default`. Use `Arc` for shared mutable state.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use std::sync::Arc;
+    ///
+    /// #[derive(Clone, Default)]
+    /// pub struct MyCounter(Arc<AtomicU64>);
+    ///
+    /// // Get a clone (auto-inserts default if not present)
+    /// let counter = raft.extension::<MyCounter>();
+    /// counter.0.fetch_add(1, Ordering::Relaxed);
+    ///
+    /// // Multiple calls share the same underlying data via Arc
+    /// let counter2 = raft.extension::<MyCounter>();
+    /// assert_eq!(counter2.0.load(Ordering::Relaxed), 1);
+    /// ```
+    #[since(version = "0.10.0")]
+    pub fn extension<T>(&self) -> T
+    where T: OptionalSend + Clone + Default + 'static {
+        self.inner.extensions.get::<T>()
+    }
+
+    /// Return a copy of the runtime statistics.
+    ///
+    /// Sends a message to RaftCore to retrieve the current runtime statistics.
+    /// This returns a snapshot of the stats at the time of the call.
+    #[cfg(feature = "runtime-stats")]
+    pub async fn runtime_stats(&self) -> Result<RuntimeStats<C>, Fatal<C>> {
+        self.inner.call_core_oneshot(|tx| RaftMsg::GetRuntimeStats { tx }).await
+    }
+
+    /// Check if this node is currently the leader.
+    ///
+    /// Returns `true` if the node's current state is [`ServerState::Leader`].
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if raft.is_leader() {
+    ///     // Perform leader-only operations
+    /// }
+    /// ```
+    ///
+    /// [`ServerState::Leader`]: crate::core::ServerState::Leader
+    #[since(version = "0.10.0")]
+    pub fn is_leader(&self) -> bool {
+        self.inner.rx_metrics.borrow_watched().state.is_leader()
+    }
+
+    /// Get leader information if this node is currently a leader.
+    ///
+    /// Returns [`Leader`] containing the leader ID and health metadata if this node is the leader
+    /// (i.e., its vote has been accepted by a quorum), otherwise returns
+    /// [`ForwardToLeader`] error containing the current known leader information.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// match raft.as_leader() {
+    ///     Ok(leader) => {
+    ///         println!("This node is leader: {:?}", leader.leader_id());
+    ///     }
+    ///     Err(forward) => {
+    ///         println!("Forward to leader: {:?}", forward.leader_id);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// [`ForwardToLeader`]: crate::errors::ForwardToLeader
+    #[since(version = "0.10.0")]
+    pub fn as_leader(&self) -> Result<Leader<C, SM>, ForwardToLeader<C>> {
+        // Do not use `is_leader()`, which depends on other state to determine, which may result in
+        // inconsistent state. And `is_leader()` just do another reading from the metrics, which also may be
+        // inconsistent.
+
+        let metrics = self.inner.rx_metrics.borrow_watched();
+
+        let Some(committed_vote) = metrics.vote.try_to_committed() else {
+            return Err(ForwardToLeader::empty());
+        };
+
+        let leader_id = committed_vote.leader_id();
+        let node_id = leader_id.node_id();
+
+        if node_id == &self.inner.id {
+            Ok(Leader {
+                raft: self.clone(),
+                leader_id: leader_id.clone(),
+                last_quorum_acked: metrics.last_quorum_acked.map(|s| s.into_inner()),
+            })
+        } else {
+            let node = metrics.membership_config.get_node(node_id).cloned();
+
+            Err(ForwardToLeader {
+                leader_id: Some(node_id.clone()),
+                leader_node: node,
+                reason: ForwardReason::NotLeader,
+            })
+        }
+    }
+
+    /// Get the ID of this Raft node.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let id = raft.node_id();
+    /// println!("Node ID: {:?}", id);
+    /// ```
+    #[since(version = "0.10.0")]
+    pub fn node_id(&self) -> &C::NodeId {
+        &self.inner.id
+    }
+
+    /// Get an iterator over the current voter node IDs.
+    ///
+    /// Returns node IDs that are voters in the effective membership. Learners are not included.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// for voter_id in raft.voter_ids() {
+    ///     println!("Voter: {:?}", voter_id);
+    /// }
+    /// ```
+    #[since(version = "0.10.0")]
+    pub fn voter_ids(&self) -> impl Iterator<Item = C::NodeId> {
+        // borrow_watched() holds a lock that blocks RaftCore.
+        // Clone and collect immediately to release the lock quickly.
+        let membership = self.inner.rx_metrics.borrow_watched().membership_config.clone();
+        membership.voter_ids().collect::<Vec<_>>().into_iter()
+    }
+
+    /// Get an iterator over the current learner node IDs.
+    ///
+    /// Returns known node IDs in the effective membership with no campaign, read voter,
+    /// or write voter role. These nodes receive replicated logs without counting toward either
+    /// quorum.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// for learner_id in raft.learner_ids() {
+    ///     println!("Learner: {:?}", learner_id);
+    /// }
+    /// ```
+    #[since(version = "0.10.0")]
+    pub fn learner_ids(&self) -> impl Iterator<Item = C::NodeId> {
+        // borrow_watched() holds a lock that blocks RaftCore.
+        // Clone and collect immediately to release the lock quickly.
+        let membership = self.inner.rx_metrics.borrow_watched().membership_config.clone();
+        let membership = membership.membership();
+        let node_ids = membership.node_ids();
+        let learners = node_ids.filter(|id| membership.is_learner(id));
+        let ids = learners.collect::<Vec<_>>();
+        ids.into_iter()
+    }
+
+    /// Create a new [`ProtocolApi`] to handle Raft protocol RPCs received by this Raft node.
+    ///
+    /// [`ProtocolApi`] provides the following protocol APIs:
+    /// - [`ProtocolApi::append_entries`]
+    /// - [`ProtocolApi::vote`]
+    /// - [`ProtocolApi::get_snapshot`]
+    /// - [`ProtocolApi::install_full_snapshot`]
+    /// - [`ProtocolApi::handle_transfer_leader`]
+    pub(crate) fn protocol_api(&self) -> ProtocolApi<C, SM> {
+        ProtocolApi::new(
+            self.inner.clone(),
+            self.sm_cmd_tx.clone(),
+            self.install_snapshot_tx.clone(),
+        )
+    }
+
+    pub(crate) fn app_api(&self) -> AppApi<'_, C> {
+        AppApi::new(&self.inner)
+    }
+
+    pub(crate) fn management_api(&self) -> ManagementApi<'_, C> {
+        ManagementApi::new(self.inner.as_ref())
+    }
+
+    /// Return a [`Trigger`] handle to manually trigger raft actions, such as elect or build
+    /// snapshot.
+    ///
+    /// Example:
+    /// ```ignore
+    /// let raft = Raft::new(...).await?;
+    /// raft.trigger().elect(false).await?;
+    /// ```
+    pub fn trigger(&self) -> Trigger<'_, C> {
+        Trigger::new(self.inner.as_ref())
+    }
+
+    /// Set or unset a custom metrics recorder for exporting Raft metrics.
+    ///
+    /// This allows applications to plug in their own metrics collection backends
+    /// (e.g., OpenTelemetry, Prometheus, StatsD) at runtime. The recorder will
+    /// receive metrics events from RaftCore as they occur.
+    ///
+    /// Pass `Some(recorder)` to enable metrics recording, or `None` to disable it.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use openraft::metrics::MetricsRecorder;
+    ///
+    /// struct MyRecorder;
+    /// impl MetricsRecorder for MyRecorder {
+    ///     fn record_apply_batch(&self, entry_count: u64) { /* ... */ }
+    ///     fn record_append_batch(&self, entry_count: u64) { /* ... */ }
+    /// }
+    ///
+    /// // Enable metrics recording
+    /// raft.set_metrics_recorder(Some(Arc::new(MyRecorder))).await?;
+    ///
+    /// // Disable metrics recording
+    /// raft.set_metrics_recorder(None).await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Fatal`] error if RaftCore is shut down or has a storage error.
+    pub async fn set_metrics_recorder(&self, recorder: Option<Arc<dyn MetricsRecorder>>) -> Result<(), Fatal<C>> {
+        self.inner.send_external_command(ExternalCommand::SetMetricsRecorder { recorder }).await
+    }
+
+    /// Submit an AppendEntries RPC to this Raft node.
+    ///
+    /// These RPCs are sent by the cluster leader to replicate log entries (§5.3), and are also
+    /// used as heartbeats (§5.2).
+    ///
+    /// The outer `Err` means this node has stopped. The inner [`AppendResult`] is the reply for
+    /// the leader: the last log id this node accepted, or the [`AppendError`] that explains why it
+    /// rejected the request. A conflict carries a hint that describes this node's log after it
+    /// truncated the conflicting entries.
+    ///
+    /// [`AppendResult`] does not implement serde, so convert it to the transport's own response
+    /// type. `AppendEntriesResponse::from(result)` keeps the existing format, but drops the log id
+    /// and the hint.
+    #[since(version = "0.10.0", change = "returns AppendResult with an optional conflict hint")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn append_entries(&self, rpc: AppendEntriesRequest<C>) -> Result<AppendResult<C>, RaftError<C>> {
+        self.protocol_api().append_entries(rpc).await.map_err(RaftError::Fatal)
+    }
+
+    /// Submit a stream of AppendEntries RPCs to this Raft node.
+    ///
+    /// This is a stream-oriented version of [`Self::append_entries`] with pipelining support.
+    /// It spawns a background task that reads from the input stream, sends requests to RaftCore,
+    /// and forwards response receivers to the output stream. Responses are yielded in order.
+    ///
+    /// ## Pipelining Behavior
+    ///
+    /// - A background task reads from the input stream and sends to RaftCore
+    /// - Uses a bounded channel (64 slots) for backpressure
+    /// - Responses are yielded in order (FIFO) as they complete
+    ///
+    /// ## Output
+    ///
+    /// The output stream emits:
+    /// - `Ok(log_id)` when logs are successfully flushed
+    /// - `Err(e)` when an error occurs, which terminates the stream
+    ///
+    /// A conflict, [`AppendError::Conflict`], carries a hint that describes this node's log after
+    /// it truncated the conflicting entries. [`AppendError`] does not implement serde, so convert
+    /// it to the transport's own response type. Converting it to [`StreamAppendError`] keeps
+    /// the existing format but drops the hint, and the leader then falls back to binary search.
+    ///
+    /// ## Pinning
+    ///
+    /// The returned stream is `!Unpin` because it uses async closures internally.
+    /// You must pin the stream before calling `.next()`:
+    ///
+    /// ```ignore
+    /// use std::pin::pin;
+    ///
+    /// let mut output = pin!(raft.stream_append(input));
+    /// while let Some(result) = output.next().await { /* ... */ }
+    /// ```
+    ///
+    /// Alternatively, use `Box::pin` for heap pinning if the stream needs to be stored or returned:
+    ///
+    /// ```ignore
+    /// let mut output = Box::pin(raft.stream_append(input));
+    /// ```
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::pin::pin;
+    /// use futures_util::StreamExt;
+    ///
+    /// let input_stream = futures_util::stream::iter(vec![request1, request2, request3]);
+    /// let mut output_stream = pin!(raft.stream_append(input_stream));
+    ///
+    /// while let Some(result) = output_stream.next().await {
+    ///     match result {
+    ///         Ok(Ok(log_id)) => println!("Flushed: {:?}", log_id),
+    ///         Ok(Err(err)) => {
+    ///             println!("Append error: {}", err);
+    ///             break;
+    ///         }
+    ///         Err(fatal) => {
+    ///             println!("Fatal: {}", fatal);
+    ///             break;
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    #[since(
+        version = "0.10.0",
+        change = "stream item carries AppendError with an optional conflict hint"
+    )]
+    #[since(version = "0.10.0", change = "stream item contains Fatal")]
+    #[since(version = "0.10.0")]
+    pub fn stream_append<S>(
+        &self,
+        stream: S,
+    ) -> impl futures_util::Stream<Item = Result<AppendResult<C>, Fatal<C>>> + OptionalSend + 'static
+    where
+        S: futures_util::Stream<Item = AppendEntriesRequest<C>> + OptionalSend + 'static,
+    {
+        self.protocol_api().stream_append(stream)
+    }
+
+    /// Submit a VoteRequest (RequestVote in the spec) RPC to this Raft node.
+    ///
+    /// These RPCs are sent by cluster peers which are in candidate state attempting to gather votes
+    /// (§5.2).
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn vote(&self, rpc: VoteRequest<C>) -> Result<VoteResponse<C>, RaftError<C>> {
+        self.protocol_api().vote(rpc).await.into_raft_result()
+    }
+
+    /// Submit a Pre-Vote RPC to this Raft node.
+    ///
+    /// A pre-candidate sends this before incrementing its term to ask whether peers *would* grant
+    /// it a vote at `rpc.vote` (a hypothetical next term). Handling this RPC never persists a
+    /// vote or changes this node's term; it only reports whether the vote would be granted,
+    /// judged by the same leader-lease and last-log-id rules as [`Raft::vote()`]. Pre-Vote is
+    /// only used when [`Config::enable_pre_vote`](crate::Config::enable_pre_vote) is enabled on
+    /// the sender.
+    #[since(version = "0.10.0", change = "added for the Pre-Vote feature")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn pre_vote(&self, rpc: VoteRequest<C>) -> Result<VoteResponse<C>, RaftError<C>> {
+        self.protocol_api().pre_vote(rpc).await.into_raft_result()
+    }
+
+    /// Get the latest snapshot from the state machine.
+    ///
+    /// The request is served directly by the state-machine worker, not `RaftCore`. It returns an
+    /// error only when that worker fails to serve it, e.g., encountering a storage error or having
+    /// stopped (`Fatal::Stopped`), which can occur while `RaftCore` is still running.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn get_snapshot(&self) -> Result<Option<SnapshotOf<C, SM::SnapshotData>>, RaftError<C>> {
+        self.protocol_api().get_snapshot().await.into_raft_result()
+    }
+
+    /// Install a completely received snapshot to the state machine.
+    ///
+    /// This method is used to implement an application defined snapshot transmission.
+    /// The application receives a snapshot from the leader, in chunks or a stream, and
+    /// then rebuild a snapshot, then pass the snapshot to Raft to install.
+    ///
+    /// # Panics
+    ///
+    /// If `vote` is accepted, the input must be one a protocol-following cluster can produce,
+    /// otherwise this method panics (also in release builds):
+    /// - the snapshot's last log id must not be beyond the leadership of `vote`: no leader owns a
+    ///   snapshot with a log id greater than its own vote;
+    /// - a snapshot greater than the locally committed log id must be at a strictly greater index:
+    ///   an equal index identifies a different entry in an already committed slot, while a smaller
+    ///   index contradicts a committed suffix.
+    ///
+    /// Such input indicates a forged or corrupted snapshot, e.g., one built by a previous
+    /// incarnation of the cluster. Installing it would corrupt the log id order.
+    #[since(
+        version = "0.10.0",
+        change = "panic on a snapshot inconsistent with the vote or with locally committed logs"
+    )]
+    #[since(version = "0.9.0")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn install_full_snapshot(
+        &self,
+        vote: VoteOf<C>,
+        snapshot: SnapshotOf<C, SM::SnapshotData>,
+    ) -> Result<SnapshotResponse<C>, Fatal<C>> {
+        self.protocol_api().install_full_snapshot(vote, snapshot).await
+    }
+
+    /// Get the ID of the current leader from this Raft node.
+    ///
+    /// This method is based on the Raft metrics system which does a good job at staying
+    /// up-to-date; however, the `is_leader` method must still be used to guard against stale
+    /// reads. This method is perfect for making decisions on where to route client requests.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn current_leader(&self) -> Option<C::NodeId> {
+        self.metrics().borrow_watched().current_leader.clone()
+    }
+
+    /// Ensures reads performed after this method are linearizable across the cluster
+    /// using explicitly provided options. This method is just a shorthand for calling
+    /// [`get_read_log_id()`](Raft::get_read_log_id) and then calling [Raft::wait].
+    ///
+    /// This method is just a shorthand for combining calling
+    /// [`Raft::get_read_linearizer()`](Self::get_read_linearizer) and
+    /// [`Linearizer::try_await_ready()`](Linearizer::try_await_ready), i.e., it is
+    /// equivalent to:
+    /// ```ignore
+    /// my_raft.get_read_linearizer(read_policy).await?.try_await_ready(&my_raft, None).await?;
+    /// ```
+    ///
+    /// To support follower read, i.e., get `read_log_id` on a remote leader then read on local
+    /// state machine, see [`Raft::get_read_linearizer`].
+    ///
+    /// The option defines how to ensure leadership. It may be a [`LinearizerOption`] or a
+    /// [`ReadPolicy`], which is converted into one.
+    ///
+    /// Returns:
+    /// - `Ok(read_log_id)` on successful confirmation that the node is the leader. `read_log_id` is
+    ///   `max(noop_log_id, committed)` at authorization: the log ID a read on any node must wait
+    ///   for. A standard read returns after this node has applied it. A relaxed read, see
+    ///   [`LinearizerOption::with_relaxed`], returns once this node has applied the no-op, so this
+    ///   node may not have applied `read_log_id` yet.
+    /// - `Err(RaftError<LinearizableReadError>)` if fails to assert leadership.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Confirm leadership with a fresh quorum acknowledgement
+    /// my_raft.ensure_linearizable(ReadPolicy::ReadIndex).await?;
+    ///
+    /// // Or reuse a valid leader lease to avoid a quorum round trip, when the lease's
+    /// // assumptions hold; see `ReadPolicy::LeaseRead`
+    /// my_raft.ensure_linearizable(ReadPolicy::LeaseRead).await?;
+    ///
+    /// // Then proceed with the state machine read
+    /// ```
+    /// Read more about how it works: [Read Operation](crate::docs::protocol::read)
+    #[since(
+        version = "0.10.0",
+        change = "accept `impl Into<LinearizerOption>` instead of `ReadPolicy`"
+    )]
+    #[since(version = "0.10.0", change = "return ReadLogId instead of Option<LogId>")]
+    #[since(version = "0.9.0")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn ensure_linearizable(
+        &self,
+        linearizer_option: impl Into<LinearizerOption>,
+    ) -> Result<ReadLogId<C>, RaftError<C, LinearizableReadError<C>>> {
+        let linearizer = self.app_api().get_read_linearizer(linearizer_option.into()).await.into_raft_result()?;
+
+        // Safe unwrap: it never times out.
+        let state = linearizer.await_ready(self).await?;
+        Ok(state.read_log_id())
+    }
+
+    /// Legacy method that returns read state as a tuple. Use
+    /// [`Raft::get_read_linearizer`] instead.
+    ///
+    /// This method extracts the read log ID and applied log ID from a [`Linearizer`] and returns
+    /// them as a tuple.
+    ///
+    /// The [`ReadLogId`] contains the current leadership and the inclusive log boundary the state
+    /// machine must apply through before serving the read. The applied log ID is the last value
+    /// known to have been applied when the linearizer was created. A relaxed option does not
+    /// change the returned boundary, so a read that waits for it gets the standard barrier; use
+    /// [`Raft::get_read_linearizer`] for relaxed reads.
+    /// **For new code, use [`Raft::get_read_linearizer`]** which provides a better API.
+    ///
+    /// See [`Raft::get_read_linearizer`] for full documentation.
+    #[since(
+        version = "0.10.0",
+        change = "accept `impl Into<LinearizerOption>` instead of `ReadPolicy`"
+    )]
+    #[since(version = "0.10.0", change = "return ReadLogId instead of Option<LogId>")]
+    #[since(version = "0.9.0")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn get_read_log_id(
+        &self,
+        linearizer_option: impl Into<LinearizerOption>,
+    ) -> Result<(ReadLogId<C>, Option<LogIdOf<C>>), RaftError<C, LinearizableReadError<C>>> {
+        let linearizer = self.app_api().get_read_linearizer(linearizer_option.into()).await.into_raft_result()?;
+
+        let read_log_id = linearizer.read_log_id();
+        let applied = linearizer.applied();
+
+        Ok((read_log_id, applied.cloned()))
+    }
+
+    /// Ensures this node is leader and returns a [`Linearizer`] to linearize reads.
+    ///
+    /// This method confirms leadership and provides the necessary information to linearize reads
+    /// across the cluster. The leadership is ensured by sending heartbeats or by lease according
+    /// to the specified [`LinearizerOption`]. [`ReadPolicy`] is also accepted and converted into
+    /// an option.
+    ///
+    /// The request always enters RaftCore's API queue alongside write requests. To allow a
+    /// caller-side lease check that bypasses this queue, use [`Self::get_local_read_linearizer`].
+    /// Queue order governs request handling; an earlier write may still be uncommitted.
+    ///
+    /// Returns:
+    /// - `Ok(Linearizer<C>)` on successful confirmation that the node is the leader. The
+    ///   [`Linearizer`] contains the `read_log_id` up to which the state machine should apply to
+    ///   linearize reads, and the last `applied` log id.
+    /// - `Err(RaftError<LinearizableReadError>)` if this node fails to ensure its leadership, for
+    ///   example, it detects a higher term, or fails to communicate with a quorum.
+    ///
+    /// Once returned, the caller should block until the state machine to apply up to `read_log_id`
+    /// using [`Linearizer::try_await_ready`].
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let linearizer = my_raft.get_read_linearizer(ReadPolicy::ReadIndex).await?;
+    /// let _ = linearizer.try_await_ready(&my_raft, None).await?.unwrap();
+    ///
+    /// // Following read from state machine is linearized across the cluster
+    /// let val = my_raft.with_state_machine(|sm| { sm.read("foo") }).await?;
+    /// ```
+    ///
+    /// # Follower Read
+    ///
+    /// For follower reads, obtain the `read_log_id` from the leader via application-defined RPC,
+    /// then use [`Linearizer::try_await_ready`] to wait for local state machine to catch
+    /// up.
+    ///
+    /// ```ignore
+    /// // Application defined RPC to get the `read_log_id` from the remote leader
+    /// let leader_id = my_raft.current_leader().await?.unwrap();
+    /// let linearizer = my_app_rpc.get_read_linearizer(leader_id, ReadPolicy::ReadIndex).await?;
+    ///
+    /// // Block waiting local state machine to apply up to to the `read_log_id`
+    /// let _ = linearizer.try_await_ready(&my_raft, None).await?.unwrap();
+    ///
+    /// // Following read from state machine is linearized across the cluster
+    /// let val = my_raft.with_state_machine(|sm| { sm.read("foo") }).await?;
+    /// ```
+    ///
+    /// See: [Read Operation](crate::docs::protocol::read)
+    #[since(
+        version = "0.10.0",
+        change = "accept `impl Into<LinearizerOption>` instead of `ReadPolicy`"
+    )]
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn get_read_linearizer(
+        &self,
+        linearizer_option: impl Into<LinearizerOption>,
+    ) -> Result<Linearizer<C>, RaftError<C, LinearizableReadError<C>>> {
+        let linearizer_option = linearizer_option.into();
+        self.app_api().get_read_linearizer(linearizer_option).await.into_raft_result()
+    }
+
+    /// Returns a [`Linearizer`] using a caller-side lease check when enabled and valid.
+    ///
+    /// With [`Config::enable_local_lease_read`] set to `Some(true)`, a valid cached leader
+    /// snapshot authorizes the read without entering RaftCore's API queue. The read can therefore
+    /// overtake queued write requests and uses the published committed boundary. Both this method
+    /// and [`Self::get_read_linearizer`] support linearizable reads; overlapping unfinished writes
+    /// may follow the read. Await a write's completion before starting a read that must observe it.
+    ///
+    /// Disabled caching, a missing or expired snapshot, and zero effective acknowledgement age
+    /// fall back to [`Self::get_read_linearizer`] with the same options. In particular,
+    /// [`ReadPolicy::ReadIndex`] always uses RaftCore for fresh quorum confirmation.
+    ///
+    /// A cache hit can return immediately, but the caller must still await
+    /// [`Linearizer::await_ready`] or [`Linearizer::try_await_ready`] before reading application
+    /// state. This method checks leader state; follower reads still obtain a linearizer from
+    /// the leader and wait for their own state machine to catch up.
+    ///
+    /// If known applied progress is behind the read boundary, the apply wait depends on RaftCore
+    /// reporting newer metrics.
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn get_local_read_linearizer(
+        &self,
+        linearizer_option: impl Into<LinearizerOption>,
+    ) -> Result<Linearizer<C>, RaftError<C, LinearizableReadError<C>>> {
+        let linearizer_option = linearizer_option.into();
+        let app_api = self.app_api();
+        let result = app_api.get_local_read_linearizer(linearizer_option).await;
+        result.into_raft_result()
+    }
+
+    /// Submit a mutating client request to Raft to update the state of the system (§5.1).
+    ///
+    /// It will be appended to the log, committed to the cluster, and then applied to the
+    /// application state machine. The result of applying the request to the state machine will
+    /// be returned as the response from this method.
+    ///
+    /// Our goal for Raft is to implement linearizable semantics. If the leader crashes after
+    /// committing a log entry but before responding to the client, the client may retry the
+    /// command with a new leader, causing it to be executed a second time. As such, clients
+    /// should assign a unique serial number to every logical command and reuse it for every retry.
+    /// The state machine should track the latest serial number processed for each client, along
+    /// with the associated response. This deduplication state must be durable and included in
+    /// snapshots. If the state machine receives a command whose serial number has already been
+    /// executed, it responds immediately without re-executing the request (§8). The
+    /// [`RaftStateMachine::apply`] method is the perfect place to implement
+    /// this.
+    ///
+    /// These are application specific requirements, and must be implemented by the application
+    /// which is being built on top of Raft.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Submit a write request
+    /// let request = MyAppData { key: "foo".to_string(), value: "bar".to_string() };
+    /// let response = raft.client_write(request).await?;
+    /// println!("Applied at log index: {:?}", response.log_id);
+    /// ```
+    #[tracing::instrument(level = "debug", skip(self, app_data))]
+    pub async fn client_write(
+        &self,
+        app_data: C::D,
+    ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
+        self.app_api().client_write(C::Payload::normal(app_data)).await.into_raft_result()
+    }
+
+    /// Write a blank log entry to the Raft log.
+    ///
+    /// A blank entry contains no application data and is typically used to:
+    /// - Commit entries from previous terms when a new leader is elected
+    /// - Advance the commit index without any state machine changes
+    /// - Act as a barrier to ensure all previous entries are committed
+    ///
+    /// Returns when the blank entry has been applied to the state machine.
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn write_blank(&self) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
+        self.app_api().client_write(C::Payload::blank()).await.into_raft_result()
+    }
+
+    /// Submit a mutating client request to Raft to update the state machine, returns an application
+    /// defined response receiver [`Responder::Receiver`].
+    ///
+    /// `_ff` means fire and forget.
+    ///
+    /// It is same as [`Self::client_write`] but does not wait for the response.
+    #[since(version = "0.10.0", date = "2025-10-27", change = "add responder arg")]
+    #[since(version = "0.10.0")]
+    pub async fn client_write_ff(
+        &self,
+        app_data: C::D,
+        responder: Option<WriteResponderOf<C>>,
+    ) -> Result<(), Fatal<C>> {
+        self.app_api().client_write_ff(C::Payload::normal(app_data), responder).await
+    }
+
+    /// Write multiple application data payloads in a single batch.
+    ///
+    /// Returns a stream that yields the result of each entry in submission order, once that entry
+    /// is applied. This is more efficient than calling [`client_write()`](Self::client_write)
+    /// multiple times as it sends all payloads in a single message to the Raft core.
+    ///
+    /// `write_option` controls how RaftCore admits the batch: pass `WriteOption::default()` for an
+    /// unconditional write, or [`WriteOption::expect_leader()`] to admit the batch only while a
+    /// given leader is established. To attach your own responders instead of reading a stream,
+    /// use [`Self::write_many()`].
+    ///
+    /// `Err(Fatal)` from this method means the batch was not submitted. If RaftCore stops later,
+    /// the stream yields `Err(Fatal::Stopped)` and ends.
+    ///
+    /// # Admission
+    ///
+    /// The batch reaches RaftCore as one message, and RaftCore admits or rejects it as a whole:
+    ///
+    /// - If the expected leader is not the current committed leader, every entry yields
+    ///   [`ClientWriteError::ForwardToLeader`] and nothing is appended.
+    /// - If this node may not accept writes, for example because it is not the leader, its leader
+    ///   lease has expired, or it is transferring leadership, every entry yields
+    ///   [`ClientWriteError::ForwardToLeader`] and nothing is appended.
+    /// - Otherwise every entry is appended to the leader's log in order, at consecutive log
+    ///   indexes.
+    ///
+    /// # Commit
+    ///
+    /// Commit is not all or nothing: each entry is replicated and committed at its own log index.
+    /// If leadership changes before the batch commits, the new leader may have received only the
+    /// first part of the batch. It then commits that part and discards the rest, and each
+    /// discarded entry yields [`ClientWriteError::LogEntryDiscarded`]. The state machine must
+    /// deduplicate retried writes, as described in [`Self::client_write()`].
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use futures_util::TryStreamExt;
+    /// use openraft::raft::WriteOption;
+    ///
+    /// // Admit the batch only in the term it was prepared in.
+    /// let term = raft.as_leader()?.term();
+    /// let mut stream = raft.client_write_many([data1, data2], WriteOption::expect_leader(term)).await?;
+    ///
+    /// // try_next() extracts Fatal error, result is WriteResult
+    /// while let Some(result) = stream.try_next().await? {
+    ///     match result {
+    ///         Ok(response) => println!("Applied at log index: {:?}", response.log_id),
+    ///         Err(error) => eprintln!("Write failed: {:?}", error),
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// [`ClientWriteError::ForwardToLeader`]: crate::errors::ClientWriteError::ForwardToLeader
+    /// [`ClientWriteError::LogEntryDiscarded`]: crate::errors::ClientWriteError::LogEntryDiscarded
+    #[since(version = "0.10.1", change = "add write_option argument")]
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn client_write_many(
+        &self,
+        app_data: impl IntoIterator<Item = C::D>,
+        write_option: WriteOption<C>,
+    ) -> Result<BoxStream<'static, Result<WriteResult<C>, Fatal<C>>>, Fatal<C>> {
+        self.app_api().client_write_many(app_data.into_iter().map(C::Payload::normal), write_option).await
+    }
+
+    /// Submit a write request to Raft.
+    ///
+    /// Returns a [`WriteRequest`] builder. Fire-and-forget by default;
+    /// use [`.responder()`] for results, [`.with_leader()`] or [`.with_option()`] for conditional
+    /// writes.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use openraft::impls::ProgressResponder;
+    ///
+    /// // Fire-and-forget
+    /// raft.write(my_data).await?;
+    ///
+    /// // With responder
+    /// let (responder, rx) = ProgressResponder::complete_only();
+    /// raft.write(my_data).responder(responder).await?;
+    /// let result = rx.await??;
+    ///
+    /// // Conditional write (fails if leader changed)
+    /// let leader_id = raft.as_leader()?.to_committed_leader_id();
+    /// raft.write(my_data)
+    ///     .with_leader(leader_id)
+    ///     .responder(responder)
+    ///     .await?;
+    /// ```
+    ///
+    /// [`.responder()`]: WriteRequest::responder
+    /// [`.with_leader()`]: WriteRequest::with_leader
+    /// [`.with_option()`]: WriteRequest::with_option
+    #[since(version = "0.10.0")]
+    pub fn write(
+        &self,
+        app_data: C::D,
+    ) -> WriteRequest<'_, C, impl Future<Output = Result<(), Fatal<C>>> + OptionalSend> {
+        message::write_request(&self.inner, app_data)
+    }
+
+    /// Submit a batch of writes to Raft in one request.
+    ///
+    /// Returns a [`WriteManyRequest`] builder. Each item of `writes` is an application data and
+    /// an optional responder that receives its result. Append more writes with [`.push()`] or
+    /// [`.extend()`], and make the batch conditional with [`.with_leader()`] or
+    /// [`.with_option()`].
+    ///
+    /// Awaiting the builder sends the batch to RaftCore without waiting for it to be appended or
+    /// committed. Each write reports its result to its responder; a write without a responder
+    /// reports nothing. `Err(Fatal)` means RaftCore has stopped and the batch was not submitted.
+    ///
+    /// # Admission
+    ///
+    /// RaftCore admits or rejects the batch as a whole:
+    ///
+    /// - If the expected leader set by [`.with_leader()`] is not the current committed leader,
+    ///   every write fails with [`ClientWriteError::ForwardToLeader`] and nothing is appended.
+    /// - If this node may not accept writes, for example because it is not the leader, its leader
+    ///   lease has expired, or it is transferring leadership, every write fails with
+    ///   [`ClientWriteError::ForwardToLeader`] and nothing is appended.
+    /// - Otherwise every write is appended to the leader's log in order, at consecutive log
+    ///   indexes.
+    ///
+    /// RaftCore may append the batch together with other queued writes, but it never splits the
+    /// batch. Since admission is all or nothing, a responder on any one write tells whether the
+    /// whole batch was admitted. An empty batch appends nothing.
+    ///
+    /// # Commit
+    ///
+    /// Commit is not all or nothing: each entry is replicated and committed at its own log index.
+    /// If leadership changes before the batch commits, the new leader may have received only the
+    /// first part of the batch. It then commits that part and discards the rest, and the
+    /// responders of the discarded writes receive [`ClientWriteError::LogEntryDiscarded`].
+    /// Retrying the whole batch then applies the committed part twice, so the state machine must
+    /// deduplicate retried writes, as described in [`Self::client_write()`].
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use openraft::impls::ProgressResponder;
+    ///
+    /// let (responder1, rx1) = ProgressResponder::complete_only();
+    /// let (responder3, rx3) = ProgressResponder::complete_only();
+    ///
+    /// // Admit the batch only in the term it was prepared in.
+    /// let term = raft.as_leader()?.term();
+    /// raft.write_many([(data1, Some(responder1)), (data2, None)])
+    ///     .push(data3, Some(responder3))
+    ///     .with_leader(term)
+    ///     .await?;
+    ///
+    /// let response1 = rx1.await??;
+    /// let response3 = rx3.await??;
+    /// ```
+    ///
+    /// [`.push()`]: WriteManyRequest::push
+    /// [`.extend()`]: WriteManyRequest::extend
+    /// [`.with_leader()`]: WriteManyRequest::with_leader
+    /// [`.with_option()`]: WriteManyRequest::with_option
+    /// [`ClientWriteError::ForwardToLeader`]: crate::errors::ClientWriteError::ForwardToLeader
+    /// [`ClientWriteError::LogEntryDiscarded`]: crate::errors::ClientWriteError::LogEntryDiscarded
+    #[since(version = "0.10.1")]
+    pub fn write_many(
+        &self,
+        writes: impl IntoIterator<Item = (C::D, Option<WriteResponderOf<C>>)>,
+    ) -> WriteManyRequest<'_, C, impl Future<Output = Result<(), Fatal<C>>> + OptionalSend> {
+        self.app_api().write_many(writes)
+    }
+
+    /// Handle the LeaderTransfer request from a Leader node.
+    ///
+    /// If this node is the `to` node, it resets the Leader lease and triggers an election when the
+    /// expected log entries are flushed.
+    /// Otherwise, it just resets the Leader lease to allow the `to` node to become the Leader.
+    ///
+    /// The application calls
+    /// [`Raft::trigger().transfer_leader()`](crate::raft::trigger::Trigger::transfer_leader) to
+    /// submit Transfer Leader command. Then, the current Leader will broadcast it to every node in
+    /// the cluster via [`RaftNetworkV2::transfer_leader`] and the implementation on the remote node
+    /// responds to transfer leader request by calling this method.
+    ///
+    /// [`RaftNetworkV2::transfer_leader`]: crate::network::RaftNetworkV2::transfer_leader
+    #[since(version = "0.10.0", change = "returns TransferLeaderResponse")]
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn handle_transfer_leader(
+        &self,
+        req: TransferLeaderRequest<C>,
+    ) -> Result<TransferLeaderResponse<C>, Fatal<C>> {
+        self.protocol_api().handle_transfer_leader(req).await
+    }
+
+    /// Return `true` if this node is already initialized and cannot be initialized again with
+    /// [`Raft::initialize`]
+    #[since(version = "0.10.0")]
+    pub async fn is_initialized(&self) -> Result<bool, Fatal<C>> {
+        let initialized = self.with_raft_state(|st| st.is_initialized()).await?;
+
+        Ok(initialized)
+    }
+
+    /// Initialize a pristine Raft node with the given config.
+    ///
+    /// This command should be called on pristine nodes — where the log index is 0 and the node is
+    /// in Learner state — as if either of those constraints are false, it indicates that the
+    /// cluster is already formed and in motion. If `InitializeError::NotAllowed` is returned
+    /// from this function, it is safe to ignore, as it simply indicates that the cluster is
+    /// already up and running, which is ultimately the goal of this function. You can check
+    /// if the cluster is initialized with [`Raft::is_initialized()`] and then avoid re-initialize
+    /// it in case you want to get rid of this error.
+    ///
+    /// ## Recommended Usage
+    ///
+    /// The simplest and most appropriate way to initialize a cluster is to call `initialize()`
+    /// on **exactly one node**. The other nodes should remain empty and wait for the initialized
+    /// node to replicate logs to them.
+    ///
+    /// Calling `initialize()` on multiple nodes with **identical configuration** is also
+    /// acceptable and will not cause any consistency issues — the Raft voting protocol ensures
+    /// that only one leader will be elected.
+    ///
+    /// However, calling `initialize()` with **different configurations** on different nodes
+    /// may lead to a split-brain condition and must be avoided.
+    ///
+    /// ## Behavior
+    ///
+    /// Once a node is successfully initialized, it will commit a new membership config
+    /// log entry to store, then enter Candidate state and attempt to elect itself as the
+    /// leader.
+    ///
+    /// `members` converts into the first membership config. The default [`Membership`] converts
+    /// from a `BTreeMap` or a `HashMap` of nodes, and from a `BTreeSet` of node ids when the node
+    /// type is `()` or `EmptyNode`.
+    /// Initialization fails with `InitializeError::InvalidMembership` when the read or the write
+    /// quorum set has no usable quorum, when a quorum ID has no node, when a write voter does not
+    /// have [`NodeRole::ReceiveLogs`], or when OpenRaft cannot prove that the read quorums
+    /// intersect the write quorums.
+    ///
+    /// [`Membership`]: crate::Membership
+    /// [`NodeRole::ReceiveLogs`]: crate::membership::NodeRole::ReceiveLogs
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use std::collections::BTreeMap;
+    /// use openraft::BasicNode;
+    ///
+    /// // Initialize a single-node cluster
+    /// let mut nodes = BTreeMap::new();
+    /// nodes.insert(1, BasicNode { addr: "127.0.0.1:8080".to_string() });
+    /// raft.initialize(nodes).await?;
+    ///
+    /// // Initialize a three-node cluster
+    /// let mut nodes = BTreeMap::new();
+    /// nodes.insert(1, BasicNode { addr: "127.0.0.1:8080".to_string() });
+    /// nodes.insert(2, BasicNode { addr: "127.0.0.1:8081".to_string() });
+    /// nodes.insert(3, BasicNode { addr: "127.0.0.1:8082".to_string() });
+    /// raft.initialize(nodes).await?;
+    /// ```
+    #[since(version = "0.10.0", change = "takes `Into<C::Membership>` instead of `IntoNodes`")]
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn initialize<T>(&self, members: T) -> Result<(), RaftError<C, InitializeError<C>>>
+    where T: Into<C::Membership> + Debug {
+        self.management_api().initialize(members).await.into_raft_result()
+    }
+
+    /// Provides read-only access to [`RaftState`] through a user-provided function.
+    ///
+    /// The function `func` is applied to the current [`RaftState`]. The result of this function,
+    /// of type `V`, is returned wrapped in `Result<V, Fatal<C>>`. `Fatal` error will be
+    /// returned if failed to receive a reply from `RaftCore`.
+    ///
+    /// A `Fatal` error is returned if:
+    /// - Raft core task is stopped normally.
+    /// - Raft core task is panicked due to programming error.
+    /// - Raft core task is encountered a storage error.
+    ///
+    /// Example for getting the current committed log id:
+    /// ```ignore
+    /// let committed = my_raft.with_raft_state(|st| st.committed).await?;
+    /// ```
+    pub async fn with_raft_state<F, V>(&self, func: F) -> Result<V, Fatal<C>>
+    where
+        F: FnOnce(&RaftState<C>) -> V + OptionalSend + 'static,
+        V: OptionalSend + 'static,
+    {
+        let (tx, rx) = C::oneshot();
+
+        self.external_request(|st| {
+            let result = func(st);
+            if let Err(_err) = tx.send(result) {
+                tracing::error!("{}: to-Raft tx send error", func_name!());
+            }
+        })
+        .await?;
+
+        match rx.await {
+            Ok(res) => Ok(res),
+            Err(err) => {
+                tracing::error!("{}: rx recv error: {}", func_name!(), err);
+                let fatal = self.inner.get_core_stop_error().await;
+                Err(fatal)
+            }
+        }
+    }
+
+    /// Send a request to the Raft core loop in a fire-and-forget manner.
+    ///
+    /// This method returns immediately after sending the message to the Raft core loop,
+    /// without waiting for the request to be executed. The returned `Result` indicates
+    /// whether the message was successfully sent, not whether the request was executed.
+    ///
+    /// The request functor will be called with an immutable reference to the [`RaftState`]
+    /// and serialized with other Raft core loop processing (e.g., client requests
+    /// or general state changes).
+    ///
+    /// If a response is required, then the caller can store the sender of a one-shot channel
+    /// in the closure of the request functor, which can then be used to send the response
+    /// asynchronously.
+    ///
+    /// Returns a `Fatal` error if:
+    /// - Raft core task is stopped normally.
+    /// - Raft core task is panicked due to programming error.
+    /// - Raft core task is encountered a storage error.
+    pub async fn external_request<F>(&self, req: F) -> Result<(), Fatal<C>>
+    where F: FnOnce(&RaftState<C>) + OptionalSend + 'static {
+        let req: BoxOnce<'static, RaftState<C>> = Box::new(req);
+        self.inner.send_msg(RaftMsg::WithRaftState { req }).await
+    }
+
+    /// Get a handle to the metrics channel.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Get current metrics
+    /// let metrics = raft.metrics().borrow_watched().clone();
+    /// println!("Current leader: {:?}", metrics.current_leader);
+    /// println!("Current term: {}", metrics.current_term);
+    /// ```
+    pub fn metrics(&self) -> WatchReceiverOf<C, RaftMetrics<C>> {
+        self.inner.rx_metrics.clone()
+    }
+
+    /// Get a handle to the data metrics channel.
+    pub fn data_metrics(&self) -> WatchReceiverOf<C, RaftDataMetrics<C>> {
+        self.inner.rx_data_metrics.clone()
+    }
+
+    /// Get a handle to the server metrics channel.
+    pub fn server_metrics(&self) -> WatchReceiverOf<C, RaftServerMetrics<C>> {
+        self.inner.rx_server_metrics.clone()
+    }
+
+    /// Get a handle to watch log I/O flush progress.
+    ///
+    /// Tracks when log entries and votes are durably written to storage.
+    /// Updated on every I/O completion (vote saves and log appends).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut log_progress = raft.watch_log_progress();
+    ///
+    /// // Wait for a specific log entry to be flushed
+    /// let target = Some(FlushPoint::new(
+    ///     Vote::new_committed(2, node_id),
+    ///     Some(LogId::new(LeaderId::new(2, node_id), 100))
+    /// ));
+    /// log_progress.wait_until_ge(&target).await?;
+    /// ```
+    #[since(version = "0.10.0")]
+    #[must_use = "progress handle should be stored to track I/O progress"]
+    pub fn watch_log_progress(&self) -> LogProgress<C> {
+        self.inner.progress_watcher.log_progress()
+    }
+
+    /// Get a handle to watch vote I/O flush progress.
+    ///
+    /// Tracks when votes (leadership changes) are durably written to storage.
+    /// Updated only when the vote changes (new term or leader), not on every log append.
+    ///
+    /// Use this when you only care about leadership changes, not specific log entries.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut vote_progress = raft.watch_vote_progress();
+    ///
+    /// // Wait for term 2 to be persisted
+    /// let target = Some(Vote::new_committed(2, 0));
+    /// vote_progress.wait_until_ge(&target).await?;
+    /// ```
+    #[since(version = "0.10.0")]
+    #[must_use = "progress handle should be stored to track vote progress"]
+    pub fn watch_vote_progress(&self) -> VoteProgress<C> {
+        self.inner.progress_watcher.vote_progress()
+    }
+
+    /// Get a handle to watch commit log progress.
+    ///
+    /// Tracks when committed logs advance(persisted on a quorum and the last-log is proposed by the
+    /// leader). Updated whenever the committed cursor moves forward.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut commit_progress = raft.watch_commit_progress();
+    ///
+    /// // Wait until log index 42 is committed
+    /// let target = Some(LogId::new(LeaderId::new(2, node_id), 42));
+    /// commit_progress.wait_until_ge(&target).await?;
+    /// ```
+    #[since(version = "0.10.0")]
+    #[must_use = "progress handle should be stored to track commit progress"]
+    pub fn watch_commit_progress(&self) -> CommitProgress<C> {
+        self.inner.progress_watcher.commit_progress()
+    }
+
+    /// Get a handle to watch snapshot persistence progress.
+    ///
+    /// Tracks when snapshots are persisted to storage.
+    /// Updated whenever a snapshot is built or installed and persisted.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut snapshot_progress = raft.watch_snapshot_progress();
+    ///
+    /// // Wait until snapshot covering log index 100 is persisted
+    /// let target = Some(LogId::new(LeaderId::new(2, node_id), 100));
+    /// snapshot_progress.wait_until_ge(&target).await?;
+    /// ```
+    #[since(version = "0.10.0")]
+    #[must_use = "progress handle should be stored to track snapshot progress"]
+    pub fn watch_snapshot_progress(&self) -> SnapshotProgress<C> {
+        self.inner.progress_watcher.snapshot_progress()
+    }
+
+    /// Get a handle to watch applied log progress.
+    ///
+    /// Tracks when logs are applied to the state machine.
+    /// Updated whenever the last applied log id advances.
+    ///
+    /// # Note
+    ///
+    /// If the state machine does not persist the applied state immediately, the watcher
+    /// may observe duplicate events when the server restarts and re-applies log entries.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut apply_progress = raft.watch_apply_progress();
+    ///
+    /// // Wait until log index 42 is applied
+    /// let target = Some(LogId::new(LeaderId::new(2, node_id), 42));
+    /// apply_progress.wait_until_ge(&target).await?;
+    /// ```
+    #[since(version = "0.10.0")]
+    #[must_use = "progress handle should be stored to track applied progress"]
+    pub fn watch_apply_progress(&self) -> AppliedProgress<C> {
+        self.inner.progress_watcher.apply_progress()
+    }
+
+    /// Watch for any leader changes in the cluster and invoke callback on each change.
+    ///
+    /// Returns a [`WatchChangeHandle`] that must be held to keep watching.
+    /// If the handle is dropped or [`WatchChangeHandle::close()`] is called,
+    /// the background task will be terminated and the callback will no longer be invoked.
+    ///
+    /// The callback receives:
+    /// - `old`: The previous leader state `(leader_id, committed)`, or `None` on the first callback
+    /// - `new`: The current leader state `(leader_id, committed)`
+    ///
+    /// This fires on ANY leader change in the cluster, not just when this node's leadership
+    /// changes. For a simpler API that only fires when THIS node becomes or loses leadership,
+    /// see [`on_leader_change()`].
+    ///
+    /// # Note on Start/Stop Service Pattern
+    ///
+    /// If you use this API to start/stop services based on leadership, be aware that
+    /// consecutive callbacks may show the same node as leader with different Terms
+    /// (e.g., Term 1 → Term 2). The simple `if is_leader { start } else { stop }` pattern
+    /// could call `start` twice without an intervening `stop`.
+    ///
+    /// For the start/stop service pattern, prefer [`on_leader_change()`] which guarantees
+    /// alternating `start`/`stop` callbacks.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let my_node_id = 1;
+    ///
+    /// let mut handle = raft.on_cluster_leader_change(move |_old, (leader_id, committed)| {
+    ///     let is_leader = leader_id.node_id == my_node_id && committed;
+    ///
+    ///     async move {
+    ///         if is_leader {
+    ///             // This node just became the committed leader
+    ///             // Start leader-only services (e.g., cron jobs, cache warming)
+    ///             start_leader_services().await;
+    ///         } else {
+    ///             // This node is no longer the leader
+    ///             // Stop leader-only services to avoid duplicate work
+    ///             stop_leader_services().await;
+    ///         }
+    ///     }
+    /// });
+    ///
+    /// // Later, stop watching
+    /// handle.close().await;
+    /// ```
+    ///
+    /// [`on_leader_change()`]: Self::on_leader_change
+    #[since(version = "0.10.0")]
+    #[must_use = "handle must be held to keep the watch task running"]
+    pub fn on_cluster_leader_change<F, Fut>(&self, mut callback: F) -> WatchChangeHandle<C>
+    where
+        F: FnMut(Option<(C::LeaderId, bool)>, (C::LeaderId, bool)) -> Fut + OptionalSend + 'static,
+        Fut: Future<Output = ()> + OptionalSend + 'static,
+    {
+        let mut prev_vote: Option<Vote<C::LeaderId>> = None;
+
+        self.watch_vote_change(move |new_vote, _my_node_id| {
+            let old_leader = prev_vote.as_ref().map(|v| v.leader_id().clone());
+            let new_leader = new_vote.leader_id().clone();
+
+            // Only call callback if leader_id actually changed
+            let fut = if old_leader.as_ref() != Some(&new_leader) {
+                let old_state = prev_vote.as_ref().map(|v| (v.leader_id().clone(), v.is_committed()));
+                let new_state = (new_vote.leader_id().clone(), new_vote.is_committed());
+                Some(callback(old_state, new_state))
+            } else {
+                None
+            };
+            prev_vote = Some(new_vote);
+
+            async move {
+                if let Some(f) = fut {
+                    f.await;
+                }
+            }
+        })
+    }
+
+    /// Register callbacks for when this node becomes or stops being the committed leader.
+    ///
+    /// Returns a [`WatchChangeHandle`] that must be held to keep watching.
+    /// If the handle is dropped or [`WatchChangeHandle::close()`] is called,
+    /// the background task will be terminated and the callbacks will no longer be invoked.
+    ///
+    /// Unlike [`on_cluster_leader_change()`] which fires on any leader change in the cluster,
+    /// this method only fires when THIS node becomes or stops being the leader.
+    ///
+    /// - `start`: Called when this node becomes the leader (committed, quorum-acknowledged)
+    /// - `stop`: Called when this node is no longer the leader (another node becomes leader)
+    ///
+    /// # Callback Guarantees
+    ///
+    /// The `start` and `stop` callbacks are guaranteed to be called in alternating order:
+    /// `start` → `stop` → `start` → `stop` → ...
+    ///
+    /// Even if a node transitions directly from leader in Term 1 to leader in Term 2,
+    /// `stop` will be called with the old `leader_id` before `start` is called with the
+    /// new `leader_id`. This ensures proper resource cleanup between leadership terms.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = raft.on_leader_change(
+    ///     |leader_id| async move {
+    ///         println!("Became leader: {:?}", leader_id);
+    ///         start_leader_services().await;
+    ///     },
+    ///     |old_leader| async move {
+    ///         println!("Stopped leading: {:?}", old_leader);
+    ///         stop_leader_services().await;
+    ///     },
+    /// );
+    ///
+    /// // Later, stop watching
+    /// handle.close().await;
+    /// ```
+    ///
+    /// [`on_cluster_leader_change()`]: Self::on_cluster_leader_change
+    #[since(version = "0.10.0")]
+    #[must_use = "handle must be held to keep the watch task running"]
+    pub fn on_leader_change<F1, F2, Fut1, Fut2>(&self, start: F1, stop: F2) -> WatchChangeHandle<C>
+    where
+        F1: Fn(C::LeaderId) -> Fut1 + OptionalSend + 'static,
+        F2: Fn(C::LeaderId) -> Fut2 + OptionalSend + 'static,
+        Fut1: Future<Output = ()> + OptionalSend + 'static,
+        Fut2: Future<Output = ()> + OptionalSend + 'static,
+    {
+        let mut prev_leader_id = None;
+
+        self.watch_vote_change(move |vote, my_node_id| {
+            let leader_id = vote.leader_id().clone();
+
+            // Fire `start` when THIS node becomes committed leader
+            // and it's a new leadership (different from current)
+            #[allow(clippy::collapsible_else_if)]
+            let (stop_fut, start_fut) = if leader_id.node_id() == my_node_id {
+                if vote.is_committed() && prev_leader_id.as_ref() != Some(&leader_id) {
+                    // Call stop first if transitioning from one leadership to another
+                    // (e.g., Term 1 leader -> Term 2 leader)
+                    // This guarantees alternating start/stop calls.
+                    let stop_fut = prev_leader_id.take().map(&stop);
+                    let start_fut = Some(start(leader_id.clone()));
+                    prev_leader_id = Some(leader_id);
+                    (stop_fut, start_fut)
+                } else {
+                    (None, None)
+                }
+            } else {
+                let stop_fut = prev_leader_id.take().map(&stop);
+                (stop_fut, None)
+            };
+
+            async move {
+                if let Some(f) = stop_fut {
+                    f.await;
+                }
+                if let Some(f) = start_fut {
+                    f.await;
+                }
+            }
+        })
+    }
+
+    /// Spawn a task that watches vote changes and invokes async callback on each change.
+    ///
+    /// This is an internal helper used by [`Self::on_leader_change()`] and
+    /// [`Self::on_cluster_leader_change()`].
+    ///
+    /// The callback returns a future that will be awaited before processing
+    /// the next vote change.
+    fn watch_vote_change<F, Fut>(&self, mut callback: F) -> WatchChangeHandle<C>
+    where
+        F: FnMut(Vote<C::LeaderId>, &NodeIdOf<C>) -> Fut + OptionalSend + 'static,
+        Fut: Future<Output = ()> + OptionalSend + 'static,
+    {
+        let my_node_id = self.inner.id().clone();
+        let mut vote_progress = self.watch_vote_progress();
+        let (cancel_tx, mut cancel_rx) = C::oneshot::<()>();
+
+        let handle = C::spawn(async move {
+            loop {
+                let selected = C::select2(&mut cancel_rx, vote_progress.changed()).await;
+                match selected {
+                    Select2::First(_) => break,
+                    Select2::Second(res) => {
+                        if res.is_err() {
+                            break;
+                        }
+                        let Some(vote) = vote_progress.get() else {
+                            continue;
+                        };
+
+                        callback(vote, &my_node_id).await;
+                    }
+                }
+            }
+        });
+
+        WatchChangeHandle {
+            cancel_tx: Some(cancel_tx),
+            join_handle: Some(handle),
+        }
+    }
+
+    /// Get a handle to wait for the metrics to satisfy some condition.
+    ///
+    ///
+    /// If `timeout` is `None`, then it will wait forever(10 years).
+    /// If `timeout` is `Some`, then it will wait for the specified duration.
+    ///
+    /// ```ignore
+    /// # use std::time::Duration;
+    /// # use openraft::{State, Raft};
+    ///
+    /// let timeout = Duration::from_millis(200);
+    ///
+    /// // wait for raft log-3 to be applied:
+    /// r.wait(Some(timeout)).applied_index(Some(3), "log-3 applied").await?;
+    ///
+    /// // wait for ever for raft node's current leader to become 3:
+    /// r.wait(None).current_leader(2, "wait for leader").await?;
+    ///
+    /// // wait for raft state to become a follower
+    /// r.wait(None).state(State::Follower, "state").await?;
+    /// ```
+    pub fn wait(&self, timeout: Option<Duration>) -> Wait<C> {
+        self.inner.wait(timeout)
+    }
+
+    /// Wait for this node's state machine to recover to at least the state it had before restart.
+    ///
+    /// Call this **once**, right after the node is created, before it starts serving requests. It
+    /// is a one-time step for recovering across a restart, **not** a per-read primitive: it does
+    /// not make later reads linearizable — use [`ensure_linearizable`](Self::ensure_linearizable)
+    /// for each linearizable read instead. (Once recovered, the node stays recovered, so calling it
+    /// again is a no-op that returns as soon as the current cluster commit has been applied.)
+    ///
+    /// The method waits in two phases, together bounded by `timeout`:
+    /// 1. until `cluster_committed` is perceived as covering this node's current durable log tail
+    ///    (the cluster commit is re-established for everything this node may have applied),
+    /// 2. until the state machine has applied up to that cluster commit.
+    ///
+    /// The target is pinned to the first `cluster_committed` that covers this node's current
+    /// durable log tail. If the cluster advanced while this node was down, that target may exceed
+    /// the node's own pre-restart applied index — which still satisfies "at least the same state".
+    ///
+    /// It requires a reachable, functioning cluster: if no cluster commit is re-established (no
+    /// leader, lost quorum, or this node is isolated), the method returns [`WaitError::Timeout`].
+    /// If `timeout` is `None` it waits forever (see [`wait`](Self::wait)).
+    ///
+    /// # Why this works
+    ///
+    /// Perceiving a `cluster_committed` that covers this node's durable log tail means the current
+    /// leader has either committed the local tail this node may have applied before restart, or has
+    /// first replaced any uncommitted tail with the leader's log. Applying up to that commit
+    /// restores every durable log entry that could have contributed to the pre-restart state. This
+    /// is the same `read_log_id` argument that makes linearizable reads safe: see [the read
+    /// protocol](crate::docs::protocol::read) for the read-safety argument and [the commit
+    /// protocol](crate::docs::protocol::commit) for why `cluster_committed` is never a value
+    /// restored from storage. A node that did not persist `committed` can use this in place of, or
+    /// together with, saving it (see [log pointers](crate::docs::data::log_pointers)).
+    ///
+    /// # Limitation: a follower may still recover a stale state
+    ///
+    /// The soundness above is bounded by what this node made **durable**. A follower may apply an
+    /// entry the cluster has committed before it flushes that entry locally — apply is gated on the
+    /// cluster commit, not on the local flush (the invariant is `applied ≤ committed ≤ submitted`,
+    /// not `applied ≤ flushed`; see [log pointers](crate::docs::data::log_pointers)). If the node
+    /// restarts while such an entry is applied but still unflushed, and its applied state was not
+    /// otherwise persisted, the restart reverts three tracking points at once: the durable log tail
+    /// falls back to `flushed`, the state machine falls back to an earlier applied state, and
+    /// `last_log_index` now describes the shorter log.
+    ///
+    /// Because the first-phase wait is `cluster_committed >= last_log_index` and `last_log_index`
+    /// has itself reverted, a stale `cluster_committed` covering only the shrunken log satisfies
+    /// it. `wait_for_recovery` can then return having recovered a state older than the one this
+    /// node served immediately before the restart. The node is not stuck — the leader
+    /// re-replicates the lost tail and it catches up — but across that window the method no
+    /// longer pins recovery to the pre-restart state.
+    ///
+    /// This can only happen while serving reads as a follower. A leader holds every committed entry
+    /// and never applies below its commit, so a read taken on the leader through
+    /// [`ensure_linearizable`](Self::ensure_linearizable) cannot revert to an earlier state. When a
+    /// read must be guaranteed fresh across a restart, serve it on the leader.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // On startup, block until the state machine has recovered the committed state before
+    /// // serving reads:
+    /// raft.wait_for_recovery(Some(Duration::from_secs(5))).await?;
+    /// ```
+    #[since(version = "0.10.0")]
+    pub async fn wait_for_recovery(&self, timeout: Option<Duration>) -> Result<RaftMetrics<C>, WaitError> {
+        let start = C::now();
+
+        // Phase 1: wait until the cluster commit is re-established for this node's durable log
+        // tail. A follower may first hear an older leader_commit, which is not enough to recover
+        // everything it had applied before restart.
+        let metrics = self
+            .wait(timeout)
+            .metrics(
+                |m| {
+                    let cluster_committed = m.cluster_committed.as_ref().map(|x| x.index());
+                    cluster_committed.is_some() && cluster_committed >= m.last_log_index
+                },
+                "wait_for_recovery: cluster commit covers local log",
+            )
+            .await?;
+
+        let target = metrics.cluster_committed.as_ref().map(|x| x.index());
+
+        // Phase 2: wait until the state machine has applied up to that cluster commit, within the
+        // time remaining from the original budget.
+        let remaining = timeout.map(|t| t.saturating_sub(C::now() - start));
+        self.wait(remaining)
+            .applied_index_at_least(target, "wait_for_recovery: state machine applied cluster commit")
+            .await
+    }
+
+    /// Shutdown this Raft node.
+    ///
+    /// It sends a shutdown signal and waits until `RaftCore` returns. If this future is cancelled
+    /// while joining the core, a later call resumes that join and waits for the core to exit.
+    /// Use [`Self::try_shutdown`] to check for core or tick task join failures.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Gracefully shutdown the Raft node
+    /// raft.shutdown().await?;
+    /// ```
+    pub async fn shutdown(&self) -> Result<(), JoinErrorOf<C>> {
+        let _ = self.try_shutdown().await;
+        Ok(())
+    }
+
+    /// Shut down this node and return an error if either core or tick task failed to join.
+    ///
+    /// Both joins finish before this returns, and results are retained across calls to this method
+    /// and [`Self::shutdown`]. Concurrent callers and retries after cancellation share the joins.
+    ///
+    /// Success describes the runtime joins of started core and tick tasks, independently of their
+    /// return values and other background task lifetimes. A node stopped before [`Self::run`]
+    /// succeeds.
+    #[since(version = "0.10.0")]
+    pub async fn try_shutdown(&self) -> Result<(), ShutdownError> {
+        if let Some(tx) = self.inner.tx_shutdown.lock().unwrap().take() {
+            let send_res = tx.send(());
+            tracing::info!("sending shutdown signal to RaftCore, sending res: {:?}", send_res);
+        }
+
+        let (_, core_failed) = self.inner.join_core_task().await;
+        let core_result = if core_failed { Err(ShutdownError) } else { Ok(()) };
+        let tick_join = {
+            let mut tick_handle = self.inner.tick_handle.lock().unwrap();
+            let Some(handle) = tick_handle.as_mut() else {
+                return core_result;
+            };
+            handle.shutdown()
+        };
+        let tick_result = tick_join.await;
+        tick_result?;
+        core_result
+    }
+
+    /// Provides mutable access to [`RaftStateMachine`] through a user-provided function.
+    ///
+    /// The function `func` is applied to the current [`RaftStateMachine`]. The result of this
+    /// function, of type `V`, is returned wrapped in `Result<V, Fatal<C>>`.
+    ///
+    /// A `Fatal` error is returned if:
+    /// - Raft core task is stopped normally.
+    /// - Raft core task is panicked due to programming error.
+    /// - Raft core task is encountered a storage error.
+    ///
+    /// Example for getting the last applied log id from SM(assume there is `last_applied()` method
+    /// provided):
+    ///
+    /// ```rust,ignore
+    /// let last_applied_log_id = my_raft.with_state_machine(|sm| {
+    ///     async move { sm.last_applied().await }
+    /// }).await?;
+    /// ```
+    #[since(version = "0.10.0")]
+    pub async fn with_state_machine<F, V>(&self, func: F) -> Result<V, Fatal<C>>
+    where
+        SM: OptionalSend + 'static,
+        F: FnOnce(&mut SM) -> BoxFuture<V> + OptionalSend + 'static,
+        V: OptionalSend + 'static,
+    {
+        let (tx, rx) = C::oneshot();
+
+        self.external_state_machine_request(|sm| {
+            Box::pin(async move {
+                let resp = func(sm).await;
+                if let Err(_err) = tx.send(resp) {
+                    tracing::error!("{}: failed to send response to user tx", func_name!());
+                }
+            })
+        })
+        .await?;
+
+        // Use the bounded receive: the state-machine worker owns the responder and can die on its
+        // own (e.g. a panic in `func`) while RaftCore keeps running. An unbounded join on the core
+        // would then hang forever. `recv_msg` waits only up to `RECV_CORE_STOP_TIMEOUT` before
+        // resolving to `Fatal::Stopped`.
+        self.inner.recv_msg(rx).await
+    }
+
+    /// Send a request to the [`RaftStateMachine`] worker in a fire-and-forget manner.
+    ///
+    /// This method returns immediately after sending the message to the state machine worker,
+    /// without waiting for the request to be executed. The returned `Result` indicates
+    /// whether the message was successfully sent, not whether the request was executed.
+    ///
+    /// The request functor will be called with a mutable reference to the state machine.
+    /// The functor returns a [`Future`] because state machine methods are `async`.
+    ///
+    /// Returns a `Fatal` error if:
+    /// - Raft core task is stopped normally.
+    /// - Raft core task is panicked due to programming error.
+    /// - Raft core task is encountered a storage error.
+    #[since(version = "0.10.0")]
+    pub async fn external_state_machine_request<F>(&self, req: F) -> Result<(), Fatal<C>>
+    where
+        SM: OptionalSend + 'static,
+        F: FnOnce(&mut SM) -> BoxFuture<()> + OptionalSend + 'static,
+    {
+        let Some(tx) = self.sm_cmd_tx.upgrade() else {
+            return Err(self.inner.get_core_stop_error_bounded().await);
+        };
+
+        let sm_cmd = sm::Command::ExternalFunc {
+            func: Box::new(move |sm| req(sm)),
+        };
+        if tx.send(sm_cmd).await.is_err() {
+            return Err(self.inner.get_core_stop_error_bounded().await);
+        }
+        Ok(())
+    }
+}

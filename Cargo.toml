@@ -26,6 +26,11 @@ members = [
     "tests/integration",
 ]
 exclude = [
+    # openraft's upstream source, a workspace of its own so that this
+    # workspace's feature selections (`--all-features`) and lints never reach
+    # it: it builds with the features its dependents ask for, as a registry
+    # dependency would.
+    "vendor",
     # Standalone bench workspaces. Build via `cd benches/<name> && cargo build`.
     "benches/gold",
     "benches/vector-ann",
@@ -51,10 +56,12 @@ publish = false
 # for trees a journal already covers.
 lsm-tree = { package = "coordinode-lsm-tree", version = "7.6.0", default-features = false }
 
-# Consensus. Upstream main until a release carries the cancellation of an
-# abandoned stream_append producer and of a pending snapshot acquisition;
-# back to crates.io with that release.
-openraft = { git = "https://github.com/databendlabs/openraft", branch = "main", features = ["serde"] }
+# Consensus. openraft's upstream main, vendored and published as
+# coordinode-openraft, until a release carries the cancellation of an abandoned
+# stream_append producer and of a pending snapshot acquisition; back to
+# openraft on crates.io with that release. A crates.io package cannot depend on
+# a Git source, so the upstream branch itself cannot be used.
+openraft = { package = "coordinode-openraft", version = "0.10.1", path = "vendor/openraft", features = ["serde"] }
 
 # Full-text search.
 # default-features = false to drop `columnar-zstd-compression`, the only tantivy

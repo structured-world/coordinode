@@ -1,0 +1,547 @@
+use std::error::Error;
+use std::ops::Deref;
+
+use openraft_macros::since;
+use validit::Valid;
+use validit::Validate;
+
+use crate::RaftTypeConfig;
+use crate::ServerState;
+use crate::engine::LogIdList;
+use crate::errors::ForwardToLeader;
+use crate::log_id::raft_log_id::RaftLogId;
+use crate::type_config::alias::CommittedLeaderIdOf;
+use crate::type_config::alias::RefLogIdOf;
+use crate::type_config::alias::SnapshotMetaOf;
+use crate::utime::Leased;
+
+pub(crate) mod io_state;
+mod log_state_reader;
+mod membership_state;
+
+pub(crate) use io_state::IOState;
+#[allow(unused)]
+pub(crate) use io_state::io_id::IOId;
+
+#[cfg(test)]
+mod tests {
+    mod forward_to_leader_test;
+    mod is_initialized_test;
+    mod log_state_reader_test;
+    mod update_committed_test;
+    mod validate_test;
+}
+
+use display_more::DisplayOptionExt;
+pub(crate) use log_state_reader::LogStateReader;
+pub use membership_state::MembershipState;
+
+use crate::base::shared_id_generator::SharedIdGenerator;
+use crate::entry::RaftEntry;
+use crate::entry::raft_entry_ext::RaftEntryExt;
+use crate::membership::RaftMembershipExt;
+use crate::progress::inflight_id::InflightId;
+use crate::proposer::Leader;
+use crate::proposer::WriteQuorumSet;
+use crate::raft_state::io_state::io_progress::IOProgress;
+use crate::raft_state::io_state::log_io_id::LogIOId;
+use crate::type_config::alias::InstantOf;
+use crate::type_config::alias::LogIdOf;
+use crate::type_config::alias::MembershipStateOf;
+use crate::type_config::alias::TermOf;
+use crate::type_config::alias::VoteOf;
+use crate::vote::RaftLeaderId;
+use crate::vote::RaftVote;
+use crate::vote::raft_vote::RaftVoteExt;
+
+/// A struct used to represent the raft state which a Raft node needs.
+#[derive(Clone, Debug)]
+#[derive(PartialEq, Eq)]
+pub struct RaftState<C>
+where C: RaftTypeConfig
+{
+    /// The vote state of this node.
+    pub(crate) vote: Leased<VoteOf<C>, InstantOf<C>>,
+
+    /// All log ids this node has.
+    pub log_ids: LogIdList<CommittedLeaderIdOf<C>>,
+
+    /// The latest cluster membership configuration found, in log or in state machine.
+    pub membership_state: MembershipStateOf<C>,
+
+    /// The metadata of the last snapshot.
+    pub snapshot_meta: SnapshotMetaOf<C>,
+
+    // --
+    // -- volatile fields: they are not persisted.
+    // --
+    pub(crate) last_inflight_id: u64,
+
+    /// The state of a Raft node, such as Leader or Follower.
+    pub server_state: ServerState,
+
+    pub(crate) io_state: Valid<IOState<C>>,
+
+    /// The log id up to which the next time it purges.
+    ///
+    /// If a log is in use by a replication task, the purge is postponed and is stored in this
+    /// field.
+    pub(crate) purge_upto: Option<LogIdOf<C>>,
+
+    pub(crate) progress_id_gen: SharedIdGenerator,
+}
+
+/// This impl is only for testing, require in the test NodeId has default value.
+impl<C> Default for RaftState<C>
+where
+    C: RaftTypeConfig,
+    C::NodeId: Default,
+{
+    fn default() -> Self {
+        Self::new(C::NodeId::default())
+    }
+}
+
+impl<C> LogStateReader<CommittedLeaderIdOf<C>> for RaftState<C>
+where C: RaftTypeConfig
+{
+    fn ref_log_id(&self, index: u64) -> Option<RefLogIdOf<'_, C>> {
+        self.log_ids.ref_at(index)
+    }
+
+    fn last_log_id(&self) -> Option<&LogIdOf<C>> {
+        self.log_ids.last()
+    }
+
+    fn committed(&self) -> Option<&LogIdOf<C>> {
+        self.apply_progress().accepted()
+    }
+
+    fn io_applied(&self) -> Option<&LogIdOf<C>> {
+        self.io_state.applied()
+    }
+
+    fn io_snapshot_last_log_id(&self) -> Option<&LogIdOf<C>> {
+        self.io_state.snapshot()
+    }
+
+    fn io_purged(&self) -> Option<&LogIdOf<C>> {
+        self.purge_progress().flushed()
+    }
+
+    fn snapshot_last_log_id(&self) -> Option<&LogIdOf<C>> {
+        self.snapshot_meta.last_log_id.as_ref()
+    }
+
+    fn purge_upto(&self) -> Option<&LogIdOf<C>> {
+        self.purge_upto.as_ref()
+    }
+
+    fn last_purged_log_id(&self) -> Option<&LogIdOf<C>> {
+        self.log_ids.purged()
+    }
+}
+
+impl<C> Validate for RaftState<C>
+where C: RaftTypeConfig
+{
+    fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if self.log_ids.purged().is_none() {
+            // Nothing purged - first log should exist at index 0 or later
+            validit::less_equal!(self.log_ids.first().map(|r| r.index()), Some(0));
+        }
+
+        validit::less_equal!(self.last_purged_log_id(), self.purge_upto());
+        if self.snapshot_last_log_id().is_none() {
+            // There is no snapshot, it is possible the application does not store snapshot, and
+            // just restarted. it is just ok.
+            // In such a case, we assert the monotonic relation without  snapshot-last-log-id
+            validit::less_equal!(self.purge_upto(), self.local_committed());
+        } else {
+            validit::less_equal!(self.purge_upto(), self.snapshot_last_log_id());
+        }
+        validit::less_equal!(self.snapshot_last_log_id(), self.local_committed());
+        validit::less_equal!(self.local_committed(), self.last_log_id());
+
+        self.membership_state.validate()?;
+        self.io_state.validate()?;
+
+        Ok(())
+    }
+}
+
+impl<C> RaftState<C>
+where C: RaftTypeConfig
+{
+    pub(crate) fn new(node_id: C::NodeId) -> Self {
+        let vote = VoteOf::<C>::new_with_default_term(node_id);
+
+        Self {
+            vote: Leased::without_last_update(vote),
+            log_ids: LogIdList::default(),
+            membership_state: MembershipState::default(),
+            snapshot_meta: SnapshotMetaOf::<C>::default(),
+            last_inflight_id: 0,
+            server_state: ServerState::default(),
+            io_state: Valid::new(IOState::default()),
+            purge_upto: None,
+            progress_id_gen: Default::default(),
+        }
+    }
+
+    /// Get a reference to the current vote.
+    pub fn vote_ref(&self) -> &VoteOf<C> {
+        self.vote.deref()
+    }
+
+    /// Return the last updated time of the vote.
+    pub fn vote_last_modified(&self) -> Option<InstantOf<C>> {
+        self.vote.last_update()
+    }
+
+    /// Get the local committed log ID: the log id up to which entries are safe to apply to the
+    /// local state machine.
+    ///
+    /// On a node that has not yet received and accepted all committed entries (e.g. a follower
+    /// catching up, or just after restart), this may lag [`Self::cluster_committed`].
+    #[since(version = "0.10.0")]
+    pub fn local_committed(&self) -> Option<&LogIdOf<C>> {
+        self.apply_progress().accepted()
+    }
+
+    /// Get the cluster committed log ID: the log id granted by a quorum, as last reported by the
+    /// leader.
+    ///
+    /// This is the cluster-wide commit, visible to all future leaders. It may be ahead of
+    /// [`Self::local_committed`] on a node that has not yet received the corresponding entries.
+    /// With [`Config::enable_relaxed_read`](crate::Config::enable_relaxed_read), a leader reports
+    /// its applied log ID instead, so on a follower this may lag the quorum-granted commit.
+    #[since(version = "0.10.0")]
+    pub fn cluster_committed(&self) -> Option<&LogIdOf<C>> {
+        self.io_state().cluster_committed.value().and_then(|io_id| io_id.last_log_id())
+    }
+
+    /// Returns the log ID a leader sends followers as `leader_commit`: the bound they may apply
+    /// up to.
+    ///
+    /// It is the cluster-committed log ID, or with relaxed reads the smaller of that and this
+    /// leader's applied log ID, so that no node applies an entry before the leader does.
+    ///
+    /// See: [Read Operation](crate::docs::protocol::read)
+    pub(crate) fn follower_apply_bound(&self, relaxed_read: bool) -> Option<LogIdOf<C>> {
+        let committed = self.cluster_committed().cloned();
+        if !relaxed_read {
+            return committed;
+        }
+        std::cmp::min(committed, self.io_applied().cloned())
+    }
+
+    /// Get the last committed log ID.
+    #[deprecated(
+        since = "0.10.0",
+        note = "use `local_committed()` instead, or `cluster_committed()` for the quorum-granted commit"
+    )]
+    pub fn committed(&self) -> Option<&LogIdOf<C>> {
+        self.local_committed()
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        // initialize() writes a membership config log entry.
+        // If there are logs, it is already initialized.
+        if self.last_log_id().is_some() {
+            return true;
+        }
+
+        // If it received a request-vote from other node, it is already initialized.
+        if self.vote_ref().leader_id().term() != TermOf::<C>::default() {
+            return true;
+        }
+
+        false
+    }
+
+    /// Return the accepted IO request(which are going to be submitted and flushed).
+    ///
+    /// Such as SaveVote or AppendEntries
+    pub(crate) fn accepted_log_io(&self) -> Option<&IOId<C>> {
+        self.log_progress().accepted()
+    }
+
+    /// Updates the accepted IO, including Vote change or AppendEntries IO.
+    ///
+    /// Returns the previously accepted value.
+    pub(crate) fn accept_log_io(&mut self, accepted: IOId<C>) -> Option<IOId<C>> {
+        let curr_accepted = self.log_progress().accepted().cloned();
+
+        tracing::debug!(
+            "{}: accept_log: current: {}, new_accepted: {}",
+            func_name!(),
+            curr_accepted.display(),
+            accepted
+        );
+
+        if cfg!(debug_assertions) {
+            let new_vote = accepted.to_app_vote();
+            let current_vote = curr_accepted.clone().map(|io_id| io_id.to_app_vote());
+            assert!(
+                Some(new_vote.as_ref_vote()) >= current_vote.as_ref().map(|x| x.as_ref_vote()),
+                "new accepted.committed_vote {} must be >= current accepted.committed_vote: {}",
+                new_vote,
+                current_vote.display(),
+            );
+        }
+
+        if Some(&accepted) > curr_accepted.as_ref() {
+            self.log_progress_mut().accept(accepted);
+        }
+
+        curr_accepted
+    }
+
+    /// Append a list of `log_id`.
+    ///
+    /// The log ids in the input has to be continuous.
+    pub(crate) fn extend_log_ids_from_same_leader<LID, I>(&mut self, new_log_ids: I)
+    where
+        LID: RaftLogId<CommittedLeaderId = CommittedLeaderIdOf<C>>,
+        I: IntoIterator<Item = LID>,
+        <I as IntoIterator>::IntoIter: DoubleEndedIterator,
+    {
+        self.log_ids.extend_from_same_leader(new_log_ids)
+    }
+
+    pub(crate) fn extend_log_ids<LID, I>(&mut self, new_log_id: I)
+    where
+        LID: RaftLogId<CommittedLeaderId = CommittedLeaderIdOf<C>>,
+        I: IntoIterator<Item = LID>,
+        <I as IntoIterator>::IntoIter: ExactSizeIterator,
+    {
+        self.log_ids.extend(new_log_id)
+    }
+
+    /// This method first updates the cluster committed log ID, then uses it to calculate and
+    /// update the local committed log ID.
+    pub(crate) fn update_committed(&mut self, cluster_committed: LogIOId<C>) {
+        tracing::debug!(
+            "{}: leader_committed: {}, my_accepted: {}, my_committed: {}",
+            func_name!(),
+            cluster_committed,
+            self.accepted_log_io().display(),
+            self.local_committed().display()
+        );
+
+        self.io_state_mut().cluster_committed.try_update(cluster_committed.clone()).ok();
+
+        let local_committed = self.io_state.calculate_local_committed();
+
+        self.update_local_committed(&local_committed);
+    }
+
+    /// Updates the committed log id for local use.
+    ///
+    /// The local committed log id may be smaller than `cluster_committed` because it requires
+    /// all log entries up to this value to be persisted (or guaranteed to be persisted) and
+    /// safe from truncation. Only then are these entries safe to apply to the state machine.
+    ///
+    /// This method updates the committed log id only if the input is greater than the current
+    /// value.
+    pub(crate) fn update_local_committed(&mut self, committed: &Option<LogIdOf<C>>) {
+        if committed.as_ref() > self.local_committed() {
+            // Safe unwrap(): committed > self.committed(), implies it cannot be None
+            self.apply_progress_mut().accept(committed.clone().unwrap());
+            self.membership_state.commit(committed);
+        }
+    }
+
+    pub(crate) fn log_progress(&self) -> &IOProgress<IOId<C>> {
+        &self.io_state().log_progress
+    }
+
+    pub(crate) fn log_progress_mut(&mut self) -> &mut IOProgress<IOId<C>> {
+        &mut self.io_state_mut().log_progress
+    }
+
+    pub(crate) fn apply_progress(&self) -> &IOProgress<LogIdOf<C>> {
+        &self.io_state().apply_progress
+    }
+
+    pub(crate) fn apply_progress_mut(&mut self) -> &mut IOProgress<LogIdOf<C>> {
+        &mut self.io_state_mut().apply_progress
+    }
+
+    pub(crate) fn purge_progress(&self) -> &IOProgress<LogIdOf<C>> {
+        &self.io_state().purged
+    }
+
+    pub(crate) fn purge_progress_mut(&mut self) -> &mut IOProgress<LogIdOf<C>> {
+        &mut self.io_state_mut().purged
+    }
+
+    pub(crate) fn snapshot_progress_mut(&mut self) -> &mut IOProgress<LogIdOf<C>> {
+        &mut self.io_state_mut().snapshot
+    }
+
+    pub(crate) fn io_state_mut(&mut self) -> &mut IOState<C> {
+        &mut self.io_state
+    }
+
+    /// Returns the state of the already happened IO.
+    ///
+    /// [`RaftState`] stores the expected state when all queued IO are completed,
+    /// which may advance the actual IO state.
+    ///
+    /// [`IOState`] stores the actual state of the storage.
+    ///
+    /// Usually, when a client request is handled, [`RaftState`] is updated and several IO command
+    /// is enqueued. And when the IO commands are completed, [`IOState`] is updated.
+    pub(crate) fn io_state(&self) -> &IOState<C> {
+        &self.io_state
+    }
+
+    /// Find the first entry in the input that does not exist on local raft-log,
+    /// by comparing the log id.
+    pub(crate) fn first_conflicting_index<Ent>(&self, entries: &[Ent]) -> usize
+    where Ent: RaftEntry<CommittedLeaderId = CommittedLeaderIdOf<C>> {
+        let l = entries.len();
+
+        for (i, ent) in entries.iter().enumerate() {
+            let ref_log_id = ent.ref_log_id();
+
+            if !self.has_log_id(ref_log_id.clone()) {
+                tracing::debug!("found conflicting log id at index {}: {}", i, ref_log_id);
+                return i;
+            }
+        }
+
+        tracing::debug!("no conflicting log id found");
+        l
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn accept_purge(&mut self, upto: &LogIdOf<C>) {
+        self.log_ids.purge(upto);
+        self.purge_progress_mut().accept(upto.clone());
+    }
+
+    /// Determine the current server state by state.
+    ///
+    /// See [Determine Server State][] for more details about determining the server state.
+    ///
+    /// [Determine Server State]: crate::docs::data::vote#vote-and-membership-define-the-server-state
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn calc_server_state(&self, id: &C::NodeId) -> ServerState {
+        tracing::debug!(
+            "states: contains: {}, is_campaigner: {}, is_leader: {}, is_leading: {}",
+            self.membership_state.contains(id),
+            self.is_campaigner(id),
+            self.is_leader(id),
+            self.is_leading(id)
+        );
+
+        // A Leader/Candidate may be a learner in the effective membership, or a campaigner in the
+        // committed membership whose removal has not yet been committed.
+        if self.is_leader(id) {
+            ServerState::Leader
+        } else if self.is_leading(id) {
+            ServerState::Candidate
+        } else {
+            self.calc_following_state(id)
+        }
+    }
+
+    /// Returns the follower or learner state for a node that is not leading.
+    ///
+    /// Configured learners have no campaign, read voter, or write voter role.
+    /// Uninitialized and removed nodes also use the passive learner state.
+    pub(crate) fn calc_following_state(&self, id: &C::NodeId) -> ServerState {
+        let membership = self.membership_state.effective().membership();
+        let is_member = membership.contains(id);
+        let is_learner = membership.is_learner(id);
+        if !is_member || is_learner {
+            return ServerState::Learner;
+        }
+
+        ServerState::Follower
+    }
+
+    /// Returns whether `id` may campaign under the effective membership.
+    ///
+    /// Election triggers also consider campaigners in the committed membership.
+    pub(crate) fn is_campaigner(&self, id: &C::NodeId) -> bool {
+        self.membership_state.is_campaigner(id)
+    }
+
+    /// Returns whether `id` owns the current vote and may remain a candidate or leader.
+    ///
+    /// An effective member, including a learner, may keep leading.
+    /// A removed node may also keep leading while it is a campaigner in the committed membership.
+    /// See [Determine Server State][] for details.
+    ///
+    /// [Determine Server State]: crate::docs::data::vote#vote-and-membership-define-the-server-state
+    pub(crate) fn is_leading(&self, id: &C::NodeId) -> bool {
+        let is_member = self.membership_state.contains(id);
+        let is_committed_campaigner = self.membership_state.committed().is_campaigner(id);
+        let owns_vote = self.vote.leader_node_id() == id;
+        (is_member || is_committed_campaigner) && owns_vote
+    }
+
+    /// The node is leader
+    ///
+    /// Leadership is granted by a quorum and the vote is committed.
+    ///
+    /// Note that in Openraft Leader does not have to be a voter. See [Determine Server State][] for
+    /// more details about determining the server state.
+    ///
+    /// [Determine Server State]: crate::docs::data::vote#vote-and-membership-define-the-server-state
+    pub(crate) fn is_leader(&self, id: &C::NodeId) -> bool {
+        self.is_leading(id) && self.vote.is_committed()
+    }
+
+    /// Create a Leader using the state of the local `Acceptor`: `Engine.state`.
+    ///
+    /// This is used when building a Leader without an election,
+    /// for example, node-1 elects node-2 as a Leader, node-2 will become a Leader when receives the
+    /// vote.
+    /// A Leader established with election using the state in `Engine.candidate`.
+    pub(crate) fn new_leader(&mut self) -> Leader<C, WriteQuorumSet<C>> {
+        let em = self.membership_state.effective().membership();
+
+        Leader::new(
+            self.vote_ref().to_committed(),
+            em.clone(),
+            self.log_ids.last().cloned(),
+            self.progress_id_gen.clone(),
+        )
+    }
+
+    /// Build a ForwardToLeader error that contains the leader id and node it knows.
+    pub(crate) fn forward_to_leader(&self) -> ForwardToLeader<C> {
+        let vote = self.vote_ref();
+
+        if vote.is_committed() {
+            let id = vote.to_leader_id().node_id().clone();
+
+            return self.new_forward_to_leader(id);
+        }
+
+        ForwardToLeader::empty()
+    }
+
+    pub(crate) fn new_forward_to_leader(&self, to: C::NodeId) -> ForwardToLeader<C> {
+        // leader may not step down after being removed from `voters`.
+        // It does not have to be a voter, being in membership is just enough
+        let node = self.membership_state.effective().get_node(&to);
+
+        if let Some(n) = node {
+            ForwardToLeader::new(to, n.clone())
+        } else {
+            tracing::debug!("id={} is not in membership, when getting leader id", to);
+            ForwardToLeader::empty()
+        }
+    }
+
+    pub(crate) fn new_inflight_id(&mut self) -> InflightId {
+        self.last_inflight_id += 1;
+        InflightId::new(self.last_inflight_id)
+    }
+}

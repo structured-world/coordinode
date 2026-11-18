@@ -1,0 +1,196 @@
+#![doc(html_logo_url = "https://raw.githubusercontent.com/databendlabs/openraft/main/assets/logo/openraft-mark.svg")]
+#![doc(html_favicon_url = "https://raw.githubusercontent.com/databendlabs/openraft/main/assets/logo/openraft-mark.svg")]
+#![doc = include_str!("lib_readme.md")]
+#![doc = include_str!("docs/docs.md")]
+// These features are stabilized in recent nightly but still needed on older toolchains.
+#![allow(unused_features)]
+#![cfg_attr(feature = "bt", feature(error_generic_member_access))]
+#![allow(clippy::bool_assert_comparison)]
+#![allow(clippy::bool_comparison)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::uninlined_format_args)]
+#![deny(unused_qualifications)]
+#![warn(missing_docs)]
+
+macro_rules! func_name {
+    () => {{
+        fn f() {}
+        fn type_name_of<T>(_: T) -> &'static str {
+            std::any::type_name::<T>()
+        }
+        let name = type_name_of(f);
+        let n = &name[..name.len() - 3];
+        let nn = n.replace("::{{closure}}", "");
+        nn
+        // nn.split("::").last().unwrap_or_default()
+    }};
+}
+
+mod deprecated_features;
+
+/// Deprecated: use `openraft::macros` instead. Will be removed in the next release.
+pub extern crate openraft_macros;
+pub extern crate openraft_macros as macros;
+pub extern crate openraft_rt as rt;
+
+mod config;
+mod core;
+mod display_ext;
+mod node;
+mod progress;
+mod quorum;
+mod raft_types;
+mod replication;
+mod runtime;
+mod summary;
+mod try_as_ref;
+
+pub(crate) mod engine;
+mod extensions;
+pub(crate) mod log_id_range;
+pub(crate) mod proposer;
+pub(crate) mod raft_state;
+pub(crate) mod utime;
+
+pub mod base;
+#[cfg(feature = "compat")]
+pub mod compat;
+pub mod docs;
+pub mod entry;
+pub mod errors;
+pub mod impls;
+pub mod log_id;
+pub mod membership;
+pub mod metrics;
+pub mod network;
+pub mod raft;
+#[cfg(feature = "runtime-stats")]
+pub mod stats;
+pub mod storage;
+pub mod testing;
+pub mod type_config;
+pub mod vote;
+
+/// Backward-compatibility alias for the [`errors`] module, which was renamed from `error`.
+#[deprecated(since = "0.10.0", note = "use `errors` instead")]
+pub use errors as error;
+
+pub mod batch;
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod bench_internals;
+#[cfg(test)]
+mod feature_serde_test;
+
+use std::fmt;
+
+pub use anyerror;
+pub use anyerror::AnyError;
+pub use errors::storage_error::ErrorSubject;
+pub use errors::storage_error::ErrorVerb;
+pub use errors::storage_error::StorageError;
+#[allow(deprecated)]
+pub use errors::storage_error::StorageIOError;
+pub use errors::storage_error::ToStorageResult;
+#[cfg(feature = "tokio-rt")]
+#[allow(deprecated)]
+#[deprecated(since = "0.10.0", note = "use `openraft_rt_tokio::TokioRuntime` directly")]
+pub use impls::TokioRuntime;
+pub use openraft_macros::add_async_trait;
+#[cfg(feature = "tokio-rt")]
+#[allow(deprecated)]
+#[deprecated(since = "0.10.0", note = "use `openraft_rt_tokio::TokioInstant` directly")]
+pub use openraft_rt_tokio::TokioInstant;
+pub use type_config::AsyncRuntime;
+pub use type_config::async_runtime;
+pub use type_config::async_runtime::Instant;
+pub use type_config::async_runtime::WatchSender;
+
+pub use self::storage::LogState;
+pub use self::storage::RaftLogReader;
+pub use self::storage::RaftSnapshotBuilder;
+pub use self::storage::Snapshot;
+pub use self::storage::SnapshotMeta;
+pub use self::storage::StorageHelper;
+use crate::base::OptionalFeatures;
+pub use crate::base::OptionalSend;
+pub use crate::base::OptionalSerde;
+pub use crate::base::OptionalSync;
+pub use crate::config::Config;
+pub use crate::config::ConfigError;
+pub use crate::config::SnapshotPolicy;
+pub use crate::config::StepDownPolicy;
+pub use crate::core::ServerState;
+pub use crate::entry::Entry;
+pub use crate::entry::EntryPayload;
+pub use crate::extensions::Extensions;
+pub use crate::log_id::LogId;
+pub use crate::log_id::LogIdOptionExt;
+pub use crate::log_id::LogIndexOptionExt;
+pub use crate::membership::Membership;
+pub use crate::membership::StoredMembership;
+pub use crate::membership::change_members::ChangeMembers;
+pub use crate::metrics::RaftMetrics;
+pub use crate::network::RPCTypes;
+#[allow(deprecated)]
+pub use crate::network::RaftNetwork;
+pub use crate::network::RaftNetworkFactory;
+pub use crate::network::RaftNetworkV2;
+pub use crate::node::BasicNode;
+pub use crate::node::EmptyNode;
+pub use crate::node::Node;
+pub use crate::node::NodeId;
+pub use crate::node::NodeInfo;
+pub use crate::raft::Precondition;
+pub use crate::raft::Raft;
+pub use crate::raft::ReadPolicy;
+pub use crate::raft::WatchChangeHandle;
+pub use crate::raft::linearizable_read::LinearizerOption;
+pub use crate::raft_state::MembershipState;
+pub use crate::raft_state::RaftState;
+pub use crate::raft_types::SnapshotId;
+#[allow(deprecated)]
+pub use crate::raft_types::SnapshotSegmentId;
+pub use crate::summary::MessageSummary;
+pub use crate::try_as_ref::TryAsRef;
+pub use crate::type_config::RaftTypeConfig;
+#[cfg(feature = "type-alias")]
+pub use crate::type_config::alias;
+pub use crate::vote::Vote;
+
+/// A trait defining application-specific data.
+///
+/// The intention of this trait is that applications which are using this crate will be able to
+/// use their own concrete data types throughout their application without having to serialize and
+/// deserialize their data as it goes through Raft. Instead, applications can present their data
+/// models as-is to Raft, Raft will present it to the application's `RaftLogStorage` and
+/// `RaftStateMachine` impl when ready, and the application may then deal with the data directly in
+/// the storage engine without having to do a preliminary deserialization.
+///
+/// ## Note
+///
+/// The trait is automatically implemented for all types that satisfy its supertraits.
+pub trait AppData: OptionalFeatures + fmt::Debug + fmt::Display + 'static {}
+
+impl<T> AppData for T where T: OptionalFeatures + fmt::Debug + fmt::Display + 'static {}
+
+/// A trait defining application-specific response data.
+///
+/// The intention of this trait is that applications which are using this crate will be able to
+/// use their own concrete data types for returning response data from the storage layer when an
+/// entry is applied to the state machine as part of a client request (this is not used during
+/// replication). This allows applications to seamlessly return application-specific data from
+/// their storage layer, up through Raft, and back into their application for returning
+/// data to clients.
+///
+/// This type must encapsulate both success and error responses, as application-specific logic
+/// related to the success or failure of a client request — application-specific validation logic,
+/// enforcing of data constraints, and anything of that nature — are expressly out of the realm of
+/// the Raft consensus protocol.
+///
+/// ## Note
+///
+/// The trait is automatically implemented for all types that satisfy its supertraits.
+pub trait AppDataResponse: OptionalFeatures + 'static {}
+
+impl<T> AppDataResponse for T where T: OptionalFeatures + 'static {}

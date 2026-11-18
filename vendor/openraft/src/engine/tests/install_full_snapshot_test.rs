@@ -1,0 +1,209 @@
+use std::time::Duration;
+
+use maplit::btreeset;
+use pretty_assertions::assert_eq;
+
+use crate::Membership;
+use crate::Vote;
+use crate::core::sm;
+use crate::engine::Command;
+use crate::engine::Condition;
+use crate::engine::Engine;
+use crate::engine::LogIdList;
+use crate::engine::Respond;
+use crate::engine::testing::UTConfig;
+use crate::engine::testing::log_id;
+use crate::raft::SnapshotResponse;
+use crate::raft_state::IOId;
+use crate::raft_state::io_state::log_io_id::LogIOId;
+use crate::type_config::TypeConfigExt;
+use crate::type_config::alias::SnapshotMetaOf;
+use crate::type_config::alias::SnapshotOf;
+use crate::type_config::alias::StoredMembershipOf;
+use crate::vote::raft_vote::RaftVoteExt;
+
+fn m12() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {1,2}], [])
+}
+
+fn m1234() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {1,2,3,4}], [])
+}
+
+fn eng() -> Engine<UTConfig> {
+    let mut eng: Engine<UTConfig> = Engine::testing_default(0);
+    eng.state.enable_validation(false); // Disable validation for incomplete state
+
+    eng.state.vote.update(
+        UTConfig::<()>::now(),
+        Duration::from_millis(500),
+        Vote::new_committed(4, 1),
+    );
+    eng.state.apply_progress_mut().accept(log_id(4, 1, 5));
+    eng.state.log_ids = LogIdList::new(None, vec![
+        //
+        log_id(2, 1, 4),
+        log_id(3, 1, 5),
+        log_id(4, 1, 8),
+    ]);
+    eng.state.snapshot_meta = SnapshotMetaOf::<UTConfig> {
+        last_log_id: Some(log_id(2, 1, 2)),
+        last_membership: StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m12()),
+    };
+    eng.state.server_state = eng.calc_server_state();
+
+    eng
+}
+
+#[test]
+fn test_handle_install_full_snapshot_lt_last_snapshot() -> anyhow::Result<()> {
+    // Snapshot will not be installed because new `last_log_id` is less or equal current
+    // `snapshot_meta.last_log_id`.
+    //
+    // It should respond at once.
+
+    let mut eng = eng();
+
+    let curr_vote = *eng.state.vote_ref();
+
+    let (tx, _rx) = UTConfig::<()>::oneshot();
+
+    eng.handle_install_full_snapshot(
+        curr_vote,
+        SnapshotOf::<UTConfig, ()> {
+            meta: SnapshotMetaOf::<UTConfig> {
+                last_log_id: Some(log_id(1, 1, 2)),
+                last_membership: StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m1234()),
+            },
+            snapshot: (),
+        },
+        tx,
+    );
+
+    assert_eq!(
+        SnapshotMetaOf::<UTConfig> {
+            last_log_id: Some(log_id(2, 1, 2)),
+            last_membership: StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m12()),
+        },
+        eng.state.snapshot_meta
+    );
+
+    let (dummy_tx, _rx) = UTConfig::<()>::oneshot();
+    assert_eq!(
+        vec![Command::FailPendingReads, Command::Respond {
+            when: None,
+            resp: Respond::new(SnapshotResponse::new(curr_vote), dummy_tx),
+        },],
+        eng.output.take_commands()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_handle_install_full_snapshot_no_conflict() -> anyhow::Result<()> {
+    // Snapshot will be installed and there are no conflicting logs.
+    // The response should be sent after the snapshot is installed.
+
+    let mut eng = eng();
+
+    let curr_vote = *eng.state.vote_ref();
+    let log_io = IOId::new_log_io(curr_vote.to_committed(), Some(log_id(4, 1, 8)));
+    eng.state.log_progress_mut().accept(log_io.clone());
+    eng.state.log_progress_mut().submit(log_io);
+    eng.state.apply_progress_mut().submit(log_id(2, 1, 4));
+
+    let (tx, _rx) = UTConfig::<()>::oneshot();
+
+    eng.handle_install_full_snapshot(
+        curr_vote,
+        SnapshotOf::<UTConfig, ()> {
+            meta: SnapshotMetaOf::<UTConfig> {
+                last_log_id: Some(log_id(4, 1, 6)),
+                last_membership: StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m1234()),
+            },
+            snapshot: (),
+        },
+        tx,
+    );
+
+    assert_eq!(
+        SnapshotMetaOf::<UTConfig> {
+            last_log_id: Some(log_id(4, 1, 6)),
+            last_membership: StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m1234()),
+        },
+        eng.state.snapshot_meta
+    );
+
+    let (dummy_tx, _rx) = UTConfig::<()>::oneshot();
+    assert_eq!(
+        vec![
+            Command::FailPendingReads,
+            Command::from(sm::Command::install_full_snapshot(
+                SnapshotOf::<UTConfig, ()> {
+                    meta: SnapshotMetaOf::<UTConfig> {
+                        last_log_id: Some(log_id(4, 1, 6)),
+                        last_membership: StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m1234()),
+                    },
+                    snapshot: (),
+                },
+                LogIOId::new(Vote::new(4, 1).to_committed(), Some(log_id(4, 1, 6)))
+            )),
+            Command::PurgeLog { upto: log_id(4, 1, 6) },
+            Command::Respond {
+                when: Some(Condition::Snapshot::<UTConfig> {
+                    log_id: log_id(4, 1, 6)
+                }),
+                resp: Respond::new(SnapshotResponse::new(curr_vote), dummy_tx),
+            },
+        ],
+        eng.output.take_commands()
+    );
+
+    tracing::info!("Wait for snapshot 6 to be submitted before generating another Apply command");
+    {
+        let command = eng.next_progress_driven_command();
+        assert_eq!(None, command);
+    }
+
+    tracing::info!("Apply logs 7 through 8 after submitting snapshot 6, while its completion is pending");
+    {
+        let installed = log_id(4, 1, 6);
+        eng.state.apply_progress_mut().submit(installed);
+        eng.state.snapshot_progress_mut().submit(installed);
+        eng.state.update_local_committed(&Some(log_id(4, 1, 8)));
+
+        let command = eng.next_progress_driven_command();
+        let expected = Some(Command::SaveCommittedAndApply {
+            already_applied: Some(installed),
+            upto: log_id(4, 1, 8),
+        });
+        assert_eq!(expected, command);
+
+        let flushed = eng.state.io_state().snapshot.flushed();
+        assert_eq!(None, flushed);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_apply_waits_for_snapshot_without_purge() {
+    let mut eng = eng();
+    let vote = eng.state.vote_ref().to_committed();
+    let log_io = IOId::new_log_io(vote, Some(log_id(4, 1, 8)));
+    eng.state.log_progress_mut().accept(log_io.clone());
+    eng.state.log_progress_mut().submit(log_io);
+    eng.state.apply_progress_mut().submit(log_id(2, 1, 4));
+    eng.state.apply_progress_mut().accept(log_id(4, 1, 8));
+
+    tracing::info!("Wait for snapshot 6 to be submitted even though no purge is accepted");
+    {
+        eng.state.snapshot_progress_mut().accept(log_id(4, 1, 6));
+        eng.state.snapshot_meta.last_log_id = Some(log_id(4, 1, 6));
+        let purged = eng.state.purge_progress().accepted();
+        assert_eq!(None, purged);
+        let command = eng.next_progress_driven_command();
+        assert_eq!(None, command);
+    }
+}

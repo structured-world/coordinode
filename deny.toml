@@ -27,10 +27,10 @@ ignore = true
 [advisories]
 ignore = [
     # chrono, chrono-tz and chrono-tz-build are unmaintained, with no fixed
-    # release. The workspace itself uses jiff; these come in only through
-    # openraft (display-more formats timestamps with chrono-tz) and pgwire
-    # (postgres-types interval and timestamp conversions). Revisit when
-    # openraft and pgwire drop chrono.
+    # release. The workspace's own code uses jiff; these come in only through
+    # the vendored openraft (itself, and display-more formatting timestamps
+    # with chrono-tz) and pgwire (postgres-types interval and timestamp
+    # conversions). Revisit when openraft and pgwire drop chrono.
     "RUSTSEC-2026-0543",
     "RUSTSEC-2026-0555",
     "RUSTSEC-2026-0559",
@@ -52,6 +52,3 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# openraft comes from its upstream main branch until an openraft release
-# carries the fixes the workspace needs.
-allow-git = ["https://github.com/databendlabs/openraft"]

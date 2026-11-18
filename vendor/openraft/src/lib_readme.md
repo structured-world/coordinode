@@ -1,0 +1,47 @@
+<!-- This page is rendered by docs.rs -->
+
+<div align="center">
+    <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/databendlabs/openraft/main/assets/logo/openraft-mark-dark.svg">
+        <img src="https://raw.githubusercontent.com/databendlabs/openraft/main/assets/logo/openraft-mark.svg" alt="OpenRaft" width="140" height="140">
+    </picture>
+    <h1>Openraft</h1>
+</div>
+
+## API status
+
+**Openraft API is currently unstable**.
+Incompatibilities may arise in upgrades prior to `1.0.0`.
+Refer to our [Change-Log](https://github.com/databendlabs/openraft/blob/main/change-log.md) for details.
+[Upgrade Guides](crate::docs::upgrade_guide) explains how to upgrade.
+
+Each commit message begins with a keyword indicating the type of change:
+
+- `DataChange:` Changes to on-disk data types, possibly requiring manual upgrade.
+- `Change:` Introduces incompatible API changes.
+- `Feature:` Adds compatible, non-breaking new features.
+- `Fix:` Addresses bug fixes.
+
+## Feature flags
+
+Openraft supports several feature flags to customize functionality:
+
+**Default features**: `tokio-rt`
+
+**Runtime**:
+- `tokio-rt` - Enable Tokio async runtime support (default)
+- `single-threaded` - Disallow sharing Raft instance across threads
+
+**Serialization**:
+- `serde` - Add `serde::Serialize` and `serde::Deserialize` bounds to data types
+
+**Error handling**:
+- `bt` - Enable error backtraces (requires nightly Rust)
+
+**Development**:
+- `bench` - Enable benchmarks in unit tests (requires `RUSTC_BOOTSTRAP=1` with stable Rust)
+
+**Compatibility**:
+- `compat` - Provide basic compatible types for upgrades
+- `type-alias` - Enable `openraft::alias::*` type shortcuts (unstable)
+

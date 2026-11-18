@@ -1,0 +1,73 @@
+use openraft_rt_tokio::TokioRuntime;
+
+use crate::Node;
+use crate::OptionalSend;
+use crate::RaftTypeConfig;
+use crate::type_config::alias::DefaultEntryOf;
+use crate::type_config::alias::LeaderIdOf;
+use crate::type_config::alias::LogIdOf;
+use crate::type_config::alias::NodeIdOf;
+use crate::vote::RaftLeaderIdExt;
+
+/// Trivial Raft type config for Engine-related unit tests,
+/// with an optional custom node type `N` for the Node type.
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct UTConfig<N = ()> {
+    _p: std::marker::PhantomData<N>,
+}
+
+impl<N> Default for UTConfig<N> {
+    fn default() -> Self {
+        Self {
+            _p: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<N> Clone for UTConfig<N> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<N> Copy for UTConfig<N> {}
+
+impl<N> RaftTypeConfig for UTConfig<N>
+where N: Node + Ord
+{
+    type D = u64;
+    type R = ();
+    type NodeId = u64;
+    type Node = N;
+    type Term = u64;
+    type LeaderId = crate::impls::leader_id_adv::LeaderId<u64, u64>;
+    type Vote = crate::impls::Vote<Self::LeaderId>;
+    type Membership = crate::impls::Membership<u64, N>;
+    type MembershipEdit = crate::impls::ChangeMembers<Self::NodeId, Self::Node>;
+    type Payload = crate::impls::EntryPayload<Self::D, Self::Membership>;
+    type Entry = DefaultEntryOf<Self>;
+    type AsyncRuntime = TokioRuntime;
+    type Responder<T>
+        = crate::impls::OneshotResponder<Self, T>
+    where T: OptionalSend + 'static;
+    type Batch<T>
+        = crate::impls::InlineBatch<T>
+    where T: OptionalSend + 'static;
+    type ErrorSource = anyerror::AnyError;
+}
+
+/// Type alias for the LeaderId used in unit tests.
+#[cfg(test)]
+pub(crate) type UTLeaderId = crate::impls::leader_id_adv::LeaderId<u64, u64>;
+
+/// Type alias for the CommittedLeaderId used in unit tests.
+///
+/// For `leader_id_adv`, `Committed = Self`, so this is the same as `UTLeaderId`.
+#[cfg(test)]
+pub(crate) type UtClid = UTLeaderId;
+
+/// Builds a log id, for testing purposes.
+pub(crate) fn log_id(term: u64, node_id: NodeIdOf<UTConfig>, index: u64) -> LogIdOf<UTConfig> {
+    LogIdOf::<UTConfig>::new(LeaderIdOf::<UTConfig>::new_committed(term, node_id), index)
+}

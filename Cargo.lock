@@ -949,10 +949,10 @@ dependencies = [
  "anyhow",
  "coordinode-core",
  "coordinode-modality",
+ "coordinode-openraft",
  "coordinode-raft",
  "coordinode-storage",
  "coordinode-workspace-hack",
- "openraft",
  "rmp-serde",
  "rmpv",
  "serde",
@@ -980,6 +980,66 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "tracking-allocator",
+]
+
+[[package]]
+name = "coordinode-openraft"
+version = "0.10.1"
+dependencies = [
+ "anyerror",
+ "backoff-series",
+ "base2histogram",
+ "chrono",
+ "clap",
+ "coordinode-openraft-macros",
+ "coordinode-openraft-rt",
+ "coordinode-openraft-rt-tokio",
+ "derive_more",
+ "display-more",
+ "futures-util",
+ "itertools 0.15.0",
+ "maplit",
+ "parse-size",
+ "peel-off",
+ "quorum-set",
+ "rand 0.10.3",
+ "serde",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tracing",
+ "validit",
+]
+
+[[package]]
+name = "coordinode-openraft-macros"
+version = "0.10.1"
+dependencies = [
+ "chrono",
+ "proc-macro2",
+ "quote",
+ "semver",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "coordinode-openraft-rt"
+version = "0.10.1"
+dependencies = [
+ "coordinode-openraft-macros",
+ "futures-channel",
+ "futures-util",
+ "pin-project-lite",
+ "rand 0.10.3",
+]
+
+[[package]]
+name = "coordinode-openraft-rt-tokio"
+version = "0.10.1"
+dependencies = [
+ "coordinode-openraft-rt",
+ "futures-util",
+ "rand 0.10.3",
+ "tokio",
 ]
 
 [[package]]
@@ -1025,6 +1085,7 @@ dependencies = [
  "bytes",
  "coordinode-core",
  "coordinode-lsm-tree",
+ "coordinode-openraft",
  "coordinode-raft",
  "coordinode-storage",
  "coordinode-test-fixtures",
@@ -1032,7 +1093,6 @@ dependencies = [
  "coordinode-workspace-hack",
  "futures-util",
  "metrics",
- "openraft",
  "parking_lot 0.13.0",
  "prost",
  "rcgen",
@@ -3686,70 +3746,6 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
-
-[[package]]
-name = "openraft"
-version = "0.10.1"
-source = "git+https://github.com/databendlabs/openraft?branch=main#8175ca602330a4534a25190d9b64a182859cec9c"
-dependencies = [
- "anyerror",
- "backoff-series",
- "base2histogram",
- "chrono",
- "clap",
- "derive_more",
- "display-more",
- "futures-util",
- "itertools 0.15.0",
- "maplit",
- "openraft-macros",
- "openraft-rt",
- "openraft-rt-tokio",
- "parse-size",
- "peel-off",
- "quorum-set",
- "rand 0.10.3",
- "serde",
- "smallvec",
- "thiserror 2.0.21",
- "tracing",
- "validit",
-]
-
-[[package]]
-name = "openraft-macros"
-version = "0.10.1"
-source = "git+https://github.com/databendlabs/openraft?branch=main#8175ca602330a4534a25190d9b64a182859cec9c"
-dependencies = [
- "chrono",
- "proc-macro2",
- "quote",
- "semver",
- "syn 3.0.9",
-]
-
-[[package]]
-name = "openraft-rt"
-version = "0.10.1"
-source = "git+https://github.com/databendlabs/openraft?branch=main#8175ca602330a4534a25190d9b64a182859cec9c"
-dependencies = [
- "futures-channel",
- "futures-util",
- "openraft-macros",
- "pin-project-lite",
- "rand 0.10.3",
-]
-
-[[package]]
-name = "openraft-rt-tokio"
-version = "0.10.1"
-source = "git+https://github.com/databendlabs/openraft?branch=main#8175ca602330a4534a25190d9b64a182859cec9c"
-dependencies = [
- "futures-util",
- "openraft-rt",
- "rand 0.10.3",
- "tokio",
-]
 
 [[package]]
 name = "openssl-probe"

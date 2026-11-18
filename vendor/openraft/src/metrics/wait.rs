@@ -1,0 +1,410 @@
+use core::time::Duration;
+use std::collections::BTreeSet;
+
+use openraft_macros::since;
+
+use crate::LogIdOptionExt;
+use crate::OptionalSend;
+use crate::RaftTypeConfig;
+use crate::async_runtime::Select2;
+use crate::async_runtime::watch::WatchReceiver;
+use crate::core::ServerState;
+use crate::core::replication_lag;
+use crate::metrics::Condition;
+use crate::metrics::Metric;
+use crate::metrics::RaftMetrics;
+use crate::metrics::ReplicationWaitError;
+use crate::type_config::TypeConfigExt;
+use crate::type_config::alias::InstantOf;
+use crate::type_config::alias::LogIdOf;
+use crate::type_config::alias::VoteOf;
+use crate::type_config::alias::WatchReceiverOf;
+
+/// Error variants related to waiting for metrics conditions.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum WaitError {
+    /// Timeout occurred while waiting for a condition.
+    #[error("timeout after {0:?} when {1}")]
+    Timeout(Duration, String),
+
+    /// Raft node is shutting down.
+    #[error("raft is shutting down")]
+    ShuttingDown,
+}
+
+/// Wait is a wrapper of RaftMetrics channel that impls several utils to wait for metrics to satisfy
+/// some condition.
+#[since(
+    version = "0.10.0",
+    change = "removed `log()`, `log_at_least()` and `members()`, deprecated since 0.9.0"
+)]
+pub struct Wait<C: RaftTypeConfig> {
+    /// The timeout duration for waiting operations.
+    ///
+    /// `None` means no timeout: the wait arms no timer and ends only when the condition is met or
+    /// Raft shuts down.
+    #[since(version = "0.10.0", change = "`Option<Duration>`; `None` means no timeout")]
+    pub timeout: Option<Duration>,
+    /// The metrics receiver channel.
+    pub rx: WatchReceiverOf<C, RaftMetrics<C>>,
+}
+
+impl<C> Wait<C>
+where C: RaftTypeConfig
+{
+    /// Wait for metrics to satisfy some condition or timeout.
+    #[tracing::instrument(level = "trace", skip(self, func), fields(msg=%msg.to_string()))]
+    pub async fn metrics<T>(&self, func: T, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError>
+    where T: Fn(&RaftMetrics<C>) -> bool + OptionalSend {
+        // Without a timeout, wait on the metrics channel alone, without arming a timer.
+        let timeout_at = self.timeout.map(|timeout| (timeout, C::now() + timeout));
+
+        let mut rx = self.rx.clone();
+        loop {
+            let latest = rx.borrow_watched().clone();
+
+            tracing::debug!("id={} wait {:} latest: {}", latest.id, msg.to_string(), latest);
+
+            if func(&latest) {
+                tracing::debug!("id={} done wait {:} latest: {}", latest.id, msg.to_string(), latest);
+                return Ok(latest);
+            }
+
+            let delay = match timeout_at {
+                None => None,
+                Some((timeout, timeout_at)) => {
+                    let now = C::now();
+                    if now >= timeout_at {
+                        return Err(WaitError::Timeout(
+                            timeout,
+                            format!("{} latest: {}", msg.to_string(), latest),
+                        ));
+                    }
+
+                    let sleep_time = timeout_at - now;
+                    tracing::debug!(?sleep_time, "wait timeout");
+                    Some((timeout, C::sleep(sleep_time)))
+                }
+            };
+            let delay = async move {
+                match delay {
+                    Some((timeout, delay)) => {
+                        delay.await;
+                        timeout
+                    }
+                    None => futures_util::future::pending().await,
+                }
+            };
+
+            let selected = C::select2(delay, rx.changed()).await;
+            match selected {
+                Select2::First(timeout) => {
+                    tracing::debug!("id={} timeout wait {:} latest: {}", latest.id, msg.to_string(), latest);
+                    return Err(WaitError::Timeout(
+                        timeout,
+                        format!("{} latest: {}", msg.to_string(), latest),
+                    ));
+                }
+                Select2::Second(changed) => {
+                    match changed {
+                        Ok(_) => {
+                            // metrics changed, continue the waiting loop
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                "id={} error: {:?}; wait {:} latest: {:?}",
+                                latest.id,
+                                err,
+                                msg.to_string(),
+                                latest
+                            );
+
+                            return Err(WaitError::ShuttingDown);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait for replication to `node_id` to reach a minimum index and lag by at most `max_lag`.
+    ///
+    /// Both conditions must hold in the same metrics report: the matched log index is at least
+    /// `min_index`, and its distance from the leader's current last log index is at most `max_lag`.
+    /// `None` imposes no minimum index; `max_lag = 0` requires fully caught-up replication.
+    /// For the leader itself, its last log index is used as the matched index.
+    ///
+    /// Call this on the leader. Before checking target membership or replication, wait for the
+    /// leader's reported last log index to reach `min_index`. For a newly added target, pass the
+    /// membership entry's index so stale metrics are not mistaken for target removal.
+    ///
+    /// Returns [`ReplicationWaitError::NotLeader`] immediately if the local node is not a leader,
+    /// or [`ReplicationWaitError::NodeNotFound`] if sufficiently fresh metrics do not contain the
+    /// target in the effective membership. Missing replication metrics for an existing target
+    /// keep the wait pending. Timeout and shutdown errors are wrapped in
+    /// [`ReplicationWaitError::Wait`].
+    ///
+    /// The result is an observation of replication, not a guarantee that the target has applied
+    /// the entries. Like other metrics waits, it can miss intermediate leadership/membership
+    /// changes.
+    ///
+    /// ```ignore
+    /// // Wait until node 4 has log 100 and is at most 10 entries behind the leader.
+    /// let metrics = raft.wait(Some(timeout)).replication(4, Some(100), 10).await?;
+    /// ```
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn replication(
+        &self,
+        node_id: C::NodeId,
+        min_index: Option<u64>,
+        max_lag: u64,
+    ) -> Result<RaftMetrics<C>, ReplicationWaitError> {
+        let metrics = self
+            .metrics(
+                |m| Self::check_replication(m, &node_id, min_index, max_lag) != Ok(false),
+                format!("replication to {node_id} reaches {min_index:?} with lag <= {max_lag}"),
+            )
+            .await?;
+
+        Self::check_replication(&metrics, &node_id, min_index, max_lag)?;
+        Ok(metrics)
+    }
+
+    fn check_replication(
+        metrics: &RaftMetrics<C>,
+        node_id: &C::NodeId,
+        min_index: Option<u64>,
+        max_lag: u64,
+    ) -> Result<bool, ReplicationWaitError> {
+        if metrics.state != ServerState::Leader {
+            return Err(ReplicationWaitError::NotLeader);
+        }
+
+        if metrics.last_log_index < min_index {
+            return Ok(false);
+        }
+
+        if metrics.membership_config.get_node(node_id).is_none() {
+            return Err(ReplicationWaitError::NodeNotFound);
+        }
+
+        let matched_index = if node_id == &metrics.id {
+            metrics.last_log_index
+        } else {
+            let Some(replication) = &metrics.replication else {
+                return Ok(false);
+            };
+            let Some(matched) = replication.get(node_id) else {
+                return Ok(false);
+            };
+            matched.index()
+        };
+
+        Ok(matched_index >= min_index && replication_lag(&matched_index, &metrics.last_log_index) <= max_lag)
+    }
+
+    /// Wait for `vote` to become `want` or timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn vote(&self, want: VoteOf<C>, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.eq(Metric::Vote(want), msg).await
+    }
+
+    /// Wait for `current_leader` to become `Some(leader_id)` until timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn current_leader(&self, leader_id: C::NodeId, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.metrics(
+            |m| m.current_leader.as_ref() == Some(&leader_id),
+            &format!("{} .current_leader == {}", msg.to_string(), leader_id),
+        )
+        .await
+    }
+
+    /// Block until the last log index becomes exactly `index` (inclusive) or timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn log_index(&self, index: Option<u64>, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.eq(Metric::LastLogIndex(index), msg).await
+    }
+
+    /// Block until the last log index becomes at least `index` (inclusive) or timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn log_index_at_least(
+        &self,
+        index: Option<u64>,
+        msg: impl ToString,
+    ) -> Result<RaftMetrics<C>, WaitError> {
+        self.ge(Metric::LastLogIndex(index), msg).await
+    }
+
+    /// Block until the applied index becomes exactly `index` (inclusive) or timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn applied_index(&self, index: Option<u64>, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.eq(Metric::AppliedIndex(index), msg).await
+    }
+
+    /// Block until the last applied log index become at least `index` (inclusive) or timeout.
+    /// Note that this also implies `last_log_id >= index`.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn applied_index_at_least(
+        &self,
+        index: Option<u64>,
+        msg: impl ToString,
+    ) -> Result<RaftMetrics<C>, WaitError> {
+        self.ge(Metric::AppliedIndex(index), msg).await
+    }
+
+    /// Wait for `state` to become `want_state` or timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn state(&self, want_state: ServerState, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.metrics(
+            |m| m.state == want_state,
+            &format!("{} .state == {:?}", msg.to_string(), want_state),
+        )
+        .await
+    }
+
+    /// Wait until this node is a leader with a quorum-acknowledged timestamp.
+    ///
+    /// If `at_least` is `Some`, the timestamp must be greater than or equal to it.
+    /// If `at_least` is `None`, any quorum-acknowledged timestamp is accepted.
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn leader_with_quorum_acked(
+        &self,
+        at_least: Option<InstantOf<C>>,
+        msg: impl ToString,
+    ) -> Result<RaftMetrics<C>, WaitError> {
+        self.metrics(
+            |m| {
+                m.state == ServerState::Leader
+                    && m.last_quorum_acked.is_some_and(|acked| at_least.is_none_or(|want| acked.into_inner() >= want))
+            },
+            &format!("{} .leader_with_quorum_acked({:?})", msg.to_string(), at_least),
+        )
+        .await
+    }
+
+    /// Block until membership contains exact the expected `voter_ids` or timeout.
+    #[tracing::instrument(level = "trace", skip_all, fields(msg=msg.to_string().as_str()))]
+    pub async fn voter_ids(
+        &self,
+        voter_ids: impl IntoIterator<Item = C::NodeId>,
+        msg: impl ToString,
+    ) -> Result<RaftMetrics<C>, WaitError> {
+        let want = voter_ids.into_iter().collect::<BTreeSet<_>>();
+
+        tracing::debug!("block until voter_ids == {:?}", want);
+
+        self.metrics(
+            |m| {
+                let got = m.membership_config.voter_ids().collect();
+                want == got
+            },
+            &format!("{} .members == {:?}", msg.to_string(), want),
+        )
+        .await
+    }
+
+    /// Wait for `snapshot` to become `snapshot_last_log_id` or timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn snapshot(
+        &self,
+        snapshot_last_log_id: LogIdOf<C>,
+        msg: impl ToString,
+    ) -> Result<RaftMetrics<C>, WaitError> {
+        self.eq(Metric::Snapshot(Some(snapshot_last_log_id)), msg).await
+    }
+
+    /// Block until the committed index becomes exactly `index` or timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn committed_index(&self, index: Option<u64>, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.metrics(
+            |m| m.local_committed.index() == index,
+            &format!("{} .committed_index == {:?}", msg.to_string(), index),
+        )
+        .await
+    }
+
+    /// Block until the committed index becomes at least `index` (inclusive) or timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn committed_index_at_least(
+        &self,
+        index: Option<u64>,
+        msg: impl ToString,
+    ) -> Result<RaftMetrics<C>, WaitError> {
+        self.metrics(
+            |m| m.local_committed.index() >= index,
+            &format!("{} .committed_index >= {:?}", msg.to_string(), index),
+        )
+        .await
+    }
+
+    /// Wait for `purged` to become `want` or timeout.
+    #[tracing::instrument(level = "trace", skip(self), fields(msg=msg.to_string().as_str()))]
+    pub async fn purged(&self, want: Option<LogIdOf<C>>, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.eq(Metric::Purged(want), msg).await
+    }
+
+    /// Block until a metric becomes greater than or equal the specified value or timeout.
+    ///
+    /// For example, to await until the term becomes 2 or greater:
+    /// ```ignore
+    /// my_raft.wait(None).ge(Metric::Term(2), "become term 2").await?;
+    /// ```
+    pub async fn ge(&self, metric: Metric<C>, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.until(Condition::ge(metric), msg).await
+    }
+
+    /// Block until a metric becomes equal to the specified value or timeout.
+    ///
+    /// For example, to await until the term becomes exact 2:
+    /// ```ignore
+    /// my_raft.wait(None).eq(Metric::Term(2), "become term 2").await?;
+    /// ```
+    pub async fn eq(&self, metric: Metric<C>, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.until(Condition::eq(metric), msg).await
+    }
+
+    /// Block until a metric satisfies the specified condition or timeout.
+    #[tracing::instrument(level = "trace", skip_all, fields(cond=cond.to_string(), msg=msg.to_string().as_str()))]
+    pub(crate) async fn until(&self, cond: Condition<C>, msg: impl ToString) -> Result<RaftMetrics<C>, WaitError> {
+        self.metrics(
+            |raft_metrics| match &cond {
+                Condition::GE(expect) => raft_metrics >= expect,
+                Condition::EQ(expect) => raft_metrics == expect,
+            },
+            &format!("{} .{}", msg.to_string(), cond),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod replication_test;
+
+#[cfg(test)]
+mod tests {
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_wait_error_serde() {
+        use super::*;
+
+        // Test Timeout variant
+        {
+            let err = WaitError::Timeout(Duration::from_millis(500), "waiting for leader".to_string());
+            let serialized = serde_json::to_string(&err).unwrap();
+            let deserialized: WaitError = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(err, deserialized);
+        }
+
+        // Test ShuttingDown variant
+        {
+            let err = WaitError::ShuttingDown;
+            let serialized = serde_json::to_string(&err).unwrap();
+            let deserialized: WaitError = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(err, deserialized);
+        }
+    }
+}

@@ -175,12 +175,17 @@ publish = true
 git_only = false
 semver_check = true
 
+# No API check against 0.9.0: that release of coordinode-raft requires
+# openraft "0.10", which now resolves to an openraft release it does not
+# compile against, so neither it nor coordinode-embed with `replication` builds
+# as a baseline. Turn the check back on once a release depending on
+# coordinode-openraft is the baseline.
 [[package]]
 name = "coordinode-embed"
 version_group = "coordinode"
 publish = true
 git_only = false
-semver_check = true
+semver_check = false
 
 [[package]]
 name = "coordinode-modality"
@@ -196,12 +201,13 @@ publish = true
 git_only = false
 semver_check = true
 
+# No API check against 0.9.0, which does not build; see coordinode-embed.
 [[package]]
 name = "coordinode-raft"
 version_group = "coordinode"
 publish = true
 git_only = false
-semver_check = true
+semver_check = false
 
 [[package]]
 name = "coordinode-replicate"

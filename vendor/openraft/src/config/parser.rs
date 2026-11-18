@@ -1,0 +1,92 @@
+//! Clap-based parsing for [`Config`].
+//!
+//! Gated behind `feature = "clap"` in [`super`]; functions and the
+//! [`Config::build`] method here are only compiled when that feature is on.
+
+use clap::Parser;
+
+use crate::Config;
+use crate::SnapshotPolicy;
+use crate::StepDownPolicy;
+use crate::config::error::ConfigError;
+use crate::errors::ErrorSource;
+use crate::impls::BoxedErrorSource;
+
+/// Parse number with unit such as 5.3 KB
+pub(super) fn parse_bytes_with_unit(src: &str) -> Result<u64, ConfigError> {
+    parse_size::parse_size(src).map_err(|e| ConfigError::InvalidNumber {
+        invalid: src.to_string(),
+        reason: e.to_string(),
+    })
+}
+
+pub(super) fn parse_snapshot_policy(src: &str) -> Result<SnapshotPolicy, ConfigError> {
+    if src == "never" {
+        return Ok(SnapshotPolicy::Never);
+    }
+
+    let elts = src.split(':').collect::<Vec<_>>();
+    if elts.len() != 2 {
+        return Err(ConfigError::InvalidSnapshotPolicy {
+            syntax: "never|since_last:<num>".to_string(),
+            invalid: src.to_string(),
+        });
+    }
+
+    if elts[0] != "since_last" {
+        return Err(ConfigError::InvalidSnapshotPolicy {
+            syntax: "never|since_last:<num>".to_string(),
+            invalid: src.to_string(),
+        });
+    }
+
+    let n_logs = elts[1].parse::<u64>().map_err(|e| ConfigError::InvalidNumber {
+        invalid: src.to_string(),
+        reason: e.to_string(),
+    })?;
+    Ok(SnapshotPolicy::LogsSinceLast(n_logs))
+}
+
+/// Parse a step-down policy: a "never" literal (`never`, `no`, `none`, `off` or `false`,
+/// case-insensitive), or the number of milliseconds to wait.
+pub(super) fn parse_step_down_policy(src: &str) -> Result<StepDownPolicy, ConfigError> {
+    const NEVER_LITERALS: &[&str] = &["never", "no", "none", "off", "false"];
+
+    if NEVER_LITERALS.iter().any(|x| src.eq_ignore_ascii_case(x)) {
+        return Ok(StepDownPolicy::Never);
+    }
+
+    let ms = src.parse::<u64>().map_err(|e| ConfigError::InvalidNumber {
+        invalid: src.to_string(),
+        reason: e.to_string(),
+    })?;
+    Ok(StepDownPolicy::After(ms))
+}
+
+impl Config {
+    /// Build a `Config` instance from a series of command line arguments.
+    ///
+    /// The first element in `args` must be the application name.
+    ///
+    /// Only available when the `clap` feature is enabled (default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use openraft::Config;
+    ///
+    /// let config = Config::build(&[
+    ///     "myapp",
+    ///     "--election-timeout-min", "300",
+    ///     "--election-timeout-max", "500",
+    /// ])?;
+    /// # Ok::<(), openraft::ConfigError>(())
+    /// ```
+    pub fn build(args: &[&str]) -> Result<Config, ConfigError> {
+        let config = <Self as Parser>::try_parse_from(args).map_err(|e| ConfigError::ParseError {
+            source: BoxedErrorSource::from_error(&e),
+            args: args.iter().map(|x| x.to_string()).collect(),
+        })?;
+        config.validate()
+    }
+}

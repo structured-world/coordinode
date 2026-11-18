@@ -1,0 +1,14 @@
+//! A proposer includes the Candidate(phase-1) state and Leader(phase-2) state.
+
+pub(crate) mod candidate;
+pub(crate) mod leader;
+pub(crate) mod leader_state;
+pub(crate) mod send_stamp;
+
+pub(crate) use candidate::Candidate;
+pub(crate) use leader::Leader;
+pub(crate) use leader_state::CandidateState;
+pub(crate) use leader_state::ElectionQuorumSet;
+pub(crate) use leader_state::LeaderState;
+pub(crate) use leader_state::WriteQuorumSet;
+pub(crate) use send_stamp::SendStamp;

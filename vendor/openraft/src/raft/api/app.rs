@@ -1,0 +1,216 @@
+use std::future::Future;
+use std::sync::Arc;
+
+use openraft_macros::since;
+
+use crate::OptionalSend;
+use crate::RaftTypeConfig;
+use crate::async_runtime::watch::WatchReceiver;
+use crate::base::BoxStream;
+use crate::batch::Batch;
+use crate::core::raft_msg::RaftMsg;
+use crate::errors::ClientWriteError;
+use crate::errors::Fatal;
+use crate::errors::LinearizableReadError;
+use crate::impls::ProgressResponder;
+use crate::raft::ClientWriteResponse;
+use crate::raft::ClientWriteResult;
+use crate::raft::linearizable_read::Linearizer;
+use crate::raft::linearizable_read::LinearizerOption;
+use crate::raft::message::WriteManyRequest;
+use crate::raft::message::WriteManyRequestArgs;
+use crate::raft::message::WriteOption;
+use crate::raft::message::WriteResult;
+use crate::raft::message::into_write_result;
+use crate::raft::raft_inner::RaftInner;
+use crate::raft::responder::core_responder::CoreResponder;
+use crate::type_config::TypeConfigExt;
+use crate::type_config::alias::BatchOf;
+#[cfg(feature = "runtime-stats")]
+use crate::type_config::alias::InstantOf;
+use crate::type_config::alias::PayloadOf;
+use crate::type_config::alias::WriteResponderOf;
+
+/// Provides application-facing APIs for interacting with the Raft system.
+///
+/// This struct contains methods for client operations such as linearizable reads
+/// and writes.
+#[since(version = "0.10.0")]
+pub(crate) struct AppApi<'a, C>
+where C: RaftTypeConfig
+{
+    inner: &'a Arc<RaftInner<C>>,
+}
+
+impl<'a, C> AppApi<'a, C>
+where C: RaftTypeConfig
+{
+    pub(in crate::raft) fn new(inner: &'a Arc<RaftInner<C>>) -> Self {
+        Self { inner }
+    }
+
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(crate) async fn get_read_linearizer(
+        &self,
+        linearizer_option: LinearizerOption,
+    ) -> Result<Result<Linearizer<C>, LinearizableReadError<C>>, Fatal<C>> {
+        self.inner.call_core_oneshot(|tx| RaftMsg::GetLinearizer { linearizer_option, tx }).await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(crate) async fn get_local_read_linearizer(
+        &self,
+        linearizer_option: LinearizerOption,
+    ) -> Result<Result<Linearizer<C>, LinearizableReadError<C>>, Fatal<C>> {
+        let enabled = self.inner.config.get_enable_local_lease_read();
+        if enabled {
+            let state = {
+                let watched = self.inner.rx_lease_read_state.borrow_watched();
+                watched.clone()
+            };
+            if let Some(state) = state {
+                let now = C::now();
+                let node_id = self.inner.id.clone();
+                let linearizer = state.try_linearizer(node_id, &linearizer_option, now);
+                if let Some(linearizer) = linearizer {
+                    let applied = {
+                        let metrics = self.inner.rx_metrics.borrow_watched();
+                        metrics.last_applied.clone()
+                    };
+                    // As in `RaftCore::handle_get_linearizer()`: the no-op barrier needs
+                    // `enable_relaxed_read`, otherwise the standard barrier is served.
+                    let relaxed = linearizer_option.relaxed && self.inner.config.get_enable_relaxed_read();
+                    let linearizer = linearizer.with_applied(applied).with_relaxed(relaxed);
+                    return Ok(Ok(linearizer));
+                }
+            }
+        }
+        self.get_read_linearizer(linearizer_option).await
+    }
+
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "debug", skip(self, payload))]
+    pub(crate) async fn client_write(
+        &self,
+        payload: PayloadOf<C>,
+    ) -> Result<Result<ClientWriteResponse<C>, ClientWriteError<C>>, Fatal<C>> {
+        let (responder, complete_rx) = ProgressResponder::complete_only();
+
+        self.do_client_write_ff(
+            Batch::of([payload]),
+            Batch::of([Some(CoreResponder::Progress(responder))]),
+            WriteOption::default(),
+        )
+        .await?;
+
+        let res: ClientWriteResult<C> = self.inner.recv_msg(complete_rx).await?;
+
+        Ok(res)
+    }
+
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn client_write_ff(
+        &self,
+        payload: PayloadOf<C>,
+        responder: Option<WriteResponderOf<C>>,
+    ) -> Result<(), Fatal<C>> {
+        self.do_client_write_ff(
+            Batch::of([payload]),
+            Batch::of([responder.map(|r| CoreResponder::UserDefined(r))]),
+            WriteOption::default(),
+        )
+        .await
+    }
+
+    /// Fire-and-forget version of `client_write`, accept a generic responder.
+    #[since(version = "0.10.0")]
+    async fn do_client_write_ff(
+        &self,
+        payloads: BatchOf<C, PayloadOf<C>>,
+        responders: BatchOf<C, Option<CoreResponder<C>>>,
+        write_option: WriteOption<C>,
+    ) -> Result<(), Fatal<C>> {
+        self.inner
+            .send_msg(RaftMsg::ClientWrite {
+                payloads,
+                responders,
+                write_option,
+                #[cfg(feature = "runtime-stats")]
+                proposed_at: propose_at_now::<C>(),
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Write multiple application data payloads in a single batch.
+    ///
+    /// Returns a stream that yields each result in submission order.
+    /// This is more efficient than calling [`client_write()`](Self::client_write) multiple times
+    /// as it sends all payloads in a single message to the Raft core. RaftCore admits the batch
+    /// with `write_option`.
+    ///
+    /// If RaftCore stops, the stream yields `Err(Fatal::Stopped)` and ends.
+    #[since(version = "0.10.0")]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn client_write_many(
+        &self,
+        payloads: impl IntoIterator<Item = PayloadOf<C>>,
+        write_option: WriteOption<C>,
+    ) -> Result<BoxStream<'static, Result<WriteResult<C>, Fatal<C>>>, Fatal<C>> {
+        let payloads: Vec<PayloadOf<C>> = payloads.into_iter().collect();
+
+        let mut responders = Vec::with_capacity(payloads.len());
+        let mut receivers = Vec::with_capacity(payloads.len());
+
+        for _ in 0..payloads.len() {
+            let (responder, complete_rx) = ProgressResponder::<C, ClientWriteResult<C>>::complete_only();
+            responders.push(Some(CoreResponder::Progress(responder)));
+            receivers.push(complete_rx);
+        }
+
+        self.do_client_write_ff(Batch::of(payloads), Batch::of(responders), write_option).await?;
+
+        let stream = futures_util::stream::unfold(Some(receivers.into_iter()), |opt_iter| async move {
+            let mut iter = opt_iter?;
+            let rx = iter.next()?;
+            match rx.await {
+                Ok(result) => Some((Ok(into_write_result(result)), Some(iter))),
+                Err(_) => Some((Err(Fatal::Stopped), None)),
+            }
+        });
+
+        Ok(Box::pin(stream))
+    }
+
+    /// Build the [`WriteManyRequest`] returned by [`Raft::write_many()`] with `writes` in it.
+    ///
+    /// It takes `self` by value because the returned `impl Future` type captures the lifetime of
+    /// a `&self` receiver; the builder must borrow only the Raft handle for `'a`, not this
+    /// short-lived `AppApi`.
+    ///
+    /// [`Raft::write_many()`]: crate::Raft::write_many
+    pub(crate) fn write_many(
+        self,
+        writes: impl IntoIterator<Item = (C::D, Option<WriteResponderOf<C>>)>,
+    ) -> WriteManyRequest<'a, C, impl Future<Output = Result<(), Fatal<C>>> + OptionalSend> {
+        let request = WriteManyRequest {
+            args: WriteManyRequestArgs {
+                inner: self.inner,
+                payloads: Batch::of([]),
+                responders: Batch::of([]),
+                write_option: WriteOption::default(),
+            },
+            make_future: WriteManyRequestArgs::send,
+        };
+
+        request.extend(writes)
+    }
+}
+
+#[cfg(feature = "runtime-stats")]
+pub(crate) fn propose_at_now<C: RaftTypeConfig>() -> InstantOf<C> {
+    C::now()
+}

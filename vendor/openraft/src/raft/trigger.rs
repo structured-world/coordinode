@@ -1,0 +1,250 @@
+//! Trigger an action to RaftCore by an external caller.
+
+use openraft_macros::since;
+
+use crate::RaftTypeConfig;
+use crate::batch::Batch;
+use crate::core::raft_msg::external_command::ExternalCommand;
+use crate::errors::AllowNextRevertError;
+use crate::errors::Fatal;
+use crate::raft::RaftInner;
+use crate::type_config::TypeConfigExt;
+use crate::type_config::alias::BatchOf;
+use crate::type_config::alias::LogIdOf;
+use crate::type_config::alias::VoteOf;
+
+/// Trigger is an interface to trigger an action to RaftCore by external caller.
+///
+/// It is created with [`Raft::trigger()`].
+///
+/// For example, to trigger an election at once, you can use the following code
+/// ```ignore
+/// raft.trigger().elect(false).await?;
+/// ```
+///
+/// Or to fire a heartbeat, building a snapshot, or purging logs:
+///
+/// ```ignore
+/// raft.trigger().heartbeat().await?;
+/// raft.trigger().snapshot().await?;
+/// raft.trigger().purge_log().await?;
+/// ```
+///
+/// [`Raft::trigger()`]: crate::Raft::trigger
+pub struct Trigger<'r, C>
+where C: RaftTypeConfig
+{
+    raft_inner: &'r RaftInner<C>,
+}
+
+impl<'r, C> Trigger<'r, C>
+where C: RaftTypeConfig
+{
+    pub(in crate::raft) fn new(raft_inner: &'r RaftInner<C>) -> Self {
+        Self { raft_inner }
+    }
+
+    /// Trigger election at once and return at once.
+    ///
+    /// If this node is already a leader, this is a no-op.
+    ///
+    /// Otherwise, with `pre_vote = false`, a real election starts immediately: the term is
+    /// incremented and the node votes for itself. This bypasses both `enable_elect` and
+    /// Pre-Vote, so the term climbs even when the node cannot win — which may step down a
+    /// healthy leader of a lower term.
+    ///
+    /// With `pre_vote = true`, a Pre-Vote round runs first and the real election proceeds only if a
+    /// quorum would grant a vote. While this node's own leader lease is still valid, the round is
+    /// refused locally and nothing is sent; a leader that a quorum keeps acking also rejects the
+    /// Pre-Vote — either way the term is left untouched. Use this to avoid disrupting a healthy
+    /// leader with a manual trigger. It does not require [`Config::enable_pre_vote`]; the caller
+    /// opts in per call.
+    ///
+    /// Returns error when RaftCore has [`Fatal`] error, e.g., shut down or having storage error.
+    /// It is not affected by `Raft::enable_elect(false)`.
+    ///
+    /// [`Config::enable_pre_vote`]: crate::Config::enable_pre_vote
+    pub async fn elect(&self, pre_vote: bool) -> Result<(), Fatal<C>> {
+        self.raft_inner.send_external_command(ExternalCommand::Elect { pre_vote }).await
+    }
+
+    /// Trigger a heartbeat at once and return at once.
+    ///
+    /// Returns error when RaftCore has [`Fatal`] error, e.g., shut down or having storage error.
+    /// It is not affected by `Raft::enable_heartbeat(false)`.
+    pub async fn heartbeat(&self) -> Result<(), Fatal<C>> {
+        self.raft_inner.send_external_command(ExternalCommand::Heartbeat).await
+    }
+
+    /// Queue one timer check and return once it is queued.
+    ///
+    /// RaftCore runs the same check that the internal ticker triggers: a node whose election
+    /// timeout has expired starts an election, and a leader whose heartbeat is due sends one
+    /// heartbeat. The check reads the current time when RaftCore handles it. A check before a
+    /// deadline does nothing, and a check after several missed heartbeat intervals sends one
+    /// heartbeat.
+    ///
+    /// Unlike [`Self::elect`] and [`Self::heartbeat`], the check honors `enable_elect` and
+    /// `enable_heartbeat`. It runs whether `enable_tick` is on or off.
+    ///
+    /// With [`Config::enable_tick`] set to `false`, an application can drive many nodes from one
+    /// timer of its own. Timeouts are noticed only when a check runs, so the caller's interval
+    /// adds to the election and heartbeat latency. The internal ticker checks about five times per
+    /// [`Config::heartbeat_interval`]. This call waits while the API channel of this node is full.
+    ///
+    /// Returns error when RaftCore has [`Fatal`] error, e.g., shut down or having storage error.
+    ///
+    /// [`Config::enable_tick`]: crate::Config::enable_tick
+    /// [`Config::heartbeat_interval`]: crate::Config::heartbeat_interval
+    #[since(version = "0.10.1")]
+    pub async fn tick(&self) -> Result<(), Fatal<C>> {
+        self.raft_inner.send_external_command(ExternalCommand::Tick).await
+    }
+
+    /// Trigger to build a snapshot at once and return at once.
+    ///
+    /// Returns error when RaftCore has [`Fatal`] error, e.g., shut down or having storage error.
+    pub async fn snapshot(&self) -> Result<(), Fatal<C>> {
+        self.raft_inner.send_external_command(ExternalCommand::Snapshot).await
+    }
+
+    /// Initiate the log purge up to and including the given `upto` log index.
+    ///
+    /// Logs that are not included in a snapshot will **NOT** be purged.
+    /// In such a scenario it will delete as many logs as possible.
+    /// The [`max_in_snapshot_log_to_keep`] config is not taken into account
+    /// when purging logs.
+    ///
+    /// It returns an error only when RaftCore has [`Fatal`] error, e.g., shut down or having
+    /// storage error.
+    ///
+    /// Openraft won't purge logs at once, e.g., it may be delayed by several seconds, because if it
+    /// is a leader and a replication task has been replicating the logs to a follower, the logs
+    /// can't be purged until the replication task is finished.
+    ///
+    /// [`max_in_snapshot_log_to_keep`]: `crate::Config::max_in_snapshot_log_to_keep`
+    pub async fn purge_log(&self, upto: u64) -> Result<(), Fatal<C>> {
+        self.raft_inner.send_external_command(ExternalCommand::PurgeLog { upto }).await
+    }
+
+    /// Submit a command to inform RaftCore to transfer leadership to the specified node.
+    ///
+    /// By default, this also resets the target's active replication backoff. Set
+    /// [`Config::reset_backoff_on_transfer_leader`] to `Some(false)` to disable the reset.
+    ///
+    /// While the transfer is in progress, this node forwards client requests to `to`. If `to` has
+    /// not taken over within an election timeout, this node steps down and starts an election,
+    /// which it may win again.
+    ///
+    /// If this node is not a Leader, it is just ignored.
+    ///
+    /// [`Config::reset_backoff_on_transfer_leader`]: crate::Config::reset_backoff_on_transfer_leader
+    pub async fn transfer_leader(&self, to: C::NodeId) -> Result<(), Fatal<C>> {
+        self.raft_inner.send_external_command(ExternalCommand::TriggerTransferLeader { to }).await
+    }
+
+    /// Request to reset the current replication backoff for the specified nodes.
+    ///
+    /// A reset ends the current or next wait of the backoff that is active when it arrives.
+    /// A backoff that starts later is not affected. Snapshot transfer retries are not affected
+    /// either.
+    ///
+    /// If no node ids are specified, this applies to all replication targets.
+    #[since(version = "0.10.0")]
+    pub async fn reset_backoff(&self, to: impl IntoIterator<Item = C::NodeId>) -> Result<(), Fatal<C>> {
+        let to = BatchOf::<C, _>::of(to);
+        self.raft_inner.send_external_command(ExternalCommand::ResetBackoff { to }).await
+    }
+
+    /// Request the RaftCore to allow to reset replication for a specific node when log revert is
+    /// detected.
+    ///
+    /// - `allow=true`: This method instructs the RaftCore to allow the target node's log to revert
+    ///   to a previous state for one time.
+    /// - `allow=false`: This method instructs the RaftCore to panic if the target node's log revert
+    ///
+    /// This method returns a [`Fatal`] error if it failed to send the request to RaftCore, e.g.,
+    /// when RaftCore is shut down.
+    /// Otherwise, it returns an `Ok(Result<_,_>)`, the inner result is:
+    /// - `Ok(())` if the request is successfully processed,
+    /// - or `Err(AllowNextRevertError)` explaining why the request is rejected.
+    ///
+    /// ### Behavior
+    ///
+    /// - If this node is the Leader, it will attempt to replicate logs to the target node from the
+    ///   beginning.
+    /// - If this node is not the Leader, the request is ignored.
+    /// - If the target node is not found, the request is ignored.
+    ///
+    /// ### Automatic Replication Reset
+    ///
+    /// When the [`Config::allow_log_reversion`] is enabled, the Leader automatically
+    /// resets replication if it detects that the target node's log has reverted. This
+    /// feature is primarily useful in testing environments.
+    ///
+    /// ### Production Considerations
+    ///
+    /// In production environments, state reversion is a critical issue that should not be
+    /// automatically handled. However, there may be scenarios where a Follower's data is
+    /// intentionally removed and needs to rejoin the cluster(without membership changes). In such
+    /// cases, the Leader should reinitialize replication for that node with the following steps:
+    /// - Shut down the target node.
+    /// - call [`Self::allow_next_revert`] on the Leader.
+    /// - Clear the target node's data directory.
+    /// - Restart the target node.
+    ///
+    /// [`Config::allow_log_reversion`]: `crate::Config::allow_log_reversion`
+    pub async fn allow_next_revert(
+        &self,
+        to: &C::NodeId,
+        allow: bool,
+    ) -> Result<Result<(), AllowNextRevertError<C>>, Fatal<C>> {
+        let (tx, rx) = C::oneshot();
+        self.raft_inner
+            .send_external_command(ExternalCommand::AllowNextRevert {
+                to: to.clone(),
+                allow,
+                tx,
+            })
+            .await?;
+
+        let res: Result<(), AllowNextRevertError<C>> = self.raft_inner.recv_msg(rx).await?;
+
+        Ok(res)
+    }
+
+    /// Recalculate the internal server state(Leader/Follower/Learner) based on the vote and the
+    /// membership config.
+    ///
+    /// Usually this method is not used at all: the internal server state is always recalculated
+    /// automatically. The only exception is the step down of a Leader that is removed from the
+    /// membership config: openraft allows such a removed node to keep acting as a Leader. By
+    /// default it is stepped down automatically (see
+    /// [`Config::removed_leader_step_down`](crate::Config::removed_leader_step_down));
+    /// with the automated step down disabled, the application or the administrator decides when
+    /// to revert it to a learner by calling this method.
+    ///
+    /// `vote` and `membership_log_id` are the expected current vote and the expected log id of
+    /// the effective membership config: the refresh is dropped if either differs from the
+    /// current state when the command is handled, so that a delayed command can not cause an
+    /// unexpected refresh. A `None` skips the corresponding check: with both `None` the server
+    /// state is refreshed unconditionally.
+    ///
+    /// To step down a removed Leader, call this method after the membership config that removes
+    /// it is committed: a Leader keeps leading while that membership config is not yet
+    /// committed, because it is the one responsible for replicating it.
+    ///
+    /// Returns error when RaftCore has [`Fatal`] error, e.g., shut down or having storage error.
+    #[since(version = "0.10.0")]
+    pub async fn refresh_server_state(
+        &self,
+        vote: Option<VoteOf<C>>,
+        membership_log_id: Option<LogIdOf<C>>,
+    ) -> Result<(), Fatal<C>> {
+        let cmd = ExternalCommand::RefreshServerState {
+            vote,
+            membership_log_id,
+        };
+        self.raft_inner.send_external_command(cmd).await
+    }
+}

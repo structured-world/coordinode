@@ -1,0 +1,11 @@
+# openraft from its upstream main branch, its source unchanged, published as
+# coordinode-openraft* until an openraft release carries what CoordiNode needs.
+# A workspace of its own: the main workspace uses it as a path dependency with
+# the features it asks for, and its own feature selections and lints stay out.
+# Published from here, macros first: cargo publish --workspace.
+[workspace]
+resolver = "2"
+members = ["openraft", "openraft-macros", "openraft-rt", "openraft-rt-tokio"]
+
+[workspace.package]
+version = "0.10.1"

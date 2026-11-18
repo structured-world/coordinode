@@ -1,0 +1,595 @@
+use std::fmt;
+use std::fmt::Debug;
+
+use display_more::DisplayOptionExt;
+use display_more::DisplayResultExt;
+use display_more::DisplaySliceExt;
+
+use crate::OptionalSend;
+use crate::RaftTypeConfig;
+use crate::async_runtime::OneshotSender;
+use crate::core::sm;
+use crate::engine::CommandKind;
+use crate::engine::CommandName;
+use crate::engine::replication_progress::TargetProgress;
+use crate::errors::InitializeError;
+use crate::progress::inflight_id::InflightId;
+use crate::raft::AppendResult;
+use crate::raft::SnapshotResponse;
+use crate::raft::VoteRequest;
+use crate::raft::VoteResponse;
+use crate::raft::message::TransferLeaderRequest;
+use crate::raft_state::IOId;
+use crate::raft_state::IOState;
+use crate::replication::ReplicationSessionId;
+use crate::replication::replicate::Replicate;
+use crate::storage::RaftStateMachine;
+use crate::type_config::alias::BatchOf;
+use crate::type_config::alias::CommittedVoteOf;
+use crate::type_config::alias::LogIdOf;
+use crate::type_config::alias::OneshotSenderOf;
+use crate::type_config::alias::VoteOf;
+
+/// Commands to send to `RaftRuntime` to execute, to update the application state.
+pub(crate) enum Command<C, SM = ()>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    /// No actual IO is submitted but need to update io progress.
+    ///
+    /// For example, when Leader-1 appends log Log-2, then Leader-2 appends log Log-2 again,
+    /// the second append does not need to submit to the log store,
+    /// but it needs to update the IO progress from `Leader-1,Log-2` to `Leader-2,Log-2`.
+    UpdateIOProgress {
+        /// This command is not submitted to [`RaftLogStorage`],
+        /// thus it cannot be queued in the log store.
+        /// Therefore, we need to specify the condition to wait for to run it.
+        /// Usually the condition is when the previous log is flushed to disk.
+        ///
+        /// [`RaftLogStorage`]: crate::storage::RaftLogStorage
+        when: Option<Condition<C>>,
+        io_id: IOId<C>,
+    },
+
+    /// Append a `range` of entries.
+    AppendEntries {
+        /// The vote of the leader that submits the entries to write.
+        ///
+        /// The leader could be a local leader that appends entries to the local log store
+        /// or a remote leader that replicates entries to this follower.
+        ///
+        /// The leader id is used to generate a monotonic increasing IO id, such as [`LogIOId`].
+        /// Where [`LogIOId`] is `(leader_id, log_id)`.
+        ///
+        /// [`LogIOId`]: crate::raft_state::io_state::io_id::IOId
+        committed_vote: CommittedVoteOf<C>,
+
+        entries: BatchOf<C, C::Entry>,
+    },
+
+    /// Send `committed` to other nodes as `leader_commit`, the log ID they may apply up to.
+    ///
+    /// The producer decides the value: with relaxed reads it is bounded by the leader's applied
+    /// log ID. See `RaftState::follower_apply_bound()`.
+    ReplicateCommitted { committed: Option<LogIdOf<C>> },
+
+    /// Broadcast heartbeat to all other nodes.
+    BroadcastHeartbeat {
+        session_id: ReplicationSessionId<C>,
+        bypass_min_interval: bool,
+    },
+
+    /// Save the committed log id `upto` to [`RaftLogStorage`].
+    ///
+    /// Upon startup, the saved committed log ids will be re-applied to the state machine to restore
+    /// the latest state.
+    ///
+    /// Apply log entries from `already_applied`, exclusive up to `upto`, inclusive.
+    ///
+    /// To `commit` logs, [`RaftLogStorage::save_committed()`] is called. And then committed logs
+    /// will be applied to the state machine by calling [`RaftStateMachine::apply()`].
+    ///
+    /// And if it is a leader, send the applied result to the client that proposed the entry once
+    /// Apply is done.
+    ///
+    ///
+    /// [`RaftLogStorage`]: crate::storage::RaftLogStorage
+    /// [`RaftLogStorage::save_committed()`]: crate::storage::RaftLogStorage::save_committed
+    /// [`RaftStateMachine::apply()`]: crate::storage::RaftStateMachine::apply
+    SaveCommittedAndApply {
+        already_applied: Option<LogIdOf<C>>,
+        upto: LogIdOf<C>,
+    },
+
+    /// Replicate log entries to a target.
+    Replicate { target: C::NodeId, req: Replicate<C> },
+
+    /// Replicate snapshot to a target.
+    ReplicateSnapshot {
+        leader_vote: CommittedVoteOf<C>,
+        target: C::NodeId,
+        inflight_id: InflightId,
+    },
+
+    /// Broadcast transfer Leader message to all other nodes.
+    BroadcastTransferLeader { req: TransferLeaderRequest<C> },
+
+    /// Close replication streams and heartbeat streams.
+    CloseReplicationStreams,
+
+    /// Fail all pending linearizable reads after losing leadership.
+    FailPendingReads,
+
+    /// Membership config changed, need to update replication streams.
+    /// The Runtime has to close all old replications and start new ones.
+    /// Because a replication stream should only report state for one membership config.
+    /// When membership config changes, the membership log id stored in ReplicationCore has to be
+    /// updated.
+    RebuildReplicationStreams {
+        leader_vote: CommittedVoteOf<C>,
+
+        /// Targets to replicate to.
+        targets: Vec<TargetProgress<C>>,
+
+        /// Whether close old replication before spawn new ones.
+        ///
+        /// If vote changes, old should be closed;
+        /// If only membership changes, old should be kept.
+        close_old_streams: bool,
+    },
+
+    /// Save vote to storage
+    SaveVote { vote: VoteOf<C> },
+
+    /// Send vote to all other members
+    SendVote { vote_req: VoteRequest<C> },
+
+    /// Send a Pre-Vote request to all other members.
+    ///
+    /// Unlike [`SendVote`](Command::SendVote), this does not persist a vote or bump the term; it
+    /// only probes whether a quorum would grant a vote at the hypothetical next term.
+    SendPreVote { vote_req: VoteRequest<C> },
+
+    /// Purge log from the beginning to `upto`, inclusive.
+    PurgeLog { upto: LogIdOf<C> },
+
+    /// Delete logs that have conflicted with the leader from a follower/learner after log id
+    /// `after`, exclusive.
+    TruncateLog { after: Option<LogIdOf<C>> },
+
+    /// A command sent to state machine worker [`sm::worker::Worker`].
+    ///
+    /// The runtime(`RaftCore`) will just forward this command to [`sm::worker::Worker`].
+    /// The response will be sent back in a `RaftMsg::StateMachine` message to `RaftCore`.
+    StateMachine { command: sm::Command<C, SM> },
+
+    /// Send result to caller
+    Respond {
+        when: Option<Condition<C>>,
+        resp: Respond<C>,
+    },
+}
+
+impl<C, SM> Debug for Command<C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl<C, SM> fmt::Display for Command<C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Command::UpdateIOProgress { when, io_id } => {
+                write!(f, "UpdateIOProgress: when: {}, io_id: {}", when.display(), io_id)
+            }
+            Command::AppendEntries {
+                committed_vote: vote,
+                entries,
+            } => {
+                write!(
+                    f,
+                    "AppendEntries: vote: {}, entries: {}",
+                    vote,
+                    entries.as_ref().display()
+                )
+            }
+            Command::ReplicateCommitted { committed } => {
+                write!(f, "ReplicateCommitted: {}", committed.display())
+            }
+            Command::BroadcastHeartbeat {
+                session_id,
+                bypass_min_interval,
+            } => {
+                write!(
+                    f,
+                    "BroadcastHeartbeat: session_id:{}, bypass_min_interval:{}",
+                    session_id, bypass_min_interval
+                )
+            }
+            Command::SaveCommittedAndApply {
+                already_applied: already_committed,
+                upto,
+            } => write!(f, "SaveCommittedAndApply: ({}, {}]", already_committed.display(), upto),
+            Command::Replicate { target, req } => {
+                write!(f, "Replicate: target={}, req: {}", target, req)
+            }
+            Command::ReplicateSnapshot {
+                leader_vote,
+                target,
+                inflight_id,
+            } => {
+                write!(
+                    f,
+                    "ReplicateSnapshot: leader_vote: {}, target={}, inflight_id: {}",
+                    leader_vote, target, inflight_id
+                )
+            }
+            Command::BroadcastTransferLeader { req } => write!(f, "TransferLeader: {}", req),
+            Command::CloseReplicationStreams => write!(f, "CloseReplicationStreams"),
+            Command::FailPendingReads => write!(f, "FailPendingReads"),
+            Command::RebuildReplicationStreams {
+                leader_vote,
+                targets,
+                close_old_streams,
+            } => {
+                write!(
+                    f,
+                    "RebuildReplicationStreams: leader_vote: {}, targets: {}; close_old: {}",
+                    leader_vote,
+                    targets.display_n(10),
+                    close_old_streams
+                )
+            }
+            Command::SaveVote { vote } => write!(f, "SaveVote: {}", vote),
+            Command::SendVote { vote_req } => write!(f, "SendVote: {}", vote_req),
+            Command::SendPreVote { vote_req } => write!(f, "SendPreVote: {}", vote_req),
+            Command::PurgeLog { upto } => write!(f, "PurgeLog: upto: {}", upto),
+            Command::TruncateLog { after } => write!(f, "TruncateLog: since: {}", after.display()),
+            Command::StateMachine { command } => write!(f, "StateMachine: command: {}", command),
+            Command::Respond { when, resp } => write!(f, "Respond: when: {}, resp: {}", when.display(), resp),
+        }
+    }
+}
+
+impl<C, SM> From<sm::Command<C, SM>> for Command<C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    fn from(cmd: sm::Command<C, SM>) -> Self {
+        Self::StateMachine { command: cmd }
+    }
+}
+
+/// For unit testing
+impl<C, SM> PartialEq for Command<C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+    C::Entry: PartialEq,
+    BatchOf<C, C::Entry>: PartialEq,
+{
+    #[rustfmt::skip]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Command::UpdateIOProgress { when, io_id },        Command::UpdateIOProgress { when: wb, io_id: ab }, )                  => when == wb && io_id == ab,
+            (Command::AppendEntries { committed_vote: vote, entries },    Command::AppendEntries { committed_vote: vb, entries: b }, )               => vote == vb && entries == b,
+            (Command::ReplicateCommitted { committed },        Command::ReplicateCommitted { committed: b }, )                       =>  committed == b,
+            (Command::BroadcastHeartbeat { session_id, bypass_min_interval },       Command::BroadcastHeartbeat { session_id: sb, bypass_min_interval: ib }, ) => session_id == sb && bypass_min_interval == ib,
+            (Command::SaveCommittedAndApply { already_applied: already_committed, upto, },      Command::SaveCommittedAndApply { already_applied: b_committed, upto: b_upto, }, )  => already_committed == b_committed && upto == b_upto,
+            (Command::Replicate { target, req },               Command::Replicate { target: b_target, req: other_req, }, )           => target == b_target && req == other_req,
+            (Command::BroadcastTransferLeader { req },         Command::BroadcastTransferLeader { req: b, }, )                       => req == b,
+            (Command::RebuildReplicationStreams { leader_vote, targets, close_old_streams },   Command::RebuildReplicationStreams { leader_vote: lb, targets: b, close_old_streams: cb }, ) => leader_vote == lb && targets == b && close_old_streams == cb,
+            (Command::SaveVote { vote },                       Command::SaveVote { vote: b })                                        => vote == b,
+            (Command::SendVote { vote_req },                   Command::SendVote { vote_req: b }, )                                  => vote_req == b,
+            (Command::SendPreVote { vote_req },                Command::SendPreVote { vote_req: b }, )                               => vote_req == b,
+            (Command::PurgeLog { upto },                       Command::PurgeLog { upto: b })                                        => upto == b,
+            (Command::TruncateLog { after },                   Command::TruncateLog { after: b }, )                                  => after == b,
+            (Command::Respond { when, resp: send },            Command::Respond { when: b_when, resp: b })                           => send == b && when == b_when,
+            (Command::StateMachine { command },                Command::StateMachine { command: b })                                 => command == b,
+            (Command::CloseReplicationStreams,                 Command::CloseReplicationStreams)                                     => true,
+            (Command::FailPendingReads,                        Command::FailPendingReads)                                            => true,
+            (Command::ReplicateSnapshot { leader_vote, target, inflight_id }, Command::ReplicateSnapshot { leader_vote: lb, target: tb, inflight_id: ib }) => leader_vote == lb && target == tb && inflight_id == ib,
+
+            // Two different commands are never equal. These arms are spelled out per variant
+            // instead of one `_ => false`, so that a newly added variant leaves the match
+            // non-exhaustive and fails to compile until it gets a comparison arm above. A
+            // catch-all would instead make the new variant silently unequal to itself.
+            (Command::UpdateIOProgress { .. },          _) => false,
+            (Command::AppendEntries { .. },             _) => false,
+            (Command::ReplicateCommitted { .. },        _) => false,
+            (Command::BroadcastHeartbeat { .. },        _) => false,
+            (Command::SaveCommittedAndApply { .. },     _) => false,
+            (Command::Replicate { .. },                 _) => false,
+            (Command::ReplicateSnapshot { .. },         _) => false,
+            (Command::BroadcastTransferLeader { .. },   _) => false,
+            (Command::CloseReplicationStreams,          _) => false,
+            (Command::FailPendingReads,                 _) => false,
+            (Command::RebuildReplicationStreams { .. }, _) => false,
+            (Command::SaveVote { .. },                  _) => false,
+            (Command::SendVote { .. },                  _) => false,
+            (Command::SendPreVote { .. },               _) => false,
+            (Command::PurgeLog { .. },                  _) => false,
+            (Command::TruncateLog { .. },               _) => false,
+            (Command::StateMachine { .. },              _) => false,
+            (Command::Respond { .. },                   _) => false,
+        }
+    }
+}
+
+impl<C, SM> Command<C, SM>
+where
+    C: RaftTypeConfig,
+    SM: RaftStateMachine<C>,
+{
+    #[allow(dead_code)]
+    #[rustfmt::skip]
+    pub(crate) fn name(&self) -> CommandName {
+        match self {
+            Command::UpdateIOProgress { .. }          => CommandName::UpdateIOProgress,
+            Command::AppendEntries { .. }             => CommandName::AppendEntries,
+            Command::ReplicateCommitted { .. }        => CommandName::ReplicateCommitted,
+            Command::BroadcastHeartbeat { .. }        => CommandName::BroadcastHeartbeat,
+            Command::SaveCommittedAndApply { .. }     => CommandName::SaveCommittedAndApply,
+            Command::Replicate { .. }                 => CommandName::Replicate,
+            Command::ReplicateSnapshot { .. }         => CommandName::ReplicateSnapshot,
+            Command::BroadcastTransferLeader { .. }   => CommandName::BroadcastTransferLeader,
+            Command::CloseReplicationStreams          => CommandName::CloseReplicationStreams,
+            Command::FailPendingReads                 => CommandName::FailPendingReads,
+            Command::RebuildReplicationStreams { .. } => CommandName::RebuildReplicationStreams,
+            Command::SaveVote { .. }                  => CommandName::SaveVote,
+            Command::SendVote { .. }                  => CommandName::SendVote,
+            Command::SendPreVote { .. }               => CommandName::SendPreVote,
+            Command::PurgeLog { .. }                  => CommandName::PurgeLog,
+            Command::TruncateLog { .. }               => CommandName::TruncateLog,
+            Command::StateMachine { command }          => CommandName::StateMachine(command.name()),
+            Command::Respond { .. }                   => CommandName::Respond,
+        }
+    }
+
+    #[allow(dead_code)]
+    #[rustfmt::skip]
+    pub(crate) fn kind(&self) -> CommandKind {
+        match self {
+            Command::CloseReplicationStreams          => CommandKind::Main,
+            Command::FailPendingReads                 => CommandKind::Main,
+            Command::RebuildReplicationStreams { .. } => CommandKind::Main,
+            Command::Respond { .. }                   => CommandKind::Respond,
+            // Apply is firstly handled by RaftCore, then forwarded to state machine worker.
+
+            Command::UpdateIOProgress { .. }          => CommandKind::Log,
+            Command::AppendEntries { .. }             => CommandKind::Log,
+            Command::SaveVote { .. }                  => CommandKind::Log,
+            Command::TruncateLog { .. }               => CommandKind::Log,
+
+            Command::PurgeLog { .. }                  => CommandKind::Log,
+
+            Command::ReplicateCommitted { .. }        => CommandKind::Network,
+            Command::BroadcastHeartbeat { .. }        => CommandKind::Network,
+            Command::Replicate { .. }                 => CommandKind::Network,
+            Command::ReplicateSnapshot { .. }         => CommandKind::Network,
+            Command::BroadcastTransferLeader { .. }   => CommandKind::Network,
+            Command::SendVote { .. }                  => CommandKind::Network,
+            Command::SendPreVote { .. }               => CommandKind::Network,
+
+            Command::SaveCommittedAndApply { .. }     => CommandKind::StateMachine,
+            Command::StateMachine { .. }              => CommandKind::StateMachine,
+        }
+    }
+
+    /// Return the condition the command waits for if any.
+    #[rustfmt::skip]
+    pub(crate) fn condition(&self) -> Option<Condition<C>> {
+        match self {
+            Command::CloseReplicationStreams          => None,
+            Command::FailPendingReads                 => None,
+            Command::RebuildReplicationStreams { .. } => None,
+            Command::Respond { when, .. }             => when.clone(),
+
+            Command::UpdateIOProgress { when, .. }    => when.clone(),
+            Command::AppendEntries { .. }             => None,
+            Command::SaveVote { .. }                  => None,
+            Command::TruncateLog { .. }               => None,
+
+            Command::PurgeLog { upto }                => Some(Condition::Snapshot { log_id: upto.clone() }),
+
+            Command::ReplicateCommitted { .. }        => None,
+            Command::BroadcastHeartbeat { .. }        => None,
+            Command::Replicate { .. }                 => None,
+            Command::ReplicateSnapshot { .. }         => None,
+            Command::BroadcastTransferLeader { .. }   => None,
+            Command::SendVote { .. }                  => None,
+            Command::SendPreVote { .. }               => None,
+
+            Command::SaveCommittedAndApply { .. }                     => None,
+            Command::StateMachine { .. }              => None,
+        }
+    }
+}
+
+/// A condition to wait for before executing a command or sending a respond.
+#[derive(Debug, Clone)]
+#[derive(PartialEq, Eq)]
+pub(crate) enum Condition<C>
+where C: RaftTypeConfig
+{
+    /// Wait for log IO to be flushed to storage.
+    ///
+    /// A log IO is uniquely identified by `(leader_id, log_id)`, not just `log_id`,
+    /// since the same log index can be written multiple times by different leaders.
+    IOFlushed { io_id: IOId<C> },
+
+    /// Wait for log entry to be flushed to storage (without specific leader).
+    #[allow(dead_code)]
+    LogFlushed { log_id: LogIdOf<C> },
+
+    /// Wait for log entry to be applied to state machine.
+    #[allow(dead_code)]
+    Applied { log_id: LogIdOf<C> },
+
+    /// Wait for snapshot to be built that includes this log entry.
+    Snapshot { log_id: LogIdOf<C> },
+}
+
+impl<C> fmt::Display for Condition<C>
+where C: RaftTypeConfig
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Condition::IOFlushed { io_id } => {
+                write!(f, "IOFlushed >= {}", io_id)
+            }
+            Condition::LogFlushed { log_id } => {
+                write!(f, "LogFlushed >= {}", log_id)
+            }
+            Condition::Applied { log_id } => write!(f, "Applied >= {}", log_id),
+            Condition::Snapshot { log_id } => write!(f, "Snapshot >= {}", log_id),
+        }
+    }
+}
+
+impl<C> Condition<C>
+where C: RaftTypeConfig
+{
+    /// Check if the condition is satisfied by the current IO state.
+    pub(crate) fn is_met(&self, io_state: &IOState<C>) -> bool {
+        match self {
+            Condition::IOFlushed { io_id } => self.is_satisfied_by(io_id, io_state.log_progress.flushed()),
+            Condition::LogFlushed { log_id } => self.is_satisfied_by(
+                log_id,
+                io_state.log_progress.flushed().and_then(|io_id| io_id.last_log_id()),
+            ),
+            Condition::Applied { log_id } => self.is_satisfied_by(log_id, io_state.apply_progress.flushed()),
+            Condition::Snapshot { log_id } => self.is_satisfied_by(log_id, io_state.snapshot.flushed()),
+        }
+    }
+
+    /// Check if actual value satisfies the expected threshold.
+    fn is_satisfied_by<T>(&self, expected: &T, actual: Option<&T>) -> bool
+    where T: PartialOrd + fmt::Display {
+        let Some(actual) = actual else {
+            tracing::debug!("{} is not met: actual: None", self);
+            return false;
+        };
+
+        if actual >= expected {
+            tracing::debug!("{} is met: actual: {}", self, actual);
+            true
+        } else {
+            tracing::debug!("{} is not met: actual: {}", self, actual);
+            false
+        }
+    }
+}
+
+/// A command to send return value to the caller via a `oneshot::Sender`.
+#[derive(Debug, PartialEq, Eq)]
+#[derive(derive_more::From)]
+pub(crate) enum Respond<C>
+where C: RaftTypeConfig
+{
+    Vote(ValueSender<C, VoteResponse<C>>),
+    AppendEntries(ValueSender<C, AppendResult<C>>),
+    InstallFullSnapshot(ValueSender<C, SnapshotResponse<C>>),
+    Initialize(ValueSender<C, Result<(), InitializeError<C>>>),
+}
+
+impl<C> fmt::Display for Respond<C>
+where C: RaftTypeConfig
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Respond::Vote(vs) => write!(f, "Vote {}", vs.value()),
+            Respond::AppendEntries(vs) => match vs.value() {
+                Ok(log_id) => write!(f, "AppendEntries Ok({})", log_id.display()),
+                Err(e) => write!(f, "AppendEntries Err({})", e),
+            },
+            Respond::InstallFullSnapshot(vs) => write!(f, "InstallFullSnapshot {}", vs.value()),
+            Respond::Initialize(vs) => write!(f, "Initialize {}", vs.value().as_ref().map(|_x| "()").display()),
+        }
+    }
+}
+
+impl<C> Respond<C>
+where C: RaftTypeConfig
+{
+    pub(crate) fn new<T>(res: T, tx: OneshotSenderOf<C, T>) -> Self
+    where
+        T: Debug + PartialEq + Eq + OptionalSend,
+        Self: From<ValueSender<C, T>>,
+    {
+        Respond::from(ValueSender::new(res, tx))
+    }
+
+    pub(crate) fn send(self) {
+        match self {
+            Respond::Vote(x) => x.send(),
+            Respond::AppendEntries(x) => x.send(),
+            Respond::InstallFullSnapshot(x) => x.send(),
+            Respond::Initialize(x) => x.send(),
+        }
+    }
+}
+
+pub(crate) struct ValueSender<C, T>
+where
+    T: Debug + PartialEq + Eq + OptionalSend,
+    C: RaftTypeConfig,
+{
+    value: T,
+    tx: OneshotSenderOf<C, T>,
+}
+
+impl<C, T> Debug for ValueSender<C, T>
+where
+    T: Debug + PartialEq + Eq + OptionalSend,
+    C: RaftTypeConfig,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValueSender").field("value", &self.value).finish()
+    }
+}
+
+impl<C, T> PartialEq for ValueSender<C, T>
+where
+    T: Debug + PartialEq + Eq + OptionalSend,
+    C: RaftTypeConfig,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<C, T> Eq for ValueSender<C, T>
+where
+    T: Debug + PartialEq + Eq + OptionalSend,
+    C: RaftTypeConfig,
+{
+}
+
+impl<C, T> ValueSender<C, T>
+where
+    T: Debug + PartialEq + Eq + OptionalSend,
+    C: RaftTypeConfig,
+{
+    pub(crate) fn new(res: T, tx: OneshotSenderOf<C, T>) -> Self {
+        Self { value: res, tx }
+    }
+
+    pub(crate) fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub(crate) fn send(self) {
+        self.tx.send(self.value).ok();
+    }
+}

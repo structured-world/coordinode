@@ -105,6 +105,9 @@ benches/gold/Cargo.lock
 # Parser generator build output (its lockfile is committed: the generated
 # parser depends on the generator's version)
 tools/pest-codegen/target/
+# Vendored openraft workspace: built only to package it for publication
+vendor/target/
+vendor/Cargo.lock
 
 # External test fixtures (Neo4j example dumps etc.) - downloaded, not versioned
 /test-data/

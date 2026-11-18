@@ -1,0 +1,468 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use maplit::btreeset;
+use pretty_assertions::assert_eq;
+
+use crate::Membership;
+use crate::MembershipState;
+use crate::Vote;
+use crate::batch::Batch;
+use crate::core::ServerState;
+use crate::engine::Command;
+use crate::engine::Condition;
+use crate::engine::Engine;
+use crate::engine::Respond;
+use crate::engine::testing::UTConfig;
+use crate::engine::testing::log_id;
+use crate::entry::RaftEntry;
+use crate::errors::ConflictingLogId;
+use crate::errors::RejectAppendEntries;
+use crate::errors::RejectVote;
+use crate::raft::AppendError;
+use crate::raft::AppendResult;
+use crate::raft::ConflictHint;
+use crate::raft::LogSegment;
+use crate::raft_state::IOId;
+use crate::raft_state::LogStateReader;
+use crate::testing::blank_ent;
+use crate::type_config::TypeConfigExt;
+use crate::type_config::alias::EntryOf;
+use crate::type_config::alias::StoredMembershipOf;
+use crate::utime::Leased;
+use crate::vote::raft_vote::RaftVoteExt;
+
+fn m01() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {0,1}], [])
+}
+
+fn m23() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {2,3}], [])
+}
+
+fn m34() -> Membership<u64, ()> {
+    Membership::<u64, ()>::new_with_defaults(vec![btreeset! {3,4}], [])
+}
+
+fn eng() -> Engine<UTConfig> {
+    let mut eng = Engine::testing_default(0);
+    eng.state.enable_validation(false); // Disable validation for incomplete state
+
+    eng.config.id = 2;
+    eng.state.vote = Leased::new(UTConfig::<()>::now(), Duration::from_millis(500), Vote::new(2, 1));
+    // Last-per-leader format: leader 1's last at index 2, leader 2's last at index 3
+    eng.state.log_ids.append(log_id(1, 1, 2));
+    eng.state.log_ids.append(log_id(2, 1, 3));
+    eng.state.apply_progress_mut().accept(log_id(0, 1, 0));
+    eng.state.membership_state = MembershipState::new(
+        Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+        Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(2, 1, 3)), m23())),
+    );
+    eng.state.server_state = eng.calc_server_state();
+    eng
+}
+
+#[test]
+fn test_append_entries_vote_is_rejected() -> anyhow::Result<()> {
+    let mut eng = eng();
+
+    let res = eng.append_entries(&Vote::new(1, 1), LogSegment::new(None, vec![]));
+
+    assert_eq!(
+        Err(RejectAppendEntries::RejectVote(RejectVote {
+            higher: Vote::new(2, 1),
+        })),
+        res
+    );
+    assert_eq!(None, eng.state.log_ids.purged());
+    assert_eq!(
+        &[
+            log_id(1, 1, 2), // Last-per-leader: leader 1's last at index 2
+            log_id(2, 1, 3),
+        ],
+        eng.state.log_ids.key_log_ids()
+    );
+    assert_eq!(Vote::new(2, 1), *eng.state.vote_ref());
+    assert_eq!(Some(&log_id(2, 1, 3)), eng.state.last_log_id());
+    assert_eq!(
+        MembershipState::new(
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(2, 1, 3)), m23())),
+        ),
+        eng.state.membership_state
+    );
+    assert_eq!(ServerState::Follower, eng.state.server_state);
+    assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+#[test]
+fn test_append_entries_prev_log_id_is_applied() -> anyhow::Result<()> {
+    // An applied log id has to be committed thus
+    let mut eng = eng();
+    eng.state.vote = Leased::new(UTConfig::<()>::now(), Duration::from_millis(500), Vote::new(1, 2));
+    eng.output.take_commands();
+
+    let res = eng.append_entries(
+        &Vote::new_committed(2, 1),
+        LogSegment::new(Some(log_id(0, 1, 0)), vec![]),
+    );
+
+    assert_eq!(Ok(Some(log_id(0, 1, 0))), res);
+    assert_eq!(None, eng.state.log_ids.purged());
+    assert_eq!(
+        &[
+            log_id(1, 1, 2), // Last-per-leader: leader 1's last at index 2
+            log_id(2, 1, 3), //
+        ],
+        eng.state.log_ids.key_log_ids()
+    );
+    assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
+    assert_eq!(Some(&log_id(2, 1, 3)), eng.state.last_log_id());
+    assert_eq!(
+        MembershipState::new(
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(2, 1, 3)), m23())),
+        ),
+        eng.state.membership_state
+    );
+    assert_eq!(ServerState::Follower, eng.state.server_state);
+    assert_eq!(
+        vec![
+            Command::FailPendingReads,
+            Command::SaveVote {
+                vote: Vote::new_committed(2, 1)
+            },
+            Command::UpdateIOProgress {
+                when: Some(Condition::IOFlushed {
+                    io_id: IOId::new_log_io(Vote::new(2, 1).to_committed(), None)
+                }),
+                io_id: IOId::new_log_io(Vote::new(2, 1).to_committed(), Some(log_id(0, 1, 0)))
+            }
+        ],
+        eng.output.take_commands()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_append_entries_prev_log_id_conflict() -> anyhow::Result<()> {
+    let mut eng = eng();
+
+    let res = eng.append_entries(
+        &Vote::new_committed(2, 1),
+        LogSegment::new(Some(log_id(2, 1, 2)), vec![]),
+    );
+
+    assert_eq!(
+        Err(RejectAppendEntries::ConflictingLogId(ConflictingLogId {
+            expect: log_id(2, 1, 2),
+            local: Some(log_id(1, 1, 2)),
+        })),
+        res
+    );
+    assert_eq!(None, eng.state.log_ids.purged());
+    assert_eq!(
+        &[
+            log_id(1, 1, 1), //
+        ],
+        eng.state.log_ids.key_log_ids()
+    );
+    assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
+    assert_eq!(Some(&log_id(1, 1, 1)), eng.state.last_log_id());
+    assert_eq!(
+        MembershipState::new(
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+        ),
+        eng.state.membership_state
+    );
+    assert_eq!(ServerState::Learner, eng.state.server_state);
+    assert_eq!(
+        vec![
+            Command::FailPendingReads,
+            Command::SaveVote {
+                vote: Vote::new_committed(2, 1)
+            },
+            Command::TruncateLog {
+                after: Some(log_id(1, 1, 1))
+            },
+        ],
+        eng.output.take_commands()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_append_entries_prev_log_id_is_committed() -> anyhow::Result<()> {
+    let mut eng = eng();
+
+    let res = eng.append_entries(
+        &Vote::new_committed(2, 1),
+        LogSegment::new(Some(log_id(0, 1, 0)), vec![
+            blank_ent::<UTConfig>(1, 1, 1),
+            blank_ent::<UTConfig>(2, 1, 2),
+        ]),
+    );
+
+    assert_eq!(Ok(Some(log_id(2, 1, 2))), res);
+    assert_eq!(None, eng.state.log_ids.purged());
+    assert_eq!(
+        &[
+            log_id(1, 1, 1), // After truncation: leader 1 ends at index 1
+            log_id(2, 1, 2), // New leader 2 entry at index 2
+        ],
+        eng.state.log_ids.key_log_ids()
+    );
+    assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
+    assert_eq!(Some(&log_id(2, 1, 2)), eng.state.last_log_id());
+    assert_eq!(
+        MembershipState::new(
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+        ),
+        eng.state.membership_state
+    );
+    assert_eq!(ServerState::Learner, eng.state.server_state);
+    assert_eq!(
+        vec![
+            Command::FailPendingReads,
+            Command::SaveVote {
+                vote: Vote::new_committed(2, 1)
+            },
+            Command::TruncateLog {
+                after: Some(log_id(1, 1, 1))
+            },
+            Command::AppendEntries {
+                committed_vote: Vote::new(2, 1).to_committed(),
+                entries: Batch::of([blank_ent::<UTConfig>(2, 1, 2)])
+            },
+        ],
+        eng.output.take_commands()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_append_entries_prev_log_id_not_exists() -> anyhow::Result<()> {
+    let mut eng = eng();
+    eng.state.vote = Leased::new(UTConfig::<()>::now(), Duration::from_millis(500), Vote::new(1, 2));
+    eng.output.take_commands();
+
+    let res = eng.append_entries(
+        &Vote::new_committed(2, 1),
+        LogSegment::new(Some(log_id(2, 1, 4)), vec![
+            blank_ent::<UTConfig>(2, 1, 5),
+            blank_ent::<UTConfig>(2, 1, 6),
+        ]),
+    );
+
+    assert_eq!(
+        Err(RejectAppendEntries::ConflictingLogId(ConflictingLogId {
+            expect: log_id(2, 1, 4),
+            local: None,
+        })),
+        res
+    );
+    assert_eq!(None, eng.state.log_ids.purged());
+    assert_eq!(
+        &[
+            log_id(1, 1, 2), // Last-per-leader: leader 1's last at index 2
+            log_id(2, 1, 3), //
+        ],
+        eng.state.log_ids.key_log_ids()
+    );
+    assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
+    assert_eq!(Some(&log_id(2, 1, 3)), eng.state.last_log_id());
+    assert_eq!(
+        MembershipState::new(
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(2, 1, 3)), m23())),
+        ),
+        eng.state.membership_state
+    );
+    assert_eq!(ServerState::Follower, eng.state.server_state);
+    assert_eq!(
+        vec![Command::FailPendingReads, Command::SaveVote {
+            vote: Vote::new_committed(2, 1)
+        },],
+        eng.output.take_commands()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_append_entries_conflict() -> anyhow::Result<()> {
+    // prev_log_id matches,
+    // The second entry in entries conflict.
+    // This request will replace the effective membership.
+    // committed is greater than entries.
+    // It is no longer a member, change to learner
+    let mut eng = eng();
+
+    let resp = eng.append_entries(
+        &Vote::new_committed(2, 1),
+        LogSegment::new(Some(log_id(1, 1, 1)), vec![
+            blank_ent::<UTConfig>(1, 1, 2),
+            EntryOf::<UTConfig>::new_membership(log_id(3, 1, 3), m34()),
+        ]),
+    );
+
+    assert_eq!(Ok(Some(log_id(3, 1, 3))), resp);
+    assert_eq!(None, eng.state.log_ids.purged());
+    assert_eq!(
+        &[
+            log_id(1, 1, 2), // Leader 1's last is at index 2 (blank_ent at index 2)
+            log_id(3, 1, 3), // Leader 3's last is at index 3 (membership entry)
+        ],
+        eng.state.log_ids.key_log_ids()
+    );
+    assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
+    assert_eq!(Some(&log_id(3, 1, 3)), eng.state.last_log_id());
+    assert_eq!(
+        MembershipState::new(
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+            Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(3, 1, 3)), m34())),
+        ),
+        eng.state.membership_state
+    );
+    assert_eq!(ServerState::Learner, eng.state.server_state);
+    assert_eq!(
+        vec![
+            Command::FailPendingReads,
+            Command::SaveVote {
+                vote: Vote::new_committed(2, 1)
+            },
+            Command::TruncateLog {
+                after: Some(log_id(1, 1, 2))
+            },
+            Command::AppendEntries {
+                committed_vote: Vote::new(2, 1).to_committed(),
+                entries: Batch::of([EntryOf::<UTConfig>::new_membership(log_id(3, 1, 3), m34())])
+            },
+        ],
+        eng.output.take_commands()
+    );
+
+    Ok(())
+}
+
+/// A heartbeat (no entries) is answered once the vote and the log up to its `prev_log_id` are
+/// flushed, not once every accepted entry is: a disk still syncing earlier entries must not delay
+/// the reply that keeps the leader's lease.
+#[test]
+fn test_handle_append_entries_heartbeat_waits_only_for_its_prev_log_id() -> anyhow::Result<()> {
+    let mut eng = eng();
+    eng.state.vote = Leased::new(
+        UTConfig::<()>::now(),
+        Duration::from_millis(500),
+        Vote::new_committed(2, 1),
+    );
+    // The log IO up to (2,1,3) is accepted but not yet flushed.
+    eng.state.accept_log_io(IOId::new_log_io(Vote::new(2, 1).to_committed(), Some(log_id(2, 1, 3))));
+    eng.output.take_commands();
+    let (tx, _rx) = UTConfig::<()>::oneshot();
+
+    eng.handle_append_entries(
+        &Vote::new_committed(2, 1),
+        LogSegment::new(Some(log_id(1, 1, 2)), vec![]),
+        tx,
+    );
+
+    let reply = eng.output.take_commands().into_iter().find(|cmd| matches!(cmd, Command::Respond { .. }));
+    assert_eq!(
+        Some(Condition::IOFlushed {
+            io_id: IOId::new_log_io(Vote::new(2, 1).to_committed(), Some(log_id(1, 1, 2)))
+        }),
+        reply.and_then(|cmd| cmd.condition())
+    );
+
+    Ok(())
+}
+
+/// A request that carries entries is answered only once they are flushed.
+#[test]
+fn test_handle_append_entries_with_entries_waits_for_them() -> anyhow::Result<()> {
+    let mut eng = eng();
+    eng.state.vote = Leased::new(
+        UTConfig::<()>::now(),
+        Duration::from_millis(500),
+        Vote::new_committed(2, 1),
+    );
+    // The log IO up to (2,1,3) is accepted but not yet flushed.
+    eng.state.accept_log_io(IOId::new_log_io(Vote::new(2, 1).to_committed(), Some(log_id(2, 1, 3))));
+    eng.output.take_commands();
+    let (tx, _rx) = UTConfig::<()>::oneshot();
+
+    eng.handle_append_entries(
+        &Vote::new_committed(2, 1),
+        LogSegment::new(Some(log_id(2, 1, 3)), vec![blank_ent::<UTConfig>(2, 1, 4)]),
+        tx,
+    );
+
+    let reply = eng.output.take_commands().into_iter().find(|cmd| matches!(cmd, Command::Respond { .. }));
+    assert_eq!(
+        Some(Condition::IOFlushed {
+            io_id: IOId::new_log_io(Vote::new(2, 1).to_committed(), Some(log_id(2, 1, 4)))
+        }),
+        reply.and_then(|cmd| cmd.condition())
+    );
+
+    Ok(())
+}
+
+/// A conflict reply describes the log after truncation and claims no flushed log.
+#[test]
+fn conflict_reply_describes_the_truncated_log() {
+    let mut eng = eng();
+    let vote = Vote::new_committed(2, 1);
+    let segment = LogSegment::new(Some(log_id(2, 1, 2)), vec![]);
+    let (tx, _rx) = UTConfig::<()>::oneshot();
+
+    eng.handle_append_entries(&vote, segment, tx);
+
+    let mut commands = eng.output.take_commands();
+    let actual = commands.pop().unwrap();
+
+    let truncated = Command::TruncateLog {
+        after: Some(log_id(1, 1, 1)),
+    };
+    assert_eq!(Some(&truncated), commands.last());
+
+    let hint = ConflictHint::new(vec![log_id(0, 1, 0), log_id(1, 1, 1)]);
+    let result: AppendResult<UTConfig> = Err(AppendError::Conflict {
+        log_id: log_id(2, 1, 2),
+        hint: Some(hint),
+    });
+    let (tx, _rx) = UTConfig::<()>::oneshot();
+    let expected = Command::Respond {
+        when: None,
+        resp: Respond::new(result, tx),
+    };
+    assert_eq!(expected, actual);
+}
+
+/// A rejected vote is answered at once.
+#[test]
+fn vote_rejection_is_answered_at_once() {
+    let mut eng = eng();
+    let segment = LogSegment::new(Some(log_id(2, 1, 3)), vec![]);
+    let (tx, _rx) = UTConfig::<()>::oneshot();
+
+    eng.handle_append_entries(&Vote::new(1, 1), segment, tx);
+
+    let commands = eng.output.take_commands();
+
+    let result: AppendResult<UTConfig> = Err(AppendError::HigherVote(Vote::new(2, 1)));
+    let (tx, _rx) = UTConfig::<()>::oneshot();
+    let expected = vec![Command::Respond {
+        when: None,
+        resp: Respond::new(result, tx),
+    }];
+    assert_eq!(expected, commands);
+}

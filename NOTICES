@@ -29,6 +29,19 @@ the original authors is carried in that crate's own repository and source
 headers, not here.
 
 
+## Vendored source
+
+`vendor/openraft`, `vendor/openraft-macros`, `vendor/openraft-rt` and
+`vendor/openraft-rt-tokio` are openraft (https://github.com/databendlabs/openraft,
+MIT OR Apache-2.0, Copyright the Databend authors and the openraft
+contributors) from commit 8175ca602330a4534a25190d9b64a182859cec9c of its main
+branch. Their source is unchanged; their Cargo.toml and openraft's README.md
+are rewritten for the package names. They are published as
+`coordinode-openraft`, `coordinode-openraft-macros`, `coordinode-openraft-rt`
+and `coordinode-openraft-rt-tokio` until an openraft release carries what the
+workspace needs. Each directory holds its LICENSE (MIT) and COPYRIGHT.
+
+
 ## Embedded data
 
 `crates/coordinode-search/data/jieba/dict.txt.zst` is jieba's default Chinese

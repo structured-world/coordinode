@@ -1,0 +1,119 @@
+//! Bounded MPSC channel traits.
+
+mod buffered_receiver;
+mod peekable_receiver;
+mod send_error;
+mod try_recv_error;
+
+use std::future::Future;
+
+pub use buffered_receiver::BufferedReceiver;
+use openraft_macros::since;
+pub use peekable_receiver::PeekableReceiver;
+pub use send_error::SendError;
+pub use try_recv_error::TryRecvError;
+
+use crate::AsyncRuntime;
+use crate::OptionalSend;
+use crate::OptionalSync;
+
+/// Multi-producer, single-consumer channel.
+#[since(version = "0.10.0", change = "remove the `OptionalSend` requirement")]
+pub trait Mpsc: Sized {
+    /// The sender type for this MPSC channel.
+    type Sender<T: OptionalSend>: MpscSender<Self, T>;
+    /// The receiver type for this MPSC channel.
+    type Receiver<T: OptionalSend>: MpscReceiver<T>;
+    /// The weak sender type for this MPSC channel.
+    type WeakSender<T: OptionalSend>: MpscWeakSender<Self, T>;
+
+    /// Creates a bounded mpsc channel for communicating between asynchronous tasks with
+    /// backpressure.
+    #[track_caller]
+    fn channel<T: OptionalSend>(buffer: usize) -> (Self::Sender<T>, Self::Receiver<T>);
+}
+
+/// Send values to the associated [`MpscReceiver`].
+pub trait MpscSender<MU, T>: OptionalSend + OptionalSync + Clone
+where
+    MU: Mpsc,
+    T: OptionalSend,
+{
+    /// Attempts to send a message, blocks if there is no capacity.
+    ///
+    /// If the receiving half of the channel is closed, this
+    /// function returns an error. The error includes the value passed to `send`.
+    #[track_caller]
+    fn send(&self, msg: T) -> impl Future<Output = Result<(), SendError<T>>> + OptionalSend;
+
+    /// Converts the [`MpscSender`] to a [`MpscWeakSender`] that does not count
+    /// towards RAII semantics, i.e., if all `Sender` instances of the
+    /// channel were dropped and only `WeakSender` instances remain,
+    /// the channel is closed.
+    #[track_caller]
+    fn downgrade(&self) -> MU::WeakSender<T>;
+}
+
+/// Receive values from the associated [`MpscSender`].
+#[since(version = "0.10.0", change = "add an unbounded receiver buffer adapter")]
+#[since(version = "0.10.0", change = "add peekable receiver conversion")]
+#[since(version = "0.10.0", change = "remove the `OptionalSync` requirement")]
+pub trait MpscReceiver<T>: OptionalSend {
+    /// Receives the next value for this receiver.
+    ///
+    /// This method returns `None` if the channel has been closed and there are
+    /// no remaining messages in the channel's buffer.
+    #[track_caller]
+    fn recv(&mut self) -> impl Future<Output = Option<T>> + OptionalSend;
+
+    /// Tries to receive the next value for this receiver.
+    ///
+    /// This method returns the [`TryRecvError::Empty`] error if the channel is currently
+    /// empty, but there are still outstanding senders.
+    ///
+    /// This method returns the [`TryRecvError::Disconnected`] error if the channel is
+    /// currently empty, and there are no outstanding senders.
+    #[track_caller]
+    fn try_recv(&mut self) -> Result<T, TryRecvError>;
+
+    /// Drain this receiver in a background task, buffering messages without a backlog limit.
+    ///
+    /// The producer can keep sending while the consumer is busy. Memory use grows with the
+    /// backlog. Dropping the returned receiver cancels the task and releases the source receiver.
+    #[since(version = "0.10.0")]
+    fn with_unbounded_buffer<Rt>(self) -> BufferedReceiver<Rt, T>
+    where
+        Rt: AsyncRuntime,
+        Self: Sized + 'static,
+        T: OptionalSend + 'static,
+    {
+        BufferedReceiver::new(self)
+    }
+
+    /// Wraps this receiver to inspect the next item without consuming it or waiting.
+    #[since(version = "0.10.0")]
+    fn peekable(self) -> PeekableReceiver<Self, T>
+    where
+        Self: Sized,
+        T: OptionalSend,
+    {
+        PeekableReceiver::new(self)
+    }
+}
+
+/// A sender that does not prevent the channel from being closed.
+///
+/// If all [`MpscSender`] instances of a channel were dropped and only
+/// `WeakSender` instances remain, the channel is closed.
+pub trait MpscWeakSender<MU, T>: OptionalSend + OptionalSync + Clone
+where
+    MU: Mpsc,
+    T: OptionalSend,
+{
+    /// Tries to convert a [`MpscWeakSender`] into an [`MpscSender`].
+    ///
+    /// This will return `Some` if there are other `Sender` instances alive and
+    /// the channel wasn't previously dropped, otherwise `None` is returned.
+    #[track_caller]
+    fn upgrade(&self) -> Option<MU::Sender<T>>;
+}

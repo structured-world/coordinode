@@ -1,0 +1,82 @@
+# openraft from its upstream main branch, unchanged, published under this name
+# until an openraft release carries what the workspace needs; then it goes and
+# the workspace depends on openraft again.
+[package]
+name = "coordinode-openraft"
+description = "openraft (Advanced Raft consensus) from its upstream main branch, as CoordiNode uses it"
+version.workspace = true
+edition = "2024"
+authors = [
+    "Databend Authors <opensource@datafuselabs.com>",
+    "Anthony Dodd <Dodd.AnthonyJosiah@gmail.com>",
+]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/databendlabs/openraft"
+repository = "https://github.com/structured-world/coordinode"
+readme = "README.md"
+keywords = ["raft", "consensus"]
+categories = ["algorithms", "asynchronous", "data-structures"]
+publish = true
+include = ["/src/**", "/README.md", "/LICENSE", "/COPYRIGHT", "/NOTICES", "/Cargo.toml"]
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "openraft"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[features]
+adapt-network-v1 = []
+bench = ["tokio-rt"]
+bt = ["anyerror/backtrace", "anyhow/backtrace"]
+clap = ["dep:clap", "dep:parse-size"]
+compat = ["serde"]
+default = ["tokio-rt", "clap"]
+loosen-follower-log-revert = []
+metrics-logids = []
+runtime-stats = ["dep:tabled"]
+serde = ["dep:serde"]
+single-term-leader = []
+single-threaded = [
+    "openraft-rt/single-threaded",
+    "openraft-rt-tokio?/single-threaded",
+    "openraft-macros/single-threaded",
+]
+singlethreaded = []
+tokio-rt = ["dep:openraft-rt-tokio"]
+tracing-log = ["tracing/log"]
+type-alias = []
+
+[dependencies]
+anyerror = "0.1.10"
+anyhow = { version = "1.0.63", optional = true }
+backoff-series = "0.1.1"
+base2histogram = "0.2.3"
+chrono = "0.4"
+clap = { version = "4.1.11", features = ["derive", "env"], optional = true }
+derive_more = { version = "2.1.1", features = ["std", "from", "try_into", "display"] }
+display-more = "0.2.6"
+futures-util = "0.3"
+itertools = "0.15"
+maplit = "1.0.2"
+openraft-macros = { package = "coordinode-openraft-macros", version = "0.10.1", path = "../openraft-macros" }
+openraft-rt = { package = "coordinode-openraft-rt", version = "0.10.1", path = "../openraft-rt" }
+openraft-rt-tokio = { package = "coordinode-openraft-rt-tokio", version = "0.10.1", path = "../openraft-rt-tokio", optional = true }
+parse-size = { version = "1.1.0", optional = true }
+peel-off = "0.1.0"
+quorum-set = "0.6.0"
+rand = "0.10"
+serde = { version = "1.0.114", features = ["derive", "rc"], optional = true }
+serde_json = { version = "1.0.57", optional = true }
+smallvec = "1"
+tabled = { version = "0.20.0", features = ["std"], optional = true, default-features = false }
+thiserror = "2.0.18"
+tracing = "0.1.40"
+validit = "0.2.6"
+
+# Upstream's code as it is: the workspace's own lints do not apply.
+[lints]

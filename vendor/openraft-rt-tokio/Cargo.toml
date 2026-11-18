@@ -1,0 +1,43 @@
+# openraft-rt-tokio from openraft's upstream main branch, unchanged; see
+# vendor/openraft/Cargo.toml.
+[package]
+name = "coordinode-openraft-rt-tokio"
+description = "openraft-rt-tokio (Tokio runtime for Openraft) from openraft's upstream main branch, as CoordiNode uses it"
+version.workspace = true
+edition = "2024"
+authors = [
+    "drdrxp <drdr.xp@gmail.com>",
+    "Databend Authors <opensource@datafuselabs.com>",
+]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/databendlabs/openraft"
+repository = "https://github.com/structured-world/coordinode"
+readme = "README.md"
+publish = true
+include = ["/src/**", "/README.md", "/LICENSE", "/COPYRIGHT", "/NOTICES", "/Cargo.toml"]
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "openraft_rt_tokio"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[features]
+default = []
+single-threaded = ["openraft-rt/single-threaded"]
+
+[dependencies]
+futures-util = "0.3"
+openraft-rt = { package = "coordinode-openraft-rt", version = "0.10.1", path = "../openraft-rt" }
+rand = { version = "0.10", features = ["std", "std_rng", "thread_rng"], default-features = false }
+tokio = { version = "1.39", features = ["rt", "sync", "time"], default-features = false }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1.39", features = ["rt-multi-thread"], default-features = false }
+
+# Upstream's code as it is: the workspace's own lints do not apply.
+[lints]

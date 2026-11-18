@@ -1,0 +1,253 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use maplit::btreeset;
+use pretty_assertions::assert_eq;
+
+use crate::Membership;
+use crate::MembershipState;
+use crate::Vote;
+use crate::batch::Batch;
+use crate::engine::Command;
+use crate::engine::Condition;
+use crate::engine::Engine;
+use crate::engine::LogIdList;
+use crate::engine::testing::UTConfig;
+use crate::engine::testing::log_id;
+use crate::raft_state::IOId;
+use crate::raft_state::LogStateReader;
+use crate::raft_state::io_state::log_io_id::LogIOId;
+use crate::testing::blank_ent;
+use crate::type_config::TypeConfigExt;
+use crate::type_config::alias::StoredMembershipOf;
+use crate::type_config::alias::VoteOf;
+use crate::utime::Leased;
+use crate::vote::raft_vote::RaftVoteExt;
+
+fn m01() -> Membership<u64, ()> {
+    Membership::new_with_defaults(vec![btreeset! {0,1}], [])
+}
+
+fn m23() -> Membership<u64, ()> {
+    Membership::new_with_defaults(vec![btreeset! {2,3}], [])
+}
+
+fn eng() -> Engine<UTConfig> {
+    let mut eng: Engine<UTConfig> = Engine::testing_default(0);
+    eng.state.enable_validation(false); // Disable validation for incomplete state
+
+    eng.config.id = 2;
+    let vote = VoteOf::<UTConfig>::new_committed(2, 1);
+    let now = UTConfig::<()>::now();
+    eng.state.vote.update(now, Duration::from_millis(500), vote);
+    eng.state.log_ids.append(log_id(1, 1, 1));
+    eng.state.log_ids.append(log_id(2, 1, 3));
+    eng.state.membership_state = MembershipState::new(
+        Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(1, 1, 1)), m01())),
+        Arc::new(StoredMembershipOf::<UTConfig>::new(Some(log_id(2, 1, 3)), m23())),
+    );
+    eng.state.server_state = eng.calc_server_state();
+    eng
+}
+
+#[test]
+fn conflict_hint_survives_vote_only_flush() {
+    let mut eng = eng();
+    let expected = crate::raft::ConflictHint::new(vec![log_id(1, 1, 1), log_id(2, 1, 3)]);
+    let vote_io = IOId::new_log_io(Vote::new(3, 1).to_committed(), None);
+    eng.state.log_progress_mut().try_update_all(vote_io);
+
+    let actual = eng.following_handler().conflict_hint();
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn conflict_hint_excludes_truncated_entries() {
+    let mut eng = eng();
+    let prev = log_id(3, 1, 3);
+    let result = eng.following_handler().ensure_log_consecutive(Some(&prev));
+    let expected_error = crate::errors::ConflictingLogId {
+        expect: prev,
+        local: Some(log_id(2, 1, 3)),
+    };
+    assert_eq!(
+        Err(crate::errors::RejectAppendEntries::ConflictingLogId(expected_error)),
+        result
+    );
+    let hint = eng.following_handler().conflict_hint();
+    let expected = crate::raft::ConflictHint::new(vec![log_id(1, 1, 1), log_id(2, 1, 2)]);
+    assert_eq!(expected, hint);
+}
+
+#[test]
+fn conflict_hint_uses_local_commit_and_only_later_samples() {
+    let mut eng = eng();
+    let committed_log_id = log_id(2, 1, 2);
+    let committed = Some(committed_log_id);
+    eng.state.update_local_committed(&committed);
+    let vote = eng.state.vote_ref().to_committed();
+    let cluster_committed = LogIOId::new(vote, Some(log_id(2, 1, 9)));
+    let io_state = eng.state.io_state_mut();
+    let updated = io_state.cluster_committed.try_update(cluster_committed);
+    updated.unwrap();
+
+    let hint = eng.following_handler().conflict_hint();
+    let tail = log_id(2, 1, 3);
+    let expected = crate::raft::ConflictHint::new(vec![committed_log_id, tail]);
+    assert_eq!(expected, hint);
+}
+
+#[test]
+fn conflict_hint_deduplicates_the_committed_tail() {
+    let mut eng = eng();
+    let tail = log_id(2, 1, 3);
+    let committed = Some(tail);
+    eng.state.update_local_committed(&committed);
+    let hint = eng.following_handler().conflict_hint();
+    let expected = crate::raft::ConflictHint::new(vec![tail]);
+    assert_eq!(expected, hint);
+}
+
+#[test]
+fn conflict_hint_includes_a_fully_purged_tail() {
+    let mut eng = eng();
+    let tail = log_id(2, 1, 3);
+    let committed = Some(tail);
+    eng.state.update_local_committed(&committed);
+    eng.state.log_ids.purge(&tail);
+    let hint = eng.following_handler().conflict_hint();
+    let expected = crate::raft::ConflictHint::new(vec![tail]);
+    assert_eq!(expected, hint);
+}
+
+#[test]
+fn conflict_hint_keeps_commit_and_tail_when_samples_are_limited() {
+    let mut eng = eng();
+    let log_ids = (1..=12).map(|index| log_id(index, 1, index));
+    eng.state.log_ids = LogIdList::new(None, log_ids);
+    let committed_log_id = log_id(2, 1, 2);
+    let committed = Some(committed_log_id);
+    eng.state.update_local_committed(&committed);
+    let hint = eng.following_handler().conflict_hint();
+    let indices = [2, 6, 7, 8, 9, 10, 11, 12];
+    let log_ids = indices.map(|index| log_id(index, 1, index));
+    let expected = crate::raft::ConflictHint::new(log_ids.to_vec());
+    assert_eq!(expected, hint);
+}
+
+#[test]
+fn conflict_hint_without_commit_keeps_the_recent_leader_boundaries() {
+    let mut eng = eng();
+    let log_ids = (1..=12).map(|index| log_id(index, 1, index));
+    eng.state.log_ids = LogIdList::new(None, log_ids);
+
+    let hint = eng.following_handler().conflict_hint();
+
+    let log_ids = (6..=12).map(|index| log_id(index, 1, index));
+    let expected = crate::raft::ConflictHint::new(log_ids.collect());
+    assert_eq!(expected, hint);
+}
+
+#[test]
+fn conflict_hint_does_not_repeat_a_committed_leader_boundary() {
+    let mut eng = eng();
+    let log_ids = (1..=12).map(|index| log_id(index, 1, index));
+    eng.state.log_ids = LogIdList::new(None, log_ids);
+    let committed = Some(log_id(8, 1, 8));
+    eng.state.update_local_committed(&committed);
+
+    let hint = eng.following_handler().conflict_hint();
+
+    let log_ids = (8..=12).map(|index| log_id(index, 1, index));
+    let expected = crate::raft::ConflictHint::new(log_ids.collect());
+    assert_eq!(expected, hint);
+}
+
+#[test]
+fn conflict_hint_of_an_empty_log_is_empty() {
+    let mut eng = eng();
+    eng.state.log_ids = LogIdList::default();
+
+    let hint = eng.following_handler().conflict_hint();
+
+    let expected = crate::raft::ConflictHint::new(vec![]);
+    assert_eq!(expected, hint);
+}
+
+#[test]
+fn test_follower_append_entries_update_accepted() -> anyhow::Result<()> {
+    let mut eng = eng();
+
+    eng.output.clear_commands();
+
+    eng.following_handler().append_entries(Some(log_id(2, 1, 3)), vec![
+        //
+        blank_ent::<UTConfig>(3, 1, 4),
+        blank_ent::<UTConfig>(3, 1, 5),
+    ]);
+
+    assert_eq!(None, eng.state.log_ids.purged());
+    assert_eq!(
+        &[
+            log_id(1, 1, 1), //
+            log_id(2, 1, 3),
+            log_id(3, 1, 5),
+        ],
+        eng.state.log_ids.key_log_ids()
+    );
+    assert_eq!(
+        Some(&IOId::new_log_io(Vote::new(2, 1).to_committed(), Some(log_id(3, 1, 5)))),
+        eng.state.accepted_log_io()
+    );
+    assert_eq!(eng.output.take_commands(), vec![
+        //
+        Command::AppendEntries {
+            committed_vote: Vote::new(2, 1).to_committed(),
+            entries: Batch::of([blank_ent::<UTConfig>(3, 1, 4), blank_ent::<UTConfig>(3, 1, 5)]),
+        }
+    ]);
+
+    // Update to a new Leader and smaller log id
+    {
+        // Assume this node's Leader becomes T3-N1
+        eng.state.vote = Leased::new(
+            UTConfig::<()>::now(),
+            Duration::from_millis(500),
+            Vote::new_committed(3, 1),
+        );
+        eng.following_handler().append_entries(Some(log_id(2, 1, 3)), vec![
+            //
+            blank_ent::<UTConfig>(3, 1, 4),
+        ]);
+        assert_eq!(Some(&log_id(3, 1, 5)), eng.state.last_log_id());
+        assert_eq!(
+            Some(&IOId::new_log_io(Vote::new(3, 1).to_committed(), Some(log_id(3, 1, 4)))),
+            eng.state.accepted_log_io()
+        );
+        assert_eq!(eng.output.take_commands(), vec![
+            //
+            Command::UpdateIOProgress {
+                when: Some(Condition::IOFlushed {
+                    io_id: IOId::new_log_io(Vote::new(2, 1).to_committed(), Some(log_id(3, 1, 5)))
+                }),
+                io_id: IOId::new_log_io(Vote::new(3, 1).to_committed(), Some(log_id(3, 1, 4))),
+            }
+        ]);
+    }
+
+    // Update to a smaller value is ignored.
+    {
+        eng.following_handler().append_entries(Some(log_id(2, 1, 3)), vec![]);
+        assert_eq!(Some(&log_id(3, 1, 5)), eng.state.last_log_id());
+        assert_eq!(
+            Some(&IOId::new_log_io(Vote::new(3, 1).to_committed(), Some(log_id(3, 1, 4)))),
+            eng.state.accepted_log_io()
+        );
+
+        assert_eq!(eng.output.take_commands(), vec![
+            //
+        ]);
+    }
+
+    Ok(())
+}
