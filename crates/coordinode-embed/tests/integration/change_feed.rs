@@ -304,7 +304,14 @@ fn identities_hold_across_interests_and_reads() {
     let all = read_all(&db, &mut start_all.clone());
     let again = read_all(&db, &mut start_all.clone());
     let org = read_all(&db, &mut start_org.clone());
-    assert_eq!(all, again);
+    // Background work after the write (an index worker's commit) can add a
+    // unit between the reads: a later read covers at least the units the
+    // first one did, and those are what must read the same.
+    assert!(
+        again.len() >= all.len() && org.len() >= all.len(),
+        "{all:?}"
+    );
+    assert_eq!(all, again[..all.len()]);
     let org_events = events(&org);
     assert_eq!(org_events.len(), 1, "{org:?}");
     assert!(events(&all).iter().any(|e| e.id == org_events[0].id));
@@ -314,7 +321,10 @@ fn identities_hold_across_interests_and_reads() {
         .expect("the write's unit");
     assert!(unit.projected > 1, "{unit:?}");
     assert_eq!(
-        org.iter().map(|u| u.position).collect::<Vec<_>>(),
+        org[..all.len()]
+            .iter()
+            .map(|u| u.position)
+            .collect::<Vec<_>>(),
         all.iter().map(|u| u.position).collect::<Vec<_>>()
     );
 }
