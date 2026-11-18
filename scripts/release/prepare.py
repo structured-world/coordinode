@@ -62,7 +62,14 @@ def prepare_manifest(document, version, names, codegen):
     lib["test"] = False
     lib["bench"] = False
     if codegen:
-        document.pop("build-dependencies", None)
+        # The prepared build script reads shipped bindings and needs no build
+        # dependency. A feature that enabled one must stop naming it, or the
+        # manifest refers to a dependency it no longer has.
+        removed = {f"dep:{name}" for name in document.pop("build-dependencies", {})}
+        for name, enables in document.get("features", {}).items():
+            kept = [item for item in enables if item not in removed]
+            if len(kept) != len(enables):
+                document["features"][name] = kept
     for dependencies in [document.get("dependencies", {}), document.get("build-dependencies", {})]:
         for name, dep in dependencies.items():
             if name == "coordinode-workspace-hack":

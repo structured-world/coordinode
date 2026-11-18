@@ -51,6 +51,24 @@ name="source-only"
         self.assertIn("/bindings/**", result["package"]["include"])
         self.assertIn("/LICENSE-*", result["package"]["include"])
 
+    def test_a_feature_stops_naming_a_removed_build_dependency(self):
+        # A feature that enabled the generator would name a dependency the
+        # prepared manifest no longer has, and cargo refuses to parse it.
+        original = tomlkit.parse('''[package]
+name="coordinode-replicate"
+[features]
+default=["transfer"]
+transfer=["dep:tonic", "dep:tonic-prost-build"]
+[dependencies]
+tonic={version="0.14", optional=true}
+[build-dependencies]
+tonic-prost-build={version="0.14", optional=true}
+''')
+        result = prepare_manifest(original, "1.0.0", set(), True)
+        self.assertNotIn("build-dependencies", result)
+        self.assertEqual(list(result["features"]["transfer"]), ["dep:tonic"])
+        self.assertEqual(list(result["features"]["default"]), ["transfer"])
+
     def test_workspace_hack_cannot_silently_ship(self):
         # Failing preparation is safer than publishing the feature-unification
         # helper and its benchmark/test dependency union to every consumer.
