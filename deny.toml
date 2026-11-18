@@ -26,12 +26,14 @@ ignore = true
 
 [advisories]
 ignore = [
-    # lru `LruCache::pop()` use-after-free when a key's `Drop` panics and the
-    # panic is caught. Reached only via tantivy's doc-store block cache, keyed by
-    # `usize`, whose drop cannot panic, so the unsound path is unreachable (and
-    # release builds abort on panic). The fix is in lru 0.18.2, but tantivy
-    # 0.26.2, its latest release, requires ^0.16. Revisit when tantivy moves on.
-    "RUSTSEC-2026-0253",
+    # chrono, chrono-tz and chrono-tz-build are unmaintained, with no fixed
+    # release. The workspace itself uses jiff; these come in only through
+    # openraft (display-more formats timestamps with chrono-tz) and pgwire
+    # (postgres-types interval and timestamp conversions). Revisit when
+    # openraft and pgwire drop chrono.
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
+    "RUSTSEC-2026-0559",
     # rsa "Marvin Attack" (timing sidechannel on RSA private-key operations).
     # The maintained TLS provider only verifies RSA peer/certificate signatures
     # with public keys. Its key loader and the wire identity admission refuse
