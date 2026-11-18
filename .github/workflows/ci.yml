@@ -445,13 +445,16 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     permissions:
-      checks: write
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      # The job's own status is the result: no separate check run to create
+      # and update, so the Checks API cannot fail a clean audit.
+      - name: Audit dependencies
+        run: cargo audit
 
   crypto-alloc:
     name: TLS provider allocation-only
