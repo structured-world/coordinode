@@ -574,6 +574,20 @@ impl Footprint {
         )
     }
 
+    /// Every name with its charge. What [`Self::charged`] holds beyond their
+    /// sum belongs to files whose names are gone and an open handle keeps.
+    #[cfg(test)]
+    pub(crate) fn charges(&self) -> Vec<(PathBuf, u64)> {
+        let mut charges: Vec<(PathBuf, u64)> = self
+            .files
+            .lock()
+            .iter()
+            .map(|(path, charge)| (path.clone(), charge.bytes()))
+            .collect();
+        charges.sort_unstable();
+        charges
+    }
+
     fn new_charge(&self, bytes: u64) -> Arc<FileCharge> {
         Arc::new(FileCharge {
             footprint: self.this.clone(),

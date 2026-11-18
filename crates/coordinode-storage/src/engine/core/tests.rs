@@ -3139,6 +3139,26 @@ fn fill_to_the_limit(
     }
 }
 
+/// What the default endpoint charges, how much of it its named files hold,
+/// and each name's charge beside the file's length.
+fn charges_against_files(engine: &StorageEngine) -> String {
+    let footprint = engine.footprints().get("default").expect("a limit");
+    let charges = footprint.charges();
+    let named: u64 = charges.iter().map(|(_, bytes)| bytes).sum();
+    let files: Vec<_> = charges
+        .iter()
+        .map(|(path, bytes)| {
+            let len = std::fs::metadata(path).map(|meta| meta.len()).ok();
+            (path.clone(), *bytes, len)
+        })
+        .collect();
+    format!(
+        "charged {} of which named {named}, the rest held by removed files still open; \
+         (path, charged, length): {files:?}",
+        footprint.charged()
+    )
+}
+
 /// Persist `engine` as an operator of a full store does: a barrier short of
 /// room is refused as the limit, losing nothing it was to write; the limit
 /// is then raised, the barrier lands, and the limit goes back. The flushes
@@ -3162,7 +3182,8 @@ fn persist_making_room(engine: &StorageEngine, limit: u64) {
             );
             assert!(
                 std::time::Instant::now() < deadline,
-                "the barrier never found room under the raised limit: {short}"
+                "the barrier never found room under the raised limit: {short}; {}",
+                charges_against_files(engine)
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
