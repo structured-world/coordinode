@@ -2645,7 +2645,13 @@ fn a_backup_elsewhere_at_the_limit_takes_no_room_and_keeps_the_memtables() {
     engine
         .create_checkpoint(&target)
         .expect("a backup elsewhere needs no room on the endpoint");
-    assert_eq!(footprint.charged(), charged, "the endpoint grew by nothing");
+    // Background syncs may give back room charged ahead of a writer meanwhile;
+    // the backup itself adds nothing.
+    assert!(
+        footprint.charged() <= charged,
+        "the endpoint grew: {} charged after the backup, {charged} before",
+        footprint.charged()
+    );
     footprints.removed(&scratch);
     drop(output);
     drop(engine);
