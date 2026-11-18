@@ -64,6 +64,29 @@ fn a_transient_on_the_rayon_pool_is_counted() {
     assert!(held.over.is_some(), "{held:?}");
 }
 
+/// An allocation the work hands to a thread outside it, which frees it
+/// there (a store's background worker), is that thread's to hold, as one
+/// still held when the work returns is: it never stands over the work's
+/// reservation, however long the other thread keeps it.
+#[test]
+fn an_allocation_freed_by_another_thread_is_not_the_works() {
+    let (handed, taken) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (freed, done) = std::sync::mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let handed_over = taken.recv().unwrap();
+        drop(handed_over);
+        freed.send(()).unwrap();
+    });
+    let ((), held) = held_against(Arc::new(|| 0), || {
+        let handed_over = vec![6u8; MIB];
+        std::hint::black_box(&handed_over);
+        handed.send(handed_over).unwrap();
+        done.recv().unwrap();
+    });
+    worker.join().unwrap();
+    assert_eq!(held.over, None, "{held:?}");
+}
+
 /// A transient reserved before it is allocated and released after it is
 /// freed never stands over the reservation.
 #[test]

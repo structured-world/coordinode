@@ -126,13 +126,19 @@ impl AllocationTracker for Peaks {
         size: usize,
         _wrapped: usize,
         source: AllocationGroupId,
-        _current: AllocationGroupId,
+        current: AllocationGroupId,
     ) {
         if source.as_usize().get() == COUNTED.load(Ordering::Relaxed) {
             LIVE.fetch_sub(size.cast_signed(), Ordering::Relaxed);
         }
         if TRACING.load(Ordering::Relaxed) {
-            Self::log(addr, -size.cast_signed(), Maker::Other);
+            // Which thread frees it: one outside the work was handed it.
+            let freer = if current.as_usize().get() == TRACED.load(Ordering::Relaxed) {
+                Maker::Traced
+            } else {
+                rayon::current_thread_index().map_or(Maker::Other, Maker::Rayon)
+            };
+            Self::log(addr, -size.cast_signed(), freer);
         }
     }
 }
@@ -203,10 +209,11 @@ pub struct Held {
 /// What `f` returns, and what its allocations held against `reserved`, read
 /// at each allocation and free while it runs. An allocation counts when
 /// the calling thread makes it, or any thread of the rayon pool does. The
-/// bytes compared with the reservation are those of the allocations freed
-/// before `f` returned; an allocation still held then (handed to a store)
-/// is left out of every instant, never subtracted as a total, so memory
-/// kept late cannot cover a transient held early.
+/// bytes compared with the reservation are those of the allocations the
+/// work itself freed before `f` returned; an allocation still held then, or
+/// freed by a thread outside the work (both handed to a store), is left out
+/// of every instant, never subtracted as a total, so memory kept late cannot
+/// cover a transient held early.
 ///
 /// Like [`peak_of`], a test using it runs alone in its process.
 ///
@@ -252,17 +259,23 @@ pub fn held_against<T>(reserved: Reserved, f: impl FnOnce() -> T) -> (T, Held) {
         })
         .collect();
 
-    // Which counted allocations were still live when `f` returned.
+    // Which counted allocations were still live when `f` returned, and which
+    // a thread outside the work freed: both were handed to another owner.
     let mut live: HashMap<usize, (usize, usize)> = HashMap::new();
+    let mut handed_at = std::collections::HashSet::new();
     for (at, &(addr, size, maker, _)) in events.iter().enumerate() {
         if size > 0 && maker.counted() {
             live.insert(addr, (at, size.cast_unsigned()));
-        } else if size < 0 {
-            live.remove(&addr);
+        } else if size < 0
+            && let Some((made_at, _)) = live.remove(&addr)
+            && !maker.counted()
+        {
+            handed_at.insert(made_at);
         }
     }
-    let kept_at: std::collections::HashSet<usize> = live.values().map(|&(at, _)| at).collect();
+    let mut kept_at: std::collections::HashSet<usize> = live.values().map(|&(at, _)| at).collect();
     let kept = live.values().map(|&(_, size)| size).sum();
+    kept_at.extend(handed_at);
 
     // Each transient allocation live now: its address, event, size and maker.
     let mut transient_live: HashMap<usize, (usize, usize, Maker)> = HashMap::new();
