@@ -98,7 +98,7 @@ cargo nextest run --cargo-profile debugger -E 'test(name)'
 2. Create a feature branch (`feat/description` or `fix/description`)
 3. Make your changes
 4. Ensure all checks pass:
-   - `cargo fmt --all -- --check`
+   - `cargo fmt -- --check` (without `--all`, which would also reformat the vendored sources under `vendor/`)
    - `cargo clippy --workspace --all-targets --all-features -- -D warnings` (zero warnings)
    - `cargo nextest run --workspace --all-features` and `cargo test --doc --all-features` (all tests pass); for a change to clustering, also `COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 cargo nextest run -P cluster --workspace --all-features`
    - `cargo hakari generate --diff` and `cargo hakari manage-deps --dry-run` (workspace-hack up to date)

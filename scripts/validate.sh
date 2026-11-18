@@ -34,7 +34,7 @@ if [[ "${1:-}" == "--quick" ]]; then
 fi
 
 step "Step 1/7: Format check"
-cargo fmt --all -- --check || fail "Formatting issues found. Run: cargo fmt --all"
+cargo fmt -- --check || fail "Formatting issues found. Run: cargo fmt"
 ok "Format clean"
 
 step "Step 2/7: Clippy (zero warnings)"

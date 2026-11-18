@@ -22,8 +22,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      # Workspace members only: `--all` also walks path dependencies, which
+      # takes in the vendored openraft sources kept in their upstream style.
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: cargo fmt -- --check
 
   parser:
     name: Generated parser
