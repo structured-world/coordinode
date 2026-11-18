@@ -357,12 +357,14 @@ impl Footprint {
     }
 
     /// The part of the limit client writes may take: the limit less the
-    /// recovery reserve. A reserve read past a limit lowered at the same
-    /// moment leaves client writes no room until the next read: none, not
-    /// an error.
+    /// recovery reserve, and at least less [`OVER_LIMIT_ALLOWANCE`], so a
+    /// store full of client writes still opens inside its limit. A reserve
+    /// read past a limit lowered at the same moment leaves client writes no
+    /// room until the next read: none, not an error.
     pub fn client_ceiling(&self) -> u64 {
         // Floored at zero on purpose: no room is the answer, see above.
-        self.limit().saturating_sub(self.reserve())
+        self.limit()
+            .saturating_sub(self.reserve().max(OVER_LIMIT_ALLOWANCE))
     }
 
     /// The bytes the endpoint's files hold, as charged.

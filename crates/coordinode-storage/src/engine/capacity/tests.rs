@@ -124,15 +124,16 @@ fn dir_size_missing_root_returns_zero() {
 #[test]
 fn refresh_reports_the_charged_footprint() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut config = ep("only", 1 << 20);
+    let mut config = ep("only", crate::engine::config::MIN_HARD_LIMIT_BYTES);
     config.path = tmp.path().to_path_buf();
     let footprints = crate::engine::footprint::Footprints::open(&[config.clone()]).unwrap();
     let footprint = footprints.get("only").unwrap();
     let tracker = CapacityTracker::new(&[config]);
     let paths = BTreeMap::from([("only".to_string(), tmp.path().to_path_buf())]);
 
+    // Most of what client writes may take: a warning, not full.
     let file = footprint.file(&tmp.path().join("table"));
-    file.grow_to(850 * 1024).unwrap();
+    file.grow_to(footprint.client_ceiling() / 100 * 88).unwrap();
     tracker.refresh(&paths, &footprints);
     let usage = tracker.get("only").unwrap();
     assert_eq!(usage.used(), footprint.charged());

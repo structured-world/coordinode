@@ -11,6 +11,12 @@ fn endpoint(dir: &Path, limit: u64) -> EndpointConfig {
         .with_recovery_reserve_bytes(0)
 }
 
+/// A limit under which client writes may take `units` units: client writes
+/// always leave the open allowance, at least.
+fn client_limit(units: u64) -> u64 {
+    OVER_LIMIT_ALLOWANCE + units * UNIT
+}
+
 fn opened(dir: &Path, limit: u64) -> Arc<Footprint> {
     Footprint::open(&endpoint(dir, limit)).unwrap()
 }
@@ -130,21 +136,61 @@ fn concurrent_growth_never_passes_the_limit() {
 #[test]
 fn client_admission_leaves_the_recovery_reserve() {
     let dir = tempfile::tempdir().unwrap();
-    let footprint =
-        Footprint::open(&endpoint(dir.path(), 100 * UNIT).with_recovery_reserve_bytes(20 * UNIT))
-            .unwrap();
+    // A reserve past the open allowance, which client writes leave anyway.
+    let reserve = OVER_LIMIT_ALLOWANCE + 20 * UNIT;
+    let footprint = Footprint::open(
+        &endpoint(dir.path(), client_limit(100)).with_recovery_reserve_bytes(reserve),
+    )
+    .unwrap();
     let held = footprint.admit(80 * UNIT, Admit::Client).unwrap();
     assert_eq!(footprint.admitted(), 80 * UNIT);
     assert!(matches!(
         footprint.admit(1, Admit::Client),
         Err(StorageError::CapacityExhausted { .. })
     ));
-    let recovery = footprint.admit(20 * UNIT, Admit::Recovery).unwrap();
+    let recovery = footprint.admit(reserve, Admit::Recovery).unwrap();
     assert!(footprint.admit(1, Admit::Recovery).is_err());
     drop(recovery);
     drop(held);
     assert_eq!(footprint.admitted(), 0);
     assert!(footprint.admit(80 * UNIT, Admit::Client).is_ok());
+}
+
+/// A store filled by client writes until they are refused, at the smallest
+/// limit and its default reserve, still holds what its open grows (up to
+/// the open allowance) inside the limit: client writes leave that room.
+#[test]
+fn a_store_full_of_client_writes_opens_inside_its_limit() {
+    let limit = crate::engine::config::MIN_HARD_LIMIT_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let config = EndpointConfig::new(
+        "ep",
+        dir.path(),
+        Media::Ssd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(limit);
+    let footprints = Footprints::open(std::slice::from_ref(&config)).unwrap();
+    let footprint = Arc::clone(footprints.get("ep").unwrap());
+    let data = footprint.file(&dir.path().join("data"));
+    let mut written = 0;
+    while let Ok(admission) = footprint.admit(UNIT, Admit::Client) {
+        written += UNIT;
+        data.grow_to(written).unwrap();
+        drop(admission);
+    }
+    let opening = footprints.open_phase();
+    footprint
+        .file(&dir.path().join("opened"))
+        .grow_to(OVER_LIMIT_ALLOWANCE)
+        .expect("the open allowance fits");
+    drop(opening);
+    assert!(
+        footprint.charged() <= limit,
+        "the store opened past its limit: {} charged under {limit}",
+        footprint.charged()
+    );
 }
 
 /// The room maintenance sees is the limit less what is charged and what
@@ -154,16 +200,16 @@ fn client_admission_leaves_the_recovery_reserve() {
 #[test]
 fn the_room_is_what_charged_and_admitted_leave() {
     let dir = tempfile::tempdir().unwrap();
-    let footprint = opened(dir.path(), 100 * UNIT);
+    let footprint = opened(dir.path(), client_limit(100));
     footprint
         .file(&dir.path().join("a"))
         .grow_to(30 * UNIT)
         .unwrap();
     let held = footprint.admit(20 * UNIT, Admit::Client).unwrap();
     assert_eq!(footprint.committed(), 50 * UNIT);
-    assert_eq!(footprint.room(), 50 * UNIT);
+    assert_eq!(footprint.room(), client_limit(100) - 50 * UNIT);
     drop(held);
-    assert_eq!(footprint.room(), 70 * UNIT);
+    assert_eq!(footprint.room(), client_limit(100) - 30 * UNIT);
 }
 
 /// A failed flush's own output, given back on its thread while it ran, does
@@ -173,7 +219,7 @@ fn the_room_is_what_charged_and_admitted_leave() {
 #[test]
 fn a_failed_flush_waits_for_room_others_give_back() {
     let dir = tempfile::tempdir().unwrap();
-    let footprints = Footprints::open(&[endpoint(dir.path(), 100 * UNIT)]).unwrap();
+    let footprints = Footprints::open(&[endpoint(dir.path(), client_limit(100))]).unwrap();
     let other = footprints.file(&dir.path().join("other")).unwrap();
     other.grow_to(UNIT).unwrap();
     let held = footprints.admit(10 * UNIT, Admit::Client).unwrap();
@@ -201,7 +247,7 @@ fn a_failed_flush_waits_for_room_others_give_back() {
 #[test]
 fn concurrent_admissions_never_overcommit() {
     let dir = tempfile::tempdir().unwrap();
-    let footprint = opened(dir.path(), 100 * UNIT);
+    let footprint = opened(dir.path(), client_limit(100));
     let admitted: Vec<Admission> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..32)
             .map(|_| {
@@ -219,7 +265,7 @@ fn concurrent_admissions_never_overcommit() {
         14,
         "100 units hold fourteen admissions of 7"
     );
-    assert!(footprint.admitted() <= 100 * UNIT);
+    assert!(footprint.admitted() <= footprint.client_ceiling());
 }
 
 /// A second name of a file is the same bytes: charged once, given back only
@@ -330,13 +376,18 @@ fn lowering_the_limit_below_the_footprint_refuses_growth_and_deletes_nothing() {
 #[test]
 fn a_store_opened_past_its_limit_holds_its_own_growth_to_a_bounded_room() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("old"), vec![1u8; 40 * UNIT as usize]).unwrap();
+    let limit = client_limit(10);
+    std::fs::write(
+        dir.path().join("old"),
+        vec![1u8; (limit + 30 * UNIT) as usize],
+    )
+    .unwrap();
     let held = {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(dir.path().join("old")).unwrap().blocks() * 512
     };
     let footprint =
-        Footprint::open(&endpoint(dir.path(), 10 * UNIT).with_recovery_reserve_bytes(2 * UNIT))
+        Footprint::open(&endpoint(dir.path(), limit).with_recovery_reserve_bytes(2 * UNIT))
             .unwrap();
     let room = footprint.over_limit_room();
     assert_eq!(room, OVER_LIMIT_ALLOWANCE, "a small reserve is raised");
@@ -356,7 +407,7 @@ fn a_store_opened_past_its_limit_holds_its_own_growth_to_a_bounded_room() {
     // The old file goes: the ceiling comes down with it, to the limit.
     footprint.removed(&dir.path().join("old"));
     assert_eq!(footprint.pending_limit(), None, "the footprint fits again");
-    assert_eq!(footprint.enforced_limit(), 10 * UNIT);
+    assert_eq!(footprint.enforced_limit(), limit);
     assert!(footprint.admit(UNIT, Admit::Client).is_ok());
 }
 

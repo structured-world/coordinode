@@ -347,7 +347,9 @@ impl EndpointConfig {
         self
     }
 
-    /// Set the recovery reserve inside the hard limit.
+    /// Set the recovery reserve inside the hard limit. Client writes leave
+    /// at least [`OVER_LIMIT_ALLOWANCE`](crate::engine::footprint::OVER_LIMIT_ALLOWANCE)
+    /// whatever the reserve: what a store may grow while it opens.
     #[must_use]
     pub fn with_recovery_reserve_bytes(mut self, bytes: u64) -> Self {
         self.recovery_reserve_bytes = Some(bytes);

@@ -884,7 +884,9 @@ fn capped_endpoint() -> (tempfile::TempDir, Footprints) {
         Durability::Durable,
         Tier::Warm,
     )
-    .with_hard_limit_bytes(64 * 1024)
+    // Client writes leave the open allowance past the reserve: 64 KiB of
+    // the limit is theirs.
+    .with_hard_limit_bytes(crate::engine::footprint::OVER_LIMIT_ALLOWANCE + 64 * 1024)
     .with_recovery_reserve_bytes(16 * 1024);
     let footprints = Footprints::open(&[endpoint]).expect("footprints");
     (dir, footprints)

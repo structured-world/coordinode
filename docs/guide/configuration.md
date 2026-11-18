@@ -879,7 +879,7 @@ Each endpoint has these keys:
 | `tier` | yes | `memory` `hot_cache` `hot` `warm` `cold` | Placement preference (fastest first). Hot LSM levels prefer hotter tiers. |
 | `capacity_bytes` | no | integer | Physical capacity. `0` or omitted = untracked. |
 | `hard_limit_bytes` | no | integer | Ceiling on the space every file of the database under `path` takes on disk, as the file system allocates it (see [Hard limit](#hard-limit-total-database-footprint)). `0` or omitted = no limit; otherwise at least 8 MiB (8388608). Must be `<= capacity_bytes` when both are set. |
-| `recovery_reserve_bytes` | no | integer | The part of `hard_limit_bytes` client writes leave for flushes, space-reclaiming compactions and the store's own records; inside the limit, not added to it. Omitted = a sixteenth of the limit (512 KiB at the smallest limit). Needs `hard_limit_bytes`, and must not exceed it. |
+| `recovery_reserve_bytes` | no | integer | The part of `hard_limit_bytes` client writes leave for flushes, space-reclaiming compactions and the store's own records; inside the limit, not added to it. Omitted = a sixteenth of the limit (512 KiB at the smallest limit). Client writes always leave at least 1 MiB, the room a store may grow while it opens, whatever the reserve. Needs `hard_limit_bytes`, and must not exceed it. |
 | `page_ecc` | no | `auto` `force_on` `force_off` | Per-block Reed-Solomon ECC policy. `auto` (default) turns ECC **on** for `degraded` endpoints and **off** for `durable` / `volatile`. See the note below. |
 | `hard_limit_strategy` | no | `reject` `cascade_evict` | What to do when client writes reach `hard_limit_bytes`. `reject` (default) refuses them; `cascade_evict` also has the capacity refresh demote data to a cooler endpoint, after which refused writes are admitted again. |
 
@@ -936,8 +936,10 @@ compactions, not from the minimum.
 Room is reserved before anything grows, under one account per endpoint:
 
 - **Client writes are admitted before they land.** Each write reserves its
-  journal record against the limit less `recovery_reserve_bytes`, together with
-  what is charged and every write already admitted. A write that does not fit is
+  journal record against the limit less `recovery_reserve_bytes` (and less at
+  least 1 MiB, so a store full of client writes still opens inside its limit),
+  together with what is charged and every write already admitted. A write that
+  does not fit is
   refused before it reaches the journal, with
   `CapacityExhausted` naming the endpoint, the bytes in use and the limit
   (gRPC `RESOURCE_EXHAUSTED`, embedded `DatabaseError::CapacityExhausted`).
