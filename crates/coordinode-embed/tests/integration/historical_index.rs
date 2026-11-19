@@ -179,7 +179,39 @@ fn a_current_read_still_uses_the_index() {
     let plan = db.explain_cypher(&top2("", None)).expect("explain");
     assert!(plan.contains("HnswScan"), "got:\n{plan}");
     let rows = db.execute_cypher(&top2("", None)).expect("current read");
-    assert_eq!(names(&rows), ["c", "far"]);
+    let got = names(&rows);
+    if got != ["c", "far"] {
+        // What the index held, and what the same read answers a second later:
+        // a node missing from both the index and the search's own evaluation
+        // of unfolded writes, or one the worker had not reached yet.
+        let held: Vec<(String, bool)> = ["a", "b", "c", "far"]
+            .iter()
+            .map(|name| {
+                let rows = db
+                    .execute_cypher(&format!(
+                        "MATCH (n:Item {{name: '{name}'}}) RETURN id(n) AS id"
+                    ))
+                    .expect("node id");
+                let held = rows
+                    .first()
+                    .and_then(|row| row.get("id"))
+                    .is_some_and(|id| {
+                        matches!(id, Value::Int(id) if db.vector_index_registry().holds(
+                            "Item",
+                            "emb",
+                            coordinode_core::graph::node::NodeId::from_raw(*id as u64),
+                        ))
+                    });
+                ((*name).to_string(), held)
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let later = names(
+            &db.execute_cypher(&top2("", None))
+                .expect("current read again"),
+        );
+        panic!("current read answered {got:?}; the index holds {held:?}; a second later {later:?}");
+    }
 }
 
 /// A filtered top-k keeps the scan-then-rank path, which also consults the
