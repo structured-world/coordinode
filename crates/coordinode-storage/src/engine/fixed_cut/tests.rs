@@ -192,7 +192,7 @@ fn an_entry_journalled_and_not_applied_is_not_handed_over() {
     let (journalled, appended) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel::<()>();
     let released = parking_lot::Mutex::new(released);
-    *engine.on_journalled.lock() = Some(Box::new(move |index| {
+    *engine.on_journalled.lock() = Some(Arc::new(move |index| {
         journalled.send(index).expect("signal");
         released.lock().recv().expect("release");
     }));
@@ -806,4 +806,56 @@ fn a_late_commit_below_the_cut_is_in_the_view_and_counted_once() {
     let source = counter(engine.get(Partition::Counter, COUNTER).expect("source"));
     assert_eq!(source, 111);
     assert_eq!(destination, source, "every unit counted once");
+}
+
+/// A cursor taken at the end of the journal while an earlier entry is still
+/// applying comes after every entry applied before it was asked for: a later
+/// entry that already applied and returned is not handed to its reader.
+/// Before, the cursor stopped at the applied prefix, before that later entry.
+#[test]
+fn a_cursor_at_the_end_follows_every_entry_applied_before_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open(&dir);
+    let (journalled, appended) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = parking_lot::Mutex::new(released);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    // Only the first entry waits between its journal append and its apply.
+    *engine.on_journalled.lock() = Some(Arc::new(move |index| {
+        if first.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            journalled.send(index).expect("signal");
+            released.lock().recv().expect("release");
+        }
+    }));
+    let writer = Arc::clone(&engine);
+    let slow = std::thread::spawn(move || {
+        writer
+            .commit_logged(&add(1), writer.next_seqno(), Journal::Journal)
+            .expect("commit");
+    });
+    let held = appended.recv().expect("journalled");
+    let later = engine
+        .journal_next_index()
+        .expect("journal")
+        .expect("a journal");
+    engine
+        .commit_logged(&add(2), engine.next_seqno(), Journal::Journal)
+        .expect("a later commit applies and returns");
+    let asker = Arc::clone(&engine);
+    let cursor = std::thread::spawn(move || {
+        asker
+            .change_cursor_at_end(crate::engine::change_feed::Interest::all())
+            .expect("cursor")
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    release.send(()).expect("release");
+    slow.join().expect("writer");
+    *engine.on_journalled.lock() = None;
+    let cursor = cursor.join().expect("asker");
+    assert!(held < later, "the held entry comes first");
+    assert!(
+        cursor.position() > later,
+        "the cursor stops at {} before entry {later}, applied before it was asked for",
+        cursor.position()
+    );
 }

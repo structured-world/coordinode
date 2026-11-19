@@ -87,6 +87,10 @@ const REBUILD_TREE_SET_WAIT_MS: u64 = 30_000;
 const REBUILD_TREE_SET_WAIT: std::time::Duration =
     std::time::Duration::from_millis(REBUILD_TREE_SET_WAIT_MS);
 
+/// How long a change cursor taken at the end of the journal waits for the
+/// entries before the last one applied to finish applying.
+pub const CURSOR_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The CoordiNode storage engine.
 ///
 /// Owns 8 `lsm_tree::AnyTree` instances (one per [`Partition`]), a shared
@@ -405,10 +409,11 @@ pub struct StorageEngine {
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) on_trees_pinned: parking_lot::Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// Test hook: run with an entry's index once it is journalled, before
-    /// it is applied.
+    /// it is applied. Called outside its lock, so a hook holding one entry
+    /// back leaves other commits free to journal and apply.
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
-    pub(crate) on_journalled: parking_lot::Mutex<Option<Box<dyn FnMut(u64) + Send>>>,
+    pub(crate) on_journalled: parking_lot::Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
     /// Test hook: run with the segment a cut's continuation read found to
     /// hold its next entry, before it opens it.
     #[cfg(test)]
@@ -4892,13 +4897,19 @@ impl StorageEngine {
         ))
     }
 
-    /// A change cursor after every entry of this store's journal applied and
-    /// durable now: a reader starting here gets what commits from now on.
+    /// A change cursor after every entry of this store's journal applied now:
+    /// a reader starting here gets what commits from now on. Entries apply
+    /// out of journal order, so an earlier entry may still be applying when a
+    /// later one has applied and returned to its writer; the cursor waits for
+    /// those and comes after them all. The journal is synced first, so an
+    /// entry applied under a volatile level is behind the cursor too.
     ///
     /// # Errors
     ///
     /// As [`Self::change_cursor_at`]; [`StorageError::InvalidConfig`] for a
-    /// store without a journal.
+    /// store without a journal; [`StorageError::Io`] when the journal cannot
+    /// be synced, or an earlier entry does not finish applying within
+    /// [`CURSOR_APPLY_WAIT`].
     pub fn change_cursor_at_end(
         &self,
         interest: crate::engine::change_feed::Interest,
@@ -4908,11 +4919,17 @@ impl StorageEngine {
                 "the store keeps no journal".into(),
             ));
         };
+        crate::engine::oplog_journal::sync_journal(oplog)?;
+        let applied = coverage.prefix_past_applied(CURSOR_APPLY_WAIT).ok_or_else(|| {
+            StorageError::Io(format!(
+                "an entry before the cursor did not finish applying within {CURSOR_APPLY_WAIT:?}"
+            ))
+        })?;
         let end = {
             let journal = oplog
                 .lock()
                 .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
-            journal.durable_below().min(coverage.applied_prefix())
+            journal.durable_below().min(applied)
         };
         self.change_cursor_at(end, interest)
     }
@@ -7368,8 +7385,11 @@ impl StorageEngine {
             guard.append(mutations, commit_ts, level)?
         };
         #[cfg(test)]
-        if let Some(hook) = self.on_journalled.lock().as_mut() {
-            hook(index);
+        {
+            let hook = self.on_journalled.lock().clone();
+            if let Some(hook) = hook {
+                hook(index);
+            }
         }
         let mark = coverage::Mark {
             domain: Domain::Journal,

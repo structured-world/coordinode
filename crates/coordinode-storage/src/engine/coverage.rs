@@ -278,6 +278,9 @@ impl AppliedSet {
 #[derive(Debug)]
 pub(crate) struct Coverage {
     applied: parking_lot::Mutex<AppliedSet>,
+    /// Woken whenever an index is marked applied, for a reader waiting on the
+    /// prefix.
+    prefix_moved: parking_lot::Condvar,
     /// The base last written to every tree. Held for the whole fold so two
     /// folds never interleave their base and tombstone writes.
     folded: parking_lot::Mutex<u64>,
@@ -314,6 +317,7 @@ impl Coverage {
     pub(crate) fn new(next: u64) -> Self {
         Self {
             applied: parking_lot::Mutex::new(AppliedSet::starting_at(next)),
+            prefix_moved: parking_lot::Condvar::new(),
             // The trees may still hold markers from before the open, so the
             // first fold removes markers from index 0.
             folded: parking_lot::Mutex::new(0),
@@ -384,6 +388,7 @@ impl Coverage {
             applied.mark(index);
             applied.next()
         };
+        self.prefix_moved.notify_all();
         // `folded` is only ever set to an applied prefix, and the prefix never
         // shrinks, so it cannot exceed `next`.
         let folded = self.folded_hint.load(Ordering::Relaxed);
@@ -402,6 +407,30 @@ impl Coverage {
     pub(crate) fn applied_snapshot(&self) -> (u64, Vec<u64>) {
         let applied = self.applied.lock();
         (applied.next(), applied.above().collect())
+    }
+
+    /// The applied prefix once it covers every index applied when this is
+    /// called: the entries before the highest one applied, still applying
+    /// now, have applied too. `None` when they did not within `limit`.
+    pub(crate) fn prefix_past_applied(&self, limit: core::time::Duration) -> Option<u64> {
+        let deadline = std::time::Instant::now() + limit;
+        let mut applied = self.applied.lock();
+        // One past the highest index applied: what the prefix must reach.
+        let target = applied
+            .above()
+            .max()
+            .map_or(applied.next(), |highest| highest + 1);
+        while applied.next() < target {
+            if self
+                .prefix_moved
+                .wait_until(&mut applied, deadline)
+                .timed_out()
+                && applied.next() < target
+            {
+                return None;
+            }
+        }
+        Some(applied.next())
     }
 
     /// Serialize folds: the guard holds the base last written to every tree.
