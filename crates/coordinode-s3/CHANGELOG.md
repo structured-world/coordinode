@@ -2,6 +2,18 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-19
+
+### Added
+
+- *(storage)* use the io_uring backend by default
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+
+### Documentation
+
+- *(storage)* drop links to private items and stray table text
+
 ## v0.9.0 - 2026-10-24
 
 ### Fixed

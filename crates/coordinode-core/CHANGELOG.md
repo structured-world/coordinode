@@ -2,6 +2,81 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-19
+
+### Added
+
+- *(replication)* deliver a dropped label as the end of its scope
+- *(embed)* keep a projection's effects and progress in one commit
+- *(replication)* route change events by implied labels
+- *(embed)* read committed changes as events from a cursor
+- *(core)* name coalesced delete runs in the effect context
+- *(core)* carry the logical effect context in the unit frame
+- *(storage)* bounded material fold in commit order
+- *(storage)* material accounting and log-ordered registry endings
+- *(raft)* client writes take room granted by a majority
+- *(replication)* typed causal bounds and receipts
+- *(storage)* hold a temporal unique value per instant of valid time
+- *(query)* answer AS OF past the retention from temporal history
+- *(modality)* read temporal node versions as known at a system time
+- *(modality)* assert temporal node versions in their history
+- *(storage)* keep node history and write records keyed by their commit
+- *(index)* key unique entries by their owner
+- *(index)* keep label counts exact across an implication change
+- *(schema)* give labels a catalog identity records store
+- *(schema)* declare type, implied and auxiliary labels
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(readme)* drop the archived Python SDK
+
+### Fixed
+
+- *(storage)* take a change read's working memory before allocating it
+- *(storage)* charge a cut's clipped bounds and real scan state
+- *(storage)* bound a cut entry's memory as a whole
+- one-cut admin backup, exclusive bounded restore
+- *(query)* charge evaluator memory before it is held
+- *(storage)* a statement's deadline and cancel bound every admission wait
+- *(replicate)* bound consumer progress, heartbeats and breakpoints
+- *(query)* read only views every commit below is applied at
+- *(storage)* report a write of unknown outcome as such
+- *(index)* bound held memory in claim restating and the report queue
+- *(index)* reserve room only for claims not held yet
+- *(index)* keep a claim's charge only on what is kept
+- *(index)* charge unique claims and checks for as long as they live
+- *(index)* count a unit's derived fan-out before expanding it
+- *(index)* bound the fan-out everywhere and type every index refusal
+- *(index)* charge an element's encoding room before it grows
+- *(index)* refuse keys past the store's limit, bound entry fan-out
+- *(index)* charge implication placement memory before taking it
+- *(storage)* keep the engine and dump format versions
+- *(index)* claim a unique value across the parts of a change
+- *(schema)* bind a label's first use through the ordered log
+- *(query)* charge exact dedup memory before allocating it
+
+### Performance
+
+- *(core)* specialize proposal projection
+- *(txn)* restate bound trends by moving the claims
+- *(query)* read a node's schemas once per write
+- *(query)* hashed exact DISTINCT, grouping and UNION
+
+### Refactored
+
+- *(core)* restore shared proposal decoder
+- *(storage)* [**breaking**] withdraw prepaid flush room and member grants
+- *(storage)* [**breaking**] remove per-mutation material accounting
+- *(schema)* store canonical labels and judge RETYPE by its result
+
+### Wip
+
+- keep only a label change's difference apart in the lookup
+- ALTER NODE TYPE SET IMPLIES with per-label lookup generations
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
