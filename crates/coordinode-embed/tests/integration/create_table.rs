@@ -293,7 +293,35 @@ fn a_stopped_columnar_table_refuses_its_statements_and_not_the_graphs() {
             Err(DatabaseError::WriteBackpressure) => {}
             Err(e) => panic!("{e}"),
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The statement's run lands and the monitor latches the verdict its
+        // runs give before the next statement: runs grow one at a time, so
+        // the table is seen at two runs, its slowdown, on the way to three.
+        // Two flushes landing between two of the monitor's passes would skip
+        // it otherwise.
+        let settle = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            use lsm_tree::AbstractTree;
+            let tree = db.engine().columnar_table_tree("Event").expect("the table");
+            let runs = tree.l0_run_count();
+            let expected = if runs >= 3 {
+                WritePressure::Stop
+            } else if runs >= 2 {
+                WritePressure::Slowdown
+            } else {
+                WritePressure::None
+            };
+            if tree.sealed_memtable_count() == 0
+                && db.engine().columnar_write_pressure("Event") == expected
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < settle,
+                "at {runs} runs the table's verdict {:?} is not {expected:?}",
+                db.engine().columnar_write_pressure("Event")
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     assert!(written >= 3, "{written} statements stopped the table");
     assert_eq!(count(&mut db), Some(Value::Int(written)));

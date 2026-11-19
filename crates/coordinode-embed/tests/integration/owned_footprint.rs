@@ -93,18 +93,19 @@ fn assert_accounted(db: &Database, root: &Path, at: &str) {
     // A snapshot the background work (flushes, compactions) did not move: the
     // files read the same before and after the account. Growth is charged
     // before it is written, so the account then covers what the files take.
+    // A file system allocating past the allowance charged ahead of a write
+    // has it recorded right after the write returns, so a reading between the
+    // two sees the account a block short; a shortfall that stays is a write
+    // that bypassed the account.
     let (mut charged, mut allocated) = (0, 0);
     for _ in 0..50 {
         let before = owned_bytes(root).0;
         charged = footprints.iter().map(|f| f.charged()).sum::<u64>();
         allocated = owned_bytes(root).0;
-        if before == allocated {
-            break;
+        if before == allocated && charged >= allocated {
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    if charged >= allocated {
-        return;
     }
     // Name the files that take more than their charge: the writes that
     // bypassed the account.
@@ -550,10 +551,12 @@ fn a_restore_past_the_cap_is_refused_without_passing_it() {
 #[test]
 fn a_barrier_short_of_room_loses_nothing_and_lands_once_room_comes_back() {
     let dir = tempfile::tempdir().unwrap();
+    let mut rows = 0u64;
     {
         let mut db = Database::open_with_config(capped(dir.path())).unwrap();
         for key in 0..8 {
             db.execute_cypher(&create(key)).unwrap();
+            rows += 1;
         }
         // Shares of the account, held across reads of the database below.
         let footprints = db.engine().footprints().clone();
@@ -565,20 +568,33 @@ fn a_barrier_short_of_room_loses_nothing_and_lands_once_room_comes_back() {
         let output = footprints
             .file(&scratch)
             .expect("a charge under the endpoint");
-        // Background work may move the room between the read and the growth.
-        let grown = (0..100).any(|_| {
-            let room = footprint.enforced_limit() - footprint.charged();
-            output.grow_to(output.bytes() + room - room % 4096).is_ok()
-        });
-        assert!(grown, "the file takes the room");
-        let short = db.engine().persist();
+        // Background work may give room back between the growth and the
+        // barrier (a file settling the allowance charged ahead of it), and a
+        // barrier that finds it lands; another row gives the next barrier
+        // something to write, and the file takes the room again.
+        let mut short = Ok(());
+        for attempt in 0..20 {
+            if attempt > 0 {
+                db.execute_cypher(&create(100 + attempt)).unwrap();
+                rows += 1;
+            }
+            let grown = (0..100).any(|_| {
+                let room = footprint.enforced_limit() - footprint.charged();
+                output.grow_to(output.bytes() + room - room % 4096).is_ok()
+            });
+            assert!(grown, "the file takes the room");
+            short = db.engine().persist();
+            if short.is_err() {
+                break;
+            }
+        }
         assert!(
             short
                 .as_ref()
                 .is_err_and(|e| e.to_string().contains("limit")),
             "a barrier with no room is refused as the limit: {short:?}"
         );
-        assert_eq!(count(&mut db), 8, "nothing acknowledged is lost");
+        assert_eq!(count(&mut db), rows as i64, "nothing acknowledged is lost");
         // Closed with the barrier refused: what it was to write is only in
         // the journal.
         drop(db);
@@ -586,7 +602,11 @@ fn a_barrier_short_of_room_loses_nothing_and_lands_once_room_comes_back() {
         drop(output);
     }
     let mut db = Database::open_with_config(capped(dir.path())).unwrap();
-    assert_eq!(count(&mut db), 8, "every row after the store reopened");
+    assert_eq!(
+        count(&mut db),
+        rows as i64,
+        "every row after the store reopened"
+    );
     db.engine()
         .persist()
         .expect("the barrier lands once room comes back");
@@ -684,7 +704,10 @@ fn journal_segments(root: &Path) -> Vec<u64> {
 /// stays, and every acknowledged row is there after a reopen.
 #[test]
 fn covered_journal_goes_as_flushes_land_without_a_refused_write() {
-    const ROWS: u64 = 40;
+    // About 1.9 MiB of journal: past one 1 MiB segment, and under what client
+    // writes may take (the limit less the open allowance) with the journal,
+    // memtables and their tables all still held, however late reclamation runs.
+    const ROWS: u64 = 30;
     let dir = tempfile::tempdir().unwrap();
     let mut db = Database::open_with_config(capped(dir.path())).unwrap();
     for key in 0..ROWS {
