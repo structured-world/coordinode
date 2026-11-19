@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-19
+
+### Fixed
+
+- *(bench)* read git state without optional locks
+
+### Refactored
+
+- replace chrono with jiff
+
 ## v0.7.0 - 2026-10-06
 
 ### Documentation

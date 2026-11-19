@@ -2,6 +2,236 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.0 - 2026-11-19
+
+### Added
+
+- *(replication)* deliver a dropped label as the end of its scope
+- *(storage)* give a cut's continuation its logical events
+- *(embed)* keep a projection's effects and progress in one commit
+- *(replication)* continue a change read inside a large transaction
+- *(replication)* route change events by implied labels
+- *(server)* stream committed changes as logical events
+- *(embed)* read committed changes as events from a cursor
+- *(storage)* project committed units into logical change events
+- *(core)* name coalesced delete runs in the effect context
+- *(storage)* seal the change-feed context at the writers
+- *(core)* carry the logical effect context in the unit frame
+- *(server)* time a statement's stages in diagnostic builds
+- *(embed)* rebuild a consumer's state through a fixed cut
+- *(storage)* fixed cut of a group member
+- *(storage)* name a fixed cut's history by its deployment
+- *(storage)* fixed-cut source handoff for a standalone store
+- *(storage)* reclaim covered journal as flushes land
+- *(storage)* count compactions by what they did
+- *(storage)* trace what a footprint refusal was judged on
+- *(storage)* bounded material fold in commit order
+- *(storage)* material accounting and log-ordered registry endings
+- *(raft)* client writes take room granted by a majority
+- *(storage)* keep a store's own journal for its log consumers
+- *(replication)* typed causal bounds and receipts
+- *(storage)* use the io_uring backend by default
+- *(storage)* hold a temporal unique value per instant of valid time
+- *(storage)* bind history to the store's deployment before it lands
+- *(query)* answer AS OF past the retention from temporal history
+- *(storage)* keep node history and write records keyed by their commit
+- *(index)* bound the bytes of implication placement and folding
+- *(index)* key unique entries by their owner
+- *(search)* configure the text index worker's step and retry
+- *(index)* answer a text search with its view's interpretation
+- *(schema)* give labels a catalog identity records store
+- *(schema)* declare type, implied and auxiliary labels
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(storage)* per-table pressure series that go with the table
+- *(storage)* judge, repair and drop columnar tables as partitions
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(storage)* link a table's creation stamp to where it comes from
+- *(storage)* drop links to private items and stray table text
+- *(readme)* drop the archived Python SDK
+- *(storage)* describe the node history partition without a dash
+- *(storage)* name a private helper without linking it
+
+### Fixed
+
+- *(storage)* a cursor at the end follows every entry applied before it
+- address the code analysis findings on main
+- *(storage)* leave the open allowance to a store full of client writes
+- *(storage)* copy kept labels and label names only within their room
+- *(server)* hold one change batch per stream and name labels by identity
+- *(storage)* take a change read's working memory before allocating it
+- *(storage)* bound a change read's memory where it is held
+- *(storage)* deliver blob owner changes and refuse unknown components
+- *(storage)* bind every node change's labels and type interpretation
+- *(storage)* route a node's later change by the labels its earlier left
+- *(embed)* refuse a projection batch that does not continue it
+- *(storage)* bind a stored ceiling read to its ledger installation
+- *(storage)* cover a visible raft write in the receipt
+- *(storage)* keep the stamp a table creation got
+- *(storage)* end a journal copy at a whole entry, keep table stamps
+- *(storage)* end a checkpoint's journal copy at its pins
+- *(storage)* hold a table operation whole against a checkpoint
+- *(storage)* hold the table set still at a checkpoint's cut
+- *(storage)* capture a checkpoint at one cut of the commit clock
+- *(storage)* take a checkpoint from pinned trees, without a flush
+- *(storage)* read the stored closure for an offline group cut
+- *(storage)* charge a cut's clipped bounds and real scan state
+- *(storage)* bound a cut entry's memory as a whole
+- *(storage)* bound a cut's reads by the caller's budget
+- *(storage)* clip a cut's range deletes to its scope
+- *(storage)* qualify a group member's cut by its scope's tree
+- *(storage)* bound a state cut by scope, settled entries and bytes
+- *(storage)* refuse a cut whose view the store does not hold
+- *(storage)* wake a failed journal reclamation when room returns
+- *(storage)* rerun journal reclamation on real grounds only
+- *(storage)* keep charging what a failed checkpoint left
+- *(storage)* remove a checkpoint that failed partway
+- *(storage)* wake a flush refused for room without a lost wakeup
+- *(raft)* a follower below its disk reserve takes no committed entries
+- *(storage)* keep the recovery reserve's margin beside two starts
+- *(storage)* hold collection at the group's closed bound
+- *(storage)* answer no commit ceiling while the Schema tree is owed
+- *(storage)* seal the replay floor and the records a rebuild keeps
+- *(storage)* charge the staged Schema copy before it is written
+- *(raft)* read a stored commit ceiling off the async runtime
+- *(storage)* read a checkpoint's replay floor without opening it
+- *(storage)* settle the Schema tree before the open reads it
+- *(storage)* material accounting in a tree of its own
+- *(storage)* a refused open removes the lock files it created
+- one-cut admin backup, exclusive bounded restore
+- *(storage)* closure ledger in the reserved keyspace
+- *(query)* charge evaluator memory before it is held
+- *(storage)* a statement's deadline and cancel bound every admission wait
+- *(replicate)* bound consumer progress, heartbeats and breakpoints
+- *(storage)* owe the manifest write a deferred flush leaves to its barrier
+- *(storage)* read history before the binding when founding
+- *(storage)* end a wait's waker registration with the wait
+- *(embed)* wait for a standalone causal bound without a thread
+- *(storage)* keep each log prefix's commit ceiling exactly
+- *(raft)* hand over again a sealed commit its own entry closed
+- *(raft)* let an entry close the commits it carries
+- *(query)* read only views every commit below is applied at
+- *(raft)* close the commits a lost leader left uncovered
+- *(storage)* keep the memtable start debt crate-private
+- *(storage)* admit a write into an empty memtable for its flush
+- *(storage)* count a flush allowance per memtable in the debt
+- *(storage)* keep member records from making closing entries due
+- *(storage)* report a write of unknown outcome as such
+- *(storage)* hold a value per instant while its unique index is built
+- *(storage)* stop the log at its first failed write
+- *(storage)* never found a new domain over retained history
+- *(storage)* admit the commit timestamp a stamped key carries
+- *(index)* keep a claim's charge only on what is kept
+- *(index)* charge unique claims and checks for as long as they live
+- *(index)* count a unit's derived fan-out before expanding it
+- *(index)* bound the fan-out everywhere and type every index refusal
+- *(index)* refuse keys past the store's limit, bound entry fan-out
+- *(storage)* map a bound too short for a slot past the whole slot
+- *(index)* charge implication placement memory before taking it
+- *(storage)* keep the engine and dump format versions
+- *(storage)* refuse only a change of what a typed label implies
+- *(schema)* bind a label's first use through the ordered log
+- *(storage)* decide a schema read from the current state
+- *(storage)* save the consensus state below half the space reserve
+- *(storage)* name the key a pending-commit conflict is about
+- *(storage)* close a dropped table's tree before removing its folder
+- *(storage)* admit promise copy writes as recovery work
+- *(raft)* bind promises to a member, write copy durably
+- *(raft)* keep the purge point and a loss with the vote; replace a member
+- *(raft)* keep a second copy of the member's vote
+- *(storage)* let blob collection run below the free-space reserve
+- *(storage)* flush and capture a table only while it lives
+- *(storage)* no table file is made in a folder being dropped
+- *(storage)* a second drop of a table drops the same table
+- *(storage)* hold a table name until its drop finishes
+- *(storage)* serve a rebuilt tree's history above its copy's floor
+- *(storage)* open a checkpoint on its clock, never compacted
+- *(storage)* refuse a rebuild from a damaged checkpoint copy
+- *(storage)* rebuild a partition at its original seqnos
+- *(storage)* rebuild a table only from provable state
+- *(storage)* roll back a torn manifest tail instead of repairing
+- *(storage)* capture the journal tail after a checkpoint's trees
+- *(storage)* refuse a hard limit below the supported minimum
+- *(storage)* sync a new journal segment's directory
+
+### Performance
+
+- *(server)* share one log reader across change streams again
+- *(storage)* take a statement's receipt at its own view
+- *(storage)* attribute complete-snapshot calls to their caller
+- *(storage)* time the complete-snapshot wait under stage-timing
+- *(embed)* open a checkpointed store without scrubbing it
+- *(storage)* read free space off the write path
+- *(storage)* check snapshot retention of the tree read only
+- *(storage)* copy a transaction's snapshot read once
+- *(storage)* copy a cut's page into budget-charged blocks
+- *(storage)* search a batch entry's seals, not scan them
+- *(storage)* keep a transaction's writes in key order
+- *(storage)* read a unique value's staged owners by range
+- *(txn)* restate bound trends by moving the claims
+- *(query)* read a node's schemas once per write
+- *(storage)* leave a journaled tree's flush syncs to a barrier
+- *(storage)* export a generation's history by its own key range
+- *(storage)* bench flush and compaction of a table
+- index partition trees by discriminant, share index definitions
+
+### Refactored
+
+- *(storage)* [**breaking**] withdraw prepaid flush room and member grants
+- *(storage)* [**breaking**] remove per-mutation material accounting
+- *(schema)* store canonical labels and judge RETYPE by its result
+- *(storage)* keep the table repair record crate-private
+
+### Testing
+
+- *(storage)* a backup at the limit may see room given back meanwhile
+- *(storage)* capture the store's log in the full-store cleanup test
+- *(storage)* name the charges a barrier finds no room beside
+- *(storage)* ask a refused barrier again under the raised limit
+- *(storage)* wait for flushes by deadline, not a fixed budget
+- *(embed)* cover instances, dropped labels and a failed last fragment
+- *(storage)* hold a settled persist to its own success
+- *(storage)* fail the installation of a persist on its own
+- *(storage)* show a persist sweep reaching an unknown installation
+- *(storage)* sweep a background flush's failures across a power cut
+- *(storage)* a compaction stopped by the limit holds no room
+- *(storage)* fill a capped store until a one-byte write is refused
+- *(storage)* assert shared cut page block
+- *(embed)* wait for the idle reaper's end, not a fixed sleep
+- *(storage)* keep unit retirement out of the replay multiplicity check
+- *(raft)* bench the closure ledger's window, lookups and load
+- *(storage)* the recovery floor's limit as a compile-time check
+- *(storage)* bench what the material accounting costs the writes
+- *(storage)* give the queued-flush test room on a loaded host
+- *(integration)* prove a member's disk stall and check every attempt
+- stall a server's Raft log on real disk I/O for the move test
+- *(raft)* a stalled log sync keeps the leader
+- *(storage)* use is_multiple_of in the mixed load test
+- *(storage)* mixed reads, writes and compactions on the default file system
+- *(storage)* a power cut never leaves history without its domain
+- *(storage)* name the candidate implication in the admission test
+- *(storage)* build the candidate test schema with its own fields
+- *(storage)* fail every matching op of a persist
+- *(storage)* fail only the persisting partition's files
+- *(storage)* wait for the drop to close the tree, not for a sleep
+- *(storage)* measure the copy's peak from a steady store
+- *(storage)* model clean-stale pages and torn files
+- *(storage)* fail each step of a promise copy write
+- *(storage)* compare table tree paths absolute, as the tree config does
+- *(storage)* compare table tree paths against the endpoints as configured
+- *(storage)* hold a slowed table's rows to the write rate
+- *(storage)* judge each table into its own verdict and one metrics series
+- *(storage)* check the tail-captured segment's bytes on every platform
+
+### Bench
+
+- *(storage)* separate foreground and full accounting cost
+- *(storage)* measure statement flushes on a fresh store per series
+- *(raft)* separate leadership seen from confirmed
+
 ## v0.8.0 - 2026-10-23
 
 ### Added
