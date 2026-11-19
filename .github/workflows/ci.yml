@@ -434,6 +434,11 @@ jobs:
         with:
           # See the `test` job: the runner's own bin directory stays out.
           cache-bin: "false"
+      # The benchmarks are a standalone workspace built `--locked` against the
+      # workspace crates by path: a change to those crates' versions or
+      # dependencies has to bring the benchmark lockfile along with it.
+      - name: Benchmark lockfile matches the workspace
+        run: cargo tree --locked --quiet --depth 0 --manifest-path benches/vector-ann/Cargo.toml
       - name: Build (release)
         run: cargo build --release --all-features
       - name: Clean the build output

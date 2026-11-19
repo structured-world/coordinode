@@ -1,10 +1,16 @@
-"""Bring the published example's requirements to the release a PR prepares.
+"""Bring the builds outside the workspace to the release a PR prepares.
 
-The example builds from registry packages as an application does, so it is not
-a workspace member and release-plz never updates its manifest. Run after
-`release-plz release-pr --output json`: on the release PR's branch, each
-requirement on a registry package becomes the caret requirement of the release
-version, committed and pushed to that branch, so the PR carries it.
+release-plz versions the workspace and its lockfile only. Run after
+`release-plz release-pr --output json`, on the release PR's branch:
+
+- the example builds from registry packages as an application does, so each of
+  its requirements on a registry package becomes the caret requirement of the
+  release version;
+- a standalone workspace that builds the workspace crates by path (the
+  benchmarks, built `--locked`) has its lockfile record their new versions,
+  every other locked package kept as it was.
+
+The changes are committed and pushed to that branch, so the PR carries them.
 """
 import argparse
 import json
@@ -15,6 +21,9 @@ import subprocess
 import tomllib
 
 QUICKSTART = "examples/embedded-quickstart/Cargo.toml"
+# Standalone workspaces with a committed lockfile that depend on workspace
+# crates by path.
+PATH_LOCKED = ("benches/vector-ann",)
 REPOSITORY = "structured-world/coordinode"
 
 
@@ -40,6 +49,19 @@ def update_manifest(text, names, version):
         if count != 1:
             raise ValueError(f"{QUICKSTART}: {name} is not one `name = \"version\"` line")
     return text
+
+
+def refresh_lock(root, workspace):
+    """Bring the lockfile of the standalone `workspace` under `root` to the
+    versions of the path crates it builds; True when it changed. Resolving
+    without `--locked` rewrites only the entries that no longer match their
+    manifests, so registry packages keep their locked versions."""
+    lock = root / workspace / "Cargo.lock"
+    before = lock.read_bytes()
+    subprocess.run(["cargo", "tree", "--quiet", "--depth", "0",
+                    "--manifest-path", str(root / workspace / "Cargo.toml")],
+                   cwd=root, check=True, stdout=subprocess.DEVNULL)
+    return lock.read_bytes() != before
 
 
 def release_branch(pr_json):
@@ -72,22 +94,26 @@ def main():
     version = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     names = set(tomllib.loads(
         (root / ".config/registry-packages.toml").read_text())["packages"])
+    changed = []
     path = root / QUICKSTART
     before = path.read_text()
     after = update_manifest(before, names, version)
-    if after == before:
-        print(f"{QUICKSTART} already admits {version}")
+    if after != before:
+        # A fixed path in the checkout the release workflow names, rewritten
+        # from its own content: no input chooses where it writes.
+        path.write_text(after)  # NOSONAR
+        changed.append(QUICKSTART)
+    changed += [f"{w}/Cargo.lock" for w in PATH_LOCKED if refresh_lock(root, w)]
+    if not changed:
+        print(f"the builds outside the workspace already take {version}")
         return
-    # A fixed path in the checkout the release workflow names, rewritten from
-    # its own content: no input chooses where it writes.
-    path.write_text(after)  # NOSONAR
-    git(root, "add", QUICKSTART)
+    git(root, "add", *changed)
     git(root, "-c", "user.name=sw-release-bot[bot]",
         "-c", "user.email=sw-release-bot[bot]@users.noreply.github.com",
         "commit", "--quiet", "-m",
-        f"chore(examples): require the {requirement_for(version)} release")
+        f"chore(release): bring the builds outside the workspace to {version}")
     git(root, "push", "--quiet", remote, f"HEAD:refs/heads/{branch}")
-    print(f"{QUICKSTART} requires {requirement_for(version)} on {branch}")
+    print(f"{', '.join(changed)} take {version} on {branch}")
 
 
 if __name__ == "__main__":
