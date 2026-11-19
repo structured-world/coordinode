@@ -219,7 +219,7 @@ function ratioDirection(m: RatioMetric): "higher-better" | "lower-better" {
 const subjects = computed<string[]>(() => {
   const s = new Set<string>();
   for (const r of reports.value) s.add(r.subject);
-  return [...s].sort();
+  return [...s].sort((a, b) => a.localeCompare(b));
 });
 
 watch(subjects, (list) => {
@@ -654,7 +654,11 @@ onMounted(render);
             v-for="e in ENGINES"
             :key="e.name"
             :class="['legend-row', enabledSubjects.has(e.name) ? 'is-on' : 'is-off', e.status === 'planned' ? 'is-planned' : '']"
+            :tabindex="e.status === 'live' ? 0 : undefined"
+            :aria-pressed="e.status === 'live' ? enabledSubjects.has(e.name) : undefined"
             @click="e.status === 'live' && toggleSubject(e.name)"
+            @keydown.enter.prevent="e.status === 'live' && toggleSubject(e.name)"
+            @keydown.space.prevent="e.status === 'live' && toggleSubject(e.name)"
           >
             <td class="col-toggle">
               <span :class="['toggle-dot', enabledSubjects.has(e.name) ? 'on' : 'off']" :title="enabledSubjects.has(e.name) ? 'visible — click to hide' : 'hidden — click to show'">

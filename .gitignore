@@ -99,9 +99,9 @@ benches/vector-ann/docker/out/
 docs/public/bench-data/
 docs/public/bench-results/
 
-# Standalone bench workspace artifacts
+# Standalone bench workspace artifacts (vector-ann's lockfile is committed:
+# the bench workflow builds it with --locked)
 benches/vector-ann/target/
-benches/vector-ann/Cargo.lock
 benches/gold/target/
 benches/gold/Cargo.lock
 # Parser generator build output (its lockfile is committed: the generated

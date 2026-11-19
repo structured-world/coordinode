@@ -2093,8 +2093,9 @@ pub struct ChangeEvent {
     pub action: Action,
     /// What it does it to.
     pub target: OwnedTarget,
-    /// The replacement for a put, the delta for a patch.
-    #[serde(with = "serde_bytes")]
+    /// The replacement for a put, the delta for a patch. Absent reads as none,
+    /// as an absent `labels` does: `with` turns off serde's own default.
+    #[serde(with = "serde_bytes", default)]
     pub payload: Option<Vec<u8>>,
     /// How it reaches this reader: enter, apply or leave its scope.
     pub delivery: Delivery,

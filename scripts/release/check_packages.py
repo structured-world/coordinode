@@ -198,8 +198,11 @@ def main():
         consumer = pathlib.Path(temporary)
         (consumer / "src").mkdir()
         (consumer / ".cargo").mkdir()
-        (consumer / "src/main.rs").write_text((root / "scripts/release/consumer.rs").read_text())
-        (consumer / "Cargo.toml").write_text(consumer_manifest(version))
+        # Fixed names in a fresh temporary directory, filled from the checkout
+        # the release workflow names: no input chooses where they are written.
+        (consumer / "src/main.rs").write_text(  # NOSONAR
+            (root / "scripts/release/consumer.rs").read_text())
+        (consumer / "Cargo.toml").write_text(consumer_manifest(version))  # NOSONAR
         if args.source == "prepared":
             (consumer / ".cargo/config.toml").write_text(
                 '[source.crates-io]\nreplace-with="prepared"\n[source.prepared]\n'
@@ -255,7 +258,8 @@ def main():
                               "quickstart_example": "passed",
                               "license_inventory_packages": evidence})
     report[f"{args.source}_consumer"] = qualified
-    report_path.write_text(json.dumps(report, indent=2) + "\n")
+    # The report preparation wrote in the named checkout, updated in place.
+    report_path.write_text(json.dumps(report, indent=2) + "\n")  # NOSONAR
     print(f"{args.source} external consumer passed; consumer build/data cleaned")
 
 

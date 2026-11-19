@@ -573,7 +573,7 @@ impl ClusterServiceImpl {
 
         tracing::info!(
             node_id,
-            message = resp.message,
+            peer_reply = %resp.message,
             "DecommissionNode self: complete"
         );
 

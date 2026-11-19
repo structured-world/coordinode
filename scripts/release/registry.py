@@ -141,7 +141,8 @@ def main():
     elif args.mode == "verify":
         check_versions(report, lambda p: request("GET", p), allow_missing=False)
         report["registry_checksums_verified"] = True
-        report_path.write_text(json.dumps(report, indent=2) + "\n")
+        # The report preparation wrote in the named checkout, updated in place.
+        report_path.write_text(json.dumps(report, indent=2) + "\n")  # NOSONAR
     print(f"{args.mode}: verified {len(names)} coordinated packages")
 
 

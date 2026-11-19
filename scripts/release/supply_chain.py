@@ -105,6 +105,13 @@ def write_evidence(directory, stem, metadata, lock_text, context):
     """Write `<stem>-licenses.json` and `<stem>-sbom.cdx.json`; return the inventory."""
     evidence = inventory(metadata, lock_text, context)
     directory = pathlib.Path(directory)
-    (directory / f"{stem}-licenses.json").write_text(json.dumps(evidence, indent=2) + "\n")
-    (directory / f"{stem}-sbom.cdx.json").write_text(json.dumps(cyclonedx(evidence), indent=2) + "\n")
+    # The stem names files in `directory`; one carrying a separator (a
+    # toolchain name given with a path in it) would write elsewhere.
+    if pathlib.Path(stem).name != stem:
+        raise ValueError(f"evidence stem {stem!r} is not a file name")
+    licenses = directory / f"{stem}-licenses.json"
+    sbom = directory / f"{stem}-sbom.cdx.json"
+    # Inside `directory`, checked above.
+    licenses.write_text(json.dumps(evidence, indent=2) + "\n")  # NOSONAR
+    sbom.write_text(json.dumps(cyclonedx(evidence), indent=2) + "\n")  # NOSONAR
     return evidence

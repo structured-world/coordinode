@@ -941,3 +941,27 @@ fn a_read_starts_at_its_place_inside_the_entry() {
         Err(crate::error::StorageError::Budget(_))
     ));
 }
+
+/// An event written without its optional payload, as a self-describing
+/// format leaves an absent field out, reads back with none, as an event
+/// without labels does; before, the payload's byte encoding made it required.
+#[test]
+fn an_event_without_its_payload_reads_as_none() {
+    let event = ChangeEvent {
+        id: EventId {
+            position: coordinode_core::txn::operation::LogPosition { index: 3, sub: 0 },
+            ordinal: 1,
+        },
+        action: Action::Remove,
+        target: OwnedTarget::Node(key(4)),
+        payload: None,
+        delivery: Delivery::Apply,
+        labels: None,
+    };
+    let mut written = serde_json::to_value(&event).expect("encode");
+    let fields = written.as_object_mut().expect("an object");
+    fields.remove("payload");
+    fields.remove("labels");
+    let read: ChangeEvent = serde_json::from_value(written).expect("decode without them");
+    assert_eq!(read, event);
+}

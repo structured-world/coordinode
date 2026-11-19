@@ -470,8 +470,8 @@ const qpsChartOption = computed(() => {
         </button>
       </div>
       <div class="ctrl-group">
-        <span class="ctrl-label">CoordiNode commit:</span>
-        <select v-model="selectedCoordinodeSha" class="select">
+        <label class="ctrl-label" for="bench-by-dim-commit">CoordiNode commit:</label>
+        <select id="bench-by-dim-commit" v-model="selectedCoordinodeSha" class="select">
           <option value="">latest ({{ coordinodeSHAs[0] ?? "—" }})</option>
           <option v-for="s in coordinodeSHAs" :key="s" :value="s">{{ s }}</option>
         </select>
@@ -522,7 +522,11 @@ const qpsChartOption = computed(() => {
           v-for="s in allSubjects"
           :key="s"
           :class="['legend-row', enabledSubjects.has(s) ? 'is-on' : 'is-off', s === 'coordinode' ? 'is-coordinode' : '']"
+          tabindex="0"
+          :aria-pressed="enabledSubjects.has(s)"
           @click="toggleSubject(s)"
+          @keydown.enter.prevent="toggleSubject(s)"
+          @keydown.space.prevent="toggleSubject(s)"
         >
           <td class="col-toggle">
             <span :class="['toggle-dot', enabledSubjects.has(s) ? 'on' : 'off']">

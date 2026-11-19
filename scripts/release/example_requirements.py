@@ -78,7 +78,9 @@ def main():
     if after == before:
         print(f"{QUICKSTART} already admits {version}")
         return
-    path.write_text(after)
+    # A fixed path in the checkout the release workflow names, rewritten from
+    # its own content: no input chooses where it writes.
+    path.write_text(after)  # NOSONAR
     git(root, "add", QUICKSTART)
     git(root, "-c", "user.name=sw-release-bot[bot]",
         "-c", "user.email=sw-release-bot[bot]@users.noreply.github.com",

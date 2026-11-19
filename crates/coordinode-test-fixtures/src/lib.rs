@@ -416,7 +416,10 @@ fn reserve_port(port: u16) -> bool {
     match file.try_lock() {
         Ok(()) => {
             // Held for the life of the process; the OS drops the lock at exit.
-            std::mem::forget(file);
+            static HELD: std::sync::Mutex<Vec<std::fs::File>> = std::sync::Mutex::new(Vec::new());
+            HELD.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(file);
             true
         }
         Err(std::fs::TryLockError::WouldBlock) => false,
