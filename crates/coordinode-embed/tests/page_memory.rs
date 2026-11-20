@@ -1039,22 +1039,29 @@ fn restating_claims_allocates_nothing() {
         bound: CardinalityBound::AtMostOne,
         trend,
     };
-    let mut claims = ClaimSet::new();
-    for node in 0..6 {
-        claims.insert(Claim::new(scope(node), bound(CountTrend::Grows), 1));
-        claims.insert(Claim::new(scope(node), bound(CountTrend::Shrinks), 1));
-    }
-    for revision in 1..=3 {
-        claims.insert(Claim::new(scope(9), bound(CountTrend::Grows), revision));
-    }
-    assert_eq!(claims.len(), 15);
-
-    let ((), allocated) = allocated_by(|| {
+    let build = || {
+        let mut claims = ClaimSet::new();
+        for node in 0..6 {
+            claims.insert(Claim::new(scope(node), bound(CountTrend::Grows), 1));
+            claims.insert(Claim::new(scope(node), bound(CountTrend::Shrinks), 1));
+        }
+        for revision in 1..=3 {
+            claims.insert(Claim::new(scope(9), bound(CountTrend::Grows), revision));
+        }
+        assert_eq!(claims.len(), 15);
+        claims
+    };
+    // Restating consumes what it drops, so every measured call takes a set
+    // built before it; the count is the process's, hence the fewest of them.
+    let mut fresh: Vec<ClaimSet> = (0..5).map(|_| build()).collect();
+    let (mut claims, allocated) = least_allocated_by(|| {
+        let mut claims = fresh.pop().expect("a set built for each call");
         claims.restate(|_, predicate| {
             if let ClaimPredicate::CardinalityBound { trend, .. } = predicate {
                 *trend = CountTrend::Changes;
             }
         });
+        claims
     });
     assert_eq!(allocated, 0, "restating allocated");
     assert_eq!(
