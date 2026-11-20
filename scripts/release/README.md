@@ -21,7 +21,10 @@ tests.
 `pr_config.ts` derives an ignored configuration for release-PR calculation.
 Before a library's first upload, it uses the existing coordinated Git baseline
 with publishing disabled in that calculation only. A published library retains
-its registry baseline and semantic-version checks. Registry failures stop the
+its registry baseline and semantic-version checks, except when any library's
+copy of the newest coordinated version is yanked: the libraries require each
+other exactly, so that release cannot be built as a baseline, and the calculation
+skips the API comparison for the set and says so in its log. Registry failures stop the
 calculation. Upload always uses the checked-in `.release-plz.toml`, never this
 derived configuration; the server tag does not establish a library upload.
 
