@@ -2236,13 +2236,19 @@ fn clocked_capped(
 
 /// Commit one client write as entry `index` the way a consensus member
 /// does: admitted first (its breakpoint and that breakpoint's removal
-/// included), applied, its closure records written, the admission given
-/// back once the entry is applied.
+/// included), applied, its closure records written.
+///
+/// The admission goes into `log`, which stands for the member's log: there
+/// the entry keeps its room until the trees cover it. This store has no log
+/// of its own, so an admission given back at apply would leave the applied
+/// data charged nowhere until its memtable flushed, and flushes running
+/// behind on a loaded host would let the memtables grow past the limit.
 fn admitted_write(
     engine: &StorageEngine,
     oracle: &coordinode_core::txn::timestamp::TimestampOracle,
     index: u64,
     value_len: usize,
+    log: &mut Vec<crate::engine::footprint::Admitted>,
 ) -> bool {
     use coordinode_core::txn::proposal::{Mutation, PartitionId};
     // Incompressible, so the tables take what the values hold: a store
@@ -2278,7 +2284,7 @@ fn admitted_write(
             .expect("write the closure records");
     }
     engine.raise_closure_frontier(0, index).expect("install");
-    drop(admitted);
+    log.push(admitted);
     true
 }
 
@@ -2295,10 +2301,12 @@ fn a_small_limit_flushes_memtables_at_half_its_reserve() {
     let threshold = crate::engine::config::default_recovery_reserve(LIMIT) / 2;
     let node = engine.tree(Partition::Node).expect("node tree");
     let mut index = 0;
+    let mut log = Vec::new();
     while index * (16 << 10) < 3 * threshold {
         index += 1;
-        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10, &mut log));
     }
+    drop(log);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while node.table_count() == 0 || node.sealed_memtable_count() > 0 {
         assert!(
@@ -2323,9 +2331,11 @@ fn a_flush_short_of_room_runs_again_once_room_comes_back() {
     const LIMIT: u64 = 64 << 20;
     let dir = tempfile::TempDir::new().expect("tempdir");
     let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    let mut log = Vec::new();
     for index in 1..=8 {
-        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10, &mut log));
     }
+    drop(log);
     let footprints = engine.footprints().clone();
     let footprint = Arc::clone(footprints.get("default").expect("a limit"));
     let scratch = dir.path().join("scratch");
@@ -2361,9 +2371,11 @@ fn room_freed_while_a_failed_flush_registers_still_wakes_it() {
     const LIMIT: u64 = 64 << 20;
     let dir = tempfile::TempDir::new().expect("tempdir");
     let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    let mut log = Vec::new();
     for index in 1..=8 {
-        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10, &mut log));
     }
+    drop(log);
     // Every other tree flushed: the node tree's flush is the only one, so no
     // other flush finishing wakes the monitor.
     engine.persist().expect("persist");
@@ -2564,10 +2576,12 @@ fn a_checkpoint_refused_for_room_leaves_nothing_behind() {
     const LIMIT: u64 = 64 << 20;
     let dir = tempfile::TempDir::new().expect("tempdir");
     let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    let mut log = Vec::new();
     for index in 1..=8 {
-        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10, &mut log));
     }
     engine.persist().expect("persist");
+    drop(log);
     engine
         .put(Partition::Node, b"node:1:unflushed", &vec![7u8; 64 << 10])
         .expect("put");
@@ -2610,10 +2624,12 @@ fn a_backup_elsewhere_at_the_limit_takes_no_room_and_keeps_the_memtables() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let backups = tempfile::TempDir::new().expect("tempdir");
     let (engine, oracle) = clocked_capped(dir.path(), LIMIT, None);
+    let mut log = Vec::new();
     for index in 1..=8 {
-        assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+        assert!(admitted_write(&engine, &oracle, index, 16 << 10, &mut log));
     }
     engine.persist().expect("persist");
+    drop(log);
     // Left in the memtables.
     engine
         .put(Partition::Node, b"node:1:unflushed", &[7u8; 4096])
@@ -3053,11 +3069,13 @@ fn a_compaction_stopped_by_the_limit_holds_nothing_after() {
     let node = engine.tree(Partition::Node).expect("node tree");
     let mut index = 0;
     for _ in 0..4 {
+        let mut log = Vec::new();
         for _ in 0..32 {
             index += 1;
-            assert!(admitted_write(&engine, &oracle, index, 16 << 10));
+            assert!(admitted_write(&engine, &oracle, index, 16 << 10, &mut log));
         }
         engine.persist().expect("flush a table");
+        drop(log);
     }
     assert!(node.table_count() >= 4, "four tables to compact");
     let inputs = node.disk_space();
@@ -3128,17 +3146,20 @@ fn await_flushed(tree: &impl lsm_tree::AbstractTree, what: &str) {
 /// refused leaves room for a small one: fill with big writes, then small
 /// ones. The refusal that ends it is the evidence; a later write is not
 /// asked, since an admission that finds no room first reclaims the journal
-/// the trees cover, and a flush landing meanwhile may give it room.
+/// the trees cover, and a flush landing meanwhile may give it room. The
+/// fill's log keeps its entries' room until the fill ends, so what the
+/// memtables hold unflushed then stays within the limit.
 fn fill_to_the_limit(
     engine: &StorageEngine,
     oracle: &coordinode_core::txn::timestamp::TimestampOracle,
     index: &mut u64,
 ) {
-    while admitted_write(engine, oracle, *index + 1, 16 << 10) {
+    let mut log = Vec::new();
+    while admitted_write(engine, oracle, *index + 1, 16 << 10, &mut log) {
         *index += 1;
     }
     let mut small = 0;
-    while admitted_write(engine, oracle, *index + 1, 1) {
+    while admitted_write(engine, oracle, *index + 1, 1, &mut log) {
         *index += 1;
         small += 1;
         assert!(small < 100_000, "the store never refused a client write");
@@ -3218,13 +3239,15 @@ fn closing_entries_clean_up_within_the_limit_client_writes_are_refused_at() {
         engine.set_retention_window(std::time::Duration::from_secs(3_600));
         // More breakpoints than the cache keeps, then writes until the store
         // refuses the next one.
+        let mut log = Vec::new();
         for _ in 0..crate::engine::closure_ledger::CACHED_BREAKPOINTS + 44 {
             index += 1;
-            assert!(admitted_write(&engine, &oracle, index, 1_024));
+            assert!(admitted_write(&engine, &oracle, index, 1_024, &mut log));
         }
-        while admitted_write(&engine, &oracle, index + 1, 16 << 10) {
+        while admitted_write(&engine, &oracle, index + 1, 16 << 10, &mut log) {
             index += 1;
         }
+        drop(log);
         let held = ledger_held(&engine);
         persist_making_room(&engine, LIMIT);
         held
