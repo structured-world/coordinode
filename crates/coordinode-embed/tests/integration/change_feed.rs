@@ -41,19 +41,24 @@ fn interest(labels: Option<&[&str]>, edge_types: Option<&[&str]>) -> ChangeInter
 /// Every unit after `cursor` up to the end of what is committed, the cursor
 /// moved past them: copies the test keeps, its own memory, each page's
 /// charge released as the page goes.
+///
+/// A read hands over only entries already applied and synced, and an entry
+/// written in the background below the test's commits may still be applying
+/// when they return, so an empty page is no end. The end is where a cursor
+/// opened now starts: it waits for every entry applied before it.
 fn read_all(db: &Database, cursor: &mut ChangeCursor) -> Vec<UnitChanges> {
+    let end = db
+        .change_cursor(&ChangeInterest::default())
+        .expect("end cursor")
+        .position();
     let budget = QueryBudget::new(1 << 24);
     let mut units = Vec::new();
-    loop {
+    while cursor.position() < end {
         let page = db.read_changes(cursor, 8, &budget).expect("read");
-        let next = page.batch().cursor.clone();
-        let moved = next != *cursor;
         units.extend(page.batch().units.iter().cloned());
-        *cursor = next;
-        if !moved {
-            return units;
-        }
+        *cursor = page.batch().cursor.clone();
     }
+    units
 }
 
 /// The events of `units`, in order.
@@ -760,6 +765,10 @@ fn a_read_too_small_for_one_event_refuses() {
         .change_cursor(&ChangeInterest::default())
         .expect("cursor");
     run(&mut db, "CREATE (:Person {name: 'a'})");
+    // Opening a cursor waits until the write is settled, so the read below
+    // has its event to refuse instead of an empty page.
+    db.change_cursor(&ChangeInterest::default())
+        .expect("settled");
     let budget = QueryBudget::new(64);
     match db.read_changes(&start, 8, &budget) {
         Err(coordinode_embed::DatabaseError::Budget(_)) => {}
