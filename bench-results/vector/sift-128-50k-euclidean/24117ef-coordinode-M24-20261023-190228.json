@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-10-23T19:02:28.299189946Z",
+  "git": {
+    "sha": "24117efb31a968363abd8c579751ed6a6193effe",
+    "sha_short": "24117ef",
+    "branch": "main",
+    "dirty": true,
+    "commit_date": "2026-10-23T18:44:41Z"
+  },
+  "hardware": {
+    "cpu_brand": "Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz",
+    "cpu_cores": 8,
+    "cpu_threads": 8,
+    "ram_gb": 31,
+    "os_name": "Fedora Linux",
+    "os_version": "44",
+    "arch": "x86_64"
+  },
+  "modality": "vector",
+  "benchmark": "ann-benchmarks",
+  "dataset": "sift-128-50k-euclidean",
+  "subject": "coordinode",
+  "codec": "none",
+  "version": "0.4.3",
+  "metrics": {
+    "build_secs": 7.27131308,
+    "dataset_dim": 128,
+    "dataset_n_test": 10000,
+    "dataset_n_train": 50000,
+    "hnsw_alpha_pruning": 1.0,
+    "hnsw_ef_construction": 200,
+    "hnsw_m": 24,
+    "hnsw_rerank_mode": "inline",
+    "hnsw_rerank_oversample": 1.0,
+    "k": 10,
+    "n_shards": 1,
+    "qps_at_recall_0_95": 26899.90993226897,
+    "qps_at_recall_peak": 6281.633190148298,
+    "quantization": "none",
+    "rayon_threads": 4,
+    "rayon_threads_effective": 4,
+    "recall_at_k_peak": 0.99671,
+    "rss_kib_after_build": 1093620,
+    "rss_kib_before_build": 511852,
+    "rss_kib_peak": 1095232,
+    "search_threads": 4,
+    "shard_routing": "modulo",
+    "subset_size": 50000,
+    "sweep": [
+      {
+        "ef_search": 40,
+        "latency_us_mean": 132.80033,
+        "latency_us_p50": 121.0,
+        "latency_us_p95": 245.0,
+        "latency_us_p99": 359.0,
+        "qps": 26899.90993226897,
+        "recall_at_k": 0.97441
+      },
+      {
+        "ef_search": 80,
+        "latency_us_mean": 185.33902,
+        "latency_us_p50": 177.0,
+        "latency_us_p95": 295.0,
+        "latency_us_p99": 449.0,
+        "qps": 20087.317822979843,
+        "recall_at_k": 0.98958
+      },
+      {
+        "ef_search": 135,
+        "latency_us_mean": 292.96088,
+        "latency_us_p50": 278.0,
+        "latency_us_p95": 493.0,
+        "latency_us_p99": 683.0,
+        "qps": 13032.44625092117,
+        "recall_at_k": 0.99417
+      },
+      {
+        "ef_search": 200,
+        "latency_us_mean": 379.00477,
+        "latency_us_p50": 365.0,
+        "latency_us_p95": 600.0,
+        "latency_us_p99": 832.0,
+        "qps": 10250.955960355654,
+        "recall_at_k": 0.99559
+      },
+      {
+        "ef_search": 400,
+        "latency_us_mean": 621.73759,
+        "latency_us_p50": 603.0,
+        "latency_us_p95": 924.0,
+        "latency_us_p99": 1347.0,
+        "qps": 6281.633190148298,
+        "recall_at_k": 0.99671
+      }
+    ]
+  }
+}
