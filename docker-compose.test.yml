@@ -18,7 +18,7 @@ services:
     environment:
       - COORDINODE_LOG_FORMAT=json
     healthcheck:
-      test: ["CMD", "/coordinode", "healthcheck"]
+      test: ["CMD", "coordinode", "healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 5

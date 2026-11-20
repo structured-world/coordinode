@@ -63,11 +63,11 @@ Expected response:
 ## Health Check
 
 The image declares a Docker `HEALTHCHECK` that runs the binary's own probe,
-`/coordinode healthcheck`: it asks `/ready` on the ops port and exits 0 on
+`coordinode healthcheck`: it asks `/ready` on the ops port and exits 0 on
 `200`. `/ready` answers `503` until the server accepts requests and again from
 the moment it starts shutting down, so an orchestrator routes nothing to a node
-that is starting or draining. The probe needs no shell or HTTP client in the
-image. `docker compose ps` shows the container as `healthy` once it is ready.
+that is starting or draining. `docker compose ps` shows the container as
+`healthy` once it is ready.
 
 Consensus that stops on a fatal error (a failed log write or sync) shuts the
 server down with a non-zero exit status rather than leaving a container that
@@ -83,7 +83,7 @@ over both. A server that runs from a config file is checked with the same file:
 ```yaml
     command: ["serve", "--config", "/etc/coordinode/coordinode.conf"]
     healthcheck:
-      test: ["CMD", "/coordinode", "healthcheck", "--config", "/etc/coordinode/coordinode.conf"]
+      test: ["CMD", "coordinode", "healthcheck", "--config", "/etc/coordinode/coordinode.conf"]
 ```
 
 A server started with a different `--ops-addr` on the command line needs the
@@ -91,7 +91,7 @@ same address in the check:
 
 ```yaml
     healthcheck:
-      test: ["CMD", "/coordinode", "healthcheck", "--ops-addr", "127.0.0.1:9184"]
+      test: ["CMD", "coordinode", "healthcheck", "--ops-addr", "127.0.0.1:9184"]
 ```
 
 A port the server cannot bind (gRPC, REST or ops) stops it at startup, so the
@@ -119,7 +119,8 @@ docker compose down -v   # removes the volume
 docker compose up -d
 ```
 
-The server runs as the unprivileged user `65532:65532`, never as root. A new
+The server runs as the unprivileged user `coordinode` (`65532:65532`), never
+as root. A new
 named volume starts out owned by that user. A bind mount, or a volume an
 earlier image wrote as root, has to be handed over once before the server can
 write to it:
@@ -127,6 +128,26 @@ write to it:
 ```bash
 docker run --rm --user 0 -v coordinode-data:/data busybox chown -R 65532:65532 /data
 ```
+
+## Maintenance Inside the Container
+
+The image is Debian-based and carries `bash` with the tools that surround the
+maintenance commands (`coordinode backup`, `restore`, `checkpoint`, `compact`,
+`verify`; see [Other subcommands](configuration#other-subcommands)): `tar`,
+`gzip`, `zstd`, `xz`, `curl`, `ps` and `less`. A dump of a stopped server's
+volume, compressed on its way to the host:
+
+```bash
+docker compose stop coordinode
+docker run --rm --entrypoint bash -v coordinode-data:/data \
+  ghcr.io/structured-world/coordinode:latest \
+  -c 'coordinode backup --data /data --output /tmp/dump.bin --format binary >&2 \
+      && zstd -q -c /tmp/dump.bin' > dump.bin.zst
+docker compose start coordinode
+```
+
+The container's shell runs as the same `coordinode` user as the server, so
+whatever it writes in the data volume stays readable to the server.
 
 ## Environment Variables
 

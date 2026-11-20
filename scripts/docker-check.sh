@@ -61,7 +61,7 @@ wait_check() {
     local id="$1"
     shift
     for _ in $(seq 1 60); do
-        if docker exec "$id" /coordinode healthcheck "$@" >/dev/null 2>&1; then
+        if docker exec "$id" coordinode healthcheck "$@" >/dev/null 2>&1; then
             return 0
         fi
         if [[ "$(docker inspect -f '{{.State.Running}}' "$id")" != "true" ]]; then
@@ -111,18 +111,37 @@ if [[ "$healthy" != "true" ]]; then
     fail "$SERVER_ID" "the server did not become healthy within 60 s"
 fi
 
+echo "==> the shell and the operator tools"
+# Backups, restores and investigations run inside the container with these.
+docker exec "$SERVER_ID" bash -c \
+    'for t in tar gzip zstd xz curl ps less; do command -v "$t" >/dev/null || { echo "missing: $t" >&2; exit 1; }; done' \
+    || fail "$SERVER_ID" "the image lacks an operator tool"
+
 echo "==> healthcheck --config"
 # The config moves the ops port off the default; it is copied into the
 # container, which works against a remote daemon too.
 CONFIG="$(mktemp)"
 printf 'ops_addr: "127.0.0.1:9184"\n' >"$CONFIG"
+# mktemp makes the file 0600 and `docker cp` keeps the mode; the server runs
+# as an unprivileged uid, which must be able to read it.
+chmod 0644 "$CONFIG"
 CONFIG_ID="$(docker create "$IMAGE" serve --config /coordinode.conf --addr '[::]:7080' --data /data)"
 CONTAINERS+=("$CONFIG_ID")
 docker cp "$CONFIG" "$CONFIG_ID:/coordinode.conf"
 docker start "$CONFIG_ID" >/dev/null
 wait_check "$CONFIG_ID" --config /coordinode.conf
-if docker exec "$CONFIG_ID" /coordinode healthcheck >/dev/null 2>&1; then
+if docker exec "$CONFIG_ID" coordinode healthcheck >/dev/null 2>&1; then
     fail "$CONFIG_ID" "a bare healthcheck passed although nothing listens on the default ops port"
+fi
+
+echo "==> a compressed backup through the image's shell"
+# The documented recipe: a dump of a data directory streamed out compressed.
+DUMP_SIZE="$(docker run --rm --entrypoint bash "$IMAGE" \
+    -c 'coordinode backup --data /data --output /tmp/dump.bin --format binary >&2 \
+        && zstd -q -c /tmp/dump.bin' | wc -c | tr -d ' ')"
+if [[ "$DUMP_SIZE" -eq 0 ]]; then
+    echo "the backup recipe produced no output" >&2
+    exit 1
 fi
 
 echo "==> $PLATFORM image is healthy"

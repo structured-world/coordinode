@@ -24,7 +24,7 @@ services:
       - COORDINODE_LOG_FORMAT=json
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "/coordinode", "healthcheck"]
+      test: ["CMD", "coordinode", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 3
