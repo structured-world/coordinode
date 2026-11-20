@@ -23,7 +23,7 @@
         {
           "id": "fedora",
           "name": "Fedora",
-          "versions": ["42", "43", "44"],
+          "versions": ["45", "44"],
           "prefix": "fc",
           "arch": "x86_64"
         }
@@ -36,14 +36,14 @@
         {
           "id": "ubuntu",
           "name": "Ubuntu",
-          "codenames": ["noble", "jammy"],
-          "versions": ["24.04", "22.04"]
+          "codenames": ["resolute", "noble"],
+          "versions": ["26.04", "24.04"]
         },
         {
           "id": "debian",
           "name": "Debian",
-          "codenames": ["bookworm"],
-          "versions": ["12"]
+          "codenames": ["trixie", "bookworm"],
+          "versions": ["13", "12"]
         }
       ],
       "repoSetup": "curl -fsSL https://repo.sw.foundation/keys/sw.gpg | sudo gpg --dearmor -o /etc/apt/keyrings/sw.gpg\necho \"deb [signed-by=/etc/apt/keyrings/sw.gpg] https://repo.sw.foundation/deb $(lsb_release -cs) main\" | sudo tee /etc/apt/sources.list.d/sw.list\nsudo apt-get update",

@@ -134,61 +134,66 @@ jobs:
   build-rpm:
     name: Build RPM (${{ matrix.fedora }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runs-on }}
-    needs: build-musl
     permissions:
       contents: write
+    # The binary is compiled in the release's own image, against the glibc it
+    # ships (see build-deb).
     container:
       image: registry.fedoraproject.org/fedora:${{ matrix.fedora }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - fedora: "42"
-            arch: x86_64
-            runs-on: ubuntu-latest
-            bin_artifact: coordinode-linux-amd64
-          - fedora: "42"
-            arch: aarch64
-            runs-on: ubuntu-24.04-arm
-            bin_artifact: coordinode-linux-arm64
-          - fedora: "43"
-            arch: x86_64
-            runs-on: ubuntu-latest
-            bin_artifact: coordinode-linux-amd64
-          - fedora: "43"
-            arch: aarch64
-            runs-on: ubuntu-24.04-arm
-            bin_artifact: coordinode-linux-arm64
+          # The current Fedora release and the one before it.
           - fedora: "44"
             arch: x86_64
             runs-on: ubuntu-latest
-            bin_artifact: coordinode-linux-amd64
           - fedora: "44"
             arch: aarch64
             runs-on: ubuntu-24.04-arm
-            bin_artifact: coordinode-linux-arm64
+          - fedora: "45"
+            arch: x86_64
+            runs-on: ubuntu-latest
+          - fedora: "45"
+            arch: aarch64
+            runs-on: ubuntu-24.04-arm
     steps:
-      - name: Install rpmbuild + helpers
+      - name: Install build and packaging tools
         run: |
+          # gcc links the binary; git lets checkout fetch the proto submodule.
           dnf install -y --setopt=install_weak_deps=False \
-            rpm-build rpmdevtools systemd-rpm-macros findutils tar
+            rpm-build rpmdevtools systemd-rpm-macros findutils tar \
+            gcc git
           rpmdev-setuptree
 
       - uses: actions/checkout@v6
-
-      - name: Download prebuilt binary
-        uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.bin_artifact }}
-          path: /tmp/bin/
+          submodules: recursive
+          ref: ${{ env.TAG_NAME }}
+
+      - name: Install rustup
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the toolchain rust-toolchain.toml names
+        run: rustup toolchain install
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fc${{ matrix.fedora }}-${{ matrix.arch }}
+
+      - name: Build the binary
+        run: cargo build --locked --release --bin coordinode
 
       - name: Stage sources
         run: |
           VERSION=$(echo "${{ env.TAG_NAME }}" | sed 's/^v//')
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          # Strip the version-prefixed name produced by build-musl down to plain `coordinode`.
-          BIN=$(find /tmp/bin -type f -name 'coordinode-*' | head -1)
-          install -m 0755 "$BIN" ~/rpmbuild/SOURCES/coordinode
+          install -m 0755 target/release/coordinode ~/rpmbuild/SOURCES/coordinode
           install -m 0644 packaging/coordinode.service   ~/rpmbuild/SOURCES/coordinode.service
           install -m 0644 packaging/coordinode.conf      ~/rpmbuild/SOURCES/coordinode.conf
           install -m 0644 packaging/coordinode.sysusers  ~/rpmbuild/SOURCES/coordinode.sysusers
@@ -232,64 +237,90 @@ jobs:
   build-deb:
     name: Build DEB (${{ matrix.codename }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runs-on }}
-    needs: build-musl
     permissions:
       contents: write
     container:
       image: ${{ matrix.image }}
+    # Each release gets a binary compiled in its own image, against the glibc
+    # it ships; the static musl binary stays for the image and the release
+    # downloads. The package name carries the codename
+    # (coordinode_<version>_<codename>_<arch>.deb), which the package
+    # repository reads to publish it into that dist alone.
     strategy:
       fail-fast: false
       matrix:
         include:
+          # The current release and the one before it, for Debian and for
+          # Ubuntu (whose interim releases have left support by then).
           - codename: bookworm
             image: debian:bookworm
             arch: amd64
             runs-on: ubuntu-latest
-            bin_artifact: coordinode-linux-amd64
           - codename: bookworm
             image: debian:bookworm
             arch: arm64
             runs-on: ubuntu-24.04-arm
-            bin_artifact: coordinode-linux-arm64
-          - codename: jammy
-            image: ubuntu:jammy
+          - codename: trixie
+            image: debian:trixie
             arch: amd64
             runs-on: ubuntu-latest
-            bin_artifact: coordinode-linux-amd64
-          - codename: jammy
-            image: ubuntu:jammy
+          - codename: trixie
+            image: debian:trixie
             arch: arm64
             runs-on: ubuntu-24.04-arm
-            bin_artifact: coordinode-linux-arm64
           - codename: noble
             image: ubuntu:noble
             arch: amd64
             runs-on: ubuntu-latest
-            bin_artifact: coordinode-linux-amd64
           - codename: noble
             image: ubuntu:noble
             arch: arm64
             runs-on: ubuntu-24.04-arm
-            bin_artifact: coordinode-linux-arm64
+          - codename: resolute
+            image: ubuntu:resolute
+            arch: amd64
+            runs-on: ubuntu-latest
+          - codename: resolute
+            image: ubuntu:resolute
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
     steps:
-      - name: Install debhelper + dpkg-dev
+      - name: Install build and packaging tools
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
           # build-essential satisfies the implicit Build-Depends pulled in by
-          # debhelper-compat (= 13); without it dpkg-checkbuilddeps aborts.
+          # debhelper-compat (= 13) and links the binary; git lets checkout
+          # fetch the proto submodule; curl installs rustup.
           apt-get install -y --no-install-recommends \
-            debhelper dpkg-dev dh-make ca-certificates findutils \
-            build-essential adduser
+            debhelper dpkg-dev ca-certificates findutils \
+            build-essential adduser git curl
 
       - uses: actions/checkout@v6
-
-      - name: Download prebuilt binary
-        uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.bin_artifact }}
-          path: /tmp/bin/
+          submodules: recursive
+          ref: ${{ env.TAG_NAME }}
+
+      - name: Install rustup
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the toolchain rust-toolchain.toml names
+        run: rustup toolchain install
+
+      # The protos use proto3 `optional` and newer protoc features than a
+      # distribution may ship, so the current protoc release is installed.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.codename }}-${{ matrix.arch }}
+
+      - name: Build the binary
+        run: cargo build --locked --release --bin coordinode
 
       - name: Assemble source tree
         run: |
@@ -297,9 +328,8 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           BUILD=/tmp/coordinode-$VERSION
           mkdir -p "$BUILD/packaging"
-          # Stage the prebuilt binary as the canonical name expected by debian/rules.
-          BIN=$(find /tmp/bin -type f -name 'coordinode-*' | head -1)
-          install -m 0755 "$BIN" "$BUILD/coordinode"
+          # Stage the binary as the canonical name expected by debian/rules.
+          install -m 0755 target/release/coordinode "$BUILD/coordinode"
           cp -r packaging/coordinode.service packaging/coordinode.conf \
                 packaging/coordinode.sysusers packaging/coordinode.tmpfiles \
                 "$BUILD/packaging/"
@@ -307,7 +337,7 @@ jobs:
           cp LICENSE README.md "$BUILD/"
           # Rewrite the placeholder changelog with the actual version.
           cat > "$BUILD/debian/changelog" <<CHANGELOG
-          coordinode ($VERSION) unstable; urgency=medium
+          coordinode ($VERSION) ${{ matrix.codename }}; urgency=medium
 
             * Automated release $VERSION; see CHANGELOG.md upstream.
 
@@ -330,7 +360,8 @@ jobs:
       - name: Stage artifact
         run: |
           mkdir -p /tmp/artifacts
-          cp "/tmp/coordinode_${VERSION}_${{ matrix.arch }}.deb" /tmp/artifacts/
+          cp "/tmp/coordinode_${VERSION}_${{ matrix.arch }}.deb" \
+             "/tmp/artifacts/coordinode_${VERSION}_${{ matrix.codename }}_${{ matrix.arch }}.deb"
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4

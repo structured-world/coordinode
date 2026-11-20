@@ -1,10 +1,11 @@
 #!/usr/bin/make -f
 # CoordiNode Debian rules.
 #
-# We do NOT compile from this rules file. The CI release pipeline produces a
-# musl-static binary via cargo, drops it into the build tree as `coordinode`,
-# then calls `dpkg-buildpackage -us -uc -b`. This rules file only stages
-# pre-built artefacts into debian/coordinode/.
+# We do NOT compile from this rules file. The CI release pipeline builds the
+# binary with cargo in the target release's own image (against its glibc),
+# drops it into the build tree as `coordinode`, then calls
+# `dpkg-buildpackage -us -uc -b`. This rules file only stages pre-built
+# artefacts into debian/coordinode/; dh_shlibdeps derives the libc dependency.
 
 %:
 	dh $@

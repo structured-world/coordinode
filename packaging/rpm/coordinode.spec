@@ -1,9 +1,10 @@
 # CoordiNode RPM spec.
 #
-# Build expects a pre-compiled musl-static `coordinode` binary in SOURCES/.
-# The CI release pipeline runs `cargo build --release --target $TARGET-unknown-linux-musl --bin coordinode`,
-# strips the result, copies it (and the packaging assets) into the rpmbuild
-# tree, then invokes `rpmbuild -bb`.
+# Build expects a pre-compiled `coordinode` binary in SOURCES/. The CI release
+# pipeline runs `cargo build --release --bin coordinode` in the target Fedora
+# release's own image (against its glibc), copies the result and the packaging
+# assets into the rpmbuild tree, then invokes `rpmbuild -bb`; rpm's dependency
+# generator derives the glibc requirement from the binary.
 
 %global _hardened_build 1
 %global debug_package %{nil}
@@ -39,8 +40,8 @@ Graph + Vector + Full-Text + Document + Time-Series in one engine,
 one query language (OpenCypher), one transaction.
 
 # ── Build phases ────────────────────────────────────────────────────
-# No %prep / %build: Source0 is already the final binary produced by
-# the CI musl toolchain. We only stage it into the buildroot.
+# No %prep / %build: Source0 is already the final binary the CI release
+# pipeline compiled. We only stage it into the buildroot.
 
 %install
 install -D -m 0755 %{SOURCE0}                              %{buildroot}%{_bindir}/coordinode

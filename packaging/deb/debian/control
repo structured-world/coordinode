@@ -8,7 +8,7 @@ Homepage: https://github.com/structured-world/coordinode
 
 Package: coordinode
 Architecture: amd64 arm64
-Depends: ${misc:Depends}, systemd, adduser
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd, adduser
 Description: Unified database for AI-native applications
  CoordiNode is a unified database combining graph, vector, full-text,
  document and time-series modalities in one engine. Queries use OpenCypher;
