@@ -278,6 +278,9 @@ fn a_stopped_columnar_table_refuses_its_statements_and_not_the_graphs() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let mut written = 0i64;
     let mut slowed = false;
+    // The table's runs once each statement settled: names the step that
+    // skipped the slowdown, if one does.
+    let mut settled_runs = Vec::new();
     while db.engine().columnar_write_pressure("Event") != WritePressure::Stop {
         if !slowed && db.engine().columnar_write_pressure("Event") == WritePressure::Slowdown {
             judged_alone(&db, WritePressure::Slowdown);
@@ -310,9 +313,15 @@ fn a_stopped_columnar_table_refuses_its_statements_and_not_the_graphs() {
             } else {
                 WritePressure::None
             };
-            if tree.sealed_memtable_count() == 0
+            // The row left the active memtable (it outgrows the threshold, so
+            // the monitor rotates it) and its sealed memtable is flushed:
+            // before the monitor's pass the row is still active, no memtable
+            // is sealed, and the run it will make is not counted yet.
+            if tree.active_memtable().size() < body.len() as u64
+                && tree.sealed_memtable_count() == 0
                 && db.engine().columnar_write_pressure("Event") == expected
             {
+                settled_runs.push(runs);
                 break;
             }
             assert!(
@@ -338,7 +347,10 @@ fn a_stopped_columnar_table_refuses_its_statements_and_not_the_graphs() {
         "no row of it landed"
     );
 
-    assert!(slowed, "the table never showed its slowdown on the way");
+    assert!(
+        slowed,
+        "the table never showed its slowdown on the way; runs after each statement: {settled_runs:?}"
+    );
     let own = judged_alone(&db, WritePressure::Stop);
     assert_ne!(own, WritePressure::Stop, "the graph's own trees stopped it");
     db.execute_cypher("CREATE (:Plain {x: 1})")
