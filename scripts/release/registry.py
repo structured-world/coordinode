@@ -40,6 +40,17 @@ def check_versions(report, read, *, allow_missing):
             raise ValueError(f"{name}: registry version does not match the qualified archive")
 
 
+def check_registered(report, read):
+    """Every package already exists on crates.io: a trusted-publishing token
+    cannot create a crate, so a new one would stop the release half-published."""
+    missing = sorted(name for name in report["packages"] if read(f"crates/{name}") is None)
+    if missing:
+        raise ValueError(
+            f"{', '.join(missing)} not on crates.io: trusted publishing cannot create a crate; "
+            "publish its first version with a publish-new token, add the trusted publisher, "
+            "then rerun")
+
+
 def merged_release_revision(pull):
     """Resolve a retry from the forge's approved merge, never a moving PR head."""
     if (pull['merged_at'] is None or pull['base']['ref'] != 'main'
@@ -137,6 +148,7 @@ def main():
                              cwd=root, text=True, capture_output=True)
         if tag.returncode == 0 and tag.stdout.strip() != source:
             raise ValueError("version belongs to another source revision; prepare a new release PR")
+        check_registered(report, lambda p: request("GET", p))
         check_versions(report, lambda p: request("GET", p), allow_missing=True)
     elif args.mode == "verify":
         check_versions(report, lambda p: request("GET", p), allow_missing=False)

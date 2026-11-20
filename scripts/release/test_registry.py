@@ -104,6 +104,16 @@ class RegistryTest(unittest.TestCase):
             check_versions(self.report, lambda _: {"version": {"checksum": "first", "yanked": True}},
                            allow_missing=True)
 
+    def test_a_crate_absent_from_the_registry_stops_before_any_upload(self):
+        # A trusted-publishing token cannot create a crate, so a new package in
+        # the set would stop the release half-published at its own upload.
+        # Preflight names it before the first upload instead.
+        def read(path):
+            return None if path == "crates/coordinode-embed" else {"crate": {}}
+        with self.assertRaisesRegex(ValueError, r"coordinode-embed\b.*first version"):
+            registry.check_registered(self.report, read)
+        registry.check_registered(self.report, lambda _: {"crate": {}})
+
     def test_publisher_provisioning_is_not_a_release_operation(self):
         # CI consumes an existing publisher and cannot register one.
         result = subprocess.run([sys.executable, '-B', registry.__file__, 'trust',
