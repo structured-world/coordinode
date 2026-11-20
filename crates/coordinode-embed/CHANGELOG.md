@@ -2,6 +2,285 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.1 - 2026-11-20
+
+### Added
+
+- *(replication)* deliver a dropped label as the end of its scope
+- *(storage)* give a cut's continuation its logical events
+- *(embed)* keep a projection's effects and progress in one commit
+- *(replication)* continue a change read inside a large transaction
+- *(replication)* route change events by implied labels
+- *(server)* stream committed changes as logical events
+- *(embed)* read committed changes as events from a cursor
+- *(embed)* time auto-commit attempts in diagnostic builds
+- *(server)* time a statement's stages in diagnostic builds
+- *(embed)* rebuild a consumer's state through a fixed cut
+- *(storage)* reclaim covered journal as flushes land
+- *(replicate)* [**breaking**] withdraw bounded consumer retention
+- *(replicate)* ordinary consumer registrations hold no history
+- *(storage)* bounded material fold in commit order
+- *(storage)* material accounting and log-ordered registry endings
+- *(raft)* client writes take room granted by a majority
+- *(replicate)* record what a consumer's resync followed
+- *(replicate)* admit new retention only where there is room for it
+- *(replicate)* say who holds retained history and how much
+- *(embed)* consumer registrations with retention in the database
+- *(embed)* admit a routed command before it takes a thread
+- *(server)* one admission for every command a member runs
+- *(txn)* bound a transaction's snapshot by its causal bound
+- *(replication)* typed causal bounds and receipts
+- *(storage)* use the io_uring backend by default
+- *(wire)* probe idle client and peer connections with keepalive
+- *(storage)* hold a temporal unique value per instant of valid time
+- *(storage)* bind history to the store's deployment before it lands
+- *(query)* answer AS OF past the retention from temporal history
+- *(modality)* read temporal node versions as known at a system time
+- *(index)* bound the bytes of implication placement and folding
+- *(index)* key unique entries by their owner
+- *(vector)* follow a change of what a type implies
+- *(query)* refuse a RETYPE NODE that would move a node's shard
+- *(search)* configure the text index worker's step and retry
+- *(index)* configure the pages of an implication change
+- *(index)* keep label counts exact across an implication change
+- *(index)* answer a text search with its view's interpretation
+- *(schema)* change what a type implies through a schema package
+- *(index)* fold what a concluded implication change kept apart
+- *(index)* keep a B-tree index's moved carriers apart under ALTER IMPLIES
+- *(schema)* give labels a catalog identity records store
+- *(query)* change a node's type with RETYPE NODE
+- *(schema)* declare type, implied and auxiliary labels
+- *(cluster)* replace a member whose vote no copy proves
+- *(storage)* collect orphan blobs and return their space
+- *(storage)* give blobs owners, a catalog and a guarded lifetime
+- *(storage)* judge, repair and drop columnar tables as partitions
+- *(embed)* physical backup of the whole database
+- *(vector)* exact scores and domain errors end to end
+- *(storage)* hold the database to a strict total footprint limit
+
+### Documentation
+
+- *(embed)* say which registrations hold history
+- *(embed)* a cursor's advice holds its first page's plan
+- *(readme)* drop the archived Python SDK
+- *(cypher)* describe ALTER NODE TYPE SET IMPLIES and test its restart
+- *(cluster)* describe a replacement refused by a changed group
+
+### Fixed
+
+- *(storage)* copy kept labels and label names only within their room
+- *(storage)* take a change read's working memory before allocating it
+- *(storage)* bound a change read's memory where it is held
+- *(storage)* deliver blob owner changes and refuse unknown components
+- *(storage)* bind every node change's labels and type interpretation
+- *(embed)* refuse a projection batch that does not continue it
+- *(embed)* report a storage memory stop as a budget refusal
+- *(query)* remove a relationship property on REMOVE
+- *(storage)* keep the stamp a table creation got
+- *(storage)* end a journal copy at a whole entry, keep table stamps
+- *(storage)* end a checkpoint's journal copy at its pins
+- *(storage)* hold a table operation whole against a checkpoint
+- *(storage)* take a checkpoint from pinned trees, without a flush
+- *(embed)* record a cursor with the plan its pages ran with
+- *(embed)* build the transaction-end probe only for replication tests
+- *(storage)* charge a cut's clipped bounds and real scan state
+- *(storage)* bound a cut entry's memory as a whole
+- *(storage)* bound a cut's reads by the caller's budget
+- *(storage)* qualify a group member's cut by its scope's tree
+- *(storage)* bound a state cut by scope, settled entries and bytes
+- *(storage)* refuse a cut whose view the store does not hold
+- *(storage)* rerun journal reclamation on real grounds only
+- *(storage)* keep charging what a failed checkpoint left
+- *(storage)* wake a flush refused for room without a lost wakeup
+- *(storage)* seal the replay floor and the records a rebuild keeps
+- *(raft)* read a stored commit ceiling off the async runtime
+- *(storage)* read a checkpoint's replay floor without opening it
+- *(storage)* settle the Schema tree before the open reads it
+- *(storage)* material accounting in a tree of its own
+- one-cut admin backup, exclusive bounded restore
+- *(query)* charge evaluator memory before it is held
+- *(storage)* a statement's deadline and cancel bound every admission wait
+- *(replicate)* bound consumer progress, heartbeats and breakpoints
+- *(query)* a vector index is its build's from registration
+- *(storage)* owe the manifest write a deferred flush leaves to its barrier
+- *(embed)* rebuild an index a build is filling instead of following a change
+- *(query)* a cancelled vector build folds nothing further
+- *(embed)* stop the running build before a rebuild writes its index
+- *(query)* tell carried columns from an aggregate named like one
+- *(query)* carry an entity grouped under two aliases once
+- *(query)* keep a grouped node's properties through aggregation
+- *(embed)* wait for a standalone causal bound without a thread
+- *(embed)* end a read's leadership proof with its operation
+- *(routing)* run a rollback on a member out of slots
+- *(embed)* end a standalone start's causal wait with its cancel
+- *(embed)* end a causal wait with its operation
+- *(raft)* meet a causal position at its applied prefix
+- *(raft)* let an entry close the commits it carries
+- *(query)* read only views every commit below is applied at
+- *(raft)* close the commits a lost leader left uncovered
+- *(index)* hold index builds and catalog changes to a memory bound
+- *(search)* never score what a text search leaves out
+- *(storage)* report a write of unknown outcome as such
+- *(embed)* a label's first node is no change for search indexes
+- *(query)* count deleted implied labels and allow redundant implications
+- *(query)* refuse readers of an index still following a change
+- *(query)* activate an implication change once search follows it
+- *(query)* reserve a vector index read's memory before allocating it
+- *(index)* charge catalog changes to the statement and check skipped fields
+- *(index)* walk the catalog by head when publishing or concluding parts
+- *(index)* check every field of an integrity record read for its state
+- *(index)* bound held memory in claim restating and the report queue
+- *(index)* charge unique claims and checks for as long as they live
+- *(index)* count a unit's derived fan-out before expanding it
+- *(index)* bound the fan-out everywhere and type every index refusal
+- *(index)* refuse keys past the store's limit, bound entry fan-out
+- *(index)* charge implication placement memory before taking it
+- *(storage)* keep the engine and dump format versions
+- *(index)* claim a unique value across the parts of a change
+- *(index)* fold what a cancelled implication change kept apart
+- *(index)* place every changed label and conclude the record read
+- *(search)* refuse text reads of an unknown commit, type not-ready
+- *(search)* refuse reads of a lagging text reader, own write refusal
+- *(index)* bind text settling to one revision and one catalog state
+- *(index)* write text documents under the interpretation held
+- *(index)* judge a label's carriers by the view's own catalog
+- *(index)* bind a text read to the interpretation its index holds
+- *(schema)* bind a label's first use through the ordered log
+- *(query)* defer only the retyped nodes' index entries in RETYPE
+- *(embed)* outwait the commits in flight before re-running a statement
+- *(vector)* draw each HNSW level once and finite
+- *(raft)* refuse a member without its vote with a typed error
+- *(storage)* serve a rebuilt tree's history above its copy's floor
+- *(storage)* refuse a rebuild from a damaged checkpoint copy
+- *(storage)* rebuild a partition at its original seqnos
+- *(storage)* rebuild a table only from provable state
+- *(embed)* finish an interrupted table rebuild on open
+- *(query)* plan subqueries with the index access paths
+- *(query)* keep rows without a vector in a vector ordering
+- *(query)* order by variables the projection drops
+- *(storage)* capture the journal tail after a checkpoint's trees
+- *(query)* subqueries see the outer row; one index search per top-k
+- *(query)* keep each edge's orientation in undirected hops
+- *(replication)* wait for the leader's address, not pauses
+- *(query)* three-valued AND/OR, simple CASE, correlated keys
+- *(storage)* refuse a hard limit below the supported minimum
+
+### Performance
+
+- *(storage)* take a statement's receipt at its own view
+- *(embed)* open a checkpointed store without scrubbing it
+- *(embed)* find the bench's written nodes through an index
+- *(embed)* split statement cost CPU by thread and process, add I/O
+- *(embed)* factor the statement cost measurement
+- *(embed)* bench what the advisor costs a statement
+- record each statement once, in the database's advisor
+- *(storage)* copy a cut's page into budget-charged blocks
+- *(embed)* bench the whole cost of ordinary writes
+- *(embed)* bench what consumer retention costs
+- *(embed)* propose a first use of a name once, not per writer
+- *(storage)* keep a transaction's writes in key order
+- *(index)* refresh the integrity view without reading the evidence
+- *(query)* build only the node properties a statement reads
+- *(bench)* declare the label the label-scan bench adds
+- *(bench)* measure label kinds on the write path
+- *(query)* look the keys of a correlated index join up in batches
+- *(query)* look a correlated index key up once per distinct key
+
+### Refactored
+
+- replace chrono with jiff
+- *(storage)* [**breaking**] withdraw prepaid flush room and member grants
+- *(storage)* [**breaking**] remove per-mutation material accounting
+- *(schema)* store canonical labels and judge RETYPE by its result
+
+### Testing
+
+- *(embed)* read the change feed up to a settled end
+- *(embed)* take the fewest allocations over fresh claim sets
+- *(embed)* wait for each row's run before judging the table
+- *(embed)* take timing out of the capped-store and table-pressure tests
+- *(embed)* report what a current vector read missed
+- *(embed)* take the least of three rounds in consumer write cost
+- *(embed)* take the least of several decodes as their allocation cost
+- *(embed)* compare change reads over the units both saw
+- *(embed)* take the least of several label decodes as their cost
+- *(embed)* ask again when a lead handover is superseded
+- *(embed)* measure consumer write cost from empty memtables
+- *(modality)* read the change feed's memory where its units are built
+- *(embed)* cover instances, dropped labels and a failed last fragment
+- *(embed)* cover versions, packed deletes and silent maintenance
+- *(embed)* tell a checkpoint's tables by their bytes, not their name
+- *(embed)* cover a resumed stale registration and state-only recovery
+- *(embed)* catch a full scrub run by the open itself
+- *(embed)* show registered consumers cost an ordinary write nothing
+- *(embed)* a cut's view is lost with its database
+- *(embed)* let a refusal stand only after background work settles
+- *(embed)* wait for the idle reaper's end, not a fixed sleep
+- *(embed)* bench the open of a database that keeps a checkpoint
+- *(embed)* the record written at the ceiling survives the reopen
+- *(embed)* a store at the client ceiling closes and reopens
+- *(vector)* drive slot reuse and wait for rebuild readiness
+- *(embed)* consumer retention across kills, backups and readers
+- *(embed)* kill a writer at random moments and reopen
+- *(integration)* diagnose a test server that is not ready in time
+- *(embed)* wait on a whole number of version allowances with is_multiple_of
+- *(embed)* a change followed during a build keeps its gained nodes
+- *(vector)* dump the graph when the outside search misses near
+- *(embed)* show a transaction-isolation ranking failure's evidence
+- *(embed)* show what an endpoint holds when a backup at its limit is refused
+- *(embed)* a read continues at its timestamp on a replacement
+- cover complete views without a bound, standalone and index reads
+- *(embed)* run the vanished text index test on Unix only
+- *(embed)* import the kill signal on Unix only
+- *(embed)* kill crash-test children with SIGKILL, not abort
+- *(embed)* give a fold thirty seconds on a slow host
+- *(embed)* take the least of a few counts for measuring that allocates nothing
+- *(embed)* allow expect in the field dictionary tests
+- *(embed)* bench temporal unique admission against the length of history
+- *(embed)* temporal unique ownership and its history survive collection
+- *(embed)* temporal unique ownership is restored after a kill
+- *(embed)* a taker racing a release of a temporal unique value
+- *(embed)* every key shape of a temporal unique index is held per instant
+- *(embed)* temporal unique ownership under derived maintenance and across a reopen
+- *(embed)* an ordinary holder of a shared label holds its value at every instant
+- *(embed)* later facts leave what history knew before
+- *(embed)* a stale certification executor changes nothing
+- *(embed)* catch a change in force before its text index is prepared
+- *(index)* count what reporting to an integrity record allocates
+- *(index)* count a refused compound unique write by the allocator
+- *(index)* size the catalog budget test so only the catalog decides
+- *(index)* stop a fold at an exact step
+- *(index)* a unique value taken on both sides of a change is held once
+- *(index)* a fold interrupted by a close finishes after a reopen
+- *(index)* a settle raced by a rebuild keeps the rebuilt documents
+- *(embed)* cover expiry, merge, restore and failed declarations for label kinds
+- *(embed)* keep an operation's outcome across a replacement
+- *(embed)* accept a cascade the capacity scanner ran first
+- *(embed)* report a table rebuild the open cannot finish
+- *(embed)* refuse an unevaluable query vector in every top-k form
+- *(embed)* measure the index top-k with the vector not returned
+- *(embed)* measure the correlated join one row per key and as a search
+- *(embed)* wait for reports and rebuilds before index checks
+- *(embed)* cover the fallbacks of the batched correlated join
+- *(embed)* wait for the recorded suspicion before a failing check
+- *(embed)* measure a correlated join through a unique index
+- *(embed)* count allocations per vector statement
+- *(embed)* bench the index-served top-k shape, store beside the build
+- *(embed)* measure vector statements end to end
+- *(embed)* keep the cascade's data on hot until it moves it
+- *(embed)* lower a full group to the supported minimum
+- *(embed)* lower the limit below the data, not the transient charge
+
+### Bench
+
+- *(embed)* time a STORAGE COLUMNAR batch write and a keyed read
+
+### Wip
+
+- reconcile the label lookup through the implication change
+- keep only a label change's difference apart in the lookup
+- ALTER NODE TYPE SET IMPLIES with per-label lookup generations
+
 ## v0.10.0 - 2026-11-19
 
 ### Added

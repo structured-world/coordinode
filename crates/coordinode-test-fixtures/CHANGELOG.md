@@ -2,6 +2,23 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.1 - 2026-11-20
+
+### Added
+
+- *(wire)* probe idle client and peer connections with keepalive
+
+### Fixed
+
+- address the code analysis findings on main
+- one-cut admin backup, exclusive bounded restore
+
+### Testing
+
+- *(fixtures)* leave out memory another thread frees from the work's held
+- *(storage)* ask a refused barrier again under the raised limit
+- *(embed)* kill crash-test children with SIGKILL, not abort
+
 ## v0.10.0 - 2026-11-19
 
 ### Added
