@@ -5,7 +5,7 @@
 # Release-only protobuf inputs are included in crate archives, never in Git.
 /crates/coordinode-raft/bindings/
 /crates/coordinode-replicate/bindings/
-# Release preparation tests use Python but have no generated source inputs.
+# The benchmark adapters plug into Python harnesses.
 __pycache__/
 
 # IDE

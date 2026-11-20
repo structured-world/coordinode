@@ -31,6 +31,11 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: current
+      - name: Install the release scripts' dependencies
+        run: npm ci --prefix scripts/release
       - name: Select the approved release source
         id: source
         env:
@@ -41,7 +46,7 @@ jobs:
           if [[ -n "$RELEASE_PR" ]]; then
             release_args+=(--release-pr "$RELEASE_PR")
           fi
-          python3 -B scripts/release/registry.py "${release_args[@]}"
+          node scripts/release/registry.ts "${release_args[@]}"
       - uses: actions/checkout@v7
         if: steps.source.outputs.commit != github.sha
         with:
@@ -49,29 +54,31 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
+      # The checkout above cleans untracked files, the installed dependencies too.
+      - name: Install the selected source's release script dependencies
+        if: steps.source.outputs.commit != github.sha
+        run: npm ci --prefix scripts/release
       - name: Identify the merged release PR
         id: eligible
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -B scripts/release/registry.py eligible --checkout "$GITHUB_WORKSPACE"
+        run: node scripts/release/registry.ts eligible --checkout "$GITHUB_WORKSPACE"
       - name: Require the source suite on this exact commit
         if: steps.eligible.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
-          import json, subprocess
-          revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-          runs = json.loads(subprocess.check_output([
-              'gh', 'run', 'list', '--repo', 'structured-world/coordinode',
-              '--workflow', 'ci.yml', '--commit', revision, '--limit', '20',
-              '--json', 'databaseId,event,headBranch'], text=True))
-          runs = [r for r in runs if r['headBranch'] == 'main' and r['event'] in ('push', 'workflow_dispatch')]
-          if not runs:
-              raise SystemExit('Run CI on this main commit before publishing')
-          subprocess.run(['gh', 'run', 'watch', str(runs[0]['databaseId']),
-                          '--repo', 'structured-world/coordinode', '--exit-status'], check=True)
-          PY
+          set -euo pipefail
+          revision="$(git rev-parse HEAD)"
+          run_id="$(gh run list --repo structured-world/coordinode --workflow ci.yml \
+            --commit "$revision" --limit 20 --json databaseId,event,headBranch \
+            --jq 'map(select(.headBranch == "main" and (.event == "push" or .event == "workflow_dispatch")))
+                  | first | .databaseId // empty')"
+          if [[ -z "$run_id" ]]; then
+            echo "Run CI on this main commit before publishing" >&2
+            exit 1
+          fi
+          gh run watch "$run_id" --repo structured-world/coordinode --exit-status
       - name: Select the exact commit release-plz will publish
         if: steps.eligible.outputs.publish == 'true'
         env:
@@ -84,7 +91,7 @@ jobs:
           SOURCE_CI_COMMIT: ${{ steps.eligible.outputs.verified_commit }}
       - name: Reconcile any earlier partial publication
         if: steps.eligible.outputs.publish == 'true'
-        run: python3 -B scripts/release/registry.py preflight --checkout "$GITHUB_WORKSPACE"
+        run: node scripts/release/registry.ts preflight --checkout "$GITHUB_WORKSPACE"
       - name: Install the verified release-plz build
         if: steps.eligible.outputs.publish == 'true'
         run: bash scripts/release/install_release_plz.sh
@@ -112,8 +119,8 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
-          python3 -B scripts/release/registry.py verify --checkout "$GITHUB_WORKSPACE"
-          python3 -B scripts/release/check_packages.py --checkout "$GITHUB_WORKSPACE" \
+          node scripts/release/registry.ts verify --checkout "$GITHUB_WORKSPACE"
+          node scripts/release/check_packages.ts --checkout "$GITHUB_WORKSPACE" \
             --source crates-io --consumer-toolchain stable
       # The SBOM and license inventory of the graph a consumer installs from
       # crates.io, per toolchain, feature set and target, ship with the release.
@@ -122,7 +129,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
-          version="$(python3 -c 'import json; print(json.load(open("target/registry-preparation.json"))["version"])')"
+          version="$(jq -r .version target/registry-preparation.json)"
           gh release upload "v${version}" --repo structured-world/coordinode --clobber \
             target/crates-io-*-licenses.json target/crates-io-*-sbom.cdx.json
       - name: Keep publication evidence
@@ -169,26 +176,21 @@ jobs:
         # mold: the project's cargo config links with it on Linux.
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv mold
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-semver-checks@0.50.0
+          tool: cargo-semver-checks
+      - uses: actions/setup-node@v7
+        with:
+          node-version: current
       - name: Install the verified release-plz build
         run: bash scripts/release/install_release_plz.sh
       - name: Calculate release-PR baselines from registry state
         run: |
           set -euo pipefail
-          if command -v uv >/dev/null 2>&1; then
-            python=(uv run --no-project --with-requirements scripts/release/requirements.txt python)
-          else
-            environment=$(mktemp -d "$RUNNER_TEMP/coordinode-release-pr-python.XXXXXX")
-            trap 'rm -rf "$environment"' EXIT
-            python3 -m venv "$environment"
-            "$environment/bin/python" -m pip install -r scripts/release/requirements.txt
-            python=("$environment/bin/python")
-          fi
-          "${python[@]}" -B -m unittest discover -s scripts/release -p 'test_*.py' -v
-          "${python[@]}" -B scripts/release/pr_config.py --checkout "$GITHUB_WORKSPACE"
+          npm ci --prefix scripts/release
+          (cd scripts/release && node --test)
+          node scripts/release/pr_config.ts --checkout "$GITHUB_WORKSPACE"
       - uses: actions/create-github-app-token@v3
         id: app
         with:
@@ -210,7 +212,7 @@ jobs:
         env:
           GIT_TOKEN: ${{ steps.app.outputs.token }}
         run: |
-          python3 -B scripts/release/example_requirements.py --checkout "$GITHUB_WORKSPACE" \
+          node scripts/release/example_requirements.ts --checkout "$GITHUB_WORKSPACE" \
             --pr-json target/release-pr.json
       - name: Clean build outputs
         if: always()

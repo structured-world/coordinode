@@ -13,7 +13,12 @@ evidence. Release-PR preparation runs separately on
 clean main. Publication does not use `workflow_run`, which crates.io rejects for
 Trusted Publishing.
 
-`pr_config.py` derives an ignored configuration for release-PR calculation.
+The scripts are TypeScript run by Node directly (`node scripts/release/<name>.ts`,
+no compile step), with one dependency, `smol-toml`, installed by
+`npm ci --prefix scripts/release`. `node --test` in `scripts/release` runs their
+tests.
+
+`pr_config.ts` derives an ignored configuration for release-PR calculation.
 Before a library's first upload, it uses the existing coordinated Git baseline
 with publishing disabled in that calculation only. A published library retains
 its registry baseline and semantic-version checks. Registry failures stop the
@@ -22,20 +27,20 @@ derived configuration; the server tag does not establish a library upload.
 
 `examples/embedded-quickstart` builds from registry packages, as an application
 does, so it is not a workspace member and release-plz leaves its manifest alone.
-After release-plz prepares the PR, `example_requirements.py` sets the example's
+After release-plz prepares the PR, `example_requirements.ts` sets the example's
 requirement on every registry package to the release's caret requirement
 (`0.10` for `0.10.0`) and pushes that commit to the release PR's branch. The
 package check refuses a release the example's requirements do not admit.
 
 ## Preparation and qualification
 
-Run `prepare.py` only in a disposable, clean checkout. It removes the workspace
+Run `prepare.ts` only in a disposable, clean checkout. It removes the workspace
 feature-unification dependency, generates bindings from the pinned proto
 submodule, and prepares manifests, build scripts and attribution files. Generated
 bindings belong in archives, not in Git. The published build scripts copy those
 bindings; they do not require protoc, a submodule or network generation.
 
-`check_packages.py` inspects every archive and installs them into an independent
+`check_packages.ts` inspects every archive and installs them into an independent
 disk-backed Rust consumer. Cargo's local registry contains the unpublished
 archives and their registry dependencies; there are no path patches. Stable Rust
 exercises the default and replication feature configurations. The fixture checks transactions, schema publication,
@@ -71,8 +76,8 @@ when its complete Git tree matches the source-CI commit. A different tree stops
 publication. The preparation report records both revisions.
 
 The workflow pins its preparation tools in `.github/actions/prepare-registry`.
-For local checks, use that same environment and run the Python unit tests before
-`prepare.py` and `check_packages.py`. The latter accepts repeated
+For local checks, use that same environment and run the tests before
+`prepare.ts` and `check_packages.ts`. The latter accepts repeated
 `--consumer-toolchain` arguments. Source builds and their full test suite are
 separate gates; stripping source-only tests from an archive does not replace them.
 
@@ -113,13 +118,13 @@ Git tags, GitHub releases and subsequent registry versions are created only by
 release-plz.
 
 An interrupted publication can be retried only with the same qualified archives.
-`registry.py preflight` rejects an existing tag belonging to another revision,
+`registry.ts preflight` rejects an existing tag belonging to another revision,
 an immutable registry version with another checksum, or a yanked version.
 Successful uploads are not repeated; missing packages remain required. An old
 server-only version is not a valid source revision for new library contents:
 prepare a new coordinated release PR instead.
 
-After upload, `registry.py verify` checks every published checksum and the
+After upload, `registry.ts verify` checks every published checksum and the
 consumer runs again with a fresh Cargo home against crates.io itself. The
 workflow retains its preparation report and consumer dependency graphs as
 artifacts, including failure evidence. A registered publisher or a no-op OIDC

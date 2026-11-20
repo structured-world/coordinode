@@ -1,0 +1,15 @@
+{
+  "name": "coordinode-release",
+  "private": true,
+  "type": "module",
+  "description": "Prepare, qualify and publish the embedded registry packages",
+  "engines": {
+    "node": ">=24.2"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "smol-toml": "^1"
+  }
+}

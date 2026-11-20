@@ -43,29 +43,16 @@ jobs:
 
       - name: Extract release notes for ${{ env.TAG_NAME }}
         run: |
-          python3 - <<'PYEOF'
-          import os, re
-
-          tag = os.environ['TAG_NAME']
-          try:
-              with open('CHANGELOG.md') as f:
-                  content = f.read()
-          except FileNotFoundError:
-              with open('/tmp/release-notes.md', 'w') as out:
-                  out.write(f'Release {tag}\n')
-              raise SystemExit(0)
-
-          # Sections are separated by "---" lines or by the next "## v" header.
-          escaped = re.escape(tag)
-          pattern = rf'^## {escaped}[^\n]*\n(.*?)(?=\n---|\n## v|\Z)'
-          m = re.search(pattern, content, re.MULTILINE | re.DOTALL)
-
-          with open('/tmp/release-notes.md', 'w') as out:
-              if m:
-                  out.write(m.group(1).strip() + '\n')
-              else:
-                  out.write(f'Release {tag}\n')
-          PYEOF
+          # shellcheck disable=SC2016 # `${...}` below is a JavaScript template, not the shell's
+          node --input-type=module -e '
+          import { existsSync, readFileSync, writeFileSync } from "node:fs";
+          const tag = process.env.TAG_NAME;
+          const content = existsSync("CHANGELOG.md") ? readFileSync("CHANGELOG.md", "utf8") : "";
+          // Sections are separated by "---" lines or by the next "## v" header.
+          const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const match = new RegExp(`^## ${escaped}[^\\n]*\\n([\\s\\S]*?)(?=\\n---|\\n## v|$(?![\\s\\S]))`, "m").exec(content);
+          writeFileSync("/tmp/release-notes.md", match ? match[1].trim() + "\n" : `Release ${tag}\n`);
+          '
 
       - name: Update GitHub Release body
         run: gh release edit "${{ env.TAG_NAME }}" --notes-file /tmp/release-notes.md

@@ -15,7 +15,10 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-venv mold
+        sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
+    - uses: actions/setup-node@v7
+      with:
+        node-version: current
     - name: Prepare archives and qualify their external consumer
       shell: bash
       env:
@@ -23,16 +26,8 @@ runs:
         CARGO_PROFILE_DEV_DEBUG: "0"
       run: |
         set -euo pipefail
-        if command -v uv >/dev/null 2>&1; then
-          python=(uv run --no-project --with-requirements scripts/release/requirements.txt python)
-        else
-          environment=$(mktemp -d "$RUNNER_TEMP/coordinode-registry-python.XXXXXX")
-          trap 'rm -rf "$environment"' EXIT
-          python3 -m venv "$environment"
-          "$environment/bin/python" -m pip install -r scripts/release/requirements.txt
-          python=("$environment/bin/python")
-        fi
-        "${python[@]}" -B -m unittest discover -s scripts/release -p 'test_*.py' -v
-        "${python[@]}" -B scripts/release/prepare.py --checkout "$GITHUB_WORKSPACE"
-        "${python[@]}" -B scripts/release/check_packages.py --checkout "$GITHUB_WORKSPACE" \
+        npm ci --prefix scripts/release
+        (cd scripts/release && node --test)
+        node scripts/release/prepare.ts --checkout "$GITHUB_WORKSPACE"
+        node scripts/release/check_packages.ts --checkout "$GITHUB_WORKSPACE" \
           --consumer-toolchain stable
