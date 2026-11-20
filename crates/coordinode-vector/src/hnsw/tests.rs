@@ -3140,6 +3140,50 @@ fn removing_the_entry_point_hands_it_over() {
     assert_eq!(index.search(&scattered_vector(77, 6), 1)[0].id, 77);
 }
 
+/// A node whose only neighbour is retired between publishing its own list
+/// and its back-edge is linked again, so it stays reachable. The retirement
+/// repairs the lists named by the list it read; the late back-edge is in
+/// none of them, and the new node's own list names only the retired one.
+/// Without the relink the node is a live result no search reaches.
+#[test]
+fn a_neighbour_retired_while_linking_does_not_orphan_the_new_node() {
+    let index = HnswIndex::new(removal_config());
+    // On one line: from the new node at the origin, `a` hides the farther
+    // two under the pruning rule, so its plan links `a` alone.
+    index.insert_shared(1, &[1.0, 0.0]);
+    index.insert_shared(2, &[2.0, 0.0]);
+    index.insert_shared(3, &[3.0, 0.0]);
+    let a = index.idx_for_id_for_test(1).expect("a is indexed");
+    let c = [0.0, 0.0];
+    let idx = index.allocate_node(4, 0, &c).expect("a slot");
+    let plan = index.plan_links(&c, 0).expect("a graph to plan against");
+    let level0: Vec<usize> = plan
+        .iter()
+        .find(|p| p.level == 0)
+        .map(|p| p.selected_idxs.clone())
+        .unwrap_or_default();
+    assert_eq!(level0, [a], "the plan links the nearest node alone");
+
+    // The insert's steps of `link_node`, with the removal of `a` falling
+    // between its own list and its back-edge.
+    let (links, intact) = index.publish_own_lists(idx, 4, plan);
+    assert!(intact, "`a` was live when the list went in");
+    assert!(index.remove(1));
+    let reported = index.publish_back_edges(idx, &links);
+    assert!(!reported, "the retirement the back-edge raced is reported");
+    index.link_node(idx, 4, 0, &c);
+    let op = index.begin_operation();
+    index.finish_insert(idx, 4, 0, &op);
+    drop(op);
+
+    let hits = index.search(&c, 1);
+    assert_eq!(
+        hits.first().map(|h| h.id),
+        Some(4),
+        "the new node is reachable, got {hits:?}"
+    );
+}
+
 /// The slots of removed nodes come back: once the epoch has passed the
 /// removal and the sweep, no list names them and new inserts take them
 /// instead of growing the store.

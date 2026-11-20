@@ -1500,7 +1500,14 @@ impl HnswIndex {
         for level in (0..=lowest_planning_layer).rev() {
             let ef = self.config.ef_construction;
             // Same f32-build rationale as step 1 above.
-            let candidates = self.search_layer_query_for_build(vector, current_ep, ef, level, wide);
+            let mut candidates =
+                self.search_layer_query_for_build(vector, current_ep, ef, level, wide);
+            // The search walks through retired nodes, which stay navigable,
+            // but a retired node is never a new link: left among the
+            // candidates it would hide live ones under the pruning rule and
+            // then be dropped, leaving the list short of what it hid.
+            let store = self.nodes();
+            candidates.retain(|c| store.state(c.idx as usize).is_linkable());
 
             let max_conn = if level == 0 {
                 self.config.m_max0
@@ -1955,9 +1962,9 @@ impl HnswIndex {
             })
             .collect();
         for (idx, id, level, vector, plan) in planned {
-            match plan {
-                Some(plan) => self.publish_links(idx, id, plan),
-                None => self.link_node(idx, id, level, vector),
+            let linked = plan.is_some_and(|plan| self.publish_links(idx, id, plan));
+            if !linked {
+                self.link_node(idx, id, level, vector);
             }
             self.finish_insert(idx, id, level, &op);
         }
@@ -2097,23 +2104,47 @@ impl HnswIndex {
     /// reachable. The first node has no one to link to and seeds the entry
     /// point instead; losing that race to another first node means linking to
     /// it.
+    ///
+    /// A neighbour retired while the node is being linked may have been its
+    /// only way in: the retirement repairs the lists its own list named, and
+    /// a back-edge that landed after it read that list is in no repaired list.
+    /// The node is then linked again against the graph that is left.
     fn link_node(&self, idx: usize, id: u64, new_level: usize, vector: &[f32]) {
-        let per_layer = loop {
-            if let Some(plan) = self.plan_links(vector, new_level) {
-                break plan;
-            }
-            if self.entry_point.try_seed(new_level as u8, idx as u64) {
+        loop {
+            let Some(plan) = self.plan_links(vector, new_level) else {
+                if self.entry_point.try_seed(new_level as u8, idx as u64) {
+                    return;
+                }
+                continue;
+            };
+            if self.publish_links(idx, id, plan) {
                 return;
             }
-        };
-        self.publish_links(idx, id, per_layer);
+        }
     }
 
-    /// Publish the lists `per_layer` planned for node `idx`, then the
-    /// back-edges that make it reachable.
-    fn publish_links(&self, idx: usize, id: u64, per_layer: Vec<LayerPlan>) {
+    /// Publish the lists `plan` holds for node `idx`, then the back-edges
+    /// that make it reachable. Returns whether every neighbour it planned
+    /// stayed linkable throughout; when one was retired meanwhile, the node
+    /// may be reachable only through it and is to be linked again.
+    fn publish_links(&self, idx: usize, id: u64, plan: Vec<LayerPlan>) -> bool {
+        let (links, intact) = self.publish_own_lists(idx, id, plan);
+        self.publish_back_edges(idx, &links) && intact
+    }
+
+    /// Publish node `idx`'s own list on every layer of `plan`, without the
+    /// neighbours no longer linkable. Returns the published lists, with each
+    /// layer's capacity, and whether no planned neighbour had to be left out
+    /// for having been retired.
+    fn publish_own_lists(
+        &self,
+        idx: usize,
+        id: u64,
+        plan: Vec<LayerPlan>,
+    ) -> (Vec<(usize, Vec<u64>, usize)>, bool) {
         let store = self.nodes();
-        let per_layer: Vec<(usize, Vec<u64>, usize)> = per_layer
+        let mut intact = true;
+        let links: Vec<(usize, Vec<u64>, usize)> = plan
             .into_iter()
             .map(
                 |LayerPlan {
@@ -2125,13 +2156,17 @@ impl HnswIndex {
                     // retired node is never a result: neither is worth a slot.
                     // Never linking a retired node is also what lets its slot
                     // be reused once the writers that saw it live are done.
-                    let selected = selected_idxs
-                        .into_iter()
-                        .filter(|&n| {
-                            n != idx && store.state(n).is_linkable() && self.node_id(n) != id
-                        })
-                        .map(|n| n as u64)
-                        .collect();
+                    let mut selected = Vec::with_capacity(selected_idxs.len());
+                    for n in selected_idxs {
+                        if n == idx || self.node_id(n) == id {
+                            continue;
+                        }
+                        if store.state(n).is_linkable() {
+                            selected.push(n as u64);
+                        } else {
+                            intact = false;
+                        }
+                    }
                     (level, selected, max_conn)
                 },
             )
@@ -2139,10 +2174,22 @@ impl HnswIndex {
         // Every own list goes in before the first back-edge makes the node
         // reachable: a search that reaches it on one layer descends through
         // it, and an empty list below would leave that search nowhere to go.
-        for (level, selected, _) in &per_layer {
+        for (level, selected, _) in &links {
             self.layer_update(idx, *level, |_| Some(selected.clone()));
         }
-        for (level, selected, max_conn) in &per_layer {
+        (links, intact)
+    }
+
+    /// Add node `idx` to the list of every neighbour in `links`. Returns
+    /// whether all of them are still linkable once the edges are in.
+    ///
+    /// The fence pairs with the one in [`Self::retire_node`]: a retirement
+    /// sets the state, fences, then reads the list it repairs from; this
+    /// appends to that list, fences, then reads the state. Under the two
+    /// fences at least one side sees the other's write, so either the
+    /// retirement repairs through `idx` or this reports the retirement.
+    fn publish_back_edges(&self, idx: usize, links: &[(usize, Vec<u64>, usize)]) -> bool {
+        for (level, selected, max_conn) in links {
             for &n in selected {
                 let n = n as usize;
                 if *level < self.node_levels(n) {
@@ -2150,6 +2197,12 @@ impl HnswIndex {
                 }
             }
         }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let store = self.nodes();
+        links
+            .iter()
+            .flat_map(|(_, selected, _)| selected)
+            .all(|&n| store.state(n as usize).is_linkable())
     }
 
     /// Make every live node reachable on layer 0 from the entry point again,
@@ -2289,6 +2342,9 @@ impl HnswIndex {
     fn retire_node(&self, old: usize, guard: &crossbeam_epoch::Guard) {
         let store = self.nodes();
         store.set_state(old, data_level0::NodeState::Retired);
+        // Pairs with the fence in `publish_back_edges`: an insert whose
+        // back-edge this snapshot misses sees the retirement and links again.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         let n = self.node_len();
         let dead = |id: u64| id == old as u64;
         for level in 0..self.node_levels(old) {
