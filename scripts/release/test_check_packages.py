@@ -72,6 +72,20 @@ class ArchiveTest(unittest.TestCase):
             self.inspect(extra={'build.rs': b'fn main() {}', 'bindings/a.rs': b'',
                                 'bindings/files.txt': b'wrong.rs\n'}, bindings=['a.rs'])
 
+    def test_a_file_the_sources_embed_must_be_in_the_archive(self):
+        # A source that embeds a data file compiles in the workspace but not
+        # from an archive that left the file out, and only with the feature
+        # that reaches that source: the consumer build can miss it.
+        tokenizer = b'const DICT: &[u8] = include_bytes!("../../assets/dict.zst");\n'
+        with self.assertRaisesRegex(ValueError, r'assets/dict\.zst'):
+            self.inspect(extra={'src/cjk/tokenizers.rs': tokenizer})
+        self.inspect(extra={'src/cjk/tokenizers.rs': tokenizer, 'assets/dict.zst': b'z'})
+        # Shared documentation a source-workspace doctest embeds from outside
+        # the package is not part of it.
+        self.inspect(extra={'src/guide.rs': b'#[doc = include_str!("../../docs/guide.md")]\n'})
+        # A path built at compile time names no shipped file.
+        self.inspect(extra={'src/gen.rs': b'include!(concat!(env!("OUT_DIR"), "/a.rs"));\n'})
+
     def test_archive_paths_cannot_escape_the_package(self):
         with self.assertRaisesRegex(ValueError, 'invalid archive path'):
             self.inspect(extra={'../outside': b'not allowed'})

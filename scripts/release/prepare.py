@@ -48,8 +48,9 @@ def prepare_manifest(document, version, names, codegen):
     """Describe only delivered library targets, preserving runtime features."""
     document = tomlkit.parse(tomlkit.dumps(document))
     package = document["package"]
-    package["include"] = ["/src/**", "/build.rs", "/bindings/**", "/LICENSE", "/LICENSE-*",
-                          "/NOTICES", "/COPYRIGHT", "/README.md", "/Cargo.toml"]
+    # `assets/` holds the data files sources embed, such as the CJK dictionary.
+    package["include"] = ["/src/**", "/build.rs", "/bindings/**", "/assets/**", "/LICENSE",
+                          "/LICENSE-*", "/NOTICES", "/COPYRIGHT", "/README.md", "/Cargo.toml"]
     for switch in ("autobins", "autoexamples", "autotests", "autobenches"):
         package[switch] = False
     for section in ("dev-dependencies", "bench", "test", "example", "bin"):

@@ -50,6 +50,8 @@ name="source-only"
         self.assertIn("build-dependencies", original)
         self.assertIn("/bindings/**", result["package"]["include"])
         self.assertIn("/LICENSE-*", result["package"]["include"])
+        # Data files the sources embed (the CJK dictionary) ship with them.
+        self.assertIn("/assets/**", result["package"]["include"])
 
     def test_a_feature_stops_naming_a_removed_build_dependency(self):
         # A feature that enabled the generator would name a dependency the

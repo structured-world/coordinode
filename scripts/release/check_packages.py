@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 import pathlib
+import posixpath
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -16,6 +18,9 @@ import tomllib
 
 from dependency_policy import check_native_stack_helpers
 from supply_chain import write_evidence
+
+
+EMBEDDED_FILE = re.compile(r'\binclude(?:_bytes|_str)?!\(\s*"([^"]+)"\s*\)')
 
 
 def host_triple(prefix, cwd, env):
@@ -45,6 +50,22 @@ def inspect_archive(archive, name, version, names, bindings):
             required.update({"bindings/files.txt", "build.rs"})
         if missing := required - files.keys():
             raise ValueError(f"{name}: missing archive files: {sorted(missing)}")
+        # A file a source embeds by literal path must ship: it may sit behind a
+        # feature no consumer build enables. Computed paths (OUT_DIR) name none.
+        for relative, member in files.items():
+            if not relative.endswith(".rs"):
+                continue
+            text = package.extractfile(member).read().decode(errors="replace")
+            for embedded in EMBEDDED_FILE.findall(text):
+                target = posixpath.normpath(
+                    posixpath.join(posixpath.dirname(relative), embedded))
+                # A path out of the package can never ship: an unconditional
+                # one fails the consumer build, the rest are source-workspace
+                # doctests of shared documentation.
+                if target.startswith("../"):
+                    continue
+                if target not in files:
+                    raise ValueError(f"{name}: {relative} embeds {target}, absent from the archive")
         manifest = tomllib.loads(package.extractfile(files["Cargo.toml"]).read().decode())
         if manifest["package"]["name"] != name or manifest["package"]["version"] != version:
             raise ValueError(f"{name}: archive identity mismatch")
