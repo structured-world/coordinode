@@ -4,6 +4,7 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { parse } from "smol-toml";
+import { byCodeUnit } from "./order.ts";
 
 export type Read = (path: string) => Promise<unknown>;
 
@@ -55,7 +56,7 @@ export async function checkVersions(report: Report, read: Read, allowMissing: bo
  */
 export async function checkRegistered(report: Pick<Report, "packages">, read: Read): Promise<void> {
   const missing: string[] = [];
-  for (const name of Object.keys(report.packages).sort()) {
+  for (const name of Object.keys(report.packages).sort(byCodeUnit)) {
     if ((await read(`crates/${name}`)) === null) missing.push(name);
   }
   if (missing.length > 0) {

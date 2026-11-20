@@ -35,7 +35,7 @@ jobs:
         with:
           node-version: current
       - name: Install the release scripts' dependencies
-        run: npm ci --prefix scripts/release
+        run: npm ci --ignore-scripts --prefix scripts/release
       - name: Select the approved release source
         id: source
         env:
@@ -57,7 +57,7 @@ jobs:
       # The checkout above cleans untracked files, the installed dependencies too.
       - name: Install the selected source's release script dependencies
         if: steps.source.outputs.commit != github.sha
-        run: npm ci --prefix scripts/release
+        run: npm ci --ignore-scripts --prefix scripts/release
       - name: Identify the merged release PR
         id: eligible
         env:
@@ -188,7 +188,7 @@ jobs:
       - name: Calculate release-PR baselines from registry state
         run: |
           set -euo pipefail
-          npm ci --prefix scripts/release
+          npm ci --ignore-scripts --prefix scripts/release
           (cd scripts/release && node --test)
           node scripts/release/pr_config.ts --checkout "$GITHUB_WORKSPACE"
       - uses: actions/create-github-app-token@v3

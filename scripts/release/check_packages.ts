@@ -12,6 +12,7 @@ import { dirname, join, posix, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { parse } from "smol-toml";
 import { checkNativeStackHelpers } from "./dependency_policy.ts";
+import { byCodeUnit } from "./order.ts";
 import { writeEvidence, type Metadata } from "./supply_chain.ts";
 import { readTarGz } from "./tar.ts";
 
@@ -63,7 +64,7 @@ export function inspectArchive(
     required.add("bindings/files.txt");
     required.add("build.rs");
   }
-  const missing = [...required].filter((f) => !files.has(f)).sort();
+  const missing = [...required].filter((f) => !files.has(f)).sort(byCodeUnit);
   if (missing.length > 0) throw new Error(`${name}: missing archive files: ${JSON.stringify(missing)}`);
   // A file a source embeds by literal path must ship: it may sit behind a
   // feature no consumer build enables. Computed paths (OUT_DIR) name none.

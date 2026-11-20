@@ -6,6 +6,7 @@
 import { readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { parse } from "smol-toml";
+import { byCodeUnit } from "./order.ts";
 
 // Files a package ships whose text a redistributor must carry along.
 const ATTRIBUTION_PREFIXES = ["LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT", "UNLICENSE"];
@@ -83,7 +84,7 @@ export function attributionFiles(manifestPath: string): string[] {
     .filter((entry) => entry.isFile())
     .map((entry) => entry.name)
     .filter((name) => ATTRIBUTION_PREFIXES.some((prefix) => name.toUpperCase().startsWith(prefix)))
-    .sort();
+    .sort(byCodeUnit);
 }
 
 /**
@@ -96,7 +97,7 @@ export function inventory(metadata: Metadata, lockText: string, context: Record<
   const packages = new Map(metadata.packages.map((p) => [p.id, p]));
   const entries: Entry[] = [];
   const unlicensed: string[] = [];
-  for (const id of [...reachable(metadata)].sort()) {
+  for (const id of [...reachable(metadata)].sort(byCodeUnit)) {
     const p = packages.get(id) as MetadataPackage;
     const license = p.license ?? null;
     const licenseFile = p.license_file ?? null;
@@ -136,7 +137,7 @@ export function cyclonedx(evidence: Evidence) {
     version: 1,
     metadata: {
       properties: Object.keys(evidence.context)
-        .sort()
+        .sort(byCodeUnit)
         .map((key) => ({ name: `coordinode:${key}`, value: String(evidence.context[key]) })),
     },
     components,

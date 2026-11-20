@@ -54,7 +54,9 @@ export function readTarGz(archive: Buffer): TarMember[] {
     const data = Buffer.from(tar.subarray(offset + BLOCK, offset + BLOCK + size));
     offset += BLOCK + Math.ceil(size / BLOCK) * BLOCK;
     if (type === "L") {
-      longName = data.toString("utf8").replace(/\0+$/, "");
+      let end = data.length;
+      while (end > 0 && data[end - 1] === 0) end--;
+      longName = data.subarray(0, end).toString("utf8");
       continue;
     }
     if (type === "x") {

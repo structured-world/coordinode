@@ -80,7 +80,7 @@ function git(root: string, ...args: string[]): void {
   execFileSync("git", args, { cwd: root, stdio: "inherit" });
 }
 
-async function main(): Promise<void> {
+function main(): void {
   const { values } = parseArgs({ options: { checkout: { type: "string" }, "pr-json": { type: "string" } } });
   if (values.checkout === undefined || values["pr-json"] === undefined) {
     throw new Error("--checkout and --pr-json are required");
@@ -130,4 +130,4 @@ async function main(): Promise<void> {
   console.log(`${changed.join(", ")} take ${version} on ${branch}`);
 }
 
-if (import.meta.main) await main();
+if (import.meta.main) main();
