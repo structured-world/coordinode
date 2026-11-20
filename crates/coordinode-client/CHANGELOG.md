@@ -2,6 +2,26 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.1 - 2026-11-20
+
+### Added
+
+- *(replication)* deliver a dropped label as the end of its scope
+- *(replication)* continue a change read inside a large transaction
+- *(replication)* route change events by implied labels
+- *(server)* stream committed changes as logical events
+- *(replicate)* [**breaking**] withdraw bounded consumer retention
+- *(replication)* typed causal bounds and receipts
+
+### Fixed
+
+- *(server)* hold one change batch per stream and name labels by identity
+- *(storage)* deliver blob owner changes and refuse unknown components
+
+### Testing
+
+- *(modality)* read the change feed's memory where its units are built
+
 ## v0.10.0 - 2026-11-19
 
 ### Added

@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.10.1 - 2026-11-20
+
+### Testing
+
+- *(storage)* keep a filled store's log room until the fill ends
+
 ## v0.10.0 - 2026-11-19
 
 ### Added
