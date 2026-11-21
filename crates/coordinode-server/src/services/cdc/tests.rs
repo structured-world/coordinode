@@ -24,6 +24,8 @@ use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
 use coordinode_storage::oplog::manager::{OplogManager, RetainedFloor};
 use tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
+// Every call here names the namespace it reads, as every client does.
+use crate::services::namespace::named;
 use tonic_types::StatusExt;
 
 use super::{AppliedFrontier, AppliedSignal, ChangeEventServiceImpl, INCARNATION_METADATA};
@@ -157,11 +159,18 @@ fn resume(id: &str, incarnation: u64) -> SubscribeRequest {
     }
 }
 
+/// The registry's name of the store's namespace's consumer `id`: the store
+/// a test opens holds one namespace, the first, whose consumers the registry
+/// keeps apart from every other namespace's.
+fn key(id: &str) -> String {
+    format!("1:{id}")
+}
+
 fn state_of(registry: &ShardConsumerRegistry, id: &str) -> Option<RegistrationState> {
     registry
         .list_consumers()
         .into_iter()
-        .find(|c| c.consumer_id == id)
+        .find(|c| c.consumer_id == key(id))
         .map(|c| c.state)
 }
 
@@ -278,7 +287,7 @@ async fn a_scrape_shows_each_consumers_lag() {
     );
     let _stream = f
         .service
-        .subscribe(Request::new(register("behind", ordinary())))
+        .subscribe(named(register("behind", ordinary())))
         .await
         .expect("subscribe");
 
@@ -289,11 +298,12 @@ async fn a_scrape_shows_each_consumers_lag() {
     });
     let scrape = handle.render();
     assert!(
-        scrape.contains("registry_consumer_lag_seqno{consumer_id=\"behind\""),
+        // Named in the registry with its namespace, as every consumer is.
+        scrape.contains("registry_consumer_lag_seqno{consumer_id=\"1:behind\""),
         "{scrape}"
     );
     assert!(
-        scrape.contains("registry_consumer_lag_age_seconds{consumer_id=\"behind\"}"),
+        scrape.contains("registry_consumer_lag_age_seconds{consumer_id=\"1:behind\"}"),
         "{scrape}"
     );
 }
@@ -313,7 +323,7 @@ async fn a_stream_registers_a_consumer_that_outlives_the_connection() {
     );
     let response = f
         .service
-        .subscribe(Request::new(register("sink", strict())))
+        .subscribe(named(register("sink", strict())))
         .await
         .expect("subscribe");
     assert_eq!(
@@ -327,7 +337,7 @@ async fn a_stream_registers_a_consumer_that_outlives_the_connection() {
         .registry
         .list_consumers()
         .into_iter()
-        .find(|c| c.consumer_id == "sink")
+        .find(|c| c.consumer_id == key("sink"))
         .expect("registered");
     assert_eq!(snapshot.kind, ConsumerKind::OplogEvents);
     drop(response);
@@ -369,7 +379,7 @@ fn an_open_stream_is_counted_until_its_client_leaves() {
             );
             let response = f
                 .service
-                .subscribe(Request::new(register("sink", strict())))
+                .subscribe(named(register("sink", strict())))
                 .await
                 .expect("subscribe");
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -452,7 +462,7 @@ async fn subscribe_refuses_requests_it_cannot_serve() {
         ),
     ];
     for (request, what) in cases {
-        let status = match f.service.subscribe(Request::new(request)).await {
+        let status = match f.service.subscribe(named(request)).await {
             Ok(_) => panic!("{what} was accepted"),
             Err(status) => status,
         };
@@ -492,7 +502,7 @@ async fn registering_below_the_retained_log_is_refused_with_retention_lost() {
 
     let status = match f
         .service
-        .subscribe(Request::new(SubscribeRequest {
+        .subscribe(named(SubscribeRequest {
             cursor: f.cursor_at(2),
             ..register("late", strict())
         }))
@@ -514,7 +524,7 @@ async fn registering_below_the_retained_log_is_refused_with_retention_lost() {
     // Without a cursor the same log streams what it holds.
     let mut fresh = f
         .service
-        .subscribe(Request::new(register("fresh", strict())))
+        .subscribe(named(register("fresh", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -551,7 +561,7 @@ async fn a_stopped_ordinary_consumer_learns_its_history_is_gone() {
     );
     let response = f
         .service
-        .subscribe(Request::new(register("sink", ordinary())))
+        .subscribe(named(register("sink", ordinary())))
         .await
         .expect("subscribe");
     let incarnation: u64 = response
@@ -570,7 +580,7 @@ async fn a_stopped_ordinary_consumer_learns_its_history_is_gone() {
     assert_eq!(mgr.purge_before(5).expect("purge"), 1);
     let status = match f
         .service
-        .subscribe(Request::new(resume("sink", incarnation)))
+        .subscribe(named(resume("sink", incarnation)))
         .await
     {
         Ok(_) => panic!("a stream resumed over a purged position"),
@@ -610,7 +620,7 @@ async fn stream_sends_only_applied_entries() {
     );
     let mut stream = f
         .service
-        .subscribe(Request::new(register("tail", strict())))
+        .subscribe(named(register("tail", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -673,7 +683,11 @@ async fn an_unread_stream_holds_one_batch() {
     let f = one_entry_a_batch(oplog_dir.path());
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     f.service
-        .open(register("unread", strict()), super::Delivery::Stream { tx })
+        .open(
+            coordinode_core::namespace::DEFAULT_NAMESPACE,
+            register("unread", strict()),
+            super::Delivery::Stream { tx },
+        )
         .await
         .expect("open");
     assert_eq!(settled(&rx, 1).await, 1, "one batch on its way");
@@ -697,6 +711,7 @@ async fn an_unread_session_holds_one_batch_per_subscription() {
     for (request_id, credit) in credits.iter().enumerate() {
         f.service
             .open(
+                coordinode_core::namespace::DEFAULT_NAMESPACE,
                 register(&format!("unread-{request_id}"), strict()),
                 super::Delivery::Session {
                     frames: frames.clone(),
@@ -820,7 +835,7 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
 
     let mut stream = f
         .service
-        .subscribe(Request::new(register("fragments", strict())))
+        .subscribe(named(register("fragments", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -850,7 +865,7 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
     // where that fragment ended.
     let mut resumed = f
         .service
-        .subscribe(Request::new(SubscribeRequest {
+        .subscribe(named(SubscribeRequest {
             cursor: cursors[0].clone(),
             ..register("resumed", strict())
         }))
@@ -971,7 +986,7 @@ async fn a_label_a_type_implies_receives_its_nodes_and_scope_changes() {
     };
     let mut implied = f
         .service
-        .subscribe(Request::new(subscribe("thing", "Thing")))
+        .subscribe(named(subscribe("thing", "Thing")))
         .await
         .expect("subscribe")
         .into_inner();
@@ -1016,7 +1031,7 @@ async fn a_label_a_type_implies_receives_its_nodes_and_scope_changes() {
 
     let mut unrelated = f
         .service
-        .subscribe(Request::new(subscribe("other", "Other")))
+        .subscribe(named(subscribe("other", "Other")))
         .await
         .expect("subscribe")
         .into_inner();
@@ -1159,7 +1174,7 @@ async fn a_label_dropped_and_created_again_is_another_label_on_the_wire() {
     // The old cursor, with the interest it was read with by name.
     let old_events = events_of(
         f.service
-            .subscribe(Request::new(SubscribeRequest {
+            .subscribe(named(SubscribeRequest {
                 cursor: old_cursor,
                 interest: Some(place(&["Place"])),
                 ..register("old", strict())
@@ -1221,7 +1236,7 @@ async fn a_label_dropped_and_created_again_is_another_label_on_the_wire() {
         .to_bytes();
     let new_events = events_of(
         f.service
-            .subscribe(Request::new(SubscribeRequest {
+            .subscribe(named(SubscribeRequest {
                 cursor: new_cursor,
                 interest: Some(place(&["Place"])),
                 ..register("new", strict())
@@ -1435,7 +1450,7 @@ async fn labels_are_named_on_every_batch_by_its_own_read() {
     });
     let mut stream = f
         .service
-        .subscribe(Request::new(register("named", strict())))
+        .subscribe(named(register("named", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -1517,7 +1532,7 @@ async fn a_name_that_cannot_be_read_ends_the_stream_with_its_cause() {
     mgr.flush().expect("flush");
     let mut stream = f
         .service
-        .subscribe(Request::new(register("unknown", strict())))
+        .subscribe(named(register("unknown", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -1598,7 +1613,7 @@ async fn a_label_created_behind_a_pending_write_is_named_at_once() {
 
     let mut stream = f
         .service
-        .subscribe(Request::new(register("late", strict())))
+        .subscribe(named(register("late", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -1621,12 +1636,12 @@ fn checkpoint_of(registry: &ShardConsumerRegistry, id: &str) -> Option<u64> {
     registry
         .list_consumers()
         .into_iter()
-        .find(|c| c.consumer_id == id)
+        .find(|c| c.consumer_id == key(id))
         .map(|c| c.checkpoint_seqno)
 }
 
 fn ack(id: &str, incarnation: u64, cursor: Vec<u8>) -> Request<AcknowledgeSubscriptionRequest> {
-    Request::new(AcknowledgeSubscriptionRequest {
+    named(AcknowledgeSubscriptionRequest {
         consumer_id: id.to_string(),
         incarnation,
         cursor,
@@ -1651,7 +1666,7 @@ async fn an_interest_taking_nothing_still_moves_a_cursor_the_client_can_acknowle
     );
     let mut stream = f
         .service
-        .subscribe(Request::new(SubscribeRequest {
+        .subscribe(named(SubscribeRequest {
             interest: Some(ChangeInterest {
                 labels: Some(NameList { names: Vec::new() }),
                 edge_types: Some(NameList {
@@ -1711,7 +1726,7 @@ async fn a_batch_dropped_unread_is_sent_again_on_resume() {
     );
     let first = f
         .service
-        .subscribe(Request::new(register("dropper", strict())))
+        .subscribe(named(register("dropper", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -1726,7 +1741,7 @@ async fn a_batch_dropped_unread_is_sent_again_on_resume() {
 
     let mut resumed = f
         .service
-        .subscribe(Request::new(resume("dropper", 1)))
+        .subscribe(named(resume("dropper", 1)))
         .await
         .expect("resume")
         .into_inner();
@@ -1754,7 +1769,7 @@ async fn acknowledgements_release_only_what_was_received() {
     );
     let _stream = f
         .service
-        .subscribe(Request::new(register("acker", strict())))
+        .subscribe(named(register("acker", strict())))
         .await
         .expect("subscribe");
 
@@ -1825,7 +1840,7 @@ async fn a_resumed_stream_continues_where_its_registration_stands() {
     );
     let mut first = f
         .service
-        .subscribe(Request::new(register("resumer", strict())))
+        .subscribe(named(register("resumer", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -1850,7 +1865,7 @@ async fn a_resumed_stream_continues_where_its_registration_stands() {
     applies.send(8).expect("signal");
     let mut resumed = f
         .service
-        .subscribe(Request::new(resume("resumer", 1)))
+        .subscribe(named(resume("resumer", 1)))
         .await
         .expect("resume")
         .into_inner();
@@ -1905,7 +1920,7 @@ async fn a_unit_without_its_context_ends_the_stream_explicitly() {
     });
     let mut stream = f
         .service
-        .subscribe(Request::new(register("strict-reader", strict())))
+        .subscribe(named(register("strict-reader", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -1939,19 +1954,89 @@ async fn a_second_registration_of_a_live_id_is_refused() {
     );
     let _first = f
         .service
-        .subscribe(Request::new(register("dup", strict())))
+        .subscribe(named(register("dup", strict())))
         .await
         .expect("subscribe");
-    let status = match f
-        .service
-        .subscribe(Request::new(register("dup", strict())))
-        .await
-    {
+    let status = match f.service.subscribe(named(register("dup", strict()))).await {
         Ok(_) => panic!("a second registration of a live id was accepted"),
         Err(status) => status,
     };
     assert_eq!(status.code(), Code::AlreadyExists);
     assert_eq!(state_of(&f.registry, "dup"), Some(RegistrationState::Live));
+}
+
+/// Consumers of two namespaces are two consumers, whatever their ids: each
+/// registers, and a cancel naming the id in one namespace leaves the other's
+/// live. A call naming no namespace is refused, and one naming a namespace
+/// the deployment does not hold is NOT_FOUND.
+#[tokio::test(flavor = "multi_thread")]
+async fn consumers_of_two_namespaces_stay_apart() {
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        empty_log(oplog_dir.path()),
+        Arc::new(|| 0),
+        None,
+        RegistryTuning::default(),
+    );
+    let other = f
+        .engine
+        .deployment()
+        .create_namespace("other")
+        .expect("create other");
+    fn in_other<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        request.metadata_mut().insert(
+            crate::services::namespace::NAMESPACE_HEADER,
+            tonic::metadata::MetadataValue::from_static("other"),
+        );
+        request
+    }
+    let _own = f
+        .service
+        .subscribe(named(register("same", strict())))
+        .await
+        .expect("the store's namespace");
+    let _others = f
+        .service
+        .subscribe(in_other(register("same", strict())))
+        .await
+        .expect("another namespace registers the same id");
+    f.service
+        .cancel_subscription(in_other(CancelSubscriptionRequest {
+            consumer_id: "same".into(),
+            incarnation: 1,
+        }))
+        .await
+        .expect("cancel in the other namespace");
+    assert_eq!(state_of(&f.registry, "same"), Some(RegistrationState::Live));
+    let others = f
+        .registry
+        .list_consumers()
+        .into_iter()
+        .find(|c| c.consumer_id == format!("{}:same", other.as_raw()))
+        .expect("the other namespace's consumer");
+    assert_ne!(others.state, RegistrationState::Live);
+
+    let unnamed = match f
+        .service
+        .subscribe(Request::new(register("x", strict())))
+        .await
+    {
+        Ok(_) => panic!("a stream naming no namespace was opened"),
+        Err(status) => status,
+    };
+    assert_eq!(unnamed.code(), Code::InvalidArgument);
+    let mut nowhere = Request::new(register("x", strict()));
+    nowhere.metadata_mut().insert(
+        crate::services::namespace::NAMESPACE_HEADER,
+        tonic::metadata::MetadataValue::from_static("nowhere"),
+    );
+    let unknown = match f.service.subscribe(nowhere).await {
+        Ok(_) => panic!("a stream of an unknown namespace was opened"),
+        Err(status) => status,
+    };
+    assert_eq!(unknown.code(), Code::NotFound);
 }
 
 /// Cancelling ends the registration: its open stream ends with
@@ -1974,13 +2059,13 @@ async fn cancelling_ends_the_registration_and_its_stream() {
     });
     let mut stream = f
         .service
-        .subscribe(Request::new(register("ending", strict())))
+        .subscribe(named(register("ending", strict())))
         .await
         .expect("subscribe")
         .into_inner();
 
     f.service
-        .cancel_subscription(Request::new(CancelSubscriptionRequest {
+        .cancel_subscription(named(CancelSubscriptionRequest {
             consumer_id: "ending".to_string(),
             incarnation: 1,
         }))
@@ -2007,13 +2092,13 @@ async fn cancelling_ends_the_registration_and_its_stream() {
         .expect("an item");
     terminated(ended.expect_err("the stream ends with the refusal"));
 
-    match f.service.subscribe(Request::new(resume("ending", 1))).await {
+    match f.service.subscribe(named(resume("ending", 1))).await {
         Ok(_) => panic!("an ended incarnation was resumed"),
         Err(status) => terminated(status),
     }
     terminated(
         f.service
-            .cancel_subscription(Request::new(CancelSubscriptionRequest {
+            .cancel_subscription(named(CancelSubscriptionRequest {
                 consumer_id: "ending".to_string(),
                 incarnation: 1,
             }))
@@ -2022,7 +2107,7 @@ async fn cancelling_ends_the_registration_and_its_stream() {
     );
     let unknown = f
         .service
-        .cancel_subscription(Request::new(CancelSubscriptionRequest {
+        .cancel_subscription(named(CancelSubscriptionRequest {
             consumer_id: "never".to_string(),
             incarnation: 1,
         }))
@@ -2033,7 +2118,7 @@ async fn cancelling_ends_the_registration_and_its_stream() {
     // Registering the id again starts a new incarnation.
     let again = f
         .service
-        .subscribe(Request::new(register("ending", strict())))
+        .subscribe(named(register("ending", strict())))
         .await
         .expect("register again");
     assert_eq!(
@@ -2065,7 +2150,7 @@ async fn a_parked_stream_learns_of_its_end_without_waiting_for_a_heartbeat() {
     });
     let mut stream = f
         .service
-        .subscribe(Request::new(register("parked", strict())))
+        .subscribe(named(register("parked", strict())))
         .await
         .expect("subscribe")
         .into_inner();
@@ -2073,7 +2158,7 @@ async fn a_parked_stream_learns_of_its_end_without_waiting_for_a_heartbeat() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     f.service
-        .cancel_subscription(Request::new(CancelSubscriptionRequest {
+        .cancel_subscription(named(CancelSubscriptionRequest {
             consumer_id: "parked".to_string(),
             incarnation: 1,
         }))
@@ -2159,7 +2244,7 @@ async fn stream_follows_a_raft_node() {
     let service = ChangeEventServiceImpl::for_raft_node(&engine, Arc::clone(&node), registry)
         .expect("service");
     let mut stream = service
-        .subscribe(Request::new(register("raft-tail", strict())))
+        .subscribe(named(register("raft-tail", strict())))
         .await
         .expect("subscribe")
         .into_inner();

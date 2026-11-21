@@ -172,6 +172,8 @@ impl SessionServiceTrait for SessionSvc {
             .executor
             .in_namespace(namespace.as_deref())
             .map_err(super::cypher::db_error_to_status)?;
+        // Its subscriptions read the same namespace's changes.
+        let session_namespace: Arc<str> = bound.namespace().into();
         let engine: Arc<dyn coordinode_session::CursorEngine> =
             Arc::new(DatabaseCursorEngine::from_executor(bound));
         let mut inbound = request.into_inner();
@@ -204,6 +206,7 @@ impl SessionServiceTrait for SessionSvc {
                     &mut subscriptions,
                     change_streams.as_ref(),
                     &sub_frames,
+                    &session_namespace,
                 ) else {
                     continue;
                 };
@@ -326,13 +329,15 @@ impl WithheldCommit {
 
 /// Serve `op` if it concerns a subscription, answering on `request_id`, and
 /// hand any other op back for the core. A Cancel naming a subscription of the
-/// session ends its delivery; any other Cancel goes to the core.
+/// session ends its delivery; any other Cancel goes to the core. A
+/// subscription reads `namespace`, the one the session works in.
 fn serve_subscription_op(
     op: Option<client_frame::Op>,
     request_id: u64,
     subscriptions: &mut HashMap<u64, Arc<Credit>>,
     change_streams: Option<&Arc<ChangeEventServiceImpl>>,
     frames: &mpsc::Sender<Outgoing<Result<ServerFrame, Status>>>,
+    namespace: &Arc<str>,
 ) -> Option<Option<client_frame::Op>> {
     let reply = move |event: Event| ServerFrame {
         request_id,
@@ -376,13 +381,14 @@ fn serve_subscription_op(
                 earlier.cancel();
             }
             let frames = frames.clone();
+            let namespace = Arc::clone(namespace);
             tokio::spawn(async move {
                 let delivery = Delivery::Session {
                     frames: frames.clone(),
                     request_id,
                     credit: Arc::clone(&credit),
                 };
-                let frame = match service.open(request, delivery).await {
+                let frame = match service.open(&namespace, request, delivery).await {
                     Ok(incarnation) => reply(Event::Subscribed(Subscribed { incarnation })),
                     Err(status) => {
                         credit.cancel();
@@ -409,8 +415,9 @@ fn serve_subscription_op(
         }
         Some(client_frame::Op::Acknowledge(ack)) => {
             let (service, frames) = (change_streams.cloned()?, frames.clone());
+            let namespace = Arc::clone(namespace);
             tokio::spawn(async move {
-                let frame = match service.acknowledge(ack).await {
+                let frame = match service.acknowledge(&namespace, ack).await {
                     Ok(()) => reply(Event::Acknowledged(Acknowledged {})),
                     Err(status) => reply(Event::Error(session_error(&status))),
                 };
@@ -420,8 +427,9 @@ fn serve_subscription_op(
         }
         Some(client_frame::Op::CancelSubscription(cancel)) => {
             let (service, frames) = (change_streams.cloned()?, frames.clone());
+            let namespace = Arc::clone(namespace);
             tokio::spawn(async move {
-                let frame = match service.cancel(cancel).await {
+                let frame = match service.cancel(&namespace, cancel).await {
                     Ok(()) => reply(Event::SubscriptionCancelled(SubscriptionCancelled {})),
                     Err(status) => reply(Event::Error(session_error(&status))),
                 };

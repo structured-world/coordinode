@@ -116,6 +116,10 @@ hold with `NOT_FOUND`, reason `UNKNOWN_NAMESPACE`. A PostgreSQL client names
 it as the connection's database (`psql "host=localhost port=7085
 dbname=default"`); a connection to a database the server does not hold is
 refused with SQLSTATE `3D000`, as PostgreSQL refuses a missing database.
+A change stream reads the changes of the namespace its call (or session)
+names, and its consumer belongs to that namespace: two namespaces may
+register consumers of the same id, and neither resumes, acknowledges or
+cancels the other's.
 
 The query (from `hybrid-query.json`):
 

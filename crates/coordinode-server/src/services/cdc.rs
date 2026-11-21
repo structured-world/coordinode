@@ -321,6 +321,14 @@ async fn blocking<T: Send + 'static>(
         .map_err(registry_status)
 }
 
+/// The namespace a change stream call names, required: a stream reads one
+/// namespace's changes, as every tenant-data call works in one.
+fn named_namespace(metadata: &tonic::metadata::MetadataMap) -> Result<String, Status> {
+    super::namespace::from_metadata(metadata)?.ok_or_else(|| {
+        super::cypher::db_error_to_status(coordinode_embed::DatabaseError::NamespaceRequired)
+    })
+}
+
 #[tonic::async_trait]
 impl ChangeStreamService for ChangeEventServiceImpl {
     type SubscribeStream =
@@ -330,11 +338,12 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let namespace = named_namespace(request.metadata())?;
         // The stream's slot keeps one batch on its way at a time; the
         // channel holds it, or the error that ends the stream.
         let (tx, rx) = mpsc::channel::<Outgoing<Result<ChangeBatch, Status>>>(1);
         let incarnation = self
-            .open(request.into_inner(), Delivery::Stream { tx })
+            .open(&namespace, request.into_inner(), Delivery::Stream { tx })
             .await?;
         // The transport takes each message here, which returns its slot.
         let stream: Pin<Box<dyn tokio_stream::Stream<Item = Result<ChangeBatch, Status>> + Send>> =
@@ -354,7 +363,8 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         &self,
         request: Request<CancelSubscriptionRequest>,
     ) -> Result<Response<CancelSubscriptionResponse>, Status> {
-        self.cancel(request.into_inner()).await?;
+        let namespace = named_namespace(request.metadata())?;
+        self.cancel(&namespace, request.into_inner()).await?;
         Ok(Response::new(CancelSubscriptionResponse {}))
     }
 
@@ -362,7 +372,8 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         &self,
         request: Request<AcknowledgeSubscriptionRequest>,
     ) -> Result<Response<AcknowledgeSubscriptionResponse>, Status> {
-        self.acknowledge(request.into_inner()).await?;
+        let namespace = named_namespace(request.metadata())?;
+        self.acknowledge(&namespace, request.into_inner()).await?;
         Ok(Response::new(AcknowledgeSubscriptionResponse {}))
     }
 }
@@ -429,16 +440,50 @@ fn read_with(
         && read.blobs() == proto.blobs)
 }
 
+/// The registry's name of a namespace's consumer: consumers of different
+/// namespaces never share a registration, so one tenant can neither resume,
+/// acknowledge nor cancel another's under the same id.
+fn consumer_key(engine: &StorageEngine, consumer_id: &str) -> String {
+    format!("{}:{consumer_id}", engine.namespace().as_raw())
+}
+
+/// Refuse a cursor read in another namespace than `engine`'s.
+fn same_namespace(engine: &StorageEngine, cursor: &ChangeCursor) -> Result<(), Status> {
+    match cursor.interest().namespace() {
+        Some(namespace) if namespace != engine.namespace() => Err(Status::invalid_argument(
+            "the cursor was read in another namespace than the call names",
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl ChangeEventServiceImpl {
-    /// Register or resume the consumer `req` names and start delivering its
-    /// units to `delivery`. Returns the registration's incarnation.
+    /// The store bound to the namespace called `namespace`.
+    fn engine_in(&self, namespace: &str) -> Result<Arc<StorageEngine>, Status> {
+        use coordinode_storage::error::StorageError;
+        match self.engine.deployment().engine_named(namespace) {
+            Ok(engine) => Ok(Arc::new(engine)),
+            Err(StorageError::NoSuchNamespace { .. } | StorageError::UnknownNamespace { .. }) => {
+                Err(super::cypher::db_error_to_status(
+                    coordinode_embed::DatabaseError::UnknownNamespace(namespace.to_owned()),
+                ))
+            }
+            Err(e) => Err(Status::internal(format!("namespace {namespace}: {e}"))),
+        }
+    }
+
+    /// Register or resume the consumer `req` names in `namespace` and start
+    /// delivering its units to `delivery`. Returns the registration's
+    /// incarnation.
     ///
     /// # Errors
     ///
-    /// The request is malformed, the registry refuses it, or the log no
-    /// longer holds where it starts.
+    /// The request is malformed, names a namespace the deployment does not
+    /// hold, the registry refuses it, or the log no longer holds where it
+    /// starts.
     pub(crate) async fn open(
         &self,
+        namespace: &str,
         req: SubscribeRequest,
         delivery: Delivery,
     ) -> Result<u64, Status> {
@@ -448,14 +493,16 @@ impl ChangeEventServiceImpl {
                 "a change stream needs a consumer_id",
             ));
         }
+        let engine = self.engine_in(namespace)?;
         // A cursor reads what it was read with: the labels it names, by
         // identity, even when one was dropped and its name bound again.
         let (start, interest) = if req.cursor.is_empty() {
-            (None, interest(&self.engine, req.interest)?)
+            (None, interest(&engine, req.interest)?)
         } else {
             let cursor = ChangeCursor::from_bytes(&req.cursor)
                 .map_err(|e| Status::invalid_argument(format!("cursor: {e}")))?;
-            if !read_with(&self.engine, &cursor, req.interest)? {
+            same_namespace(&engine, &cursor)?;
+            if !read_with(&engine, &cursor, req.interest)? {
                 return Err(Status::invalid_argument(
                     "the cursor was read with another interest than the request's",
                 ));
@@ -465,7 +512,7 @@ impl ChangeEventServiceImpl {
         };
 
         let registry = self.registry.clone();
-        let consumer_id = req.consumer_id;
+        let consumer_id = consumer_key(&engine, &req.consumer_id);
         let handle = if req.incarnation == 0 {
             let retention = retention(req.retention)?;
             let reg = ConsumerRegistration {
@@ -496,7 +543,7 @@ impl ChangeEventServiceImpl {
             None => {
                 let (registry, handle) = (registry.clone(), handle.clone());
                 let from = blocking(move || registry.check_retention(&handle)).await?;
-                self.engine
+                engine
                     .change_cursor_at(from, interest)
                     .map_err(|e| Status::internal(format!("change cursor: {e}")))?
             }
@@ -506,7 +553,7 @@ impl ChangeEventServiceImpl {
         let reader = hub.reader(cursor.position());
         let incarnation = handle.incarnation();
         tokio::spawn(stream_consumer(StreamState {
-            engine: Arc::clone(&self.engine),
+            engine,
             watch: registry.watch(&handle),
             registry,
             handle,
@@ -528,12 +575,18 @@ impl ChangeEventServiceImpl {
     /// # Errors
     ///
     /// The request is malformed, or the registry refuses it.
-    pub(crate) async fn cancel(&self, req: CancelSubscriptionRequest) -> Result<(), Status> {
+    pub(crate) async fn cancel(
+        &self,
+        namespace: &str,
+        req: CancelSubscriptionRequest,
+    ) -> Result<(), Status> {
         if req.consumer_id.is_empty() {
             return Err(Status::invalid_argument("cancelling needs a consumer_id"));
         }
+        let engine = self.engine_in(namespace)?;
         let registry = self.registry.clone();
-        let handle = RegisteredHandle::new(req.consumer_id, req.incarnation);
+        let handle =
+            RegisteredHandle::new(consumer_key(&engine, &req.consumer_id), req.incarnation);
         blocking(move || registry.unregister(handle)).await
     }
 
@@ -546,6 +599,7 @@ impl ChangeEventServiceImpl {
     /// what this node has applied, or the registry refuses it.
     pub(crate) async fn acknowledge(
         &self,
+        namespace: &str,
         req: AcknowledgeSubscriptionRequest,
     ) -> Result<(), Status> {
         if req.consumer_id.is_empty() {
@@ -556,10 +610,11 @@ impl ChangeEventServiceImpl {
         if req.cursor.is_empty() {
             return Err(Status::invalid_argument("acknowledging needs a cursor"));
         }
+        let engine = self.engine_in(namespace)?;
         let cursor = ChangeCursor::from_bytes(&req.cursor)
             .map_err(|e| Status::invalid_argument(format!("cursor: {e}")))?;
-        let history = self
-            .engine
+        same_namespace(&engine, &cursor)?;
+        let history = engine
             .cut_history()
             .map_err(|e| Status::internal(format!("history: {e}")))?;
         if history != Some(cursor.history()) {
@@ -577,7 +632,8 @@ impl ChangeEventServiceImpl {
             )));
         }
         let registry = self.registry.clone();
-        let handle = RegisteredHandle::new(req.consumer_id, req.incarnation);
+        let handle =
+            RegisteredHandle::new(consumer_key(&engine, &req.consumer_id), req.incarnation);
         // Monotonic: an earlier position than one already acknowledged keeps
         // the later one.
         blocking(move || registry.checkpoint(&handle, index)).await
