@@ -181,7 +181,7 @@ fn a_compaction_that_did_work_is_counted_for_its_partition() {
     for _ in 0..2 {
         sender
             .send(CompactionRequest {
-                tree: TreeRef::Partition(tree.clone()),
+                tree: TreeRef::Partition(tree.downgrade()),
                 source: CompactionSource::Partition(crate::engine::scope::TreeId::namespace(
                     crate::engine::scope::NamespaceId::from_raw(1),
                     Partition::Node,

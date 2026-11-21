@@ -100,6 +100,40 @@ fn statements_change_and_list_the_catalog() {
     ));
 }
 
+/// A namespace whose last session is gone closes its trees, and a session
+/// opened after reads every row the closed one wrote, its schema with it.
+/// One a session holds stays open.
+#[test]
+fn a_namespace_closed_when_idle_reopens_with_its_data() {
+    let (database, _dir) = open();
+    database.create_namespace("quiet").unwrap();
+    database.create_namespace("busy").unwrap();
+    let _busy = database.session("busy").unwrap();
+    {
+        let mut quiet = database.session("quiet").unwrap();
+        quiet
+            .execute_cypher("CREATE CONSTRAINT kept_v FOR (n:Kept) REQUIRE n.v IS UNIQUE")
+            .unwrap();
+        quiet.execute_cypher("CREATE (:Kept {v: 7})").unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while database.close_idle_namespaces().unwrap() == 0 {
+        assert!(std::time::Instant::now() < deadline, "never closed");
+    }
+    let mut quiet = database.session("quiet").unwrap();
+    let rows = quiet
+        .execute_cypher("MATCH (n:Kept) WHERE n.v = 7 RETURN n.v AS v")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the reopened namespace holds its row");
+    assert!(
+        matches!(
+            quiet.execute_cypher("CREATE (:Kept {v: 7})"),
+            Err(DatabaseError::UniqueViolation { .. })
+        ),
+        "its constraint came back with it"
+    );
+}
+
 /// A name no namespace may have is refused before anything is written.
 #[test]
 fn an_invalid_namespace_name_is_refused() {

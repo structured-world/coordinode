@@ -782,6 +782,16 @@ impl Member {
         database.set_execution_tenure(node.node_id(), leader, term);
         let (database, tasks) = serve_beside(node, database, &self.stop.subscribe());
         self.background.extend(tasks);
+        // The namespaces it serves close their trees once idle, on the
+        // session bound's own idle time.
+        {
+            let served = Arc::clone(&self.database);
+            self.background.push(background::spawn_namespace_closer(
+                Arc::clone(self.engine.deployment()),
+                move || served.session_limits().idle_close,
+                self.stop.subscribe(),
+            ));
+        }
         if self.database.set(database).is_err() {
             return Err(DatabaseError::Other("the member's database opened twice".into()).into());
         }

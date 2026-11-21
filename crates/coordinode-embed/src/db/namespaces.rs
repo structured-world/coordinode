@@ -83,6 +83,20 @@ impl Database {
         Ok(())
     }
 
+    /// Close the trees of every namespace of the deployment that no handle
+    /// holds and nothing reached since the previous call, flushing them
+    /// first; each opens again from disk on its next use. A replicated
+    /// member runs this itself, on its session idle bound; a host keeping
+    /// sessions of its own calls it as often as it wants namespaces closed.
+    /// The number closed.
+    ///
+    /// # Errors
+    ///
+    /// A flush failure; the namespace it struck stays open.
+    pub fn close_idle_namespaces(&self) -> Result<usize, DatabaseError> {
+        Ok(self.engine.deployment().close_idle_namespaces()?)
+    }
+
     /// The namespaces of the deployment's catalog, in creation order.
     ///
     /// # Errors

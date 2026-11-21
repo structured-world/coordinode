@@ -195,28 +195,27 @@ pub(crate) struct TableTree {
 #[derive(Clone)]
 pub(crate) enum TreeRef {
     /// A partition's tree.
-    Partition(lsm_tree::AnyTree),
+    Partition(lsm_tree::WeakTree),
     /// A table's tree.
     Table(lsm_tree::WeakTree),
 }
 
 impl TreeRef {
-    /// The request for `tree`: weak for a table, so it holds no table open.
+    /// The request for `tree`, weak: it holds open neither a table nor a
+    /// namespace's tree, either of which may close (dropped, or idle).
     pub(crate) fn of(tree: &lsm_tree::AnyTree, table: bool) -> Self {
         if table {
             Self::Table(tree.downgrade())
         } else {
-            Self::Partition(tree.clone())
+            Self::Partition(tree.downgrade())
         }
     }
 
-    /// Run `work` on the tree: always for a partition, for a table only
-    /// while it is neither dropped nor being dropped, whose drop then waits
-    /// for the work. `None` when the table is gone.
+    /// Run `work` on the tree while it is neither closed nor closing, whose
+    /// closing then waits for the work. `None` when the tree is gone.
     pub(crate) fn with_live<T>(&self, work: impl FnOnce(&lsm_tree::AnyTree) -> T) -> Option<T> {
         match self {
-            Self::Partition(tree) => Some(work(tree)),
-            Self::Table(tree) => tree.upgrade().map(|tree| work(&tree)),
+            Self::Partition(tree) | Self::Table(tree) => tree.upgrade().map(|tree| work(&tree)),
         }
     }
 }
@@ -583,6 +582,10 @@ fn flush_monitor_loop(trees: &OpenSets, cfg: FlushMonitorConfig) {
         // with it; a finished flush wakes the monitor to judge it again.
         cfg.pressure.latch();
 
+        // The handles go before the sleep: a tree closing (its namespace
+        // idle or dropped) waits for every holder, and a sleeping monitor
+        // would hold it until its next pass.
+        drop(listed);
         cfg.wake.wait(next_due);
     }
 }

@@ -417,9 +417,13 @@ pub struct Deployment {
     me: std::sync::OnceLock<std::sync::Weak<Deployment>>,
     /// What opening a namespace's set takes, for one created after the open.
     opener: namespace_open::TreeOpener,
-    /// Held while a namespace's set is opened, so two first uses of one
-    /// namespace open its trees once.
-    namespace_opening: parking_lot::Mutex<()>,
+    /// Held while a namespace's set is opened or closed, so two first uses
+    /// of one namespace open its trees once and no use opens them while
+    /// they close. Holds the closing signals of the trees of each namespace
+    /// closed for being idle, which its next open waits for: until then the
+    /// closed trees may still touch their directories. no-std: spin::Mutex
+    namespace_opening:
+        parking_lot::Mutex<rustc_hash::FxHashMap<NamespaceId, Vec<lsm_tree::TreeClose>>>,
     /// The holds on the data directories. Last, so they are released only
     /// once every tree above is closed.
     _directory_locks: crate::format::DirectoryLocks,
@@ -2223,7 +2227,7 @@ impl Deployment {
             group_history,
             me: std::sync::OnceLock::new(),
             opener,
-            namespace_opening: parking_lot::Mutex::new(()),
+            namespace_opening: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             _directory_locks: directory_locks,
         };
         engine.drain_local_journal()?;
@@ -3196,10 +3200,12 @@ impl Deployment {
     /// namespace of that id; its trees cannot be opened.
     pub(crate) fn namespace_set(&self, namespace: NamespaceId) -> StorageResult<Arc<SetTrees>> {
         if let Some(set) = self.coordinator.sets().namespace(namespace) {
+            set.touch();
             return Ok(set);
         }
-        let _opening = self.namespace_opening.lock();
+        let mut opening = self.namespace_opening.lock();
         if let Some(set) = self.coordinator.sets().namespace(namespace) {
+            set.touch();
             return Ok(set);
         }
         if !namespace_open::live_at(
@@ -3208,6 +3214,13 @@ impl Deployment {
             lsm_tree::SeqNo::MAX,
         )? {
             return Err(StorageError::UnknownNamespace { namespace });
+        }
+        // Trees closed for being idle are opened again only once nothing of
+        // the closed handles touches their directories.
+        if let Some(closing) = opening.remove(&namespace) {
+            for tree in closing {
+                tree.wait();
+            }
         }
         let (set, repairs) = self.opener.open_namespace(namespace)?;
         for repair in repairs {
@@ -7630,10 +7643,100 @@ impl Deployment {
     /// every endpoint, removed once the last holder lets go of them.
     fn retire_namespace(&self, id: NamespaceId) {
         let dirs = namespace_dirs(&self.endpoints, id);
-        match self.coordinator.sets().remove(id) {
-            Some(set) => set.retire_on_drop(dirs, self.footprints.clone()),
-            None => remove_namespace_dirs(&dirs, &self.footprints),
+        let closing = self.namespace_opening.lock().remove(&id);
+        match (self.coordinator.sets().remove(id), closing) {
+            (Some(set), _) => set.retire_on_drop(dirs, self.footprints.clone()),
+            // A namespace closed for being idle: its directories go once the
+            // last of its closed trees no longer touches them, without the
+            // apply waiting for that.
+            (None, Some(closing)) if !closing.is_empty() => {
+                let left = Arc::new(std::sync::atomic::AtomicUsize::new(closing.len()));
+                let removal = Arc::new((dirs, self.footprints.clone()));
+                for tree in closing {
+                    let (left, removal) = (Arc::clone(&left), Arc::clone(&removal));
+                    tree.on_closed(move || {
+                        if left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                            remove_namespace_dirs(&removal.0, &removal.1);
+                        }
+                    });
+                }
+            }
+            (None, _) => remove_namespace_dirs(&dirs, &self.footprints),
         }
+    }
+
+    /// Close the trees of every namespace that nothing holds and nothing
+    /// reached since the previous call: a namespace's trees hold memtables,
+    /// open files and compaction bookkeeping, which grow with the namespaces
+    /// open rather than with those that exist. Each is flushed first and
+    /// opens again from disk on its next use, which waits for the closed
+    /// trees to let go of their directories. The number of namespaces
+    /// closed.
+    ///
+    /// # Errors
+    ///
+    /// A flush failure; the namespace it struck stays open.
+    pub fn close_idle_namespaces(&self) -> StorageResult<usize> {
+        let mut opening = self.namespace_opening.lock();
+        let mut closed = 0;
+        for namespace in self.coordinator.sets().namespace_ids() {
+            let Some(set) = self.coordinator.sets().namespace(namespace) else {
+                continue;
+            };
+            // Held by a handle (a session, a write batch, a monitor pass),
+            // or reached since the last pass: in use.
+            if set.take_touched() || Arc::strong_count(&set) > 2 {
+                continue;
+            }
+            #[cfg(feature = "columnar")]
+            if set.columnar().is_some_and(|r| Arc::strong_count(r) > 1) {
+                continue;
+            }
+            // Out of the map first: from here no use reaches the set but
+            // through the open, which waits on this lock.
+            let Some(taken) = self.coordinator.sets().remove(namespace) else {
+                continue;
+            };
+            drop(set);
+            let set = match Arc::try_unwrap(taken) {
+                Ok(set) => set,
+                // A handle taken between the look and the removal.
+                Err(shared) => {
+                    self.coordinator.sets().insert(shared);
+                    continue;
+                }
+            };
+            // The trees hold what reached them in memtables only: written
+            // to tables before they close, or the next open would lose it.
+            let flushed = set
+                .iter()
+                .try_for_each(|(_, tree)| self.flush_memtables_in_order(tree))
+                .and_then(|()| self.flush_tables_of(&set));
+            if let Err(e) = flushed {
+                self.coordinator.sets().insert(Arc::new(set));
+                return Err(e);
+            }
+            self.sync_endpoint_devices()?;
+            opening.entry(namespace).or_default().extend(set.close());
+            tracing::debug!(%namespace, "idle namespace closed");
+            closed += 1;
+        }
+        Ok(closed)
+    }
+
+    /// Flush the memtables of every table of `set`'s namespace.
+    fn flush_tables_of(&self, set: &SetTrees) -> StorageResult<()> {
+        #[cfg(feature = "columnar")]
+        if let Some(registry) = set.columnar() {
+            for table_id in registry.table_ids() {
+                registry
+                    .with_live(&table_id, |tree| self.flush_memtables_in_order(tree))
+                    .unwrap_or(Ok(()))?;
+            }
+        }
+        #[cfg(not(feature = "columnar"))]
+        let _ = set;
+        Ok(())
     }
 
     /// Retire every open namespace the catalog no longer holds live: what a

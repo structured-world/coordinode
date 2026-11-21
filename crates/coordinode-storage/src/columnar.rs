@@ -573,6 +573,20 @@ impl ColumnarTableRegistry {
         Ok(())
     }
 
+    /// Close every table's tree, keeping its directory: the namespace these
+    /// tables belong to is going idle and is opened again from disk. The
+    /// caller flushed them and holds the namespace closed meanwhile, so
+    /// nothing writes them; the signals report when each tree no longer
+    /// touches its directory.
+    pub(crate) fn close_all(&self) -> Vec<lsm_tree::TreeClose> {
+        let mut tables = self.lock();
+        tables
+            .live
+            .drain()
+            .map(|(_, entry)| entry.tree.close())
+            .collect()
+    }
+
     /// Highest LSM seqno across every registered columnar tree, or `None` if no
     /// table has any persisted data. Used at open time to bump the engine's
     /// shared sequence-number generator past columnar writes (the partition-tree

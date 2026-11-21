@@ -162,6 +162,71 @@ fn two_namespaces_with_the_same_keys_stay_apart() {
     assert_eq!(node(&b, b"only-a"), None);
 }
 
+/// A namespace nothing holds and nothing reached for a pass closes, its
+/// trees flushed first: the next use opens it again from disk with every row
+/// it had. A namespace a handle holds, or one reached since the last pass,
+/// stays open.
+#[test]
+fn an_idle_namespace_closes_and_opens_again_with_its_rows() {
+    let dir = TempDir::new().expect("tmp");
+    let (deployment, oracle) = open_deployment(&durable_cfg(&dir));
+    let held = deployment
+        .engine(deployment.create_namespace("held").expect("create held"))
+        .expect("bind held");
+    let idle_id = deployment.create_namespace("idle").expect("create idle");
+    {
+        let idle = deployment.engine(idle_id).expect("bind idle");
+        commit(&idle, &oracle, vec![put(b"k", b"kept")]);
+    }
+    let open = |id| deployment.coordinator.sets().namespace(id).is_some();
+    // The first pass finds both reached since the open.
+    assert_eq!(deployment.close_idle_namespaces().expect("pass"), 0);
+    // A background pass (flush, compaction, capacity) holding the set for a
+    // moment keeps it open that pass: the next one closes it.
+    let close_idle = || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while open(idle_id) {
+            assert!(std::time::Instant::now() < deadline, "never closed");
+            deployment.close_idle_namespaces().expect("pass");
+        }
+    };
+    close_idle();
+    assert!(open(held.namespace()), "a held namespace stays open");
+
+    // The reopen waits for the closed trees to let go of their files, which
+    // no background holder delays past its work.
+    let started = std::time::Instant::now();
+    let again = deployment.engine(idle_id).expect("open again");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the reopen waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        node(&again, b"k").as_deref(),
+        Some(&b"kept"[..]),
+        "a closed namespace keeps its rows"
+    );
+    drop(again);
+    // Reached by the read: the next pass leaves it open.
+    assert_eq!(deployment.close_idle_namespaces().expect("pass"), 0);
+    assert!(open(idle_id));
+    close_idle();
+
+    // Dropped while closed: its directories go with it.
+    deployment.drop_namespace("idle").expect("drop");
+    let gone = namespace_dirs(&deployment.endpoints, idle_id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while gone.iter().any(|d| d.exists()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a closed namespace's files stayed: {:?}",
+            gone.iter().flat_map(|d| walk(d)).collect::<Vec<_>>()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// One unit writing two namespaces lands in both trees at one timestamp, and
 /// a crash before any flush brings both back from the journal.
 #[test]

@@ -55,6 +55,38 @@ pub(super) fn spawn_execution_tenure(
     })
 }
 
+/// Close the trees of the namespaces nothing holds and nothing reached for
+/// a whole pass, passes `period()` apart: a namespace whose session closed,
+/// or one a follower only applied writes to, lets go of its memtables, files
+/// and compaction bookkeeping until its next use. Ends when `stop` says so.
+pub(super) fn spawn_namespace_closer(
+    deployment: Arc<coordinode_storage::engine::core::Deployment>,
+    period: impl Fn() -> Duration + Send + 'static,
+    mut stop: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            // At least a second apart, whatever the bound: a pass walks every
+            // open namespace.
+            let wait = period().max(Duration::from_secs(1));
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = stopped(&mut stop) => break,
+            }
+            let deployment = Arc::clone(&deployment);
+            // A close flushes the namespace's trees: off the runtime.
+            match tokio::task::spawn_blocking(move || deployment.close_idle_namespaces()).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(closed)) => tracing::debug!(closed, "idle namespaces closed"),
+                // The namespace a flush failed for stays open; the next pass
+                // tries again.
+                Ok(Err(e)) => tracing::warn!(%e, "closing idle namespaces failed"),
+                Err(e) => tracing::error!(%e, "the idle namespace pass did not finish"),
+            }
+        }
+    })
+}
+
 /// How far apart reaper passes are at least: transactions expiring close
 /// together end in one pass.
 pub(super) const REAPER_GRANULARITY: Duration = Duration::from_millis(250);

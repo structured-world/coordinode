@@ -49,6 +49,9 @@ pub struct SetTrees {
     /// The index layer's handling of transferred copies of the namespace's
     /// indexes: each namespace has an index catalog of its own.
     index_copy_qualifier: RwLock<Option<Arc<dyn crate::engine::index_copies::IndexCopyQualifier>>>,
+    /// Set whenever the set is reached, cleared by each pass that looks for
+    /// idle sets: a set found clear was reached by nothing for a whole pass.
+    touched: std::sync::atomic::AtomicBool,
 }
 
 /// What a dropped namespace's set removes when it goes.
@@ -88,7 +91,43 @@ impl SetTrees {
             #[cfg(feature = "columnar")]
             table_repairs: parking_lot::Mutex::new(Vec::new()),
             index_copy_qualifier: RwLock::new(None),
+            touched: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Note that the set was reached.
+    #[inline]
+    pub(crate) fn touch(&self) {
+        // Relaxed: a hint for the idle pass, which decides under the open
+        // lock and the set's handle count, not on this flag alone.
+        self.touched
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the set was reached since the last call, clearing the mark.
+    pub(crate) fn take_touched(&self) -> bool {
+        self.touched
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Close every tree of the set, the namespace's tables' included,
+    /// keeping their directories: the namespace goes idle and opens again
+    /// from disk. The caller flushed the trees and holds the namespace closed
+    /// meanwhile. The signals report when each tree no longer touches its
+    /// directory, which a reopen waits for.
+    pub(crate) fn close(mut self) -> Vec<lsm_tree::TreeClose> {
+        let mut closing: Vec<lsm_tree::TreeClose> = self
+            .trees
+            .iter_mut()
+            .filter_map(Option::take)
+            .map(lsm_tree::AnyTree::close)
+            .collect();
+        self.installations = None;
+        #[cfg(feature = "columnar")]
+        if let Some(registry) = self.columnar.take() {
+            closing.extend(registry.close_all());
+        }
+        closing
     }
 
     /// The index layer's handling of the namespace's transferred index

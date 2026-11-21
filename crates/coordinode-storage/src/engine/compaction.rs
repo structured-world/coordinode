@@ -292,7 +292,7 @@ fn compaction_monitor_loop(sets: &OpenSets, cfg: MonitorConfig, wake: &Wake) {
         trees.retain(|id, _| listed.iter().any(|(listed, _)| listed == id));
         for (id, tree) in listed {
             trees.entry(id).or_insert_with(|| MonitoredTree {
-                tree: TreeRef::Partition(tree),
+                tree: TreeRef::Partition(tree.downgrade()),
                 source: CompactionSource::Partition(id),
                 strategy: cfg.strategy.for_tree(),
                 table: None,
