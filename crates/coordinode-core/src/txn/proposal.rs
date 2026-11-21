@@ -467,6 +467,24 @@ pub enum MetadataCommand {
         /// Registry keys and the values written when every condition holds.
         put: Vec<(Vec<u8>, Vec<u8>)>,
     },
+    /// Create a namespace named `name` under the next namespace id the
+    /// deployment's catalog hands out, unless a live namespace holds the
+    /// name or the name is not one a namespace may have: refused then,
+    /// writing nothing. The record keeps `token`, so the proposer can tell
+    /// its own creation from another one of the same name.
+    CreateNamespace {
+        /// The name, as [`crate::namespace::validate_namespace_name`] admits.
+        name: String,
+        /// Identifies the creation.
+        token: [u8; crate::namespace::NAMESPACE_TOKEN_LEN],
+    },
+    /// Begin dropping the live namespace `name`: the name is free at once,
+    /// and the namespace's record marks it dropping until its trees are
+    /// gone. Refused, writing nothing, when no live namespace has the name.
+    DropNamespace {
+        /// The name of the namespace to drop.
+        name: String,
+    },
 }
 
 impl MetadataCommand {
@@ -481,7 +499,9 @@ impl MetadataCommand {
             }
             Self::GrantNodeLease { .. }
             | Self::RecordGroupPair { .. }
-            | Self::RecordDeployment { .. } => PartitionId::Deployment,
+            | Self::RecordDeployment { .. }
+            | Self::CreateNamespace { .. }
+            | Self::DropNamespace { .. } => PartitionId::Deployment,
             Self::ConditionalRegistryWrite { .. } => PartitionId::Registry,
         }
     }
@@ -504,6 +524,8 @@ impl MetadataCommand {
                 let put: usize = put.iter().map(|(k, v)| k.len() + v.len()).sum();
                 expect + put
             }
+            Self::CreateNamespace { name, token } => name.len() + token.len() + 2,
+            Self::DropNamespace { name } => name.len() + 2,
         }
     }
 }

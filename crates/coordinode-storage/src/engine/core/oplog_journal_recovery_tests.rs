@@ -426,7 +426,7 @@ impl PowerRig {
     /// Lose power: nothing written from now on is durable, the engine goes
     /// away, and every file falls back to what was fsynced before the cut,
     /// the journal's unsynced tail included.
-    fn cut(&self, engine: StorageEngine) {
+    fn cut<E: core::ops::Deref<Target = Deployment>>(&self, engine: E) {
         let journal = engine.journal_crash_point(CrashKind::PowerCut);
         self.stop(engine);
         cut_journal(journal);
@@ -435,7 +435,7 @@ impl PowerRig {
 
     /// Kill the process: what it handed to the operating system stays, its
     /// own buffers (the journal's among them) are lost.
-    fn kill(&self, engine: StorageEngine) {
+    fn kill<E: core::ops::Deref<Target = Deployment>>(&self, engine: E) {
         let journal = engine.journal_crash_point(CrashKind::Kill);
         self.stop(engine);
         cut_journal(journal);
@@ -443,7 +443,7 @@ impl PowerRig {
 
     /// Take `engine` away with every table write refused, so the flush its
     /// drop attempts never lands.
-    fn stop(&self, engine: StorageEngine) {
+    fn stop<E: core::ops::Deref<Target = Deployment>>(&self, engine: E) {
         use lsm_tree::fs::{Fault, FaultOp, FaultRule};
         let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
         for op in [
@@ -1199,6 +1199,18 @@ fn a_routine_fold_writes_only_the_trees_its_entries_reached() {
             .map(|&part| engine.tree(part).expect("tree").table_count())
             .collect()
     };
+    // The store's own first entry (its namespace's creation) reached the
+    // deployment's records: a first fold takes it, so the window measured
+    // below holds the commits alone.
+    let warm = crate::engine::coverage::FOLD_EVERY;
+    for i in 0..warm {
+        commit_at(
+            &engine,
+            &oracle,
+            &two_tree_commit(&format!("w{i}"), i),
+            Journal::Cache,
+        );
+    }
     engine.persist().expect("persist");
     let before = tables(&engine);
     let commits = crate::engine::coverage::FOLD_EVERY + 100;

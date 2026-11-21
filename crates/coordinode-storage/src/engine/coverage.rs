@@ -26,12 +26,13 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::BTreeSet;
-#[cfg(feature = "columnar")]
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 
 use crate::engine::partition::Partition;
+use crate::engine::scope::{NamespaceId, Scope, TreeId};
 use crate::engine::{StorageGuard, StorageIter};
 use crate::error::{StorageError, StorageResult};
 
@@ -286,19 +287,38 @@ pub(crate) struct Coverage {
     folded: parking_lot::Mutex<u64>,
     /// Lock-free copy of `folded` for the commit path's "is a fold due" test.
     folded_hint: AtomicU64,
-    /// Per `STORAGE COLUMNAR` table, the indices marked in its tree and not
-    /// folded yet: a table fold removes them by name.
+    /// Per `STORAGE COLUMNAR` table of a namespace, the indices marked in its
+    /// tree and not folded yet: a table fold removes them by name.
     #[cfg(feature = "columnar")]
-    table_markers: parking_lot::Mutex<HashMap<String, Vec<u64>>>,
-    /// Per partition ([`Partition::position`]), one past the highest index
-    /// applied to it in this process; 0 when none was. A fold writes only the
-    /// trees an index in its range reached: a tree no entry of the range
-    /// touched holds no marker there to fold, and a base for it would only
-    /// make a table to flush.
+    table_markers: parking_lot::Mutex<HashMap<(NamespaceId, String), Vec<u64>>>,
+    /// The system set's trees' counters.
+    system: TreeCounters,
+    /// Each namespace's trees' counters, added the first time one of its
+    /// trees is noted. no-std: spin::RwLock
+    namespaces: parking_lot::RwLock<HashMap<NamespaceId, Arc<TreeCounters>>>,
+}
+
+/// What a fold reads of each tree of one set, by partition
+/// ([`Partition::position`]).
+#[derive(Debug)]
+struct TreeCounters {
+    /// One past the highest index applied to the tree in this process; 0
+    /// when none was. A fold writes only the trees an index in its range
+    /// reached: a tree no entry of the range touched holds no marker there
+    /// to fold, and a base for it would only make a table to flush.
     touched: [AtomicU64; Partition::COUNT],
-    /// Per partition, the base this process last wrote to its tree; 0 before
-    /// the first. A fold removes the tree's markers from here up.
+    /// The base this process last wrote to the tree; 0 before the first. A
+    /// fold removes the tree's markers from here up.
     based: [AtomicU64; Partition::COUNT],
+}
+
+impl Default for TreeCounters {
+    fn default() -> Self {
+        Self {
+            touched: core::array::from_fn(|_| AtomicU64::new(0)),
+            based: core::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 }
 
 /// Which trees a fold writes.
@@ -324,50 +344,74 @@ impl Coverage {
             folded_hint: AtomicU64::new(0),
             #[cfg(feature = "columnar")]
             table_markers: parking_lot::Mutex::new(HashMap::new()),
-            touched: core::array::from_fn(|_| AtomicU64::new(0)),
-            based: core::array::from_fn(|_| AtomicU64::new(0)),
+            system: TreeCounters::default(),
+            namespaces: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
-    /// The base this process last wrote to `partition`'s tree.
-    pub(crate) fn based(&self, partition: Partition) -> u64 {
-        self.based[partition.position()].load(Ordering::Acquire)
+    /// Run `read` on the counters of `tree`'s set, made now for a namespace
+    /// noted the first time.
+    fn with_counters<R>(&self, tree: TreeId, read: impl FnOnce(&TreeCounters) -> R) -> R {
+        let Scope::Namespace(namespace) = tree.scope else {
+            return read(&self.system);
+        };
+        if let Some(counters) = self.namespaces.read().get(&namespace) {
+            return read(counters);
+        }
+        let counters = Arc::clone(self.namespaces.write().entry(namespace).or_default());
+        read(&counters)
     }
 
-    /// Record that `partition`'s tree now carries the base `next`.
-    pub(crate) fn note_based(&self, partition: Partition, next: u64) {
-        self.based[partition.position()].fetch_max(next, Ordering::AcqRel);
+    /// The base this process last wrote to `tree`.
+    pub(crate) fn based(&self, tree: TreeId) -> u64 {
+        self.with_counters(tree, |c| {
+            c.based[tree.part.position()].load(Ordering::Acquire)
+        })
     }
 
-    /// Record that entry `index` applied effects to `partition`. Called
-    /// before the entry is marked applied, so a fold that covers `index`
-    /// sees it.
-    pub(crate) fn note_touched(&self, partition: Partition, index: u64) {
+    /// Record that `tree` now carries the base `next`.
+    pub(crate) fn note_based(&self, tree: TreeId, next: u64) {
+        self.with_counters(tree, |c| {
+            c.based[tree.part.position()].fetch_max(next, Ordering::AcqRel);
+        });
+    }
+
+    /// Record that entry `index` applied effects to `tree`. Called before the
+    /// entry is marked applied, so a fold that covers `index` sees it.
+    pub(crate) fn note_touched(&self, tree: TreeId, index: u64) {
         // Indices are far below u64::MAX: one per commit.
-        self.touched[partition.position()].fetch_max(index + 1, Ordering::AcqRel);
+        self.with_counters(tree, |c| {
+            c.touched[tree.part.position()].fetch_max(index + 1, Ordering::AcqRel);
+        });
     }
 
-    /// Whether an entry at or above `from` reached `partition`.
-    pub(crate) fn touched_since(&self, partition: Partition, from: u64) -> bool {
-        self.touched[partition.position()].load(Ordering::Acquire) > from
+    /// Whether an entry at or above `from` reached `tree`.
+    pub(crate) fn touched_since(&self, tree: TreeId, from: u64) -> bool {
+        self.with_counters(tree, |c| {
+            c.touched[tree.part.position()].load(Ordering::Acquire) > from
+        })
     }
 
-    /// Record that `table`'s tree now holds the marker for `index`.
+    /// Record that namespace `namespace`'s table `table` now holds the marker
+    /// for `index`.
     #[cfg(feature = "columnar")]
-    pub(crate) fn note_table_marker(&self, table: &str, index: u64) {
+    pub(crate) fn note_table_marker(&self, namespace: NamespaceId, table: &str, index: u64) {
         let mut markers = self.table_markers.lock();
-        match markers.get_mut(table) {
+        match markers.get_mut(&(namespace, table.to_owned())) {
             Some(indices) => indices.push(index),
             None => {
-                markers.insert(table.to_owned(), vec![index]);
+                markers.insert((namespace, table.to_owned()), vec![index]);
             }
         }
     }
 
-    /// Take, per table, the unfolded markers below `next`; the ones at or
-    /// above it stay for a later fold.
+    /// Take, per table of a namespace, the unfolded markers below `next`; the
+    /// ones at or above it stay for a later fold.
     #[cfg(feature = "columnar")]
-    pub(crate) fn take_table_markers_below(&self, next: u64) -> Vec<(String, Vec<u64>)> {
+    pub(crate) fn take_table_markers_below(
+        &self,
+        next: u64,
+    ) -> Vec<((NamespaceId, String), Vec<u64>)> {
         let mut markers = self.table_markers.lock();
         let mut taken = Vec::new();
         markers.retain(|table, indices| {

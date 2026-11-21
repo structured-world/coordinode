@@ -35,6 +35,39 @@ pub struct SetTrees {
     /// whole write. Kept per set: the same key in two namespaces is two
     /// records. no-std: spin::Mutex
     node_delta_runs: parking_lot::Mutex<rustc_hash::FxHashMap<Vec<u8>, u32>>,
+    /// Set when the set's namespace was dropped: the directories its trees
+    /// lie in, removed once the set itself goes. no-std: spin::Mutex
+    retire: parking_lot::Mutex<Option<Retire>>,
+    /// The namespace's `STORAGE COLUMNAR` table trees, under
+    /// `<endpoint>/ns/<id>/tables`; `None` for the system set.
+    #[cfg(feature = "columnar")]
+    columnar: Option<Arc<crate::columnar::ColumnarTableRegistry>>,
+    /// The namespace's tables whose tree the open repaired by block salvage
+    /// and which still owe what it lost. no-std: spin::Mutex
+    #[cfg(feature = "columnar")]
+    table_repairs: parking_lot::Mutex<Vec<crate::columnar::TableRepair>>,
+}
+
+/// What a dropped namespace's set removes when it goes.
+struct Retire {
+    dirs: Vec<std::path::PathBuf>,
+    footprints: crate::engine::footprint::Footprints,
+}
+
+impl Drop for SetTrees {
+    fn drop(&mut self) {
+        let Some(retire) = self.retire.get_mut().take() else {
+            return;
+        };
+        // The set's own handles first, so nothing of it keeps a file open.
+        self.trees = Default::default();
+        self.installations = None;
+        #[cfg(feature = "columnar")]
+        {
+            self.columnar = None;
+        }
+        crate::engine::core::remove_namespace_dirs(&retire.dirs, &retire.footprints);
+    }
 }
 
 impl SetTrees {
@@ -46,7 +79,49 @@ impl SetTrees {
             trees: Default::default(),
             installations: None,
             node_delta_runs: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
+            retire: parking_lot::Mutex::new(None),
+            #[cfg(feature = "columnar")]
+            columnar: None,
+            #[cfg(feature = "columnar")]
+            table_repairs: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    /// The set with its namespace's table registry and the repairs its open
+    /// made.
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub(crate) fn with_columnar(
+        mut self,
+        registry: Arc<crate::columnar::ColumnarTableRegistry>,
+        repairs: Vec<crate::columnar::TableRepair>,
+    ) -> Self {
+        self.columnar = Some(registry);
+        self.table_repairs = parking_lot::Mutex::new(repairs);
+        self
+    }
+
+    /// The namespace's table registry, when the set has one.
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub(crate) fn columnar(&self) -> Option<&Arc<crate::columnar::ColumnarTableRegistry>> {
+        self.columnar.as_ref()
+    }
+
+    /// The namespace's table repairs still owed.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn table_repairs(&self) -> &parking_lot::Mutex<Vec<crate::columnar::TableRepair>> {
+        &self.table_repairs
+    }
+
+    /// Have the set remove `dirs`, its namespace's directories, once it
+    /// goes: its namespace was dropped.
+    pub(crate) fn retire_on_drop(
+        &self,
+        dirs: Vec<std::path::PathBuf>,
+        footprints: crate::engine::footprint::Footprints,
+    ) {
+        *self.retire.lock() = Some(Retire { dirs, footprints });
     }
 
     /// Count one more property delta written to `node_key` and return the
@@ -197,6 +272,28 @@ impl OpenSets {
         self.namespaces.read().get(&ns).cloned()
     }
 
+    /// Add namespace `set`, opened after the engine. A set of the system or
+    /// of a namespace already open is a programming error the debug build
+    /// catches; the release build keeps the set it has.
+    pub(crate) fn insert(&self, set: Arc<SetTrees>) {
+        let Scope::Namespace(namespace) = set.scope() else {
+            debug_assert!(false, "the system set is not added after the open");
+            return;
+        };
+        let mut namespaces = self.namespaces.write();
+        debug_assert!(
+            !namespaces.contains_key(&namespace),
+            "{namespace} opened twice"
+        );
+        namespaces.entry(namespace).or_insert(set);
+    }
+
+    /// Take namespace `namespace`'s set out: nothing new reaches its trees
+    /// through the engine. Returned, so the caller can see it through.
+    pub(crate) fn remove(&self, namespace: NamespaceId) -> Option<Arc<SetTrees>> {
+        self.namespaces.write().remove(&namespace)
+    }
+
     /// The namespaces whose sets are open, in id order.
     #[must_use]
     pub fn namespace_ids(&self) -> Vec<NamespaceId> {
@@ -216,6 +313,25 @@ impl OpenSets {
     #[must_use]
     pub fn tree(&self, id: TreeId) -> Option<AnyTree> {
         self.set(id.scope).and_then(|set| set.get(id.part).cloned())
+    }
+
+    /// Every `STORAGE COLUMNAR` table tree of every open namespace now, for
+    /// the flush and compaction monitors' passes.
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub(crate) fn table_trees(&self) -> Vec<crate::engine::flush::TableTree> {
+        let namespaces: Vec<Arc<SetTrees>> = self.namespaces.read().values().cloned().collect();
+        namespaces
+            .iter()
+            .filter_map(|set| set.columnar())
+            .flat_map(|registry| registry.trees())
+            .collect()
+    }
+
+    /// Every open namespace's set now, in id order.
+    #[must_use]
+    pub(crate) fn namespace_sets(&self) -> Vec<Arc<SetTrees>> {
+        self.namespaces.read().values().cloned().collect()
     }
 
     /// Every open tree now: the system set's first, then each namespace's in

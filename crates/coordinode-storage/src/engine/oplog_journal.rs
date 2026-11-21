@@ -278,28 +278,36 @@ impl EmbeddedOplog {
         self.append_ops(vec![OplogOp::Unit { frame }], commit_ts, level, bytes)
     }
 
-    /// Append a single `STORAGE COLUMNAR` row write as one oplog entry stamped
-    /// at `commit_ts`, then fsync. Returns the assigned entry index.
+    /// Append a single `STORAGE COLUMNAR` row write of namespace `namespace`'s
+    /// table `table_id` as one oplog entry stamped at `commit_ts`, then fsync.
+    /// Returns the assigned entry index.
     ///
     /// Columnar tables live outside the `Partition` keyspace, so their writes
     /// carry a [`OplogOp::ColumnarInsert`] tagged with the table id rather than
-    /// a partition discriminant. Like [`append`](Self::append), must be called
-    /// BEFORE the row is applied to the columnar tree's memtable so a write that
-    /// reached the journal survives a crash and is replayed.
+    /// a partition discriminant, after the namespace it is a table of. Like
+    /// [`append`](Self::append), must be called BEFORE the row is applied to
+    /// the columnar tree's memtable so a write that reached the journal
+    /// survives a crash and is replayed.
     #[cfg(feature = "columnar")]
     pub(crate) fn append_columnar(
         &mut self,
+        namespace: crate::engine::scope::NamespaceId,
         table_id: &str,
         key: &[u8],
         value: &[u8],
         commit_ts: u64,
     ) -> StorageResult<u64> {
         let bytes = (table_id.len() + key.len() + value.len()) as u64;
-        let ops = vec![OplogOp::ColumnarInsert {
-            table_id: table_id.to_owned(),
-            key: key.to_vec(),
-            value: value.to_vec(),
-        }];
+        let ops = vec![
+            OplogOp::Namespace {
+                id: namespace.as_raw(),
+            },
+            OplogOp::ColumnarInsert {
+                table_id: table_id.to_owned(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+        ];
         self.append_ops(ops, commit_ts, Journal::Journal, bytes)
     }
 

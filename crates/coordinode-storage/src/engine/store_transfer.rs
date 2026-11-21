@@ -471,11 +471,27 @@ impl Deployment {
         }
     }
 
-    /// Every `STORAGE COLUMNAR` table's tree with its id; none without
-    /// columnar support.
-    fn table_trees(&self) -> Vec<(String, lsm_tree::AnyTree)> {
+    /// Every `STORAGE COLUMNAR` table's tree of every namespace, with the
+    /// namespace and its id; none without columnar support.
+    fn table_trees(&self) -> Vec<(NamespaceId, String, lsm_tree::AnyTree)> {
         #[cfg(feature = "columnar")]
-        return self.columnar_table_trees();
+        return self
+            .coordinator()
+            .sets()
+            .namespace_sets()
+            .iter()
+            .filter_map(|set| match (set.scope(), set.columnar()) {
+                (crate::engine::scope::Scope::Namespace(namespace), Some(registry)) => {
+                    Some((namespace, registry))
+                }
+                _ => None,
+            })
+            .flat_map(|(namespace, registry)| {
+                registry.table_ids().into_iter().filter_map(move |table| {
+                    registry.get(&table).map(|tree| (namespace, table, tree))
+                })
+            })
+            .collect();
         #[cfg(not(feature = "columnar"))]
         Vec::new()
     }
@@ -509,7 +525,7 @@ impl Deployment {
         let _no_flush: Vec<_> = parts
             .iter()
             .map(|(_, tree)| tree.get_flush_lock())
-            .chain(tables.iter().map(|(_, tree)| tree.get_flush_lock()))
+            .chain(tables.iter().map(|(_, _, tree)| tree.get_flush_lock()))
             .collect();
         let bound = self.next_seqno();
         let below = bound
@@ -531,7 +547,7 @@ impl Deployment {
         &self,
         applies: Option<&RaftApplyState>,
         scope: PinScope,
-        tables: Vec<(String, lsm_tree::AnyTree)>,
+        tables: Vec<(NamespaceId, String, lsm_tree::AnyTree)>,
     ) -> StorageResult<(Vec<PinnedTree>, Option<Vec<u8>>)> {
         let open = self.coordinator().trees();
         let mut trees = Vec::with_capacity(open.len());
@@ -566,9 +582,9 @@ impl Deployment {
                 hook(part);
             }
         }
-        for (table_id, tree) in tables {
+        for (namespace, table_id, tree) in tables {
             trees.push(PinnedTree {
-                name: TreeName::Table(STORE_NAMESPACE, table_id),
+                name: TreeName::Table(namespace, table_id),
                 position: None,
                 pin: tree.pin(),
                 _held: (scope == PinScope::Whole).then_some(tree),

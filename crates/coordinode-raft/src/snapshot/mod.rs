@@ -375,10 +375,16 @@ struct ParsedSnapshot {
 
 /// Whether a receiver installs `key` of `partition` from a snapshot: none of
 /// this node's own records
-/// ([`is_node_local`](coordinode_storage::engine::core::is_node_local)). Raft
-/// state is openraft's, routing and index records (`meta:`) are per node.
+/// ([`is_node_local`](coordinode_storage::engine::core::is_node_local)), and
+/// none of the namespace catalog. Raft state is openraft's, routing and
+/// index records (`meta:`) are per node. The image carries the trees of the
+/// one namespace its engine is bound to, while the catalog names every
+/// namespace of the deployment: installing it from one namespace's image
+/// would make the receiver serve namespaces whose trees never came.
 fn installable(partition: Partition, key: &[u8]) -> bool {
     !coordinode_storage::engine::core::is_node_local(partition, key)
+        && !(partition == Partition::Deployment
+            && coordinode_core::namespace::is_namespace_catalog_key(key))
 }
 
 /// Verify `data`'s trailing checksum, then parse the body. The whole buffer

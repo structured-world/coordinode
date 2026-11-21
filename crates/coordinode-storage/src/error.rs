@@ -411,12 +411,51 @@ pub enum StorageError {
     #[error("the closure ledger was replaced while a commit ceiling was read from it")]
     ClosureLedgerReplaced,
 
-    /// A unit names a namespace this store holds no trees of. Nothing of
-    /// the unit is applied.
-    #[error("{namespace} is not a namespace of this store")]
+    /// The catalog holds no live namespace of this id: none was created
+    /// under it, or it was dropped.
+    #[error("{namespace} is not a live namespace of this store")]
     UnknownNamespace {
         /// The namespace named.
         namespace: crate::engine::scope::NamespaceId,
+    },
+
+    /// No live namespace has this name.
+    #[error("no live namespace is named {name:?}")]
+    NoSuchNamespace {
+        /// The name asked for.
+        name: String,
+    },
+
+    /// A store opened as a store of one namespace holds none, and is not a
+    /// fresh one: its namespaces were dropped, and its own namespace is not
+    /// created again behind the catalog's back.
+    #[error(
+        "the store at {path} holds no live namespace; its namespaces were dropped, so none is \
+         created for it again"
+    )]
+    NoNamespace {
+        /// The store's data directory.
+        path: String,
+    },
+
+    /// A store opened as a store of one namespace holds several: which one a
+    /// reader or writer means has to be named.
+    #[error("the store at {path} holds several namespaces ({names:?}); name the one to open")]
+    SeveralNamespaces {
+        /// The store's data directory.
+        path: String,
+        /// The live namespaces' names.
+        names: Vec<String>,
+    },
+
+    /// A namespace creation was refused: the name is taken by a live
+    /// namespace, or it is not one a namespace may have.
+    #[error("namespace {name:?} was not created: {reason}")]
+    NamespaceRefused {
+        /// The name asked for.
+        name: String,
+        /// Why.
+        reason: String,
     },
 
     /// A unit writes a namespace's data before naming any namespace. Nothing

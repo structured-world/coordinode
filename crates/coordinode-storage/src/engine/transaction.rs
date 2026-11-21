@@ -3105,10 +3105,7 @@ impl<'a> Transaction<'a> {
             .collect();
         // The unit names the namespace its rows belong to before them; the
         // positions DERIVED work names count it, so it goes in first.
-        mutations.insert(
-            0,
-            Mutation::Namespace(crate::engine::scope::STORE_NAMESPACE),
-        );
+        mutations.insert(0, Mutation::Namespace(self.engine.namespace()));
         if !derived.is_empty() {
             derived.seal(&mut mutations);
         }

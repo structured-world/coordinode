@@ -52,11 +52,19 @@ fn scrub_config_defaults() {
 
 #[test]
 fn scrub_empty_engine() {
+    use lsm_tree::AbstractTree as _;
     let (engine, _dir) = test_engine();
     let report = scrub_all(&engine, &ScrubConfig::default()).expect("scrub failed");
-    // No SSTs flushed yet → nothing on disk to verify, and no corruption.
-    assert_eq!(report.blocks_checked, 0);
-    assert_eq!(report.sst_files_checked, 0);
+    // No data written: the only tables on disk are the catalog's, made
+    // durable when the store created its namespace. Each is verified and
+    // none is corrupt.
+    let tables: usize = engine
+        .coordinator()
+        .trees()
+        .iter()
+        .map(|(_, tree)| tree.table_count())
+        .sum();
+    assert_eq!(report.sst_files_checked as usize, tables);
     assert!(!report.has_errors());
     assert_eq!(report.partition_counts.len(), Partition::all().len());
 }

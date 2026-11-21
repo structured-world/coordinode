@@ -27,6 +27,11 @@ use coordinode_core::graph::node::{
 use coordinode_core::group::{
     DEPLOYMENT_KEY, DeploymentId, ENROLLED_DEPLOYMENT_KEY, retired_identity_key,
 };
+use coordinode_core::namespace::{
+    NAMESPACE_ALLOCATOR_KEY, NAMESPACE_RECORD_PREFIX, NAMESPACE_TOKEN_LEN, NamespaceId,
+    NamespaceRecord, NamespaceState, decode_namespace_record_key, namespace_name_key,
+    namespace_record_key, validate_namespace_name,
+};
 use coordinode_core::schema::definition::{
     encode_label_binding_history_prefix, encode_label_current_revision_key,
 };
@@ -91,7 +96,153 @@ pub(crate) fn decide(
         MetadataCommand::ConditionalRegistryWrite { expect, put } => {
             decide_registry_write(deployment, expect, put)
         }
+        MetadataCommand::CreateNamespace { name, token } => {
+            decide_namespace_creation(deployment, name, token)
+        }
+        MetadataCommand::DropNamespace { name } => decide_namespace_drop(deployment, name),
     }
+}
+
+/// The records creating namespace `name` under the next id: its record,
+/// its name's entry and the allocator moved past the id. None when the
+/// name is not one a namespace may have, a live namespace holds it, or the
+/// ids are exhausted.
+fn decide_namespace_creation(
+    engine: &Deployment,
+    name: &str,
+    token: &[u8; NAMESPACE_TOKEN_LEN],
+) -> StorageResult<Vec<Mutation>> {
+    if let Err(e) = validate_namespace_name(name) {
+        tracing::warn!(name, error = %e, "namespace creation refused");
+        return Ok(Vec::new());
+    }
+    if namespace_by_name(engine, name)?.is_some() {
+        return Ok(Vec::new());
+    }
+    let next = namespace_allocator(engine)?;
+    let Some(after) = next.checked_add(1) else {
+        tracing::warn!(name, "namespace creation refused: the ids are exhausted");
+        return Ok(Vec::new());
+    };
+    let id = NamespaceId::from_raw(next);
+    let record = NamespaceRecord {
+        name: name.to_owned(),
+        state: NamespaceState::Live,
+        token: *token,
+    };
+    Ok(vec![
+        deployment_put(namespace_record_key(id), record.encode()),
+        deployment_put(namespace_name_key(name), id.as_raw().to_be_bytes().to_vec()),
+        deployment_put(
+            NAMESPACE_ALLOCATOR_KEY.to_vec(),
+            after.to_be_bytes().to_vec(),
+        ),
+    ])
+}
+
+/// The records beginning to drop the live namespace `name`: its record
+/// marked dropping and its name freed. None when no live namespace has the
+/// name.
+fn decide_namespace_drop(engine: &Deployment, name: &str) -> StorageResult<Vec<Mutation>> {
+    let Some(id) = namespace_by_name(engine, name)? else {
+        return Ok(Vec::new());
+    };
+    let Some(record) = namespace_record(engine, id)? else {
+        return Err(StorageError::Serialization(format!(
+            "namespace {name:?} is named in the catalog without a record of {id}"
+        )));
+    };
+    let dropping = NamespaceRecord {
+        state: NamespaceState::Dropping,
+        ..record
+    };
+    Ok(vec![
+        deployment_put(namespace_record_key(id), dropping.encode()),
+        Mutation::Delete {
+            partition: PartitionId::Deployment,
+            key: namespace_name_key(name),
+        },
+    ])
+}
+
+/// A token no other namespace creation draws, to tell this creation's
+/// record from another one of the same name: as unique as a
+/// [`deployment_candidate`], and as little secret.
+#[must_use]
+pub fn namespace_token() -> [u8; NAMESPACE_TOKEN_LEN] {
+    deployment_candidate().0
+}
+
+/// The id the deployment's catalog hands the next namespace: 1 before the
+/// first.
+///
+/// # Errors
+///
+/// The allocator record does not decode.
+pub fn namespace_allocator(engine: &Deployment) -> StorageResult<u64> {
+    match engine.system_get(Partition::Deployment, NAMESPACE_ALLOCATOR_KEY)? {
+        None => Ok(1),
+        Some(bytes) => <[u8; 8]>::try_from(bytes.as_ref())
+            .map(u64::from_be_bytes)
+            .map_err(|_| {
+                StorageError::Serialization("the namespace allocator does not decode".into())
+            }),
+    }
+}
+
+/// The live namespace called `name`, if one is.
+///
+/// # Errors
+///
+/// The name's entry does not decode.
+pub fn namespace_by_name(engine: &Deployment, name: &str) -> StorageResult<Option<NamespaceId>> {
+    match engine.system_get(Partition::Deployment, &namespace_name_key(name))? {
+        None => Ok(None),
+        Some(bytes) => <[u8; 8]>::try_from(bytes.as_ref())
+            .map(|raw| Some(NamespaceId::from_raw(u64::from_be_bytes(raw))))
+            .map_err(|_| {
+                StorageError::Serialization(format!(
+                    "the catalog entry of namespace {name:?} does not decode"
+                ))
+            }),
+    }
+}
+
+/// The catalog's record of namespace `id`, if it has one.
+///
+/// # Errors
+///
+/// The record does not decode.
+pub fn namespace_record(
+    engine: &Deployment,
+    id: NamespaceId,
+) -> StorageResult<Option<NamespaceRecord>> {
+    engine
+        .system_get(Partition::Deployment, &namespace_record_key(id))?
+        .map(|bytes| {
+            NamespaceRecord::decode(&bytes).ok_or_else(|| {
+                StorageError::Serialization(format!("the catalog record of {id} does not decode"))
+            })
+        })
+        .transpose()
+}
+
+/// Every namespace the catalog records, live or dropping, in id order.
+///
+/// # Errors
+///
+/// A record or its key does not decode.
+pub fn namespaces(engine: &Deployment) -> StorageResult<Vec<(NamespaceId, NamespaceRecord)>> {
+    let mut out = Vec::new();
+    for guard in engine.system_prefix_scan(Partition::Deployment, NAMESPACE_RECORD_PREFIX)? {
+        let (key, value) = guard.into_inner()?;
+        let malformed = || {
+            StorageError::Serialization("a namespace record of the catalog does not decode".into())
+        };
+        let id = decode_namespace_record_key(&key).ok_or_else(malformed)?;
+        out.push((id, NamespaceRecord::decode(&value).ok_or_else(malformed)?));
+    }
+    Ok(out)
 }
 
 /// The writes of a conditional registry write: `put`, when every record in

@@ -282,18 +282,6 @@ pub struct Deployment {
     /// without that, follower reads pin a stale snapshot and observe
     /// none of the replicated data.
     oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
-    /// `STORAGE COLUMNAR` table trees, keyed by table id. Each columnar table
-    /// owns one columnar-mode tree (the whole-tree columnar layout cannot share
-    /// the row-mode partition trees); see [`crate::columnar`]. Shares this
-    /// engine's seqno generator and block cache. Re-opened from disk at engine
-    /// open so a restart recovers the tables.
-    #[cfg(feature = "columnar")]
-    columnar_tables: Arc<crate::columnar::ColumnarTableRegistry>,
-    /// The columnar tables whose tree this open repaired by block salvage
-    /// and which still owe what it lost; a lossy one is rebuilt from a
-    /// checkpoint by the repair orchestrator, as a partition is.
-    #[cfg(feature = "columnar")]
-    table_repairs: parking_lot::Mutex<Vec<crate::columnar::TableRepair>>,
     /// Each live columnar table's write-pressure series; empty in a build
     /// without columnar support.
     table_metrics: Arc<crate::engine::owned_metrics::TableMetrics>,
@@ -435,6 +423,11 @@ pub struct Deployment {
     /// a [`StorageEngine`] bound to one of its namespaces holds.
     // no-std: once_cell::race::OnceBox
     me: std::sync::OnceLock<std::sync::Weak<Deployment>>,
+    /// What opening a namespace's set takes, for one created after the open.
+    opener: namespace_open::TreeOpener,
+    /// Held while a namespace's set is opened, so two first uses of one
+    /// namespace open its trees once.
+    namespace_opening: parking_lot::Mutex<()>,
     /// The holds on the data directories. Last, so they are released only
     /// once every tree above is closed.
     _directory_locks: crate::format::DirectoryLocks,
@@ -721,6 +714,18 @@ impl StorageEngine {
         &self.set
     }
 
+    /// The address of the tree of `part` this engine reaches: the
+    /// namespace's, or the system set's for a partition only the deployment
+    /// holds.
+    #[must_use]
+    pub fn tree_id(&self, part: Partition) -> TreeId {
+        if part.is_deployment() {
+            TreeId::system(part)
+        } else {
+            TreeId::namespace(self.namespace, part)
+        }
+    }
+
     /// [`Deployment::commit_local`] of records of this namespace's trees
     /// beside the deployment's own.
     ///
@@ -732,73 +737,67 @@ impl StorageEngine {
             .commit_local_in(Some(self.namespace), writes, sync)
     }
 
-    /// Open the store at `config` as a store of one namespace and bind it.
+    /// Open the store at `config` as a store of one namespace: the host's
+    /// choice of its own store, which initializes a fresh one with its one
+    /// namespace ([`Deployment::single_store`]).
     ///
     /// # Errors
     ///
-    /// As [`Deployment::open`].
+    /// As [`Deployment::open`] and [`Deployment::single_store`].
     pub fn open(config: &StorageConfig) -> StorageResult<Self> {
-        Self::bind(Deployment::open(config)?, STORE_NAMESPACE)
+        Deployment::open(config)?.single_store()
     }
 
-    /// [`Deployment::open_with_oracle`], bound as [`Self::open`] binds.
+    /// [`Deployment::open_with_oracle`], as a store of one namespace.
     ///
     /// # Errors
     ///
-    /// As [`Deployment::open_with_oracle`].
+    /// As [`Deployment::open_with_oracle`] and [`Deployment::single_store`].
     pub fn open_with_oracle(
         config: &StorageConfig,
         oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
     ) -> StorageResult<Self> {
-        Self::bind(
-            Deployment::open_with_oracle(config, oracle)?,
-            STORE_NAMESPACE,
-        )
+        Deployment::open_with_oracle(config, oracle)?.single_store()
     }
 
-    /// [`Deployment::open_embedded`], bound as [`Self::open`] binds.
+    /// [`Deployment::open_embedded`], as a store of one namespace.
     ///
     /// # Errors
     ///
-    /// As [`Deployment::open_embedded`].
+    /// As [`Deployment::open_embedded`] and [`Deployment::single_store`].
     pub fn open_embedded(
         config: &StorageConfig,
         oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
     ) -> StorageResult<Self> {
-        Self::bind(Deployment::open_embedded(config, oracle)?, STORE_NAMESPACE)
+        Deployment::open_embedded(config, oracle)?.single_store()
     }
 
-    /// [`Deployment::open_embedded_with_journal`], bound as [`Self::open`]
-    /// binds.
+    /// [`Deployment::open_embedded_with_journal`], as a store of one
+    /// namespace.
     ///
     /// # Errors
     ///
-    /// As [`Deployment::open_embedded_with_journal`].
+    /// As [`Deployment::open_embedded_with_journal`] and
+    /// [`Deployment::single_store`].
     pub fn open_embedded_with_journal(
         config: &StorageConfig,
         oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
         journal: OplogJournalConfig,
     ) -> StorageResult<Self> {
-        Self::bind(
-            Deployment::open_embedded_with_journal(config, oracle, journal)?,
-            STORE_NAMESPACE,
-        )
+        Deployment::open_embedded_with_journal(config, oracle, journal)?.single_store()
     }
 
-    /// [`Deployment::open_restoring`], bound as [`Self::open`] binds.
+    /// [`Deployment::open_restoring`], as a store of one namespace.
     ///
     /// # Errors
     ///
-    /// As [`Deployment::open_restoring`].
+    /// As [`Deployment::open_restoring`] and [`Deployment::single_store`].
     pub fn open_restoring(
         config: &StorageConfig,
         oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
         claim: crate::format::RestoreClaim,
     ) -> StorageResult<Self> {
-        Self::bind(
-            Deployment::open_restoring(config, oracle, claim)?,
-            STORE_NAMESPACE,
-        )
+        Deployment::open_restoring(config, oracle, claim)?.single_store()
     }
 }
 
@@ -1229,11 +1228,10 @@ impl Deployment {
             }
         }
 
-        // Pass 2: load/initialise routing for each other partition, then
-        // open it with `level_routes` wired. The node partition's routing
-        // also places the columnar tables' levels.
-        #[cfg(feature = "columnar")]
-        let mut node_routing = None;
+        // Pass 2: load/initialise routing for each other partition. The
+        // deployment's other trees open here with `level_routes` wired; a
+        // namespace's take the same routing when its set opens. The node
+        // partition's routing also places the columnar tables' levels.
         // Where each partition's flushes land: the endpoint of its level 0.
         // The Schema trees stay on the primary endpoint.
         let mut flush_landing: HashMap<Partition, std::path::PathBuf> = HashMap::new();
@@ -1243,6 +1241,7 @@ impl Deployment {
         // Intents live as files of the data directory itself: a store whose
         // directory is not one on disk (a memory filesystem) keeps none.
         let durable_intents = config.data_dir().is_dir();
+        let mut data_routing: HashMap<Partition, PartitionRouting> = HashMap::new();
         for &part in Partition::all() {
             if part == Partition::Deployment {
                 continue;
@@ -1267,8 +1266,18 @@ impl Deployment {
             {
                 flush_landing.insert(part, endpoint.path.clone());
             }
+            if !part.is_deployment() {
+                if let Some(routing) = routing {
+                    data_routing.insert(part, routing);
+                }
+                continue;
+            }
             let tree_config = config
-                .to_tree_config_with_routing(store_tree(part), Arc::clone(&seqno), routing.as_ref())
+                .to_tree_config_with_routing(
+                    TreeId::system(part),
+                    Arc::clone(&seqno),
+                    routing.as_ref(),
+                )
                 .use_cache(Arc::clone(&cache))
                 .write_buffer_budget(Arc::clone(&write_buffer))
                 .compaction_rate_limiter(Arc::clone(&maintenance))
@@ -1289,10 +1298,42 @@ impl Deployment {
                 });
             }
             trees.insert(part, tree);
-            #[cfg(feature = "columnar")]
-            if part == Partition::Node {
-                node_routing = routing;
+        }
+        // Each live columnar table's write-pressure series, of every
+        // namespace.
+        let table_metrics = Arc::new(crate::engine::owned_metrics::TableMetrics::default());
+        let opener = namespace_open::TreeOpener {
+            config: config.clone(),
+            seqno: Arc::clone(&seqno),
+            cache: Arc::clone(&cache),
+            write_buffer: Arc::clone(&write_buffer),
+            maintenance: Arc::clone(&maintenance),
+            capacity: Arc::clone(&capacity_pool),
+            repair_policy,
+            routing: data_routing,
+            table_metrics: Arc::clone(&table_metrics),
+        };
+        // Every namespace the catalog holds live, and every one whose trees
+        // lie on disk, opens with the store: the journal's replay and the
+        // proof of what the trees cover below reach any of them, also while
+        // the catalog itself is owed a rebuild.
+        let mut namespace_sets: std::collections::BTreeMap<NamespaceId, SetTrees> =
+            std::collections::BTreeMap::new();
+        let mut to_open = namespace_open::namespaces_on_disk(&config.endpoints);
+        for (id, record) in namespace_open::catalog_at(&deployment_tree, seqno.get())? {
+            if record.state == coordinode_core::namespace::NamespaceState::Live {
+                to_open.insert(id);
+            } else {
+                // What a dropped namespace's removal left, a crash or an open
+                // file in its way, goes now: nothing reads it again.
+                to_open.remove(&id);
+                remove_namespace_dirs(&namespace_dirs(&config.endpoints, id), &footprints);
             }
+        }
+        for id in to_open {
+            let (set, repairs) = opener.open_namespace(id)?;
+            open_repairs.extend(repairs);
+            namespace_sets.insert(id, set);
         }
 
         // Registrations a consumer registry recorded in an earlier run hold
@@ -1317,16 +1358,6 @@ impl Deployment {
         if protections_pending {
             gc_controller.set_external_floor(0);
         }
-
-        // The index tree's installations are known before anything reads or
-        // replays into it: a generation key means nothing without them.
-        let installations = crate::engine::installation::Installations::load(
-            trees
-                .get(&Partition::Idx)
-                .ok_or_else(|| StorageError::PartitionNotFound {
-                    name: Partition::Idx.name().to_string(),
-                })?,
-        )?;
 
         // ── Embedded oplog journal: open + crash recovery ────────────────────
         // Oracle-backed standalone engines journal every proposal to a RETAINED
@@ -1372,32 +1403,25 @@ impl Deployment {
                     // A rebuild owed already keeps its intent as it is: the
                     // Schema tree's holds the records the rebuild puts back.
                     let owed = read_rebuild_intents(config.data_dir())?.partitions;
-                    let mut covered: HashMap<Partition, TreeCoverage> =
-                        HashMap::with_capacity(trees.len());
+                    let mut covered: HashMap<TreeId, TreeCoverage> = HashMap::new();
                     for (&part, tree) in &trees {
-                        match TreeCoverage::read(tree, Domain::Journal) {
-                            Ok(record) => {
-                                covered.insert(part, record);
-                            }
-                            // A tree whose record is damaged no longer says
-                            // what it holds: like a rebuild cut short, it is
-                            // left out of the replay below and rebuilt by the
-                            // repair that follows the open.
-                            Err(e) if e.is_data_damage() => {
-                                tracing::warn!(
-                                    partition = part.name(),
-                                    error = %e,
-                                    "a partition's journal coverage record is damaged; the \
-                                     partition is rebuilt from the latest checkpoint"
-                                );
-                                if !owed.contains(&part) {
-                                    write_rebuild_intent(
-                                        config.data_dir(),
-                                        RebuildTarget::Partition(part),
-                                    )?;
-                                }
-                            }
-                            Err(e) => return Err(e),
+                        note_journal_coverage(
+                            TreeId::system(part),
+                            tree,
+                            &owed,
+                            config.data_dir(),
+                            &mut covered,
+                        )?;
+                    }
+                    for set in namespace_sets.values() {
+                        for (id, tree) in set.iter() {
+                            note_journal_coverage(
+                                id,
+                                tree,
+                                &owed,
+                                config.data_dir(),
+                                &mut covered,
+                            )?;
                         }
                     }
                     // A tree without a coverage record is replayed every entry
@@ -1423,7 +1447,7 @@ impl Deployment {
                         &entries,
                         journal.next_index(),
                         &covered,
-                        |part, _| rebuilding.contains(&part),
+                        |id: TreeId, _| rebuilding.contains(&id.part),
                     ) {
                         return Err(StorageError::CoverageUnprovable {
                             path: dir.display().to_string(),
@@ -1461,14 +1485,45 @@ impl Deployment {
                     }
                     let mut replayed = 0usize;
                     for entry in &entries {
-                        // Group the entry's data ops per partition so each
-                        // partition receives them as one batch at the entry's
-                        // ts, with the entry's marker last. DERIVED work is
-                        // derived first, from the whole entry: the data
-                        // partition it reads may already hold the entry.
+                        // Group the entry's data ops per tree so each tree
+                        // receives them as one batch at the entry's ts, with
+                        // the entry's marker last. DERIVED work is derived
+                        // first, from the whole entry: the data partition it
+                        // reads may already hold the entry.
                         let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
-                        let mut per_partition: HashMap<Partition, Vec<&OplogOp>> = HashMap::new();
+                        let mut per_tree: HashMap<TreeId, Vec<&OplogOp>> = HashMap::new();
+                        // The namespace the rows after the last marker belong
+                        // to; `Some(None)` for one no longer live, whose rows
+                        // are left out as its apply leaves them out.
+                        let mut namespace: Option<Option<NamespaceId>> = None;
                         for op in ops.iter() {
+                            if let OplogOp::Namespace { id } = op {
+                                let id = NamespaceId::from_raw(*id);
+                                // A namespace an earlier entry created opens
+                                // now: its record is replayed by then.
+                                if !namespace_sets.contains_key(&id)
+                                    && namespace_open::live_at(
+                                        &deployment_tree,
+                                        id,
+                                        lsm_tree::SeqNo::MAX,
+                                    )?
+                                {
+                                    let (set, repairs) = opener.open_namespace(id)?;
+                                    open_repairs.extend(repairs);
+                                    for (tree_id, tree) in set.iter() {
+                                        note_journal_coverage(
+                                            tree_id,
+                                            tree,
+                                            &owed,
+                                            config.data_dir(),
+                                            &mut covered,
+                                        )?;
+                                    }
+                                    namespace_sets.insert(id, set);
+                                }
+                                namespace = Some(namespace_sets.contains_key(&id).then_some(id));
+                                continue;
+                            }
                             #[cfg(feature = "columnar")]
                             if let OplogOp::ColumnarInsert {
                                 table_id,
@@ -1476,34 +1531,63 @@ impl Deployment {
                                 value,
                             } = op
                             {
-                                columnar_replay.push(ColumnarReplay {
-                                    table_id: table_id.clone(),
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    ts: entry.ts,
-                                    index: entry.index,
-                                });
+                                // A row of a namespace dropped since is not
+                                // kept, as its apply would not keep it.
+                                if let Some(Some(namespace)) = namespace {
+                                    columnar_replay.push(ColumnarReplay {
+                                        namespace,
+                                        table_id: table_id.clone(),
+                                        key: key.clone(),
+                                        value: value.clone(),
+                                        ts: entry.ts,
+                                        index: entry.index,
+                                    });
+                                }
                                 continue;
                             }
                             let Some(part) = op_partition(op) else {
                                 continue;
                             };
-                            per_partition.entry(part).or_default().push(op);
-                        }
-                        for (&part, ops) in &per_partition {
-                            let tree = trees.get(&part).ok_or_else(|| {
-                                StorageError::PartitionNotFound {
-                                    name: part.name().to_string(),
+                            let id = if part.is_deployment() {
+                                TreeId::system(part)
+                            } else {
+                                match namespace {
+                                    Some(Some(ns)) => TreeId::namespace(ns, part),
+                                    // A namespace dropped since: nothing of
+                                    // it is kept.
+                                    Some(None) => continue,
+                                    None => {
+                                        return Err(StorageError::Io(format!(
+                                            "journal entry {} writes the {} partition \
+                                             without naming its namespace",
+                                            entry.index,
+                                            part.name()
+                                        )));
+                                    }
                                 }
+                            };
+                            per_tree.entry(id).or_default().push(op);
+                        }
+                        for (id, ops) in &per_tree {
+                            let (tree, installations) = match id.scope {
+                                Scope::System => (trees.get(&id.part), None),
+                                Scope::Namespace(ns) => {
+                                    let set = namespace_sets.get(&ns);
+                                    (
+                                        set.and_then(|set| set.get(id.part)),
+                                        set.and_then(|set| set.installations_of(id.part)),
+                                    )
+                                }
+                            };
+                            let tree = tree.ok_or_else(|| StorageError::PartitionNotFound {
+                                name: id.name(),
                             })?;
-                            let skip = rebuilding.contains(&part)
-                                || covered
-                                    .get(&part)
-                                    .is_some_and(|c| c.contains(entry.index, 0));
+                            let skip = rebuilding.contains(&id.part)
+                                || covered.get(id).is_some_and(|c| c.contains(entry.index, 0));
                             if !skip {
                                 apply_oplog_ops_at(
                                     tree,
-                                    (part == Partition::Idx).then_some(&installations),
+                                    installations,
                                     ops,
                                     entry.ts,
                                     entry.index,
@@ -1548,11 +1632,19 @@ impl Deployment {
             Ok(endpoint) => {
                 let dir = crate::engine::local_journal::LocalJournal::dir(&endpoint.path);
                 if oplog.is_none() || dir.exists() {
+                    // The local records' trees: the deployment's, and those
+                    // of the one namespace a store of one namespace holds.
+                    let mut local_trees = trees.clone();
+                    let mut local_installations = None;
+                    if let [set] = namespace_sets.values().collect::<Vec<_>>()[..] {
+                        local_trees.extend(set.iter().map(|(id, tree)| (id.part, tree.clone())));
+                        local_installations = set.installations();
+                    }
                     Some(crate::engine::local_journal::LocalJournal::open(
                         &dir,
                         &OplogJournalConfig::from(config),
-                        &trees,
-                        &installations,
+                        &local_trees,
+                        local_installations,
                         footprints.clone(),
                     )?)
                 } else {
@@ -1563,12 +1655,19 @@ impl Deployment {
             // from; they live in its trees alone.
             Err(_) => None,
         };
+        // Every tree the open holds, for what is read of all of them alike.
+        let every_tree = || {
+            trees.values().chain(
+                namespace_sets
+                    .values()
+                    .flat_map(|set| set.iter().map(|(_, tree)| tree)),
+            )
+        };
 
         // Restore seqno counter to (max_persisted_seqno + 1) so reads see all
         // data written in a previous session. seqno_filter uses strict <, so
         // `get()` must be > the highest written seqno for those writes to be visible.
-        let max_persisted = trees
-            .values()
+        let max_persisted = every_tree()
             .filter_map(|t| {
                 use lsm_tree::AbstractTree;
                 t.get_highest_seqno()
@@ -1585,8 +1684,7 @@ impl Deployment {
         // (`lsm_tree::Error::SnapshotBelowRetention`), so a counter seeded only
         // from the data would reopen the engine unable to read itself. Seed
         // above the floor as well.
-        let max_floor = trees
-            .values()
+        let max_floor = every_tree()
             .map(|t| {
                 use lsm_tree::AbstractTree;
                 t.retention_floor()
@@ -1605,8 +1703,21 @@ impl Deployment {
         // A replacement cut short before its contents were complete is
         // dropped, and a retired copy still holding entries is cleared, at
         // seqnos above everything the store holds.
-        if let Some(idx) = trees.get(&Partition::Idx) {
-            installations.settle(idx, seqno.next())?;
+        for set in namespace_sets.values() {
+            if let (Some(idx), Some(installations)) = (set.get(Partition::Idx), set.installations())
+            {
+                installations.settle(idx, seqno.next())?;
+            }
+        }
+        // A namespace the catalog marks dropping once its records are whole
+        // (a drop the replay brought back) is not served: its set closes and
+        // its trees go.
+        for (id, record) in namespace_open::catalog_at(&deployment_tree, lsm_tree::SeqNo::MAX)? {
+            if record.state != coordinode_core::namespace::NamespaceState::Live
+                && namespace_sets.remove(&id).is_some()
+            {
+                remove_namespace_dirs(&namespace_dirs(&config.endpoints, id), &footprints);
+            }
         }
 
         // No coverage base is written at open, and nothing is flushed for one:
@@ -1684,66 +1795,15 @@ impl Deployment {
         // flush monitor, which writes and finished flushes wake.
         let memtable_pressure = Arc::new(AtomicU8::new(0));
 
-        // Per-table columnar trees live under `<primary endpoint>/tables`,
-        // sharing this engine's seqno generator, block cache, maintenance
-        // budget and write buffer; re-opens any table tree already on disk.
-        // Opened before the flush manager, which flushes them with the
-        // partition trees.
-        let table_metrics = Arc::new(crate::engine::owned_metrics::TableMetrics::default());
-        #[cfg(feature = "columnar")]
-        let (columnar_tables, table_repairs) = {
-            // Use the engine's configured filesystem backend (MemFs for
-            // in-memory engines) so columnar table trees never touch the host
-            // filesystem when the engine is virtual.
-            let fs: Arc<dyn lsm_tree::fs::Fs> = config
-                .fs
-                .clone()
-                .unwrap_or_else(|| Arc::new(lsm_tree::fs::StdFs));
-            let tree_config = {
-                let config = config.clone();
-                let seqno = Arc::clone(&seqno);
-                move |table_id: &str| {
-                    config.to_table_tree_config(
-                        STORE_NAMESPACE,
-                        table_id,
-                        Arc::clone(&seqno),
-                        node_routing.as_ref(),
-                    )
-                }
-            };
-            let (registry, repairs) = crate::columnar::ColumnarTableRegistry::open(
-                fs,
-                crate::columnar::TableTreeSettings {
-                    config: Box::new(tree_config),
-                    roots: config
-                        .endpoints
-                        .iter()
-                        .map(|endpoint| {
-                            endpoint
-                                .path
-                                .join(Scope::Namespace(STORE_NAMESPACE).dir())
-                                .join(crate::columnar::TABLES_DIR)
-                        })
-                        .collect(),
-                    cache: Arc::clone(&cache),
-                    maintenance: Arc::clone(&maintenance),
-                    write_buffer: Arc::clone(&write_buffer),
-                    capacity: Arc::clone(&capacity_pool),
-                    column_encoding: crate::columnar::TableTreeSettings::column_encoding_from(
-                        config.columnar_encoded_from_level,
-                    ),
-                    backpressure: config.backpressure.to_thresholds(),
-                    metrics: Arc::clone(&table_metrics),
-                },
-            )?;
-            (Arc::new(registry), repairs)
-        };
-        // The columnar tables, listed afresh on each pass of the flush and
-        // compaction monitors.
+        // From here on the trees are found by set: the background services
+        // list them afresh on every pass.
+        let sets = open_sets_of(&trees, namespace_sets);
+        // Every namespace's columnar tables, listed afresh on each pass of
+        // the flush and compaction monitors.
         #[cfg(feature = "columnar")]
         let table_source = || -> Option<crate::engine::flush::TableSource> {
-            let tables = Arc::clone(&columnar_tables);
-            Some(Box::new(move || tables.trees()))
+            let sets = Arc::clone(&sets);
+            Some(Box::new(move || sets.table_trees()))
         };
         #[cfg(not(feature = "columnar"))]
         let table_source = || -> Option<crate::engine::flush::TableSource> { None };
@@ -1751,10 +1811,6 @@ impl Deployment {
         let _ = &capacity_pool;
         let flushed_tables = table_source();
         let table_landed = Arc::new(coordinode_core::txn::wake::Wake::default());
-
-        // From here on the trees are found by set: the background services
-        // list them afresh on every pass.
-        let sets = open_sets_of(&trees, installations);
         let flush_manager = FlushManager::start(
             Arc::clone(&sets),
             gc_controller.watermarks(),
@@ -1885,29 +1941,44 @@ impl Deployment {
         #[cfg(feature = "columnar")]
         {
             use lsm_tree::AbstractTree;
-            if let Some(max) = columnar_tables.max_highest_seqno() {
-                seqno.fetch_max(max + 1);
+            let registries: HashMap<NamespaceId, Arc<crate::columnar::ColumnarTableRegistry>> =
+                sets.namespace_sets()
+                    .iter()
+                    .filter_map(|set| match (set.scope(), set.columnar()) {
+                        (Scope::Namespace(ns), Some(registry)) => Some((ns, Arc::clone(registry))),
+                        _ => None,
+                    })
+                    .collect();
+            for registry in registries.values() {
+                if let Some(max) = registry.max_highest_seqno() {
+                    seqno.fetch_max(max + 1);
+                }
             }
             // Each table's own coverage record decides, like a partition's. A
             // table that is gone was dropped: its rows are not brought back,
             // and a table created later under the same name starts its record
             // past every entry journalled before it (`open_columnar_table`).
-            let mut covered: HashMap<String, TreeCoverage> = HashMap::new();
+            let mut covered: HashMap<(NamespaceId, String), TreeCoverage> = HashMap::new();
             if let Some(coverage) = &coverage {
-                for table_id in columnar_tables.table_ids() {
-                    if let Some(tree) = columnar_tables.get(&table_id) {
-                        let c = TreeCoverage::read(&tree, Domain::Journal)?;
-                        // Markers already on disk are folded by the next fold.
-                        for index in c.marked_indices() {
-                            coverage.note_table_marker(&table_id, index);
+                for (&ns, registry) in &registries {
+                    for table_id in registry.table_ids() {
+                        if let Some(tree) = registry.get(&table_id) {
+                            let c = TreeCoverage::read(&tree, Domain::Journal)?;
+                            // Markers already on disk are folded by the next
+                            // fold.
+                            for index in c.marked_indices() {
+                                coverage.note_table_marker(ns, &table_id, index);
+                            }
+                            covered.insert((ns, table_id), c);
                         }
-                        covered.insert(table_id, c);
                     }
                 }
             }
-            let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut touched: std::collections::HashSet<(NamespaceId, String)> =
+                std::collections::HashSet::new();
             let mut replayed = 0usize;
             for ColumnarReplay {
+                namespace,
                 table_id,
                 key,
                 value,
@@ -1915,22 +1986,27 @@ impl Deployment {
                 index,
             } in columnar_replay
             {
-                let (Some(tree), Some(c)) =
-                    (columnar_tables.get(&table_id), covered.get(&table_id))
-                else {
+                let Some(registry) = registries.get(&namespace) else {
+                    continue;
+                };
+                let table = (namespace, table_id);
+                let (Some(tree), Some(c)) = (registry.get(&table.1), covered.get(&table)) else {
                     continue;
                 };
                 if !c.contains(index, 0) {
                     apply_columnar_row(&tree, key, value, ts, Some(index))?;
                     if let Some(coverage) = &coverage {
-                        coverage.note_table_marker(&table_id, index);
+                        coverage.note_table_marker(namespace, &table.1, index);
                     }
-                    touched.insert(table_id);
+                    touched.insert(table);
                     replayed += 1;
                 }
             }
-            for table_id in &touched {
-                if let Some(tree) = columnar_tables.get(table_id) {
+            for (namespace, table_id) in &touched {
+                if let Some(tree) = registries
+                    .get(namespace)
+                    .and_then(|registry| registry.get(table_id))
+                {
                     tree.flush_active_memtable(0)?;
                     tree.persist_flushes()?;
                 }
@@ -2023,10 +2099,6 @@ impl Deployment {
             memtable_flushes: AtomicU64::new(0),
             coverage,
             oracle,
-            #[cfg(feature = "columnar")]
-            columnar_tables,
-            #[cfg(feature = "columnar")]
-            table_repairs: parking_lot::Mutex::new(table_repairs),
             table_metrics,
             node_counts,
             open_repairs,
@@ -2076,6 +2148,8 @@ impl Deployment {
             journal_holds: Default::default(),
             group_history,
             me: std::sync::OnceLock::new(),
+            opener,
+            namespace_opening: parking_lot::Mutex::new(()),
             _directory_locks: directory_locks,
         };
         engine.drain_local_journal()?;
@@ -2088,16 +2162,16 @@ impl Deployment {
             }
         }
         #[cfg(feature = "columnar")]
-        {
-            let settled: Vec<String> = engine
-                .table_repairs
+        for set in engine.coordinator.sets().namespace_sets() {
+            let settled: Vec<String> = set
+                .table_repairs()
                 .lock()
                 .iter()
                 .filter(|repair| !repair.is_lossy())
                 .map(|repair| repair.table.clone())
                 .collect();
             for table in settled {
-                engine.acknowledge_table_repair(&table)?;
+                acknowledge_table_repair(&set, &table)?;
             }
         }
         Ok(engine.shared())
@@ -2116,42 +2190,6 @@ impl Deployment {
     #[must_use]
     pub fn node_counts(&self) -> &crate::engine::owned_metrics::NodeCounts {
         &self.node_counts
-    }
-
-    /// The columnar tables whose tree an open repaired with loss and which
-    /// still owe a rebuild from a checkpoint plus the journal, by id. Empty
-    /// in a build without columnar support.
-    #[must_use]
-    pub fn lossy_table_repairs(&self) -> Vec<String> {
-        #[cfg(feature = "columnar")]
-        {
-            self.table_repairs
-                .lock()
-                .iter()
-                .map(|repair| repair.table.clone())
-                .collect()
-        }
-        #[cfg(not(feature = "columnar"))]
-        Vec::new()
-    }
-
-    /// Let `table`'s tree stop owing the report of the repair an open ran on
-    /// it, once what it lost is restored. `false` when none is owed.
-    #[cfg(feature = "columnar")]
-    fn acknowledge_table_repair(&self, table: &str) -> StorageResult<bool> {
-        use lsm_tree::AbstractTree as _;
-        let mut repairs = self.table_repairs.lock();
-        let Some(at) = repairs.iter().position(|repair| repair.table == table) else {
-            return Ok(false);
-        };
-        let Some(tree) = self.columnar_tables.get(table) else {
-            // A table dropped since owes nothing.
-            repairs.remove(at);
-            return Ok(false);
-        };
-        let acknowledged = tree.acknowledge_repair_report(repairs[at].report.id)?;
-        repairs.remove(at);
-        Ok(acknowledged)
     }
 
     /// Let `partition`'s tree stop owing the report of the repair this open
@@ -2188,7 +2226,7 @@ impl Deployment {
         // synced first, so no table takes an entry it could still lose.
         local.sync()?;
         let at = self.next_seqno();
-        let store = self.namespace_set(STORE_NAMESPACE)?;
+        let store = self.local_record_set();
         local.compact(&self.coordinator.partition_trees(&store), at, |tree| {
             self.flush_memtables(tree)
         })?;
@@ -2377,22 +2415,6 @@ impl Deployment {
         WritePressure::from_u8(tables.max(memtables))
     }
 
-    /// The write-pressure verdict a write to `STORAGE COLUMNAR` table
-    /// `table_id` meets: the worse of the table's own (its L0 height and
-    /// compaction debt, latched by the compaction monitor) and the memtables'
-    /// shared one. The partitions' verdict does not hold the table's writes
-    /// back, nor does the table's hold theirs. `Stop` means its writes should
-    /// be rejected (retryable) until compaction or flushes drain.
-    #[cfg(feature = "columnar")]
-    #[must_use]
-    pub fn columnar_write_pressure(&self, table_id: &str) -> WritePressure {
-        let table = self.columnar_tables.pressure(table_id);
-        let memtables = self
-            .memtable_pressure
-            .load(std::sync::atomic::Ordering::Relaxed);
-        WritePressure::from_u8(table.max(memtables))
-    }
-
     /// Test-only override of the cached pressure tier (the production value
     /// is latched by the compaction monitor, which is timing-dependent).
     #[cfg(test)]
@@ -2413,6 +2435,60 @@ impl Deployment {
     #[must_use]
     pub fn open_repairs(&self) -> &[OpenRepair] {
         &self.open_repairs
+    }
+}
+
+impl StorageEngine {
+    /// The namespace's `STORAGE COLUMNAR` table registry.
+    #[cfg(feature = "columnar")]
+    fn columnar(&self) -> StorageResult<&Arc<crate::columnar::ColumnarTableRegistry>> {
+        self.set.columnar().ok_or_else(|| {
+            StorageError::InvalidConfig(format!("{} holds no table registry", self.namespace))
+        })
+    }
+
+    /// The write-pressure verdict a write to `STORAGE COLUMNAR` table
+    /// `table_id` meets: the worse of the table's own (its L0 height and
+    /// compaction debt, latched by the compaction monitor) and the memtables'
+    /// shared one. The partitions' verdict does not hold the table's writes
+    /// back, nor does the table's hold theirs. `Stop` means its writes should
+    /// be rejected (retryable) until compaction or flushes drain.
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub fn columnar_write_pressure(&self, table_id: &str) -> WritePressure {
+        let table = self
+            .set
+            .columnar()
+            .map_or(0, |registry| registry.pressure(table_id));
+        let memtables = self
+            .memtable_pressure
+            .load(std::sync::atomic::Ordering::Relaxed);
+        WritePressure::from_u8(table.max(memtables))
+    }
+
+    /// The columnar tables whose tree an open repaired with loss and which
+    /// still owe a rebuild from a checkpoint plus the journal, by id. Empty
+    /// in a build without columnar support.
+    #[must_use]
+    pub fn lossy_table_repairs(&self) -> Vec<String> {
+        #[cfg(feature = "columnar")]
+        {
+            self.set
+                .table_repairs()
+                .lock()
+                .iter()
+                .map(|repair| repair.table.clone())
+                .collect()
+        }
+        #[cfg(not(feature = "columnar"))]
+        Vec::new()
+    }
+
+    /// Let `table`'s tree stop owing the report of the repair an open ran on
+    /// it, once what it lost is restored. `false` when none is owed.
+    #[cfg(feature = "columnar")]
+    fn acknowledge_table_repair(&self, table: &str) -> StorageResult<bool> {
+        acknowledge_table_repair(&self.set, table)
     }
 
     /// Create (or open if it already exists) the columnar tree for a
@@ -2465,7 +2541,7 @@ impl Deployment {
     /// at the journal's next index, made durable before any row can reach it.
     #[cfg(feature = "columnar")]
     fn open_columnar_table(&self, table_id: &str) -> StorageResult<(lsm_tree::AnyTree, u8, u64)> {
-        self.columnar_tables.open_judged(
+        self.columnar()?.open_judged(
             table_id,
             || self.next_seqno(),
             |tree| {
@@ -2496,7 +2572,7 @@ impl Deployment {
     /// table is registered on this node.
     #[cfg(feature = "columnar")]
     pub fn columnar_table_tree(&self, table_id: &str) -> Option<lsm_tree::AnyTree> {
-        self.columnar_tables.get(table_id)
+        self.set.columnar()?.get(table_id)
     }
 
     /// Drop a `STORAGE COLUMNAR` table: release its tree handle and delete its
@@ -2524,7 +2600,7 @@ impl Deployment {
         table_id: &str,
         _held: &crate::engine::tree_set::TreeSetHold,
     ) -> StorageResult<()> {
-        self.columnar_tables.drop_table(table_id)?;
+        self.columnar()?.drop_table(table_id)?;
         #[cfg(any(test, feature = "test-faults"))]
         if let Some(hook) = self.on_table_dropped.lock().as_mut() {
             hook();
@@ -2601,11 +2677,11 @@ impl Deployment {
         value: Vec<u8>,
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
-        let (tree, table_tier, created_at) = self
-            .columnar_tables
-            .get_stamped(table_id)
-            .ok_or_else(|| StorageError::TableTreeMissing {
-                table: table_id.to_owned(),
+        let (tree, table_tier, created_at) =
+            self.columnar()?.get_stamped(table_id).ok_or_else(|| {
+                StorageError::TableTreeMissing {
+                    table: table_id.to_owned(),
+                }
             })?;
         if created_at > read_at && created_here != Some(created_at) {
             return Err(StorageError::TableCreatedSinceRead {
@@ -2650,7 +2726,7 @@ impl Deployment {
                 let mut guard = oplog
                     .lock()
                     .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
-                Some(guard.append_columnar(table_id, &key, &value, seqno)?)
+                Some(guard.append_columnar(self.namespace, table_id, &key, &value, seqno)?)
             }
             None => None,
         };
@@ -2660,7 +2736,7 @@ impl Deployment {
             .flush_trigger()
             .wrote(Partition::Node, added, memtable);
         if let (Some(index), Some(coverage)) = (index, &self.coverage) {
-            coverage.note_table_marker(table_id, index);
+            coverage.note_table_marker(self.namespace, table_id, index);
             self.note_applied(coverage, index);
         }
         #[cfg(any(test, feature = "test-faults"))]
@@ -2692,7 +2768,7 @@ impl Deployment {
     /// or its drop has taken it.
     #[cfg(feature = "columnar")]
     pub(crate) fn flush_columnar_table(&self, table_id: &str) -> StorageResult<()> {
-        self.columnar_tables
+        self.columnar()?
             .with_live(table_id, |tree| self.flush_memtables(tree))
             .unwrap_or(Ok(()))
     }
@@ -2712,7 +2788,7 @@ impl Deployment {
     ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
         use lsm_tree::table::columnar::{COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE};
 
-        let Some(tree) = self.columnar_tables.get(table_id) else {
+        let Some(tree) = self.columnar()?.get(table_id) else {
             return Ok(Vec::new());
         };
         // Tree-level projected columnar scan: segment selection, MVCC
@@ -2761,7 +2837,7 @@ impl Deployment {
     {
         use lsm_tree::table::columnar::{COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE};
 
-        let Some(tree) = self.columnar_tables.get(table_id) else {
+        let Some(tree) = self.columnar()?.get(table_id) else {
             return Ok(());
         };
         for batch in tree
@@ -2807,7 +2883,7 @@ impl Deployment {
         #[cfg(feature = "columnar")]
         {
             let mut tables = Vec::new();
-            for table_id in self.columnar_tables.table_ids() {
+            for table_id in self.columnar()?.table_ids() {
                 let rows = self.columnar_scan(&table_id, snapshot)?;
                 tables.push((table_id, rows));
             }
@@ -2818,51 +2894,6 @@ impl Deployment {
             let _ = snapshot;
             Ok(Vec::new())
         }
-    }
-
-    /// The budget background maintenance reads and writes under: every
-    /// tree's compactions and the scrub.
-    pub fn maintenance_budget(&self) -> &Arc<lsm_tree::rate_limiter::RateLimiter> {
-        &self.maintenance
-    }
-
-    /// Retune the maintenance budget to `bytes_per_sec` (`0`: unthrottled).
-    /// Work already waiting on it is held to the new rate at once.
-    pub fn set_maintenance_rate(&self, bytes_per_sec: u64) {
-        self.maintenance.set_rate(bytes_per_sec);
-    }
-
-    /// Back the maintenance budget off, down to 5% of its rate, while the
-    /// smoothed read latency of maintenance stays above `ceiling`; `None`
-    /// keeps the budget at its rate.
-    pub fn set_maintenance_backoff(&self, ceiling: Option<std::time::Duration>) {
-        self.maintenance
-            .set_latency_backoff(ceiling.map(lsm_tree::rate_limiter::LatencyBackoff::new));
-    }
-
-    /// Hold client writes to `bytes_per_sec` while a partition is past its
-    /// slowdown threshold (`0`: full speed until the stop threshold).
-    pub fn set_write_slowdown_rate(&self, bytes_per_sec: u64) {
-        self.write_slowdown.set_rate(bytes_per_sec);
-    }
-
-    /// How long a commit of `bytes` waits under slowdown: its turn at the
-    /// write rate, after every byte debited before it. Zero without a rate.
-    pub(crate) fn write_slowdown_delay(&self, bytes: u64) -> std::time::Duration {
-        if self.write_slowdown.rate() == 0 {
-            return std::time::Duration::ZERO;
-        }
-        self.write_slowdown.reserve(bytes)
-    }
-
-    /// Every `STORAGE COLUMNAR` table's tree with its id, in id order.
-    #[cfg(feature = "columnar")]
-    pub(crate) fn columnar_table_trees(&self) -> Vec<(String, lsm_tree::AnyTree)> {
-        self.columnar_tables
-            .table_ids()
-            .into_iter()
-            .filter_map(|id| self.columnar_tables.get(&id).map(|tree| (id, tree)))
-            .collect()
     }
 
     /// Make the `STORAGE COLUMNAR` tables exactly `tables`: a table not
@@ -2878,15 +2909,16 @@ impl Deployment {
     pub fn replace_columnar_tables(&self, tables: Vec<ColumnarTable>) -> StorageResult<()> {
         #[cfg(feature = "columnar")]
         {
+            let registry = self.columnar()?;
             let keep: std::collections::HashSet<&str> =
                 tables.iter().map(|(id, _)| id.as_str()).collect();
-            for table_id in self.columnar_tables.table_ids() {
+            for table_id in registry.table_ids() {
                 if !keep.contains(table_id.as_str()) {
-                    self.columnar_tables.drop_table(&table_id)?;
+                    registry.drop_table(&table_id)?;
                 }
             }
             for (table_id, rows) in &tables {
-                self.columnar_tables.drop_table(table_id)?;
+                registry.drop_table(table_id)?;
                 let (tree, _, _) = self.open_columnar_table(table_id)?;
                 if !rows.is_empty() {
                     let rows: Vec<crate::columnar::ColumnarRow<'_>> = rows
@@ -2920,8 +2952,11 @@ impl Deployment {
     /// Returns [`StorageError::Engine`] if a tree cannot be dropped.
     pub fn clear_columnar_tables(&self) -> StorageResult<()> {
         #[cfg(feature = "columnar")]
-        for table_id in self.columnar_tables.table_ids() {
-            self.columnar_tables.drop_table(&table_id)?;
+        {
+            let registry = self.columnar()?;
+            for table_id in registry.table_ids() {
+                registry.drop_table(&table_id)?;
+            }
         }
         Ok(())
     }
@@ -2938,7 +2973,7 @@ impl Deployment {
     pub fn reset_columnar_table(&self, table_id: &str) -> StorageResult<()> {
         #[cfg(feature = "columnar")]
         {
-            self.columnar_tables.drop_table(table_id)?;
+            self.columnar()?.drop_table(table_id)?;
             self.open_columnar_table(table_id).map(drop)
         }
         #[cfg(not(feature = "columnar"))]
@@ -2981,6 +3016,43 @@ impl Deployment {
             )))
         }
     }
+}
+
+impl Deployment {
+    /// The budget background maintenance reads and writes under: every
+    /// tree's compactions and the scrub.
+    pub fn maintenance_budget(&self) -> &Arc<lsm_tree::rate_limiter::RateLimiter> {
+        &self.maintenance
+    }
+
+    /// Retune the maintenance budget to `bytes_per_sec` (`0`: unthrottled).
+    /// Work already waiting on it is held to the new rate at once.
+    pub fn set_maintenance_rate(&self, bytes_per_sec: u64) {
+        self.maintenance.set_rate(bytes_per_sec);
+    }
+
+    /// Back the maintenance budget off, down to 5% of its rate, while the
+    /// smoothed read latency of maintenance stays above `ceiling`; `None`
+    /// keeps the budget at its rate.
+    pub fn set_maintenance_backoff(&self, ceiling: Option<std::time::Duration>) {
+        self.maintenance
+            .set_latency_backoff(ceiling.map(lsm_tree::rate_limiter::LatencyBackoff::new));
+    }
+
+    /// Hold client writes to `bytes_per_sec` while a partition is past its
+    /// slowdown threshold (`0`: full speed until the stop threshold).
+    pub fn set_write_slowdown_rate(&self, bytes_per_sec: u64) {
+        self.write_slowdown.set_rate(bytes_per_sec);
+    }
+
+    /// How long a commit of `bytes` waits under slowdown: its turn at the
+    /// write rate, after every byte debited before it. Zero without a rate.
+    pub(crate) fn write_slowdown_delay(&self, bytes: u64) -> std::time::Duration {
+        if self.write_slowdown.rate() == 0 {
+            return std::time::Duration::ZERO;
+        }
+        self.write_slowdown.reserve(bytes)
+    }
 
     /// The timestamp oracle this engine stamps writes with, when opened
     /// via [`StorageEngine::open_with_oracle`]. Subsystems that apply
@@ -3012,16 +3084,48 @@ impl Deployment {
             .ok_or_else(|| StorageError::PartitionNotFound { name: id.name() })
     }
 
-    /// Namespace `namespace`'s set of trees.
+    /// Namespace `namespace`'s set of trees, opened now when the catalog
+    /// holds the namespace live and its set is not open yet.
     ///
     /// # Errors
     ///
-    /// [`StorageError::UnknownNamespace`] when its set is not open here.
+    /// [`StorageError::UnknownNamespace`] when the catalog holds no live
+    /// namespace of that id; its trees cannot be opened.
     pub(crate) fn namespace_set(&self, namespace: NamespaceId) -> StorageResult<Arc<SetTrees>> {
-        self.coordinator
-            .sets()
-            .namespace(namespace)
-            .ok_or(StorageError::UnknownNamespace { namespace })
+        if let Some(set) = self.coordinator.sets().namespace(namespace) {
+            return Ok(set);
+        }
+        let _opening = self.namespace_opening.lock();
+        if let Some(set) = self.coordinator.sets().namespace(namespace) {
+            return Ok(set);
+        }
+        if !namespace_open::live_at(
+            self.system_tree(Partition::Deployment)?,
+            namespace,
+            lsm_tree::SeqNo::MAX,
+        )? {
+            return Err(StorageError::UnknownNamespace { namespace });
+        }
+        let (set, repairs) = self.opener.open_namespace(namespace)?;
+        for repair in repairs {
+            // A namespace that opens after the store is one created since:
+            // a repair of its trees has nothing earlier to lose.
+            tracing::warn!(
+                %namespace,
+                partition = repair.partition.name(),
+                lossy = repair.is_lossy(),
+                "a namespace's tree opened after the store was repaired"
+            );
+        }
+        if let (Some(idx), Some(installations)) = (set.get(Partition::Idx), set.installations()) {
+            installations.settle(idx, self.next_seqno())?;
+        }
+        let set = Arc::new(set);
+        self.coordinator.sets().insert(Arc::clone(&set));
+        // Brought up to the clock the settle moved, the window held all
+        // along, as the store's own open does.
+        self.coordinator.advance_gc_watermark();
+        Ok(set)
     }
 }
 
@@ -3774,8 +3878,16 @@ impl StorageEngine {
             return Ok(Rebuild::Refused(RebuildRefusal::NoJournal));
         };
 
-        // 1. Prove the state before touching the live partition.
-        let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
+        // 1. Prove the state before touching the live partition, against the
+        //    checkpoint's copy of this namespace's tree.
+        let ckpt = Deployment::open_checkpoint(checkpoint_dir)?;
+        let ckpt = match ckpt.engine(self.namespace) {
+            Ok(ckpt) => ckpt,
+            Err(StorageError::UnknownNamespace { .. }) => {
+                return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
+            }
+            Err(err) => return Err(err),
+        };
         if ckpt
             .open_repairs()
             .iter()
@@ -3861,10 +3973,7 @@ impl StorageEngine {
             // A rebuilt index partition derives its DERIVED entries from the
             // journal entry's own data ops, which it does not replay itself.
             let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
-            let ops: Vec<&OplogOp> = ops
-                .iter()
-                .filter(|op| op_partition(op) == Some(partition))
-                .collect();
+            let ops = ops_of_tree(&ops, self.namespace, partition);
             if ops.is_empty() {
                 continue;
             }
@@ -4082,8 +4191,17 @@ impl StorageEngine {
         //    the checkpoint does not hold may be a DROP and a re-create: the
         //    checkpoint's table and the live one are then different tables
         //    under one name.
-        let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
-        let Some(source) = ckpt.columnar_tables.get(table_id) else {
+        // The checkpoint's copy of this namespace's table: the same name may
+        // be a table of another namespace too.
+        let ckpt = Deployment::open_checkpoint(checkpoint_dir)?;
+        let ckpt = match ckpt.engine(self.namespace) {
+            Ok(ckpt) => ckpt,
+            Err(StorageError::UnknownNamespace { .. }) => {
+                return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
+            }
+            Err(err) => return Err(err),
+        };
+        let Some(source) = ckpt.columnar_table_tree(table_id) else {
             return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
         };
         if ckpt.lossy_table_repairs().iter().any(|t| t == table_id) {
@@ -4113,15 +4231,13 @@ impl StorageEngine {
         // table was created with (none for one the store held at its open), so
         // a transaction that read the table before a later creation under its
         // name is still refused a row in it.
-        let created_at = self
-            .columnar_tables
+        let registry = self.columnar()?;
+        let created_at = registry
             .get_stamped(table_id)
             .map_or(0, |(_, _, created_at)| created_at);
         write_rebuild_intent(&self.data_dir, target)?;
-        self.columnar_tables.drop_table(table_id)?;
-        let tree = self
-            .columnar_tables
-            .create_or_open_with(table_id, created_at, |_| Ok(()))?;
+        registry.drop_table(table_id)?;
+        let tree = registry.create_or_open_with(table_id, created_at, |_| Ok(()))?;
         tree.clear()?;
         #[cfg(any(test, feature = "test-faults"))]
         if let Some(hook) = self.on_rebuild_cleared.lock().as_mut() {
@@ -4141,16 +4257,24 @@ impl StorageEngine {
         // 3. Replay the table's rows the copy lacks, each at its entry's ts
         //    with its marker, rolling the table forward to the journal's end.
         let mut replayed = 0;
+        let own = self.namespace.as_raw();
         for entry in oplog_since {
             if held.contains(entry.index, 0) {
                 continue;
             }
+            // A row belongs to the namespace whose marker precedes it.
+            let mut namespace = None;
             for op in crate::oplog::convert::resolve_entry_ops(&entry.ops)?.iter() {
+                if let OplogOp::Namespace { id } = op {
+                    namespace = Some(*id);
+                    continue;
+                }
                 if let OplogOp::ColumnarInsert {
                     table_id: table,
                     key,
                     value,
                 } = op
+                    && namespace == Some(own)
                     && table == table_id
                 {
                     let (added, memtable) = apply_columnar_row(
@@ -6631,7 +6755,7 @@ impl Deployment {
                 }
             }
             #[cfg(feature = "columnar")]
-            if !self.columnar_tables.table_ids().is_empty() {
+            if !self.coordinator.sets().table_trees().is_empty() {
                 return Err(refuse(
                     "its STORAGE COLUMNAR tables record no position in its group's log, so \
                      no closed cut of them can be shown complete"
@@ -7054,6 +7178,216 @@ impl Deployment {
             cache.remove(part, key);
         }
         Ok(())
+    }
+
+    /// The store bound to its one namespace: what a store of one namespace
+    /// reads and writes through. A fresh store, one whose catalog never
+    /// held a namespace, is initialized as its own: it creates the one
+    /// namespace [`DEFAULT_NAMESPACE`](coordinode_core::namespace::DEFAULT_NAMESPACE).
+    /// One whose namespaces were all dropped is not: its own namespace is
+    /// never created again behind its catalog.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NoNamespace`] for a store whose namespaces were all
+    /// dropped; [`StorageError::SeveralNamespaces`] for one holding several;
+    /// the creation's errors.
+    pub fn single_store(&self) -> StorageResult<StorageEngine> {
+        let live: Vec<(NamespaceId, coordinode_core::namespace::NamespaceRecord)> =
+            crate::engine::metadata::namespaces(self)?
+                .into_iter()
+                .filter(|(_, record)| {
+                    record.state == coordinode_core::namespace::NamespaceState::Live
+                })
+                .collect();
+        match live.as_slice() {
+            [(id, _)] => self.engine(*id),
+            [] if crate::engine::metadata::namespace_allocator(self)? == 1 => {
+                let id = self.create_namespace(coordinode_core::namespace::DEFAULT_NAMESPACE)?;
+                self.engine(id)
+            }
+            [] => Err(StorageError::NoNamespace {
+                path: self.data_dir.display().to_string(),
+            }),
+            many => Err(StorageError::SeveralNamespaces {
+                path: self.data_dir.display().to_string(),
+                names: many.iter().map(|(_, record)| record.name.clone()).collect(),
+            }),
+        }
+    }
+
+    /// Create namespace `name` in this store's catalog and return its id.
+    /// For a store that is not a member of a group: a member's catalog
+    /// changes through its group's log.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NamespaceRefused`] for a name no namespace may have,
+    /// one a live namespace holds, or a store holding a group's history; a
+    /// write failure.
+    pub fn create_namespace(&self, name: &str) -> StorageResult<NamespaceId> {
+        let refused = |reason: String| StorageError::NamespaceRefused {
+            name: name.to_owned(),
+            reason,
+        };
+        coordinode_core::namespace::validate_namespace_name(name)
+            .map_err(|e| refused(e.to_string()))?;
+        self.refuse_local_catalog_change()
+            .map_err(|e| refused(e.to_string()))?;
+        let token = crate::engine::metadata::namespace_token();
+        self.commit_command(
+            coordinode_core::txn::proposal::MetadataCommand::CreateNamespace {
+                name: name.to_owned(),
+                token,
+            },
+        )?;
+        let taken = || refused("a live namespace has the name".into());
+        let id = crate::engine::metadata::namespace_by_name(self, name)?.ok_or_else(taken)?;
+        match crate::engine::metadata::namespace_record(self, id)? {
+            Some(record) if record.token == token => Ok(id),
+            _ => Err(taken()),
+        }
+    }
+
+    /// Drop the live namespace `name` from this store's catalog and return
+    /// the id it had: from here on nothing reads or writes it, and its trees
+    /// are removed. For a store that is not a member of a group.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NoSuchNamespace`] when no live namespace has the
+    /// name; [`StorageError::NamespaceRefused`] on a store holding a group's
+    /// history; a write failure.
+    pub fn drop_namespace(&self, name: &str) -> StorageResult<NamespaceId> {
+        let id = crate::engine::metadata::namespace_by_name(self, name)?.ok_or_else(|| {
+            StorageError::NoSuchNamespace {
+                name: name.to_owned(),
+            }
+        })?;
+        self.refuse_local_catalog_change()
+            .map_err(|e| StorageError::NamespaceRefused {
+                name: name.to_owned(),
+                reason: e.to_string(),
+            })?;
+        self.commit_command(
+            coordinode_core::txn::proposal::MetadataCommand::DropNamespace {
+                name: name.to_owned(),
+            },
+        )?;
+        Ok(id)
+    }
+
+    /// The live namespace called `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NoSuchNamespace`] when none is; the catalog cannot be
+    /// read.
+    pub fn namespace_id(&self, name: &str) -> StorageResult<NamespaceId> {
+        crate::engine::metadata::namespace_by_name(self, name)?.ok_or_else(|| {
+            StorageError::NoSuchNamespace {
+                name: name.to_owned(),
+            }
+        })
+    }
+
+    /// The live namespaces, with their names, in id order.
+    ///
+    /// # Errors
+    ///
+    /// The catalog cannot be read.
+    pub fn live_namespaces(&self) -> StorageResult<Vec<(NamespaceId, String)>> {
+        Ok(crate::engine::metadata::namespaces(self)?
+            .into_iter()
+            .filter(|(_, record)| record.state == coordinode_core::namespace::NamespaceState::Live)
+            .map(|(id, record)| (id, record.name))
+            .collect())
+    }
+
+    /// This store bound to the live namespace called `name`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::namespace_id`]; the namespace's trees cannot be opened.
+    pub fn engine_named(&self, name: &str) -> StorageResult<StorageEngine> {
+        self.engine(self.namespace_id(name)?)
+    }
+
+    /// Refuse a catalog change decided here for a store whose order is a
+    /// group's log, which the change would bypass.
+    fn refuse_local_catalog_change(&self) -> StorageResult<()> {
+        if self.group_history || self.raft_fence().is_some() {
+            return Err(StorageError::InvalidConfig(
+                "this store holds a group's history: its catalog changes through the group's log"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decide and apply `command` in this store's own order, logged in its
+    /// journal when it keeps one.
+    fn commit_command(
+        &self,
+        command: coordinode_core::txn::proposal::MetadataCommand,
+    ) -> StorageResult<()> {
+        let mutations = [Mutation::Command(command)];
+        let (commit_ts, _held) = self.pending_commits.obligate(|| self.next_seqno());
+        if self.oplog.is_some() {
+            return self.commit_journaled(&mutations, commit_ts);
+        }
+        self.apply_proposal_at(&mutations, commit_ts)?;
+        // No journal keeps it: the catalog's records are made durable before
+        // the change is answered, as a namespace outlives any write into it.
+        self.flush_memtables(self.system_tree(Partition::Deployment)?)
+    }
+
+    /// The set a member-local record of a namespace's tree lands in: the one
+    /// namespace of a store holding one, else the system set alone.
+    fn local_record_set(&self) -> Arc<SetTrees> {
+        match self.coordinator.sets().namespace_ids()[..] {
+            [only] => self
+                .coordinator
+                .sets()
+                .namespace(only)
+                .unwrap_or_else(|| Arc::clone(self.coordinator.sets().system())),
+            _ => Arc::clone(self.coordinator.sets().system()),
+        }
+    }
+
+    /// See through the catalog changes `effects`, just applied, make: the
+    /// set of a namespace they mark dropping is taken out of the engine and
+    /// its trees removed once nothing holds them.
+    fn note_catalog(&self, effects: &[Mutation]) {
+        use coordinode_core::namespace::{
+            NamespaceRecord, NamespaceState, decode_namespace_record_key,
+        };
+        for effect in effects {
+            let Mutation::Put {
+                partition: coordinode_core::txn::proposal::PartitionId::Deployment,
+                key,
+                value,
+            } = effect
+            else {
+                continue;
+            };
+            let Some(id) = decode_namespace_record_key(key) else {
+                continue;
+            };
+            if NamespaceRecord::decode(value).is_some_and(|r| r.state == NamespaceState::Dropping) {
+                self.retire_namespace(id);
+            }
+        }
+    }
+
+    /// Take namespace `id`'s set out of the engine and have its trees, on
+    /// every endpoint, removed once the last holder lets go of them.
+    fn retire_namespace(&self, id: NamespaceId) {
+        let dirs = namespace_dirs(&self.endpoints, id);
+        match self.coordinator.sets().remove(id) {
+            Some(set) => set.retire_on_drop(dirs, self.footprints.clone()),
+            None => remove_namespace_dirs(&dirs, &self.footprints),
+        }
     }
 
     /// The value of `key` in the system set's `part` at `snapshot`.
@@ -7507,7 +7841,9 @@ impl Deployment {
                     | MetadataCommand::GrantNodeLease { .. }
                     | MetadataCommand::RecordGroupPair { .. }
                     | MetadataCommand::RecordDeployment { .. }
-                    | MetadataCommand::ConditionalRegistryWrite { .. } => DictionaryChange::None,
+                    | MetadataCommand::ConditionalRegistryWrite { .. }
+                    | MetadataCommand::CreateNamespace { .. }
+                    | MetadataCommand::DropNamespace { .. } => DictionaryChange::None,
                 };
             }
             effects.extend(decided_effects);
@@ -7692,6 +8028,7 @@ impl Deployment {
             }
             self.journal_and_apply(&effects, commit_ts, level)?;
             self.note_dictionary(dictionary);
+            self.note_catalog(&effects);
             return Ok(());
         }
         self.journal_and_apply(mutations, commit_ts, level)
@@ -7939,9 +8276,20 @@ impl Deployment {
             EntryScope::NodeLocal => &[],
         };
         let staged = self.applied_feed.stage(index, commit_ts, published);
+        // The trees the entry reaches: a namespace's rows the tree of the
+        // namespace their last marker names.
+        let mut namespace = None;
         for mutation in resolved.iter() {
+            if let Mutation::Namespace(named) = mutation {
+                namespace = Some(*named);
+                continue;
+            }
             if let Some(partition) = mutation_partition(mutation) {
-                coverage.note_touched(partition, index);
+                let tree = match namespace {
+                    Some(ns) if !partition.is_deployment() => TreeId::namespace(ns, partition),
+                    _ => TreeId::system(partition),
+                };
+                coverage.note_touched(tree, index);
             }
         }
         self.apply_effects_covered(&resolved, commit_ts, Some(mark))?;
@@ -7980,29 +8328,35 @@ impl Deployment {
         // commit_ts from this generator before it was applied.
         let at = self.next_seqno();
         for (id, tree) in &self.coordinator.trees() {
-            let part = id.part;
-            let based = coverage.based(part);
+            let id = *id;
+            let based = coverage.based(id);
             // A tree no entry since the last fold reached holds no marker
             // there; skipping it leaves its old base, which a later fold of
             // every tree (before a purge or a checkpoint) brings up. Replay
             // stays exact either way: a marker or a base covers each entry
             // that reached the tree.
             let due = match scope {
-                coverage::FoldScope::Touched => coverage.touched_since(part, from),
+                coverage::FoldScope::Touched => coverage.touched_since(id, from),
                 coverage::FoldScope::All => true,
             };
             if !due || based >= next {
                 continue;
             }
             coverage::write_fold(tree, Domain::Journal, based, next, &[], at);
-            coverage.note_based(part, next);
+            coverage.note_based(id, next);
         }
         // A fold can land in a memtable a rotation just emptied.
         self.coordinator.flush_trigger().wrote_unmeasured();
         #[cfg(feature = "columnar")]
-        for (table_id, markers) in coverage.take_table_markers_below(next) {
-            // A dropped table took its markers with it.
-            if let Some(tree) = self.columnar_tables.get(&table_id) {
+        for ((namespace, table_id), markers) in coverage.take_table_markers_below(next) {
+            // A dropped table, or a dropped namespace, took its markers with
+            // it.
+            if let Some(tree) = self
+                .coordinator
+                .sets()
+                .namespace(namespace)
+                .and_then(|set| set.columnar()?.get(&table_id))
+            {
                 coverage::write_table_fold(&tree, Domain::Journal, next, &markers, at);
             }
         }
@@ -8026,6 +8380,7 @@ impl Deployment {
             let (effects, dictionary) = self.decide_commands(mutations, commit_ts)?;
             self.apply_effects_covered(&effects, commit_ts, cover)?;
             self.note_dictionary(dictionary);
+            self.note_catalog(&effects);
             return Ok(());
         }
         self.apply_effects_covered(mutations, commit_ts, cover)
@@ -8033,6 +8388,11 @@ impl Deployment {
 
     /// Apply `mutations`, none of them a metadata command, as one batch at
     /// `commit_ts` together with `cover`.
+    ///
+    /// The rows of a namespace the catalog does not hold live (dropped while
+    /// the unit was on its way) are left out, and the rest applies: nothing
+    /// of that namespace is kept to observe them by, and a replay of the
+    /// unit leaves out the same rows.
     fn apply_effects_covered(
         &self,
         mutations: &[Mutation],
@@ -8044,9 +8404,16 @@ impl Deployment {
         }
         let mut batch = WriteBatch::for_deployment(self, mutations.len());
         let mut named = false;
+        // The rows after the last marker are of a namespace no longer live.
+        let mut gone = false;
         for (at, mutation) in mutations.iter().enumerate() {
-            if mutation.requires_namespace() && !named {
-                return Err(coordinode_core::txn::proposal::Unscoped { at }.into());
+            if mutation.requires_namespace() {
+                if !named {
+                    return Err(coordinode_core::txn::proposal::Unscoped { at }.into());
+                }
+                if gone {
+                    continue;
+                }
             }
             match mutation {
                 Mutation::Put {
@@ -8085,11 +8452,23 @@ impl Deployment {
                 // What the unit's rows mean for the change feed; it writes
                 // nothing of its own.
                 Mutation::Effects(_) => {}
-                // The rows after it are of this namespace: one whose trees
-                // this store holds.
+                // The rows after it are of this namespace.
                 Mutation::Namespace(namespace) => {
-                    batch.write_to(self.namespace_set(*namespace)?)?;
                     named = true;
+                    gone = match self.namespace_set(*namespace) {
+                        Ok(set) => {
+                            batch.write_to(set)?;
+                            false
+                        }
+                        Err(StorageError::UnknownNamespace { .. }) => {
+                            tracing::debug!(
+                                %namespace,
+                                "rows of a namespace no longer live are left out"
+                            );
+                            true
+                        }
+                        Err(e) => return Err(e),
+                    };
                 }
             }
         }
@@ -8390,10 +8769,15 @@ impl Deployment {
         }
         // A table dropped meanwhile has nothing left to persist.
         #[cfg(feature = "columnar")]
-        for table_id in self.columnar_tables.table_ids() {
-            self.columnar_tables
-                .with_live(&table_id, |tree| self.flush_memtables_in_order(tree))
-                .unwrap_or(Ok(()))?;
+        for set in self.coordinator.sets().namespace_sets() {
+            let Some(registry) = set.columnar() else {
+                continue;
+            };
+            for table_id in registry.table_ids() {
+                registry
+                    .with_live(&table_id, |tree| self.flush_memtables_in_order(tree))
+                    .unwrap_or(Ok(()))?;
+            }
         }
         // Once per device, not once per tree: every tree lies under the
         // endpoints.
@@ -9980,25 +10364,132 @@ fn run_cascade_evict(
     })
 }
 
-/// The sets the trees an open put up form: the deployment's own partitions
-/// in the system set, the rest in the one namespace the engine holds, its
-/// index tree read through `installations`.
+/// The sets an open put up: the deployment's own trees in the system set,
+/// and each namespace's set it opened.
 fn open_sets_of(
     trees: &HashMap<Partition, lsm_tree::AnyTree>,
-    installations: crate::engine::installation::Installations,
+    namespaces: std::collections::BTreeMap<NamespaceId, SetTrees>,
 ) -> Arc<OpenSets> {
     let mut system = SetTrees::new(Scope::System);
-    let mut store = SetTrees::new(Scope::Namespace(STORE_NAMESPACE));
     for (&part, tree) in trees {
-        let set = if store_tree(part).scope == Scope::System {
-            &mut system
-        } else {
-            &mut store
-        };
-        set.insert(part, tree.clone());
+        system.insert(part, tree.clone());
     }
-    let store = Arc::new(store.with_installations(installations));
-    Arc::new(OpenSets::new(system, [store]))
+    Arc::new(OpenSets::new(
+        system,
+        namespaces.into_values().map(Arc::new),
+    ))
+}
+
+/// The ops of one journal entry's `ops` that write namespace `namespace`'s
+/// `partition` tree: a namespace partition's write follows its namespace's
+/// marker, a deployment partition's is the deployment's wherever it stands.
+fn ops_of_tree(ops: &[OplogOp], namespace: NamespaceId, partition: Partition) -> Vec<&OplogOp> {
+    let deployment = partition.is_deployment();
+    let mut current = None;
+    let mut out = Vec::new();
+    for op in ops {
+        if let OplogOp::Namespace { id } = op {
+            current = Some(*id);
+            continue;
+        }
+        if op_partition(op) == Some(partition)
+            && (deployment || current == Some(namespace.as_raw()))
+        {
+            out.push(op);
+        }
+    }
+    out
+}
+
+/// Let table `table` of `set`'s namespace stop owing the report of the repair
+/// an open ran on its tree, once what it lost is restored. `false` when none
+/// is owed.
+///
+/// # Errors
+///
+/// The tree cannot install the version without the report.
+#[cfg(feature = "columnar")]
+fn acknowledge_table_repair(set: &SetTrees, table: &str) -> StorageResult<bool> {
+    use lsm_tree::AbstractTree as _;
+    let mut repairs = set.table_repairs().lock();
+    let Some(at) = repairs.iter().position(|repair| repair.table == table) else {
+        return Ok(false);
+    };
+    let Some(tree) = set.columnar().and_then(|registry| registry.get(table)) else {
+        // A table dropped since owes nothing.
+        repairs.remove(at);
+        return Ok(false);
+    };
+    let acknowledged = tree.acknowledge_repair_report(repairs[at].report.id)?;
+    repairs.remove(at);
+    Ok(acknowledged)
+}
+
+/// Namespace `id`'s directory under each of `endpoints`: where its trees,
+/// on whichever tier they were placed, and its tables lie.
+fn namespace_dirs(endpoints: &[EndpointConfig], id: NamespaceId) -> Vec<PathBuf> {
+    let set = Scope::Namespace(id).dir();
+    endpoints
+        .iter()
+        .map(|endpoint| endpoint.path.join(&set))
+        .collect()
+}
+
+/// Remove `dirs`, a dropped namespace's directories, uncharging what they
+/// held. A directory that cannot be removed now (a file still open on a
+/// platform that keeps it) is left for the next open, which removes what a
+/// dropping namespace left.
+pub(crate) fn remove_namespace_dirs(
+    dirs: &[PathBuf],
+    footprints: &crate::engine::footprint::Footprints,
+) {
+    for dir in dirs {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => footprints.removed_tree(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(?dir, error = %e, "a dropped namespace's directory stays until the next open");
+                footprints.removed_partly(dir);
+            }
+        }
+    }
+}
+
+/// Add tree `id`'s journal coverage record to `covered`. A tree whose
+/// record is damaged no longer says what it holds: like a rebuild cut
+/// short, it is left out (and so out of the replay) and owed a rebuild from
+/// the latest checkpoint, under an intent written unless `owed` holds one.
+///
+/// # Errors
+///
+/// The record cannot be read for another reason, or the intent cannot be
+/// written.
+fn note_journal_coverage(
+    id: TreeId,
+    tree: &lsm_tree::AnyTree,
+    owed: &[Partition],
+    data_dir: &Path,
+    covered: &mut HashMap<TreeId, TreeCoverage>,
+) -> StorageResult<()> {
+    match TreeCoverage::read(tree, Domain::Journal) {
+        Ok(record) => {
+            covered.insert(id, record);
+            Ok(())
+        }
+        Err(e) if e.is_data_damage() => {
+            tracing::warn!(
+                tree = %id,
+                error = %e,
+                "a tree's journal coverage record is damaged; the tree is rebuilt from the \
+                 latest checkpoint"
+            );
+            if !owed.contains(&id.part) {
+                write_rebuild_intent(data_dir, RebuildTarget::Partition(id.part))?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Publish each partition's footprint: the live version (in-window key
@@ -10095,10 +10586,11 @@ fn publish_tree_metrics(trees: &[(TreeId, lsm_tree::AnyTree)]) {
 
 /// Publish the stored nodes per label (`coordinode_graph_nodes_total`), from
 /// the counters the write path keeps on the same transaction as the nodes:
-/// one read per label, sampled on the capacity-scan cadence. The sample
-/// replaces the last one, and a label with no node left is not in it. A
-/// counter below zero is not published; no sequence of committed writes
-/// leaves one. A scan that fails keeps the last sample.
+/// one read per label of each namespace, summed per label name so the series
+/// do not grow with the namespaces, sampled on the capacity-scan cadence.
+/// The sample replaces the last one, and a label with no node left is not in
+/// it. A counter below zero is not published; no sequence of committed
+/// writes leaves one. A scan that fails keeps the last sample.
 fn publish_label_counts(
     sets: &OpenSets,
     seqno: &lsm_tree::SharedSequenceNumberGenerator,
@@ -10107,33 +10599,36 @@ fn publish_label_counts(
     use coordinode_core::graph::stats::LABEL_KEY_PREFIX;
     use lsm_tree::{AbstractTree, Guard as _};
 
-    let Some(tree) = sets.tree(store_tree(Partition::Counter)) else {
-        return;
-    };
-    let mut counts = std::collections::BTreeMap::new();
-    for guard in tree.prefix(LABEL_KEY_PREFIX, seqno.get(), None) {
-        let (key, value) = match guard.into_inner() {
-            Ok(kv) => kv,
-            Err(e) => {
-                tracing::warn!(error = %e, "label counter scan failed");
-                return;
-            }
-        };
-        let Ok(label) = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..]) else {
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for namespace in sets.namespace_ids() {
+        let Some(tree) = sets.tree(TreeId::namespace(namespace, Partition::Counter)) else {
             continue;
         };
-        match crate::engine::merge::decode_counter(&value) {
-            // A label with no node left has no series.
-            Ok(0) => {}
-            Ok(count) if count > 0 => {
-                // Positive, so the cast is exact.
-                counts.insert(label.to_owned(), count as u64);
-            }
-            Ok(count) => {
-                tracing::warn!(label, count, "label counter below zero; not published");
-            }
-            Err(e) => {
-                tracing::warn!(label, error = %e, "label counter does not decode");
+        for guard in tree.prefix(LABEL_KEY_PREFIX, seqno.get(), None) {
+            let (key, value) = match guard.into_inner() {
+                Ok(kv) => kv,
+                Err(e) => {
+                    tracing::warn!(error = %e, "label counter scan failed");
+                    return;
+                }
+            };
+            let Ok(label) = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..]) else {
+                continue;
+            };
+            match crate::engine::merge::decode_counter(&value) {
+                // A label with no node left has no series.
+                Ok(0) => {}
+                Ok(count) if count > 0 => {
+                    // Positive, so the cast is exact; nodes of a store sum far
+                    // below u64::MAX.
+                    *counts.entry(label.to_owned()).or_insert(0) += count as u64;
+                }
+                Ok(count) => {
+                    tracing::warn!(label, count, "label counter below zero; not published");
+                }
+                Err(e) => {
+                    tracing::warn!(label, error = %e, "label counter does not decode");
+                }
             }
         }
     }
@@ -11238,6 +11733,7 @@ fn sync_dir(dir: &Path) -> StorageResult<()> {
 /// table registry exists to replay it into.
 #[cfg(feature = "columnar")]
 struct ColumnarReplay {
+    namespace: NamespaceId,
     table_id: String,
     key: Vec<u8>,
     value: Vec<u8>,
@@ -11266,6 +11762,10 @@ fn apply_columnar_row(
 }
 
 mod deployment_bootstrap;
+mod namespace_open;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod namespace_tests;
 mod raft_coverage;
 #[cfg(any(test, feature = "test-faults"))]
 pub use deployment_bootstrap::CUT_AFTER_CLEAR as DEPLOYMENT_REBUILD_CUT_AFTER_CLEAR;

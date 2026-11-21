@@ -422,7 +422,7 @@ impl StorageEngine {
         self.flush_memtables(tree)?;
         // The tree lies in its set's directory, made here: the tree's
         // checkpoint makes only its own.
-        let tree_dir = target.join(crate::engine::scope::store_tree(partition).dir());
+        let tree_dir = target.join(self.tree_id(partition).dir());
         if let Some(set) = tree_dir.parent() {
             std::fs::create_dir_all(set).map_err(|e| {
                 StorageError::Io(format!("capture partition {}: {e}", partition.name()))

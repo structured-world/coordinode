@@ -29,6 +29,16 @@ use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp};
 use crate::placement::partition_wire_tag;
 
+/// The key `part`'s tree is counted under in this journal's coverage: the
+/// journal's records land in one tree per partition, so the partition names
+/// it.
+fn counted(part: Partition) -> crate::engine::scope::TreeId {
+    crate::engine::scope::TreeId {
+        scope: crate::engine::scope::Scope::System,
+        part,
+    }
+}
+
 /// See the module docs.
 pub(crate) struct LocalJournal {
     log: Arc<Mutex<EmbeddedOplog>>,
@@ -63,7 +73,7 @@ impl LocalJournal {
         dir: &Path,
         cfg: &OplogJournalConfig,
         trees: &HashMap<Partition, AnyTree>,
-        installations: &Installations,
+        installations: Option<&Installations>,
         footprints: crate::engine::footprint::Footprints,
     ) -> StorageResult<Self> {
         // Its own ceiling, never read: local records do not bound a read view.
@@ -102,10 +112,10 @@ impl LocalJournal {
         // next compaction, so its base keeps up with the purge.
         for (&part, c) in &covered {
             if let Some((base, _)) = c.base() {
-                coverage.note_based(part, base);
+                coverage.note_based(counted(part), base);
             }
             if let Some(last) = c.marked_indices().last() {
-                coverage.note_touched(part, last);
+                coverage.note_touched(counted(part), last);
             }
         }
         for entry in &entries {
@@ -118,10 +128,10 @@ impl LocalJournal {
                     continue;
                 }
                 let tree = tree_of(trees, part)?;
-                coverage.note_touched(part, entry.index);
+                coverage.note_touched(counted(part), entry.index);
                 apply_oplog_ops_at(
                     tree,
-                    (part == Partition::Idx).then_some(installations),
+                    installations.filter(|_| part == Partition::Idx),
                     ops,
                     entry.ts,
                     entry.index,
@@ -185,7 +195,7 @@ impl LocalJournal {
         let grouped = by_partition(&applied);
         for (&part, ops) in &grouped {
             let tree = tree_of(trees, part)?;
-            self.coverage.note_touched(part, index);
+            self.coverage.note_touched(counted(part), index);
             apply_oplog_ops_at(
                 tree,
                 installations.filter(|_| part == Partition::Idx),
@@ -215,12 +225,12 @@ impl LocalJournal {
     ) -> u64 {
         let next = self.coverage.applied_prefix();
         for (&part, tree) in trees {
-            let based = self.coverage.based(part);
+            let based = self.coverage.based(counted(part));
             if !self.holds_records(part) || based >= next {
                 continue;
             }
             coverage::write_fold(tree, Domain::Local, based, next, &[], at);
-            self.coverage.note_based(part, next);
+            self.coverage.note_based(counted(part), next);
         }
         folded.set_folded(next);
         next
@@ -228,7 +238,7 @@ impl LocalJournal {
 
     /// Whether `part`'s tree took a local entry, now or before this open.
     fn holds_records(&self, part: Partition) -> bool {
-        self.coverage.based(part) > 0 || self.coverage.touched_since(part, 0)
+        self.coverage.based(counted(part)) > 0 || self.coverage.touched_since(counted(part), 0)
     }
 
     /// Fold the base of every tree that holds local records, flush those
@@ -361,11 +371,11 @@ fn op_bytes(op: &OplogOp) -> u64 {
 /// where `skip(tree, hole_start)` excuses the tree from that hole. A tree
 /// without coverage for such an index would never be replayed the entry it
 /// may have missed.
-pub(crate) fn holes_covered(
+pub(crate) fn holes_covered<K: Copy + Eq + std::hash::Hash>(
     entries: &[OplogEntry],
     next: u64,
-    covered: &HashMap<Partition, TreeCoverage>,
-    skip: impl Fn(Partition, u64) -> bool,
+    covered: &HashMap<K, TreeCoverage>,
+    skip: impl Fn(K, u64) -> bool,
 ) -> bool {
     let mut holes: Vec<(u64, u64)> = Vec::new();
     let mut expected = 0u64;

@@ -221,6 +221,42 @@ fn checking_a_large_dictionary_holds_no_more_than_the_limit() {
     );
 }
 
+/// An image carries one namespace's trees, so installing it leaves the
+/// receiver's namespace catalog exactly as it was: the receiver keeps serving
+/// the namespace it is bound to, under its own record, and no namespace of
+/// the sender's catalog appears without its trees.
+#[test]
+fn installing_an_image_leaves_the_namespace_catalog_alone() {
+    use coordinode_core::namespace::namespace_record_key;
+    let sender_dir = tempdir().unwrap();
+    let sender = open_engine(sender_dir.path());
+    sender
+        .deployment()
+        .create_namespace("only-on-sender")
+        .unwrap();
+    sender.put(Partition::Node, b"n1", b"v").unwrap();
+    let image = build_full_snapshot(&sender).unwrap();
+    drop(sender);
+
+    let target_dir = tempdir().unwrap();
+    let target = open_engine(target_dir.path());
+    let record = namespace_record_key(target.namespace());
+    let before = target.get(Partition::Deployment, &record).unwrap();
+    let catalog = target.deployment().live_namespaces().unwrap();
+
+    let budget = QueryBudget::new(32 << 20);
+    let check = check_image(&mut io::Cursor::new(&image), &budget).unwrap();
+    install_image(&target, &mut io::Cursor::new(&image), &check, &budget).unwrap();
+
+    assert_eq!(target.get(Partition::Deployment, &record).unwrap(), before);
+    assert_eq!(target.deployment().live_namespaces().unwrap(), catalog);
+    assert_eq!(
+        target.get(Partition::Node, b"n1").unwrap().as_deref(),
+        Some(&b"v"[..]),
+        "the image's rows did not arrive"
+    );
+}
+
 /// Installing columnar rows holds, by the allocator's count, no more than
 /// the memory limit at once: the copies the table write makes of a batch
 /// are reserved, and a written batch gives its memory back.
