@@ -44,7 +44,8 @@ const RECORDS_TREE: TreeId = TreeId::system(Partition::Deployment);
 
 /// The key ranges, `[start, end)`, of this member's own records in the
 /// deployment tree: its routes and records (`meta:`) and its consensus state
-/// machine's (`raft:`).
+/// machine's (`raft:`). The group's records (`group:`) are rebuilt as the
+/// rest of the tree is.
 const MEMBER_RANGES: [(&[u8], &[u8]); 2] = [(b"meta:", b"meta;"), (b"raft:", b"raft;")];
 
 /// The closure ledger's records, the head and the breakpoints, as a range:

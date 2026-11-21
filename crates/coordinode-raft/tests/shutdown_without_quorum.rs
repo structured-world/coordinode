@@ -10,7 +10,7 @@ use std::time::Duration;
 use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine_at};
 
 /// The CA the members of a test's group prove their identities under.
 static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
@@ -73,7 +73,7 @@ async fn the_last_leader_of_a_group_shuts_down_without_a_quorum() {
         .expect("n1");
         let n2 = RaftNode::open_joining(
             2,
-            open_engine(d2.path()),
+            member_engine_at(d2.path()),
             format!("127.0.0.1:{p2}").parse().expect("addr"),
             PKI.connections(2),
             enroll(&n1, p1),
@@ -82,7 +82,7 @@ async fn the_last_leader_of_a_group_shuts_down_without_a_quorum() {
         .expect("n2");
         let n3 = RaftNode::open_joining(
             3,
-            open_engine(d3.path()),
+            member_engine_at(d3.path()),
             format!("127.0.0.1:{p3}").parse().expect("addr"),
             PKI.connections(3),
             enroll(&n1, p1),
@@ -147,7 +147,7 @@ async fn the_last_member_stops_without_waiting_on_the_group() {
         .expect("n1");
         let n2 = RaftNode::open_joining(
             2,
-            open_engine(d2.path()),
+            member_engine_at(d2.path()),
             format!("127.0.0.1:{p2}").parse().expect("addr"),
             PKI.connections(2),
             enroll(&n1, p1),
@@ -156,7 +156,7 @@ async fn the_last_member_stops_without_waiting_on_the_group() {
         .expect("n2");
         let n3 = RaftNode::open_joining(
             3,
-            open_engine(d3.path()),
+            member_engine_at(d3.path()),
             format!("127.0.0.1:{p3}").parse().expect("addr"),
             PKI.connections(3),
             enroll(&n1, p1),
@@ -216,7 +216,7 @@ async fn asking_a_quorumless_leader_whether_it_leads_returns() {
         .expect("n1");
         let n2 = RaftNode::open_joining(
             2,
-            open_engine(d2.path()),
+            member_engine_at(d2.path()),
             format!("127.0.0.1:{p2}").parse().expect("addr"),
             PKI.connections(2),
             enroll(&n1, p1),

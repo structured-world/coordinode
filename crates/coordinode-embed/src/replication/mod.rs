@@ -145,14 +145,28 @@ impl MemberOptions {
     }
 }
 
+/// The database a member serves, once it serves: shared with what answers
+/// the calls peers route here, which may arrive before a joining member has
+/// caught up. no-std: once_cell::race::OnceBox
+pub type ServedDatabase = Arc<std::sync::OnceLock<Arc<RwLock<Database>>>>;
+
 /// A database over a store that is a member of a replicated group: the
 /// engine, the consensus node, the database over its replicated pipeline and
 /// the member's background work.
 ///
+/// A member that forms its group, runs alone or restarts serves its database
+/// from the open. A member that joins serves none until the group has added
+/// it and its namespace has arrived with the group's catalog
+/// ([`Member::serve`]): its consensus runs meanwhile, so the group can catch
+/// it up.
+///
 /// Opening does not start the background work, so a caller can configure the
 /// database first; [`Member::start_background`] starts it.
 pub struct Member {
-    database: Arc<RwLock<Database>>,
+    database: ServedDatabase,
+    /// What opening the database needs, for a member that serves later.
+    data_dir: std::path::PathBuf,
+    oracle: Arc<TimestampOracle>,
     node: Arc<RaftNode>,
     engine: Arc<StorageEngine>,
     handler: Option<RaftGrpcHandler>,
@@ -194,10 +208,22 @@ impl Member {
         tracing::debug!(target: "coordinode::startup", "store opening");
         coordinode_storage::engine::core::Deployment::retire_embedded_journal(storage)?;
         let oracle = Arc::new(TimestampOracle::new());
-        let engine = Arc::new(StorageEngine::open_with_oracle(
+        let deployment = coordinode_storage::engine::core::Deployment::open_with_oracle(
             storage,
             Arc::clone(&oracle),
-        )?);
+        )?;
+        // A member that joins brings no namespace of its own: its namespace
+        // arrives with the group's catalog. A member that forms a group, or
+        // runs alone, starts the store's one namespace.
+        let joins = matches!(
+            options.peering.as_ref().map(|peering| &peering.founding),
+            Some(Founding::Join(_))
+        );
+        let engine = Arc::new(if joins {
+            deployment.member_engine()
+        } else {
+            deployment.single_store()?
+        });
         tracing::debug!(target: "coordinode::startup", "store open; consensus opening");
         let MemberOptions {
             node_id,
@@ -257,11 +283,71 @@ impl Member {
             }
         };
         let node = Arc::new(node);
+        let mut member = Self {
+            database: ServedDatabase::default(),
+            data_dir: storage.data_dir().to_path_buf(),
+            oracle,
+            node,
+            engine,
+            handler,
+            preference,
+            command_slots: checked_routing.command_slots(),
+            routing: checked_routing,
+            follower: None,
+            background: Vec::new(),
+            stop: tokio::sync::watch::Sender::new(false),
+        };
+        // A member whose store holds its namespace serves from the open; one
+        // that joins serves once its namespace arrives (`serve`).
+        if member.engine.try_bind()? {
+            member.open_database().await?;
+        }
+        Ok(member)
+    }
+
+    /// Serve the member's database: at once for a member whose store holds
+    /// its namespace, and for a member that joined, once the group has added
+    /// it and its namespace has arrived with the group's catalog. Its
+    /// consensus runs meanwhile; a caller serves the member's peers before
+    /// waiting here, or the group cannot reach it to catch it up.
+    ///
+    /// # Errors
+    ///
+    /// The store's catalog holds several namespaces or cannot be read, the
+    /// consensus node stopped before the namespace arrived, or the database
+    /// cannot be opened.
+    pub async fn serve(&mut self) -> Result<&Arc<RwLock<Database>>, ReplicationError> {
+        if self.database.get().is_none() {
+            tracing::debug!(target: "coordinode::startup", "awaiting the group's catalog");
+            let mut applied = self.node.subscribe_applied();
+            while !self.engine.try_bind()? {
+                if applied.changed().await.is_err() {
+                    return Err(RaftNodeError::Init(
+                        "the consensus node stopped before the group's catalog arrived".into(),
+                    )
+                    .into());
+                }
+            }
+            self.open_database().await?;
+        }
+        self.database
+            .get()
+            .ok_or_else(|| DatabaseError::NotServing.into())
+    }
+
+    /// Open the database over the member's namespace and start the work no
+    /// database runs without: its execution tenure and its idle reaper.
+    async fn open_database(&mut self) -> Result<(), ReplicationError> {
         tracing::debug!(target: "coordinode::startup", "consensus open; database opening");
+        let node = &self.node;
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(node.pipeline());
-        let database =
-            Database::from_engine(storage.data_dir(), Arc::clone(&engine), oracle, pipeline)?;
+        let database = Database::from_engine(
+            &self.data_dir,
+            Arc::clone(&self.engine),
+            Arc::clone(&self.oracle),
+            pipeline,
+        )?;
         tracing::debug!(target: "coordinode::startup", "database open; awaiting leadership");
         // Before the database serves anything: a member that does not lead
         // opens no transaction, and one that leads opens them in its term.
@@ -279,7 +365,7 @@ impl Member {
         // Weak: the node outlives none of the database's users, and a node
         // that is gone answers as a group of unknown size.
         {
-            let node = Arc::downgrade(&node);
+            let node = Arc::downgrade(node);
             database.set_group_members(Arc::new(move || {
                 node.upgrade()
                     .map_or(usize::MAX, |node| node.member_count())
@@ -290,66 +376,63 @@ impl Member {
         // instead.
         if node.connections().is_some() {
             database.set_index_copy_source(Arc::new(index_copy::PeerIndexCopy {
-                installer: Arc::new(SegmentInstaller::new(Arc::clone(&engine))),
-                node: Arc::clone(&node),
+                installer: Arc::new(SegmentInstaller::new(Arc::clone(&self.engine))),
+                node: Arc::clone(node),
                 runtime: tokio::runtime::Handle::current(),
             }));
         }
         let database = Arc::new(RwLock::new(database));
-        let stop = tokio::sync::watch::Sender::new(false);
         // Not part of the optional background work: a member that is not
         // told when it stops leading would keep transactions of a lost lead.
-        let tenure = background::spawn_execution_tenure(
+        self.background.push(background::spawn_execution_tenure(
             Arc::clone(&database),
-            Arc::clone(&node),
-            stop.subscribe(),
-        );
+            Arc::clone(node),
+            self.stop.subscribe(),
+        ));
         // Not optional either: an idle transaction ends with its timeout
         // outcome whether or not anything else ever begins.
-        let reaper = background::spawn_idle_reaper(
+        self.background.push(background::spawn_idle_reaper(
             Arc::clone(&database),
             begun,
             background::REAPER_GRANULARITY,
-            stop.subscribe(),
-        );
-        Ok(Self {
-            database,
-            node,
-            engine,
-            handler,
-            preference,
-            command_slots: checked_routing.command_slots(),
-            routing: checked_routing,
-            follower: None,
-            background: vec![tenure, reaper],
-            stop,
-        })
+            self.stop.subscribe(),
+        ));
+        if self.database.set(database).is_err() {
+            return Err(DatabaseError::Other("the member's database opened twice".into()).into());
+        }
+        Ok(())
     }
 
     /// Start the member's background work: bring index definitions live as
     /// their entries apply, and, while it leads, finish interrupted index
     /// builds and dispatch AFTER COMMIT triggers no more often than
-    /// `trigger_dispatch_interval`. Starting it twice does nothing.
+    /// `trigger_dispatch_interval`. The work is the database's: a member
+    /// starts it once it serves ([`Member::serve`]); before, and when started
+    /// twice, this does nothing.
     pub fn start_background(&mut self, trigger_dispatch_interval: Duration) {
         if self.follower.is_some() {
             return;
         }
+        let Some(database) = self.database.get().map(Arc::clone) else {
+            tracing::debug!("background work asked for before the member serves");
+            return;
+        };
         self.follower = Some(follower::IndexDefinitionFollower::spawn(
             &self.engine,
-            Arc::downgrade(&self.database),
+            Arc::downgrade(&database),
         ));
         // With peers a body's writes go through the leader; a member alone
         // runs them as it commits.
         if self.handler.is_some() {
             self.background.push(background::spawn_trigger_dispatch(
-                Arc::clone(&self.database),
+                Arc::clone(&database),
                 Arc::clone(&self.node),
                 trigger_dispatch_interval,
                 self.stop.subscribe(),
             ));
         }
         self.background.push(background::spawn_index_build_resumer(
-            Arc::clone(&self.database),
+            Arc::clone(&database),
             Arc::clone(&self.node),
             self.stop.subscribe(),
         ));
@@ -385,8 +468,14 @@ impl Member {
         }
     }
 
-    /// The database.
-    pub fn database(&self) -> &Arc<RwLock<Database>> {
+    /// The database, once the member serves ([`Member::serve`]).
+    pub fn database(&self) -> Option<&Arc<RwLock<Database>>> {
+        self.database.get()
+    }
+
+    /// The database as the calls peers route here reach it: empty until the
+    /// member serves.
+    pub fn served_database(&self) -> &ServedDatabase {
         &self.database
     }
 
@@ -523,6 +612,8 @@ impl LeadershipChanges {
 /// the handle.
 pub struct ReplicatedDatabase {
     member: Member,
+    /// The member's database: a handle opens once its member serves.
+    database: Arc<RwLock<Database>>,
     ingress: ingress::Ingress,
     timing: ElectionTiming,
     security: Option<Arc<SecurityContext>>,
@@ -542,10 +633,16 @@ impl ReplicatedDatabase {
     /// bound before this returns, so a busy port fails the open rather than
     /// leaving a member deaf to its group.
     ///
+    /// A member that joins its group returns once it serves: the group's
+    /// leader has added it and its namespace has arrived
+    /// ([`Member::serve`]). Its peers are served from the listener's bind,
+    /// so the group can catch it up meanwhile.
+    ///
     /// # Errors
     ///
-    /// As [`Member::open`]; a member with peers and no `listen`, or a listener
-    /// that cannot be bound, is [`ReplicationError::Listener`].
+    /// As [`Member::open`] and [`Member::serve`]; a member with peers and no
+    /// `listen`, or a listener that cannot be bound, is
+    /// [`ReplicationError::Listener`].
     pub async fn open(
         storage: &StorageConfig,
         options: MemberOptions,
@@ -565,8 +662,9 @@ impl ReplicatedDatabase {
             (_, listen) => listen,
         };
         let mut member = Member::open(storage, options).await?;
-        member.start_background(DEFAULT_TRIGGER_DISPATCH_INTERVAL);
-        let admitter = admission::Admitter::new(Arc::clone(member.database()))
+        // A member that joins serves its peers before it serves data: the
+        // calls they route here are refused until it has caught up.
+        let admitter = admission::Admitter::serving(Arc::clone(member.served_database()))
             .with_node(Arc::clone(member.node()));
         let ingress = ingress::Ingress::new(admitter.clone());
 
@@ -622,8 +720,22 @@ impl ReplicatedDatabase {
             });
             listener = Some((stop, task));
         }
+        // With its peers served, a joining member waits here until the group
+        // has added it and its namespace has arrived.
+        let database = match member.serve().await {
+            Ok(database) => Arc::clone(database),
+            Err(err) => {
+                if let Some((stop, task)) = listener.take() {
+                    drop(stop);
+                    task.abort();
+                }
+                return Err(err);
+            }
+        };
+        member.start_background(DEFAULT_TRIGGER_DISPATCH_INTERVAL);
         Ok(Self {
             member,
+            database,
             ingress,
             timing,
             security,
@@ -670,7 +782,7 @@ impl ReplicatedDatabase {
     /// [`ReplicatedDatabase::execute`] or [`ReplicatedDatabase::ingress`] to
     /// have commands run wherever they must.
     pub fn database(&self) -> &Arc<RwLock<Database>> {
-        self.member.database()
+        &self.database
     }
 
     /// Where a host's commands enter the group through this member: each

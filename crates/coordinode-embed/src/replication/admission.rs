@@ -151,7 +151,7 @@ pub enum Admission {
 /// Cheap to clone: the database and the consensus node are shared.
 #[derive(Clone)]
 pub struct Admitter {
-    database: Arc<RwLock<Database>>,
+    database: super::ServedDatabase,
     node: Option<Arc<RaftNode>>,
     defaults: AdmissionDefaults,
     /// The router to each member commands were routed to, kept with where
@@ -164,6 +164,13 @@ impl Admitter {
     /// An admitter over a standalone `database`, with the built-in defaults:
     /// every statement runs here, unfenced.
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
+        Self::serving(Arc::new(std::sync::OnceLock::from(database)))
+    }
+
+    /// An admitter over the database a member serves once it has caught up
+    /// with its group ([`super::Member::served_database`]): statements are
+    /// refused with [`DatabaseError::NotServing`] until then.
+    pub fn serving(database: super::ServedDatabase) -> Self {
         Self {
             database,
             node: None,
@@ -187,8 +194,13 @@ impl Admitter {
     }
 
     /// The database statements run against.
-    pub fn database(&self) -> &Arc<RwLock<Database>> {
-        &self.database
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::NotServing`] on a member that has not caught up with
+    /// its group yet.
+    pub fn database(&self) -> Result<&Arc<RwLock<Database>>, DatabaseError> {
+        self.database.get().ok_or(DatabaseError::NotServing)
     }
 
     /// The consensus node, when this member has one.
@@ -229,7 +241,7 @@ impl Admitter {
         let causal = requested.after_ts > 0 || requested.after_position.is_some();
         // Known before it runs, from the parse execution reuses. A query that
         // does not parse runs on and fails there with the richer error.
-        let writes = self.database.read().statement_writes(query) == Some(true);
+        let writes = self.database()?.read().statement_writes(query) == Some(true);
 
         // A causal read is bounded by what a majority committed. A LOCAL
         // read promises nothing about majority, so a bound on top of it is
@@ -261,7 +273,7 @@ impl Admitter {
                 // the one to check.
                 let concern = requested
                     .write_concern
-                    .unwrap_or_else(|| self.database.read().write_concern());
+                    .map_or_else(|| self.database().map(|db| db.read().write_concern()), Ok)?;
                 if !concern.is_causal_safe() {
                     return Err(refused(
                         "Causal sessions require writeConcern w:majority with \
@@ -480,14 +492,15 @@ impl Admitter {
         deadline: Option<Instant>,
         cancel: Option<&CancelFlag>,
     ) -> Result<(), DatabaseError> {
-        let met = self.database.read().causal_bound_met(after_ts);
+        let database = self.database()?;
+        let met = database.read().causal_bound_met(after_ts);
         let outcome =
             within_deadline_and_cancel(deadline, cancel, tokio::time::timeout(wait, met)).await?;
         match outcome {
             Ok(()) => Ok(()),
             Err(_elapsed) => Err(DatabaseError::ReadNotReady {
                 requested: after_ts,
-                ready_through: self.database.read().causal_ready_through(after_ts),
+                ready_through: database.read().causal_ready_through(after_ts),
             }),
         }
     }

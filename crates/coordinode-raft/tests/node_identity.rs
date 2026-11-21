@@ -37,7 +37,7 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_test_fixtures::pki::UriAdapter;
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine_at};
 use coordinode_wire::peer::{PeerIdentity, PeerProfile, PeerTarget, SecurityContext};
 use futures_util::StreamExt;
 use openraft::rt::watch::WatchReceiver;
@@ -207,7 +207,7 @@ async fn join(
     authority: PeerTarget,
 ) -> Member {
     let dir = tempfile::tempdir().expect("dir");
-    let engine = open_engine(&dir);
+    let engine = member_engine_at(dir.path());
     let port = alloc_port();
     let node = RaftNode::open_joining(
         id,
@@ -281,14 +281,16 @@ fn write(leader: &RaftNode, ids: &ProposalIdGenerator, key: &str, ts: u64) {
         .expect("commit");
 }
 
-/// Whether `key` reaches `engine` within `within`.
+/// Whether `key` reaches `engine` within `within`. A joining member's engine
+/// holds nothing before its group's catalog brings its namespace.
 async fn reaches(engine: &StorageEngine, key: &str, within: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + within;
     while tokio::time::Instant::now() < deadline {
-        if engine
-            .get(Partition::Node, key.as_bytes())
-            .expect("read")
-            .is_some()
+        if engine.is_bound()
+            && engine
+                .get(Partition::Node, key.as_bytes())
+                .expect("read")
+                .is_some()
         {
             return true;
         }
@@ -727,7 +729,7 @@ async fn an_interrupted_enrollment_resumes_into_its_own_deployment(fx: Fixture) 
         authorities: vec![fx.target(1, founder.port)],
     };
     let open = |enrollment: Enrollment| {
-        let engine = open_engine(&dir);
+        let engine = member_engine_at(dir.path());
         let connections = fx.connections(2);
         async move {
             let node = RaftNode::open_joining(

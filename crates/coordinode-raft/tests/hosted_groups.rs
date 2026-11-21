@@ -32,7 +32,7 @@ use coordinode_raft::storage::TypeConfig;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine};
 use futures_util::StreamExt;
 use tonic_types::StatusExt;
 
@@ -45,7 +45,10 @@ struct Replica {
     _dir: tempfile::TempDir,
 }
 
-fn engine() -> (Arc<StorageEngine>, tempfile::TempDir) {
+/// A replica's store: one that starts its own namespace for a member the
+/// group forms around (`joins` false), a joining member's otherwise, whose
+/// namespace arrives with its group's catalog.
+fn engine(joins: bool) -> (Arc<StorageEngine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -54,7 +57,12 @@ fn engine() -> (Arc<StorageEngine>, tempfile::TempDir) {
         Durability::Durable,
         Tier::Warm,
     )]);
-    (Arc::new(StorageEngine::open(&config).expect("open")), dir)
+    let engine = if joins {
+        member_engine(&config)
+    } else {
+        Arc::new(StorageEngine::open(&config).expect("open"))
+    };
+    (engine, dir)
 }
 
 /// The CA the servers of a test prove their identities under; server `n`
@@ -101,7 +109,7 @@ async fn replica(
     role: Role,
     connections: &Arc<PeerConnections>,
 ) -> (Replica, RaftGrpcHandler) {
-    let (engine, dir) = engine();
+    let (engine, dir) = engine(matches!(role, Role::Joins(_)));
     let (node, handler) = match &role {
         Role::Forms(_) => RaftNode::open_cluster_embedded_with_options(
             node_id,

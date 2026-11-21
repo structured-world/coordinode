@@ -185,8 +185,9 @@ pub fn is_node_local(partition: Partition, key: &[u8]) -> bool {
 }
 
 /// The key prefixes of `partition`'s node-local rows, outside the Raft
-/// partition (which is node-local whole).
-fn node_local_prefixes(partition: Partition) -> &'static [&'static [u8]] {
+/// partition (which is node-local whole). Records the group's state machine
+/// writes are not among them ([`coordinode_core::group::GROUP_RECORD_PREFIX`]).
+pub(crate) fn node_local_prefixes(partition: Partition) -> &'static [&'static [u8]] {
     match partition {
         Partition::Deployment => &[b"meta:", b"raft:"],
         Partition::Schema => &[b"meta:"],
@@ -576,9 +577,12 @@ impl StorageEngine {
             tree,
             self.next_seqno(),
         );
+        // A deployment partition's rows land in the system set's tree whatever
+        // set is named; a member's engine bound to no namespace names that.
+        let set = self.batch_set();
         for (key, value) in rows {
             self.coordinator.put_at(
-                self.set(),
+                &set,
                 partition,
                 addressing.point(key)?,
                 value,

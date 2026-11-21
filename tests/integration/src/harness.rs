@@ -279,8 +279,10 @@ impl CoordinodeProcess {
             launch,
         };
         // The port is fixed by the caller (peers already name it), so a
-        // process that lost it cannot move to another one.
-        if let Err(status) = proc.ready_or_diagnose().await {
+        // process that lost it cannot move to another one. A member that
+        // joins is started once it is alive: it serves clients after its
+        // group has added it.
+        if let Err(status) = proc.started_or_diagnose(node_id > 1).await {
             panic!("cluster member {node_id} exited during startup on port {port}: {status}");
         }
         proc
@@ -696,6 +698,7 @@ impl CoordinodeProcess {
 
     /// Build a `SchemaServiceClient` connected to this process.
     pub async fn schema_client(&self) -> SchemaServiceClient<tonic::transport::Channel> {
+        self.serving().await;
         let channel = tonic::transport::Endpoint::from_shared(self.endpoint())
             .expect("valid endpoint")
             .connect()
@@ -704,8 +707,24 @@ impl CoordinodeProcess {
         SchemaServiceClient::new(channel)
     }
 
+    /// Wait until this process serves clients: a member that joined its
+    /// group does once the group has added it and caught it up, and only
+    /// its peers are served on its port before.
+    async fn serving(&self) {
+        let deadline = Instant::now() + START_READY_TIMEOUT;
+        while probe_ready(self.ops_port) != ReadyProbe::Status(200) {
+            assert!(
+                Instant::now() < deadline,
+                "coordinode on port {} never served clients",
+                self.port
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Build a `CypherServiceClient` connected to this process.
     pub async fn cypher_client(&self) -> CypherServiceClient<tonic::transport::Channel> {
+        self.serving().await;
         let channel = tonic::transport::Endpoint::from_shared(self.endpoint())
             .expect("valid endpoint")
             .connect()
@@ -733,6 +752,18 @@ impl CoordinodeProcess {
     /// the query engine are open. A server that lost a port to another holder
     /// exits at its bind, which the exit check catches first.
     async fn wait_until_ready(&mut self, timeout: Duration) -> Result<(), StartFailure> {
+        self.wait_until_started(timeout, false).await
+    }
+
+    /// [`wait_until_ready`](Self::wait_until_ready), or, for a member that
+    /// `joins` its group, until it is alive: it serves its ops port, not
+    /// ready, from the open, and serves clients once the group has added it
+    /// and caught it up.
+    async fn wait_until_started(
+        &mut self,
+        timeout: Duration,
+        joins: bool,
+    ) -> Result<(), StartFailure> {
         let started = Instant::now();
         let deadline = started + timeout;
         loop {
@@ -740,7 +771,7 @@ impl CoordinodeProcess {
                 return Err(StartFailure::Exited(status));
             }
             let probe = probe_ready(self.ops_port);
-            if probe == ReadyProbe::Status(200) {
+            if probe == ReadyProbe::Status(200) || (joins && probe == ReadyProbe::Status(503)) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -759,7 +790,14 @@ impl CoordinodeProcess {
     /// failed with both attempts reported; the exit status of a process that
     /// ended during startup.
     async fn ready_or_diagnose(&mut self) -> Result<(), std::process::ExitStatus> {
-        match self.wait_until_ready(START_READY_TIMEOUT).await {
+        self.started_or_diagnose(false).await
+    }
+
+    /// [`ready_or_diagnose`](Self::ready_or_diagnose), for a member that
+    /// `joins` its group alive rather than ready
+    /// ([`wait_until_started`](Self::wait_until_started)).
+    async fn started_or_diagnose(&mut self, joins: bool) -> Result<(), std::process::ExitStatus> {
+        match self.wait_until_started(START_READY_TIMEOUT, joins).await {
             Ok(()) => Ok(()),
             Err(StartFailure::Exited(status)) => Err(status),
             Err(StartFailure::NotReady(first)) => {

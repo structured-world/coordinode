@@ -323,6 +323,7 @@ fn an_entry_is_stored_under_its_installation_and_read_back_logically() {
             .expect("put spatial");
         let installation = engine
             .set()
+            .expect("bound")
             .installations()
             .expect("installations")
             .current()
@@ -397,6 +398,7 @@ fn a_generation_without_an_installation_holds_nothing() {
         .expect("put");
     let installation = engine
         .set()
+        .expect("bound")
         .installations()
         .expect("installations")
         .current()

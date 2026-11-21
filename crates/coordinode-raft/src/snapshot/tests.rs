@@ -533,6 +533,40 @@ fn a_snapshot_installs_history_only_into_its_domain() {
     );
 }
 
+/// A member enrolled in a deployment but holding no record of it yet, as one
+/// caught up by a snapshot is (the record is node-local and stays out of
+/// every snapshot), records the snapshot's domain when it is the one it was
+/// enrolled in. Without it the member never learned its deployment, and once
+/// it led it refused every membership change.
+#[test]
+fn an_enrolled_member_records_the_snapshots_domain() {
+    use coordinode_core::group::DeploymentId;
+    let dir = tempdir().unwrap();
+    let source = open_engine(dir.path());
+    with_history(&source, 1);
+    let data = build_full_snapshot(&source).unwrap();
+
+    let member_dir = tempdir().unwrap();
+    let member = open_engine(member_dir.path());
+    member
+        .put(
+            Partition::Deployment,
+            coordinode_core::group::ENROLLED_DEPLOYMENT_KEY,
+            &[1; 16],
+        )
+        .unwrap();
+    assert_eq!(
+        coordinode_storage::engine::metadata::recorded_deployment(&member).unwrap(),
+        None
+    );
+    install_full_snapshot(&member, &data).expect("the deployment it was enrolled in");
+    assert_eq!(
+        coordinode_storage::engine::metadata::recorded_deployment(&member).unwrap(),
+        Some(DeploymentId([1; 16])),
+        "the member records the deployment the snapshot names"
+    );
+}
+
 /// Replacing a whole database replaces its domain with the image's, bound
 /// with the image's records; history the image names no domain for is still
 /// refused, and the receiver left as it was.

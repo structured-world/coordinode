@@ -69,7 +69,7 @@ pub mod pki;
 
 pub use client::tls_client_channel;
 pub use kill::{CHILD_KILL_SIGNAL, die_killed};
-pub use pki::{TestPki, serve_member_port};
+pub use pki::{TestPki, serve_member_listener, serve_member_port, serve_peers_until};
 
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
@@ -221,6 +221,40 @@ pub fn engine_for_memory() -> EngineFixture {
         backing: Backing::Memory(fs),
         scratch,
     }
+}
+
+/// The store `config` describes, opened as a member joining a group opens
+/// it: with no namespace of its own, bound to the one its group's catalog
+/// brings ([`Deployment::member_engine`]). A store opened with
+/// [`StorageEngine::open`] starts its own namespace instead and is refused
+/// as a joiner.
+///
+/// [`Deployment::member_engine`]: coordinode_storage::engine::core::Deployment::member_engine
+///
+/// # Panics
+///
+/// If the store cannot be opened. Test-only.
+pub fn member_engine(config: &StorageConfig) -> Arc<StorageEngine> {
+    Arc::new(
+        coordinode_storage::engine::core::Deployment::open(config)
+            .expect("open the member's store")
+            .member_engine(),
+    )
+}
+
+/// [`member_engine`] of a durable store in `dir`.
+///
+/// # Panics
+///
+/// As [`member_engine`].
+pub fn member_engine_at(dir: &std::path::Path) -> Arc<StorageEngine> {
+    member_engine(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]))
 }
 
 /// A durable store whose power can be cut, for crash tests.

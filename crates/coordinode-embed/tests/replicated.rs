@@ -153,22 +153,22 @@ async fn group_limited(
     let mut members = vec![founder];
     for (i, dir) in dirs.iter().enumerate().skip(1) {
         let id = i as u64 + 1;
-        members.push(
+        // A joiner's open returns once it serves, which the leader's adding
+        // it brings about.
+        let storage = storage_limited(dir.path(), hard_limit);
+        let (joined, added) = tokio::join!(
             open_over(
-                &storage_limited(dir.path(), hard_limit),
+                &storage,
                 id,
                 ports[i],
                 Founding::Join(enrollment.clone()),
                 preference(id),
                 PKI.context(id),
-            )
-            .await
-            .unwrap(),
+            ),
+            members[0].add_learner(id, addr(ports[i]), PKI.identity(id)),
         );
-        members[0]
-            .add_learner(id, addr(ports[i]), PKI.identity(id))
-            .await
-            .unwrap();
+        added.unwrap();
+        members.push(joined.unwrap());
         members[0].promote(id).await.unwrap();
     }
     (members, ports)
@@ -348,19 +348,18 @@ async fn a_store_written_without_replication_grows_into_a_group_in_place() {
         assert_eq!(count(&founder, "Before"), 2, "the store keeps its data");
         let enrollment = founder.enrollment(addr(p1)).expect("enrollment");
 
-        let joiner = open(
-            2,
-            dirs[1].path(),
-            p2,
-            Founding::Join(enrollment.clone()),
-            ElectionPreference::Ordinary,
-        )
-        .await
-        .unwrap();
-        founder
-            .add_learner(2, addr(p2), PKI.identity(2))
-            .await
-            .unwrap();
+        let (joiner, added) = tokio::join!(
+            open(
+                2,
+                dirs[1].path(),
+                p2,
+                Founding::Join(enrollment.clone()),
+                ElectionPreference::Ordinary,
+            ),
+            founder.add_learner(2, addr(p2), PKI.identity(2)),
+        );
+        added.unwrap();
+        let joiner = joiner.unwrap();
         founder.promote(2).await.unwrap();
         wait_until("the joiner holds the founder's data", || {
             count(&joiner, "Before") == 2
@@ -731,25 +730,26 @@ async fn a_member_without_its_vote_is_refused_and_replaced_through_the_handle() 
 
         let new_dir = tempfile::tempdir().unwrap();
         let new_port = alloc_port();
-        let replacement = open(
-            4,
-            new_dir.path(),
-            new_port,
-            Founding::Join(leader.enrollment(addr(ports[0])).unwrap()),
-            ElectionPreference::Ordinary,
-        )
-        .await
-        .unwrap();
         // The same identity is never let back.
         let same = leader.replace(3, 3, addr(ports[2]), PKI.identity(3)).await;
         assert!(
             matches!(same, Err(ReplicationError::Consensus(_))),
             "a member is not replaced by itself: {same:?}"
         );
-        leader
-            .replace(3, 4, addr(new_port), PKI.identity(4))
-            .await
-            .expect("the replacement completes");
+        // The replacement's open returns once it serves, which the
+        // replacement brings about.
+        let (replacement, replaced) = tokio::join!(
+            open(
+                4,
+                new_dir.path(),
+                new_port,
+                Founding::Join(leader.enrollment(addr(ports[0])).unwrap()),
+                ElectionPreference::Ordinary,
+            ),
+            leader.replace(3, 4, addr(new_port), PKI.identity(4)),
+        );
+        replaced.expect("the replacement completes");
+        let replacement = replacement.unwrap();
         leader
             .replace(3, 4, addr(new_port), PKI.identity(4))
             .await
@@ -843,20 +843,20 @@ async fn an_operation_keeps_its_outcome_across_a_replacement() {
         }
         let new_dir = tempfile::tempdir().unwrap();
         let new_port = alloc_port();
-        let replacement = open(
-            4,
-            new_dir.path(),
-            new_port,
-            Founding::Join(members[0].enrollment(addr(ports[0])).unwrap()),
-            ElectionPreference::Ordinary,
-        )
-        .await
-        .unwrap();
-        members[0]
-            .replace(3, 4, addr(new_port), PKI.identity(4))
-            .await
-            .expect("the replacement completes");
-        members.push(replacement);
+        // The replacement's open returns once it serves, which the
+        // replacement brings about.
+        let (replacement, replaced) = tokio::join!(
+            open(
+                4,
+                new_dir.path(),
+                new_port,
+                Founding::Join(members[0].enrollment(addr(ports[0])).unwrap()),
+                ElectionPreference::Ordinary,
+            ),
+            members[0].replace(3, 4, addr(new_port), PKI.identity(4)),
+        );
+        replaced.expect("the replacement completes");
+        members.push(replacement.unwrap());
 
         // The new member leads and answers from the history it received.
         members[0].transfer_leadership(4).await.unwrap();
@@ -1129,19 +1129,18 @@ async fn descriptors_issued_standalone_stay_valid_in_the_grown_group() {
         .await
         .unwrap();
         let enrollment = founder.enrollment(addr(p1)).expect("enrollment");
-        let joiner = open(
-            2,
-            dirs[1].path(),
-            p2,
-            Founding::Join(enrollment),
-            ElectionPreference::Ordinary,
-        )
-        .await
-        .unwrap();
-        founder
-            .add_learner(2, addr(p2), PKI.identity(2))
-            .await
-            .unwrap();
+        let (joiner, added) = tokio::join!(
+            open(
+                2,
+                dirs[1].path(),
+                p2,
+                Founding::Join(enrollment),
+                ElectionPreference::Ordinary,
+            ),
+            founder.add_learner(2, addr(p2), PKI.identity(2)),
+        );
+        added.unwrap();
+        let joiner = joiner.unwrap();
         founder.promote(2).await.unwrap();
 
         {
@@ -2609,7 +2608,9 @@ async fn host_group(
     let mut members = vec![founder];
     for (i, dir) in dirs.iter().enumerate().skip(1) {
         let id = i as u64 + 1;
-        members.push(
+        // A joiner's open returns once it serves, which the leader's adding
+        // it brings about.
+        let (joined, added) = tokio::join!(
             open_under(
                 id,
                 dir.path(),
@@ -2617,14 +2618,11 @@ async fn host_group(
                 Founding::Join(enrollment.clone()),
                 ElectionPreference::Ordinary,
                 host_context(id, adapter),
-            )
-            .await
-            .unwrap(),
+            ),
+            members[0].add_learner(id, addr(ports[i]), PKI.host_identity(id, adapter)),
         );
-        members[0]
-            .add_learner(id, addr(ports[i]), PKI.host_identity(id, adapter))
-            .await
-            .unwrap();
+        added.unwrap();
+        members.push(joined.unwrap());
         members[0].promote(id).await.unwrap();
     }
     members

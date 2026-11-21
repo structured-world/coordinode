@@ -1044,7 +1044,12 @@ async fn failovers() {
     let mut members: Vec<Member> = Vec::new();
     for id in 1..=3u64 {
         let store = Store::new();
-        let engine = store.open();
+        // Member 1 forms the group; the others join it.
+        let engine = if id == 1 {
+            store.open()
+        } else {
+            coordinode_test_fixtures::member_engine(&store.config)
+        };
         let port = alloc_port();
         let listen = format!("127.0.0.1:{port}").parse().expect("addr");
         let node = match members.first() {

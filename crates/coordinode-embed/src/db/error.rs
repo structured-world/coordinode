@@ -498,6 +498,13 @@ pub enum DatabaseError {
         leader_id: Option<u64>,
     },
 
+    /// The call reached a member that joined its group and has not yet
+    /// received the group's namespace with its catalog: until it has caught
+    /// up it serves no data. Nothing was run; the same call succeeds at a
+    /// member that serves.
+    #[error("this member has not caught up with its group yet and serves no data")]
+    NotServing,
+
     /// The write reached a member that does not run its group's version: it
     /// is read-only. Nothing was applied. Names both versions and the leader
     /// when known.

@@ -294,7 +294,7 @@ async fn a_blob_write_in_a_group_is_refused_before_it_is_written() {
     );
     let (p1, p2) = (alloc_port(), alloc_port());
     let founder = open(1, p1, Founding::Form { deployment: None }, &dir1).await;
-    let service = BlobServiceImpl::new(Arc::clone(founder.member().database()))
+    let service = BlobServiceImpl::new(Arc::clone(founder.database()))
         .with_node(Arc::clone(founder.member().node()));
 
     let alone = upload(&service, b"a member alone serves blob writes").await;
@@ -306,11 +306,13 @@ async fn a_blob_write_in_a_group_is_refused_before_it_is_written() {
     let enrollment = founder
         .enrollment(format!("127.0.0.1:{p1}"))
         .expect("enrollment");
-    let joiner = open(2, p2, Founding::Join(enrollment), &dir2).await;
+    // A joiner's open returns once the group has added it and it serves.
+    let joining = tokio::spawn(open(2, p2, Founding::Join(enrollment), &dir2));
     founder
         .add_learner(2, format!("127.0.0.1:{p2}"), pki.identity(2))
         .await
         .expect("add learner");
+    let joiner = joining.await.expect("the joiner's open");
 
     for refused in [
         service
@@ -331,11 +333,7 @@ async fn a_blob_write_in_a_group_is_refused_before_it_is_written() {
     }
     // The database refuses on its own as well, for an embedded member.
     assert!(matches!(
-        founder
-            .member()
-            .database()
-            .read()
-            .upload_blob(b"refused", None),
+        founder.database().read().upload_blob(b"refused", None),
         Err(coordinode_embed::DatabaseError::Unsupported(_))
     ));
 

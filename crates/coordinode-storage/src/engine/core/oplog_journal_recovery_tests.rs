@@ -1677,7 +1677,9 @@ fn a_crash_inside_a_member_local_compaction_keeps_every_record() {
             .as_ref()
             .expect("a member-local journal")
             .compact(
-                &engine.coordinator.partition_trees(engine.set()),
+                &engine
+                    .coordinator
+                    .partition_trees(engine.set().expect("bound")),
                 engine.next_seqno(),
                 |tree| engine.flush_memtables(tree),
             )

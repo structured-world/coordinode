@@ -65,7 +65,7 @@ fn coordinator_tree_returns_every_partition() {
     for &part in Partition::all() {
         engine
             .coordinator()
-            .tree_in(engine.set(), part)
+            .tree_in(engine.set().expect("bound"), part)
             .unwrap_or_else(|e| panic!("tree({part:?}) failed: {e}"));
     }
 }

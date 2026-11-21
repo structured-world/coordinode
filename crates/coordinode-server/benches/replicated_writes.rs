@@ -34,8 +34,8 @@ use coordinode_server::services::cypher::CypherServiceImpl;
 use coordinode_storage::engine::config::{
     Durability, EndpointConfig, Media, StorageConfig, SyncMethod, Tier,
 };
-use coordinode_storage::engine::core::StorageEngine;
-use coordinode_test_fixtures::{TestPki, alloc_port, serve_member_port};
+use coordinode_storage::engine::core::Deployment;
+use coordinode_test_fixtures::{TestPki, alloc_port, serve_member_listener, serve_peers_until};
 use parking_lot::RwLock;
 
 /// The CA the nodes are issued their identities by.
@@ -48,7 +48,9 @@ struct Node {
 }
 
 /// Open node `node_id` on `port`: founding a group, or joining the one of
-/// the founder given with its port.
+/// the founder given with its port, which adds it as a learner; a joiner
+/// serves its peers until its namespace has arrived, and its database from
+/// then on.
 async fn open_node(
     node_id: u64,
     port: u16,
@@ -65,7 +67,12 @@ async fn open_node(
         Tier::Warm,
     )]);
     config.oplog_sync_method = sync;
-    let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open"));
+    let deployment = Deployment::open_with_oracle(&config, oracle.clone()).expect("open");
+    // A founder starts the store's namespace; a joiner receives its group's.
+    let engine = Arc::new(match founder {
+        None => deployment.single_store().expect("the store's namespace"),
+        Some(_) => deployment.member_engine(),
+    });
     let connections = PKI.connections(node_id);
     let (raft, raft_handler) = match founder {
         None => RaftNode::open_cluster_embedded(
@@ -87,22 +94,48 @@ async fn open_node(
         }
     };
     let raft = Arc::new(raft);
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    let context = Arc::clone(raft.connections().expect("peers").context());
+    let listener = match founder {
+        None => tokio::net::TcpListener::bind(addr).await.expect("bind"),
+        Some((founder, _)) => {
+            serve_peers_until(
+                addr,
+                &context,
+                tonic::service::Routes::new(RaftServiceServer::new(raft_handler.clone())),
+                async {
+                    // A membership change needs a leader to take it.
+                    while !founder.raft.is_leader().await {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    founder
+                        .raft
+                        .add_node(node_id, format!("127.0.0.1:{port}"), PKI.identity(node_id))
+                        .await
+                        .expect("add the joiner");
+                    let mut applied = raft.subscribe_applied();
+                    while !engine.try_bind().expect("the joiner's catalog") {
+                        applied.changed().await.expect("the joiner's consensus");
+                    }
+                },
+            )
+            .await
+            .0
+        }
+    };
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(RaftProposalPipeline::new(Arc::clone(raft.raft())));
     let db = Arc::new(RwLock::new(
         Database::from_engine(dir.path(), engine, oracle, pipeline).expect("database"),
     ));
     let cypher = CypherServiceImpl::new(Arc::clone(&db)).with_raft_node(Arc::clone(&raft));
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let context = Arc::clone(raft.connections().expect("peers").context());
-    serve_member_port(
-        addr,
+    serve_member_listener(
+        listener,
         &context,
         tonic::service::Routes::new(RaftServiceServer::new(raft_handler)).add_service(
             query::cypher_service_server::CypherServiceServer::new(cypher),
         ),
-    )
-    .await;
+    );
     Node { db, raft, dir }
 }
 
@@ -408,18 +441,6 @@ fn main() {
         let n1 = open_node(1, ports[0], None, sync).await;
         let n2 = open_node(2, ports[1], Some((&n1, ports[0])), sync).await;
         let n3 = open_node(3, ports[2], Some((&n1, ports[0])), sync).await;
-        for _ in 0..150 {
-            if n1.raft.is_leader().await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        for (id, port) in [(2u64, ports[1]), (3, ports[2])] {
-            n1.raft
-                .add_node(id, format!("127.0.0.1:{port}"), PKI.identity(id))
-                .await
-                .expect("add");
-        }
         n1.raft
             .change_membership(vec![1, 2, 3])
             .await

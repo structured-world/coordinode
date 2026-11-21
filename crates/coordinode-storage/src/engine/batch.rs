@@ -231,7 +231,7 @@ impl<'a> WriteBatch<'a> {
     pub(crate) fn with_capacity(engine: &'a StorageEngine, capacity: usize) -> Self {
         Self {
             engine,
-            sets: smallvec::smallvec![Arc::clone(engine.set())],
+            sets: smallvec::smallvec![engine.batch_set()],
             current: 0,
             mutations: Vec::with_capacity(capacity),
         }

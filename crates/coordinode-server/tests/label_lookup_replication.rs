@@ -14,9 +14,11 @@ use coordinode_raft::cluster::{ElectionTiming, NodeOptions, RaftNode};
 use coordinode_raft::proposal::RaftProposalPipeline;
 use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::core::Deployment;
 
-use coordinode_test_fixtures::{TestPki, alloc_port, serve_member_port};
+use coordinode_test_fixtures::{
+    TestPki, alloc_port, serve_member_listener, serve_member_port, serve_peers_until,
+};
 
 /// The CA the nodes are issued their identities by.
 static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
@@ -28,7 +30,9 @@ struct Node {
 }
 
 /// Open node `node_id` on `port`: founding a group, or joining the one of
-/// the founder given with its port.
+/// the founder given with its port, which adds it as a learner; a joiner
+/// serves its peers until its namespace has arrived, and its database from
+/// then on.
 async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
@@ -39,7 +43,12 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> No
         Durability::Durable,
         Tier::Warm,
     )]);
-    let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
+    let deployment = Deployment::open_with_oracle(&config, oracle.clone()).unwrap();
+    // A founder starts the store's namespace; a joiner receives its group's.
+    let engine = Arc::new(match founder {
+        None => deployment.single_store().unwrap(),
+        Some(_) => deployment.member_engine(),
+    });
     // The test is about what a follower reads, not about failover: a leader
     // that misses a few heartbeats on a host short of CPU keeps its group,
     // where the rack profile would hand leadership over in the middle of a
@@ -81,17 +90,36 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> No
         }
     };
     let raft = Arc::new(raft);
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let context = Arc::clone(raft.connections().unwrap().context());
+    let routes = tonic::service::Routes::new(RaftServiceServer::new(raft_handler));
+    match founder {
+        None => {
+            serve_member_port(addr, &context, routes).await;
+        }
+        Some((founder, _)) => {
+            let (listener, ()) = serve_peers_until(addr, &context, routes.clone(), async {
+                // A membership change needs a leader to take it.
+                while !founder.raft.is_leader().await {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                founder
+                    .raft
+                    .add_node(node_id, format!("127.0.0.1:{port}"), PKI.identity(node_id))
+                    .await
+                    .unwrap();
+                let mut applied = raft.subscribe_applied();
+                while !engine.try_bind().unwrap() {
+                    applied.changed().await.unwrap();
+                }
+            })
+            .await;
+            serve_member_listener(listener, &context, routes);
+        }
+    }
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(RaftProposalPipeline::new(Arc::clone(raft.raft())));
     let db = Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap();
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let context = Arc::clone(raft.connections().unwrap().context());
-    serve_member_port(
-        addr,
-        &context,
-        tonic::service::Routes::new(RaftServiceServer::new(raft_handler)),
-    )
-    .await;
     Node {
         db,
         raft,
@@ -121,11 +149,6 @@ async fn a_follower_scans_a_label_from_its_replicated_lookup() {
     let (p1, p2) = (alloc_port(), alloc_port());
     let mut n1 = open_node(1, p1, None).await;
     let mut n2 = open_node(2, p2, Some((&n1, p1))).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    n1.raft
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     n1.raft.change_membership(vec![1, 2]).await.unwrap();
     // The leader provisions the lookup, as the server's resumer does.
     n1.db.resume_interrupted_index_builds().expect("provision");

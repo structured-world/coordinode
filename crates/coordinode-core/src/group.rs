@@ -82,16 +82,30 @@ impl fmt::Display for DeploymentId {
     }
 }
 
-/// Schema-partition key of the deployment's identity record.
+/// Deployment-partition key of the deployment's identity record. A
+/// member's own: a copy of the store carries the domain on its own, and the
+/// receiver checks it against what it was enrolled in.
 pub const DEPLOYMENT_KEY: &[u8] = b"meta:deployment";
 
-/// Schema-partition key recording the deployment a joining store is bound
-/// to, before or without the deployment's own record reaching it.
+/// Deployment-partition key recording the deployment a joining store is
+/// bound to, before or without the deployment's own record reaching it.
 pub const ENROLLED_DEPLOYMENT_KEY: &[u8] = b"raft:enrolled_deployment";
 
-/// Schema-partition prefix of retired node identities; the key ends with
-/// the identity's canonical encoding.
-pub const RETIRED_IDENTITY_KEY_PREFIX: &[u8] = b"meta:retired_identity:";
+/// Deployment-partition prefix of the records a group's state machine
+/// writes as it applies the group's entries: group state, which a copy of
+/// the store carries to a member it catches up, unlike a member's own
+/// records (`meta:`, `raft:`).
+pub const GROUP_RECORD_PREFIX: &[u8] = b"group:";
+
+/// Whether `key` of the deployment partition is a [group record](GROUP_RECORD_PREFIX).
+pub fn is_group_record(key: &[u8]) -> bool {
+    key.starts_with(GROUP_RECORD_PREFIX)
+}
+
+/// Deployment-partition prefix of retired node identities, a
+/// [group record](GROUP_RECORD_PREFIX); the key ends with the identity's
+/// canonical encoding.
+pub const RETIRED_IDENTITY_KEY_PREFIX: &[u8] = b"group:retired_identity:";
 
 /// The key recording that `identity` (canonically encoded) was retired.
 pub fn retired_identity_key(identity: &[u8]) -> alloc::vec::Vec<u8> {

@@ -42,7 +42,7 @@ use openraft::async_runtime::watch::WatchReceiver as _;
 /// Hard timeout for cluster tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine, member_engine_at};
 
 /// The CA the members of a test's group prove their identities under.
 static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
@@ -139,8 +139,7 @@ async fn create_follower_limited(
     hard_limit: u64,
 ) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
-    let engine =
-        Arc::new(StorageEngine::open(&node_storage(dir.path(), hard_limit)).expect("open"));
+    let engine = member_engine(&node_storage(dir.path(), hard_limit));
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
 
     let node = RaftNode::open_joining(
@@ -1303,26 +1302,8 @@ async fn cluster_crash_recovery() {
                 )]))
                 .expect("open 1"),
             );
-            let e2 = Arc::new(
-                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                    "default",
-                    &path2,
-                    Media::Hdd,
-                    Durability::Durable,
-                    Tier::Warm,
-                )]))
-                .expect("open 2"),
-            );
-            let e3 = Arc::new(
-                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                    "default",
-                    &path3,
-                    Media::Hdd,
-                    Durability::Durable,
-                    Tier::Warm,
-                )]))
-                .expect("open 3"),
-            );
+            let e2 = member_engine_at(&path2);
+            let e3 = member_engine_at(&path3);
 
             let n1 = RaftNode::open_cluster(
                 1,
@@ -2165,16 +2146,7 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
         // Now add a NEW node that has never seen any data.
         // The leader's logs are purged, so it MUST send a snapshot via gRPC.
         let dir2 = tempfile::tempdir().expect("d2");
-        let e2 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir2.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open2"),
-        );
+        let e2 = member_engine_at(dir2.path());
 
         let n2 = RaftNode::open_joining(
             2,
@@ -2316,7 +2288,7 @@ async fn a_snapshot_carries_the_sealed_index_inventory() {
             tempfile::tempdir().expect("d1"),
             tempfile::tempdir().expect("d2"),
         );
-        let (e1, e2) = (open(dir1.path()), open(dir2.path()));
+        let (e1, e2) = (open(dir1.path()), member_engine_at(dir2.path()));
         let leader_layer = InventoryRecorder::new(b"leader inventory");
         let member_layer = InventoryRecorder::new(b"member inventory");
         e1.set_index_copy_qualifier(Arc::clone(&leader_layer) as _);
@@ -2444,18 +2416,7 @@ async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
         let n1 = create_leader(1, p1).await;
         let n2 = create_follower(2, p2, &n1).await;
         let dir3 = tempfile::tempdir().expect("d3");
-        let open3 = || {
-            Arc::new(
-                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                    "default",
-                    dir3.path(),
-                    Media::Hdd,
-                    Durability::Durable,
-                    Tier::Warm,
-                )]))
-                .expect("open3"),
-            )
-        };
+        let open3 = || member_engine_at(dir3.path());
         let e3 = open3();
         let n3 = RaftNode::open_joining(
             3,
@@ -2992,16 +2953,7 @@ async fn cluster_snapshot_multi_chunk_transfer() {
 
         // Add new node — must receive snapshot via chunked gRPC transfer
         let dir2 = tempfile::tempdir().expect("d2");
-        let e2 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir2.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open2"),
-        );
+        let e2 = member_engine_at(dir2.path());
 
         let n2 = RaftNode::open_joining(
             2,
@@ -3090,26 +3042,8 @@ async fn cluster_follower_restart_reconnection() {
             .expect("open1"),
         );
         let e2_dir = tempfile::tempdir().expect("d2");
-        let e2 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                e2_dir.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open2"),
-        );
-        let e3 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                &path3,
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open3"),
-        );
+        let e2 = member_engine_at(e2_dir.path());
+        let e3 = member_engine_at(&path3);
 
         // Bootstrap 3-node cluster
         let n1 = RaftNode::open_cluster(
@@ -3376,8 +3310,8 @@ async fn a_member_that_lost_committed_entries_votes_again_only_once_caught_up() 
             tempfile::tempdir().expect("d3"),
         ];
         let e1 = open_engine_at(dirs[0].path());
-        let e2 = open_engine_at(dirs[1].path());
-        let e3 = open_engine_at(dirs[2].path());
+        let e2 = member_engine_at(dirs[1].path());
+        let e3 = member_engine_at(dirs[2].path());
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -3542,8 +3476,8 @@ async fn a_member_that_lost_its_raft_tree_keeps_its_promise() {
             tempfile::tempdir().expect("d3"),
         ];
         let e1 = open_engine_at(dirs[0].path());
-        let e2 = open_engine_at(dirs[1].path());
-        let e3 = open_engine_at(dirs[2].path());
+        let e2 = member_engine_at(dirs[1].path());
+        let e3 = member_engine_at(dirs[2].path());
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&e1),
@@ -3716,8 +3650,8 @@ async fn a_member_without_its_promise_is_replaced_under_a_new_identity() {
             tempfile::tempdir().expect("d4"),
         ];
         let e1 = open_engine_at(dirs[0].path());
-        let e2 = open_engine_at(dirs[1].path());
-        let e3 = open_engine_at(dirs[2].path());
+        let e2 = member_engine_at(dirs[1].path());
+        let e3 = member_engine_at(dirs[2].path());
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&e1),
@@ -3822,7 +3756,7 @@ async fn a_member_without_its_promise_is_replaced_under_a_new_identity() {
         let damaged = listing(dirs[2].path());
 
         // Its replacement: a new node, a new identity, its own directory.
-        let e4 = open_engine_at(dirs[3].path());
+        let e4 = member_engine_at(dirs[3].path());
         let n4 = RaftNode::open_joining(
             4,
             Arc::clone(&e4),
@@ -3948,8 +3882,8 @@ async fn a_replacement_cut_short_in_its_catch_up_is_resumed_by_the_next_leader()
             tempfile::tempdir().expect("d4"),
         ];
         let e1 = open_engine_at(dirs[0].path());
-        let e2 = open_engine_at(dirs[1].path());
-        let e3 = open_engine_at(dirs[2].path());
+        let e2 = member_engine_at(dirs[1].path());
+        let e3 = member_engine_at(dirs[2].path());
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&e1),
@@ -4020,7 +3954,7 @@ async fn a_replacement_cut_short_in_its_catch_up_is_resumed_by_the_next_leader()
         lose_the_copy(dirs[2].path());
 
         // Member 4 joins as a learner, then goes down and falls behind.
-        let e4 = open_engine_at(dirs[3].path());
+        let e4 = member_engine_at(dirs[3].path());
         let n4 = RaftNode::open_joining(
             4,
             Arc::clone(&e4),
@@ -4142,8 +4076,8 @@ async fn a_replacement_cut_short_in_its_joint_configuration_is_completed_by_the_
             tempfile::tempdir().expect("d4"),
         ];
         let e1 = open_engine_at(dirs[0].path());
-        let e2 = open_engine_at(dirs[1].path());
-        let e3 = open_engine_at(dirs[2].path());
+        let e2 = member_engine_at(dirs[1].path());
+        let e3 = member_engine_at(dirs[2].path());
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&e1),
@@ -4212,7 +4146,7 @@ async fn a_replacement_cut_short_in_its_joint_configuration_is_completed_by_the_
         lose_the_copy(dirs[2].path());
 
         // Member 4 joins as a learner and catches up.
-        let e4 = open_engine_at(dirs[3].path());
+        let e4 = member_engine_at(dirs[3].path());
         let n4 = RaftNode::open_joining(
             4,
             Arc::clone(&e4),
@@ -4346,8 +4280,8 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_promote_another_memb
             tempfile::tempdir().expect("d4b"),
         ];
         let e1 = open_engine_at(dirs[0].path());
-        let e2 = open_engine_at(dirs[1].path());
-        let e3 = open_engine_at(dirs[2].path());
+        let e2 = member_engine_at(dirs[1].path());
+        let e3 = member_engine_at(dirs[2].path());
         let n1 = Arc::new(
             RaftNode::open_cluster(
                 1,
@@ -4389,7 +4323,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_promote_another_memb
             .expect("membership");
 
         // 4 joins under identity A, then stops and falls behind.
-        let e4 = open_engine_at(dirs[3].path());
+        let e4 = member_engine_at(dirs[3].path());
         let n4a = RaftNode::open_joining(
             4,
             Arc::clone(&e4),
@@ -4446,7 +4380,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_promote_another_memb
         )
         .await
         .expect("add 4 under B");
-        let e4b = open_engine_at(dirs[4].path());
+        let e4b = member_engine_at(dirs[4].path());
         let n4b = RaftNode::open_joining(
             4,
             Arc::clone(&e4b),
@@ -4542,8 +4476,8 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_remove_another_membe
             tempfile::tempdir().expect("d4"),
         ];
         let e1 = open_engine_at(dirs[0].path());
-        let e2 = open_engine_at(dirs[1].path());
-        let e3 = open_engine_at(dirs[2].path());
+        let e2 = member_engine_at(dirs[1].path());
+        let e3 = member_engine_at(dirs[2].path());
         let n1 = Arc::new(
             RaftNode::open_cluster(
                 1,
@@ -4585,7 +4519,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_remove_another_membe
             .expect("membership");
 
         // 4 joins under identity A, then stops and falls behind.
-        let e4 = open_engine_at(dirs[4].path());
+        let e4 = member_engine_at(dirs[4].path());
         let n4a = RaftNode::open_joining(
             4,
             Arc::clone(&e4),
@@ -4647,7 +4581,7 @@ async fn a_replacement_waiting_out_a_leader_change_does_not_remove_another_membe
         )
         .await
         .expect("add 3 under D");
-        let e3d = open_engine_at(dirs[3].path());
+        let e3d = member_engine_at(dirs[3].path());
         let n3d = RaftNode::open_joining(
             3,
             Arc::clone(&e3d),
@@ -4726,7 +4660,18 @@ impl LeftInJoint {
             tempfile::tempdir().expect("d3"),
             tempfile::tempdir().expect("d4"),
         ];
-        let engines: Vec<_> = dirs.iter().map(|d| open_engine_at(d.path())).collect();
+        // Member 1 forms the group; the others join it.
+        let engines: Vec<_> = dirs
+            .iter()
+            .enumerate()
+            .map(|(at, d)| {
+                if at == 0 {
+                    open_engine_at(d.path())
+                } else {
+                    member_engine_at(d.path())
+                }
+            })
+            .collect();
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&engines[0]),
@@ -4952,7 +4897,12 @@ async fn a_group_that_lost_a_quorum_of_promises_stays_unavailable() {
             tempfile::tempdir().expect("d3"),
             tempfile::tempdir().expect("d4"),
         ];
-        let engines: Vec<_> = dirs[..3].iter().map(|d| open_engine_at(d.path())).collect();
+        // Member 1 forms the group; 2 and 3 join it.
+        let engines = vec![
+            open_engine_at(dirs[0].path()),
+            member_engine_at(dirs[1].path()),
+            member_engine_at(dirs[2].path()),
+        ];
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&engines[0]),
@@ -5029,7 +4979,7 @@ async fn a_group_that_lost_a_quorum_of_promises_stays_unavailable() {
         }
 
         // Member 1 alone has no quorum to change the membership with.
-        let e4 = open_engine_at(dirs[3].path());
+        let e4 = member_engine_at(dirs[3].path());
         let n4 = RaftNode::open_joining(
             4,
             Arc::clone(&e4),
@@ -5104,26 +5054,8 @@ async fn cluster_graceful_leader_transfer() {
             )]))
             .expect("open1"),
         );
-        let e2 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir2.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open2"),
-        );
-        let e3 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir3.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open3"),
-        );
+        let e2 = member_engine_at(dir2.path());
+        let e3 = member_engine_at(dir3.path());
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -5266,21 +5198,12 @@ async fn a_transfer_to_a_stopped_member_ends_when_another_leads() {
             tempfile::tempdir().expect("d2"),
             tempfile::tempdir().expect("d3"),
         ];
-        let engines: Vec<Arc<StorageEngine>> = dirs
-            .iter()
-            .map(|d| {
-                Arc::new(
-                    StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                        "default",
-                        d.path(),
-                        Media::Hdd,
-                        Durability::Durable,
-                        Tier::Warm,
-                    )]))
-                    .expect("open engine"),
-                )
-            })
-            .collect();
+        // Member 1 forms the group; 2 and 3 join it.
+        let engines: Vec<Arc<StorageEngine>> = vec![
+            open_engine_at(dirs[0].path()),
+            member_engine_at(dirs[1].path()),
+            member_engine_at(dirs[2].path()),
+        ];
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -5435,26 +5358,8 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
             )]))
             .expect("open1"),
         );
-        let e2 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir2.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open2"),
-        );
-        let e3 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir3.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open3"),
-        );
+        let e2 = member_engine_at(dir2.path());
+        let e3 = member_engine_at(dir3.path());
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -5531,14 +5436,17 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
             (&n3, 2)
         };
         // Asked well inside an election timeout of the stopped member's last
-        // acknowledgement, while it still counts as live.
-        let mut target = None;
-        for _ in 0..5 {
+        // acknowledgement, while it still counts as live: within half the
+        // shortest one. The stopped member may have acknowledged the new
+        // term's first entry before the running one did, and then holds the
+        // longer log until the running one acknowledges it, a heartbeat
+        // later on a loaded host.
+        let window = Duration::from_millis(leader.raft().config().election_timeout_min) / 2;
+        let asked = std::time::Instant::now();
+        let mut target = leader.find_transfer_target();
+        while target != Some(other) && asked.elapsed() < window {
+            tokio::time::sleep(Duration::from_millis(10)).await;
             target = leader.find_transfer_target();
-            if target == Some(other) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(
             target,
@@ -5654,16 +5562,7 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         // ── New node joins (zero data) ──
         // Must receive: snapshot (pre-data) + log replay (post-data)
         let dir2 = tempfile::tempdir().expect("d2");
-        let e2 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir2.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open2"),
-        );
+        let e2 = member_engine_at(dir2.path());
         let n2 = RaftNode::open_joining(
             2,
             Arc::clone(&e2),
@@ -5748,26 +5647,8 @@ async fn cluster_replication_status_tracking() {
             )]))
             .expect("open1"),
         );
-        let e2 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir2.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open2"),
-        );
-        let e3 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir3.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open3"),
-        );
+        let e2 = member_engine_at(dir2.path());
+        let e3 = member_engine_at(dir3.path());
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -5937,26 +5818,8 @@ async fn cluster_read_concern_levels() {
             )]))
             .expect("open1"),
         );
-        let e2 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir2.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open2"),
-        );
-        let e3 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir3.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open3"),
-        );
+        let e2 = member_engine_at(dir2.path());
+        let e3 = member_engine_at(dir3.path());
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -6103,26 +5966,8 @@ async fn cluster_write_concern_w0_vs_majority() {
             )]))
             .expect("open1"),
         );
-        let e2 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir2.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open2"),
-        );
-        let e3 = Arc::new(
-            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir3.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]))
-            .expect("open3"),
-        );
+        let e2 = member_engine_at(dir2.path());
+        let e3 = member_engine_at(dir3.path());
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -6278,8 +6123,8 @@ async fn cluster_write_concern_acks_counts_members() {
             )
         };
         let e1 = open(dir1.path());
-        let e2 = open(dir2.path());
-        let e3 = open(dir3.path());
+        let e2 = member_engine_at(dir2.path());
+        let e3 = member_engine_at(dir3.path());
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -7344,12 +7189,15 @@ fn dictionary_of(engine: &StorageEngine, names: &[&str]) -> Vec<(String, Option<
         .collect()
 }
 
-/// Block until `engine` binds every one of `names`.
+/// Block until `engine` binds every one of `names`. A joining member's
+/// engine holds no namespace until its group's catalog arrives: nothing is
+/// bound before.
 async fn await_bound(engine: &StorageEngine, names: &[&str], what: &str) {
     await_condition(Duration::from_secs(20), what, || {
-        dictionary_of(engine, names)
-            .iter()
-            .all(|(_, id)| id.is_some())
+        engine.is_bound()
+            && dictionary_of(engine, names)
+                .iter()
+                .all(|(_, id)| id.is_some())
     })
     .await;
 }
@@ -7792,7 +7640,7 @@ async fn a_member_bootstrapped_from_a_snapshot_continues_the_dictionary() {
             .expect("register after the snapshot");
 
         let dir2 = tempfile::tempdir().expect("d2");
-        let e2 = open(&dir2);
+        let e2 = member_engine_at(dir2.path());
         let n2 = RaftNode::open_joining(
             2,
             Arc::clone(&e2),
@@ -8030,9 +7878,11 @@ async fn kept_cardinality_counts_are_the_same_on_every_member() {
 // ── Closed bound ────────────────────────────────────────────────────
 
 /// A store opened with a clock of its own, which the leader stamps each
-/// entry's closed bound from.
+/// entry's closed bound from: a joining member's (`joins`), whose namespace
+/// arrives with its group's catalog, or one that starts or keeps its own.
 fn clocked_engine(
     dir: &std::path::Path,
+    joins: bool,
 ) -> (
     Arc<StorageEngine>,
     Arc<coordinode_core::txn::timestamp::TimestampOracle>,
@@ -8045,9 +7895,17 @@ fn clocked_engine(
         Tier::Warm,
     )]);
     let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let engine =
-        Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open"));
-    (engine, oracle)
+    let deployment = coordinode_storage::engine::core::Deployment::open_with_oracle(
+        &config,
+        Arc::clone(&oracle),
+    )
+    .expect("open");
+    let engine = if joins {
+        deployment.member_engine()
+    } else {
+        deployment.single_store().expect("the store's namespace")
+    };
+    (Arc::new(engine), oracle)
 }
 
 /// Propose one node write through `node`'s pipeline at a timestamp taken
@@ -8152,7 +8010,7 @@ async fn open_clocked(
     port: u16,
     joining: Option<Enrollment>,
 ) -> Clocked {
-    let (engine, oracle) = clocked_engine(dir);
+    let (engine, oracle) = clocked_engine(dir, joining.is_some());
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let mut opened = None;
     let mut last = None;
@@ -8643,8 +8501,8 @@ async fn an_idle_group_closes_past_its_last_commit() {
             tempfile::tempdir().expect("tempdir"),
             tempfile::tempdir().expect("tempdir"),
         );
-        let (e1, o1) = clocked_engine(d1.path());
-        let (e2, _o2) = clocked_engine(d2.path());
+        let (e1, o1) = clocked_engine(d1.path(), false);
+        let (e2, _o2) = clocked_engine(d2.path(), true);
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&e1),
@@ -8715,7 +8573,7 @@ async fn an_idle_group_closes_past_its_last_commit() {
 async fn a_timestamp_below_the_closed_bound_is_refused() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (engine, oracle) = clocked_engine(dir.path());
+        let (engine, oracle) = clocked_engine(dir.path(), false);
         let node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
             .await
             .expect("open");
@@ -8771,7 +8629,7 @@ async fn the_closed_bound_survives_a_restart() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let dir = tempfile::tempdir().expect("tempdir");
         let closed = {
-            let (engine, oracle) = clocked_engine(dir.path());
+            let (engine, oracle) = clocked_engine(dir.path(), false);
             let node =
                 RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
                     .await
@@ -8792,7 +8650,7 @@ async fn the_closed_bound_survives_a_restart() {
             closed
         };
 
-        let (engine, oracle) = clocked_engine(dir.path());
+        let (engine, oracle) = clocked_engine(dir.path(), false);
         let _node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
             .await
             .expect("reopen");

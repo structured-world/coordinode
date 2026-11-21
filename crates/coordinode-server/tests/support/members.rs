@@ -21,10 +21,10 @@ use coordinode_server::services::session::SessionSvc;
 use coordinode_server::services::statement::StatementExecutor;
 use coordinode_session::SessionRegistry;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::core::Deployment;
 use parking_lot::RwLock;
 
-use coordinode_test_fixtures::{TestPki, alloc_port, serve_member_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, serve_member_listener, serve_peers_until};
 
 /// The CA the members are issued their identities by.
 pub static PKI: std::sync::LazyLock<TestPki> = std::sync::LazyLock::new(TestPki::new);
@@ -38,7 +38,8 @@ pub struct Node {
 }
 
 /// Open a member serving on `port`. It joins the group of `founder`, which
-/// listens on the port given with it; without one it founds a group.
+/// listens on the port given with it and adds it as a learner; without one
+/// it founds a group.
 pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
@@ -49,31 +50,71 @@ pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -
         Durability::Durable,
         Tier::Warm,
     )]);
-    let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
+    let deployment = Deployment::open_with_oracle(&config, oracle.clone()).unwrap();
+    // A founder starts the store's namespace; a joiner receives its group's.
+    let engine = Arc::new(match founder {
+        None => deployment.single_store().unwrap(),
+        Some(_) => deployment.member_engine(),
+    });
     let connections = PKI.connections(node_id);
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let (raft, raft_handler) = match founder {
-        None => RaftNode::open_cluster_embedded(
-            node_id,
-            Arc::clone(&engine),
-            format!("127.0.0.1:{port}"),
-            connections,
-        )
-        .await
-        .unwrap(),
+    let (raft, raft_handler, listener) = match founder {
+        None => {
+            let (raft, handler) = RaftNode::open_cluster_embedded(
+                node_id,
+                Arc::clone(&engine),
+                format!("127.0.0.1:{port}"),
+                connections,
+            )
+            .await
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            (Arc::new(raft), handler, listener)
+        }
         // A joining member learns its own advertised address from the
-        // leader's add_node call, so it takes none here.
+        // leader's add_node call, so it takes none here. It serves its
+        // peers until the leader has added it and its namespace has
+        // arrived, and its clients from then on.
         Some((founder, founder_port)) => {
             let enrollment = founder
                 .raft
                 .enrollment(format!("127.0.0.1:{founder_port}"))
                 .unwrap();
-            RaftNode::open_joining_embedded(node_id, Arc::clone(&engine), connections, enrollment)
-                .await
-                .unwrap()
+            let (raft, handler) = RaftNode::open_joining_embedded(
+                node_id,
+                Arc::clone(&engine),
+                connections,
+                enrollment,
+            )
+            .await
+            .unwrap();
+            let raft = Arc::new(raft);
+            let context = Arc::clone(raft.connections().unwrap().context());
+            let (listener, ()) = serve_peers_until(
+                addr,
+                &context,
+                tonic::service::Routes::new(RaftServiceServer::new(handler.clone())),
+                async {
+                    // A membership change needs a leader to take it.
+                    while !founder.raft.is_leader().await {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    founder
+                        .raft
+                        .add_node(node_id, format!("127.0.0.1:{port}"), PKI.identity(node_id))
+                        .await
+                        .unwrap();
+                    let mut applied = raft.subscribe_applied();
+                    while !engine.try_bind().unwrap() {
+                        applied.changed().await.unwrap();
+                    }
+                },
+            )
+            .await;
+            (raft, handler, listener)
         }
     };
-    let raft = Arc::new(raft);
 
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(RaftProposalPipeline::new(Arc::clone(raft.raft())));
@@ -91,10 +132,9 @@ pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -
         CommandRoutingHandler::new(Arc::new(ServerCommandExecutor::new(executor.clone())))
             .into_service(MAX_ROUTED_MESSAGE);
 
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let context = Arc::clone(raft.connections().unwrap().context());
-    serve_member_port(
-        addr,
+    serve_member_listener(
+        listener,
         &context,
         tonic::service::Routes::new(RaftServiceServer::new(raft_handler))
             .add_service(query::cypher_service_server::CypherServiceServer::new(
@@ -107,8 +147,7 @@ pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -
                 sessions,
             ))
             .add_service(routing),
-    )
-    .await;
+    );
 
     Node {
         db,
@@ -124,11 +163,6 @@ pub async fn leader_and_follower() -> ((Node, u16), (Node, u16)) {
     let (p1, p2) = (alloc_port(), alloc_port());
     let n1 = open_node(1, p1, None).await;
     let n2 = open_node(2, p2, Some((&n1, p1))).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    n1.raft
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     n1.raft.change_membership(vec![1, 2]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(800)).await;
     ((n1, p1), (n2, p2))

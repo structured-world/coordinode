@@ -750,3 +750,65 @@ fn rows_of_a_dropped_namespace_are_left_out_on_apply_and_replay() {
     let b = deployment.engine(b_id).expect("b after the crash");
     assert_eq!(node(&b, b"k").as_deref(), Some(&b"b"[..]));
 }
+
+/// A store that created a namespace, even an empty one, or dropped it again,
+/// has a history of its own a group it joins would have to lose: only a
+/// store that never created one is free to join. Without the check an empty
+/// `default` passed as nothing, and the joiner's catalog was overwritten.
+#[test]
+fn a_created_namespace_is_local_state_even_empty() {
+    let dir = TempDir::new().expect("tmp");
+    let (deployment, _) = open_deployment(&durable_cfg(&dir));
+    assert!(
+        !deployment
+            .holds_local_state()
+            .expect("read the fresh store"),
+        "a store that never created a namespace holds nothing of its own"
+    );
+
+    deployment.create_namespace("scratch").expect("create");
+    assert!(
+        !deployment.holds_user_data().expect("read"),
+        "an empty namespace holds no data"
+    );
+    assert!(
+        deployment.holds_local_state().expect("read"),
+        "an empty namespace is still the store's own"
+    );
+
+    deployment.drop_namespace("scratch").expect("drop");
+    assert!(
+        deployment.holds_local_state().expect("read"),
+        "a namespace dropped here was still created here"
+    );
+}
+
+/// A member that joins a group opens with no namespace: its engine reaches
+/// the deployment's records at once and binds to the namespace its group's
+/// catalog brings on its first use after that.
+#[test]
+fn a_member_engine_binds_to_the_namespace_its_catalog_brings() {
+    let dir = TempDir::new().expect("tmp");
+    let (deployment, _) = open_deployment(&durable_cfg(&dir));
+    let member = deployment.member_engine();
+    assert!(
+        deployment.live_namespaces().expect("catalog").is_empty(),
+        "a member's engine creates no namespace"
+    );
+    member
+        .put(Partition::Deployment, b"raft:sm:applied", b"1")
+        .expect("the deployment's records need no namespace");
+    assert!(matches!(
+        member.get(Partition::Node, b"k"),
+        Err(StorageError::NoNamespace { .. })
+    ));
+
+    // The catalog arrives: the next use binds to its one namespace.
+    let id = deployment
+        .create_namespace(DEFAULT_NAMESPACE)
+        .expect("create");
+    member.put(Partition::Node, b"k", b"v").expect("put");
+    assert_eq!(member.namespace(), id);
+    let named = deployment.engine(id).expect("engine");
+    assert_eq!(node(&named, b"k").as_deref(), Some(&b"v"[..]));
+}

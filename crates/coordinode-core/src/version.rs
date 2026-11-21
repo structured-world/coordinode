@@ -135,9 +135,10 @@ impl core::fmt::Display for Mismatch {
     }
 }
 
-/// Schema-partition prefix of the group's pair records; the key ends with
-/// the record number, big-endian, so the last record sorts last.
-pub const GROUP_PAIR_KEY_PREFIX: &[u8] = b"meta:group_pair:";
+/// Deployment-partition prefix of the group's pair records, a
+/// [group record](crate::group::GROUP_RECORD_PREFIX); the key ends with the
+/// record number, big-endian, so the last record sorts last.
+pub const GROUP_PAIR_KEY_PREFIX: &[u8] = b"group:pair:";
 
 /// The key of group pair record `seq`.
 pub fn group_pair_key(seq: u64) -> Vec<u8> {

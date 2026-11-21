@@ -55,7 +55,12 @@ async fn group(pki: &TestPki) -> Vec<Member> {
     let mut members: Vec<Member> = Vec::new();
     for (i, port) in ports.iter().enumerate() {
         let dir = tempfile::tempdir().expect("dir");
-        let engine = open_engine(dir.path());
+        // Member 1 forms the group; the others join it.
+        let engine = if i == 0 {
+            open_engine(dir.path())
+        } else {
+            coordinode_test_fixtures::member_engine_at(dir.path())
+        };
         let listen = format!("127.0.0.1:{port}").parse().expect("addr");
         let id = i as u64 + 1;
         let node = match members.first() {

@@ -347,6 +347,72 @@ pub async fn serve_member_port(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind the member port");
+    serve_member_listener(listener, context, routes)
+}
+
+/// Serve `peer_routes` on `addr` until `joined` completes, then hand back
+/// the port, still bound, with what `joined` gave. A joining member serves
+/// its peers before its clients, so its group can catch it up, and then
+/// serves every route on the same port ([`serve_member_listener`]).
+///
+/// # Panics
+///
+/// If the port cannot be bound or its TLS configured. Test-only.
+pub async fn serve_peers_until<F: core::future::Future>(
+    addr: std::net::SocketAddr,
+    context: &Arc<SecurityContext>,
+    peer_routes: tonic::service::Routes,
+    joined: F,
+) -> (tokio::net::TcpListener, F::Output) {
+    let held = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind the member port")
+        .into_std()
+        .expect("the member port");
+    let early = tokio::net::TcpListener::from_std(held.try_clone().expect("a second handle"))
+        .expect("the member port");
+    let incoming = coordinode_wire::peer::incoming(
+        early,
+        context,
+        coordinode_wire::peer::Accept {
+            inbound: coordinode_wire::peer::InboundAuth::NodeOnly,
+            plaintext_clients: false,
+            handshake_timeout: coordinode_wire::peer::PeerTimeouts::default().handshake,
+            keepalive: coordinode_wire::peer::PeerTimeouts::default().keepalive,
+        },
+    )
+    .expect("the port's TLS configuration");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let peers = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_routes(peer_routes)
+            .serve_with_incoming_shutdown(incoming, async {
+                // A value sent and a dropped sender both mean stop.
+                drop(stopped.await);
+            }),
+    );
+    let output = joined.await;
+    drop(stop);
+    peers
+        .await
+        .expect("the peer listener task")
+        .expect("serve the member's peers");
+    (
+        tokio::net::TcpListener::from_std(held).expect("the member port"),
+        output,
+    )
+}
+
+/// [`serve_member_port`] on a port already bound.
+///
+/// # Panics
+///
+/// If the port's TLS cannot be configured. Test-only.
+pub fn serve_member_listener(
+    listener: tokio::net::TcpListener,
+    context: &Arc<SecurityContext>,
+    routes: tonic::service::Routes,
+) -> tokio::task::JoinHandle<()> {
     let incoming = coordinode_wire::peer::incoming(
         listener,
         context,

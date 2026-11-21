@@ -21,7 +21,7 @@ use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine_at};
 
 struct Member {
     node: RaftNode,
@@ -81,7 +81,7 @@ async fn bootstrap_3() -> (Member, Member, Member) {
     let mut joined = Vec::new();
     for (id, port) in [(2u64, ports[1]), (3, ports[2])] {
         let dir = tempfile::tempdir().expect("dir");
-        let engine = open_engine(&dir);
+        let engine = member_engine_at(dir.path());
         let node = RaftNode::open_joining(
             id,
             Arc::clone(&engine),
@@ -198,10 +198,11 @@ fn entries(engine: &StorageEngine) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-/// Block until `engine` holds exactly `expected`.
+/// Block until `engine` holds exactly `expected`. A joining member's engine
+/// holds no entry before its group's catalog brings its namespace.
 async fn await_entries(engine: &StorageEngine, expected: &[(Vec<u8>, Vec<u8>)], what: &str) {
     for _ in 0..200 {
-        if entries(engine) == expected {
+        if engine.is_bound() && entries(engine) == expected {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -341,7 +342,7 @@ async fn a_member_joining_from_a_snapshot_derives_the_log_tail() {
         propose(&n1, &write_email(&id_gen, 1, "c@x", Some("a@x"), 210));
 
         let dir2 = tempfile::tempdir().expect("d2");
-        let e2 = open_engine(&dir2);
+        let e2 = member_engine_at(dir2.path());
         let n2 = RaftNode::open_joining(
             2,
             Arc::clone(&e2),

@@ -142,11 +142,14 @@ async fn group(dirs: &[tempfile::TempDir]) -> Vec<ReplicatedDatabase> {
     let mut members = vec![founder];
     for (i, dir) in dirs.iter().enumerate().skip(1) {
         let id = i as u64 + 1;
-        members.push(open(id, dir.path(), ports[i], Founding::Join(enrollment.clone())).await);
-        members[0]
-            .add_learner(id, format!("127.0.0.1:{}", ports[i]), PKI.identity(id))
-            .await
-            .expect("add");
+        // A joiner's open returns once it serves, which the leader's adding
+        // it brings about.
+        let (joined, added) = tokio::join!(
+            open(id, dir.path(), ports[i], Founding::Join(enrollment.clone())),
+            members[0].add_learner(id, format!("127.0.0.1:{}", ports[i]), PKI.identity(id)),
+        );
+        added.expect("add");
+        members.push(joined);
         members[0].promote(id).await.expect("promote");
     }
     let deadline = Instant::now() + Duration::from_secs(60);

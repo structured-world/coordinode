@@ -18,7 +18,7 @@ use coordinode_embed::Database;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proposal::RaftProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::core::{Deployment, StorageEngine};
 
 use coordinode_test_fixtures::{TestPki, alloc_port};
 
@@ -34,7 +34,8 @@ struct ClusterNode {
 }
 
 /// Open node `node_id` on `port`: founding a group, or joining the one of
-/// the founder given with its port.
+/// the founder given with its port, which adds it as a learner; a joiner's
+/// database opens once its namespace has arrived.
 async fn open_node(node_id: u64, port: u16, founder: Option<(&ClusterNode, u16)>) -> ClusterNode {
     let dir = tempfile::tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
@@ -45,7 +46,12 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&ClusterNode, u16)>
         Durability::Durable,
         Tier::Warm,
     )]);
-    let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
+    let deployment = Deployment::open_with_oracle(&config, oracle.clone()).unwrap();
+    // A founder starts the store's namespace; a joiner receives its group's.
+    let engine = Arc::new(match founder {
+        None => deployment.single_store().unwrap(),
+        Some(_) => deployment.member_engine(),
+    });
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     let connections = PKI.connections(node_id);
@@ -64,7 +70,7 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&ClusterNode, u16)>
                 ._node
                 .enrollment(format!("127.0.0.1:{founder_port}"))
                 .unwrap();
-            RaftNode::open_joining(
+            let node = RaftNode::open_joining(
                 node_id,
                 Arc::clone(&engine),
                 listen_addr,
@@ -72,7 +78,9 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&ClusterNode, u16)>
                 enrollment,
             )
             .await
-            .unwrap()
+            .unwrap();
+            join(&founder._node, &node, &engine, port).await;
+            node
         }
     };
     let node = Arc::new(node);
@@ -89,6 +97,27 @@ async fn open_node(node_id: u64, port: u16, founder: Option<(&ClusterNode, u16)>
         oracle,
         _node: node,
         _dir: dir,
+    }
+}
+
+/// Have `leader` add `node`, reachable on `port`, as a learner, and wait
+/// until `engine`, its store, holds the group's namespace.
+async fn join(leader: &RaftNode, node: &RaftNode, engine: &StorageEngine, port: u16) {
+    // A membership change needs a leader to take it.
+    while !leader.is_leader().await {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    leader
+        .add_node(
+            node.node_id(),
+            format!("127.0.0.1:{port}"),
+            PKI.identity(node.node_id()),
+        )
+        .await
+        .unwrap();
+    let mut applied = node.subscribe_applied();
+    while !engine.try_bind().unwrap() {
+        applied.changed().await.unwrap();
     }
 }
 
@@ -198,12 +227,6 @@ async fn follower_vector_search_matches_leader() {
 
     let mut n1 = open_node(1, p1, None).await;
     let mut n2 = open_node(2, p2, Some((&n1, p1))).await;
-
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    n1._node
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(800)).await;
 
@@ -378,19 +401,8 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
     let p1 = alloc_port();
     let p2 = alloc_port();
     let mut n1 = open_node(1, p1, None).await;
+    // Opening member 2 adds it, under the leader member 1 is by then.
     let n2 = open_node(2, p2, Some((&n1, p1))).await;
-
-    // A membership change needs a leader; it returns once committed.
-    for _ in 0..150 {
-        if n1._node.is_leader().await {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    n1._node
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
 
     // Rows go in as one parameter: the statement text stays the same, so it
@@ -559,12 +571,6 @@ async fn after_commit_trigger_fires_on_leader_and_replicates_to_follower() {
 
     let mut n1 = open_node(1, p1, None).await;
     let mut n2 = open_node(2, p2, Some((&n1, p1))).await;
-
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    n1._node
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(800)).await;
 
@@ -645,12 +651,6 @@ async fn follower_text_search_follows_leader_commits() {
     let p2 = alloc_port();
     let mut n1 = open_node(1, p1, None).await;
     let mut n2 = open_node(2, p2, Some((&n1, p1))).await;
-
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    n1._node
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
 
     n1.db
@@ -710,12 +710,6 @@ async fn a_follower_that_cannot_fold_answers_from_its_store() {
     let p2 = alloc_port();
     let mut n1 = open_node(1, p1, None).await;
     let mut n2 = open_node(2, p2, Some((&n1, p1))).await;
-
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    n1._node
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
 
     n1.db
@@ -854,11 +848,6 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
         })
     };
 
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    n1._node
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
 
     n1.db

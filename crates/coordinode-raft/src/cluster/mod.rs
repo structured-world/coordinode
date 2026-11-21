@@ -4038,7 +4038,9 @@ fn member_refused(e: crate::storage::MemberCheckError) -> RaftNodeError {
     }
 }
 
-/// Refuse to join a group while this store holds data of its own.
+/// Refuse to join a group while this store holds data of its own, or a
+/// namespace it created, even an empty one: the group's catalog would
+/// replace it.
 ///
 /// What the store holds is what its trees hold plus what its log will replay
 /// into them: after a crash an acknowledged write may live only in the log.
@@ -4065,7 +4067,7 @@ fn refuse_join_with_local_data(
     {
         return Ok(());
     }
-    if engine.holds_user_data().map_err(init)? {
+    if engine.holds_local_state().map_err(init)? {
         return Err(RaftNodeError::JoinWithLocalData);
     }
     if log_store.writes_user_data_from(from).map_err(init)? {
@@ -4089,14 +4091,16 @@ fn refuse_join_with_local_data(
 /// nothing a new member could be caught up from except the snapshot, which
 /// is built from the state machine and therefore carries everything. This
 /// runs only when the group is formed (the open that initialized it) and
-/// only when there is data to publish, so the ordinary empty start does
-/// nothing at all.
+/// only when the store holds a namespace or data: the catalog its first
+/// member started was never in the log either.
 async fn publish_existing_state_as_group_base(
     raft: &RaftInstance,
     engine: &StorageEngine,
 ) -> Result<(), RaftNodeError> {
+    // A namespace counts even empty: the catalog naming it is what a member
+    // added later must receive to serve it.
     if !engine
-        .holds_user_data()
+        .holds_local_state()
         .map_err(|e| RaftNodeError::Init(e.to_string()))?
     {
         return Ok(());

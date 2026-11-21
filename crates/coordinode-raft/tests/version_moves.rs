@@ -31,7 +31,7 @@ use coordinode_raft::read_fence::{ReadConcern, ReadFenceError, ReadPreference};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine_at};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -99,11 +99,14 @@ fn write(
     node.pipeline().propose_and_wait(&proposal).map(|_| ())
 }
 
+/// Whether `engine` holds `key`: a joining member's engine holds nothing
+/// before its group's catalog brings its namespace.
 fn holds(engine: &StorageEngine, key: &str) -> bool {
-    engine
-        .get(Partition::Node, key.as_bytes())
-        .expect("read")
-        .is_some()
+    engine.is_bound()
+        && engine
+            .get(Partition::Node, key.as_bytes())
+            .expect("read")
+            .is_some()
 }
 
 async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
@@ -173,8 +176,8 @@ async fn group_of_three(host_epoch: u64) -> [Member; 3] {
     let ports = [alloc_port(), alloc_port(), alloc_port()];
     let [d1, d2, d3] = dirs;
     let e1 = open_engine(d1.path());
-    let e2 = open_engine(d2.path());
-    let e3 = open_engine(d3.path());
+    let e2 = member_engine_at(d2.path());
+    let e3 = member_engine_at(d3.path());
     let n1 = RaftNode::open_cluster_with_options(
         1,
         Arc::clone(&e1),
@@ -407,7 +410,7 @@ async fn a_member_reopened_before_the_log_reached_it_opens_as_a_member() {
         );
         let (p1, p3) = (alloc_port(), alloc_port());
         let e1 = open_engine(d1.path());
-        let e3 = open_engine(d3.path());
+        let e3 = member_engine_at(d3.path());
         let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&e1),
@@ -485,7 +488,7 @@ async fn a_member_updated_before_the_log_reached_it_learns_it_runs_ahead() {
         );
         let (p1, p3) = (alloc_port(), alloc_port());
         let e1 = open_engine(d1.path());
-        let e3 = open_engine(d3.path());
+        let e3 = member_engine_at(d3.path());
         let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&e1),
@@ -552,7 +555,7 @@ async fn a_move_is_abandoned_by_removing_and_re_adding_the_updated_member() {
             .await
             .expect("shutdown 3");
         let fresh = tempfile::tempdir().expect("fresh directory");
-        m3.engine = open_engine(fresh.path());
+        m3.engine = member_engine_at(fresh.path());
         m3._dir = fresh;
         // The member left: its identity is retired, and it returns under a
         // new one.

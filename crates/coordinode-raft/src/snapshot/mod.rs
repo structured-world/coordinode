@@ -376,15 +376,19 @@ struct ParsedSnapshot {
 /// Whether a receiver installs `key` of `partition` from a snapshot: none of
 /// this node's own records
 /// ([`is_node_local`](coordinode_storage::engine::core::is_node_local)), and
-/// none of the namespace catalog. Raft state is openraft's, routing and
-/// index records (`meta:`) are per node. The image carries the trees of the
-/// one namespace its engine is bound to, while the catalog names every
-/// namespace of the deployment: installing it from one namespace's image
-/// would make the receiver serve namespaces whose trees never came.
+/// none of the deployment's own: the namespace catalog and the records of
+/// its group. Raft state is openraft's, routing and index records (`meta:`)
+/// are per node. The image carries the trees of the one namespace its
+/// engine is bound to, while the catalog names every namespace of the
+/// deployment: installing it from one namespace's image would make the
+/// receiver serve namespaces whose trees never came. The group records
+/// (version pairs, retired identities) describe the group the image was
+/// taken in, not the database it holds.
 fn installable(partition: Partition, key: &[u8]) -> bool {
     !coordinode_storage::engine::core::is_node_local(partition, key)
         && !(partition == Partition::Deployment
-            && coordinode_core::namespace::is_namespace_catalog_key(key))
+            && (coordinode_core::namespace::is_namespace_catalog_key(key)
+                || coordinode_core::group::is_group_record(key)))
 }
 
 /// Verify `data`'s trailing checksum, then parse the body. The whole buffer
@@ -650,16 +654,20 @@ enum Install {
 
 /// The check of [`verify_history_domain`] for a source naming `source` as
 /// its history's domain and carrying history or not: `Ok(Some(domain))` when
-/// the receiver, bound to nothing yet, is to adopt `domain` before any of the
-/// history lands; `Ok(None)` when its binding already is the source's, or
-/// the source brings no domain and no history.
+/// the receiver holds no deployment record yet and is to record `domain`
+/// before any of the history lands: bound to nothing, or enrolled in that
+/// very deployment (the record is node-local, so a member caught up by a
+/// snapshot receives it only this way). `Ok(None)` when its record already
+/// is the source's, or the source brings no domain and no history.
 fn check_history_domain(
     engine: &StorageEngine,
     source: Option<coordinode_core::group::DeploymentId>,
     carries_history: bool,
 ) -> io::Result<Option<coordinode_core::group::DeploymentId>> {
-    let bound = coordinode_storage::engine::metadata::bound_deployment(engine)
-        .map_err(|e| io::Error::other(format!("the receiver's history domain: {e}")))?;
+    let domain = |e| io::Error::other(format!("the receiver's history domain: {e}"));
+    let bound = coordinode_storage::engine::metadata::bound_deployment(engine).map_err(domain)?;
+    let recorded =
+        coordinode_storage::engine::metadata::recorded_deployment(engine).map_err(domain)?;
     match (source, bound) {
         (None, _) if carries_history => Err(io::Error::other(
             "the snapshot carries history but names no domain for it",
@@ -668,7 +676,7 @@ fn check_history_domain(
             "the snapshot's history belongs to deployment {source}, \
              and this store to deployment {bound}"
         ))),
-        (Some(source), None) => Ok(Some(source)),
+        (Some(source), _) if recorded.is_none() => Ok(Some(source)),
         _ => Ok(None),
     }
 }
@@ -703,12 +711,13 @@ fn install_verified(
         engine.begin_index_transfer().map_err(transfer)?;
     }
     let mut batch = WriteBatch::new(engine);
-    // A receiver bound to no domain yet takes the snapshot's with its
-    // history, and a replaced database takes it whatever it was bound to, in
-    // the same batch: the history never lands unbound or under another.
+    // A receiver holding no deployment record yet takes the snapshot's with
+    // its history (the domain was checked against an enrollment above), and
+    // a replaced database takes it whatever it was bound to, in the same
+    // batch: the history never lands unbound or under another.
     if let Some(domain) = parsed.domain
         && (install == Install::ReplaceDatabase
-            || coordinode_storage::engine::metadata::bound_deployment(engine)
+            || coordinode_storage::engine::metadata::recorded_deployment(engine)
                 .map_err(|e| io::Error::other(format!("the receiver's history domain: {e}")))?
                 .is_none())
     {
@@ -1507,8 +1516,12 @@ impl<'b> ImageVisit<'b> for Installing<'_, 'b> {
 /// held that the snapshot's catalog does not name is retired.
 ///
 /// Everything the install reads is checked before anything is replaced:
-/// every namespace's field dictionary, the history domain, and that the
-/// snapshot holds the namespace `engine` is bound to.
+/// every namespace's field dictionary, the history domain, and, for an
+/// `engine` bound to a namespace, that the snapshot holds it. A member's
+/// engine bound to none yet ([`Deployment::member_engine`]) receives its
+/// namespace with the catalog.
+///
+/// [`Deployment::member_engine`]: coordinode_storage::engine::core::Deployment::member_engine
 ///
 /// # Errors
 ///
@@ -1529,12 +1542,23 @@ pub fn install_received(
     let namespaces = source_deployment
         .live_namespaces()
         .map_err(|e| storage("read the snapshot's catalog", e))?;
-    if !namespaces.iter().any(|(id, _)| *id == engine.namespace()) {
-        return Err(io::Error::other(format!(
-            "the snapshot's catalog does not hold {}, the namespace this member serves",
-            engine.namespace()
-        )));
-    }
+    // The namespace this member serves: the one its engine is bound to, or,
+    // for a member bound to none, the catalog's one namespace when it holds
+    // exactly one.
+    let serves = if engine.is_bound() {
+        let own = engine.namespace();
+        if !namespaces.iter().any(|(id, _)| *id == own) {
+            return Err(io::Error::other(format!(
+                "the snapshot's catalog does not hold {own}, the namespace this member serves"
+            )));
+        }
+        Some(own)
+    } else {
+        match namespaces.as_slice() {
+            [(id, _)] => Some(*id),
+            _ => None,
+        }
+    };
     let mut sources = Vec::with_capacity(namespaces.len());
     for (id, name) in &namespaces {
         let source = source_deployment
@@ -1546,13 +1570,9 @@ pub fn install_received(
         verify_field_dictionary(&schema)?;
         sources.push(source);
     }
-    let own = sources
-        .iter()
-        .position(|source| source.namespace() == engine.namespace())
-        .ok_or_else(|| io::Error::other("the member's namespace left the snapshot's catalog"))?;
     // The received store is the source's whole copy, its own binding
     // included: its history's domain is that binding.
-    let source_domain = coordinode_storage::engine::metadata::bound_deployment(&sources[own])
+    let source_domain = coordinode_storage::engine::metadata::bound_deployment(&source_deployment)
         .map_err(|e| storage("read the snapshot's history domain", e))?;
     let mut carries_history = false;
     for source in &sources {
@@ -1577,33 +1597,51 @@ pub fn install_received(
         }
         let mut total_written = 0usize;
         let mut tables = 0usize;
-        // The deployment's records first, with the member's own namespace:
-        // the catalog they carry is the one every namespace after them is
-        // bound by.
-        let mut order: Vec<usize> = vec![own];
-        order.extend((0..sources.len()).filter(|&i| i != own));
-        for (step, &at) in order.iter().enumerate() {
-            let source = &sources[at];
-            let target = if step == 0 {
-                engine.clone()
-            } else {
-                deployment
-                    .engine(source.namespace())
-                    .map_err(|e| storage("open a namespace of the install", e))?
-            };
-            let partitions: Vec<Partition> = snapshot_partitions()
-                .filter(|part| step == 0 || !part.is_deployment())
-                .collect();
-            let ahead: Vec<_> = received
+        let ahead_of = |target: &StorageEngine, partitions: &[Partition]| -> Vec<_> {
+            received
                 .positions()
                 .iter()
                 .filter(|(tree, _)| partitions.iter().any(|&part| target.tree_id(part) == *tree))
                 .cloned()
-                .collect();
-            // The sender's inventory names the copies of its own namespace's
-            // index; another namespace's copies stay unknown here, so each
-            // is checked before it serves.
-            let inventory = if step == 0 {
+                .collect()
+        };
+        // The deployment's records first: the catalog they carry is the one
+        // every namespace after them is bound by. They live in the system
+        // set, which the member's engine reaches bound or not.
+        let records: Vec<Partition> = snapshot_partitions()
+            .filter(|part| part.is_deployment())
+            .collect();
+        let source_records = source_deployment.member_engine();
+        engine
+            .install_raft_image(
+                &records,
+                |partition| {
+                    let rows = source_records.replicated_rows(partition)?;
+                    total_written += rows.len();
+                    Ok(rows)
+                },
+                next,
+                payload,
+                &ahead_of(engine, &records),
+                None,
+            )
+            .map_err(|e| storage("install the snapshot's records", e))?;
+        // The catalog now is the snapshot's: a namespace it does not hold
+        // goes, and every one it holds can be opened.
+        deployment
+            .adopt_catalog()
+            .map_err(|e| storage("adopt the snapshot's catalog", e))?;
+        let partitions: Vec<Partition> = snapshot_partitions()
+            .filter(|part| !part.is_deployment())
+            .collect();
+        for source in &sources {
+            let target = deployment
+                .engine(source.namespace())
+                .map_err(|e| storage("open a namespace of the install", e))?;
+            // The sender's inventory names the copies of the index of the
+            // namespace this member serves; another namespace's copies stay
+            // unknown here, so each is checked before it serves.
+            let inventory = if Some(source.namespace()) == serves {
                 received.index_inventory()
             } else {
                 None
@@ -1618,7 +1656,7 @@ pub fn install_received(
                     },
                     next,
                     payload,
-                    &ahead,
+                    &ahead_of(&target, &partitions),
                     inventory,
                 )
                 .map_err(|e| storage("install the snapshot's partitions", e))?;
@@ -1626,13 +1664,6 @@ pub fn install_received(
                 .columnar_tables_at(source.snapshot())
                 .map_err(|e| storage("read the snapshot's columnar tables", e))?;
             tables += install_tables(&target, Some(source_tables))?;
-            if step == 0 {
-                // The catalog now is the snapshot's: a namespace it does not
-                // hold goes.
-                deployment
-                    .adopt_catalog()
-                    .map_err(|e| storage("adopt the snapshot's catalog", e))?;
-            }
         }
         engine.note_field_dictionary_change();
         tracing::info!(

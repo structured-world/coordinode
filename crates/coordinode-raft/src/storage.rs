@@ -1333,7 +1333,8 @@ impl LogStore {
     }
 
     /// Whether an entry at index `from` or later writes data a user put
-    /// there, by the measure of [`Partition::is_user_key`].
+    /// there, by the measure of [`Partition::is_user_key`], or creates a
+    /// namespace.
     ///
     /// Entries past the state machine's resume point exist only here until
     /// they are replayed: a crash drops what they applied to unflushed trees,
@@ -1365,6 +1366,11 @@ impl LogStore {
                     | Mutation::Merge { partition, key, .. } => {
                         Partition::from(*partition).is_user_key(key)
                     }
+                    // A namespace created here, written to or not, is a
+                    // catalog of the store's own.
+                    Mutation::Command(
+                        coordinode_core::txn::proposal::MetadataCommand::CreateNamespace { .. },
+                    ) => true,
                     // Removals, metadata and operation commands and index
                     // maintenance add nothing of the user's: an index entry
                     // follows a record the same unit or an earlier one wrote,

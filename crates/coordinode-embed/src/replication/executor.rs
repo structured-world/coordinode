@@ -492,7 +492,7 @@ impl CommandExecutor for MemberCommandExecutor {
                 ))?;
             }
             return write_in_transaction(
-                self.admitter.database(),
+                self.admitter.database()?,
                 statement,
                 cancel,
                 admitted,
@@ -516,7 +516,7 @@ impl CommandExecutor for MemberCommandExecutor {
                 }
             };
         write_admitted(
-            self.admitter.database(),
+            self.admitter.database()?,
             &statement.query,
             statement.params,
             statement.source.as_ref(),
@@ -532,15 +532,15 @@ impl CommandExecutor for MemberCommandExecutor {
             None,
             None,
         ))?;
-        begin(&self.admitter.database().read(), call)
+        begin(&self.admitter.database()?.read(), call)
     }
 
     fn commit(&self, call: RoutedCommit) -> Result<CommitReceipt, DatabaseError> {
-        commit(&self.admitter.database().read(), call)
+        commit(&self.admitter.database()?.read(), call)
     }
 
     fn rollback(&self, call: RoutedRollback) -> Result<(), DatabaseError> {
-        rollback(&self.admitter.database().read(), call)
+        rollback(&self.admitter.database()?.read(), call)
     }
 
     fn operation(
@@ -548,7 +548,7 @@ impl CommandExecutor for MemberCommandExecutor {
         _actor: ActingContext,
         call: RoutedOperationCall,
     ) -> Result<RoutedOperationAnswer, DatabaseError> {
-        run_operation(&self.admitter.database().read(), call)
+        run_operation(&self.admitter.database()?.read(), call)
     }
 
     fn prepare(
@@ -642,7 +642,7 @@ impl PreparedRouted for MemberFenced {
             fenced,
         } = *self;
         write_admitted(
-            admitter.database(),
+            admitter.database()?,
             &statement.query,
             statement.params,
             statement.source.as_ref(),
@@ -671,6 +671,6 @@ impl PreparedRouted for MemberStarted {
             statement,
             cancel,
         } = *self;
-        write_in_transaction(admitter.database(), statement, &cancel, admitted, answer)
+        write_in_transaction(admitter.database()?, statement, &cancel, admitted, answer)
     }
 }

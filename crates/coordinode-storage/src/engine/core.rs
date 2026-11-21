@@ -439,12 +439,31 @@ pub struct Deployment {
 /// deployment holds ([`Partition::is_deployment`]); a unit it commits names
 /// the namespace. Everything the namespaces share is reached through the
 /// [`Deployment`] it dereferences to. Cloning it is two reference counts.
+///
+/// An engine is bound to its namespace when it is made, except a member's
+/// engine ([`Deployment::member_engine`]): a member that joins a group holds
+/// no namespace until its group's catalog arrives, so its engine binds to
+/// the catalog's one namespace on its first use after that. The deployment's
+/// own partitions are reached without a binding.
 #[derive(Clone)]
 pub struct StorageEngine {
     deployment: Arc<Deployment>,
+    /// Set at construction for an engine of a named namespace, on first use
+    /// for a member's. no-std: once_cell::race::OnceBox
+    bound: std::sync::OnceLock<Bound>,
+}
+
+/// The namespace an engine is bound to, with its set of trees.
+#[derive(Clone)]
+struct Bound {
     namespace: NamespaceId,
     set: Arc<SetTrees>,
 }
+
+/// What [`StorageEngine::namespace`] answers for a member's engine bound to
+/// no namespace yet. The catalog hands out ids from 1, so no namespace has
+/// it, and a unit naming it is refused.
+const NO_NAMESPACE: NamespaceId = NamespaceId::from_raw(0);
 
 impl core::ops::Deref for StorageEngine {
     type Target = Deployment;
@@ -459,7 +478,7 @@ impl core::fmt::Debug for StorageEngine {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("StorageEngine")
             .field("data_dir", &self.deployment.data_dir)
-            .field("namespace", &self.namespace)
+            .field("namespace", &self.bound.get().map(|bound| bound.namespace))
             .finish_non_exhaustive()
     }
 }
@@ -688,8 +707,7 @@ impl StorageEngine {
         let set = deployment.namespace_set(namespace)?;
         Ok(Self {
             deployment,
-            namespace,
-            set,
+            bound: std::sync::OnceLock::from(Bound { namespace, set }),
         })
     }
 
@@ -700,17 +718,80 @@ impl StorageEngine {
         &self.deployment
     }
 
-    /// The namespace this engine reads and writes.
+    /// The namespace this engine is bound to, binding a member's engine
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// A member's engine whose catalog holds no namespace, or several,
+    /// ([`StorageError::NoNamespace`], [`StorageError::SeveralNamespaces`]),
+    /// or the namespace's trees cannot be opened.
+    #[inline]
+    fn bound(&self) -> StorageResult<&Bound> {
+        match self.bound.get() {
+            Some(bound) => Ok(bound),
+            None => self.bind_sole(),
+        }
+    }
+
+    /// Bind a member's engine to its catalog's one namespace.
+    #[cold]
+    fn bind_sole(&self) -> StorageResult<&Bound> {
+        let namespace = self.deployment.sole_namespace()?;
+        let set = self.deployment.namespace_set(namespace)?;
+        Ok(self.bound.get_or_init(|| Bound { namespace, set }))
+    }
+
+    /// Whether this engine is bound to a namespace, binding a member's engine
+    /// first when its catalog now holds one.
+    #[must_use]
+    pub fn is_bound(&self) -> bool {
+        self.bound().is_ok()
+    }
+
+    /// Bind a member's engine when its catalog now holds its one namespace:
+    /// `true` once bound, `false` while the catalog holds none yet.
+    ///
+    /// # Errors
+    ///
+    /// The catalog holds several namespaces
+    /// ([`StorageError::SeveralNamespaces`]), or it or the namespace's trees
+    /// cannot be read.
+    pub fn try_bind(&self) -> StorageResult<bool> {
+        match self.bound() {
+            Ok(_) => Ok(true),
+            Err(StorageError::NoNamespace { .. }) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The namespace this engine reads and writes. A member's engine bound
+    /// to none yet, its catalog holding none, answers an id no namespace
+    /// has, under which nothing is written or read.
     #[inline]
     #[must_use]
     pub fn namespace(&self) -> NamespaceId {
-        self.namespace
+        self.bound().map_or(NO_NAMESPACE, |bound| bound.namespace)
     }
 
     /// The namespace's set of trees.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bound`].
     #[inline]
-    pub(crate) fn set(&self) -> &Arc<SetTrees> {
-        &self.set
+    pub(crate) fn set(&self) -> StorageResult<&Arc<SetTrees>> {
+        self.bound().map(|bound| &bound.set)
+    }
+
+    /// The set a write batch of this engine starts in: the namespace's, or
+    /// the system set for a member's engine bound to none, whose batches
+    /// write only the deployment's partitions.
+    pub(crate) fn batch_set(&self) -> Arc<SetTrees> {
+        match self.bound() {
+            Ok(bound) => Arc::clone(&bound.set),
+            Err(_) => Arc::clone(self.coordinator.sets().system()),
+        }
     }
 
     /// The address of the tree of `part` this engine reaches: the
@@ -721,7 +802,7 @@ impl StorageEngine {
         if part.is_deployment() {
             TreeId::system(part)
         } else {
-            TreeId::namespace(self.namespace, part)
+            TreeId::namespace(self.namespace(), part)
         }
     }
 
@@ -732,8 +813,11 @@ impl StorageEngine {
     ///
     /// As [`Deployment::commit_local`].
     pub fn commit_local(&self, writes: Vec<LocalWrite>, sync: LocalSync) -> StorageResult<()> {
-        self.deployment
-            .commit_local_in(Some(self.namespace), writes, sync)
+        let namespace = match self.bound() {
+            Ok(bound) => Some(bound.namespace),
+            Err(_) => None,
+        };
+        self.deployment.commit_local_in(namespace, writes, sync)
     }
 
     /// Open the store at `config` as a store of one namespace: the host's
@@ -2465,8 +2549,9 @@ impl StorageEngine {
     /// The namespace's `STORAGE COLUMNAR` table registry.
     #[cfg(feature = "columnar")]
     fn columnar(&self) -> StorageResult<&Arc<crate::columnar::ColumnarTableRegistry>> {
-        self.set.columnar().ok_or_else(|| {
-            StorageError::InvalidConfig(format!("{} holds no table registry", self.namespace))
+        let bound = self.bound()?;
+        bound.set.columnar().ok_or_else(|| {
+            StorageError::InvalidConfig(format!("{} holds no table registry", bound.namespace))
         })
     }
 
@@ -2480,7 +2565,6 @@ impl StorageEngine {
     #[must_use]
     pub fn columnar_write_pressure(&self, table_id: &str) -> WritePressure {
         let table = self
-            .set
             .columnar()
             .map_or(0, |registry| registry.pressure(table_id));
         let memtables = self
@@ -2496,12 +2580,16 @@ impl StorageEngine {
     pub fn lossy_table_repairs(&self) -> Vec<String> {
         #[cfg(feature = "columnar")]
         {
-            self.set
-                .table_repairs()
-                .lock()
-                .iter()
-                .map(|repair| repair.table.clone())
-                .collect()
+            self.set().map_or_else(
+                |_| Vec::new(),
+                |set| {
+                    set.table_repairs()
+                        .lock()
+                        .iter()
+                        .map(|repair| repair.table.clone())
+                        .collect()
+                },
+            )
         }
         #[cfg(not(feature = "columnar"))]
         Vec::new()
@@ -2511,7 +2599,7 @@ impl StorageEngine {
     /// it, once what it lost is restored. `false` when none is owed.
     #[cfg(feature = "columnar")]
     fn acknowledge_table_repair(&self, table: &str) -> StorageResult<bool> {
-        acknowledge_table_repair(&self.set, table)
+        acknowledge_table_repair(self.set()?, table)
     }
 
     /// Create (or open if it already exists) the columnar tree for a
@@ -2595,7 +2683,7 @@ impl StorageEngine {
     /// table is registered on this node.
     #[cfg(feature = "columnar")]
     pub fn columnar_table_tree(&self, table_id: &str) -> Option<lsm_tree::AnyTree> {
-        self.set.columnar()?.get(table_id)
+        self.columnar().ok()?.get(table_id)
     }
 
     /// Drop a `STORAGE COLUMNAR` table: release its tree handle and delete its
@@ -2749,7 +2837,7 @@ impl StorageEngine {
                 let mut guard = oplog
                     .lock()
                     .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
-                Some(guard.append_columnar(self.namespace, table_id, &key, &value, seqno)?)
+                Some(guard.append_columnar(self.namespace(), table_id, &key, &value, seqno)?)
             }
             None => None,
         };
@@ -2759,7 +2847,7 @@ impl StorageEngine {
             .flush_trigger()
             .wrote(Partition::Node, added, memtable);
         if let (Some(index), Some(coverage)) = (index, &self.coverage) {
-            coverage.note_table_marker(self.namespace, table_id, index);
+            coverage.note_table_marker(self.namespace(), table_id, index);
             self.note_applied(coverage, index);
         }
         #[cfg(any(test, feature = "test-faults"))]
@@ -3160,7 +3248,12 @@ impl StorageEngine {
     /// the generation itself. Read and write through the engine's methods,
     /// which translate.
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
-        self.coordinator.tree_in(&self.set, part)
+        // The deployment's own trees need no namespace: a member's engine
+        // reaches them before its namespace arrives.
+        if part.is_deployment() {
+            return self.coordinator.system_tree(part);
+        }
+        self.coordinator.tree_in(self.set()?, part)
     }
 
     /// The index tree's installation catalog, when `part` is the index
@@ -3170,13 +3263,13 @@ impl StorageEngine {
         &self,
         part: Partition,
     ) -> Option<&crate::engine::installation::Installations> {
-        self.set.installations_of(part)
+        self.set().ok()?.installations_of(part)
     }
 
     /// The namespace's index tree installation catalog.
     #[inline]
     fn installations(&self) -> StorageResult<&crate::engine::installation::Installations> {
-        self.set
+        self.set()?
             .installations()
             .ok_or_else(|| StorageError::PartitionNotFound {
                 name: Partition::Idx.name().to_string(),
@@ -3190,7 +3283,8 @@ impl StorageEngine {
         &self,
         generation: coordinode_core::index::identity::GenerationId,
     ) -> Option<u64> {
-        self.set
+        self.set()
+            .ok()?
             .installations()?
             .current()
             .installation(generation.as_raw())
@@ -3221,7 +3315,8 @@ impl StorageEngine {
         &self,
         generation: coordinode_core::index::identity::GenerationId,
     ) -> Option<u64> {
-        self.set
+        self.set()
+            .ok()?
             .installations()?
             .current()
             .staging(generation.as_raw())
@@ -3442,7 +3537,7 @@ impl StorageEngine {
         if part != Partition::Idx {
             return Some(key);
         }
-        match self.set.installations()?.current().locate(key, buf) {
+        match self.set().ok()?.installations()?.current().locate(key, buf) {
             Located::Raw(key) | Located::Bound(key) => Some(key),
             Located::Unbound => None,
         }
@@ -3567,7 +3662,12 @@ impl StorageEngine {
     /// key is read through the engine's own methods, which translate it.
     #[must_use]
     pub fn scoped_coordinator(&self) -> crate::engine::coordinator::ScopedCoordinator<'_> {
-        self.coordinator.scoped(&self.set)
+        // A member's engine bound to no namespace yet reaches the
+        // deployment's trees only.
+        match self.set() {
+            Ok(set) => self.coordinator.scoped(set),
+            Err(_) => self.coordinator.scoped(self.coordinator.sets().system()),
+        }
     }
 }
 
@@ -3878,7 +3978,13 @@ impl StorageEngine {
     ///
     /// The checkpoint cannot be opened, or its catalog cannot be read.
     fn checkpoint_view(&self, checkpoint_dir: &Path) -> StorageResult<Option<StorageEngine>> {
-        match Deployment::open_checkpoint(checkpoint_dir)?.engine(self.namespace) {
+        let checkpoint = Deployment::open_checkpoint(checkpoint_dir)?;
+        // A member's engine bound to no namespace rebuilds the deployment's
+        // trees only, which the checkpoint's own member engine reaches.
+        let Ok(bound) = self.bound() else {
+            return Ok(Some(checkpoint.member_engine()));
+        };
+        match checkpoint.engine(bound.namespace) {
             Ok(view) => Ok(Some(view)),
             Err(StorageError::UnknownNamespace { .. }) => Ok(None),
             Err(err) => Err(err),
@@ -4006,7 +4112,7 @@ impl StorageEngine {
             // A rebuilt index partition derives its DERIVED entries from the
             // journal entry's own data ops, which it does not replay itself.
             let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
-            let ops = ops_of_tree(&ops, self.namespace, partition);
+            let ops = ops_of_tree(&ops, self.namespace(), partition);
             if ops.is_empty() {
                 continue;
             }
@@ -4251,7 +4357,7 @@ impl StorageEngine {
         //    not, so the intent goes first. The new tree is cleared before
         //    the history goes in: its floor then refuses every older snapshot
         //    until the whole history is back.
-        let target = RebuildTarget::Table(self.namespace, table_id);
+        let target = RebuildTarget::Table(self.namespace(), table_id);
         // Held alone until the rebuilt table is installed (the end of this
         // call): no capture pins it dropped or half filled.
         let _alone = self.rebuild_alone()?;
@@ -4285,7 +4391,7 @@ impl StorageEngine {
         // 3. Replay the table's rows the copy lacks, each at its entry's ts
         //    with its marker, rolling the table forward to the journal's end.
         let mut replayed = 0;
-        let own = self.namespace.as_raw();
+        let own = self.namespace().as_raw();
         for entry in oplog_since {
             if held.contains(entry.index, 0) {
                 continue;
@@ -4343,9 +4449,7 @@ impl StorageEngine {
     fn node_local_rows(&self, partition: Partition) -> StorageResult<Rows> {
         let prefixes: &[&[u8]] = match partition {
             Partition::Raft => &[b""],
-            Partition::Deployment => &[b"meta:", b"raft:"],
-            Partition::Schema => &[b"meta:"],
-            _ => &[],
+            _ => raft_coverage::node_local_prefixes(partition),
         };
         let mut rows = Rows::new();
         for prefix in prefixes {
@@ -4737,7 +4841,7 @@ impl StorageEngine {
             }
             replayed += 1;
             let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
-            for op in ops_of_tree(&ops, self.namespace, partition) {
+            for op in ops_of_tree(&ops, self.namespace(), partition) {
                 match op {
                     OplogOp::Insert { key, .. }
                     | OplogOp::Delete { key, .. }
@@ -7235,6 +7339,42 @@ impl Deployment {
         }
     }
 
+    /// The catalog's one live namespace.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NoNamespace`] when the catalog holds none,
+    /// [`StorageError::SeveralNamespaces`] when it holds more than one, or the
+    /// catalog cannot be read.
+    pub fn sole_namespace(&self) -> StorageResult<NamespaceId> {
+        let live = self.live_namespaces()?;
+        match live.as_slice() {
+            [(id, _)] => Ok(*id),
+            [] => Err(StorageError::NoNamespace {
+                path: self.data_dir.display().to_string(),
+            }),
+            many => Err(StorageError::SeveralNamespaces {
+                path: self.data_dir.display().to_string(),
+                names: many.iter().map(|(_, name)| name.clone()).collect(),
+            }),
+        }
+    }
+
+    /// The engine of a member of a group: bound to the catalog's one
+    /// namespace when it holds one, or, for a member whose namespace arrives
+    /// with its group's catalog, on its first use once it has. Creates no
+    /// namespace: a store that joins a group brings none of its own.
+    #[must_use]
+    pub fn member_engine(self: &Arc<Self>) -> StorageEngine {
+        let engine = StorageEngine {
+            deployment: Arc::clone(self),
+            bound: std::sync::OnceLock::new(),
+        };
+        // Bound now when it can be: a member restarting over its namespace.
+        drop(engine.bound());
+        engine
+    }
+
     /// Create namespace `name` in this store's catalog and return its id.
     /// For a store that is not a member of a group: a member's catalog
     /// changes through its group's log.
@@ -7816,7 +7956,7 @@ impl StorageEngine {
                 if mutation.requires_namespace() {
                     self.apply_proposal_at(
                         &coordinode_core::txn::proposal::in_namespace(
-                            self.namespace,
+                            self.namespace(),
                             [mutation.clone()],
                         ),
                         0,
@@ -8648,17 +8788,20 @@ impl StorageEngine {
     /// Count one more property delta written to `node_key` and return the
     /// run it makes since the key's last whole write.
     pub fn note_node_delta(&self, node_key: &[u8]) -> u32 {
-        self.set.note_node_delta(node_key)
+        // A hint only: an engine bound to no namespace writes no node.
+        self.set().map_or(0, |set| set.note_node_delta(node_key))
     }
 
     /// The property deltas written to `node_key` since its last whole write.
     pub fn node_delta_run(&self, node_key: &[u8]) -> u32 {
-        self.set.node_delta_run(node_key)
+        self.set().map_or(0, |set| set.node_delta_run(node_key))
     }
 
     /// `node_key` was written whole: its run of deltas is over.
     pub fn note_node_whole_write(&self, node_key: &[u8]) {
-        self.set.note_node_whole_write(node_key);
+        if let Ok(set) = self.set() {
+            set.note_node_whole_write(node_key);
+        }
     }
 
     /// Check if a key exists in the given partition.
@@ -9110,6 +9253,20 @@ impl Deployment {
             }
         }
         Ok(false)
+    }
+
+    /// Whether this store has a history of its own a group it joined would
+    /// have to lose: data of its own ([`Self::holds_user_data`]) or a
+    /// namespace it created, even one that is empty or dropped since. Only
+    /// the member a group is formed around brings either into it.
+    ///
+    /// # Errors
+    ///
+    /// The catalog or a tree cannot be read.
+    pub fn holds_local_state(&self) -> StorageResult<bool> {
+        // The catalog hands out ids from 1: an allocator past it means some
+        // namespace was created here.
+        Ok(crate::engine::metadata::namespace_allocator(self)? != 1 || self.holds_user_data()?)
     }
 }
 

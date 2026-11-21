@@ -55,7 +55,7 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
 use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine_at};
 
 /// Hard per-test timeout — a hung election/replication fails fast, never spins.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -121,7 +121,7 @@ async fn create_leader(node_id: u64, port: u16) -> TestNode {
 
 async fn create_follower(node_id: u64, port: u16, founder: &TestNode) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
-    let engine = engine_at(dir.path());
+    let engine = member_engine_at(dir.path());
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let node = RaftNode::open_joining(
         node_id,
@@ -1115,9 +1115,10 @@ async fn linearizability_workload(
 // far ahead. This test seeds one follower ~2s ahead of wall and asserts the same
 // register workload still produces a linearizable history.
 
-/// Open an engine whose HLC is seeded `skew_us` microseconds ahead of wall clock
-/// (a fast/skewed node). `resume_from` seeds at `max(wall, given)`, so passing
-/// `wall + skew_us` puts the node's clock that far ahead.
+/// Open a joining member's engine whose HLC is seeded `skew_us` microseconds
+/// ahead of wall clock (a fast/skewed node). `resume_from` seeds at
+/// `max(wall, given)`, so passing `wall + skew_us` puts the node's clock that
+/// far ahead.
 fn engine_skewed(dir: &std::path::Path, skew_us: u64) -> Arc<StorageEngine> {
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -1133,7 +1134,11 @@ fn engine_skewed(dir: &std::path::Path, skew_us: u64) -> Arc<StorageEngine> {
     let oracle = Arc::new(HybridLogicalClock::resume_from(Timestamp::from_raw(
         wall + skew_us,
     )));
-    Arc::new(StorageEngine::open_with_oracle(&config, oracle).expect("open skewed engine"))
+    Arc::new(
+        coordinode_storage::engine::core::Deployment::open_with_oracle(&config, oracle)
+            .expect("open skewed engine")
+            .member_engine(),
+    )
 }
 
 async fn create_follower_skewed(

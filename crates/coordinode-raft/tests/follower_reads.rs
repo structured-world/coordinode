@@ -36,7 +36,7 @@ use coordinode_raft::read_fence::{
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine_at};
 
 /// Hard timeout for multi-node tests that require cluster formation.
 const CLUSTER_TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -70,26 +70,9 @@ async fn bootstrap_3node() -> (
         )]))
         .expect("e1"),
     );
-    let e2 = Arc::new(
-        StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            d2.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]))
-        .expect("e2"),
-    );
-    let e3 = Arc::new(
-        StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            d3.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]))
-        .expect("e3"),
-    );
+    // Members 2 and 3 join the group member 1 forms.
+    let e2 = member_engine_at(d2.path());
+    let e3 = member_engine_at(d3.path());
 
     let pki = TestPki::new();
     let n1 = RaftNode::open_cluster(

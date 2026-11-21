@@ -104,8 +104,8 @@ impl Ingress {
         &self.admitter
     }
 
-    fn database(&self) -> Arc<RwLock<Database>> {
-        Arc::clone(self.admitter.database())
+    fn database(&self) -> Result<Arc<RwLock<Database>>, DatabaseError> {
+        self.admitter.database().map(Arc::clone)
     }
 
     /// `value` as answered by `ran_at`, `None` for this member, with the
@@ -153,7 +153,7 @@ impl Ingress {
         // so only a follower keeps a copy.
         let retry = (!admitted.served_by_leader && statement.placement == Placement::Anywhere)
             .then(|| statement.clone());
-        let db = self.database();
+        let db = self.database()?;
         let Statement {
             query,
             params,
@@ -288,7 +288,7 @@ impl Ingress {
     ) -> Result<Routed<()>, DatabaseError> {
         let ran_at = match self.leader_for(placement)? {
             None => {
-                let db = self.database();
+                let db = self.database()?;
                 blocking(move || executor::begin(&db.read(), begin)).await?;
                 None
             }
@@ -321,7 +321,7 @@ impl Ingress {
     ) -> Result<Routed<RoutedAnswer>, DatabaseError> {
         let (answer, ran_at) = match self.leader_for(placement)? {
             None => {
-                let db = self.database();
+                let db = self.database()?;
                 let (admitted, cancel) = (admitted.clone(), cancel.clone());
                 let answer = blocking(move || {
                     executor::run_in_transaction(&db.read(), statement, &cancel, &admitted)
@@ -358,7 +358,7 @@ impl Ingress {
     ) -> Result<Routed<CommitReceipt>, DatabaseError> {
         let (receipt, ran_at) = match self.leader_for(placement)? {
             None => {
-                let db = self.database();
+                let db = self.database()?;
                 (
                     blocking(move || executor::commit(&db.read(), commit)).await?,
                     None,
@@ -389,7 +389,7 @@ impl Ingress {
     ) -> Result<Routed<()>, DatabaseError> {
         let ran_at = match self.leader_for(placement)? {
             None => {
-                let db = self.database();
+                let db = self.database()?;
                 blocking(move || executor::rollback(&db.read(), rollback)).await?;
                 None
             }
@@ -420,7 +420,7 @@ impl Ingress {
     ) -> Result<Routed<RoutedOperationAnswer>, DatabaseError> {
         let (answer, ran_at) = match self.leader_for(placement)? {
             None => {
-                let db = self.database();
+                let db = self.database()?;
                 (
                     blocking(move || executor::run_operation(&db.read(), call)).await?,
                     None,

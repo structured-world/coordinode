@@ -23,9 +23,9 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::{DeploymentId, Enrollment, RaftNode};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::core::{Deployment, StorageEngine};
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine_at};
 use openraft::rt::watch::WatchReceiver;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(90);
@@ -203,8 +203,8 @@ async fn grow_standalone_directory(
     let p2 = alloc_port();
     let p3 = alloc_port();
     let e1 = open_engine(path1);
-    let e2 = open_engine(path2);
-    let e3 = open_engine(path3);
+    let e2 = member_engine_at(path2);
+    let e3 = member_engine_at(path3);
 
     let n1 = RaftNode::open_cluster(
         1,
@@ -468,10 +468,36 @@ async fn a_node_holding_data_is_refused_when_it_joins() {
             "the refusals must leave the data where it was"
         );
 
+        // A store that started a namespace of its own, even one it never
+        // wrote to, has a catalog the group's would replace: refused too.
+        let initialized_dir = tempfile::tempdir().expect("tempdir");
+        let initialized = open_engine(initialized_dir.path());
+        assert!(
+            !initialized
+                .holds_user_data()
+                .expect("read the empty namespace")
+        );
+        let refused = RaftNode::open_joining(
+            4,
+            initialized,
+            format!("127.0.0.1:{}", alloc_port()).parse().expect("addr"),
+            PKI.connections(4),
+            enroll_nowhere(),
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(coordinode_raft::cluster::RaftNodeError::JoinWithLocalData)
+            ),
+            "a store with a namespace of its own must be refused when it joins, got {:?}",
+            refused.map(|_| "a running joining node")
+        );
+
         // An empty directory is what a joining node is supposed to have.
         let empty_dir = tempfile::tempdir().expect("tempdir");
-        let empty = open_engine(empty_dir.path());
-        assert!(!empty.holds_user_data().expect("read the empty store"));
+        let empty = member_engine_at(empty_dir.path());
+        assert!(!empty.holds_local_state().expect("read the empty store"));
         let joining = RaftNode::open_joining(
             3,
             empty,
@@ -542,7 +568,11 @@ async fn an_embedded_directory_opens_as_the_first_member_of_a_group() {
         };
         let _ = base;
 
-        // The same directory, now the first member of a group.
+        // The same directory, now the first member of a group. The embedded
+        // build's journal (its namespace was created through it) is brought
+        // into the store first, as a member's open does.
+        Deployment::retire_embedded_journal(&config(dir1.path()))
+            .expect("retire the embedded journal");
         let e1 = Arc::new(
             StorageEngine::open_with_oracle(&config(dir1.path()), Arc::new(TimestampOracle::new()))
                 .expect("reopen the embedded directory under the replicated build"),
@@ -564,8 +594,9 @@ async fn an_embedded_directory_opens_as_the_first_member_of_a_group() {
         await_leadership(&n1).await;
 
         let e2 = Arc::new(
-            StorageEngine::open_with_oracle(&config(dir2.path()), Arc::new(TimestampOracle::new()))
-                .expect("open the empty member"),
+            Deployment::open_with_oracle(&config(dir2.path()), Arc::new(TimestampOracle::new()))
+                .expect("open the empty member")
+                .member_engine(),
         );
         let p2 = alloc_port();
         let n2 = RaftNode::open_joining(

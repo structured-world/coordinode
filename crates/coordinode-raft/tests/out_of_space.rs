@@ -29,7 +29,7 @@ use coordinode_raft::cluster::{Enrollment, RaftNode};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_test_fixtures::{TestPki, alloc_port};
+use coordinode_test_fixtures::{TestPki, alloc_port, member_engine_at};
 use openraft::rt::watch::WatchReceiver;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(90);
@@ -80,11 +80,14 @@ fn write(
     node.pipeline().propose_and_wait(&proposal).map(|_| ())
 }
 
+/// Whether `engine` holds `key`: a joining member's engine holds nothing
+/// before its group's catalog brings its namespace.
 fn holds(engine: &StorageEngine, key: &str) -> bool {
-    engine
-        .get(Partition::Node, key.as_bytes())
-        .expect("read")
-        .is_some()
+    engine.is_bound()
+        && engine
+            .get(Partition::Node, key.as_bytes())
+            .expect("read")
+            .is_some()
 }
 
 async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
@@ -163,7 +166,12 @@ async fn a_follower_out_of_space_pauses_and_catches_up() {
             tempfile::tempdir().expect("d3"),
         ];
         let ports = [alloc_port(), alloc_port(), alloc_port()];
-        let engines: Vec<_> = dirs.iter().map(|d| open_engine(d.path())).collect();
+        // Member 1 forms the group; 2 and 3 join it.
+        let engines = [
+            open_engine(dirs[0].path()),
+            member_engine_at(dirs[1].path()),
+            member_engine_at(dirs[2].path()),
+        ];
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&engines[0]),
@@ -261,7 +269,11 @@ async fn a_leader_out_of_space_refuses_writes_without_stopping() {
             tempfile::tempdir().expect("d2"),
         ];
         let ports = [alloc_port(), alloc_port()];
-        let engines: Vec<_> = dirs.iter().map(|d| open_engine(d.path())).collect();
+        // Member 1 forms the group; 2 joins it.
+        let engines = [
+            open_engine(dirs[0].path()),
+            member_engine_at(dirs[1].path()),
+        ];
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&engines[0]),

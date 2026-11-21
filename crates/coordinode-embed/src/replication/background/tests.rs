@@ -5,7 +5,7 @@ use coordinode_modality::{IndexState, IndexStore as _, LocalIndexStore};
 use coordinode_query::index::{BuildPhase, BuildState, BuildStatus};
 use coordinode_raft::proposal::RaftProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::core::Deployment;
 use coordinode_test_fixtures::alloc_port;
 
 use super::*;
@@ -24,7 +24,8 @@ struct Member {
 }
 
 /// Open member `node_id` on `port`: the founder of a group, or a node
-/// joining `founder`'s.
+/// joining `founder`'s, which adds it as a learner; a joiner's database
+/// opens once its namespace has arrived.
 async fn open_member(node_id: u64, port: u16, founder: Option<&Member>) -> Member {
     let dir = tempfile::tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
@@ -35,7 +36,12 @@ async fn open_member(node_id: u64, port: u16, founder: Option<&Member>) -> Membe
         Durability::Durable,
         Tier::Warm,
     )]);
-    let engine = Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).unwrap());
+    let deployment = Deployment::open_with_oracle(&config, Arc::clone(&oracle)).unwrap();
+    // A founder starts the store's namespace; a joiner receives its group's.
+    let engine = Arc::new(match founder {
+        None => deployment.single_store().unwrap(),
+        Some(_) => deployment.member_engine(),
+    });
     let listen: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let connections = PKI.connections(node_id);
     let node = Arc::new(match founder {
@@ -53,7 +59,7 @@ async fn open_member(node_id: u64, port: u16, founder: Option<&Member>) -> Membe
                 .node
                 .enrollment(format!("127.0.0.1:{}", founder.port))
                 .unwrap();
-            RaftNode::open_joining(
+            let node = RaftNode::open_joining(
                 node_id,
                 Arc::clone(&engine),
                 listen,
@@ -61,7 +67,18 @@ async fn open_member(node_id: u64, port: u16, founder: Option<&Member>) -> Membe
                 enrollment,
             )
             .await
-            .unwrap()
+            .unwrap();
+            await_leader(founder).await;
+            founder
+                .node
+                .add_node(node_id, format!("127.0.0.1:{port}"), PKI.identity(node_id))
+                .await
+                .unwrap();
+            let mut applied = node.subscribe_applied();
+            while !engine.try_bind().unwrap() {
+                applied.changed().await.unwrap();
+            }
+            node
         }
     });
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
@@ -207,11 +224,6 @@ async fn a_repair_on_the_leader_reaches_a_follower() {
     let (p1, p2) = (alloc_port(), alloc_port());
     let m1 = open_member(1, p1, None).await;
     let m2 = open_member(2, p2, Some(&m1)).await;
-    await_leader(&m1).await;
-    m1.node
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     m1.node.change_membership(vec![1, 2]).await.unwrap();
     m1.db
         .write()
@@ -275,11 +287,6 @@ async fn every_new_leader_finishes_the_build_the_old_one_held() {
     let (p1, p2) = (alloc_port(), alloc_port());
     let m1 = open_member(1, p1, None).await;
     let m2 = open_member(2, p2, Some(&m1)).await;
-    await_leader(&m1).await;
-    m1.node
-        .add_node(2, format!("127.0.0.1:{p2}"), PKI.identity(2))
-        .await
-        .unwrap();
     m1.node.change_membership(vec![1, 2]).await.unwrap();
     m1.db
         .write()

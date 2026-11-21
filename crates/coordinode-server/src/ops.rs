@@ -261,21 +261,35 @@ pub(crate) type VersionView = Arc<dyn Fn() -> String + Send + Sync>;
 /// cannot remove.
 pub(crate) type OwnedSeries = Arc<dyn Fn(&mut String) + Send + Sync>;
 
+/// What the ops server answers from the database: set once the member
+/// serves it. A member that joins its group serves its ops port from the
+/// start, alive and not ready, while its group catches it up; until then
+/// `/metrics` carries what needs no database and `/blob-gc` says why it
+/// cannot answer.
+#[derive(Default)]
+pub(crate) struct DatabaseViews {
+    /// Sets the gauges sampled per scrape.
+    pub(crate) sample: std::sync::OnceLock<SampleGauges>,
+    /// Appends the series kept outside the facade.
+    pub(crate) owned: std::sync::OnceLock<OwnedSeries>,
+    /// Answers `/blob-gc`.
+    pub(crate) blob_gc: std::sync::OnceLock<BlobGcView>,
+}
+
 /// Start the operational HTTP server on `listener`, bound by the caller at
 /// startup so a busy port fails the start.
 ///
 /// Handles /health, /ready, /metrics, /version, `POST /reload` and
-/// `/blob-gc`; `/ready` follows `readiness`, `/metrics` runs `sample` first
-/// and appends `owned`, `/version` renders `version`, `/reload` runs `reload`
-/// and `/blob-gc` asks `blob_gc`. Runs until the process exits.
+/// `/blob-gc`; `/ready` follows `readiness`, `/metrics` runs the sampler of
+/// `views` first and appends its series, `/version` renders `version`,
+/// `/reload` runs `reload` and `/blob-gc` asks the collector view of
+/// `views`. Runs until the process exits.
 pub(crate) async fn start_ops_server(
     listener: TcpListener,
     readiness: Readiness,
-    sample: SampleGauges,
-    owned: OwnedSeries,
     version: VersionView,
     reload: Option<ReloadHook>,
-    blob_gc: BlobGcView,
+    views: Arc<DatabaseViews>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Install Prometheus metrics recorder
     let prometheus_handle = PrometheusBuilder::new()
@@ -299,11 +313,9 @@ pub(crate) async fn start_ops_server(
         };
 
         let handle = prometheus_handle.clone();
-        let sample = Arc::clone(&sample);
-        let owned = Arc::clone(&owned);
+        let views = Arc::clone(&views);
         let version = Arc::clone(&version);
         let reload = reload.clone();
-        let blob_gc = Arc::clone(&blob_gc);
         let ready = readiness.get();
 
         tokio::spawn(async move {
@@ -342,23 +354,35 @@ pub(crate) async fn start_ops_server(
             {
                 // A pass reads and writes the store; keep it off the runtime.
                 let (method, target) = (method.to_owned(), path.to_owned());
-                tokio::task::spawn_blocking(move || blob_gc_response(&method, &target, &blob_gc))
-                    .await
-                    .unwrap_or_else(|e| {
-                        (
-                            "500 Internal Server Error",
-                            "application/json",
-                            serde_json::json!({ "error": e.to_string() }).to_string(),
-                        )
-                    })
+                tokio::task::spawn_blocking(move || match views.blob_gc.get() {
+                    Some(blob_gc) => blob_gc_response(&method, &target, blob_gc),
+                    None => (
+                        "503 Service Unavailable",
+                        "application/json",
+                        r#"{"error":"this member has not caught up with its group yet"}"#
+                            .to_string(),
+                    ),
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    (
+                        "500 Internal Server Error",
+                        "application/json",
+                        serde_json::json!({ "error": e.to_string() }).to_string(),
+                    )
+                })
             } else {
                 respond(
                     path,
                     ready,
                     || {
-                        sample();
+                        if let Some(sample) = views.sample.get() {
+                            sample();
+                        }
                         let mut body = handle.render();
-                        owned(&mut body);
+                        if let Some(owned) = views.owned.get() {
+                            owned(&mut body);
+                        }
                         body
                     },
                     || version(),

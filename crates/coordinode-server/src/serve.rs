@@ -510,6 +510,125 @@ pub(crate) async fn serve(
     let engine = Arc::clone(member.engine());
     let raft_node = Arc::clone(member.node());
 
+    // The operational HTTP server (default :7084, configurable via
+    // --ops-addr) serves from here on: a member that joins its group is
+    // alive while its group catches it up, and ready only once it serves.
+    // What it answers from the database is set once the member serves it.
+    let readiness = ops::Readiness::default();
+    let ops_views = Arc::new(ops::DatabaseViews::default());
+    // Consensus that stopped on a fatal error commits nothing more, and the
+    // process does not try to carry on: after a failed log sync the kernel
+    // may already have dropped the unsynced pages, so nothing written since
+    // the last good sync can be trusted. The node stops reporting ready and
+    // shuts down with an error; its supervisor restarts it and recovery
+    // replays the durable state, where every acknowledged write is.
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None::<String>);
+    {
+        let node = Arc::clone(&raft_node);
+        let consensus_readiness = readiness.clone();
+        tokio::spawn(async move {
+            if let Some(fatal) = node.consensus_stopped().await {
+                // Down before anything else, so no probe that follows the
+                // report finds the node ready.
+                consensus_readiness.consensus_failed();
+                tracing::error!(
+                    %fatal,
+                    "consensus stopped on a fatal error; the process exits so it restarts \
+                     from its durable state"
+                );
+                fatal_tx.send_replace(Some(fatal));
+            }
+        });
+    }
+    // Test builds only: SIGUSR1 makes every later write of the Raft log fail,
+    // as a full disk does, so a test drives the failure through the process.
+    #[cfg(all(unix, feature = "test-faults"))]
+    {
+        let mut fault =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .map_err(|e| format!("failed to install SIGUSR1 handler: {e}"))?;
+        let node = Arc::clone(&raft_node);
+        tokio::spawn(async move {
+            while fault.recv().await.is_some() {
+                node.fail_log_writes();
+                tracing::warn!("test fault: Raft log writes now fail");
+            }
+        });
+        // SIGUSR2 starts, and the next one stops, a stalling disk under the
+        // Raft log. By default each of its syncs first writes and syncs
+        // 64 MiB, so the node waits on real block I/O as a disk shared with
+        // other writers makes it, and slows every process on that disk. A
+        // process started with COORDINODE_TEST_DISK_STALL_OWN_MS instead
+        // holds each of its own syncs that long, as its own slow disk does,
+        // and leaves the disk to the others.
+        let own_ms: Option<u64> = std::env::var("COORDINODE_TEST_DISK_STALL_OWN_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok());
+        let mut stall =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+                .map_err(|e| format!("failed to install SIGUSR2 handler: {e}"))?;
+        tokio::spawn(async move {
+            use coordinode_storage::oplog::segment::{SYNC_STALL_BYTES, SYNC_STALL_MS};
+            use std::sync::atomic::Ordering;
+            let (switch, on) = match own_ms {
+                Some(ms) => (&SYNC_STALL_MS, ms),
+                None => (&SYNC_STALL_BYTES, 64 << 20),
+            };
+            while stall.recv().await.is_some() {
+                let stalled = switch.load(Ordering::Relaxed) == 0;
+                switch.store(if stalled { on } else { 0 }, Ordering::Relaxed);
+                tracing::warn!(
+                    stalled,
+                    own = own_ms.is_some(),
+                    "test fault: Raft log syncs stall"
+                );
+            }
+        });
+    }
+    // Reading the node's files again, on `POST /reload` and on SIGHUP: a
+    // renewed certificate or changed trust bundles take effect without a
+    // restart, and a set that does not validate leaves the last in force.
+    let reload: Option<ops::ReloadHook> = node_identity.clone().map(|identity| {
+        let hook: ops::ReloadHook = Arc::new(move || {
+            let outcome = identity.reload();
+            match &outcome {
+                Ok(()) => info!("node credentials and trust reloaded"),
+                Err(e) => tracing::error!(%e, "node credentials and trust not reloaded; the last valid ones stay"),
+            }
+            outcome
+        });
+        hook
+    });
+    #[cfg(unix)]
+    if let Some(reload) = reload.clone() {
+        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .map_err(|e| format!("failed to install SIGHUP handler: {e}"))?;
+        tokio::spawn(async move {
+            while hangup.recv().await.is_some() {
+                let reload = Arc::clone(&reload);
+                // The outcome is logged by the hook.
+                let _ = tokio::task::spawn_blocking(move || reload()).await;
+            }
+        });
+    }
+    let version_view: ops::VersionView = {
+        let node = Arc::clone(&raft_node);
+        Arc::new(move || {
+            serde_json::to_string(&node.version_report())
+                .unwrap_or_else(|e| format!(r#"{{"error":"version report: {e}"}}"#))
+        })
+    };
+    {
+        let (readiness, views) = (readiness.clone(), Arc::clone(&ops_views));
+        tokio::spawn(async move {
+            if let Err(e) =
+                ops::start_ops_server(ops_listener, readiness, version_view, reload, views).await
+            {
+                tracing::error!("ops server error: {e}");
+            }
+        });
+    }
+
     // Background integrity scrub. Each node verifies its OWN local
     // storage independently (no leader election — silent bit rot is a
     // per-node, per-disk concern), so this is multi-instance-safe with
@@ -772,9 +891,71 @@ pub(crate) async fn serve(
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(raft_node.pipeline());
 
+    // A member that joins its group serves its peers before it serves data:
+    // the group reaches it on the gRPC port to catch it up, and its clients
+    // are served once its namespace has arrived. Until then the port answers
+    // nodes only, through a second handle on the bound socket, so the port
+    // is held throughout and the full server below takes it over.
+    let grpc_listener = match member.database() {
+        Some(_) => grpc_listener,
+        None => {
+            let identity = node_identity
+                .as_ref()
+                .ok_or("a joining member needs node_identity to serve its peers")?;
+            let held = grpc_listener
+                .into_std()
+                .map_err(|e| format!("the gRPC port: {e}"))?;
+            let early = held
+                .try_clone()
+                .and_then(tokio::net::TcpListener::from_std)
+                .map_err(|e| format!("the gRPC port: {e}"))?;
+            let held = tokio::net::TcpListener::from_std(held)
+                .map_err(|e| format!("the gRPC port: {e}"))?;
+            let incoming = coordinode_wire::peer::incoming(
+                early,
+                identity.context(),
+                coordinode_wire::peer::Accept {
+                    inbound: coordinode_wire::peer::InboundAuth::NodeOnly,
+                    plaintext_clients: false,
+                    handshake_timeout: peer_timeouts.handshake,
+                    keepalive: peer_timeouts.keepalive,
+                },
+            )
+            .map_err(|e| format!("gRPC port TLS configuration: {e}"))?;
+            let mut routes = tonic::service::Routes::builder();
+            member.add_inter_node_services(&mut routes, sizes.max_request_bytes);
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let peers_served = tokio::spawn(
+                Server::builder()
+                    .add_routes(routes.routes())
+                    .serve_with_incoming_shutdown(incoming, async {
+                        if stopped.await.is_err() {
+                            tracing::debug!("the joining member's peer listener lost its handle");
+                        }
+                    }),
+            );
+            info!(
+                node_id,
+                "awaiting the group's catalog before serving clients"
+            );
+            let served = member.serve().await.map(|_| ());
+            drop(stop);
+            match peers_served.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(%e, "the joining member's peer listener failed"),
+                Err(e) => tracing::warn!(%e, "the joining member's peer listener task failed"),
+            }
+            served.map_err(|e| format!("the member never served: {e}"))?;
+            held
+        }
+    };
     // The database is configured before the member's background work
     // starts, below: an interrupted index build resumes under these settings.
-    let database = Arc::clone(member.database());
+    let database = Arc::clone(
+        member
+            .database()
+            .ok_or("the member serves no database after joining")?,
+    );
     {
         let mut database = database.write();
         if let Some(secs) = planner_stats_ttl_secs {
@@ -1129,112 +1310,10 @@ pub(crate) async fn serve(
     let blob_service = services::blob::BlobServiceImpl::new(Arc::clone(&database))
         .with_node(Arc::clone(&raft_node));
 
-    // Spawn operational HTTP server (default :7084, configurable via --ops-addr).
-    let readiness = ops::Readiness::default();
-    // Consensus that stopped on a fatal error commits nothing more, and the
-    // process does not try to carry on: after a failed log sync the kernel
-    // may already have dropped the unsynced pages, so nothing written since
-    // the last good sync can be trusted. The node stops reporting ready and
-    // shuts down with an error; its supervisor restarts it and recovery
-    // replays the durable state, where every acknowledged write is.
-    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None::<String>);
-    if let Some(node) = raft_node_shared.clone() {
-        let consensus_readiness = readiness.clone();
-        tokio::spawn(async move {
-            if let Some(fatal) = node.consensus_stopped().await {
-                // Down before anything else, so no probe that follows the
-                // report finds the node ready.
-                consensus_readiness.consensus_failed();
-                tracing::error!(
-                    %fatal,
-                    "consensus stopped on a fatal error; the process exits so it restarts \
-                     from its durable state"
-                );
-                fatal_tx.send_replace(Some(fatal));
-            }
-        });
-    }
-    // Test builds only: SIGUSR1 makes every later write of the Raft log fail,
-    // as a full disk does, so a test drives the failure through the process.
-    #[cfg(all(unix, feature = "test-faults"))]
-    {
-        let mut fault =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-                .map_err(|e| format!("failed to install SIGUSR1 handler: {e}"))?;
-        let node = Arc::clone(&raft_node);
-        tokio::spawn(async move {
-            while fault.recv().await.is_some() {
-                node.fail_log_writes();
-                tracing::warn!("test fault: Raft log writes now fail");
-            }
-        });
-        // SIGUSR2 starts, and the next one stops, a stalling disk under the
-        // Raft log. By default each of its syncs first writes and syncs
-        // 64 MiB, so the node waits on real block I/O as a disk shared with
-        // other writers makes it, and slows every process on that disk. A
-        // process started with COORDINODE_TEST_DISK_STALL_OWN_MS instead
-        // holds each of its own syncs that long, as its own slow disk does,
-        // and leaves the disk to the others.
-        let own_ms: Option<u64> = std::env::var("COORDINODE_TEST_DISK_STALL_OWN_MS")
-            .ok()
-            .and_then(|ms| ms.parse().ok());
-        let mut stall =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
-                .map_err(|e| format!("failed to install SIGUSR2 handler: {e}"))?;
-        tokio::spawn(async move {
-            use coordinode_storage::oplog::segment::{SYNC_STALL_BYTES, SYNC_STALL_MS};
-            use std::sync::atomic::Ordering;
-            let (switch, on) = match own_ms {
-                Some(ms) => (&SYNC_STALL_MS, ms),
-                None => (&SYNC_STALL_BYTES, 64 << 20),
-            };
-            while stall.recv().await.is_some() {
-                let stalled = switch.load(Ordering::Relaxed) == 0;
-                switch.store(if stalled { on } else { 0 }, Ordering::Relaxed);
-                tracing::warn!(
-                    stalled,
-                    own = own_ms.is_some(),
-                    "test fault: Raft log syncs stall"
-                );
-            }
-        });
-    }
-    let ops_readiness = readiness.clone();
-    // Reading the node's files again, on `POST /reload` and on SIGHUP: a
-    // renewed certificate or changed trust bundles take effect without a
-    // restart, and a set that does not validate leaves the last in force.
-    let reload: Option<ops::ReloadHook> = node_identity.clone().map(|identity| {
-        let hook: ops::ReloadHook = Arc::new(move || {
-            let outcome = identity.reload();
-            match &outcome {
-                Ok(()) => info!("node credentials and trust reloaded"),
-                Err(e) => tracing::error!(%e, "node credentials and trust not reloaded; the last valid ones stay"),
-            }
-            outcome
-        });
-        hook
-    });
-    #[cfg(unix)]
-    if let Some(reload) = reload.clone() {
-        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .map_err(|e| format!("failed to install SIGHUP handler: {e}"))?;
-        tokio::spawn(async move {
-            while hangup.recv().await.is_some() {
-                let reload = Arc::clone(&reload);
-                // The outcome is logged by the hook.
-                let _ = tokio::task::spawn_blocking(move || reload()).await;
-            }
-        });
-    }
-    let version_view: ops::VersionView = {
-        let node = Arc::clone(&raft_node);
-        Arc::new(move || {
-            serde_json::to_string(&node.version_report())
-                .unwrap_or_else(|e| format!(r#"{{"error":"version report: {e}"}}"#))
-        })
-    };
-    // The series that go with what they describe: a columnar table's with
-    // its drop, a label's with its last node.
+    // What the ops server answers from the database, now that the member
+    // serves it: the gauges sampled per scrape, the series that go with what
+    // they describe (a columnar table's with its drop, a label's with its
+    // last node) and the operator's view of orphan blob collection.
     let owned_series: ops::OwnedSeries = {
         let engine = Arc::clone(&engine);
         Arc::new(move |out: &mut String| {
@@ -1242,8 +1321,6 @@ pub(crate) async fn serve(
             engine.node_counts().render(out);
         })
     };
-    // The operator's view of orphan blob collection: its status, and a pass
-    // run now.
     let blob_gc: ops::BlobGcView = {
         let database = Arc::clone(&database);
         Arc::new(move |request| {
@@ -1260,21 +1337,12 @@ pub(crate) async fn serve(
             }
         })
     };
-    tokio::spawn(async move {
-        if let Err(e) = ops::start_ops_server(
-            ops_listener,
-            ops_readiness,
-            sample_gauges,
-            owned_series,
-            version_view,
-            reload,
-            blob_gc,
-        )
-        .await
-        {
-            tracing::error!("ops server error: {e}");
-        }
-    });
+    if ops_views.sample.set(sample_gauges).is_err()
+        || ops_views.owned.set(owned_series).is_err()
+        || ops_views.blob_gc.set(blob_gc).is_err()
+    {
+        return Err("the ops server's database views were set twice".into());
+    }
 
     // Spawn embedded REST/JSON proxy (default :7081, configurable via --rest-addr).
     // Transcodes HTTP/JSON requests to gRPC via google.api.http annotations.

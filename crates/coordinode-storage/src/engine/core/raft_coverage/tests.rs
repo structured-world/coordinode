@@ -276,3 +276,29 @@ fn a_reset_is_durable_and_leaves_no_marker() {
     );
     assert_eq!(coverage.skip_until(), 10, "the old marker is gone");
 }
+
+/// Records the state machine writes as it applies the group's entries (the
+/// version pairs the group recorded, the identities it retired) are group
+/// state: a member caught up by a copy of the store holds them as one that
+/// applied the entries does. Kept as a member's own, a joiner never knew
+/// the group's pair, a version move waited forever for it, and a retired
+/// identity could be admitted back on a member that never saw it retired.
+#[test]
+fn records_the_group_applies_travel_with_its_state() {
+    for key in [
+        coordinode_core::version::group_pair_key(1),
+        coordinode_core::group::retired_identity_key(b"spiffe://cluster/node/3"),
+    ] {
+        assert!(
+            !is_node_local(Partition::Deployment, &key),
+            "{} is the group's",
+            String::from_utf8_lossy(&key)
+        );
+    }
+    // What is a member's own stays its own.
+    assert!(is_node_local(
+        Partition::Deployment,
+        coordinode_core::group::DEPLOYMENT_KEY
+    ));
+    assert!(is_node_local(Partition::Deployment, b"raft:sm:applied"));
+}

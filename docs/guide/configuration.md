@@ -64,7 +64,7 @@ apply when neither the config file nor a flag sets the value.
 | `--addr` | `[::]:7080` | gRPC listen address. Carries the native API and inter-node Raft RPCs. A port already in use fails the start before storage is opened; so does a busy `--rest-addr` or `--ops-addr`. |
 | `--advertise-addr` | same as `--addr` | Address other nodes use to reach this node. Set it when `--addr` binds `0.0.0.0` or `[::]` so peers learn the real host/IP. |
 | `--rest-addr` | `[::]:7081` | REST/JSON listen address. Present only when built with the `rest-proxy` feature. A port already in use fails the start. Pass port `0` for an ephemeral port. |
-| `--ops-addr` | `[::]:7084` | Operational HTTP address for `/metrics`, `/health` (200 while the process runs), `/ready` (200 while the gRPC server serves; 503 while starting and from the shutdown signal on), `POST /reload` (reads a cluster member's node identity files again, see [Node identity](#node-identity)), and `GET /blob-gc` / `POST /blob-gc/run` (orphan blob collection status and an immediate pass, see [Orphan blob collection](#orphan-blob-collection)). Bind it to an operators' network: whoever reaches it can read these and ask for a pass, though a pass cannot do more than the collector does by itself. Consensus that stops on a fatal error, such as a failed log write or sync, shuts the process down with a non-zero exit status: after a failed sync the unsynced pages may already be gone, so the node does not carry on; its supervisor restarts it and recovery replays the durable state, which holds every acknowledged write. Run the server under a supervisor that restarts it (`restart: unless-stopped` in Compose, `Restart=on-failure` in systemd). A port already in use fails the start, so a health check on this port can never be answered by another process. Pass port `0` to let the OS assign an ephemeral port (handy in tests). |
+| `--ops-addr` | `[::]:7084` | Operational HTTP address for `/metrics`, `/health` (200 while the process runs), `/ready` (200 while the gRPC server serves; 503 while starting, while a joining member waits for its group to add it and catch it up, and from the shutdown signal on), `POST /reload` (reads a cluster member's node identity files again, see [Node identity](#node-identity)), and `GET /blob-gc` / `POST /blob-gc/run` (orphan blob collection status and an immediate pass, see [Orphan blob collection](#orphan-blob-collection)). Bind it to an operators' network: whoever reaches it can read these and ask for a pass, though a pass cannot do more than the collector does by itself. Consensus that stops on a fatal error, such as a failed log write or sync, shuts the process down with a non-zero exit status: after a failed sync the unsynced pages may already be gone, so the node does not carry on; its supervisor restarts it and recovery replays the durable state, which holds every acknowledged write. Run the server under a supervisor that restarts it (`restart: unless-stopped` in Compose, `Restart=on-failure` in systemd). A port already in use fails the start, so a health check on this port can never be answered by another process. Pass port `0` to let the OS assign an ephemeral port (handy in tests). |
 | `--pg-addr` | (disabled) | PostgreSQL wire-protocol listen address (for example `127.0.0.1:7085`). Unset = the Postgres frontend is off. Serves SQL over the Postgres Simple Query protocol with trust authentication (no password), so bind it to a trusted interface only. |
 | `--data` | `./data` | Data directory. Holds the storage engine state. |
 | `--peers` | (none) | Comma-separated peer addresses, for example `node2:7080,node3:7080`. Presence enables Raft consensus, and then the node needs a `node_identity` (see [Node identity](#node-identity)). |
@@ -1255,12 +1255,20 @@ place, without export or import.
    yet is never promoted, and the cluster status shows it as `DOWN` until it
    does.
 
+A joining member starts with no namespace of its own: its namespaces, with
+their data, arrive with the group's state once the first member has added it.
+Until then it serves only its peers on the gRPC port, `/health` answers `200`
+and `/ready` answers `503`, and it serves clients from the moment its
+namespace has arrived.
+
 Member addresses are given as `host:port`. Members dial them over mutually
 authenticated TLS, expecting the identity the member is bound to.
 
 Only the member a group is formed around brings data into it. A machine that
-still holds data of its own is refused when it starts as a joiner, and the
-refusal says so and names the fix: start it with an empty data directory.
+still holds data of its own, or a namespace created in it (even an empty one,
+such as the one a standalone start creates), is refused when it starts as a
+joiner, and the refusal says so and names the fix: start it with an empty data
+directory.
 Its data is not merged; anything it holds that the cluster needs is written
 into the cluster through its members, like any other write.
 
