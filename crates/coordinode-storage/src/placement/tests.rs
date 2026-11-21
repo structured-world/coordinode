@@ -34,7 +34,12 @@ fn populated_partition_one_spanning_segment() {
 
     let seg = &map.segments()[0];
     assert_eq!(seg.id, SegmentId(7));
-    assert_eq!(seg.partition, Partition::Node);
+    // The segment is of the engine's namespace's node tree.
+    assert_eq!(seg.tree, engine.tree_id(Partition::Node));
+    assert!(matches!(
+        seg.tree.scope,
+        crate::engine::scope::Scope::Namespace(ns) if ns == engine.namespace()
+    ));
     assert_eq!(seg.data_type, SegmentDataType::PropertyDoc);
     // Whole-partition span: starts at the minimum key, unbounded above.
     assert_eq!(seg.key_range.start, b"node:0:00000000".to_vec());

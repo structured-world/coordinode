@@ -51,6 +51,25 @@ impl Scope {
         }
     }
 
+    /// The set's number on the wire: the namespace's identifier, or 0 for
+    /// the system set (the catalog hands namespace identifiers out from 1).
+    #[must_use]
+    pub const fn to_wire(self) -> u64 {
+        match self {
+            Self::System => 0,
+            Self::Namespace(ns) => ns.as_raw(),
+        }
+    }
+
+    /// The set [`Self::to_wire`] numbered `raw`.
+    #[must_use]
+    pub const fn from_wire(raw: u64) -> Self {
+        match raw {
+            0 => Self::System,
+            raw => Self::Namespace(NamespaceId::from_raw(raw)),
+        }
+    }
+
     /// The partitions with a tree in a set of this kind, in
     /// [`Partition::all`] order.
     pub fn partitions(self) -> impl Iterator<Item = Partition> {
@@ -87,6 +106,16 @@ impl TreeId {
             scope: Scope::Namespace(ns),
             part,
         }
+    }
+
+    /// `part` in the set numbered `scope` on the wire ([`Scope::to_wire`]);
+    /// `None` when that set holds no tree of `part`, so a data partition
+    /// named in the system set, or a deployment partition in a namespace,
+    /// names no tree.
+    #[must_use]
+    pub fn from_wire(scope: u64, part: Partition) -> Option<Self> {
+        let scope = Scope::from_wire(scope);
+        scope.holds(part).then_some(Self { scope, part })
     }
 
     /// The tree's directory, relative to each endpoint.

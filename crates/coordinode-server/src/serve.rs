@@ -708,15 +708,16 @@ pub(crate) async fn serve(
                             }
                             if !corrupt.is_empty() {
                                 // Basic replica-fetch repair: re-pull each
-                                // affected partition from healthy peers over
-                                // the swarm transport and re-install it. A
+                                // affected tree from healthy peers over the
+                                // swarm transport and re-install it. A
                                 // standalone node has no peer to repair from.
-                                // A peer's copy and the Raft log carry a
-                                // partition of the group's namespace, so the
-                                // tree is repaired by its partition.
-                                let parts: std::collections::BTreeSet<_> =
-                                    corrupt.into_iter().map(|id| id.part).collect();
-                                for part in parts {
+                                // Peers serve the same tree, the same
+                                // partition of the same namespace, so a
+                                // namespace's corruption is repaired from its
+                                // own copies and no other.
+                                let trees: std::collections::BTreeSet<_> =
+                                    corrupt.into_iter().collect();
+                                for tree in trees {
                                     // 1) Replica-fetch repair from healthy peers.
                                     let repair_peers =
                                         coordinode_embed::replication::segment_peers(&scrub_raft);
@@ -724,10 +725,10 @@ pub(crate) async fn serve(
                                         None => None,
                                         Some((links, peers)) => Some(
                                             repair_installer
-                                                .repair_partition(
+                                                .repair_tree(
                                                     links,
                                                     peers,
-                                                    part,
+                                                    tree,
                                                     1 << 20,
                                                     coordinode_replicate::PieceEncoding::None,
                                                 )
@@ -739,9 +740,9 @@ pub(crate) async fn serve(
                                             metrics::counter!("coordinode_scrub_repairs_total")
                                                 .increment(1);
                                             tracing::info!(
-                                                partition = part.name(),
+                                                %tree,
                                                 bytes,
-                                                "repaired partition from peers"
+                                                "repaired tree from peers"
                                             );
                                             continue;
                                         }
@@ -752,11 +753,7 @@ pub(crate) async fn serve(
                                             _,
                                         ))) => {}
                                         Some(Err(e)) => {
-                                            tracing::warn!(
-                                                partition = part.name(),
-                                                %e,
-                                                "partition repair failed"
-                                            );
+                                            tracing::warn!(%tree, %e, "tree repair failed");
                                             continue;
                                         }
                                     }
@@ -766,14 +763,14 @@ pub(crate) async fn serve(
                                     let Some(ckpt) = checkpoint::latest_checkpoint(&scrub_ckpt_dir)
                                     else {
                                         tracing::warn!(
-                                            partition = part.name(),
+                                            %tree,
                                             "no checkpoint available for WAL-replay repair"
                                         );
                                         continue;
                                     };
                                     let raft = Arc::clone(&scrub_raft);
                                     match tokio::task::spawn_blocking(move || {
-                                        raft.rebuild_partition_from_checkpoint(&ckpt, part)
+                                        raft.rebuild_tree_from_checkpoint(&ckpt, tree)
                                     })
                                     .await
                                     {
@@ -781,15 +778,15 @@ pub(crate) async fn serve(
                                             metrics::counter!("coordinode_scrub_wal_repairs_total")
                                                 .increment(1);
                                             tracing::info!(
-                                                partition = part.name(),
-                                                "repaired partition by WAL replay from checkpoint"
+                                                %tree,
+                                                "repaired tree by WAL replay from checkpoint"
                                             );
                                         }
                                         Ok(Err(e)) => {
-                                            tracing::warn!(partition = part.name(), %e, "WAL-replay repair failed")
+                                            tracing::warn!(%tree, %e, "WAL-replay repair failed")
                                         }
                                         Err(e) => {
-                                            tracing::warn!(partition = part.name(), %e, "WAL-replay repair task panicked")
+                                            tracing::warn!(%tree, %e, "WAL-replay repair task panicked")
                                         }
                                     }
                                 }

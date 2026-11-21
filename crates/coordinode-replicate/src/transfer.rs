@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::scope::{NamespaceId, Scope, TreeId};
 use coordinode_storage::placement::{KeyRange, partition_from_wire_tag};
 use coordinode_swarm::{
     NodeId, PieceBitfield, PieceEncoding, PieceIndex, PieceSource, PieceStore, SegmentId,
@@ -91,16 +91,18 @@ pub trait SegmentSource: Send + Sync {
 /// What a segment holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentSubject {
-    /// The current rows of `partition` in the half-open `range`.
+    /// The current rows of `tree` in the half-open `range`.
     Range {
-        /// The partition the rows live in.
-        partition: Partition,
+        /// The tree the rows live in.
+        tree: TreeId,
         /// The rows' key range; unbounded is the whole partition.
         range: KeyRange,
     },
-    /// The retained history of one index generation, for a local replacement
-    /// copy of it.
+    /// The retained history of one index generation of a namespace, for a
+    /// local replacement copy of it.
     History {
+        /// The namespace whose index the generation is of.
+        namespace: NamespaceId,
         /// The generation, as its raw `GenerationId`.
         generation: u64,
     },
@@ -242,15 +244,33 @@ async fn build_from_ref<Src: SegmentSource + 'static>(
     fresh: bool,
 ) -> Result<Arc<BuiltSegment>, Status> {
     let subject = match seg.generation {
-        Some(generation) => SegmentSubject::History { generation },
+        // An index generation lives in a namespace's index tree.
+        Some(generation) => match Scope::from_wire(seg.namespace) {
+            Scope::Namespace(namespace) => SegmentSubject::History {
+                namespace,
+                generation,
+            },
+            Scope::System => {
+                return Err(Status::invalid_argument(
+                    "an index generation names no namespace",
+                ));
+            }
+        },
         None => {
             let tag = u8::try_from(seg.partition).map_err(|_| {
                 Status::invalid_argument(format!("partition tag {} out of range", seg.partition))
             })?;
             let partition = partition_from_wire_tag(tag)
                 .ok_or_else(|| Status::invalid_argument(format!("unknown partition tag {tag}")))?;
+            let tree = TreeId::from_wire(seg.namespace, partition).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "set {} holds no {} tree",
+                    seg.namespace,
+                    partition.name()
+                ))
+            })?;
             SegmentSubject::Range {
-                partition,
+                tree,
                 range: KeyRange {
                     start: seg.range_start.clone(),
                     end: seg.range_end.clone(),

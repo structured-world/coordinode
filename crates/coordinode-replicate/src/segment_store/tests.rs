@@ -232,7 +232,7 @@ fn segment_source_builds_and_caches_servable_pieces() {
         end: Vec::new(),
     };
     let subject = crate::transfer::SegmentSubject::Range {
-        partition: Partition::Node,
+        tree: engine.tree_id(Partition::Node),
         range: range.clone(),
     };
 
@@ -243,7 +243,7 @@ fn segment_source_builds_and_caches_servable_pieces() {
     // The served pieces assemble back to exactly the exported blob, and each
     // piece verifies against the manifest — so a peer can pull them piece-by-piece
     // and reconstruct the segment.
-    let blob = export_range(&engine, Partition::Node, &range).expect("export");
+    let blob = export_range(&engine, engine.tree_id(Partition::Node), &range).expect("export");
     assert_eq!(built.wire.len() as u32, built.manifest.piece_count());
     for (i, w) in built.wire.iter().enumerate() {
         verify_piece(&built.manifest, i as u32, w).expect("verify piece");
@@ -399,6 +399,7 @@ async fn a_caller_without_a_node_identity_is_refused() {
                 encoding: 0,
                 zstd_level: 0,
                 generation: None,
+                namespace: engine.namespace().as_raw(),
             }),
         })
         .await
@@ -437,6 +438,7 @@ async fn swarm_pull_reconstructs_segment_over_grpc() {
         encoding: 0,
         zstd_level: 0,
         generation: None,
+        namespace: src.namespace().as_raw(),
     };
 
     // Connect a gRPC piece source to the peer (fetches manifest + bitfield).
@@ -466,7 +468,7 @@ async fn swarm_pull_reconstructs_segment_over_grpc() {
     // The pulled segment equals what the source would export for that range.
     let expected = export_range(
         &src,
-        Partition::Node,
+        src.tree_id(Partition::Node),
         &KeyRange {
             start: b"node:".to_vec(),
             end: Vec::new(),
@@ -502,10 +504,10 @@ async fn repair_partition_pulls_and_installs_from_peer() {
     let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
 
     let bytes = installer
-        .repair_partition(
+        .repair_tree(
             &links(),
             &[target],
-            Partition::Node,
+            local.tree_id(Partition::Node),
             256,
             PieceEncoding::None,
         )
@@ -532,13 +534,14 @@ async fn repair_partition_pulls_and_installs_from_peer() {
 async fn repair_partition_no_reachable_peer_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let local = std::sync::Arc::new(test_engine(dir.path()));
+    let node = local.tree_id(Partition::Node);
     let installer = std::sync::Arc::new(SegmentInstaller::new(local));
     // Port 1 is never listening here → no source can be reached.
     let err = installer
-        .repair_partition(
+        .repair_tree(
             &links(),
             &[PKI.target(2, "127.0.0.1:1")],
-            Partition::Node,
+            node,
             256,
             PieceEncoding::None,
         )
@@ -584,7 +587,7 @@ async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
     let victim = largest_file(
         &local_dir
             .path()
-            .join(coordinode_storage::engine::scope::store_tree(Partition::Node).dir())
+            .join(local.tree_id(Partition::Node).dir())
             .join("tables"),
     );
     let mut bytes = std::fs::read(&victim).expect("read sst");
@@ -605,10 +608,10 @@ async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
     // reads on-disk SSTs) sees it.
     let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
     installer
-        .repair_partition(
+        .repair_tree(
             &links(),
             &[target],
-            Partition::Node,
+            local.tree_id(Partition::Node),
             256,
             PieceEncoding::None,
         )
@@ -679,7 +682,13 @@ async fn a_copy_ahead_installs_at_its_position_and_raises_the_floor() {
         .expect("put");
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .repair_partition(&links(), &[uri], Partition::Node, 256, PieceEncoding::None)
+        .repair_tree(
+            &links(),
+            &[uri],
+            local.tree_id(Partition::Node),
+            256,
+            PieceEncoding::None,
+        )
         .await
         .expect("repair");
 
@@ -722,7 +731,13 @@ async fn a_copy_behind_the_local_applies_is_refused() {
         .expect("put");
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     let err = installer
-        .repair_partition(&links(), &[uri], Partition::Node, 256, PieceEncoding::None)
+        .repair_tree(
+            &links(),
+            &[uri],
+            local.tree_id(Partition::Node),
+            256,
+            PieceEncoding::None,
+        )
         .await
         .expect_err("a copy behind is refused");
     assert!(matches!(err, RepairError::Behind(_)), "{err:?}");
@@ -766,10 +781,10 @@ async fn a_repair_from_peers_with_different_copies_installs_one_of_them_whole() 
     let (local, _) = raft_engine(local_dir.path(), 10);
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .repair_partition(
+        .repair_tree(
             &links(),
             &[uri_a, uri_b],
-            Partition::Node,
+            local.tree_id(Partition::Node),
             256,
             PieceEncoding::None,
         )
@@ -827,10 +842,10 @@ async fn a_records_copy_keeps_the_node_local_records() {
         .expect("put");
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .repair_partition(
+        .repair_tree(
             &links(),
             &[uri],
-            Partition::Deployment,
+            local.tree_id(Partition::Deployment),
             256,
             PieceEncoding::None,
         )
@@ -873,10 +888,10 @@ async fn a_schema_copy_keeps_the_nodes_index_records() {
         .expect("put");
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .repair_partition(
+        .repair_tree(
             &links(),
             &[uri],
-            Partition::Schema,
+            local.tree_id(Partition::Schema),
             256,
             PieceEncoding::None,
         )
@@ -899,6 +914,155 @@ async fn a_schema_copy_keeps_the_nodes_index_records() {
     );
 }
 
+/// Two namespaces of one deployment, `a` and `b`, each holding rows of its
+/// own under the same keys, as views of one opened deployment.
+fn two_namespaces(dir: &std::path::Path) -> (Arc<StorageEngine>, Arc<StorageEngine>) {
+    let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let deployment = coordinode_storage::engine::core::Deployment::open_embedded(
+        &cfg,
+        Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new()),
+    )
+    .expect("open");
+    let a = deployment
+        .engine(deployment.create_namespace("a").expect("a"))
+        .expect("bind a");
+    let b = deployment
+        .engine(deployment.create_namespace("b").expect("b"))
+        .expect("bind b");
+    (Arc::new(a), Arc::new(b))
+}
+
+/// A tree of one namespace is repaired from the peers' copies of that
+/// namespace's tree, through any view of the deployment: the other
+/// namespace's rows under the same keys neither travel nor change.
+#[tokio::test]
+async fn a_repair_of_one_namespaces_tree_takes_that_namespaces_copy_only() {
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let (peer_a, peer_b) = two_namespaces(peer_dir.path());
+    peer_a
+        .put(Partition::Node, b"node:0:00000001", b"peer-a")
+        .expect("put");
+    peer_b
+        .put(Partition::Node, b"node:0:00000001", b"peer-b")
+        .expect("put");
+    // The peer serves through its view of namespace a.
+    let target = serve(&peer_a).await;
+
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let (local_a, local_b) = two_namespaces(local_dir.path());
+    local_a
+        .put(Partition::Node, b"node:0:00000001", b"local-a")
+        .expect("put");
+    // The installer holds the view of namespace a, and repairs b's tree.
+    let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local_a)));
+    installer
+        .repair_tree(
+            &links(),
+            &[target],
+            local_b.tree_id(Partition::Node),
+            256,
+            PieceEncoding::None,
+        )
+        .await
+        .expect("repair");
+
+    assert_eq!(
+        local_b
+            .get(Partition::Node, b"node:0:00000001")
+            .expect("get")
+            .as_deref(),
+        Some(b"peer-b".as_slice()),
+        "b's tree holds b's copy"
+    );
+    assert_eq!(
+        local_a
+            .get(Partition::Node, b"node:0:00000001")
+            .expect("get")
+            .as_deref(),
+        Some(b"local-a".as_slice()),
+        "a's tree is untouched"
+    );
+}
+
+/// A descriptor naming a data partition in the system set, or a deployment
+/// partition in a namespace, names no tree: the peer builds nothing.
+#[tokio::test]
+async fn a_descriptor_naming_no_tree_is_refused() {
+    use crate::transfer::proto::SegmentDescriptorRef;
+    use crate::transfer::proto::SegmentManifestRequest;
+    use crate::transfer::proto::segment_transfer_service_client::SegmentTransferServiceClient;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = Arc::new(test_engine(dir.path()));
+    engine
+        .put(Partition::Node, b"node:0:00000001", b"v")
+        .expect("put");
+    let target = serve(&engine).await;
+    let ask = |partition: Partition, namespace: u64| SegmentManifestRequest {
+        segment: Some(SegmentDescriptorRef {
+            segment_id: 1,
+            partition: u32::from(coordinode_storage::placement::partition_wire_tag(partition)),
+            range_start: Vec::new(),
+            range_end: Vec::new(),
+            piece_size: 256,
+            encoding: 0,
+            zstd_level: 0,
+            generation: None,
+            namespace,
+        }),
+    };
+    let channel = links().connections.channel(&target).expect("channel");
+    let mut client = SegmentTransferServiceClient::new(channel);
+    for (partition, namespace) in [
+        (Partition::Node, 0),
+        (Partition::Deployment, engine.namespace().as_raw()),
+    ] {
+        let status = client
+            .get_segment_manifest(links().request(ask(partition, namespace)))
+            .await
+            .expect_err("no such tree");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    }
+}
+
+/// A received segment names the set of trees it is of; one naming the
+/// system set for a data partition is refused before anything is installed.
+#[test]
+fn a_segment_naming_another_set_than_its_partitions_is_refused() {
+    let src_dir = tempfile::tempdir().expect("tempdir");
+    let src = test_engine(src_dir.path());
+    src.put(Partition::Node, b"node:0:00000001", b"v")
+        .expect("put");
+    let mut blob = export_range(
+        &src,
+        src.tree_id(Partition::Node),
+        &KeyRange {
+            start: Vec::new(),
+            end: Vec::new(),
+        },
+    )
+    .expect("export");
+    // The set follows the partition tag and the flags.
+    blob[2..10].copy_from_slice(&0u64.to_be_bytes());
+
+    let tgt_dir = tempfile::tempdir().expect("tempdir");
+    let tgt = Arc::new(test_engine(tgt_dir.path()));
+    SegmentInstaller::new(Arc::clone(&tgt))
+        .store_segment(SegmentId(1), &blob)
+        .expect_err("a node segment of the system set is refused");
+    assert!(
+        tgt.get(Partition::Node, b"node:0:00000001")
+            .expect("get")
+            .is_none()
+    );
+}
+
 /// The Raft partition is this node's vote and log metadata; another node's
 /// copy of it would make this node vote and log as the other.
 #[tokio::test(flavor = "multi_thread")]
@@ -911,7 +1075,13 @@ async fn the_raft_partition_is_never_copied() {
     let (local, _) = raft_engine(local_dir.path(), 10);
     let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .repair_partition(&links(), &[uri], Partition::Raft, 256, PieceEncoding::None)
+        .repair_tree(
+            &links(),
+            &[uri],
+            local.tree_id(Partition::Raft),
+            256,
+            PieceEncoding::None,
+        )
         .await
         .expect_err("the peer refuses to export it");
 }
@@ -926,7 +1096,7 @@ fn a_key_range_does_not_install_into_a_raft_store() {
         .expect("put");
     let blob = export_range(
         &src,
-        Partition::Node,
+        src.tree_id(Partition::Node),
         &KeyRange {
             start: b"node:".to_vec(),
             end: Vec::new(),

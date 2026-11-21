@@ -2144,27 +2144,41 @@ impl RaftNode {
         *self.applied_rx.borrow()
     }
 
-    /// Rebuild `partition` from the local checkpoint at `checkpoint_dir` and
-    /// this node's Raft log, with the applies paused: the repair path when
-    /// no healthy replica serves the partition. See
+    /// Rebuild `tree` from the local checkpoint at `checkpoint_dir` and this
+    /// node's Raft log, with the applies paused: the repair path when no
+    /// healthy replica serves the tree. A namespace's tree is rebuilt
+    /// through that namespace's view, a system tree through the node's. See
     /// [`crate::storage::rebuild_partition_from_checkpoint`].
     ///
     /// Blocks; call it off the async runtime.
     ///
     /// # Errors
     ///
-    /// [`RaftNodeError::Init`] with the rebuild's reason.
-    pub fn rebuild_partition_from_checkpoint(
+    /// [`RaftNodeError::Init`] with the rebuild's reason, the namespace no
+    /// longer held among them.
+    pub fn rebuild_tree_from_checkpoint(
         &self,
         checkpoint_dir: &std::path::Path,
-        partition: coordinode_storage::engine::partition::Partition,
+        tree: coordinode_storage::engine::scope::TreeId,
     ) -> Result<(), RaftNodeError> {
-        crate::storage::rebuild_partition_from_checkpoint(
-            &self.engine,
-            &self.oplog,
-            checkpoint_dir,
-            partition,
-        )
+        use coordinode_storage::engine::scope::Scope;
+        let rebuild = |engine: &StorageEngine| {
+            crate::storage::rebuild_partition_from_checkpoint(
+                engine,
+                &self.oplog,
+                checkpoint_dir,
+                tree.part,
+            )
+        };
+        match tree.scope {
+            Scope::System => rebuild(&self.engine),
+            Scope::Namespace(namespace) => rebuild(
+                &self
+                    .engine
+                    .engine(namespace)
+                    .map_err(|e| RaftNodeError::Init(e.to_string()))?,
+            ),
+        }
         .map_err(|e| RaftNodeError::Init(e.to_string()))
     }
 

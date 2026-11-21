@@ -143,8 +143,9 @@ impl KeyRange {
 pub struct SegmentDescriptor {
     /// Stable identifier (tracks the logical region across compaction).
     pub id: SegmentId,
-    /// Partition this segment belongs to.
-    pub partition: Partition,
+    /// The tree this segment belongs to: one partition of one namespace (or
+    /// of the system set).
+    pub tree: crate::engine::scope::TreeId,
     /// Key range covered.
     pub key_range: KeyRange,
     /// Dominant data type, for placement heuristics.
@@ -232,7 +233,7 @@ impl SegmentMap {
 
         let descriptor = SegmentDescriptor {
             id: segment_id,
-            partition,
+            tree: engine.tree_id(partition),
             // Whole-partition span: unbounded above (empty end).
             key_range: KeyRange {
                 start,

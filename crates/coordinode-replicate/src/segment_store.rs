@@ -25,6 +25,7 @@ use coordinode_core::index::identity::GenerationId;
 use coordinode_storage::engine::core::{PartitionCopy, RaftPosition, StorageEngine};
 use coordinode_storage::engine::installation::{GenerationHistory, HistoryEntry};
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::scope::{NamespaceId, Scope, TreeId};
 use coordinode_storage::error::{StorageError, StorageResult};
 use coordinode_storage::placement::{
     KeyRange, SegmentDescriptor, partition_from_wire_tag, partition_wire_tag,
@@ -169,44 +170,61 @@ fn read_chunk(blob: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
     Ok(chunk)
 }
 
-/// Export the entries covered by `descriptor` from the engine into a portable,
-/// self-describing blob, ready to be split into swarm pieces.
-///
-/// The blob is `[u8 partition tag] [length-prefixed key-value entries]`. The
-/// leading tag lets [`SegmentInstaller`] route a received segment to the right
-/// partition with no out-of-band state. Reads the descriptor's key range (the
-/// whole partition when the range is unbounded above) and keeps only entries the
-/// range actually contains (half-open `[start, end)`).
-///
-/// # Errors
-///
-/// Returns an error if the partition is unavailable, a scanned entry cannot be
-/// read, or a key/value exceeds the `u32` length bound.
-pub fn export_segment(
-    engine: &StorageEngine,
-    descriptor: &SegmentDescriptor,
-) -> StorageResult<Vec<u8>> {
-    export_range(engine, descriptor.partition, &descriptor.key_range)
+/// Run `f` on the view of `deployment` holding the trees of `scope`: the
+/// system set's deployment partitions are reached through any view, a
+/// namespace's trees through that namespace's.
+fn in_scope<T>(
+    deployment: &StorageEngine,
+    scope: Scope,
+    f: impl FnOnce(&StorageEngine) -> StorageResult<T>,
+) -> StorageResult<T> {
+    match scope {
+        Scope::System => f(deployment),
+        Scope::Namespace(namespace) => f(&deployment.engine(namespace)?),
+    }
 }
 
-/// Export the entries of `part` covered by `range` into the portable,
-/// self-describing blob (the core of [`export_segment`], addressed by partition +
-/// key range rather than a full descriptor — what the receiver-driven swarm pull
-/// needs). The scan is deterministic (sorted key order), so every node exporting
-/// the same `(part, range)` produces byte-identical output.
+/// Export the entries covered by `descriptor` from the deployment into a
+/// portable, self-describing blob, ready to be split into swarm pieces.
+///
+/// The blob is `[u8 partition tag] [u8 flags] [u64 BE set] [...]`, the set
+/// numbered as [`Scope::to_wire`]. The leading tree lets [`SegmentInstaller`]
+/// route a received segment to the right tree with no out-of-band state.
+/// Reads the descriptor's key range (the whole partition when the range is
+/// unbounded above) and keeps only entries the range actually contains
+/// (half-open `[start, end)`).
 ///
 /// # Errors
-/// Returns an error if the partition is unavailable, a scanned entry cannot be
+///
+/// Returns an error if the tree is unavailable, a scanned entry cannot be
+/// read, or a key/value exceeds the `u32` length bound.
+pub fn export_segment(
+    deployment: &StorageEngine,
+    descriptor: &SegmentDescriptor,
+) -> StorageResult<Vec<u8>> {
+    export_range(deployment, descriptor.tree, &descriptor.key_range)
+}
+
+/// Export the entries of `tree` covered by `range` into the portable,
+/// self-describing blob (the core of [`export_segment`], addressed by tree +
+/// key range rather than a full descriptor: what the receiver-driven swarm
+/// pull needs). The scan is deterministic (sorted key order), so every node
+/// exporting the same `(tree, range)` produces byte-identical output.
+///
+/// # Errors
+/// Returns an error if the tree is unavailable, a scanned entry cannot be
 /// read, or a key/value exceeds the `u32` length bound.
 pub fn export_range(
-    engine: &StorageEngine,
-    part: Partition,
+    deployment: &StorageEngine,
+    tree: TreeId,
     range: &KeyRange,
 ) -> StorageResult<Vec<u8>> {
-    // The partition's replicated rows, captured at the exact Raft position
-    // they stand at when the engine runs Raft, narrowed to the half-open
+    // The tree's replicated rows, captured at the exact Raft position they
+    // stand at when the engine runs Raft, narrowed to the half-open
     // `[start, end)` range (an unbounded range is the whole partition).
-    let copy = engine.copy_partition(part)?;
+    let copy = in_scope(deployment, tree.scope, |engine| {
+        engine.copy_partition(tree.part)
+    })?;
     let entries: Vec<KvEntry> = copy
         .rows
         .into_iter()
@@ -214,7 +232,7 @@ pub fn export_range(
         .collect();
     let whole = range.start.is_empty() && range.end.is_empty();
 
-    let mut blob = vec![partition_wire_tag(part)];
+    let mut blob = vec![partition_wire_tag(tree.part)];
     let mut flags = 0u8;
     if copy.position.is_some() {
         flags |= FLAG_POSITION;
@@ -223,6 +241,7 @@ pub fn export_range(
         flags |= FLAG_WHOLE;
     }
     blob.push(flags);
+    blob.extend_from_slice(&tree.scope.to_wire().to_be_bytes());
     if let Some(position) = &copy.position {
         let payload_len = u32::try_from(position.payload.len())
             .map_err(|_| StorageError::Serialization("position payload exceeds u32".into()))?;
@@ -234,11 +253,12 @@ pub fn export_range(
     Ok(blob)
 }
 
-/// Export the retained history of index `generation` into a portable,
-/// self-describing blob: `[u8 Idx tag] [u8 FLAG_HISTORY] [u64 BE generation]
-/// [u64 BE covers_through] [u64 BE history_from] [history entries]`. Every
-/// replica holds a generation's versions at the same commit timestamps, so
-/// peers whose compactions kept the same versions build byte-identical blobs.
+/// Export the retained history of index `generation` of `engine`'s namespace
+/// into a portable, self-describing blob: `[u8 Idx tag] [u8 FLAG_HISTORY]
+/// [u64 BE namespace] [u64 BE generation] [u64 BE covers_through]
+/// [u64 BE history_from] [history entries]`. Every replica holds a
+/// generation's versions at the same commit timestamps, so peers whose
+/// compactions kept the same versions build byte-identical blobs.
 ///
 /// # Errors
 ///
@@ -271,6 +291,7 @@ fn export_generation_proved(
         FLAG_HISTORY
     };
     let mut blob = vec![partition_wire_tag(Partition::Idx), flags];
+    blob.extend_from_slice(&engine.namespace().as_raw().to_be_bytes());
     blob.extend_from_slice(&generation.to_be_bytes());
     blob.extend_from_slice(&history.covers_through.to_be_bytes());
     blob.extend_from_slice(&history.history_from.to_be_bytes());
@@ -297,15 +318,16 @@ const FLAG_PROOF: u8 = 8;
 
 /// A received segment, decoded.
 enum Segment {
-    /// Current rows of a partition.
+    /// Current rows of a tree.
     Rows {
-        partition: Partition,
+        tree: TreeId,
         whole: bool,
         copy: PartitionCopy,
     },
-    /// The history of an index generation, with the sender's proof of its
-    /// copy when it carried one.
+    /// The history of an index generation of a namespace, with the sender's
+    /// proof of its copy when it carried one.
     History {
+        namespace: NamespaceId,
         generation: u64,
         history: GenerationHistory,
         proof: Option<Vec<u8>>,
@@ -313,17 +335,28 @@ enum Segment {
 }
 
 /// Parse a segment blob produced by [`export_range`] or [`export_generation`].
+/// Every segment names the set of trees it is of; one naming a set that
+/// holds no tree of its partition is refused before anything is read into
+/// storage.
 fn decode_segment(data: &[u8]) -> Result<Segment, String> {
     let (&tag, rest) = data
         .split_first()
         .ok_or_else(|| "empty segment blob (missing partition tag)".to_string())?;
     let partition =
         partition_from_wire_tag(tag).ok_or_else(|| format!("unknown partition wire tag {tag}"))?;
-    let (&flags, mut rest) = rest
+    let (&flags, rest) = rest
         .split_first()
         .ok_or_else(|| "segment blob truncated in its flags".to_string())?;
+    let scope = read_u64(rest, 0, "set")?;
+    // The read above proved the 8 bytes are there.
+    let mut rest = &rest[8..];
+    let tree = TreeId::from_wire(scope, partition)
+        .ok_or_else(|| format!("set {scope} holds no {} tree", partition.name()))?;
     if (flags == FLAG_HISTORY || flags == FLAG_HISTORY | FLAG_PROOF) && partition == Partition::Idx
     {
+        let Scope::Namespace(namespace) = tree.scope else {
+            return Err("an index history names no namespace".to_string());
+        };
         let generation = read_u64(rest, 0, "generation")?;
         let covers_through = read_u64(rest, 8, "history position")?;
         let history_from = read_u64(rest, 16, "history floor")?;
@@ -336,6 +369,7 @@ fn decode_segment(data: &[u8]) -> Result<Segment, String> {
         };
         let entries = decode_history(&rest[pos..])?;
         return Ok(Segment::History {
+            namespace,
             generation,
             history: GenerationHistory {
                 covers_through,
@@ -362,7 +396,7 @@ fn decode_segment(data: &[u8]) -> Result<Segment, String> {
         Some(RaftPosition { next, payload })
     };
     Ok(Segment::Rows {
-        partition,
+        tree,
         whole: flags & FLAG_WHOLE != 0,
         copy: PartitionCopy {
             rows: decode_kv_blob(rest)?,
@@ -458,11 +492,12 @@ pub async fn drain_segment_to_peer(
     Ok(ack)
 }
 
-/// Installs a received, assembled segment into the engine, routing it to the
-/// partition named by the blob's leading wire tag and writing each entry. The
-/// target re-encodes locally per its own tier/codec policy (entries are plain
-/// key-value bytes). Holds an `Arc<StorageEngine>` so it can be registered as a
-/// long-lived transfer handler on the server.
+/// Installs a received, assembled segment into the deployment, routing it to
+/// the tree named by the blob's leading partition tag and set and writing
+/// each entry. The target re-encodes locally per its own tier/codec policy
+/// (entries are plain key-value bytes). Holds an `Arc<StorageEngine>`, a view
+/// of the deployment through which every namespace's trees are reached, so it
+/// can be registered as a long-lived transfer handler on the server.
 ///
 /// Current install is upsert-per-entry (correct for repair fill and migration);
 /// bulk ingestion and atomic replace-of-corrupt are deferred refinements.
@@ -487,8 +522,8 @@ type BuildKey = (BuildSubject, usize, u32);
 /// The hashable form of a [`SegmentSubject`].
 #[derive(PartialEq, Eq, Hash)]
 enum BuildSubject {
-    Range(Partition, Vec<u8>, Vec<u8>),
-    History(u64),
+    Range(TreeId, Vec<u8>, Vec<u8>),
+    History(NamespaceId, u64),
 }
 
 /// Max distinct segments held in the serve-side build cache before it is cleared.
@@ -515,10 +550,13 @@ impl SegmentSource for SegmentInstaller {
     ) -> Result<Arc<BuiltSegment>, String> {
         let (enc_disc, _) = encoding.to_wire();
         let build = match subject {
-            SegmentSubject::Range { partition, range } => {
-                BuildSubject::Range(*partition, range.start.clone(), range.end.clone())
+            SegmentSubject::Range { tree, range } => {
+                BuildSubject::Range(*tree, range.start.clone(), range.end.clone())
             }
-            SegmentSubject::History { generation } => BuildSubject::History(*generation),
+            SegmentSubject::History {
+                namespace,
+                generation,
+            } => BuildSubject::History(*namespace, *generation),
         };
         let key: BuildKey = (build, piece_size, enc_disc);
 
@@ -535,11 +573,17 @@ impl SegmentSource for SegmentInstaller {
                 // A history built with this member's proof is served only
                 // while the proof stands: a finding since disqualifies it.
                 let stands = match (&proof, subject) {
-                    (Some(proof), SegmentSubject::History { generation }) => self
-                        .engine
-                        .index_copy_proof(*generation)
-                        .map_err(|e| e.to_string())?
-                        .is_some_and(|(now, _)| now == *proof),
+                    (
+                        Some(proof),
+                        SegmentSubject::History {
+                            namespace,
+                            generation,
+                        },
+                    ) => in_scope(&self.engine, Scope::Namespace(*namespace), |engine| {
+                        engine.index_copy_proof(*generation)
+                    })
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|(now, _)| now == *proof),
                     _ => true,
                 };
                 if stands {
@@ -549,12 +593,15 @@ impl SegmentSource for SegmentInstaller {
         }
 
         let (blob, proof) = match subject {
-            SegmentSubject::Range { partition, range } => {
-                export_range(&self.engine, *partition, range).map(|blob| (blob, None))
+            SegmentSubject::Range { tree, range } => {
+                export_range(&self.engine, *tree, range).map(|blob| (blob, None))
             }
-            SegmentSubject::History { generation } => {
-                export_generation_proved(&self.engine, *generation)
-            }
+            SegmentSubject::History {
+                namespace,
+                generation,
+            } => in_scope(&self.engine, Scope::Namespace(*namespace), |engine| {
+                export_generation_proved(engine, *generation)
+            }),
         }
         .map_err(|e| e.to_string())?;
         let (manifest, wire) =
@@ -595,31 +642,27 @@ impl SegmentInstaller {
             e => RepairError::Install(e.to_string()),
         };
         match decode_segment(data).map_err(RepairError::Install)? {
-            Segment::Rows {
-                partition,
-                whole,
-                copy,
-            } => self
-                .engine
-                .install_partition(partition, &copy, whole)
-                .map(|()| None)
-                .map_err(behind_or_install),
+            Segment::Rows { tree, whole, copy } => in_scope(&self.engine, tree.scope, |engine| {
+                engine.install_partition(tree.part, &copy, whole)
+            })
+            .map(|()| None)
+            .map_err(behind_or_install),
             Segment::History {
+                namespace,
                 generation,
                 history,
                 proof,
             } => {
                 let generation = GenerationId::from_raw(generation);
-                self.engine
-                    .import_generation_history(generation, &history.entries)
-                    .map_err(behind_or_install)?;
-                self.engine
-                    .finish_generation_import(
+                in_scope(&self.engine, Scope::Namespace(namespace), |engine| {
+                    engine.import_generation_history(generation, &history.entries)?;
+                    engine.finish_generation_import(
                         generation,
                         history.covers_through,
                         history.history_from,
                     )
-                    .map_err(behind_or_install)?;
+                })
+                .map_err(behind_or_install)?;
                 Ok(proof)
             }
         }
@@ -629,18 +672,27 @@ impl SegmentInstaller {
 /// What `descriptor` asks for, for an error message.
 fn describe(descriptor: &SegmentDescriptorRef) -> String {
     match descriptor.generation {
-        Some(generation) => format!("index generation {generation}"),
+        Some(generation) => format!(
+            "index generation {generation} of set {}",
+            descriptor.namespace
+        ),
         None => u8::try_from(descriptor.partition)
             .ok()
             .and_then(partition_from_wire_tag)
+            .and_then(|partition| TreeId::from_wire(descriptor.namespace, partition))
             .map_or_else(
-                || format!("partition tag {}", descriptor.partition),
-                |partition| format!("partition {partition:?}"),
+                || {
+                    format!(
+                        "partition tag {} of set {}",
+                        descriptor.partition, descriptor.namespace
+                    )
+                },
+                |tree| format!("tree {tree}"),
             ),
     }
 }
 
-/// Failure modes of [`SegmentInstaller::repair_partition`].
+/// Failure modes of [`SegmentInstaller::repair_tree`].
 #[derive(Debug, thiserror::Error)]
 pub enum RepairError {
     /// No reachable peer could serve the segment (all unreachable or none held
@@ -669,8 +721,10 @@ const REPAIR_ATTEMPTS: u32 = 5;
 const REPAIR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl SegmentInstaller {
-    /// Repair a (possibly corrupt) partition by pulling a fresh copy from healthy
-    /// peers over the swarm transport and re-installing it locally.
+    /// Repair a (possibly corrupt) tree by pulling a fresh copy from healthy
+    /// peers over the swarm transport and re-installing it locally. Peers
+    /// serve the same tree: the same partition of the same namespace, or of
+    /// the system set.
     ///
     /// CE coarse repair: re-fetches the **whole** partition (Merkle page-level
     /// localization is EE). Connects a [`GrpcPieceSource`] to each reachable peer
@@ -691,16 +745,16 @@ impl SegmentInstaller {
     /// # Errors
     /// [`RepairError`] if no peer serves the segment, the download fails its
     /// checksums, every copy stands behind this node, or the install fails.
-    pub async fn repair_partition(
+    pub async fn repair_tree(
         self: &Arc<Self>,
         links: &PeerLinks,
         peers: &[PeerTarget],
-        partition: Partition,
+        tree: TreeId,
         piece_size: usize,
         encoding: PieceEncoding,
     ) -> Result<usize, RepairError> {
         let (enc_disc, zstd_level) = encoding.to_wire();
-        let tag = partition_wire_tag(partition);
+        let tag = partition_wire_tag(tree.part);
         // Whole-partition descriptor: empty range is unbounded both ends, so the
         // serving peer exports the entire partition.
         let descriptor = SegmentDescriptorRef {
@@ -712,6 +766,7 @@ impl SegmentInstaller {
             encoding: enc_disc,
             zstd_level,
             generation: None,
+            namespace: tree.scope.to_wire(),
         };
         Ok(self.pull_until_current(links, peers, &descriptor).await?.0)
     }
@@ -758,6 +813,8 @@ impl SegmentInstaller {
             encoding: enc_disc,
             zstd_level,
             generation: Some(generation.as_raw()),
+            // The generation is of the installer's namespace.
+            namespace: self.engine.namespace().as_raw(),
         };
         let outcome = self.pull_until_current(links, peers, &descriptor).await;
         if outcome.is_err() {

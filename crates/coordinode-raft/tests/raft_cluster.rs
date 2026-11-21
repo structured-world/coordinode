@@ -7117,7 +7117,7 @@ async fn a_partition_rebuilt_from_a_checkpoint_holds_each_entry_once() {
         let before = n1.engine.get(Partition::Adj, b"adj:R:out:1").expect("get");
         tokio::task::block_in_place(|| {
             n1.node
-                .rebuild_partition_from_checkpoint(&ckpt, Partition::Adj)
+                .rebuild_tree_from_checkpoint(&ckpt, n1.engine.tree_id(Partition::Adj))
                 .expect("rebuild")
         });
         assert_eq!(
