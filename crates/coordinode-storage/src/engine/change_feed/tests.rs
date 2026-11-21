@@ -813,6 +813,7 @@ fn entry_units(nodes: u64) -> Vec<ChangeUnit> {
         position: LogPosition { index: 7, sub },
         commit_ts: 100 + u64::from(sub),
         refused: false,
+        namespace: Some(crate::engine::scope::STORE_NAMESPACE),
         mutations: ids
             .clone()
             .map(|id| put(PartitionId::Node, key(id), record(&[3])))
@@ -896,6 +897,46 @@ fn a_read_stops_inside_a_unit_and_continues_there() {
         .flat_map(|u| u.events.clone())
         .collect();
     assert_eq!(joined, whole[0].events);
+}
+
+/// A reader of one namespace receives the units of that namespace and no
+/// other's: neither their events nor an empty place for them. A reader of
+/// every namespace receives both.
+#[test]
+fn a_namespace_reader_receives_only_its_namespaces_units() {
+    use coordinode_core::namespace::NamespaceId;
+    let mine = crate::engine::scope::STORE_NAMESPACE;
+    let other = NamespaceId::from_raw(mine.as_raw() + 1);
+    let mut units = entry_units(3);
+    units[1].namespace = Some(other);
+    let read = |interest: &Interest| {
+        let budget = coordinode_core::budget::QueryBudget::new(1 << 20);
+        let mut charge = budget.empty_charge();
+        let (got, stopped) =
+            unit_changes(&units, interest, at(0, 0), &mut charge, &mut Unencoded).expect("read");
+        assert_eq!(stopped, None);
+        got.iter().map(|u| u.position.sub).collect::<Vec<_>>()
+    };
+    assert_eq!(read(&Interest::all().in_namespace(mine)), vec![0]);
+    assert_eq!(read(&Interest::all().in_namespace(other)), vec![1]);
+    assert_eq!(read(&Interest::all()), vec![0, 1]);
+}
+
+/// A cursor names the namespace its reader follows: one of another
+/// namespace's reader is not the same stream, and the namespace survives
+/// encoding.
+#[test]
+fn a_cursor_carries_its_readers_namespace() {
+    use coordinode_core::namespace::NamespaceId;
+    let history = crate::engine::fixed_cut::CutHistory::Journal(
+        coordinode_core::group::DeploymentId([7; 16]),
+    );
+    let mine = Interest::all().in_namespace(NamespaceId::from_raw(1));
+    let other = Interest::all().in_namespace(NamespaceId::from_raw(2));
+    let cursor = ChangeCursor::new(history, mine, 5);
+    let decoded = ChangeCursor::from_bytes(&cursor.to_bytes()).expect("decode");
+    assert_eq!(decoded, cursor);
+    assert!(!ChangeCursor::new(history, other, 5).continues(&cursor));
 }
 
 /// A read starting inside an entry passes over the units before its place

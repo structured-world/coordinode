@@ -695,6 +695,9 @@ fn a_store_of_one_namespace_creates_its_default_once() {
             StorageEngine::open_embedded(&config, Arc::new(TimestampOracle::new())).expect("fresh");
         engine.namespace()
     };
+    // The namespace tests build units and paths for before holding the
+    // store's engine is the one a fresh store creates.
+    assert_eq!(first, crate::engine::scope::STORE_NAMESPACE);
     {
         let (deployment, _) = open_deployment(&config);
         assert_eq!(

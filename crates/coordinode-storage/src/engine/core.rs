@@ -32,8 +32,7 @@ use crate::engine::oplog_journal::{
 use crate::engine::partition::Partition;
 use crate::engine::rebuild::{self, Rebuild, RebuildRefusal};
 use crate::engine::routing::PartitionRouting;
-use crate::engine::scope::store_tree;
-use crate::engine::scope::{NamespaceId, STORE_NAMESPACE, Scope, TreeId};
+use crate::engine::scope::{NamespaceId, Scope, TreeId};
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp};
 
@@ -3957,16 +3956,15 @@ impl Deployment {
 }
 
 impl StorageEngine {
-    /// [`Deployment::open_checkpoint`], bound as [`Self::open`] binds.
+    /// [`Deployment::open_checkpoint`] as a store of one namespace: bound to
+    /// the checkpoint's one namespace, and reaching only the deployment's own
+    /// trees when it holds none or several. Opening creates nothing.
     ///
     /// # Errors
     ///
     /// As [`Deployment::open_checkpoint`].
     pub fn open_checkpoint(checkpoint_dir: &Path) -> StorageResult<Self> {
-        Self::bind(
-            Deployment::open_checkpoint(checkpoint_dir)?,
-            STORE_NAMESPACE,
-        )
+        Ok(Deployment::open_checkpoint(checkpoint_dir)?.member_engine())
     }
 
     /// The checkpoint at `checkpoint_dir` opened read-only and bound to this
@@ -5078,7 +5076,7 @@ impl Deployment {
     /// [`StorageError::InvalidConfig`] for a store without a journal of its
     /// own; [`StorageError::CutNotReady`] when a commit is still in flight or
     /// not durable after `timeout`; a journal sync failure.
-    pub fn fixed_cut(
+    fn fixed_cut_of(
         &self,
         scope: crate::engine::fixed_cut::CutScope,
         timeout: std::time::Duration,
@@ -5232,7 +5230,7 @@ impl Deployment {
         join_end: u64,
     ) -> StorageResult<()> {
         let partition = scope.partition();
-        let tree = store_tree(partition);
+        let tree = scope.tree()?;
         let not_ready = |reason: String| StorageError::CutNotReady { reason };
         if self.is_under_repair(tree) {
             return Err(not_ready(format!(
@@ -5744,6 +5742,20 @@ impl Deployment {
             let refused = bound
                 && crate::engine::operations::unit_skipped(self, position)
                     .map_err(EntryOutcome::Failed)?;
+            // The unit's namespace, by its marker. A unit naming several
+            // would mix their keys in one projection, which names no
+            // namespace per event.
+            let mut namespace = None;
+            for m in &unit.mutations {
+                if let Mutation::Namespace(named) = m {
+                    match namespace {
+                        Some(known) if known != *named => {
+                            return Err(unsupported("a unit of several namespaces"));
+                        }
+                        _ => namespace = Some(*named),
+                    }
+                }
+            }
             let mut mutations = unit.mutations;
             if refused {
                 mutations.clear();
@@ -5761,6 +5773,7 @@ impl Deployment {
                 position,
                 commit_ts: unit.commit_ts.as_raw(),
                 refused,
+                namespace,
                 mutations,
             });
         }
@@ -5984,6 +5997,72 @@ impl Deployment {
 }
 
 impl StorageEngine {
+    /// Take a fixed cut of this store's history for `scope`'s rows in this
+    /// engine's namespace: a view pinned below a fresh bound `B`, the first
+    /// journal position `L` its continuation replays, and the join end `H`
+    /// (see [`crate::engine::fixed_cut`]). Cold work: nothing is added to
+    /// writes, and the journal is not searched. The view and the units of
+    /// the continuation are of this namespace only.
+    ///
+    /// `L` is read first; `B` is then drawn from the commit clock, above
+    /// every commit journalled before `L`. The view is qualified once every
+    /// commit below `B` has finished and is durable. `H` is read after that,
+    /// and every entry before it is then waited for and made durable: a late
+    /// entry below `B` falls inside the join, not after it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a store without a journal of its
+    /// own; [`StorageError::CutNotReady`] when a commit is still in flight or
+    /// not durable after `timeout`; a journal sync failure.
+    pub fn fixed_cut(
+        &self,
+        scope: crate::engine::fixed_cut::CutScope,
+        timeout: std::time::Duration,
+    ) -> StorageResult<crate::engine::fixed_cut::FixedCut> {
+        self.fixed_cut_of(scope.in_namespace(self.namespace()), timeout)
+    }
+
+    /// The position `resume` names in this store's log, where reading of
+    /// `scope`'s rows in this engine's namespace goes on after a cut's join.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a position of another history or
+    /// reached for another scope or namespace: it counts entries of another
+    /// log, or the consumer's state covers other rows.
+    pub fn resume_position(
+        &self,
+        resume: &crate::engine::fixed_cut::CutResume,
+        scope: &crate::engine::fixed_cut::CutScope,
+    ) -> StorageResult<u64> {
+        if self.cut_history()? != Some(resume.history) {
+            return Err(StorageError::InvalidConfig(
+                "the position is of another history".into(),
+            ));
+        }
+        if resume.scope != scope.clone().in_namespace(self.namespace()) {
+            return Err(StorageError::InvalidConfig(
+                "the position was reached for another scope".into(),
+            ));
+        }
+        Ok(resume.next)
+    }
+
+    /// Refuse `cut` taken in another namespace than this engine's.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`].
+    fn cut_of_namespace(&self, cut: &crate::engine::fixed_cut::FixedCut) -> StorageResult<()> {
+        if cut.scope.namespace() != Some(self.namespace()) {
+            return Err(StorageError::InvalidConfig(
+                "the cut was taken in another namespace".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// One page of `cut`'s view: the rows of its scope in key order, past
     /// `after` when given, at most `max_rows` of them, within `budget`; the
     /// rows keep their memory charged to it through the returned charge.
@@ -6007,6 +6086,7 @@ impl StorageEngine {
     )> {
         use std::ops::Bound;
         self.held_cut(cut)?;
+        self.cut_of_namespace(cut)?;
         self.scope_view_intact(cut)?;
         self.check_snapshot_retained(cut.scope.partition(), cut.bound)?;
         let prefix = cut.scope.prefix();
@@ -6169,6 +6249,8 @@ impl Deployment {
             })
         };
         let mut sub = 0u32;
+        // The namespace the raw ops after a marker are of.
+        let mut raw_namespace = None;
         for op in &entry.ops {
             let frame = match op {
                 OplogOpRef::Unit { frame } => *frame,
@@ -6180,6 +6262,7 @@ impl Deployment {
                 | OplogOpRef::Merge { partition, key, .. } => {
                     match crate::placement::partition_from_wire_tag(*partition) {
                         Some(p) if p != scope.partition() => continue,
+                        Some(_) if scope.names_other(raw_namespace) => continue,
                         Some(_) if !scope.holds_key(key) => continue,
                         _ => return Err(unsupported("a raw row write")),
                     }
@@ -6190,6 +6273,7 @@ impl Deployment {
                     end,
                 } => match crate::placement::partition_from_wire_tag(*partition) {
                     Some(p) if p != scope.partition() => continue,
+                    Some(_) if scope.names_other(raw_namespace) => continue,
                     Some(_) if !scope.meets_range(start, end) => continue,
                     _ => return Err(unsupported("a raw range delete")),
                 },
@@ -6205,7 +6289,10 @@ impl Deployment {
                 | OplogOpRef::RaftEntry { .. } => continue,
                 // Names the namespace of the raw ops after it, which carry
                 // none of their own.
-                OplogOpRef::Namespace { .. } => continue,
+                OplogOpRef::Namespace { id } => {
+                    raw_namespace = Some(coordinode_core::namespace::NamespaceId::from_raw(*id));
+                    continue;
+                }
             };
             let position = LogPosition {
                 index: entry.index,
@@ -6229,6 +6316,21 @@ impl Deployment {
                 }
                 Err(e) => return Err(EntryOutcome::Failed(e.into())),
             };
+            // A unit of another namespace holds nothing of the scope's.
+            let mut unit_namespace = None;
+            for m in &unit.mutations {
+                if let Mutation::Namespace(named) = m {
+                    match unit_namespace {
+                        Some(known) if known != *named => {
+                            return Err(unsupported("a unit of several namespaces"));
+                        }
+                        _ => unit_namespace = Some(*named),
+                    }
+                }
+            }
+            if !scope.holds_namespace(unit_namespace) {
+                continue;
+            }
             // What the decoded unit holds: its operations, of the capacity
             // decoded, and the bytes they own. Within the decode bounds.
             let held = (unit.mutations.capacity() * core::mem::size_of::<Mutation>()) as u64
@@ -6403,32 +6505,6 @@ impl Deployment {
             .ok_or_else(|| StorageError::CutNotReady {
                 reason: "the history of the store's log is not known yet".into(),
             })
-    }
-
-    /// The position `resume` names in this store's log, where reading of
-    /// `scope` goes on after a cut's join.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageError::InvalidConfig`] for a position of another history or
-    /// reached for another scope: it counts entries of another log, or the
-    /// consumer's state covers other rows.
-    pub fn resume_position(
-        &self,
-        resume: &crate::engine::fixed_cut::CutResume,
-        scope: &crate::engine::fixed_cut::CutScope,
-    ) -> StorageResult<u64> {
-        if self.cut_history()? != Some(resume.history) {
-            return Err(StorageError::InvalidConfig(
-                "the position is of another history".into(),
-            ));
-        }
-        if &resume.scope != scope {
-            return Err(StorageError::InvalidConfig(
-                "the position was reached for another scope".into(),
-            ));
-        }
-        Ok(resume.next)
     }
 
     /// Keep the journal from `index` on for a rebuild from the latest local

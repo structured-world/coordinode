@@ -14,11 +14,15 @@ use rmpv::Value;
 pub(crate) fn proposal(id: u64, commit_ts: u64) -> RaftProposal {
     RaftProposal {
         id: ProposalId::from_raw(id),
-        mutations: coordinode_storage::engine::scope::store_unit([Mutation::Put {
-            partition: PartitionId::Node,
-            key: format!("node:1:{id}").into_bytes(),
-            value: b"v".to_vec(),
-        }]),
+        // Any namespace: the migration carries units without reading them.
+        mutations: coordinode_core::txn::proposal::in_namespace(
+            coordinode_core::namespace::NamespaceId::from_raw(1),
+            [Mutation::Put {
+                partition: PartitionId::Node,
+                key: format!("node:1:{id}").into_bytes(),
+                value: b"v".to_vec(),
+            }],
+        ),
         commit_ts: Timestamp::from_raw(commit_ts),
         start_ts: Timestamp::from_raw(commit_ts - 1),
         bypass_rate_limiter: false,

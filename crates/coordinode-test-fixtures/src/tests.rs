@@ -1,6 +1,23 @@
 use super::*;
 use coordinode_storage::engine::partition::Partition;
 
+/// The namespace and trees tests name before holding a fresh store's engine
+/// are the ones that store opens: otherwise their units would land nowhere.
+#[test]
+fn a_fresh_store_is_of_the_namespace_tests_name_for_it() {
+    use coordinode_storage::engine::scope::{STORE_NAMESPACE, store_tree};
+    let fx = engine_for_disk();
+    assert_eq!(fx.engine.namespace(), STORE_NAMESPACE);
+    assert_eq!(
+        fx.engine.tree_id(Partition::Node),
+        store_tree(Partition::Node)
+    );
+    assert_eq!(
+        fx.engine.tree_id(Partition::Schema),
+        store_tree(Partition::Schema)
+    );
+}
+
 #[test]
 fn memory_engine_writes_and_reads() {
     let fx = engine_for_memory();

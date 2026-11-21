@@ -14,8 +14,11 @@ use coordinode_core::budget::{BudgetStop, MemoryCharge, QueryBudget};
 use coordinode_core::txn::operation::LogPosition;
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
 
+use coordinode_core::namespace::NamespaceId;
+
 use crate::engine::coordinator::SnapshotPin;
 use crate::engine::partition::Partition;
+use crate::engine::scope::TreeId;
 use crate::error::{StorageError, StorageResult};
 
 /// The rows a cut hands over: the keys of one partition under a prefix. A
@@ -28,6 +31,9 @@ pub struct CutScope {
     /// The least key past every key under the prefix; `None` when the scope
     /// reaches the end of the key space.
     end: Option<Vec<u8>>,
+    /// The namespace whose rows the scope holds: set when a cut is taken,
+    /// by the engine of that namespace.
+    namespace: Option<NamespaceId>,
 }
 
 impl CutScope {
@@ -53,7 +59,44 @@ impl CutScope {
             partition,
             end: prefix_successor(&prefix),
             prefix,
+            namespace: None,
         })
+    }
+
+    /// The same scope, of `namespace`'s rows.
+    pub(crate) fn in_namespace(mut self, namespace: NamespaceId) -> Self {
+        self.namespace = Some(namespace);
+        self
+    }
+
+    /// The namespace whose rows it holds; `None` before a cut names it.
+    #[must_use]
+    pub fn namespace(&self) -> Option<NamespaceId> {
+        self.namespace
+    }
+
+    /// The tree its rows are in.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a scope no cut named a namespace
+    /// for.
+    pub(crate) fn tree(&self) -> StorageResult<TreeId> {
+        self.namespace
+            .map(|namespace| TreeId::namespace(namespace, self.partition))
+            .ok_or_else(|| StorageError::InvalidConfig("a cut scope names no namespace".into()))
+    }
+
+    /// Whether operations under the namespace marker `named` may be in it.
+    pub(crate) fn holds_namespace(&self, named: Option<NamespaceId>) -> bool {
+        named.is_some() && named == self.namespace
+    }
+
+    /// Whether the marker `named` names a namespace other than its own: what
+    /// follows it is none of the scope's. No marker names none, and an
+    /// operation under none cannot be placed.
+    pub(crate) fn names_other(&self, named: Option<NamespaceId>) -> bool {
+        named.is_some() && named != self.namespace
     }
 
     /// The partition.

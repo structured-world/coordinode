@@ -16,7 +16,8 @@ pub enum InterestRefusal {
 }
 
 /// The interest that follows the nodes of `labels` and the relationships of
-/// `edge_types`, `None` for either following all of that kind. A label name
+/// `edge_types`, `None` for either following all of that kind, in the
+/// namespace `engine` is bound to and no other. A label name
 /// is bound to the label it names now: a label dropped and created again
 /// later is another label, whose nodes this interest does not follow. A
 /// label a type implies is followed through the nodes of every type
@@ -46,5 +47,7 @@ pub fn resolve_change_interest(
         }
     };
     let edge_types = edge_types.map(|names| names.iter().map(|n| n.as_bytes().to_vec()).collect());
-    Ok(Ok(Interest::new(labels, edge_types)))
+    Ok(Ok(
+        Interest::new(labels, edge_types).in_namespace(engine.namespace())
+    ))
 }

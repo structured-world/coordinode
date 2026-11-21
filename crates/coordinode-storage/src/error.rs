@@ -224,10 +224,12 @@ pub enum StorageError {
     /// catalog change did not commit). Nothing is taken; the table is created
     /// or dropped again, and the copy then taken.
     #[error(
-        "the catalog and the table trees disagree: declared without a tree {declared_only:?}, \
-         a tree without a declaration {trees_only:?}"
+        "the catalog and the table trees of {namespace} disagree: declared without a tree \
+         {declared_only:?}, a tree without a declaration {trees_only:?}"
     )]
     CatalogMismatch {
+        /// The namespace whose catalog and trees disagree.
+        namespace: coordinode_core::namespace::NamespaceId,
         /// Tables the catalog declares that have no tree.
         declared_only: Vec<String>,
         /// Trees whose table the catalog does not declare.

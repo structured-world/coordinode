@@ -18,6 +18,7 @@
 
 use std::borrow::Cow;
 
+use coordinode_core::namespace::NamespaceId;
 use coordinode_core::schema::label_id::LabelId;
 use coordinode_core::txn::proposal::{
     EFFECTS_INTERPRETATION, Mutation, NodeBasis, PartitionId, UnitEffects,
@@ -163,6 +164,9 @@ pub struct ChangeUnit {
     /// Whether its operation binding refused it: it took no effect and has
     /// no events.
     pub refused: bool,
+    /// The namespace its operations are of; `None` for a unit of the
+    /// deployment's own records only.
+    pub namespace: Option<NamespaceId>,
     /// Its operations; empty when it was refused.
     pub mutations: Vec<Mutation>,
 }
@@ -1675,16 +1679,20 @@ pub struct Interest {
     /// large property, a stored object, an S3 object. They belong to no
     /// label, so a label interest does not choose them.
     blobs: bool,
+    /// The namespace whose units the reader follows; `None` follows every
+    /// namespace's, as a reader of the whole deployment does.
+    namespace: Option<NamespaceId>,
 }
 
 impl Interest {
-    /// Every event.
+    /// Every event, of every namespace.
     #[must_use]
     pub fn all() -> Self {
         Self {
             labels: None,
             edge_types: None,
             blobs: true,
+            namespace: None,
         }
     }
 
@@ -1693,6 +1701,28 @@ impl Interest {
     pub fn with_blobs(mut self, blobs: bool) -> Self {
         self.blobs = blobs;
         self
+    }
+
+    /// The same interest, following the units of `namespace` only: a
+    /// reader of one namespace receives nothing of another's, neither its
+    /// events nor that its units exist.
+    #[must_use]
+    pub fn in_namespace(mut self, namespace: NamespaceId) -> Self {
+        self.namespace = Some(namespace);
+        self
+    }
+
+    /// The namespace whose units it follows; `None` for every namespace.
+    #[must_use]
+    pub fn namespace(&self) -> Option<NamespaceId> {
+        self.namespace
+    }
+
+    /// Whether it follows `unit`, by the unit's namespace.
+    #[must_use]
+    pub fn follows(&self, unit: &ChangeUnit) -> bool {
+        self.namespace
+            .is_none_or(|namespace| unit.namespace == Some(namespace))
     }
 
     /// Whether it follows blob objects.
@@ -1735,6 +1765,7 @@ impl Interest {
             labels,
             edge_types,
             blobs: false,
+            namespace: None,
         }
     }
 
@@ -1791,6 +1822,13 @@ impl Interest {
             }
         }
         out.push(u8::from(self.blobs));
+        match self.namespace {
+            None => out.push(0),
+            Some(namespace) => {
+                out.push(1);
+                out.extend_from_slice(&namespace.as_raw().to_be_bytes());
+            }
+        }
     }
 }
 
@@ -2024,10 +2062,22 @@ impl ChangeCursor {
             1 => true,
             _ => return Err(CursorError::Malformed("an unknown blob interest")),
         };
+        let namespace = match r.u8()? {
+            0 => None,
+            1 => match u64::from_be_bytes(r.array()?) {
+                // The catalog hands out ids from 1.
+                0 => return Err(CursorError::Malformed("namespace id 0")),
+                raw => Some(NamespaceId::from_raw(raw)),
+            },
+            _ => return Err(CursorError::Malformed("an unknown namespace interest")),
+        };
         if !r.0.is_empty() {
             return Err(CursorError::Malformed("bytes after the cursor"));
         }
-        let interest = Interest::new(labels.clone(), edge_types.clone()).with_blobs(blobs);
+        let mut interest = Interest::new(labels.clone(), edge_types.clone()).with_blobs(blobs);
+        if let Some(namespace) = namespace {
+            interest = interest.in_namespace(namespace);
+        }
         if interest.labels != labels || interest.edge_types != edge_types {
             return Err(CursorError::Malformed("an interest not in canonical order"));
         }
@@ -2432,6 +2482,11 @@ pub(crate) fn unit_changes(
         Ok((out, Some(place)))
     };
     for unit in units {
+        // A unit of another namespace is no part of this reader's feed: it
+        // learns neither its events nor that it exists.
+        if !interest.follows(unit) {
+            continue;
+        }
         let first = if unit.position.index == from_entry {
             if unit.position.sub < from_within.sub {
                 continue;

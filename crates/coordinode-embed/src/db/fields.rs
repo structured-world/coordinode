@@ -216,7 +216,10 @@ impl FieldDictionary {
         // A namespace's dictionary: the unit names the namespace first.
         let proposal = RaftProposal {
             id: self.proposal_ids.next(),
-            mutations: coordinode_storage::engine::scope::store_unit([Mutation::Command(command)]),
+            mutations: coordinode_core::txn::proposal::in_namespace(
+                self.engine.namespace(),
+                [Mutation::Command(command)],
+            ),
             commit_ts: Timestamp::from_raw(commit_ts),
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: false,

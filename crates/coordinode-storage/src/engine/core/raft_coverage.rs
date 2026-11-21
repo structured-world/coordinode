@@ -472,6 +472,22 @@ impl StorageEngine {
         )
     }
 
+    /// The capture at `dir` of this engine's tree of `partition`
+    /// ([`Self::capture_partition`]), opened as the tree's set: this
+    /// engine's namespace, or the deployment's own.
+    ///
+    /// # Errors
+    ///
+    /// The capture cannot be opened.
+    pub(crate) fn open_capture(&self, dir: &Path, partition: Partition) -> StorageResult<Self> {
+        let capture = Deployment::open_checkpoint(dir)?;
+        if partition.is_deployment() {
+            Ok(capture.member_engine())
+        } else {
+            Self::bind(capture, self.namespace())
+        }
+    }
+
     /// The replicated rows of `partition` in this engine: every key but the
     /// node-local ones ([`is_node_local`]), and, of the reserved records,
     /// only the deployment tree's closure ledger, read at the same cut: the
@@ -495,17 +511,25 @@ impl StorageEngine {
         Ok(rows)
     }
 
-    /// The replicated rows of `partition` in the checkpoint at
-    /// `checkpoint_dir`, with which Raft entries the checkpoint's tree holds.
+    /// The replicated rows of `partition`, of this engine's namespace or the
+    /// deployment's own, in the checkpoint at `checkpoint_dir`, with which
+    /// Raft entries the checkpoint's tree holds.
     ///
     /// # Errors
     ///
-    /// The checkpoint cannot be opened or read.
+    /// The checkpoint cannot be opened or read, or holds no such namespace
+    /// ([`StorageError::UnknownNamespace`]).
     pub fn checkpoint_raft_partition(
+        &self,
         checkpoint_dir: &Path,
         partition: Partition,
     ) -> StorageResult<(Rows, RaftHeld)> {
-        let ckpt = Self::open_checkpoint(checkpoint_dir)?;
+        let checkpoint = Deployment::open_checkpoint(checkpoint_dir)?;
+        let ckpt = if partition.is_deployment() {
+            checkpoint.member_engine()
+        } else {
+            checkpoint.engine(self.namespace())?
+        };
         let rows = ckpt.replicated_rows(partition)?;
         let held = RaftHeld(TreeCoverage::read(ckpt.tree(partition)?, Domain::Raft)?);
         Ok((rows, held))
@@ -732,7 +756,10 @@ impl StorageEngine {
                 });
                 Ok(())
             })
-            .and_then(|()| Self::open_checkpoint(&dir)?.replicated_rows(partition));
+            .and_then(|()| {
+                self.open_capture(&dir, partition)?
+                    .replicated_rows(partition)
+            });
         let removed = std::fs::remove_dir_all(&dir);
         let rows = copied?;
         removed.map_err(|e| StorageError::Io(format!("remove capture {dir:?}: {e}")))?;

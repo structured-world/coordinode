@@ -139,21 +139,26 @@ impl core::fmt::Display for TreeId {
     }
 }
 
-/// The namespace an engine's data partitions open in while it holds one set
-/// of them.
+/// The namespace a fresh deployment's single store creates first, for tests
+/// that build units and tree paths of the store they open before holding
+/// its engine. Not built into a release: no serving path names a namespace
+/// it was not bound to.
+#[cfg(any(test, feature = "test-faults"))]
 pub const STORE_NAMESPACE: NamespaceId = NamespaceId::from_raw(1);
 
 /// The unit of `mutations` in [`STORE_NAMESPACE`], the marker naming it
 /// first.
+#[cfg(any(test, feature = "test-faults"))]
 pub fn store_unit(
     mutations: impl IntoIterator<Item = coordinode_core::txn::proposal::Mutation>,
 ) -> Vec<coordinode_core::txn::proposal::Mutation> {
     coordinode_core::txn::proposal::in_namespace(STORE_NAMESPACE, mutations)
 }
 
-/// The tree an engine holding one data set keeps `part` in: the deployment's
-/// own partitions in the system set, the rest in [`STORE_NAMESPACE`]. Its
+/// The tree a fresh single store keeps `part` in: the deployment's own
+/// partitions in the system set, the rest in [`STORE_NAMESPACE`]. Its
 /// [`TreeId::dir`] is where the tree lies under each endpoint.
+#[cfg(any(test, feature = "test-faults"))]
 #[must_use]
 pub const fn store_tree(part: Partition) -> TreeId {
     if part.is_deployment() {

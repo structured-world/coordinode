@@ -256,10 +256,12 @@ fn a_backup_of_a_table_a_rolled_back_drop_left_is_refused() {
     assert!(
         matches!(
             refused.storage_cause(),
-            Some(StorageError::CatalogMismatch { declared_only, trees_only })
-                if declared_only == &["Trade".to_owned()] && trees_only.is_empty()
+            Some(StorageError::CatalogMismatch { namespace, declared_only, trees_only })
+                if *namespace == db.engine().namespace()
+                    && declared_only == &["Trade".to_owned()]
+                    && trees_only.is_empty()
         ),
-        "refused naming the table declared without its tree: {refused:?}"
+        "refused naming the namespace and its table declared without a tree: {refused:?}"
     );
     assert!(
         !backups.path().join("b").exists(),

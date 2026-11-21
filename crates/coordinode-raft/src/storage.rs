@@ -580,7 +580,7 @@ pub fn rebuild_partition_from_checkpoint(
         .ok_or_else(|| io::Error::other("no Raft state machine runs over this store"))?;
     fence
         .with_applies_paused(&mut |applies, payload| {
-            let (rows, held) = StorageEngine::checkpoint_raft_partition(checkpoint_dir, partition)?;
+            let (rows, held) = engine.checkpoint_raft_partition(checkpoint_dir, partition)?;
             let (from, to) = (held.base_next(), applies.next());
             let entries = if from < to {
                 log.read_range(from, to)?

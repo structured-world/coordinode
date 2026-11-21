@@ -591,14 +591,22 @@ fn a_cut_hands_over_its_scope_and_refuses_what_it_cannot_carry() {
         key: COUNTER.to_vec(),
         value: b"1".to_vec(),
     };
-    let refused = engine.cut_units_of(&cut, &[entry(vec![inside])]);
+    let refused = engine.cut_units_of(&cut, &[entry(vec![inside.clone()])]);
     assert!(
         matches!(
             refused,
             Err(crate::error::StorageError::CutUnsupported { .. })
         ),
-        "{refused:?}"
+        "a raw write naming no namespace cannot be placed: {refused:?}"
     );
+    // The same write under another namespace's marker is none of the scope's.
+    let other = crate::oplog::OplogOp::Namespace {
+        id: engine.namespace().as_raw() + 1,
+    };
+    let units = engine
+        .cut_units_of(&cut, &[entry(vec![other, inside])])
+        .expect("another namespace's raw write");
+    assert!(units.is_empty());
     for partition in [Partition::Idx, Partition::Schema, Partition::Raft] {
         assert!(
             super::CutScope::rows(partition, Vec::new()).is_err(),
@@ -729,6 +737,87 @@ fn a_scope_without_a_successor_clips_to_the_end_of_the_key_space() {
         top.clip_range(&[0x00], &[0xFE]),
         None,
         "nothing of it is inside"
+    );
+}
+
+/// A cut taken in one namespace holds that namespace's rows and continues
+/// with its units only: another namespace's rows under the same keys and its
+/// later units are neither in the view nor in the join. An engine of another
+/// namespace refuses the cut.
+#[test]
+fn a_cut_holds_its_namespaces_rows_and_units_only() {
+    use coordinode_core::txn::proposal::in_namespace;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let deployment = crate::engine::core::Deployment::open_embedded(
+        &config(&dir),
+        Arc::new(TimestampOracle::new()),
+    )
+    .expect("open");
+    let a = deployment
+        .engine(deployment.create_namespace("a").expect("a"))
+        .expect("bind a");
+    let b = deployment
+        .engine(deployment.create_namespace("b").expect("b"))
+        .expect("bind b");
+    a.put(
+        Partition::Deployment,
+        coordinode_core::group::ENROLLED_DEPLOYMENT_KEY,
+        &[7; 16],
+    )
+    .expect("deployment");
+    let row = |engine: &StorageEngine, key: &[u8], value: &[u8]| {
+        engine
+            .commit_logged(
+                &in_namespace(
+                    engine.namespace(),
+                    [Mutation::Put {
+                        partition: PartitionId::Counter,
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                    }],
+                ),
+                engine.next_seqno(),
+                Journal::Journal,
+            )
+            .expect("row");
+    };
+    row(&a, b"counter:shared", b"of-a");
+    row(&b, b"counter:shared", b"of-b");
+    row(&b, b"counter:only-b", b"1");
+    let cut = cut(&a);
+    assert_eq!(cut.scope().namespace(), Some(a.namespace()));
+
+    let (page, _) = a.cut_page(&cut, None, 16, &unlimited()).expect("page");
+    let rows: Vec<(Vec<u8>, Vec<u8>)> =
+        page.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+    assert_eq!(
+        rows,
+        vec![(b"counter:shared".to_vec(), b"of-a".to_vec())],
+        "the view holds a's rows only"
+    );
+    assert!(
+        b.cut_page(&cut, None, 16, &unlimited()).is_err(),
+        "another namespace's engine refuses the cut"
+    );
+
+    row(&b, b"counter:later-b", b"1");
+    row(&a, b"counter:later-a", b"1");
+    let read = read(&a, &cut, cut.first(), usize::MAX);
+    let keys: Vec<Vec<u8>> = read
+        .units
+        .iter()
+        .filter(|u| !u.in_view)
+        .flat_map(|u| {
+            u.mutations.iter().filter_map(|m| match m {
+                Mutation::Put { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![b"counter:later-a".to_vec()],
+        "the join carries a's units only"
     );
 }
 

@@ -506,7 +506,10 @@ impl Database {
         // The queue is the namespace's: the unit names it before its rows.
         let proposal = RaftProposal {
             id: self.proposal_id_gen.next(),
-            mutations: coordinode_storage::engine::scope::store_unit(mutations),
+            mutations: coordinode_core::txn::proposal::in_namespace(
+                self.engine.namespace(),
+                mutations,
+            ),
             commit_ts: Timestamp::from_raw(commit_ts),
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: true,

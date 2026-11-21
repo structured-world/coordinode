@@ -456,6 +456,13 @@ recorded without the context that says what it means, is
 `Budget`. On each the cursor stays valid. A member of a replicated group
 reads the group's log up to what it applied.
 
+A feed is of the namespace the database serves: its cursor names that
+namespace, and the transactions of other namespaces sharing the store's log
+are passed over without a trace in the batch. A cursor of another namespace
+is another stream; one carried to a database of another namespace reads
+nothing of it. A transaction writes one namespace; a log unit spanning
+several, which no transaction produces, is `ChangeFeedUnsupported`.
+
 A transaction with more events than one read holds is delivered in
 fragments: each `UnitChanges` covers the ordinals `first..through` of its
 transaction, `completes_unit()` tells the last one, and the cursor continues
@@ -539,6 +546,12 @@ budget alone is refused as `Budget`, without moving the continuation. A
 position the log no longer holds while the copy runs is `RetentionLost`:
 take a new cut. An effect inside the scope the cut cannot carry is
 `CutUnsupported`, and the continuation does not move past it.
+
+A cut is of the namespace the database serves: its view holds that
+namespace's rows and its continuation that namespace's units, even where
+another namespace holds rows under the same keys. A database of another
+namespace refuses to page through it, and a resume point reached in one
+namespace is refused in another.
 
 Copy the view into a new generation of the destination, apply the
 continuation, and publish the generation together with the consumer's

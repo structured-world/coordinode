@@ -45,7 +45,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::engine::core::{Deployment, RaftApplyState, RaftPosition};
 use crate::engine::coverage::{Domain, TreeCoverage};
 use crate::engine::partition::Partition;
-use crate::engine::scope::{NAMESPACES_DIR, NamespaceId, STORE_NAMESPACE, Scope, TreeId};
+use crate::engine::scope::{NAMESPACES_DIR, NamespaceId, Scope, TreeId};
 use crate::error::{StorageError, StorageResult};
 
 /// What a transfer stream starts with.
@@ -594,8 +594,18 @@ impl Deployment {
             return Ok((trees, None));
         }
         // Taken while nothing applies, as the trees are, and sealed at once:
-        // the receiver keeps the evidence of what this member proved.
-        let store = self.engine(STORE_NAMESPACE)?;
+        // the receiver keeps the evidence of what this member proved. An
+        // inventory names the copies of one namespace's index, the one the
+        // receiver serves: with several namespaces none is sent, and the
+        // receiver checks every copy before it serves.
+        let namespace = match self.sole_namespace() {
+            Ok(namespace) => namespace,
+            Err(StorageError::NoNamespace { .. } | StorageError::SeveralNamespaces { .. }) => {
+                return Ok((trees, None));
+            }
+            Err(e) => return Err(e),
+        };
+        let store = self.engine(namespace)?;
         let inventory = match store.capture_index_inventory()? {
             Some(captured) => store.seal_index_inventory(&captured)?,
             None => None,
@@ -698,24 +708,28 @@ impl Deployment {
         let Some(catalog) = self.catalog_inventory() else {
             return Ok(());
         };
-        let declared: std::collections::BTreeSet<String> = catalog
-            .columnar_tables(&self.engine(STORE_NAMESPACE)?)?
-            .into_iter()
-            .collect();
-        let pinned: std::collections::BTreeSet<String> = trees
-            .iter()
-            .filter_map(|tree| match &tree.name {
-                TreeName::Table(_, id) => Some(id.clone()),
-                TreeName::Partition(_) => None,
-            })
-            .collect();
-        if declared == pinned {
-            return Ok(());
+        // Each namespace's catalog declares its own tables.
+        for (namespace, _) in self.live_namespaces()? {
+            let declared: std::collections::BTreeSet<String> = catalog
+                .columnar_tables(&self.engine(namespace)?)?
+                .into_iter()
+                .collect();
+            let pinned: std::collections::BTreeSet<String> = trees
+                .iter()
+                .filter_map(|tree| match &tree.name {
+                    TreeName::Table(of, id) if *of == namespace => Some(id.clone()),
+                    TreeName::Table(..) | TreeName::Partition(_) => None,
+                })
+                .collect();
+            if declared != pinned {
+                return Err(StorageError::CatalogMismatch {
+                    namespace,
+                    declared_only: declared.difference(&pinned).cloned().collect(),
+                    trees_only: pinned.difference(&declared).cloned().collect(),
+                });
+            }
         }
-        Err(StorageError::CatalogMismatch {
-            declared_only: declared.difference(&pinned).cloned().collect(),
-            trees_only: pinned.difference(&declared).cloned().collect(),
-        })
+        Ok(())
     }
 
     /// Lay `tree`'s pinned files into its folder under `root` and rebuild it

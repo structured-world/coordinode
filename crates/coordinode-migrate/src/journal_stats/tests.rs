@@ -22,11 +22,15 @@ fn record(index: u64, key: &[u8], value: Vec<u8>) -> OplogEntry {
 fn put(index: u64, partition: PartitionId, key: &[u8], value: Vec<u8>) -> OplogEntry {
     let proposal = RaftProposal {
         id: ProposalId::from_raw(index),
-        mutations: coordinode_storage::engine::scope::store_unit([Mutation::Put {
-            partition,
-            key: key.to_vec(),
-            value,
-        }]),
+        // Any namespace: the statistics count units without reading it.
+        mutations: coordinode_core::txn::proposal::in_namespace(
+            coordinode_core::namespace::NamespaceId::from_raw(1),
+            [Mutation::Put {
+                partition,
+                key: key.to_vec(),
+                value,
+            }],
+        ),
         commit_ts: Timestamp::from_raw(1000 + index),
         start_ts: Timestamp::from_raw(999 + index),
         bypass_rate_limiter: false,
