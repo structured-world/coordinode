@@ -841,7 +841,13 @@ impl Database {
     pub fn open_with_config(config: StorageConfig) -> Result<Self, DatabaseError> {
         let path = config.data_dir().to_path_buf();
         let oracle = Arc::new(TimestampOracle::new());
-        let engine = StorageEngine::open_embedded(&config, oracle.clone())?;
+        // Its anchor namespace when the store holds several: the others are
+        // reached by name ([`Self::session`]).
+        let engine = coordinode_storage::engine::core::Deployment::open_embedded(
+            &config,
+            Arc::clone(&oracle),
+        )?
+        .anchored_store()?;
         let engine = Arc::new(engine);
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));

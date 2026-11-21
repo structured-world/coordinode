@@ -147,5 +147,5 @@ pub(crate) fn named<T>(message: T) -> tonic::Request<T> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests;

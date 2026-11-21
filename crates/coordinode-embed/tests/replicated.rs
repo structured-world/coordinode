@@ -1429,6 +1429,85 @@ async fn a_schema_package_is_published_through_the_group() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A namespace created on the leader is in every member's catalog once the
+/// group applies it: a session of it opens on a follower and reads what was
+/// written in it on the leader, and nothing of the members' own namespace.
+/// A follower refuses the creation, naming the leader; a drop on the leader
+/// takes the namespace from every member.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_namespace_created_on_the_leader_serves_on_every_member() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        assert!(matches!(
+            members[1].database().read().create_namespace("tenant"),
+            Err(DatabaseError::NotLeader { leader_id: Some(1) })
+        ));
+        members[0]
+            .database()
+            .read()
+            .create_namespace("tenant")
+            .unwrap();
+        members[0]
+            .member()
+            .served_database()
+            .in_namespace("tenant")
+            .unwrap()
+            .write()
+            .execute_cypher("CREATE (:InTenant {v: 1})")
+            .unwrap();
+        members[0]
+            .database()
+            .write()
+            .execute_cypher("CREATE (:InOwn {v: 2})")
+            .unwrap();
+        for m in &members {
+            wait_until("the namespace serves on the member", || {
+                m.member()
+                    .served_database()
+                    .in_namespace("tenant")
+                    .ok()
+                    .and_then(|db| {
+                        db.write()
+                            .execute_cypher("MATCH (n:InTenant) RETURN n")
+                            .ok()
+                    })
+                    .is_some_and(|rows| rows.len() == 1)
+            })
+            .await;
+            let tenant = m.member().served_database().in_namespace("tenant").unwrap();
+            assert!(
+                tenant
+                    .write()
+                    .execute_cypher("MATCH (n:InOwn) RETURN n")
+                    .unwrap()
+                    .is_empty(),
+                "the tenant namespace sees the members' own namespace"
+            );
+        }
+
+        members[0]
+            .database()
+            .read()
+            .drop_namespace("tenant")
+            .unwrap();
+        for m in &members {
+            wait_until("the namespace is gone from the member", || {
+                matches!(
+                    m.member().served_database().in_namespace("tenant"),
+                    Err(DatabaseError::UnknownNamespace(_))
+                )
+            })
+            .await;
+        }
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A j:memory write on the leader is answered once the leader's log holds
 /// it, and goes through the group's log like any write: it reaches every
 /// member exactly once, its label count included.
@@ -1774,12 +1853,11 @@ fn an_idle_session_closes_unless_it_holds_a_transaction() {
 
 /// A store holding two namespaces opens as a member that serves both: its own
 /// database works in the anchor namespace, a session of the other opens by
-/// name, and each holds its own rows. An embedding host's handle is one store
-/// of one namespace, and refuses that store by name.
+/// name, and each holds its own rows. An embedding host's handle reopens the
+/// same store the same way, its other namespace reached by name.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_serves_every_namespace_its_store_holds() {
     use coordinode_embed::replication::Member;
-    use coordinode_storage::error::StorageError;
 
     let dir = tempfile::tempdir().unwrap();
     {
@@ -1824,17 +1902,24 @@ async fn a_member_serves_every_namespace_its_store_holds() {
     member.node().shutdown().await.unwrap();
     drop((own, other, member));
 
-    let refused = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+    let host = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
         .await
-        .err()
         .expect("a host's handle of a store of two namespaces");
-    assert!(
-        matches!(
-            refused,
-            ReplicationError::Storage(StorageError::SeveralNamespaces { .. })
-        ),
-        "{refused:?}"
+    assert_eq!(host.database().read().namespace(), NAMESPACE);
+    let rows = host
+        .member()
+        .served_database()
+        .in_namespace("other")
+        .unwrap()
+        .write()
+        .execute_cypher("MATCH (n:Shared) RETURN n.v AS v")
+        .unwrap();
+    assert_eq!(
+        rows[0].get("v"),
+        Some(&coordinode_core::graph::types::Value::Int(2)),
+        "the other namespace kept its row through the reopen"
     );
+    host.shutdown().await.unwrap();
 }
 
 /// A store whose history is a group's log is opened only as a member: the

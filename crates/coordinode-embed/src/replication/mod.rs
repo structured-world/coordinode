@@ -1171,16 +1171,10 @@ impl ReplicatedDatabase {
             listener = Some((stop, task));
         }
         // With its peers served, a joining member waits here until the group
-        // has added it and its namespace has arrived.
-        // An embedding host's handle is one store of one namespace, as a
-        // `Database` it opens is: a store holding several is refused by name.
-        let served = match member.serve().await.map(Arc::clone) {
-            Ok(database) => match member.engine().sole_namespace() {
-                Ok(_) => Ok(database),
-                Err(err) => Err(ReplicationError::from(err)),
-            },
-            Err(err) => Err(err),
-        };
+        // has added it and its namespace has arrived. The handle's database
+        // works in the store's anchor namespace; a host reaches the others
+        // through the member's served databases, by name.
+        let served = member.serve().await.map(Arc::clone);
         let database = match served {
             Ok(database) => database,
             Err(err) => {

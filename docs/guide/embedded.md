@@ -147,9 +147,11 @@ same fields on `StorageConfig` that the server reads from its config file.
 `Database::open_in_memory()` opens a database that lives in memory only, for
 tests and demos: nothing reaches the disk and nothing survives the process.
 
-The handle `Database::open` returns works in the store's one namespace,
+The handle `Database::open` returns works in the store's first namespace,
 `default` on a fresh store; `namespace()` names it. A store holding further
-namespaces gives a session of each with `session(name)`: a `Database` bound to
+namespaces opens the same way, and gives a session of each with
+`session(name)`; `Database::open_namespace(config, name, create)` opens the
+store bound to a named one instead. A session is a `Database` bound to
 that namespace for its whole life, with its own schema, indexes and data, and
 the deployment's log, clock, NodeId leases and change consumers shared with
 the handle it came from. Labels and keys written through one session are not

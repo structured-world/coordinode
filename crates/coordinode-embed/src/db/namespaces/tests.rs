@@ -134,6 +134,31 @@ fn a_namespace_closed_when_idle_reopens_with_its_data() {
     );
 }
 
+/// A store of several namespaces reopens: the handle works in the first
+/// namespace again, and a session of another reads what it held.
+#[test]
+fn a_store_of_several_namespaces_reopens_on_its_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = {
+        let database = Database::open(dir.path()).unwrap();
+        database.create_namespace("second").unwrap();
+        database
+            .session("second")
+            .unwrap()
+            .execute_cypher("CREATE (:Held {v: 3})")
+            .unwrap();
+        database.namespace().to_owned()
+    };
+    let database = Database::open(dir.path()).unwrap();
+    assert_eq!(database.namespace(), first);
+    let rows = database
+        .session("second")
+        .unwrap()
+        .execute_cypher("MATCH (n:Held) RETURN n.v AS v")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
 /// A name no namespace may have is refused before anything is written.
 #[test]
 fn an_invalid_namespace_name_is_refused() {

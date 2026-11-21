@@ -7421,6 +7421,21 @@ impl Deployment {
         }
     }
 
+    /// This store bound to its anchor namespace ([`Self::anchor_namespace`])
+    /// when the catalog holds one, else as [`Self::single_store`] makes a
+    /// store's first: what a host serving the namespaces of its own store
+    /// opens, the others reached by name.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::single_store`]; the anchor's trees cannot be opened.
+    pub fn anchored_store(&self) -> StorageResult<StorageEngine> {
+        if self.live_namespaces()?.is_empty() {
+            return self.single_store();
+        }
+        self.engine(self.anchor_namespace()?)
+    }
+
     /// The catalog's one live namespace.
     ///
     /// # Errors
