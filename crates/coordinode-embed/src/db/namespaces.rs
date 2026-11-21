@@ -24,6 +24,54 @@ pub struct NamespaceInfo {
 }
 
 impl Database {
+    /// Open the store `config` describes, bound to its namespace called
+    /// `name`: what a host serving several namespaces opens one of, and what
+    /// a restore into a named namespace writes. With `create`, a namespace
+    /// of the name is created when the catalog holds none.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::UnknownNamespace`] when the catalog holds no such
+    /// namespace and `create` is off; [`DatabaseError::NamespaceRefused`]
+    /// for a name no namespace may have; what opening the store refuses.
+    pub fn open_namespace(
+        config: coordinode_storage::engine::config::StorageConfig,
+        name: &str,
+        create: bool,
+    ) -> Result<Self, DatabaseError> {
+        use coordinode_storage::error::StorageError;
+        let path = config.data_dir().to_path_buf();
+        let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+        let deployment = coordinode_storage::engine::core::Deployment::open_embedded(
+            &config,
+            std::sync::Arc::clone(&oracle),
+        )?;
+        let engine = match deployment.engine_named(name) {
+            Ok(engine) => engine,
+            Err(StorageError::NoSuchNamespace { .. } | StorageError::UnknownNamespace { .. })
+                if create =>
+            {
+                validate_namespace_name(name).map_err(|e| DatabaseError::NamespaceRefused {
+                    name: name.to_owned(),
+                    reason: e.to_string(),
+                })?;
+                deployment.engine(deployment.create_namespace(name)?)?
+            }
+            Err(StorageError::NoSuchNamespace { .. } | StorageError::UnknownNamespace { .. }) => {
+                return Err(DatabaseError::UnknownNamespace(name.to_owned()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let engine = std::sync::Arc::new(engine);
+        let pipeline: std::sync::Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+            std::sync::Arc::new(
+                coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline::new(
+                    &engine,
+                ),
+            );
+        Self::finish_open(&path, oracle, engine, pipeline, false, None)
+    }
+
     /// Create the namespace `name` in the deployment's catalog. It holds no
     /// data; a session naming it works in it from here on.
     ///

@@ -56,16 +56,25 @@ pub(crate) fn admin_open_engine(
 /// writer opens it: a store outside any group replays its journal, a group
 /// member's store opens as the member does, so nothing is written outside the
 /// group's log.
+///
+/// Bound to the namespace called `namespace`, or, when none is named, to the
+/// store's one namespace: a store holding several is refused naming them.
 pub(crate) fn admin_open_for_reading(
     config: &coordinode_storage::engine::config::StorageConfig,
+    namespace: Option<&str>,
 ) -> Result<coordinode_storage::engine::core::StorageEngine, Box<dyn std::error::Error>> {
+    use coordinode_storage::engine::core::Deployment;
     let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    match coordinode_storage::engine::core::StorageEngine::open_embedded(config, oracle) {
+    let deployment = match Deployment::open_embedded(config, std::sync::Arc::clone(&oracle)) {
         Err(coordinode_storage::error::StorageError::GroupMemberStore { .. }) => {
-            admin_open_engine(config)
+            Deployment::open_with_oracle(config, oracle)?
         }
-        opened => Ok(opened?),
-    }
+        opened => opened?,
+    };
+    Ok(match namespace {
+        Some(name) => deployment.engine_named(name)?,
+        None => deployment.single_store()?,
+    })
 }
 
 /// The raft-snapshot backup frame's mode byte: a whole database, framed with
@@ -80,12 +89,25 @@ const SNAPSHOT_MODE_FULL_WITHOUT_DOMAIN: u8 = 0;
 ///
 /// Takes a consistent MVCC snapshot up front, so writes are never blocked for
 /// the duration of the dump.
+///
+/// A logical format exports the namespace `namespace` names, or the store's
+/// one namespace when it names none; a raft-snapshot backup holds the whole
+/// deployment, every namespace and its catalog, and takes no namespace.
 pub(crate) fn run_backup(
     data_dir: String,
     config_path: Option<String>,
     output: String,
     format: coordinode_embed::backup::BackupFormat,
+    namespace: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if namespace.is_some() && matches!(format, coordinode_embed::backup::BackupFormat::RaftSnapshot)
+    {
+        return Err(
+            "a raft-snapshot backup holds the whole deployment, every namespace with \
+                    it; --namespace applies to the logical formats"
+                .into(),
+        );
+    }
     let _log = logging::init_logging();
     info!(
         data_dir = %data_dir,
@@ -96,7 +118,7 @@ pub(crate) fn run_backup(
 
     let storage_config = admin_storage_config(config_path.as_deref(), &data_dir)?;
     let engine = std::sync::Arc::new(
-        admin_open_for_reading(&storage_config)
+        admin_open_for_reading(&storage_config, namespace.as_deref())
             .map_err(|e| format!("failed to open database: {e}"))?,
     );
 
@@ -219,14 +241,28 @@ pub(crate) fn run_backup(
 /// `only_labels` narrows a json / apoc-json / hetio-json restore to nodes
 /// carrying one of the listed labels (and the edges between kept nodes); an
 /// empty list restores everything.
+///
+/// A logical restore writes the namespace `namespace` names, created when
+/// the store holds none of the name, or the store's one namespace when it
+/// names none; a raft-snapshot restore installs a whole deployment and takes
+/// no namespace.
 pub(crate) fn run_restore(
     data_dir: String,
     config_path: Option<String>,
     input: String,
     format: coordinode_embed::backup::BackupFormat,
+    namespace: Option<String>,
     only_labels: Vec<String>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if namespace.is_some() && matches!(format, coordinode_embed::backup::BackupFormat::RaftSnapshot)
+    {
+        return Err(
+            "a raft-snapshot restore installs a whole deployment, every namespace \
+                    with it; --namespace applies to the logical formats"
+                .into(),
+        );
+    }
     let _log = logging::init_logging();
     info!(
         data_dir = %data_dir,
@@ -275,8 +311,13 @@ pub(crate) fn run_restore(
             );
         }
         logical => {
-            let db = coordinode_embed::Database::open_with_config(storage_config)
-                .map_err(|e| format!("failed to open database: {e}"))?;
+            let db = match namespace.as_deref() {
+                Some(name) => {
+                    coordinode_embed::Database::open_namespace(storage_config, name, true)
+                }
+                None => coordinode_embed::Database::open_with_config(storage_config),
+            }
+            .map_err(|e| format!("failed to open database: {e}"))?;
             let options = coordinode_embed::backup::restore::RestoreOptions {
                 only_labels: label_filter.as_ref(),
                 force,

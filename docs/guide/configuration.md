@@ -1130,8 +1130,8 @@ ignored. `healthcheck` opens nothing: it asks a running server.
 
 | Command | Required flags | Notable options |
 |---------|----------------|-----------------|
-| `coordinode backup` | `--output FILE` | `--config FILE` (multi-endpoint); `--format json\|cypher\|binary\|snapshot`, `--namespace NS`; always the whole database |
-| `coordinode restore` | `--input FILE` | `--config FILE` (multi-endpoint); `--format ...` (plus import-only `apoc-json`, `apoc-cypher`, `hetio-json`), `--namespace NS`, `--only-labels L1,L2`, `--force` |
+| `coordinode backup` | `--output FILE` | `--config FILE` (multi-endpoint); `--format json\|cypher\|binary\|snapshot`, `--namespace NS`. A logical format exports one namespace: the one `--namespace` names, or the store's only one (a store of several needs `--namespace`). `snapshot` holds the whole deployment, every namespace and the catalog, and refuses `--namespace` |
+| `coordinode restore` | `--input FILE` | `--config FILE` (multi-endpoint); `--format ...` (plus import-only `apoc-json`, `apoc-cypher`, `hetio-json`), `--namespace NS` (a logical restore writes that namespace, created when the store holds none of the name; `snapshot` refuses it), `--only-labels L1,L2`, `--force` |
 | `coordinode checkpoint` | `--output DIR` | `--config FILE` (multi-endpoint); hard-linked physical checkpoint gathered into one directory, whatever the endpoint layout; restore by pointing `serve --data` at it |
 | `coordinode compact` | (none) | `--config FILE` (multi-endpoint); offline major-compaction folding merge operands |
 | `coordinode verify` | (none) | `--config FILE` (multi-endpoint); `--deep` for full-page checksum verification |

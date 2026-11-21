@@ -240,9 +240,9 @@ pub(crate) async fn run_with(
             config_path,
             output,
             format,
-            namespace: _namespace,
+            namespace,
         } => {
-            admin::run_backup(data_dir, config_path, output, format)?;
+            admin::run_backup(data_dir, config_path, output, format, namespace)?;
         }
 
         cli::Command::Restore {
@@ -250,11 +250,19 @@ pub(crate) async fn run_with(
             config_path,
             input,
             format,
-            namespace: _namespace,
+            namespace,
             only_labels,
             force,
         } => {
-            admin::run_restore(data_dir, config_path, input, format, only_labels, force)?;
+            admin::run_restore(
+                data_dir,
+                config_path,
+                input,
+                format,
+                namespace,
+                only_labels,
+                force,
+            )?;
         }
 
         cli::Command::AdminNodeJoin {

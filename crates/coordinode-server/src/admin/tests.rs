@@ -38,6 +38,98 @@ fn zstd_magic_is_rejected_with_guidance() {
     }
 }
 
+// ── Backup and restore of one namespace ──
+
+/// A logical backup naming a namespace exports that namespace alone, and a
+/// restore naming one writes it, created in a store that holds none: two
+/// namespaces' rows never cross. A store of several namespaces is not backed
+/// up without naming one, and a raft-snapshot backup or restore, which holds
+/// the whole deployment, takes no namespace.
+#[test]
+fn a_logical_backup_and_restore_carry_one_namespace() {
+    use coordinode_embed::backup::BackupFormat;
+    let source = tempfile::tempdir().expect("source");
+    {
+        let database = coordinode_embed::Database::open(source.path()).expect("open");
+        database.create_namespace("a").expect("create a");
+        database.create_namespace("b").expect("create b");
+        for (name, value) in [("a", 1), ("b", 2)] {
+            database
+                .session(name)
+                .expect("session")
+                .execute_cypher(&format!("CREATE (:Owned {{v: {value}}})"))
+                .expect("write");
+        }
+    }
+    let data_dir = source.path().display().to_string();
+    let out = tempfile::tempdir().expect("out");
+    let file = out.path().join("a.json").display().to_string();
+    super::run_backup(
+        data_dir.clone(),
+        None,
+        file.clone(),
+        BackupFormat::Json,
+        Some("a".into()),
+    )
+    .expect("backup of a");
+    assert!(
+        super::run_backup(
+            data_dir.clone(),
+            None,
+            out.path().join("all.json").display().to_string(),
+            BackupFormat::Json,
+            None,
+        )
+        .is_err(),
+        "a store of several namespaces is backed up one namespace at a time"
+    );
+    assert!(
+        super::run_backup(
+            data_dir,
+            None,
+            out.path().join("a.snap").display().to_string(),
+            BackupFormat::RaftSnapshot,
+            Some("a".into()),
+        )
+        .is_err()
+    );
+
+    let target = tempfile::tempdir().expect("target");
+    super::run_restore(
+        target.path().display().to_string(),
+        None,
+        file.clone(),
+        BackupFormat::Json,
+        Some("c".into()),
+        Vec::new(),
+        false,
+    )
+    .expect("restore into c");
+    assert!(
+        super::run_restore(
+            target.path().display().to_string(),
+            None,
+            file,
+            BackupFormat::RaftSnapshot,
+            Some("c".into()),
+            Vec::new(),
+            false,
+        )
+        .is_err()
+    );
+    let mut restored =
+        coordinode_embed::Database::open_namespace(single_endpoint(target.path()), "c", false)
+            .expect("open c");
+    let rows = restored
+        .execute_cypher("MATCH (n:Owned) RETURN n.v AS v")
+        .expect("read");
+    assert_eq!(rows.len(), 1, "a's row alone");
+    assert_eq!(
+        rows[0].get("v"),
+        Some(&coordinode_core::graph::types::Value::Int(1))
+    );
+}
+
 // ── Maintenance commands open the directory the way the server does ──
 
 /// Wall-clock microseconds plus a wide margin: opening an engine allocates
