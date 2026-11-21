@@ -487,7 +487,7 @@ checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
 
 [[package]]
 name = "coordinode-bench"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "clap",
  "jiff",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-client"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "parking_lot 0.13.0",
  "prost",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-core"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-storage"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "byteorder-lite",
  "bytes",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-vector"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "coordinode-core",
  "coordinode-storage",
