@@ -22,13 +22,15 @@
 //! - The retained oplog / Raft log ensures consistency
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use lsm_tree::AbstractTree;
 use rayon::prelude::*;
 
 use crate::engine::config::FlushPolicy;
-use crate::engine::core::StorageEngine;
+use crate::engine::core::{Deployment, StorageEngine};
 use crate::engine::coverage;
+use crate::engine::open_sets::SetTrees;
 use crate::engine::partition::Partition;
 use crate::error::StorageResult;
 
@@ -103,7 +105,7 @@ pub fn staged_delete_bytes(key_len: u64) -> u64 {
 pub fn staged_batch_bytes(longest_key: u64) -> u64 {
     let groups = Partition::all().len() as u64
         * 2
-        * (core::mem::size_of::<(Partition, Vec<&Mutation>)>() as u64 + 16 + SEEN_GROUP);
+        * (core::mem::size_of::<((u8, Partition), Vec<&Mutation>)>() as u64 + 16 + SEEN_GROUP);
     longest_key + 32 + groups
 }
 
@@ -137,15 +139,19 @@ pub fn local_record_bytes(key_len: u64, value_len: u64) -> u64 {
         + fold
 }
 
-/// A mutation to be applied in a write batch.
+/// A mutation to be applied in a write batch. `set` is the place in the
+/// batch's [`WriteBatch::sets`] of the set whose tree it writes; a partition
+/// only the deployment holds goes to the system set's whatever the set.
 #[derive(Debug)]
 pub(crate) enum Mutation {
     Put {
+        set: u8,
         partition: Partition,
         key: Vec<u8>,
         value: Vec<u8>,
     },
     Delete {
+        set: u8,
         partition: Partition,
         key: Vec<u8>,
     },
@@ -155,12 +161,14 @@ pub(crate) enum Mutation {
     /// Use `encode_add_batch` to combine multiple UIDs into one operand when
     /// adding many edges to the same posting list in a single batch write.
     Merge {
+        set: u8,
         partition: Partition,
         key: Vec<u8>,
         operand: Vec<u8>,
     },
     /// One MVCC range tombstone over the half-open key range `[start, end)`.
     RemoveRange {
+        set: u8,
         partition: Partition,
         start: Vec<u8>,
         end: Vec<u8>,
@@ -168,14 +176,19 @@ pub(crate) enum Mutation {
 }
 
 impl Mutation {
+    /// The tree this mutation targets: its set's place and its partition.
+    fn target(&self) -> (u8, Partition) {
+        match self {
+            Self::Put { set, partition, .. }
+            | Self::Delete { set, partition, .. }
+            | Self::Merge { set, partition, .. }
+            | Self::RemoveRange { set, partition, .. } => (*set, *partition),
+        }
+    }
+
     /// Return the partition this mutation targets.
     fn partition(&self) -> Partition {
-        match self {
-            Self::Put { partition, .. }
-            | Self::Delete { partition, .. }
-            | Self::Merge { partition, .. }
-            | Self::RemoveRange { partition, .. } => *partition,
-        }
+        self.target().1
     }
 
     /// The key and value bytes this mutation writes.
@@ -194,26 +207,74 @@ impl Mutation {
 /// Accumulates mutations, then applies them all at one seqno on `commit()`
 /// (allocating the seqno) or, inside the crate, `commit_at` (caller-supplied
 /// seqno, the commit timestamp of a transaction).
+///
+/// A batch built from a [`StorageEngine`] writes its namespace; one the
+/// deployment builds to apply a logged unit writes the namespace each part
+/// of the unit names ([`Self::write_to`]), every part at the one seqno.
 pub struct WriteBatch<'a> {
-    engine: &'a StorageEngine,
+    engine: &'a Deployment,
+    /// The sets the mutations write, by the place a mutation names.
+    sets: smallvec::SmallVec<[Arc<SetTrees>; 2]>,
+    /// The place in `sets` of the set staged writes go to.
+    current: u8,
     mutations: Vec<Mutation>,
 }
 
 impl<'a> WriteBatch<'a> {
-    /// Create a new empty write batch.
+    /// Create a new empty write batch of `engine`'s namespace.
     pub fn new(engine: &'a StorageEngine) -> Self {
-        Self {
-            engine,
-            mutations: Vec::new(),
-        }
+        Self::with_capacity(engine, 0)
     }
 
-    /// Create an empty write batch sized for `capacity` mutations.
+    /// Create an empty write batch of `engine`'s namespace sized for
+    /// `capacity` mutations.
     pub(crate) fn with_capacity(engine: &'a StorageEngine, capacity: usize) -> Self {
         Self {
             engine,
+            sets: smallvec::smallvec![Arc::clone(engine.set())],
+            current: 0,
             mutations: Vec::with_capacity(capacity),
         }
+    }
+
+    /// An empty batch of `deployment` sized for `capacity` mutations, writing
+    /// only the deployment's own partitions until [`Self::write_to`] names a
+    /// namespace's set.
+    pub(crate) fn for_deployment(deployment: &'a Deployment, capacity: usize) -> Self {
+        Self {
+            engine: deployment,
+            sets: smallvec::smallvec![Arc::clone(deployment.coordinator().sets().system())],
+            current: 0,
+            mutations: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Stage the writes that follow into `set`'s trees.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`](crate::error::StorageError::InvalidConfig)
+    /// for a batch writing more sets than its places can name.
+    pub(crate) fn write_to(&mut self, set: Arc<SetTrees>) -> StorageResult<()> {
+        let at = match self.sets.iter().position(|held| Arc::ptr_eq(held, &set)) {
+            Some(at) => at,
+            None => {
+                self.sets.push(set);
+                self.sets.len() - 1
+            }
+        };
+        self.current = u8::try_from(at).map_err(|_| {
+            crate::error::StorageError::InvalidConfig(
+                "one write batch names more than 256 namespaces".into(),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// The place of the set staged writes go to.
+    #[inline]
+    fn current(&self) -> u8 {
+        self.current
     }
 
     /// Stage a put operation.
@@ -224,6 +285,7 @@ impl<'a> WriteBatch<'a> {
         value: impl Into<Vec<u8>>,
     ) {
         self.mutations.push(Mutation::Put {
+            set: self.current(),
             partition,
             key: key.into(),
             value: value.into(),
@@ -233,6 +295,7 @@ impl<'a> WriteBatch<'a> {
     /// Stage a delete operation.
     pub fn delete(&mut self, partition: Partition, key: impl Into<Vec<u8>>) {
         self.mutations.push(Mutation::Delete {
+            set: self.current(),
             partition,
             key: key.into(),
         });
@@ -253,6 +316,7 @@ impl<'a> WriteBatch<'a> {
         operand: impl Into<Vec<u8>>,
     ) {
         self.mutations.push(Mutation::Merge {
+            set: self.current(),
             partition,
             key: key.into(),
             operand: operand.into(),
@@ -267,6 +331,7 @@ impl<'a> WriteBatch<'a> {
         end: impl Into<Vec<u8>>,
     ) {
         self.mutations.push(Mutation::RemoveRange {
+            set: self.current(),
             partition,
             start: start.into(),
             end: end.into(),
@@ -357,24 +422,40 @@ impl<'a> WriteBatch<'a> {
             return Ok(());
         }
 
-        let WriteBatch { engine, mutations } = self;
+        let WriteBatch {
+            engine,
+            sets,
+            mutations,
+            ..
+        } = self;
 
-        // Group by partition, preserving staging order within each group so
+        // Group by tree, preserving staging order within each group so
         // repeated merge operands on one key resolve in the order they were
-        // staged.
-        let mut groups: HashMap<Partition, Vec<&Mutation>> =
+        // staged. A partition only the deployment holds lands in the system
+        // set's tree whatever set staged it, so its group is keyed by place 0
+        // of no set in particular.
+        let mut groups: HashMap<(u8, Partition), Vec<&Mutation>> =
             HashMap::with_capacity(Partition::all().len());
         for m in mutations {
-            groups.entry(m.partition()).or_default().push(m);
+            let (set, part) = m.target();
+            let set = if part.is_deployment() { u8::MAX } else { set };
+            groups.entry((set, part)).or_default().push(m);
         }
+        let set_of = |at: u8| -> &SetTrees {
+            match sets.get(usize::from(at)) {
+                Some(set) => set,
+                // A deployment partition's tree is the system set's.
+                None => engine.coordinator().sets().system(),
+            }
+        };
 
         if groups.len() >= 2 && mutations.len() >= PARALLEL_THRESHOLD {
-            groups
-                .par_iter()
-                .try_for_each(|(&part, group)| apply_group(engine, part, group, seqno, cover))
+            groups.par_iter().try_for_each(|(&(at, part), group)| {
+                apply_group(engine, set_of(at), part, group, seqno, cover)
+            })
         } else {
-            for (&part, group) in &groups {
-                apply_group(engine, part, group, seqno, cover)?;
+            for (&(at, part), group) in &groups {
+                apply_group(engine, set_of(at), part, group, seqno, cover)?;
             }
             Ok(())
         }
@@ -390,7 +471,7 @@ impl<'a> WriteBatch<'a> {
         for mutation in &self.mutations {
             match mutation {
                 Mutation::Put { partition, key, .. }
-                | Mutation::Delete { partition, key }
+                | Mutation::Delete { partition, key, .. }
                 | Mutation::Merge { partition, key, .. } => cache.remove(*partition, key),
                 Mutation::RemoveRange { partition, .. } => cache.clear_partition(*partition),
             }
@@ -407,15 +488,16 @@ impl<'a> WriteBatch<'a> {
 /// persists memtables as a prefix in seal order, never persists the marker
 /// without them. A re-applied tombstone at the same seqno is idempotent.
 fn apply_group(
-    engine: &StorageEngine,
+    engine: &Deployment,
+    set: &SetTrees,
     part: Partition,
     group: &[&Mutation],
     seqno: lsm_tree::SeqNo,
     cover: Option<coverage::Mark>,
 ) -> StorageResult<()> {
-    let tree = engine.tree(part)?;
+    let tree = engine.coordinator().tree_in(set, part)?;
     let mut addressing =
-        crate::engine::installation::Addressing::new(engine.installations_of(part), tree, seqno);
+        crate::engine::installation::Addressing::new(set.installations_of(part), tree, seqno);
     let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 1);
     // A replacement being prepared for a generation receives the same write
     // in the same batch, so the batch's coverage marker covers it too.

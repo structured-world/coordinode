@@ -1211,7 +1211,7 @@ impl Database {
         // from here, before anything this open starts purges the journal.
         let consumers = consumers::Consumers::open(&engine, &pipeline)?;
         // After the registrations above hold their history again.
-        let journal_reclaim = engine.start_journal_reclaim()?;
+        let journal_reclaim = engine.deployment().start_journal_reclaim()?;
 
         let db = Self {
             engine,

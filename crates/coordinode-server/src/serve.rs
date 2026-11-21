@@ -724,7 +724,7 @@ pub(crate) async fn serve(
                         // A rebuild from this checkpoint replays the Raft log
                         // from what its trees lack; the log keeps that.
                         let floor =
-                            coordinode_storage::engine::core::StorageEngine::checkpoint_raft_floor(
+                            coordinode_storage::engine::core::Deployment::checkpoint_raft_floor(
                                 &path,
                             )
                             .map_err(|e| format!("read the checkpoint's raft floor: {e}"))?;

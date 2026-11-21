@@ -1,7 +1,7 @@
 //! A copy of the whole store for another member, made from pinned versions of
 //! its trees.
 //!
-//! [`StorageEngine::pin_store`] pins every replicated tree (each partition but
+//! [`Deployment::pin_store`] pins every replicated tree (each partition but
 //! the node-local Raft one, and every `STORAGE COLUMNAR` table) while no Raft
 //! entry applies, and returns a [`StoreTransfer`]: a byte stream of known
 //! length that reads the pinned files in place as it is consumed. Nothing is
@@ -42,12 +42,10 @@ use std::path::{Path, PathBuf};
 use lsm_tree::{AbstractTree, PinnedEntry, PinnedFile, PinnedRangeTombstone, PinnedVersion};
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::engine::core::{RaftApplyState, RaftPosition, StorageEngine};
+use crate::engine::core::{Deployment, RaftApplyState, RaftPosition};
 use crate::engine::coverage::{Domain, TreeCoverage};
 use crate::engine::partition::Partition;
-use crate::engine::scope::{
-    NAMESPACES_DIR, NamespaceId, STORE_NAMESPACE, Scope, TreeId, store_tree,
-};
+use crate::engine::scope::{NAMESPACES_DIR, NamespaceId, STORE_NAMESPACE, Scope, TreeId};
 use crate::error::{StorageError, StorageResult};
 
 /// What a transfer stream starts with.
@@ -432,7 +430,7 @@ impl Read for StoreTransfer {
     }
 }
 
-impl StorageEngine {
+impl Deployment {
     /// Pin the whole replicated store for a transfer to another member:
     /// every partition but the node-local Raft one, and every `STORAGE
     /// COLUMNAR` table, with the inventory of its index copies.
@@ -506,14 +504,11 @@ impl StorageEngine {
     /// [`StorageError::CutNotReady`] when a write below the cut is still in
     /// flight after [`CHECKPOINT_CUT_WAIT`]; a tree cannot be read.
     fn pin_at_cut(&self) -> StorageResult<(Vec<PinnedTree>, u64)> {
-        let mut parts = Vec::with_capacity(Partition::all().len());
-        for &part in Partition::all() {
-            parts.push(self.tree(part)?);
-        }
+        let parts = self.coordinator().trees();
         let tables = self.table_trees();
         let _no_flush: Vec<_> = parts
             .iter()
-            .map(|tree| tree.get_flush_lock())
+            .map(|(_, tree)| tree.get_flush_lock())
             .chain(tables.iter().map(|(_, tree)| tree.get_flush_lock()))
             .collect();
         let bound = self.next_seqno();
@@ -538,12 +533,13 @@ impl StorageEngine {
         scope: PinScope,
         tables: Vec<(String, lsm_tree::AnyTree)>,
     ) -> StorageResult<(Vec<PinnedTree>, Option<Vec<u8>>)> {
-        let mut trees = Vec::with_capacity(Partition::all().len());
-        for &part in Partition::all() {
+        let open = self.coordinator().trees();
+        let mut trees = Vec::with_capacity(open.len());
+        for (id, tree) in &open {
+            let part = id.part;
             if part == Partition::Raft && scope == PinScope::Replicated {
                 continue;
             }
-            let tree = self.tree(part)?;
             // A checkpoint's trees carry their own coverage: a position
             // travels only with a transfer to another member.
             let position = match applies {
@@ -560,7 +556,7 @@ impl StorageEngine {
                 _ => None,
             };
             trees.push(PinnedTree {
-                name: TreeName::Partition(store_tree(part)),
+                name: TreeName::Partition(*id),
                 position,
                 pin: tree.pin(),
                 _held: None,
@@ -583,8 +579,9 @@ impl StorageEngine {
         }
         // Taken while nothing applies, as the trees are, and sealed at once:
         // the receiver keeps the evidence of what this member proved.
-        let inventory = match self.capture_index_inventory()? {
-            Some(captured) => self.seal_index_inventory(&captured)?,
+        let store = self.engine(STORE_NAMESPACE)?;
+        let inventory = match store.capture_index_inventory()? {
+            Some(captured) => store.seal_index_inventory(&captured)?,
             None => None,
         };
         Ok((trees, inventory))
@@ -688,8 +685,10 @@ impl StorageEngine {
         let Some(catalog) = self.catalog_inventory() else {
             return Ok(());
         };
-        let declared: std::collections::BTreeSet<String> =
-            catalog.columnar_tables(self)?.into_iter().collect();
+        let declared: std::collections::BTreeSet<String> = catalog
+            .columnar_tables(&self.engine(STORE_NAMESPACE)?)?
+            .into_iter()
+            .collect();
         let pinned: std::collections::BTreeSet<String> = trees
             .iter()
             .filter_map(|tree| match &tree.name {

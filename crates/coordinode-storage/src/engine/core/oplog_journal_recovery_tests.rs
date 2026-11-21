@@ -614,7 +614,7 @@ fn an_index_entry_and_its_new_binding_lost_to_a_crash_are_replayed() {
                 "{round}"
             );
         }
-        let installations = engine.installations.current();
+        let installations = engine.installations().expect("installations").current();
         let (Some(a), Some(b)) = (
             installations.installation(40),
             installations.installation(41),
@@ -1665,7 +1665,7 @@ fn a_crash_inside_a_member_local_compaction_keeps_every_record() {
             .as_ref()
             .expect("a member-local journal")
             .compact(
-                &engine.coordinator.partition_trees(),
+                &engine.coordinator.partition_trees(engine.set()),
                 engine.next_seqno(),
                 |tree| engine.flush_memtables(tree),
             )
@@ -1904,7 +1904,7 @@ fn a_journal_retirement_cut_short_is_finished_by_the_next_one() {
         std::fs::remove_file(segment).expect("remove");
     }
 
-    assert!(StorageEngine::retire_embedded_journal(&config).expect("retire"));
+    assert!(Deployment::retire_embedded_journal(&config).expect("retire"));
     let oracle = Arc::new(TimestampOracle::new());
     let engine = StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("open");
     for name in names {
@@ -1967,7 +1967,7 @@ fn retired_segments_that_come_back_after_a_cut_are_retired_again() {
             .map(|p| (p.clone(), std::fs::read(p).expect("read segment")))
             .collect();
 
-        assert!(StorageEngine::retire_embedded_journal(&config).expect("retire"));
+        assert!(Deployment::retire_embedded_journal(&config).expect("retire"));
         // The cut: the removals were not durable, some segments are back.
         for (i, (path, bytes)) in saved.iter().enumerate() {
             if comes_back(i) {
@@ -1975,7 +1975,7 @@ fn retired_segments_that_come_back_after_a_cut_are_retired_again() {
             }
         }
 
-        StorageEngine::retire_embedded_journal(&config)
+        Deployment::retire_embedded_journal(&config)
             .unwrap_or_else(|e| panic!("round {round}: retire again: {e}"));
         let oracle = Arc::new(TimestampOracle::new());
         let engine = StorageEngine::open_embedded(&config, Arc::clone(&oracle))

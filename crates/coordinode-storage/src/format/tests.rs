@@ -384,7 +384,7 @@ fn the_engine_refuses_a_directory_of_an_earlier_format() {
             None => std::fs::remove_file(root.path().join(MARKER_FILE)).expect("unmark"),
             Some(format) => mark(root.path(), format).expect("mark earlier"),
         }
-        let err = StorageEngine::open(&config).err().expect("refused");
+        let err = StorageEngine::open(&config).expect_err("refused");
         assert!(
             matches!(err, StorageError::UnsupportedFormat { runs: r, .. } if r == runs),
             "{err}"
@@ -476,7 +476,7 @@ fn the_engine_refuses_a_store_with_trees_at_its_top_level() {
         touch(&flat.join(tree), "table");
         let before = contents(root.path());
 
-        let err = StorageEngine::open(&config).err().expect("refused");
+        let err = StorageEngine::open(&config).expect_err("refused");
         assert!(
             matches!(&err, StorageError::UnsupportedLayout { tree: t, .. } if t == tree),
             "{tree}: {err}"
@@ -513,7 +513,7 @@ fn the_engine_refuses_a_directory_of_a_newer_format() {
     let runs = coordinode_core::version::engine_format_version();
     assert_eq!(read_marker(root.path()).expect("read"), Some(runs));
     mark(root.path(), runs + 1).expect("mark newer");
-    let err = StorageEngine::open(&config).err().expect("refused");
+    let err = StorageEngine::open(&config).expect_err("refused");
     assert!(
         matches!(err, StorageError::UnsupportedFormat { .. }),
         "{err}"

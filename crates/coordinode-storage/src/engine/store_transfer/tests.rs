@@ -2,6 +2,7 @@ use std::io::Read;
 
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use crate::engine::core::StorageEngine;
 
 fn open(dir: &Path) -> StorageEngine {
     StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(

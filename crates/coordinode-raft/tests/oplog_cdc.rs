@@ -807,7 +807,13 @@ async fn an_offline_cut_of_a_tree_behind_the_closure_is_refused() {
     // The counter tree shown to hold the log only from its start, below what
     // the Schema tree's closure accounts for, its rows as they were.
     engine
-        .lose_raft_coverage(Partition::Counter, 1)
+        .lose_raft_coverage(
+            coordinode_storage::engine::scope::TreeId::namespace(
+                engine.namespace(),
+                Partition::Counter,
+            ),
+            1,
+        )
         .expect("behind the closure");
     let refused = offline(engine).await;
     assert!(

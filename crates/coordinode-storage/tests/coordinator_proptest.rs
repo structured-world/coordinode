@@ -58,7 +58,7 @@ proptest! {
         let (_dir, engine) = open_engine();
         engine.put(part, &key, &value).unwrap();
         let via_engine = engine.get(part, &key).unwrap();
-        let via_coord = engine.coordinator().get(part, &key).unwrap();
+        let via_coord = engine.scoped_coordinator().get(part, &key).unwrap();
         prop_assert_eq!(
             via_engine.as_deref(),
             Some(value.as_slice()),

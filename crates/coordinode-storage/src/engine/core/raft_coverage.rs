@@ -16,7 +16,7 @@ use std::sync::Arc;
 use coordinode_core::txn::proposal::Mutation;
 use lsm_tree::AbstractTree;
 
-use super::{PartitionRepair, Rows, StorageEngine, claim_checkpoint_dir};
+use super::{Deployment, PartitionRepair, Rows, StorageEngine, claim_checkpoint_dir};
 use crate::engine::MAX_DERIVED_EFFECTS;
 use crate::engine::coverage::{self, Domain, Mark, TreeCoverage};
 use crate::engine::partition::Partition;
@@ -256,7 +256,7 @@ impl RaftCoverage {
     }
 }
 
-impl StorageEngine {
+impl Deployment {
     /// Read the Raft coverage record of every partition tree.
     ///
     /// # Errors
@@ -264,8 +264,8 @@ impl StorageEngine {
     /// A tree read failure, or a malformed record.
     pub fn raft_coverage(&self) -> StorageResult<RaftCoverage> {
         let mut trees = HashMap::with_capacity(Partition::all().len());
-        for (part, tree) in &self.coordinator.partition_trees() {
-            trees.insert(*part, TreeCoverage::read(tree, Domain::Raft)?);
+        for (id, tree) in &self.coordinator.trees() {
+            trees.insert(id.part, TreeCoverage::read(tree, Domain::Raft)?);
         }
         Ok(RaftCoverage { trees })
     }
@@ -385,8 +385,8 @@ impl StorageEngine {
         // Above every marker below `next`: those proposals were applied, and
         // the oracle advanced past their commit_ts, before this call.
         let at = self.next_seqno();
-        for (part, tree) in &self.coordinator.partition_trees() {
-            if !ahead(*part) {
+        for (id, tree) in &self.coordinator.trees() {
+            if !ahead(id.part) {
                 coverage::write_fold(tree, Domain::Raft, from, next, payload, at);
             }
         }
@@ -406,7 +406,9 @@ impl StorageEngine {
     pub fn raft_fence(&self) -> Option<Arc<dyn RaftApplyFence>> {
         self.raft_fence.read().clone()
     }
+}
 
+impl StorageEngine {
     /// Capture `partition` as it stands into `target` (which must not
     /// exist), for [`Self::open_checkpoint`]. Taken with the applies paused,
     /// the capture is the partition at the applies' position.
@@ -544,6 +546,7 @@ impl StorageEngine {
         );
         for (key, value) in rows {
             self.coordinator.put_at(
+                self.set(),
                 partition,
                 addressing.point(key)?,
                 value,
@@ -770,7 +773,9 @@ impl StorageEngine {
         let repair = self.begin_partition_rebuild(partition, rows)?;
         self.finish_raft_rebuild(repair, next, payload)
     }
+}
 
+impl Deployment {
     /// Record, durably, that every tree holds the entries below `next`: what
     /// a freshly created store and a freshly installed snapshot both mean.
     /// The markers below `next` are removed.

@@ -1121,7 +1121,7 @@ impl<'a> Transaction<'a> {
         if self.oracle.is_some() && self.occ_scope.is_none() {
             self.occ_scope = Some(
                 self.engine
-                    .coordinator()
+                    .scoped_coordinator()
                     .occ_scope_at(self.read_ts.as_raw()),
             );
         }

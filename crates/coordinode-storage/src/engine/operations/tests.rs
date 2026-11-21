@@ -11,6 +11,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use crate::engine::core::StorageEngine;
 
 const ISSUER: IssuerId = IssuerId([0x5a; ISSUER_ID_LEN]);
 const COUNTER: &[u8] = b"count:test";

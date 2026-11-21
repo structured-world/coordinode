@@ -1,5 +1,7 @@
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_core::index::identity::GenerationId;
+
 use crate::engine::core::StorageEngine;
 use crate::engine::partition::Partition;
 
@@ -320,7 +322,9 @@ fn an_entry_is_stored_under_its_installation_and_read_back_logically() {
             .put(Partition::Idx, b"idx:spatial:1", b"s")
             .expect("put spatial");
         let installation = engine
-            .installations
+            .set()
+            .installations()
+            .expect("installations")
             .current()
             .installation(generation)
             .expect("bound on its first write");
@@ -392,7 +396,9 @@ fn a_generation_without_an_installation_holds_nothing() {
         .put(Partition::Idx, &entry(0x02, 77, b"x"), b"holder")
         .expect("put");
     let installation = engine
-        .installations
+        .set()
+        .installations()
+        .expect("installations")
         .current()
         .installation(77)
         .expect("bound");
@@ -518,25 +524,27 @@ fn a_cleared_partition_never_hands_an_installation_out_twice() {
             .put(Partition::Idx, &entry(0x01, 5, b"a"), b"")
             .expect("put");
         first = engine
-            .installations
-            .current()
-            .installation(5)
+            .installation_of(GenerationId::from_raw(5))
             .expect("bound");
         engine.clear_partition(Partition::Idx).expect("clear");
         engine
             .put(Partition::Idx, &entry(0x01, 6, b"b"), b"")
             .expect("put after clear");
         second = engine
-            .installations
-            .current()
-            .installation(6)
+            .installation_of(GenerationId::from_raw(6))
             .expect("bound");
         assert_ne!(first, second);
         engine.persist().expect("persist");
     }
     let engine = StorageEngine::open(&config(dir.path())).expect("reopen");
-    assert_eq!(engine.installations.current().installation(5), Some(first));
-    assert_eq!(engine.installations.current().installation(6), Some(second));
+    assert_eq!(
+        engine.installation_of(GenerationId::from_raw(5)),
+        Some(first)
+    );
+    assert_eq!(
+        engine.installation_of(GenerationId::from_raw(6)),
+        Some(second)
+    );
     assert_eq!(logical_keys(&engine), vec![entry(0x01, 6, b"b")]);
 }
 

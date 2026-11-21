@@ -22,10 +22,9 @@ use crate::engine::batch::WriteBatch;
 use crate::engine::compaction::CompactionScheduler;
 use crate::engine::config::EndpointConfig;
 use crate::engine::config::{FlushPolicy, StorageConfig};
-use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator, SnapshotPin};
+use crate::engine::coordinator::{LocalMultiModalCoordinator, SnapshotPin};
 use crate::engine::coverage::{self, Coverage, Domain, TreeCoverage};
 use crate::engine::flush::FlushManager;
-#[cfg(feature = "columnar")]
 use crate::engine::open_sets::{OpenSets, SetTrees};
 use crate::engine::oplog_journal::{
     EmbeddedOplog, OplogJournalConfig, apply_oplog_ops_at, op_partition,
@@ -34,7 +33,7 @@ use crate::engine::partition::Partition;
 use crate::engine::rebuild::{self, Rebuild, RebuildRefusal};
 use crate::engine::routing::PartitionRouting;
 use crate::engine::scope::store_tree;
-use crate::engine::scope::{STORE_NAMESPACE, Scope, TreeId};
+use crate::engine::scope::{NamespaceId, STORE_NAMESPACE, Scope, TreeId};
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp};
 
@@ -95,14 +94,15 @@ const REBUILD_TREE_SET_WAIT: std::time::Duration =
 /// entries before the last one applied to finish applying.
 pub const CURSOR_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The CoordiNode storage engine.
+/// One deployment's store: the system set of trees and every namespace's
+/// set, with what they share (the sequence line, the log or journal, the
+/// block cache, the flush and compaction pools, the maintenance budget and
+/// the endpoints' footprints).
 ///
-/// Owns 8 `lsm_tree::AnyTree` instances (one per [`Partition`]), a shared
-/// `Cache`, and a shared `SequenceNumberGenerator`. All mutations go directly
-/// to the appropriate tree; there is no intermediate transaction layer.
-///
-/// For atomic multi-partition writes use [`WriteBatch`]. Crash safety is
-/// provided by the LSM WAL (each tree has its own WAL segment).
+/// It reads and writes no namespace's data itself: that goes through a
+/// [`StorageEngine`] bound to one namespace, which reaches everything here
+/// besides. Applying a logged unit routes each row to the namespace its
+/// unit names.
 ///
 /// # Drop ordering
 ///
@@ -110,7 +110,7 @@ pub const CURSOR_APPLY_WAIT: std::time::Duration = std::time::Duration::from_sec
 /// 1. `flush_manager` — stops flush workers before trees are touched
 /// 2. `compaction_scheduler` — stops compaction workers before trees drop
 /// 3. `trees` — AnyTree handles released last
-pub struct StorageEngine {
+pub struct Deployment {
     /// Background flush worker pool. Dropped first (before trees) to ensure
     /// worker threads are joined before the tree Arc refs are released.
     flush_manager: Option<FlushManager>,
@@ -133,13 +133,6 @@ pub struct StorageEngine {
     /// running at the same time, and no attempt outlives the process. Giving
     /// it durable identity would buy nothing and cost a write on every DDL.
     schema_generation: AtomicU64,
-    /// Per node key, the property deltas written since its last whole write:
-    /// a read of a key with pending deltas folds every one of them, so a
-    /// writer bounds the run by writing the record whole once it is long
-    /// enough (the reason RocksDB has `max_successive_merges`). A hint for
-    /// the choice of write form only, so process-local and bounded: a lost
-    /// or reset count costs one early whole write.
-    node_delta_runs: parking_lot::Mutex<rustc_hash::FxHashMap<Vec<u8>, u32>>,
     /// One bit per partition (its place in [`Partition::all`]) whose tree is
     /// under repair: set before the first destructive step, cleared once the
     /// repaired tree is installed. A repair that fails leaves its bit set,
@@ -340,9 +333,6 @@ pub struct StorageEngine {
     /// holds what this process proved about the copy: only what it wrote
     /// durably is known to survive a power cut, not bytes merely read back.
     promise_copy: parking_lot::Mutex<crate::engine::promise::CopyWriter>,
-    /// Which local installation holds each index generation in the index
-    /// tree; every read and write of a generation key goes through it.
-    pub(crate) installations: crate::engine::installation::Installations,
     /// The index layer's handling of transferred index copies, once it
     /// registers it. no-std: spin::RwLock.
     pub(crate) index_copy_qualifier: parking_lot::RwLock<
@@ -441,9 +431,46 @@ pub struct StorageEngine {
     /// Whether the store holds a consensus group's history (its log is bound
     /// to a group, or its trees hold entries of one), as found at open.
     group_history: bool,
+    /// This deployment as shared, set once when the open hands it out: what
+    /// a [`StorageEngine`] bound to one of its namespaces holds.
+    // no-std: once_cell::race::OnceBox
+    me: std::sync::OnceLock<std::sync::Weak<Deployment>>,
     /// The holds on the data directories. Last, so they are released only
     /// once every tree above is closed.
     _directory_locks: crate::format::DirectoryLocks,
+}
+
+/// A deployment's store bound to one namespace: what a session, a query, a
+/// modality store or a transaction reads and writes through.
+///
+/// Every partition-addressed read and write here reaches the namespace's own
+/// tree of that partition, or the system set's for a partition only the
+/// deployment holds ([`Partition::is_deployment`]); a unit it commits names
+/// the namespace. Everything the namespaces share is reached through the
+/// [`Deployment`] it dereferences to. Cloning it is two reference counts.
+#[derive(Clone)]
+pub struct StorageEngine {
+    deployment: Arc<Deployment>,
+    namespace: NamespaceId,
+    set: Arc<SetTrees>,
+}
+
+impl core::ops::Deref for StorageEngine {
+    type Target = Deployment;
+
+    #[inline]
+    fn deref(&self) -> &Deployment {
+        &self.deployment
+    }
+}
+
+impl core::fmt::Debug for StorageEngine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StorageEngine")
+            .field("data_dir", &self.deployment.data_dir)
+            .field("namespace", &self.namespace)
+            .finish_non_exhaustive()
+    }
 }
 
 /// History entries a replacement import writes between two admissions
@@ -659,10 +686,148 @@ impl OpenRepair {
 }
 
 impl StorageEngine {
-    /// Open or create a CoordiNode storage engine at the configured path.
+    /// `deployment` bound to namespace `namespace`, whose set it opens when
+    /// it is not open yet.
     ///
-    /// Creates all 8 partition trees if they don't exist.
+    /// # Errors
+    ///
+    /// The namespace's trees cannot be opened.
+    pub fn bind(deployment: Arc<Deployment>, namespace: NamespaceId) -> StorageResult<Self> {
+        let set = deployment.namespace_set(namespace)?;
+        Ok(Self {
+            deployment,
+            namespace,
+            set,
+        })
+    }
+
+    /// The deployment this engine is a namespace of.
+    #[inline]
+    #[must_use]
+    pub fn deployment(&self) -> &Arc<Deployment> {
+        &self.deployment
+    }
+
+    /// The namespace this engine reads and writes.
+    #[inline]
+    #[must_use]
+    pub fn namespace(&self) -> NamespaceId {
+        self.namespace
+    }
+
+    /// The namespace's set of trees.
+    #[inline]
+    pub(crate) fn set(&self) -> &Arc<SetTrees> {
+        &self.set
+    }
+
+    /// [`Deployment::commit_local`] of records of this namespace's trees
+    /// beside the deployment's own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Deployment::commit_local`].
+    pub fn commit_local(&self, writes: Vec<LocalWrite>, sync: LocalSync) -> StorageResult<()> {
+        self.deployment
+            .commit_local_in(Some(self.namespace), writes, sync)
+    }
+
+    /// Open the store at `config` as a store of one namespace and bind it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Deployment::open`].
     pub fn open(config: &StorageConfig) -> StorageResult<Self> {
+        Self::bind(Deployment::open(config)?, STORE_NAMESPACE)
+    }
+
+    /// [`Deployment::open_with_oracle`], bound as [`Self::open`] binds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Deployment::open_with_oracle`].
+    pub fn open_with_oracle(
+        config: &StorageConfig,
+        oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+    ) -> StorageResult<Self> {
+        Self::bind(
+            Deployment::open_with_oracle(config, oracle)?,
+            STORE_NAMESPACE,
+        )
+    }
+
+    /// [`Deployment::open_embedded`], bound as [`Self::open`] binds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Deployment::open_embedded`].
+    pub fn open_embedded(
+        config: &StorageConfig,
+        oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+    ) -> StorageResult<Self> {
+        Self::bind(Deployment::open_embedded(config, oracle)?, STORE_NAMESPACE)
+    }
+
+    /// [`Deployment::open_embedded_with_journal`], bound as [`Self::open`]
+    /// binds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Deployment::open_embedded_with_journal`].
+    pub fn open_embedded_with_journal(
+        config: &StorageConfig,
+        oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+        journal: OplogJournalConfig,
+    ) -> StorageResult<Self> {
+        Self::bind(
+            Deployment::open_embedded_with_journal(config, oracle, journal)?,
+            STORE_NAMESPACE,
+        )
+    }
+
+    /// [`Deployment::open_restoring`], bound as [`Self::open`] binds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Deployment::open_restoring`].
+    pub fn open_restoring(
+        config: &StorageConfig,
+        oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+        claim: crate::format::RestoreClaim,
+    ) -> StorageResult<Self> {
+        Self::bind(
+            Deployment::open_restoring(config, oracle, claim)?,
+            STORE_NAMESPACE,
+        )
+    }
+}
+
+impl Deployment {
+    /// This deployment bound to namespace `namespace`.
+    ///
+    /// # Errors
+    ///
+    /// The deployment is being dropped, or the namespace's set cannot be
+    /// opened.
+    pub fn engine(&self, namespace: NamespaceId) -> StorageResult<StorageEngine> {
+        let me = self
+            .me
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| StorageError::Io("the deployment is closing".into()))?;
+        StorageEngine::bind(me, namespace)
+    }
+
+    /// Hand the opened deployment out shared.
+    fn shared(self) -> Arc<Self> {
+        let shared = Arc::new(self);
+        // Set once, here, before anyone else holds it.
+        shared.me.get_or_init(|| Arc::downgrade(&shared));
+        shared
+    }
+
+    /// Open or create a deployment's store at the configured path.
+    pub fn open(config: &StorageConfig) -> StorageResult<Arc<Self>> {
         let gc_watermark = Arc::new(AtomicU64::new(0));
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(lsm_tree::SequenceNumberCounter::default());
@@ -677,7 +842,7 @@ impl StorageEngine {
     pub fn open_with_oracle(
         config: &StorageConfig,
         oracle: std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
-    ) -> StorageResult<Self> {
+    ) -> StorageResult<Arc<Self>> {
         let gc_watermark = Arc::new(AtomicU64::new(0));
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(OracleSeqnoGenerator(Arc::clone(&oracle)));
@@ -699,7 +864,7 @@ impl StorageEngine {
     pub fn open_embedded(
         config: &StorageConfig,
         oracle: std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
-    ) -> StorageResult<Self> {
+    ) -> StorageResult<Arc<Self>> {
         let gc_watermark = Arc::new(AtomicU64::new(0));
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(OracleSeqnoGenerator(Arc::clone(&oracle)));
@@ -718,7 +883,7 @@ impl StorageEngine {
         config: &StorageConfig,
         oracle: std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
         journal: OplogJournalConfig,
-    ) -> StorageResult<Self> {
+    ) -> StorageResult<Arc<Self>> {
         let gc_watermark = Arc::new(AtomicU64::new(0));
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(OracleSeqnoGenerator(Arc::clone(&oracle)));
@@ -822,7 +987,7 @@ impl StorageEngine {
         config: &StorageConfig,
         oracle: std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
         claim: crate::format::RestoreClaim,
-    ) -> StorageResult<Self> {
+    ) -> StorageResult<Arc<Self>> {
         let gc_watermark = Arc::new(AtomicU64::new(0));
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(OracleSeqnoGenerator(Arc::clone(&oracle)));
@@ -848,7 +1013,7 @@ impl StorageEngine {
         gc_watermark: Arc<AtomicU64>,
         oracle: Option<std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
         journal_config: Option<OplogJournalConfig>,
-    ) -> StorageResult<Self> {
+    ) -> StorageResult<Arc<Self>> {
         Self::finish_open_with(config, seqno, gc_watermark, oracle, journal_config, None)
     }
 
@@ -859,7 +1024,7 @@ impl StorageEngine {
         oracle: Option<std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
         journal_config: Option<OplogJournalConfig>,
         claim: Option<crate::format::RestoreClaim>,
-    ) -> StorageResult<Self> {
+    ) -> StorageResult<Arc<Self>> {
         // Before anything reads the directory: the directories are taken,
         // and one of another engine format is migrated or refused here,
         // never opened as it is.
@@ -1589,7 +1754,7 @@ impl StorageEngine {
 
         // From here on the trees are found by set: the background services
         // list them afresh on every pass.
-        let (sets, store_set) = open_sets_of(&trees);
+        let sets = open_sets_of(&trees, installations);
         let flush_manager = FlushManager::start(
             Arc::clone(&sets),
             gc_controller.watermarks(),
@@ -1803,7 +1968,6 @@ impl StorageEngine {
                 .contains(&Partition::Deployment);
         let coordinator = LocalMultiModalCoordinator::new(
             sets,
-            store_set,
             Arc::clone(&seqno),
             cache,
             gc_watermark,
@@ -1822,7 +1986,6 @@ impl StorageEngine {
             coordinator,
             claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             schema_generation: AtomicU64::new(0),
-            node_delta_runs: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             under_repair: core::sync::atomic::AtomicU64::new(0),
             repair_active: core::sync::atomic::AtomicU64::new(0),
             metadata_decisions: parking_lot::Mutex::new(()),
@@ -1874,7 +2037,6 @@ impl StorageEngine {
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
             promise_copy: parking_lot::Mutex::new(crate::engine::promise::CopyWriter::default()),
-            installations,
             index_copy_qualifier: parking_lot::RwLock::new(None),
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
             applied_feed: Arc::new(crate::engine::applied::AppliedFeed::default()),
@@ -1913,6 +2075,7 @@ impl StorageEngine {
             protections_pending: std::sync::atomic::AtomicBool::new(protections_pending),
             journal_holds: Default::default(),
             group_history,
+            me: std::sync::OnceLock::new(),
             _directory_locks: directory_locks,
         };
         engine.drain_local_journal()?;
@@ -1937,7 +2100,7 @@ impl StorageEngine {
                 engine.acknowledge_table_repair(&table)?;
             }
         }
-        Ok(engine)
+        Ok(engine.shared())
     }
 
     /// Each live `STORAGE COLUMNAR` table's write-pressure series, for an
@@ -2005,7 +2168,7 @@ impl StorageEngine {
             return Ok(false);
         };
         Ok(self
-            .tree(partition)?
+            .tree_of(store_tree(partition))?
             .acknowledge_repair_report(repair.report.id)?)
     }
 
@@ -2025,7 +2188,8 @@ impl StorageEngine {
         // synced first, so no table takes an entry it could still lose.
         local.sync()?;
         let at = self.next_seqno();
-        local.compact(&self.coordinator.partition_trees(), at, |tree| {
+        let store = self.namespace_set(STORE_NAMESPACE)?;
+        local.compact(&self.coordinator.partition_trees(&store), at, |tree| {
             self.flush_memtables(tree)
         })?;
         // Every tree now covers it durably, so a later open has nothing to
@@ -2826,14 +2990,51 @@ impl StorageEngine {
         self.oracle.clone()
     }
 
-    /// Get a tree handle by logical partition.
+    /// The tree of a partition only the deployment holds
+    /// ([`Partition::is_deployment`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::PartitionNotFound`] for a namespace's partition.
+    pub fn system_tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
+        self.coordinator.system_tree(part)
+    }
+
+    /// The tree `id`, when its set is open.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::PartitionNotFound`] when the tree is not open.
+    pub(crate) fn tree_of(&self, id: TreeId) -> StorageResult<lsm_tree::AnyTree> {
+        self.coordinator
+            .sets()
+            .tree(id)
+            .ok_or_else(|| StorageError::PartitionNotFound { name: id.name() })
+    }
+
+    /// Namespace `namespace`'s set of trees.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::UnknownNamespace`] when its set is not open here.
+    pub(crate) fn namespace_set(&self, namespace: NamespaceId) -> StorageResult<Arc<SetTrees>> {
+        self.coordinator
+            .sets()
+            .namespace(namespace)
+            .ok_or(StorageError::UnknownNamespace { namespace })
+    }
+}
+
+impl StorageEngine {
+    /// Get a tree handle by logical partition: the namespace's own, or the
+    /// system set's for a partition only the deployment holds.
     ///
     /// The tree holds keys as stored: in the index tree a generation key
     /// sits under this member's installation of the generation, not under
     /// the generation itself. Read and write through the engine's methods,
     /// which translate.
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
-        self.coordinator.tree(part)
+        self.coordinator.tree_in(&self.set, part)
     }
 
     /// The index tree's installation catalog, when `part` is the index
@@ -2843,7 +3044,17 @@ impl StorageEngine {
         &self,
         part: Partition,
     ) -> Option<&crate::engine::installation::Installations> {
-        (part == Partition::Idx).then_some(&self.installations)
+        self.set.installations_of(part)
+    }
+
+    /// The namespace's index tree installation catalog.
+    #[inline]
+    fn installations(&self) -> StorageResult<&crate::engine::installation::Installations> {
+        self.set
+            .installations()
+            .ok_or_else(|| StorageError::PartitionNotFound {
+                name: Partition::Idx.name().to_string(),
+            })
     }
 
     /// This member's published installation of `generation` in the index
@@ -2853,7 +3064,8 @@ impl StorageEngine {
         &self,
         generation: coordinode_core::index::identity::GenerationId,
     ) -> Option<u64> {
-        self.installations
+        self.set
+            .installations()?
             .current()
             .installation(generation.as_raw())
     }
@@ -2870,7 +3082,7 @@ impl StorageEngine {
         &self,
         generation: coordinode_core::index::identity::GenerationId,
     ) -> StorageResult<u64> {
-        self.installations.bind(
+        self.installations()?.bind(
             self.tree(Partition::Idx)?,
             generation.as_raw(),
             self.next_seqno(),
@@ -2883,7 +3095,10 @@ impl StorageEngine {
         &self,
         generation: coordinode_core::index::identity::GenerationId,
     ) -> Option<u64> {
-        self.installations.current().staging(generation.as_raw())
+        self.set
+            .installations()?
+            .current()
+            .staging(generation.as_raw())
     }
 
     /// Begin replacing this member's copy of `generation` in the index
@@ -2907,7 +3122,7 @@ impl StorageEngine {
         generation: coordinode_core::index::identity::GenerationId,
     ) -> StorageResult<()> {
         self.admit_replacement_write()?;
-        self.installations.stage(
+        self.installations()?.stage(
             self.tree(Partition::Idx)?,
             self.coverage_domain(),
             generation.as_raw(),
@@ -2964,7 +3179,7 @@ impl StorageEngine {
         generation: coordinode_core::index::identity::GenerationId,
         entries: &[crate::engine::installation::HistoryEntry],
     ) -> StorageResult<usize> {
-        let written = self.installations.import(
+        let written = self.installations()?.import(
             self.tree(Partition::Idx)?,
             generation.as_raw(),
             entries,
@@ -3010,7 +3225,7 @@ impl StorageEngine {
         covers_through: u64,
         history_from: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
-        self.installations.mark_imported(
+        self.installations()?.mark_imported(
             self.tree(Partition::Idx)?,
             generation.as_raw(),
             covers_through,
@@ -3033,7 +3248,7 @@ impl StorageEngine {
         generation: coordinode_core::index::identity::GenerationId,
     ) -> StorageResult<()> {
         let tree = self.tree(Partition::Idx)?;
-        self.installations.publish(
+        self.installations()?.publish(
             tree,
             generation.as_raw(),
             self.next_seqno(),
@@ -3058,7 +3273,7 @@ impl StorageEngine {
         &self,
         generation: coordinode_core::index::identity::GenerationId,
     ) -> StorageResult<()> {
-        self.installations.abandon(
+        self.installations()?.abandon(
             self.tree(Partition::Idx)?,
             generation.as_raw(),
             self.next_seqno(),
@@ -3078,7 +3293,7 @@ impl StorageEngine {
         &self,
         generation: coordinode_core::index::identity::GenerationId,
     ) -> StorageResult<crate::engine::installation::GenerationHistory> {
-        self.installations.export(
+        self.installations()?.export(
             self.tree(Partition::Idx)?,
             |idx| self.applied_position(idx),
             generation.as_raw(),
@@ -3101,7 +3316,7 @@ impl StorageEngine {
         if part != Partition::Idx {
             return Some(key);
         }
-        match self.installations.current().locate(key, buf) {
+        match self.set.installations()?.current().locate(key, buf) {
             Located::Raw(key) | Located::Bound(key) => Some(key),
             Located::Unbound => None,
         }
@@ -3118,7 +3333,7 @@ impl StorageEngine {
         let tree = self.tree(part)?;
         Ok(match part {
             Partition::Idx => {
-                let bindings = self.installations.current();
+                let bindings = self.installations()?.current();
                 bindings.check_prefix_history(prefix, seqno)?;
                 crate::engine::installation::scan_prefix(tree, &bindings, prefix, seqno)
             }
@@ -3147,7 +3362,7 @@ impl StorageEngine {
         };
         Ok(match part {
             Partition::Idx => {
-                let bindings = self.installations.current();
+                let bindings = self.installations()?.current();
                 bindings.check_history(lo, hi, seqno)?;
                 crate::engine::installation::scan(tree, &bindings, lo, hi, seqno)
             }
@@ -3180,7 +3395,7 @@ impl StorageEngine {
         if part != Partition::Idx {
             return Ok(tree.multi_get(keys.iter().copied(), seqno)?);
         }
-        let bindings = self.installations.current();
+        let bindings = self.installations()?.current();
         let mut stored = Vec::with_capacity(keys.iter().map(|k| k.len()).sum());
         // Per key: where its stored form sits in `stored`, or `None`.
         let mut spans: Vec<Option<(usize, usize)>> = Vec::with_capacity(keys.len());
@@ -3216,10 +3431,21 @@ impl StorageEngine {
         Ok(crate::engine::installation::Addressing::new(
             self.installations_of(part),
             self.tree(part)?,
-            self.coordinator.current_seqno(),
+            self.coordinator.seqno_generator().get(),
         ))
     }
 
+    /// The Layer-3 coordinator reading and writing this namespace.
+    ///
+    /// Its key-addressed methods read keys as stored; an index generation
+    /// key is read through the engine's own methods, which translate it.
+    #[must_use]
+    pub fn scoped_coordinator(&self) -> crate::engine::coordinator::ScopedCoordinator<'_> {
+        self.coordinator.scoped(&self.set)
+    }
+}
+
+impl Deployment {
     /// Borrow the Layer-3 coordinator. Replicated-writer and the
     /// seqno-consumer registry plug in at this seam — see
     /// [`LocalMultiModalCoordinator`] doc for the wire-in contract.
@@ -3483,7 +3709,7 @@ impl StorageEngine {
     /// # Errors
     ///
     /// The errors of [`Self::open`].
-    pub fn open_checkpoint(checkpoint_dir: &Path) -> StorageResult<Self> {
+    pub fn open_checkpoint(checkpoint_dir: &Path) -> StorageResult<Arc<Self>> {
         use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
         let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",
@@ -3501,6 +3727,20 @@ impl StorageEngine {
         config.retention_window_secs = u64::MAX;
         let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
         Self::open_with_oracle(&config, oracle)
+    }
+}
+
+impl StorageEngine {
+    /// [`Deployment::open_checkpoint`], bound as [`Self::open`] binds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Deployment::open_checkpoint`].
+    pub fn open_checkpoint(checkpoint_dir: &Path) -> StorageResult<Self> {
+        Self::bind(
+            Deployment::open_checkpoint(checkpoint_dir)?,
+            STORE_NAMESPACE,
+        )
     }
 
     /// Rebuild a corrupt partition from a checkpoint plus oplog replay
@@ -3982,7 +4222,9 @@ impl StorageEngine {
         self.coordinator.flush_trigger().wrote_unmeasured();
         Ok(())
     }
+}
 
+impl Deployment {
     /// The partitions whose rebuild started and did not finish: a crash
     /// between clearing a tree and persisting its rebuilt data. Such a tree
     /// holds an unknown part of its data and of its coverage record, so only
@@ -4005,7 +4247,7 @@ impl StorageEngine {
         use lsm_tree::AbstractTree as _;
         partition == Partition::Deployment
             && self.deployment_verified.is_some_and(|version| {
-                self.tree(partition)
+                self.system_tree(partition)
                     .is_ok_and(|tree| tree.current_version().id() == version)
             })
     }
@@ -4131,6 +4373,20 @@ impl StorageEngine {
             .fetch_and(!repair_bit(partition), core::sync::atomic::Ordering::AcqRel);
     }
 
+    /// Refuse a repair taken on another store.
+    pub(crate) fn check_repair(&self, repair: &PartitionRepair<'_>) -> StorageResult<()> {
+        if core::ptr::eq(repair.engine, self) {
+            Ok(())
+        } else {
+            Err(StorageError::InvalidConfig(format!(
+                "the repair of the {} partition was taken on another store",
+                repair.partition.name()
+            )))
+        }
+    }
+}
+
+impl StorageEngine {
     /// Persist the tree `repair` rebuilt, then drop its intent and end the
     /// repair. Only the repair's holder can finish it.
     fn finish_rebuild(&self, repair: PartitionRepair<'_>) -> StorageResult<()> {
@@ -4196,18 +4452,6 @@ impl StorageEngine {
         }
     }
 
-    /// Refuse a repair taken on another store.
-    pub(crate) fn check_repair(&self, repair: &PartitionRepair<'_>) -> StorageResult<()> {
-        if core::ptr::eq(repair.engine, self) {
-            Ok(())
-        } else {
-            Err(StorageError::InvalidConfig(format!(
-                "the repair of the {} partition was taken on another store",
-                repair.partition.name()
-            )))
-        }
-    }
-
     /// Apply one journal op during a checkpoint rebuild (shared by the full
     /// and range-scoped repair paths). Ops that target no partition (Noop,
     /// Raft bookkeeping, columnar rows) are no-ops here; the callers filter
@@ -4269,7 +4513,7 @@ impl StorageEngine {
         // it crosses.
         let ranges: Vec<(Vec<u8>, Vec<u8>)> = match partition {
             Partition::Idx => {
-                let bindings = self.installations.current();
+                let bindings = self.installations()?.current();
                 ranges
                     .iter()
                     .flat_map(|(min, max)| bindings.logical_ranges(min, max))
@@ -4387,7 +4631,9 @@ impl StorageEngine {
             replayed,
         })
     }
+}
 
+impl Deployment {
     /// Read journal entries with `index >= from_index` from the embedded oplog,
     /// or `None` when no journal is active. Used by the repair orchestrator to
     /// collect the entries to replay forward from a checkpoint cursor.
@@ -5365,9 +5611,10 @@ impl StorageEngine {
             coordinode_core::txn::operation::LogPosition { index: 0, sub: 0 },
         )
         .len() as u64;
-        let reader = FRAME_CURSOR_BUFFER as u64
-            + READER_PATH_ROOM
-            + self.scan_hold_bytes(Partition::Deployment, marker)?;
+        let (fixed, per_record_byte) = scan_hold_terms(self.system_tree(Partition::Deployment)?);
+        // Runs are bounded by the tree's levels: far below u64::MAX.
+        let reader =
+            FRAME_CURSOR_BUFFER as u64 + READER_PATH_ROOM + fixed + per_record_byte * marker;
         charge.grow(reader).map_err(StorageError::Budget)?;
         'log: while next < until && taken < max_entries {
             let at = next;
@@ -5486,7 +5733,9 @@ impl StorageEngine {
         charge.shrink(reader);
         Ok((next, charge))
     }
+}
 
+impl StorageEngine {
     /// One page of `cut`'s view: the rows of its scope in key order, past
     /// `after` when given, at most `max_rows` of them, within `budget`; the
     /// rows keep their memory charged to it through the returned charge.
@@ -5587,7 +5836,9 @@ impl StorageEngine {
         }
         Ok(())
     }
+}
 
+impl Deployment {
     /// Refuse a cut whose view this store does not hold: one taken of a
     /// store closed since. Its bound may still be readable here, but nothing
     /// kept it, so serving it would hide that the view was lost.
@@ -6403,13 +6654,15 @@ impl StorageEngine {
             self.pin_latest_snapshot()
         };
         // Under the pin, no collection raises a floor past the cut any more.
-        for part in included() {
-            let floor = self.tree(part)?.oldest_retained_seqno();
+        for (id, tree) in self.coordinator.trees() {
+            if id.part == Partition::Raft {
+                continue;
+            }
+            let floor = tree.oldest_retained_seqno();
             if cut <= floor {
                 return Err(refuse(format!(
-                    "its {} tree no longer holds its state at the cut {cut} (collected \
-                     through {floor})",
-                    part.name()
+                    "its {id} tree no longer holds its state at the cut {cut} (collected \
+                     through {floor})"
                 )));
             }
         }
@@ -6469,7 +6722,6 @@ impl StorageEngine {
     /// [`Self::await_transactions_through`] waits for the ones opened before
     /// a boundary.
     pub(crate) fn open_transaction(&self) -> crate::engine::open_txns::OpenTransaction {
-        use crate::engine::coordinator::MultiModalCoordinator as _;
         self.open_transactions
             .open(|| self.coordinator.current_seqno())
     }
@@ -6573,33 +6825,62 @@ impl StorageEngine {
     /// do not bound a time-travel read of data.
     pub fn oldest_readable_seqno(&self) -> lsm_tree::SeqNo {
         let mut horizon = self.coordinator.gc_watermark_value();
-        for part in Partition::all().iter().filter(|part| !part.is_system()) {
-            horizon = horizon.max(self.first_readable_in(*part));
+        for (id, tree) in self.coordinator.trees() {
+            if !id.part.is_system() {
+                horizon = horizon.max(first_readable_in(&tree));
+            }
         }
         horizon
     }
+}
 
-    /// The first seqno `part`'s tree still serves: one past its persisted
-    /// retention floor; `0` for a partition that has no tree.
-    fn first_readable_in(&self, part: Partition) -> lsm_tree::SeqNo {
-        use lsm_tree::AbstractTree as _;
-        let Ok(tree) = self.tree(part) else {
-            return 0;
-        };
-        // A tree serves strictly above its floor, so the first readable
-        // seqno is one past it. Plain arithmetic: the floor is a watermark or
-        // an install seqno, both from the seqno generator (HLC microseconds
-        // or a counter), and is never `SeqNo::MAX`, the read-latest sentinel
-        // a caller passes to a read. The `debug_assert` fails loudly if that
-        // ever stops holding, which is where it would need fixing.
-        let oldest_retained = tree.oldest_retained_seqno();
-        debug_assert!(
-            oldest_retained < lsm_tree::SeqNo::MAX,
-            "retention floor at the read-latest sentinel"
-        );
-        oldest_retained + 1
-    }
+/// What one scan of `tree` holds, as a fixed part and a part per byte of its
+/// longest record: [`StorageEngine::scan_hold_bytes`] is their sum.
+fn scan_hold_terms(tree: &lsm_tree::AnyTree) -> (u64, u64) {
+    use lsm_tree::AbstractTree as _;
+    // The read's own state and memtable iterators.
+    const READS_FIXED: u64 = 16 << 10;
+    // The trees' data block size: the LSM default, which the engine keeps.
+    const DATA_BLOCK: u64 = 4096;
+    // A table read's iterator beside the block it stands in.
+    const TABLE_READ: u64 = 1024 + DATA_BLOCK;
+    // A range read opens a run's first table as a source of its own and the
+    // rest as a second, one table at a time.
+    const READS_PER_RUN: u64 = 2;
+    // Each of the first level's runs and the one of each deeper level; the
+    // memtables count as one more.
+    let runs: u64 = tree
+        .current_version()
+        .iter_levels()
+        .map(|level| level.run_count() as u64)
+        .sum::<u64>()
+        + 1;
+    // A data block holds at most one record past its size.
+    (
+        READS_FIXED + READS_PER_RUN * runs * TABLE_READ,
+        READS_PER_RUN * runs,
+    )
+}
 
+/// The first seqno `tree` still serves: one past its persisted retention
+/// floor.
+fn first_readable_in(tree: &lsm_tree::AnyTree) -> lsm_tree::SeqNo {
+    use lsm_tree::AbstractTree as _;
+    // A tree serves strictly above its floor, so the first readable seqno is
+    // one past it. Plain arithmetic: the floor is a watermark or an install
+    // seqno, both from the seqno generator (HLC microseconds or a counter),
+    // and is never `SeqNo::MAX`, the read-latest sentinel a caller passes to
+    // a read. The `debug_assert` fails loudly if that ever stops holding,
+    // which is where it would need fixing.
+    let oldest_retained = tree.oldest_retained_seqno();
+    debug_assert!(
+        oldest_retained < lsm_tree::SeqNo::MAX,
+        "retention floor at the read-latest sentinel"
+    );
+    oldest_retained + 1
+}
+
+impl StorageEngine {
     /// Refuse a snapshot read of `part` below the retention horizon: the GC
     /// watermark, or `part`'s own retention floor where it is higher. Version
     /// history there may already be collected; answering from what survived
@@ -6621,8 +6902,10 @@ impl StorageEngine {
         snapshot: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
         let mut watermark = self.coordinator.gc_watermark_value();
-        if !part.is_system() {
-            watermark = watermark.max(self.first_readable_in(part));
+        if !part.is_system()
+            && let Ok(tree) = self.tree(part)
+        {
+            watermark = watermark.max(first_readable_in(tree));
         }
         if snapshot < watermark {
             return Err(StorageError::SnapshotOutsideRetention {
@@ -6632,7 +6915,9 @@ impl StorageEngine {
         }
         Ok(())
     }
+}
 
+impl Deployment {
     /// Advance the GC watermark toward the current seqno when no read snapshot
     /// is pinned. Lets compaction fold merge operands and collect old versions
     /// during quiescent periods; a no-op while any snapshot is pinned.
@@ -6669,6 +6954,159 @@ impl StorageEngine {
         self.coordinator.gc_watermark_value()
     }
 
+    /// Set the MVCC time-travel retention window at runtime and republish the
+    /// GC watermark. Takes effect for the next compaction; widening the window
+    /// cannot bring back versions an earlier compaction already collected.
+    /// Inert on an engine opened without an oracle (seqnos are not a clock).
+    pub fn set_retention_window(&self, window: std::time::Duration) {
+        self.coordinator
+            .set_retention_window_us(retention_window_to_us(window));
+    }
+
+    /// The configured MVCC time-travel retention window.
+    pub fn retention_window(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.coordinator.retention_window_us())
+    }
+
+    /// Capacity tracker handle — exposed so background scanners,
+    /// Prometheus exporters, and admin RPCs can read per-endpoint
+    /// usage state without going through `put`/`get` paths.
+    pub fn capacity(&self) -> &Arc<crate::engine::capacity::CapacityTracker> {
+        &self.capacity
+    }
+
+    /// Refresh the capacity report from the owned footprints (an endpoint
+    /// without a hard limit by walking its folder). Side effects:
+    /// severity-transition logs and gauges, and (when the endpoint strategy
+    /// is `CascadeEvict`) a cascade-eviction fire at the 95% emergency
+    /// threshold. Enforcement is the footprint's, not this report's.
+    ///
+    /// Synchronous — caller decides cadence. A background polling
+    /// loop wrapper lives in the engine's open path.
+    pub fn refresh_capacity(&self) {
+        run_capacity_refresh(
+            &self.capacity,
+            &self.endpoints,
+            &self.coordinator.trees(),
+            &self.footprints,
+            |id| self.cascade_evict_endpoint(id),
+        );
+    }
+
+    /// The value of `key` in the system set's `part` now.
+    ///
+    /// # Errors
+    ///
+    /// `part` has no tree in the system set, or the read fails.
+    pub fn system_get(&self, part: Partition, key: &[u8]) -> StorageResult<Option<bytes::Bytes>> {
+        let value = self
+            .system_tree(part)?
+            .get(key, self.coordinator.current_seqno())?;
+        Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
+    }
+
+    /// Write `key` of the system set's `part` directly, at the next seqno,
+    /// admitted on the owned footprint like any direct write.
+    ///
+    /// # Errors
+    ///
+    /// `part` has no tree in the system set, the write is not admitted, or
+    /// the tree refuses it.
+    pub fn system_put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
+        let mut batch = lsm_tree::WriteBatch::with_capacity(1);
+        batch.insert(key, value);
+        self.system_write(part, key, (key.len() + value.len()) as u64, batch)
+    }
+
+    /// Delete `key` of the system set's `part` directly, as
+    /// [`Self::system_put`] writes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::system_put`].
+    pub fn system_delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {
+        let mut batch = lsm_tree::WriteBatch::with_capacity(1);
+        batch.remove(key);
+        self.system_write(part, key, key.len() as u64, batch)
+    }
+
+    /// Apply `batch`, one direct write of `key` carrying `bytes`, to the
+    /// system set's `part`.
+    fn system_write(
+        &self,
+        part: Partition,
+        key: &[u8],
+        bytes: u64,
+        batch: lsm_tree::WriteBatch,
+    ) -> StorageResult<()> {
+        let tree = self.system_tree(part)?;
+        let _admitted =
+            self.admit_partition_write([part], crate::engine::footprint::footprint_of(bytes, 1))?;
+        // Held until the data is in: no complete snapshot may cover its seqno
+        // before.
+        let (seqno, _landing) = self.pending_commits.admit_direct(|| self.next_seqno());
+        let (added, memtable) = tree.apply_batch(batch, seqno)?;
+        self.coordinator
+            .flush_trigger()
+            .wrote(part, added, memtable);
+        self.write_taps.wrote(part, [key]);
+        if let Some(cache) = &self.tiered_cache {
+            cache.remove(part, key);
+        }
+        Ok(())
+    }
+
+    /// The value of `key` in the system set's `part` at `snapshot`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::system_get`]; the snapshot is no longer retained.
+    pub fn system_snapshot_get(
+        &self,
+        snapshot: &lsm_tree::SeqNo,
+        part: Partition,
+        key: &[u8],
+    ) -> StorageResult<Option<bytes::Bytes>> {
+        let value = self.system_tree(part)?.get(key, *snapshot)?;
+        Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
+    }
+
+    /// The records of the system set's `part` under `prefix` now, in key
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// `part` has no tree in the system set.
+    pub fn system_prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
+        Ok(coverage::user_prefix(
+            self.system_tree(part)?,
+            prefix,
+            self.coordinator.current_seqno(),
+        ))
+    }
+
+    /// [`Self::system_prefix_scan`] newest key first.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::system_prefix_scan`].
+    pub fn system_prefix_scan_rev(
+        &self,
+        part: Partition,
+        prefix: &[u8],
+    ) -> StorageResult<StorageIter> {
+        Ok(Box::new(
+            coverage::user_prefix(
+                self.system_tree(part)?,
+                prefix,
+                self.coordinator.current_seqno(),
+            )
+            .rev(),
+        ))
+    }
+}
+
+impl StorageEngine {
     /// What the retention window holds on disk for `part` beyond its live
     /// version: the tables compactions inside the window consumed, kept for
     /// the snapshots that still see them. See
@@ -6690,20 +7128,6 @@ impl StorageEngine {
             out.push((part, self.retained_history(part)?));
         }
         Ok(out)
-    }
-
-    /// Set the MVCC time-travel retention window at runtime and republish the
-    /// GC watermark. Takes effect for the next compaction; widening the window
-    /// cannot bring back versions an earlier compaction already collected.
-    /// Inert on an engine opened without an oracle (seqnos are not a clock).
-    pub fn set_retention_window(&self, window: std::time::Duration) {
-        self.coordinator
-            .set_retention_window_us(retention_window_to_us(window));
-    }
-
-    /// The configured MVCC time-travel retention window.
-    pub fn retention_window(&self) -> std::time::Duration {
-        std::time::Duration::from_micros(self.coordinator.retention_window_us())
     }
 
     /// Read a value by key from the given partition.
@@ -6886,31 +7310,6 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Capacity tracker handle — exposed so background scanners,
-    /// Prometheus exporters, and admin RPCs can read per-endpoint
-    /// usage state without going through `put`/`get` paths.
-    pub fn capacity(&self) -> &Arc<crate::engine::capacity::CapacityTracker> {
-        &self.capacity
-    }
-
-    /// Refresh the capacity report from the owned footprints (an endpoint
-    /// without a hard limit by walking its folder). Side effects:
-    /// severity-transition logs and gauges, and (when the endpoint strategy
-    /// is `CascadeEvict`) a cascade-eviction fire at the 95% emergency
-    /// threshold. Enforcement is the footprint's, not this report's.
-    ///
-    /// Synchronous — caller decides cadence. A background polling
-    /// loop wrapper lives in the engine's open path.
-    pub fn refresh_capacity(&self) {
-        run_capacity_refresh(
-            &self.capacity,
-            &self.endpoints,
-            &self.coordinator.trees(),
-            &self.footprints,
-            |id| self.cascade_evict_endpoint(id),
-        );
-    }
-
     /// Delete a key from the given partition.
     ///
     /// Admitted on the owned footprint like a put: a tombstone takes memtable
@@ -7028,11 +7427,17 @@ impl StorageEngine {
                 start,
                 end,
             } => self.remove_range(Partition::from(*partition), start, end),
-            // Each is resolved by the unit it belongs to: one of the store's
+            // Each is resolved by the unit it belongs to: one of this
             // namespace for a namespace's work.
             Mutation::Command(_) | Mutation::Derive(_) | Mutation::Operation(_) => {
                 if mutation.requires_namespace() {
-                    self.apply_proposal_at(&crate::engine::scope::store_unit([mutation.clone()]), 0)
+                    self.apply_proposal_at(
+                        &coordinode_core::txn::proposal::in_namespace(
+                            self.namespace,
+                            [mutation.clone()],
+                        ),
+                        0,
+                    )
                 } else {
                     self.apply_proposal_at(std::slice::from_ref(mutation), 0)
                 }
@@ -7041,7 +7446,9 @@ impl StorageEngine {
             Mutation::Effects(_) | Mutation::Namespace(_) => Ok(()),
         }
     }
+}
 
+impl Deployment {
     /// `mutations` with its metadata command replaced by the effects it has
     /// against the state held now, and whether those effects publish field
     /// bindings. Runs under `metadata_decisions`.
@@ -7059,10 +7466,21 @@ impl StorageEngine {
         let mut effects = Vec::with_capacity(mutations.len() + 1);
         let mut decided = false;
         let mut dictionary = DictionaryChange::None;
-        for mutation in mutations {
-            let Mutation::Command(command) = mutation else {
-                effects.push(mutation.clone());
-                continue;
+        // The namespace the rows and the command after the last marker
+        // belong to.
+        let mut namespace = None;
+        for (at, mutation) in mutations.iter().enumerate() {
+            let command = match mutation {
+                Mutation::Command(command) => command,
+                Mutation::Namespace(named) => {
+                    namespace = Some(*named);
+                    effects.push(mutation.clone());
+                    continue;
+                }
+                _ => {
+                    effects.push(mutation.clone());
+                    continue;
+                }
             };
             if decided {
                 tracing::warn!(
@@ -7072,7 +7490,15 @@ impl StorageEngine {
                 continue;
             }
             decided = true;
-            let decided_effects = crate::engine::metadata::decide(self, command, commit_ts)?;
+            // A namespace's command decides against that namespace's records;
+            // one of the deployment's against the deployment's alone.
+            let decided_effects = if mutation.requires_namespace() {
+                let namespace = namespace.ok_or(coordinode_core::txn::proposal::Unscoped { at })?;
+                let scope = self.engine(namespace)?;
+                crate::engine::metadata::decide(self, Some(&scope), command, commit_ts)?
+            } else {
+                crate::engine::metadata::decide(self, None, command, commit_ts)?
+            };
             if !decided_effects.is_empty() {
                 dictionary = match command {
                     MetadataCommand::RegisterFields { .. } => DictionaryChange::Extended,
@@ -7294,6 +7720,21 @@ impl StorageEngine {
     /// The journal cannot take or sync the entry, or a write names a
     /// partition the journal cannot carry.
     pub fn commit_local(&self, writes: Vec<LocalWrite>, sync: LocalSync) -> StorageResult<()> {
+        self.commit_local_in(None, writes, sync)
+    }
+
+    /// [`Self::commit_local`] of records of `namespace`'s trees beside the
+    /// deployment's own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::commit_local`]; a namespace's record without `namespace`.
+    fn commit_local_in(
+        &self,
+        namespace: Option<NamespaceId>,
+        writes: Vec<LocalWrite>,
+        sync: LocalSync,
+    ) -> StorageResult<()> {
         if writes.is_empty() {
             return Ok(());
         }
@@ -7330,7 +7771,7 @@ impl StorageEngine {
             )?
         };
         if self.oplog.is_none() {
-            return self.commit_member_local(writes, sync);
+            return self.commit_member_local(namespace, writes, sync);
         }
         let mutations = writes
             .into_iter()
@@ -7338,10 +7779,12 @@ impl StorageEngine {
             .collect::<StorageResult<Vec<_>>>()?;
         // A record of a namespace's tree (an index guard) names the namespace
         // first; the consensus state is the deployment's and names none.
-        let mutations = if mutations.iter().any(Mutation::requires_namespace) {
-            crate::engine::scope::store_unit(mutations)
-        } else {
-            mutations
+        let mutations = match mutations.iter().position(Mutation::requires_namespace) {
+            None => mutations,
+            Some(at) => coordinode_core::txn::proposal::in_namespace(
+                namespace.ok_or(coordinode_core::txn::proposal::Unscoped { at })?,
+                mutations,
+            ),
         };
         let level = match sync {
             LocalSync::BeforeUse => Journal::Journal,
@@ -7358,28 +7801,60 @@ impl StorageEngine {
     /// [`LocalSync::BeforeUse`]) in place of a flush of every tree they
     /// touch. A store kept in memory has no journal and nothing to recover
     /// from, so its records are only written.
-    fn commit_member_local(&self, writes: Vec<LocalWrite>, sync: LocalSync) -> StorageResult<()> {
+    fn commit_member_local(
+        &self,
+        namespace: Option<NamespaceId>,
+        writes: Vec<LocalWrite>,
+        sync: LocalSync,
+    ) -> StorageResult<()> {
+        // The trees the records land in: the namespace's and the system
+        // set's, or the system set's alone for the deployment's records.
+        let set = match namespace {
+            Some(namespace) => self.namespace_set(namespace)?,
+            None => Arc::clone(self.coordinator.sets().system()),
+        };
         let Some(local) = &self.local_journal else {
+            let engine = match namespace {
+                Some(namespace) => Some(self.engine(namespace)?),
+                None => None,
+            };
             for write in writes {
-                match write {
-                    LocalWrite::Put {
-                        partition,
-                        key,
-                        value,
-                    } => self.put(partition, &key, &value)?,
-                    LocalWrite::Delete { partition, key } => self.delete(partition, &key)?,
+                let (partition, key) = match &write {
+                    LocalWrite::Put { partition, key, .. }
+                    | LocalWrite::Delete { partition, key } => (*partition, key),
+                };
+                match (&write, partition.is_deployment(), &engine) {
+                    (LocalWrite::Put { value, .. }, true, _) => {
+                        self.system_put(partition, key, value)?;
+                    }
+                    (LocalWrite::Put { value, .. }, false, Some(engine)) => {
+                        engine.put(partition, key, value)?;
+                    }
+                    (LocalWrite::Delete { .. }, false, Some(engine)) => {
+                        engine.delete(partition, key)?;
+                    }
+                    (LocalWrite::Delete { .. }, true, _) => {
+                        self.system_delete(partition, key)?;
+                    }
+                    (_, false, None) => {
+                        return Err(StorageError::InvalidConfig(format!(
+                            "a record of the {} partition names no namespace",
+                            partition.name()
+                        )));
+                    }
                 }
             }
             return Ok(());
         };
+        let trees = self.coordinator.partition_trees(&set);
         let compact_due = {
             // The record stays on this member: nothing reaches the log for a
             // closing entry to cover once it is written.
             let (seqno, _held) = self.pending_commits.obligate_local(|| self.next_seqno());
             local.commit(
                 crate::engine::local_journal::Targets {
-                    trees: &self.coordinator.partition_trees(),
-                    installations: &self.installations,
+                    trees: &trees,
+                    installations: set.installations(),
                 },
                 writes,
                 sync,
@@ -7390,11 +7865,7 @@ impl StorageEngine {
         // Written past the coordinator, so the flush monitor is told.
         self.coordinator.flush_trigger().wrote_unmeasured();
         if compact_due {
-            local.compact(
-                &self.coordinator.partition_trees(),
-                self.next_seqno(),
-                |tree| self.flush_memtables(tree),
-            )?;
+            local.compact(&trees, self.next_seqno(), |tree| self.flush_memtables(tree))?;
         }
         Ok(())
     }
@@ -7508,8 +7979,8 @@ impl StorageEngine {
         // Above every marker below `next`: each of those entries drew its
         // commit_ts from this generator before it was applied.
         let at = self.next_seqno();
-        for (part, tree) in &self.coordinator.partition_trees() {
-            let part = *part;
+        for (id, tree) in &self.coordinator.trees() {
+            let part = id.part;
             let based = coverage.based(part);
             // A tree no entry since the last fold reached holds no marker
             // there; skipping it leaves its old base, which a later fold of
@@ -7571,7 +8042,7 @@ impl StorageEngine {
         if mutations.is_empty() {
             return Ok(());
         }
-        let mut batch = WriteBatch::with_capacity(self, mutations.len());
+        let mut batch = WriteBatch::for_deployment(self, mutations.len());
         let mut named = false;
         for (at, mutation) in mutations.iter().enumerate() {
             if mutation.requires_namespace() && !named {
@@ -7617,11 +8088,7 @@ impl StorageEngine {
                 // The rows after it are of this namespace: one whose trees
                 // this store holds.
                 Mutation::Namespace(namespace) => {
-                    if self.coordinator.sets().namespace(*namespace).is_none() {
-                        return Err(StorageError::UnknownNamespace {
-                            namespace: *namespace,
-                        });
-                    }
+                    batch.write_to(self.namespace_set(*namespace)?)?;
                     named = true;
                 }
             }
@@ -7646,7 +8113,9 @@ impl StorageEngine {
         batch.forget_cached();
         Ok(())
     }
+}
 
+impl StorageEngine {
     /// The most bytes one scan of `part` opened now holds besides the records
     /// it hands out, when none of its records is longer than
     /// `longest_record` key and value bytes. A caller charging its memory
@@ -7658,40 +8127,10 @@ impl StorageEngine {
     ///
     /// The partition's tree is not open.
     pub fn scan_hold_bytes(&self, part: Partition, longest_record: u64) -> StorageResult<u64> {
-        let (fixed, per_record_byte) = self.scan_hold_terms(part)?;
+        let (fixed, per_record_byte) = scan_hold_terms(self.tree(part)?);
         // Runs are bounded by the tree's levels, a record by the engine's
         // key and value limits: far below u64::MAX.
         Ok(fixed + per_record_byte * longest_record)
-    }
-
-    /// What one scan of `part` holds, as a fixed part and a part per byte
-    /// of its longest record: [`Self::scan_hold_bytes`] is their sum.
-    fn scan_hold_terms(&self, part: Partition) -> StorageResult<(u64, u64)> {
-        use lsm_tree::AbstractTree as _;
-        // The read's own state and memtable iterators.
-        const READS_FIXED: u64 = 16 << 10;
-        // The trees' data block size: the LSM default, which the engine
-        // keeps.
-        const DATA_BLOCK: u64 = 4096;
-        // A table read's iterator beside the block it stands in.
-        const TABLE_READ: u64 = 1024 + DATA_BLOCK;
-        // A range read opens a run's first table as a source of its own and
-        // the rest as a second, one table at a time.
-        const READS_PER_RUN: u64 = 2;
-        // Each of the first level's runs and the one of each deeper level;
-        // the memtables count as one more.
-        let runs: u64 = self
-            .tree(part)?
-            .current_version()
-            .iter_levels()
-            .map(|level| level.run_count() as u64)
-            .sum::<u64>()
-            + 1;
-        // A data block holds at most one record past its size.
-        Ok((
-            READS_FIXED + READS_PER_RUN * runs * TABLE_READ,
-            READS_PER_RUN * runs,
-        ))
     }
 
     /// For a scan of `part` given `room` bytes in all: what the scan holds
@@ -7703,7 +8142,7 @@ impl StorageEngine {
     ///
     /// The partition's tree is not open.
     pub fn scan_room(&self, part: Partition, room: u64) -> StorageResult<Option<(u64, u64)>> {
-        let (fixed, per_record_byte) = self.scan_hold_terms(part)?;
+        let (fixed, per_record_byte) = scan_hold_terms(self.tree(part)?);
         // The scan holds `per_record_byte` bytes per byte of the record, and
         // the copy handed over one more.
         let longest = room
@@ -7776,84 +8215,20 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// The invariant-claim table shared by every attempt on this engine.
-    ///
-    /// Shared rather than per-transaction: a condition is only protected if
-    /// the attempt that would break it consults the same table.
-    pub fn claim_registry(&self) -> &crate::engine::claims::ClaimRegistry {
-        &self.claim_registry
-    }
-
-    /// The commits admitted on this node and not yet applied.
-    ///
-    /// A writer registers its scope here before it validates, so no interval
-    /// exists in which another writer sees neither its effect nor the
-    /// obligation to account for it. A reader consults the same table to know
-    /// whether a snapshot is complete.
-    pub fn pending_commits(&self) -> &Arc<crate::engine::pending::PendingCommits> {
-        &self.pending_commits
-    }
-
-    /// The schema generation as it stands now. An attempt reads this once and
-    /// stamps it on every claim it makes.
-    pub fn schema_generation(&self) -> u64 {
-        self.schema_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
     /// Count one more property delta written to `node_key` and return the
     /// run it makes since the key's last whole write.
     pub fn note_node_delta(&self, node_key: &[u8]) -> u32 {
-        /// Keys tracked at once; past it the table starts over, which only
-        /// makes some runs look shorter than they are.
-        const MAX_TRACKED: usize = 1 << 16;
-        let mut runs = self.node_delta_runs.lock();
-        if runs.len() >= MAX_TRACKED && !runs.contains_key(node_key) {
-            runs.clear();
-        }
-        let run = runs.entry(node_key.to_vec()).or_insert(0);
-        // Bounded far below u32::MAX: a writer ends the run with a whole
-        // write once it reaches its limit.
-        *run += 1;
-        *run
+        self.set.note_node_delta(node_key)
     }
 
     /// The property deltas written to `node_key` since its last whole write.
     pub fn node_delta_run(&self, node_key: &[u8]) -> u32 {
-        self.node_delta_runs
-            .lock()
-            .get(node_key)
-            .copied()
-            .unwrap_or(0)
+        self.set.node_delta_run(node_key)
     }
 
     /// `node_key` was written whole: its run of deltas is over.
     pub fn note_node_whole_write(&self, node_key: &[u8]) {
-        self.node_delta_runs.lock().remove(node_key);
-    }
-
-    /// Record that a schema definition changed, so that predicates evaluated
-    /// before the change stop counting as evidence about the graph after it.
-    ///
-    /// Called when the change lands, not when it is staged: a definition that
-    /// never commits never invalidated anything.
-    pub fn note_schema_change(&self) {
-        self.schema_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    /// The shard whose node rows this engine holds.
-    pub fn node_shard(&self) -> u16 {
-        self.node_shard.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Tell the engine which shard's node rows it holds.
-    ///
-    /// Called by the handle above once it is constructed; the configured value
-    /// stands until then.
-    pub fn set_node_shard(&self, shard: u16) {
-        self.node_shard
-            .store(shard, std::sync::atomic::Ordering::Release);
+        self.set.note_node_whole_write(node_key);
     }
 
     /// Check if a key exists in the given partition.
@@ -7892,10 +8267,9 @@ impl StorageEngine {
         //
         // `seqno_threshold` is the GC watermark: everything BELOW it may be
         // folded, collected and have its seqno zeroed. Passing `SeqNo::MAX`
-        // here (as this did until 2026-09-08) reads as "keep everything" but
-        // means the opposite — it collects every superseded version whatever
-        // the retention policy says, zeroes the bottommost seqnos, and, since
-        // coordinode-lsm-tree 5.8.6, records a retention floor at the
+        // means the opposite of "keep everything": it collects every
+        // superseded version whatever the retention policy says, zeroes the
+        // bottommost seqnos, and records a retention floor at the
         // compaction's install seqno that refuses every snapshot at or below
         // it after a reopen.
         //
@@ -7907,6 +8281,68 @@ impl StorageEngine {
         tree.major_compact(64 * 1024 * 1024, threshold)
             .map_err(|e| StorageError::Io(format!("major compact {}: {e}", part.name())))?;
         Ok(())
+    }
+
+    /// [`persist`](Deployment::persist) for one partition: every write to
+    /// `part` made before the call is durable when it returns. For state
+    /// that has no journal behind it, such as a Raft vote.
+    ///
+    /// # Errors
+    ///
+    /// The partition does not exist or its flush fails.
+    pub fn persist_partition(&self, part: Partition) -> StorageResult<()> {
+        self.flush_memtables(self.tree(part)?)
+    }
+}
+
+impl Deployment {
+    /// The invariant-claim table shared by every attempt on this engine.
+    ///
+    /// Shared rather than per-transaction: a condition is only protected if
+    /// the attempt that would break it consults the same table.
+    pub fn claim_registry(&self) -> &crate::engine::claims::ClaimRegistry {
+        &self.claim_registry
+    }
+
+    /// The commits admitted on this node and not yet applied.
+    ///
+    /// A writer registers its scope here before it validates, so no interval
+    /// exists in which another writer sees neither its effect nor the
+    /// obligation to account for it. A reader consults the same table to know
+    /// whether a snapshot is complete.
+    pub fn pending_commits(&self) -> &Arc<crate::engine::pending::PendingCommits> {
+        &self.pending_commits
+    }
+
+    /// The schema generation as it stands now. An attempt reads this once and
+    /// stamps it on every claim it makes.
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that a schema definition changed, so that predicates evaluated
+    /// before the change stop counting as evidence about the graph after it.
+    ///
+    /// Called when the change lands, not when it is staged: a definition that
+    /// never commits never invalidated anything.
+    pub fn note_schema_change(&self) {
+        self.schema_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The shard whose node rows this engine holds.
+    pub fn node_shard(&self) -> u16 {
+        self.node_shard.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tell the engine which shard's node rows it holds.
+    ///
+    /// Called by the handle above once it is constructed; the configured value
+    /// stands until then.
+    pub fn set_node_shard(&self, shard: u16) {
+        self.node_shard
+            .store(shard, std::sync::atomic::Ordering::Release);
     }
 
     /// Report from a single cascade-eviction invocation.
@@ -7997,17 +8433,6 @@ impl StorageEngine {
             })?;
         }
         Ok(())
-    }
-
-    /// [`persist`](Self::persist) for one partition: every write to `part`
-    /// made before the call is durable when it returns. For state that has
-    /// no journal behind it, such as a Raft vote.
-    ///
-    /// # Errors
-    ///
-    /// The partition does not exist or its flush fails.
-    pub fn persist_partition(&self, part: Partition) -> StorageResult<()> {
-        self.flush_memtables(self.tree(part)?)
     }
 
     /// Write `tree`'s memtables to tables, the journal synced first: the
@@ -8111,10 +8536,10 @@ impl StorageEngine {
     ///
     /// The tree is not open, or the record cannot be made durable.
     #[cfg(any(test, feature = "test-faults"))]
-    pub fn lose_raft_coverage(&self, partition: Partition, next: u64) -> StorageResult<()> {
-        let tree = self.tree(partition)?;
-        coverage::write_fold(tree, Domain::Raft, 0, next, &[], self.next_seqno());
-        self.flush_memtables(tree)
+    pub fn lose_raft_coverage(&self, tree: TreeId, next: u64) -> StorageResult<()> {
+        let tree = self.tree_of(tree)?;
+        coverage::write_fold(&tree, Domain::Raft, 0, next, &[], self.next_seqno());
+        self.flush_memtables(&tree)
     }
 
     /// Run `hook` in the next fixed cuts of this store's own journal once the
@@ -8196,18 +8621,7 @@ impl StorageEngine {
     /// then feed it to [`Self::changed_keys_since`]. Saves callers from
     /// importing the Layer-3 coordinator trait to reach the same value.
     pub fn current_seqno(&self) -> lsm_tree::SeqNo {
-        use crate::engine::coordinator::MultiModalCoordinator as _;
         self.coordinator.current_seqno()
-    }
-
-    /// Approximate live item count in a partition.
-    ///
-    /// Read straight off the LSM metadata, so it costs no scan — but it counts
-    /// every version and tombstone the levels still hold, and knows nothing of
-    /// labels or shards. It is an upper bound suitable for progress bars and
-    /// ETAs, never for an answer a caller might present as a row count.
-    pub fn approximate_len(&self, part: Partition) -> StorageResult<usize> {
-        Ok(self.tree(part)?.approximate_len())
     }
 
     /// Get approximate disk space used by the engine in bytes.
@@ -8234,6 +8648,59 @@ impl StorageEngine {
     /// Get the shared block cache.
     pub fn cache(&self) -> &Arc<lsm_tree::Cache> {
         self.coordinator.cache()
+    }
+
+    /// Whether this store holds any data of its own: one live key under any
+    /// partition's [user-data prefix](Partition::user_data_prefix), in any
+    /// namespace.
+    ///
+    /// Consensus state, partition routing and internal bookkeeping do not
+    /// count, so a node that has only ever been started answers `false`
+    /// however many times it was restarted. This is the question a node has
+    /// to answer before it joins a group that already holds data: only the
+    /// member a group is formed around brings data into it, and a joining
+    /// node that brought its own would have to lose it silently.
+    pub fn holds_user_data(&self) -> StorageResult<bool> {
+        for &part in Partition::all().iter().filter(|part| part.is_deployment()) {
+            let Some(prefix) = part.user_data_prefix() else {
+                continue;
+            };
+            if self.system_prefix_scan(part, prefix)?.next().is_some() {
+                return Ok(true);
+            }
+        }
+        for namespace in self.coordinator.sets().namespace_ids() {
+            if self.engine(namespace)?.holds_own_data()? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl StorageEngine {
+    /// Approximate live item count in a partition.
+    ///
+    /// Read straight off the LSM metadata, so it costs no scan — but it counts
+    /// every version and tombstone the levels still hold, and knows nothing of
+    /// labels or shards. It is an upper bound suitable for progress bars and
+    /// ETAs, never for an answer a caller might present as a row count.
+    pub fn approximate_len(&self, part: Partition) -> StorageResult<usize> {
+        Ok(self.tree(part)?.approximate_len())
+    }
+
+    /// Whether the namespace holds one live key under any of its partitions'
+    /// [user-data prefixes](Partition::user_data_prefix).
+    fn holds_own_data(&self) -> StorageResult<bool> {
+        for &part in Partition::all().iter().filter(|part| !part.is_deployment()) {
+            let Some(prefix) = part.user_data_prefix() else {
+                continue;
+            };
+            if self.prefix_scan(part, prefix)?.next().is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Force a major compaction on a specific partition.
@@ -8311,27 +8778,6 @@ impl StorageEngine {
         self.scan_prefix_at(part, prefix, self.coordinator.current_seqno())
     }
 
-    /// Whether this store holds any data of its own: one live key under any
-    /// partition's [user-data prefix](Partition::user_data_prefix).
-    ///
-    /// Consensus state, partition routing and internal bookkeeping do not
-    /// count, so a node that has only ever been started answers `false`
-    /// however many times it was restarted. This is the question a node has
-    /// to answer before it joins a group that already holds data: only the
-    /// member a group is formed around brings data into it, and a joining
-    /// node that brought its own would have to lose it silently.
-    pub fn holds_user_data(&self) -> StorageResult<bool> {
-        for &part in Partition::all() {
-            let Some(prefix) = part.user_data_prefix() else {
-                continue;
-            };
-            if self.prefix_scan(part, prefix)?.next().is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Prefix scan in descending key order (high to low) — the reverse-iteration
     /// counterpart of [`Self::prefix_scan`], walking the same double-ended LSM
     /// iterator from its high end. A "latest" / "last N within a prefix"
@@ -8367,7 +8813,10 @@ impl StorageEngine {
         use lsm_tree::{AnyTree, ScanSinceEvent};
 
         // The index tree's keys go back in the form callers address them.
-        let bindings = (part == Partition::Idx).then(|| self.installations.current());
+        let bindings = match part {
+            Partition::Idx => Some(self.installations()?.current()),
+            _ => None,
+        };
         let mut keys: Vec<Vec<u8>> = Vec::new();
         let mut collect = |ev: ScanSinceEvent| -> StorageResult<()> {
             match ev {
@@ -8497,7 +8946,10 @@ impl StorageEngine {
         use std::ops::Bound;
         self.check_snapshot_retained(part, seqno)?;
         let tree = self.tree(part)?;
-        let bindings = (part == Partition::Idx).then(|| self.installations.current());
+        let bindings = match part {
+            Partition::Idx => Some(self.installations()?.current()),
+            _ => None,
+        };
         if let Some(bindings) = &bindings {
             bindings.check_history(
                 Bound::Included(coverage::clamp_user_start(start)),
@@ -8514,6 +8966,13 @@ impl StorageEngine {
         )))
     }
 
+    /// Create a new write batch for atomic, crash-safe mutations.
+    pub fn write_batch(&self) -> WriteBatch<'_> {
+        WriteBatch::new(self)
+    }
+}
+
+impl Deployment {
     /// Get the tiered cache, if enabled.
     pub fn tiered_cache(&self) -> Option<&TieredCache> {
         self.tiered_cache.as_ref()
@@ -8522,11 +8981,6 @@ impl StorageEngine {
     /// Get the access tracker.
     pub fn access_tracker(&self) -> &AccessTracker {
         &self.access_tracker
-    }
-
-    /// Create a new write batch for atomic, crash-safe mutations.
-    pub fn write_batch(&self) -> WriteBatch<'_> {
-        WriteBatch::new(self)
     }
 
     /// Take a snapshot of the current sequence number.
@@ -8552,7 +9006,7 @@ impl StorageEngine {
         #[cfg(feature = "stage-timing")]
         let (caller, start) = (std::panic::Location::caller(), std::time::Instant::now());
         let snapshot = self.pending_commits.complete_snapshot(
-            || self.coordinator.snapshot(),
+            || self.coordinator.current_seqno(),
             std::time::Duration::from_millis(
                 self.snapshot_wait
                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -8930,7 +9384,7 @@ impl StorageEngine {
             BREAKPOINT_PREFIX, Breakpoint, ClosureLedger, HEAD_KEY,
         };
         use lsm_tree::{AbstractTree, Guard as _};
-        let tree = self.tree(Partition::Deployment)?;
+        let tree = self.system_tree(Partition::Deployment)?;
         let Some(bytes) = tree.get(HEAD_KEY, lsm_tree::SeqNo::MAX)? else {
             return Ok(ClosureLedger::default());
         };
@@ -8953,7 +9407,7 @@ impl StorageEngine {
     pub(crate) fn closure_rows_at(&self, seqno: lsm_tree::SeqNo) -> StorageResult<Rows> {
         use crate::engine::closure_ledger::{BREAKPOINT_PREFIX, HEAD_KEY};
         use lsm_tree::{AbstractTree, Guard as _};
-        let tree = self.tree(Partition::Deployment)?;
+        let tree = self.system_tree(Partition::Deployment)?;
         let mut rows = Vec::new();
         if let Some(head) = tree.get(HEAD_KEY, seqno)? {
             rows.push((HEAD_KEY.to_vec(), head.to_vec()));
@@ -9059,13 +9513,12 @@ impl StorageEngine {
     }
 
     fn tap_snapshot(&self) -> StorageResult<lsm_tree::SeqNo> {
-        use crate::engine::coordinator::MultiModalCoordinator as _;
         let Some(fence) = self.raft_fence() else {
-            return Ok(self.coordinator.snapshot());
+            return Ok(self.coordinator.current_seqno());
         };
         let mut at = 0;
         fence.with_applies_paused(&mut |_, _| {
-            at = self.coordinator.snapshot();
+            at = self.coordinator.current_seqno();
             Ok(())
         })?;
         Ok(at)
@@ -9146,7 +9599,9 @@ impl StorageEngine {
     pub fn snapshot_at(&self, seqno: lsm_tree::SeqNo) -> Option<lsm_tree::SeqNo> {
         Some(seqno)
     }
+}
 
+impl StorageEngine {
     /// Inspect a value borrowed from its LSM owner at the selected snapshot.
     /// The owner remains alive until `inspect` returns; its borrow cannot
     /// escape in `R`. No payload is copied into an intermediate byte buffer.
@@ -9177,7 +9632,9 @@ impl StorageEngine {
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
         if part == Partition::Idx {
-            self.installations.current().check_key_history(key, seqno)?;
+            self.installations()?
+                .current()
+                .check_key_history(key, seqno)?;
         }
         Ok(())
     }
@@ -9524,9 +9981,12 @@ fn run_cascade_evict(
 }
 
 /// The sets the trees an open put up form: the deployment's own partitions
-/// in the system set, the rest in the one namespace the engine holds, which
-/// is also returned.
-fn open_sets_of(trees: &HashMap<Partition, lsm_tree::AnyTree>) -> (Arc<OpenSets>, Arc<SetTrees>) {
+/// in the system set, the rest in the one namespace the engine holds, its
+/// index tree read through `installations`.
+fn open_sets_of(
+    trees: &HashMap<Partition, lsm_tree::AnyTree>,
+    installations: crate::engine::installation::Installations,
+) -> Arc<OpenSets> {
     let mut system = SetTrees::new(Scope::System);
     let mut store = SetTrees::new(Scope::Namespace(STORE_NAMESPACE));
     for (&part, tree) in trees {
@@ -9537,8 +9997,8 @@ fn open_sets_of(trees: &HashMap<Partition, lsm_tree::AnyTree>) -> (Arc<OpenSets>
         };
         set.insert(part, tree.clone());
     }
-    let store = Arc::new(store);
-    (Arc::new(OpenSets::new(system, [Arc::clone(&store)])), store)
+    let store = Arc::new(store.with_installations(installations));
+    Arc::new(OpenSets::new(system, [store]))
 }
 
 /// Publish each partition's footprint: the live version (in-window key
@@ -9897,7 +10357,7 @@ fn load_or_init_partition_routing(
 /// a repair, and the next one may start.
 #[must_use = "the repair runs while this is held, and ends with its finish"]
 pub struct PartitionRepair<'e> {
-    engine: &'e StorageEngine,
+    engine: &'e Deployment,
     partition: Partition,
     bit: u64,
     /// The set of trees, held alone by a rebuild from a checkpoint until its
@@ -9961,7 +10421,7 @@ fn repair_bit(partition: Partition) -> u64 {
 /// 3. Stop the journal flusher, which syncs the journal's tail.
 /// 4. Flush active memtables: best-effort final flush.
 /// 5. Remaining fields (`trees`, `cache`, etc.) drop naturally after this.
-impl Drop for StorageEngine {
+impl Drop for Deployment {
     fn drop(&mut self) {
         // Step 0: stop the background capacity scanner. Joins the
         // scanner thread BEFORE other background workers — the
@@ -10339,7 +10799,7 @@ struct ClosureState {
 /// The breakpoint records in the deployment tree's reserved key space, read
 /// by bounded seeks of the tree itself: the application's scans never reach
 /// that key space.
-struct StoredBreakpoints<'a>(&'a StorageEngine);
+struct StoredBreakpoints<'a>(&'a Deployment);
 
 impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
     fn predecessor(
@@ -10355,7 +10815,7 @@ impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
         #[cfg(any(test, feature = "test-faults"))]
         breakpoint_read_gate::pass();
         self.0
-            .tree(Partition::Deployment)?
+            .system_tree(Partition::Deployment)?
             .range(
                 breakpoint_key(from)..=breakpoint_key(through),
                 lsm_tree::SeqNo::MAX,
@@ -10380,7 +10840,7 @@ impl crate::engine::closure_ledger::Breakpoints for StoredBreakpoints<'_> {
             return Ok(Vec::new());
         };
         self.0
-            .tree(Partition::Deployment)?
+            .system_tree(Partition::Deployment)?
             .range(
                 breakpoint_key(from)..=breakpoint_key(u64::MAX),
                 lsm_tree::SeqNo::MAX,

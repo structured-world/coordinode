@@ -2982,7 +2982,7 @@ fn a_checkpoint_refusal_names_where_the_growth_was_refused() {
         "endpoint \"cold\" footprint limit reached",
     )));
     let reported =
-        StorageEngine::checkpoint_failure(refused, || "flush before checkpoint node".into());
+        Deployment::checkpoint_failure(refused, || "flush before checkpoint node".into());
     assert!(reported.is_out_of_room(), "retryable: {reported:?}");
     assert!(
         !matches!(reported, StorageError::CapacityExhausted { .. }),

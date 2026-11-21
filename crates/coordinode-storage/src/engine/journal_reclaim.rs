@@ -11,7 +11,7 @@ use std::sync::{Arc, Weak};
 
 use coordinode_core::txn::wake::Wake;
 
-use crate::engine::core::StorageEngine;
+use crate::engine::core::Deployment;
 use crate::error::{StorageError, StorageResult};
 
 /// What a round may remove, read before it: the newest sealed segment and
@@ -63,7 +63,7 @@ impl std::fmt::Debug for JournalReclaimer {
 impl JournalReclaimer {
     /// Reclaim for `engine` each time `landed` is notified, until dropped.
     /// The engine is held weakly: the reclaimer does not keep it open.
-    pub(crate) fn start(engine: Weak<StorageEngine>, landed: Arc<Wake>) -> StorageResult<Self> {
+    pub(crate) fn start(engine: Weak<Deployment>, landed: Arc<Wake>) -> StorageResult<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let wake = Arc::clone(&landed);

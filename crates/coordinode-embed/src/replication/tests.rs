@@ -174,7 +174,9 @@ fn befores(db: &Database) -> (usize, u64) {
 async fn a_store_retired_but_never_opened_as_a_member_is_still_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let config = standalone_store(dir.path());
-    assert!(StorageEngine::retire_embedded_journal(&config).unwrap());
+    assert!(
+        coordinode_storage::engine::core::Deployment::retire_embedded_journal(&config).unwrap()
+    );
 
     let reopened = config.clone();
     tokio::task::spawn_blocking(move || {

@@ -188,7 +188,7 @@ impl LocalJournal {
             self.coverage.note_touched(part, index);
             apply_oplog_ops_at(
                 tree,
-                (part == Partition::Idx).then_some(installations),
+                installations.filter(|_| part == Partition::Idx),
                 ops,
                 seqno,
                 index,
@@ -317,7 +317,7 @@ fn into_op(write: LocalWrite) -> OplogOp {
 #[derive(Clone, Copy)]
 pub(crate) struct Targets<'a> {
     pub(crate) trees: &'a HashMap<Partition, AnyTree>,
-    pub(crate) installations: &'a Installations,
+    pub(crate) installations: Option<&'a Installations>,
 }
 
 /// The ops of one entry, grouped by the tree each lands in.

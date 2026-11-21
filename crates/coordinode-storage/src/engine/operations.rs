@@ -19,7 +19,7 @@ use coordinode_core::txn::operation::{
 };
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
 
-use crate::engine::core::StorageEngine;
+use crate::engine::core::Deployment;
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 
@@ -98,7 +98,7 @@ pub(crate) fn unit_command(
 /// operations are `rest`, against the records `engine` holds, for the unit
 /// applying at `commit_ts`.
 pub(crate) fn decide(
-    engine: &StorageEngine,
+    engine: &Deployment,
     command: &OperationCommand,
     rest: &[Mutation],
     commit_ts: u64,
@@ -160,7 +160,7 @@ fn record_put(key: Vec<u8>, value: Vec<u8>) -> Mutation {
 /// Open `incarnation`, closing every lower open one; nothing when the issuer
 /// already has it or a higher one, or when it admits nothing.
 fn decide_enrollment(
-    engine: &StorageEngine,
+    engine: &Deployment,
     issuer: &IssuerId,
     incarnation: u64,
     window: u64,
@@ -196,7 +196,7 @@ fn decide_enrollment(
 
 /// Exclude `op` when nothing is recorded of it and it could still be
 /// admitted, so no attempt ever binds it. Nothing otherwise.
-fn decide_exclusion(engine: &StorageEngine, op: &OperationId) -> StorageResult<Vec<Mutation>> {
+fn decide_exclusion(engine: &Deployment, op: &OperationId) -> StorageResult<Vec<Mutation>> {
     if operation_record(engine, op)?.is_some() {
         return Ok(Vec::new());
     }
@@ -220,7 +220,7 @@ fn decide_exclusion(engine: &StorageEngine, op: &OperationId) -> StorageResult<V
 /// Release the outcome of `op` when it is settled (committed or excluded),
 /// keeping its intent and the evidence that it is settled. A number nothing
 /// is recorded of may still be on its way: it is not released.
-fn decide_release(engine: &StorageEngine, op: &OperationId) -> StorageResult<Vec<Mutation>> {
+fn decide_release(engine: &Deployment, op: &OperationId) -> StorageResult<Vec<Mutation>> {
     match operation_record(engine, op)? {
         Some(OperationRecord {
             intent,
@@ -239,7 +239,7 @@ fn decide_release(engine: &StorageEngine, op: &OperationId) -> StorageResult<Vec
 /// Retire the incarnation's numbers below `below`: release their records and
 /// move the retired prefix.
 fn decide_retirement(
-    engine: &StorageEngine,
+    engine: &Deployment,
     issuer: &IssuerId,
     incarnation: u64,
     below: u64,
@@ -252,7 +252,7 @@ fn decide_retirement(
     }
     let mut effects = Vec::new();
     let prefix = incarnation_operations_prefix(issuer, incarnation);
-    for guard in engine.prefix_scan(Partition::Deployment, &prefix)? {
+    for guard in engine.system_prefix_scan(Partition::Deployment, &prefix)? {
         let (key, value) = guard.into_inner()?;
         let op = decode_operation_key(&key).ok_or_else(|| malformed("operation key"))?;
         if op.sequence >= below {
@@ -286,11 +286,11 @@ fn malformed(what: &str) -> StorageError {
 ///
 /// The record cannot be read or does not decode.
 pub fn operation_record(
-    engine: &StorageEngine,
+    engine: &Deployment,
     op: &OperationId,
 ) -> StorageResult<Option<OperationRecord>> {
     engine
-        .get(Partition::Deployment, &operation_key(op))?
+        .system_get(Partition::Deployment, &operation_key(op))?
         .map(|bytes| OperationRecord::decode(&bytes).ok_or_else(|| malformed("operation record")))
         .transpose()
 }
@@ -301,12 +301,12 @@ pub fn operation_record(
 ///
 /// The record cannot be read or does not decode.
 pub fn incarnation_record(
-    engine: &StorageEngine,
+    engine: &Deployment,
     issuer: &IssuerId,
     incarnation: u64,
 ) -> StorageResult<Option<IncarnationRecord>> {
     engine
-        .get(Partition::Deployment, &incarnation_key(issuer, incarnation))?
+        .system_get(Partition::Deployment, &incarnation_key(issuer, incarnation))?
         .map(|bytes| {
             IncarnationRecord::decode(&bytes).ok_or_else(|| malformed("incarnation record"))
         })
@@ -319,11 +319,13 @@ pub fn incarnation_record(
 ///
 /// A record cannot be read or does not decode.
 pub fn incarnations(
-    engine: &StorageEngine,
+    engine: &Deployment,
     issuer: &IssuerId,
 ) -> StorageResult<Vec<(u64, IncarnationRecord)>> {
     let mut out = Vec::new();
-    for guard in engine.prefix_scan(Partition::Deployment, &issuer_incarnations_prefix(issuer))? {
+    for guard in
+        engine.system_prefix_scan(Partition::Deployment, &issuer_incarnations_prefix(issuer))?
+    {
         let (key, value) = guard.into_inner()?;
         let number = decode_incarnation_key(&key).ok_or_else(|| malformed("incarnation key"))?;
         let record =
@@ -338,10 +340,7 @@ pub fn incarnations(
 /// # Errors
 ///
 /// A record cannot be read or does not decode.
-pub fn operation_outcome(
-    engine: &StorageEngine,
-    op: &OperationId,
-) -> StorageResult<OperationOutcome> {
+pub fn operation_outcome(engine: &Deployment, op: &OperationId) -> StorageResult<OperationOutcome> {
     let incarnation = incarnation_record(engine, &op.issuer, op.incarnation)?;
     let record = operation_record(engine, op)?;
     Ok(outcome_of(op, incarnation.as_ref(), record.as_ref()))
@@ -354,10 +353,10 @@ pub fn operation_outcome(
 ///
 /// A record cannot be read or does not decode.
 pub fn admission_fences(
-    engine: &StorageEngine,
+    engine: &Deployment,
 ) -> StorageResult<Vec<(IssuerId, u64, IncarnationRecord)>> {
     let mut out = Vec::new();
-    for guard in engine.prefix_scan(Partition::Deployment, INCARNATION_KEY_PREFIX)? {
+    for guard in engine.system_prefix_scan(Partition::Deployment, INCARNATION_KEY_PREFIX)? {
         let (key, value) = guard.into_inner()?;
         let issuer = key
             .get(INCARNATION_KEY_PREFIX.len()..)
@@ -385,7 +384,7 @@ pub fn admission_fences(
 ///
 /// A record cannot be read, decoded or written.
 pub fn fence_restored(
-    engine: &StorageEngine,
+    engine: &Deployment,
     surviving: &[(IssuerId, u64, IncarnationRecord)],
 ) -> StorageResult<()> {
     let mut fences: std::collections::BTreeMap<([u8; ISSUER_ID_LEN], u64), IncarnationRecord> =
@@ -406,7 +405,7 @@ pub fn fence_restored(
             open: false,
             ..record
         };
-        engine.put(
+        engine.system_put(
             Partition::Deployment,
             &incarnation_key(&IssuerId(issuer), number),
             &closed.encode(),
@@ -436,16 +435,16 @@ pub(crate) fn skipped_unit_key(at: LogPosition) -> Vec<u8> {
 /// # Errors
 ///
 /// The mark cannot be read.
-pub fn unit_skipped(engine: &StorageEngine, at: LogPosition) -> StorageResult<bool> {
+pub fn unit_skipped(engine: &Deployment, at: LogPosition) -> StorageResult<bool> {
     Ok(engine
-        .get(Partition::Deployment, &skipped_unit_key(at))?
+        .system_get(Partition::Deployment, &skipped_unit_key(at))?
         .is_some())
 }
 
 /// [`unit_skipped`] of `engine`, for a reader of the log `engine` applies.
 #[must_use]
 pub fn unit_decisions(
-    engine: std::sync::Arc<StorageEngine>,
+    engine: std::sync::Arc<Deployment>,
 ) -> crate::oplog::tailer::UnitDecisionSource {
     std::sync::Arc::new(move |at| unit_skipped(&engine, at))
 }

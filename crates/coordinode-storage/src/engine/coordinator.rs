@@ -797,9 +797,6 @@ impl Drop for WatermarkHold {
 pub struct LocalMultiModalCoordinator {
     /// Every open tree, by set.
     sets: Arc<OpenSets>,
-    /// The namespace set the partition-addressed methods below read and
-    /// write, held so that each finds its tree by an index.
-    store: Arc<SetTrees>,
     /// Shared LSM seqno generator. All `Coordinator` writes pull
     /// from this counter; readers pin to `seqno.get()` for
     /// snapshot consistency across partitions.
@@ -849,7 +846,6 @@ impl LocalMultiModalCoordinator {
 
     pub(crate) fn new(
         sets: Arc<OpenSets>,
-        store: Arc<SetTrees>,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         cache: Arc<lsm_tree::Cache>,
         gc_watermark: Arc<AtomicU64>,
@@ -858,7 +854,6 @@ impl LocalMultiModalCoordinator {
     ) -> Self {
         Self {
             sets,
-            store,
             seqno,
             cache,
             gc_watermark,
@@ -968,16 +963,57 @@ impl LocalMultiModalCoordinator {
     /// `AnyTree` would leak Layer-2 concerns into Layer 3's contract.
     /// Reserved for engine-internal call sites (cascade eviction,
     /// persist, capacity refresh).
-    pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
+    pub fn system_tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
+        self.sets
+            .system()
+            .get(part)
+            .ok_or_else(|| StorageError::PartitionNotFound {
+                name: part.name().to_string(),
+            })
+    }
+
+    /// The tree of `part` a reader or writer of namespace set `set` reaches:
+    /// the system set's for a partition only the deployment holds, `set`'s
+    /// otherwise.
+    #[inline]
+    pub(crate) fn tree_in<'s>(
+        &'s self,
+        set: &'s SetTrees,
+        part: Partition,
+    ) -> StorageResult<&'s lsm_tree::AnyTree> {
         let set = if part.is_deployment() {
             self.sets.system()
         } else {
-            &self.store
+            set
         };
         set.get(part)
             .ok_or_else(|| StorageError::PartitionNotFound {
                 name: part.name().to_string(),
             })
+    }
+
+    /// Allocate the next seqno of the deployment's one sequence line.
+    #[inline]
+    pub fn next_seqno(&self) -> lsm_tree::SeqNo {
+        self.seqno.next()
+    }
+
+    /// The seqno a read now sees everything below.
+    #[inline]
+    pub fn current_seqno(&self) -> lsm_tree::SeqNo {
+        self.seqno.get()
+    }
+
+    /// Publish `watermark` as the GC watermark directly.
+    pub fn set_gc_watermark(&self, watermark: u64) {
+        self.gc_watermark.store(watermark, Ordering::Release);
+    }
+
+    /// This coordinator as a reader and writer of namespace set `set`.
+    #[inline]
+    #[must_use]
+    pub fn scoped<'s>(&'s self, set: &'s SetTrees) -> ScopedCoordinator<'s> {
+        ScopedCoordinator { inner: self, set }
     }
 
     /// Every open tree now, with its address. Used by lifecycle helpers
@@ -992,15 +1028,16 @@ impl LocalMultiModalCoordinator {
         &self.sets
     }
 
-    /// The trees the partition-addressed methods reach, by partition: the
-    /// system set's and the store namespace's.
+    /// The trees a reader or writer of namespace set `set` reaches, by
+    /// partition: the system set's and `set`'s.
     pub(crate) fn partition_trees(
         &self,
+        set: &SetTrees,
     ) -> std::collections::HashMap<Partition, lsm_tree::AnyTree> {
         self.sets
             .system()
             .iter()
-            .chain(self.store.iter())
+            .chain(set.iter())
             .map(|(id, tree)| (id.part, tree.clone()))
             .collect()
     }
@@ -1020,32 +1057,49 @@ impl LocalMultiModalCoordinator {
         &self.seqno
     }
 
-    /// Write `key` at a caller-chosen `seqno` instead of the next one.
+    /// Write `key` of `set`'s `part` at a caller-chosen `seqno` instead of
+    /// the next one.
     pub(crate) fn put_at(
         &self,
+        set: &SetTrees,
         part: Partition,
         key: &[u8],
         value: &[u8],
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
-        let tree = self.tree(part)?;
+        let tree = self.tree_in(set, part)?;
         let (added, memtable) = tree.insert(key, value, seqno);
         self.flush_trigger.wrote(part, added, memtable);
         Ok(())
     }
 }
 
-impl MultiModalCoordinator for LocalMultiModalCoordinator {
+/// A [`LocalMultiModalCoordinator`] reading and writing one namespace's set:
+/// what its partition-addressed methods reach. Built per call, by reference.
+#[derive(Clone, Copy)]
+pub struct ScopedCoordinator<'a> {
+    inner: &'a LocalMultiModalCoordinator,
+    set: &'a SetTrees,
+}
+
+impl ScopedCoordinator<'_> {
+    #[inline]
+    fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
+        self.inner.tree_in(self.set, part)
+    }
+}
+
+impl MultiModalCoordinator for ScopedCoordinator<'_> {
     fn next_seqno(&self) -> lsm_tree::SeqNo {
-        self.seqno.next()
+        self.inner.seqno.next()
     }
 
     fn current_seqno(&self) -> lsm_tree::SeqNo {
-        self.seqno.get()
+        self.inner.seqno.get()
     }
 
     fn snapshot(&self) -> lsm_tree::SeqNo {
-        self.seqno.get()
+        self.inner.seqno.get()
     }
 
     fn snapshot_at(&self, seqno: lsm_tree::SeqNo) -> Option<lsm_tree::SeqNo> {
@@ -1053,12 +1107,12 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
     }
 
     fn set_gc_watermark(&self, watermark: u64) {
-        self.gc_watermark.store(watermark, Ordering::Release);
+        self.inner.gc_watermark.store(watermark, Ordering::Release);
     }
 
     fn get(&self, part: Partition, key: &[u8]) -> StorageResult<Option<bytes::Bytes>> {
         let tree = self.tree(part)?;
-        let value = tree.get(key, self.seqno.get())?;
+        let value = tree.get(key, self.inner.seqno.get())?;
         Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
     }
 
@@ -1075,13 +1129,13 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
 
     fn contains_key(&self, part: Partition, key: &[u8]) -> StorageResult<bool> {
         let tree = self.tree(part)?;
-        let value = tree.get(key, self.seqno.get())?;
+        let value = tree.get(key, self.inner.seqno.get())?;
         Ok(value.is_some())
     }
 
     fn prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
-        let seqno = self.seqno.get();
+        let seqno = self.inner.seqno.get();
         Ok(coverage::user_prefix(tree, prefix, seqno))
     }
 
@@ -1097,7 +1151,7 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
 
     fn range_scan(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
-        let seqno = self.seqno.get();
+        let seqno = self.inner.seqno.get();
         // `lsm_tree::AbstractTree::range` takes a `RangeBounds<K>`;
         // inclusive bounds map directly. Owned `Vec<u8>` so the bounds
         // outlive this call (lsm-tree borrows internally for the scan).

@@ -576,7 +576,10 @@ async fn a_checkpoint_raft_floor_is_the_lowest_base_of_its_trees() {
     let ckpt_root = tempfile::tempdir().unwrap();
     let ckpt = ckpt_root.path().join("c");
     engine.create_checkpoint(&ckpt).unwrap();
-    assert_eq!(StorageEngine::checkpoint_raft_floor(&ckpt).unwrap(), 7);
+    assert_eq!(
+        coordinode_storage::engine::core::Deployment::checkpoint_raft_floor(&ckpt).unwrap(),
+        7
+    );
 }
 
 #[tokio::test]

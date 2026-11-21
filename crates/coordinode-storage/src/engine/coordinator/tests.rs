@@ -65,7 +65,7 @@ fn coordinator_tree_returns_every_partition() {
     for &part in Partition::all() {
         engine
             .coordinator()
-            .tree(part)
+            .tree_in(engine.set(), part)
             .unwrap_or_else(|e| panic!("tree({part:?}) failed: {e}"));
     }
 }
@@ -401,7 +401,7 @@ fn coordinator_concurrent_reads_under_arc_share() {
 #[test]
 fn occ_scope_track_dedupes_and_validates_clean() {
     let (_dir, engine) = open_engine();
-    let coord = engine.coordinator();
+    let coord = engine.scoped_coordinator();
     let scope = coord.occ_scope_at(engine.snapshot());
     // Track same key twice — set semantics.
     scope.track(Partition::Node, b"k1");
@@ -416,7 +416,7 @@ fn occ_scope_track_dedupes_and_validates_clean() {
 #[test]
 fn occ_scope_validate_detects_post_snapshot_write() {
     let (_dir, engine) = open_engine();
-    let coord = engine.coordinator();
+    let coord = engine.scoped_coordinator();
     // SequenceNumberCounter::get() returns "next-to-allocate", so
     // snapshot()'s value coincides with the next put's seqno. Probe
     // at `snapshot - 1` to assert strict post-snapshot newer-write
@@ -435,7 +435,7 @@ fn occ_scope_validate_detects_post_snapshot_write() {
 #[test]
 fn occ_scope_skips_commutative_partitions() {
     let (_dir, engine) = open_engine();
-    let coord = engine.coordinator();
+    let coord = engine.scoped_coordinator();
     let scope = coord.occ_scope_at(engine.snapshot());
     // Adj is commutative — even a post-snapshot write must NOT
     // produce a conflict on it.
@@ -453,7 +453,7 @@ fn occ_scope_skips_commutative_partitions() {
 #[test]
 fn occ_scope_extend_merges_parallel_collections() {
     let (_dir, engine) = open_engine();
-    let coord = engine.coordinator();
+    let coord = engine.scoped_coordinator();
     let scope = coord.occ_scope_at(engine.snapshot());
     // Simulate a parallel worker collecting into a local Vec then
     // merging into the shared scope.
@@ -472,7 +472,7 @@ fn occ_scope_concurrent_track_thread_safe() {
     use std::sync::Arc;
     use std::thread;
     let (_dir, engine) = open_engine();
-    let scope = Arc::new(engine.coordinator().occ_scope_at(engine.snapshot()));
+    let scope = Arc::new(engine.scoped_coordinator().occ_scope_at(engine.snapshot()));
     let handles: Vec<_> = (0..4)
         .map(|tid| {
             let s = Arc::clone(&scope);
@@ -495,7 +495,7 @@ fn occ_scope_concurrent_track_thread_safe() {
 fn occ_scope_validate_empty_scope_is_clean() {
     // Empty scope → never any conflict regardless of writes.
     let (_dir, engine) = open_engine();
-    let coord = engine.coordinator();
+    let coord = engine.scoped_coordinator();
     let scope = coord.occ_scope_at(engine.snapshot());
     engine
         .put(Partition::Node, b"unrelated", b"v")
@@ -514,7 +514,7 @@ fn occ_scope_validate_returns_first_conflict_decisive() {
     // *a* conflict; downstream retry handles all of them after
     // restart.
     let (_dir, engine) = open_engine();
-    let coord = engine.coordinator();
+    let coord = engine.scoped_coordinator();
     let scope = coord.occ_scope_at(engine.snapshot().saturating_sub(1));
     scope.track(Partition::Node, b"a");
     scope.track(Partition::Node, b"b");
@@ -541,7 +541,7 @@ fn occ_scope_drain_resets_and_extends_after() {
     // start from an empty state (matches the test path that pulls
     // tracked keys out for assertion then expects an empty scope).
     let (_dir, engine) = open_engine();
-    let scope = engine.coordinator().occ_scope_at(engine.snapshot());
+    let scope = engine.scoped_coordinator().occ_scope_at(engine.snapshot());
     scope.track(Partition::Node, b"k1");
     scope.track(Partition::Node, b"k2");
     let drained = scope.drain();
@@ -557,7 +557,7 @@ fn occ_scope_drain_resets_and_extends_after() {
 #[test]
 fn occ_scope_contains_unit() {
     let (_dir, engine) = open_engine();
-    let scope = engine.coordinator().occ_scope_at(engine.snapshot());
+    let scope = engine.scoped_coordinator().occ_scope_at(engine.snapshot());
     scope.track(Partition::EdgeProp, b"ep_key");
     assert!(scope.contains(Partition::EdgeProp, b"ep_key"));
     assert!(!scope.contains(Partition::EdgeProp, b"missing"));
@@ -571,7 +571,7 @@ fn occ_scope_validate_multi_partition_mixed_outcome() {
     // Conflict on a non-commutative partition + writes on a
     // commutative partition: only the non-commutative key triggers.
     let (_dir, engine) = open_engine();
-    let coord = engine.coordinator();
+    let coord = engine.scoped_coordinator();
     let scope = coord.occ_scope_at(engine.snapshot().saturating_sub(1));
     scope.track(Partition::Adj, b"adj_key"); // commutative — skipped
     scope.track(Partition::Schema, b"schema_key"); // checked
@@ -598,7 +598,8 @@ fn multimodal_coordinator_dyn_dispatch_works() {
     // by the EE `MultiShardCoordinator`: Layer 4 / Layer 5
     // hold a trait object, never a concrete type.
     let (_dir, engine) = open_engine();
-    let coord: &dyn MultiModalCoordinator = engine.coordinator();
+    let scoped = engine.scoped_coordinator();
+    let coord: &dyn MultiModalCoordinator = &scoped;
     let snap = coord.snapshot();
     engine.put(Partition::Node, b"dyn_k", b"v").expect("put");
     assert_eq!(

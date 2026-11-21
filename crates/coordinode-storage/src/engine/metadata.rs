@@ -40,38 +40,56 @@ use coordinode_core::version::{
     encode_pair, group_pair_key,
 };
 
-use crate::engine::core::StorageEngine;
+use crate::engine::core::{Deployment, StorageEngine};
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 
 /// The effects `command`, committing at `commit_ts`, has against the state
-/// `engine` holds now. An empty result is a refusal: the command's whole
-/// batch publishes nothing.
+/// `deployment` holds now: the records of the namespace `scope` is bound to
+/// for a command of a namespace, the deployment's own otherwise. An empty
+/// result is a refusal: the command's whole batch publishes nothing.
+///
+/// # Errors
+///
+/// A read failure; [`StorageError::UnknownNamespace`] for a namespace's
+/// command without `scope`.
 pub(crate) fn decide(
-    engine: &StorageEngine,
+    deployment: &Deployment,
+    scope: Option<&StorageEngine>,
     command: &MetadataCommand,
     commit_ts: u64,
 ) -> StorageResult<Vec<Mutation>> {
+    let namespace = || {
+        scope.ok_or_else(|| {
+            StorageError::InvalidConfig(format!(
+                "the metadata command {command:?} names no namespace"
+            ))
+        })
+    };
     match command {
-        MetadataCommand::RegisterFields { names } => decide_registration(engine, names),
-        MetadataCommand::AdoptFields { bindings } => decide_adoption(engine, bindings),
-        MetadataCommand::BindLabels { names } => label_binding_effects(engine, names, commit_ts),
+        MetadataCommand::RegisterFields { names } => decide_registration(namespace()?, names),
+        MetadataCommand::AdoptFields { bindings } => decide_adoption(namespace()?, bindings),
+        MetadataCommand::BindLabels { names } => {
+            label_binding_effects(namespace()?, names, commit_ts)
+        }
         MetadataCommand::GrantNodeLease {
             base,
             ceiling,
             token,
-        } => decide_lease(engine, *base, *ceiling, token),
-        MetadataCommand::RecordGroupPair { pair } => decide_group_pair(engine, *pair),
-        MetadataCommand::RecordDeployment { id } => Ok(if recorded_deployment(engine)?.is_some() {
-            Vec::new()
-        } else {
-            vec![deployment_put(
-                DEPLOYMENT_KEY.to_vec(),
-                id.as_bytes().to_vec(),
-            )]
-        }),
+        } => decide_lease(deployment, *base, *ceiling, token),
+        MetadataCommand::RecordGroupPair { pair } => decide_group_pair(deployment, *pair),
+        MetadataCommand::RecordDeployment { id } => {
+            Ok(if recorded_deployment(deployment)?.is_some() {
+                Vec::new()
+            } else {
+                vec![deployment_put(
+                    DEPLOYMENT_KEY.to_vec(),
+                    id.as_bytes().to_vec(),
+                )]
+            })
+        }
         MetadataCommand::ConditionalRegistryWrite { expect, put } => {
-            decide_registry_write(engine, expect, put)
+            decide_registry_write(deployment, expect, put)
         }
     }
 }
@@ -82,12 +100,12 @@ pub(crate) fn decide(
 /// ordered apply is every earlier entry's registry writes and none of a
 /// later one's, on every member and on a replay alike.
 fn decide_registry_write(
-    engine: &StorageEngine,
+    engine: &Deployment,
     expect: &[(Vec<u8>, Option<Vec<u8>>)],
     put: &[(Vec<u8>, Vec<u8>)],
 ) -> StorageResult<Vec<Mutation>> {
     for (key, expected) in expect {
-        let held = engine.get(Partition::Registry, key)?;
+        let held = engine.system_get(Partition::Registry, key)?;
         if held.as_deref() != expected.as_deref() {
             return Ok(Vec::new());
         }
@@ -107,8 +125,8 @@ fn decide_registry_write(
 /// # Errors
 ///
 /// The record does not decode.
-pub fn recorded_deployment(engine: &StorageEngine) -> StorageResult<Option<DeploymentId>> {
-    match engine.get(Partition::Deployment, DEPLOYMENT_KEY)? {
+pub fn recorded_deployment(engine: &Deployment) -> StorageResult<Option<DeploymentId>> {
+    match engine.system_get(Partition::Deployment, DEPLOYMENT_KEY)? {
         None => Ok(None),
         Some(bytes) => DeploymentId::from_slice(&bytes).map(Some).ok_or_else(|| {
             StorageError::Serialization("the deployment record does not decode".into())
@@ -126,10 +144,10 @@ pub fn recorded_deployment(engine: &StorageEngine) -> StorageResult<Option<Deplo
 ///
 /// A record does not decode; [`StorageError::DeploymentConflict`] when the
 /// record and the enrollment both exist and disagree.
-pub fn bound_deployment(engine: &StorageEngine) -> StorageResult<Option<DeploymentId>> {
+pub fn bound_deployment(engine: &Deployment) -> StorageResult<Option<DeploymentId>> {
     binding_of(
         recorded_deployment(engine)?,
-        engine.get(Partition::Deployment, ENROLLED_DEPLOYMENT_KEY)?,
+        engine.system_get(Partition::Deployment, ENROLLED_DEPLOYMENT_KEY)?,
     )
 }
 
@@ -139,18 +157,19 @@ pub fn bound_deployment(engine: &StorageEngine) -> StorageResult<Option<Deployme
 ///
 /// As [`bound_deployment`]; the snapshot is no longer retained.
 pub fn bound_deployment_at(
-    engine: &StorageEngine,
+    engine: &Deployment,
     snapshot: lsm_tree::SeqNo,
 ) -> StorageResult<Option<DeploymentId>> {
-    let recorded = match engine.snapshot_get(&snapshot, Partition::Deployment, DEPLOYMENT_KEY)? {
-        None => None,
-        Some(bytes) => Some(DeploymentId::from_slice(&bytes).ok_or_else(|| {
-            StorageError::Serialization("the deployment record does not decode".into())
-        })?),
-    };
+    let recorded =
+        match engine.system_snapshot_get(&snapshot, Partition::Deployment, DEPLOYMENT_KEY)? {
+            None => None,
+            Some(bytes) => Some(DeploymentId::from_slice(&bytes).ok_or_else(|| {
+                StorageError::Serialization("the deployment record does not decode".into())
+            })?),
+        };
     binding_of(
         recorded,
-        engine.snapshot_get(&snapshot, Partition::Deployment, ENROLLED_DEPLOYMENT_KEY)?,
+        engine.system_snapshot_get(&snapshot, Partition::Deployment, ENROLLED_DEPLOYMENT_KEY)?,
     )
 }
 
@@ -203,7 +222,7 @@ pub fn deployment_candidate() -> DeploymentId {
 ///
 /// As [`bound_deployment`]; [`StorageError::HistoryDomainMissing`] for an
 /// unbound store holding history.
-pub fn founding_candidate(engine: &StorageEngine) -> StorageResult<DeploymentId> {
+pub fn founding_candidate(engine: &Deployment) -> StorageResult<DeploymentId> {
     founding_candidate_from(|| holds_history(engine), || bound_deployment(engine))
 }
 
@@ -226,18 +245,26 @@ fn founding_candidate_from(
     Ok(deployment_candidate())
 }
 
-/// Whether the store holds any retained assertion of a node. The kept label
-/// bindings do not count: the ordered first-use binding keeps them before a
-/// store has founded anything, and they answer no read without node history.
+/// Whether the store holds any retained assertion of a node, in any of its
+/// namespaces. The kept label bindings do not count: the ordered first-use
+/// binding keeps them before a store has founded anything, and they answer
+/// no read without node history.
 ///
 /// # Errors
 ///
 /// A read failure.
-pub fn holds_history(engine: &StorageEngine) -> StorageResult<bool> {
-    Ok(engine
-        .prefix_scan(Partition::NodeHistory, &[])?
-        .next()
-        .is_some())
+pub fn holds_history(engine: &Deployment) -> StorageResult<bool> {
+    for namespace in engine.coordinator().sets().namespace_ids() {
+        if engine
+            .engine(namespace)?
+            .prefix_scan(Partition::NodeHistory, &[])?
+            .next()
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the node identity `identity` (canonically encoded) was retired.
@@ -245,15 +272,15 @@ pub fn holds_history(engine: &StorageEngine) -> StorageResult<bool> {
 /// # Errors
 ///
 /// The record cannot be read.
-pub fn identity_retired(engine: &StorageEngine, identity: &[u8]) -> StorageResult<bool> {
+pub fn identity_retired(engine: &Deployment, identity: &[u8]) -> StorageResult<bool> {
     Ok(engine
-        .get(Partition::Deployment, &retired_identity_key(identity))?
+        .system_get(Partition::Deployment, &retired_identity_key(identity))?
         .is_some())
 }
 
 /// A new record only when the pair changes: a leader re-elected at the pair
 /// the group already runs records nothing.
-fn decide_group_pair(engine: &StorageEngine, pair: VersionPair) -> StorageResult<Vec<Mutation>> {
+fn decide_group_pair(engine: &Deployment, pair: VersionPair) -> StorageResult<Vec<Mutation>> {
     let last = recorded_group_pair(engine)?;
     if last.is_some_and(|r| r.pair == pair) {
         return Ok(Vec::new());
@@ -267,10 +294,10 @@ fn decide_group_pair(engine: &StorageEngine, pair: VersionPair) -> StorageResult
 /// # Errors
 ///
 /// A record's key or value does not decode.
-pub fn group_pair_records(engine: &StorageEngine) -> StorageResult<Vec<RecordedPair>> {
+pub fn group_pair_records(engine: &Deployment) -> StorageResult<Vec<RecordedPair>> {
     let malformed = || StorageError::Serialization("a group pair record does not decode".into());
     let mut records = Vec::new();
-    for guard in engine.prefix_scan(Partition::Deployment, GROUP_PAIR_KEY_PREFIX)? {
+    for guard in engine.system_prefix_scan(Partition::Deployment, GROUP_PAIR_KEY_PREFIX)? {
         let (key, value) = guard.into_inner()?;
         records.push(RecordedPair {
             seq: decode_group_pair_key(&key).ok_or_else(malformed)?,
@@ -285,9 +312,9 @@ pub fn group_pair_records(engine: &StorageEngine) -> StorageResult<Vec<RecordedP
 /// # Errors
 ///
 /// The last record's key or value does not decode.
-pub fn recorded_group_pair(engine: &StorageEngine) -> StorageResult<Option<RecordedPair>> {
+pub fn recorded_group_pair(engine: &Deployment) -> StorageResult<Option<RecordedPair>> {
     let Some(guard) = engine
-        .prefix_scan_rev(Partition::Deployment, GROUP_PAIR_KEY_PREFIX)?
+        .system_prefix_scan_rev(Partition::Deployment, GROUP_PAIR_KEY_PREFIX)?
         .next()
     else {
         return Ok(None);
@@ -393,7 +420,7 @@ fn decide_adoption(
 }
 
 fn decide_lease(
-    engine: &StorageEngine,
+    engine: &Deployment,
     base: u64,
     ceiling: u64,
     token: &[u8; NODE_LEASE_TOKEN_LEN],
@@ -697,9 +724,9 @@ pub fn label_binding_effects(
 /// # Errors
 ///
 /// The last lease record's key does not name a ceiling.
-pub fn node_lease_ceiling(engine: &StorageEngine) -> StorageResult<u64> {
+pub fn node_lease_ceiling(engine: &Deployment) -> StorageResult<u64> {
     let Some(guard) = engine
-        .prefix_scan_rev(Partition::Deployment, NODE_LEASE_KEY_PREFIX)?
+        .system_prefix_scan_rev(Partition::Deployment, NODE_LEASE_KEY_PREFIX)?
         .next()
     else {
         return Ok(0);
@@ -716,11 +743,11 @@ pub fn node_lease_ceiling(engine: &StorageEngine) -> StorageResult<u64> {
 ///
 /// A storage read fails.
 pub fn node_lease_holder(
-    engine: &StorageEngine,
+    engine: &Deployment,
     ceiling: u64,
 ) -> StorageResult<Option<[u8; NODE_LEASE_TOKEN_LEN]>> {
     Ok(engine
-        .get(Partition::Deployment, &node_lease_key(ceiling))?
+        .system_get(Partition::Deployment, &node_lease_key(ceiling))?
         .and_then(|v| <[u8; NODE_LEASE_TOKEN_LEN]>::try_from(v.as_ref()).ok()))
 }
 

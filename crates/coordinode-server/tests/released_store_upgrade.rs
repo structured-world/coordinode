@@ -92,9 +92,7 @@ fn a_released_raft_store_is_refused_untouched() {
         Tier::Warm,
     )]);
 
-    let err = StorageEngine::open(&config)
-        .err()
-        .expect("a released Raft store must be refused");
+    let err = StorageEngine::open(&config).expect_err("a released Raft store must be refused");
     assert!(
         matches!(err, StorageError::UnsupportedFormat { found: 0, .. }),
         "the refusal names the reason, got: {err}"

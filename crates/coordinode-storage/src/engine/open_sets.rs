@@ -20,10 +20,21 @@ use crate::engine::partition::Partition;
 use crate::engine::scope::{NamespaceId, Scope, TreeId};
 
 /// One set's open trees.
-#[derive(Clone)]
 pub struct SetTrees {
     scope: Scope,
     trees: [Option<AnyTree>; Partition::COUNT],
+    /// Which local installation holds each index generation in the set's
+    /// index tree; every read and write of a generation key goes through
+    /// it. `None` for a set without an index tree.
+    installations: Option<crate::engine::installation::Installations>,
+    /// Per node key of the set, the property deltas written since its last
+    /// whole write: a read of a key with pending deltas folds every one of
+    /// them, so a writer bounds the run by writing the record whole once it
+    /// is long enough. A hint for the choice of write form only, so
+    /// process-local and bounded: a lost or reset count costs one early
+    /// whole write. Kept per set: the same key in two namespaces is two
+    /// records. no-std: spin::Mutex
+    node_delta_runs: parking_lot::Mutex<rustc_hash::FxHashMap<Vec<u8>, u32>>,
 }
 
 impl SetTrees {
@@ -33,7 +44,72 @@ impl SetTrees {
         Self {
             scope,
             trees: Default::default(),
+            installations: None,
+            node_delta_runs: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
         }
+    }
+
+    /// Count one more property delta written to `node_key` and return the
+    /// run it makes since the key's last whole write.
+    pub(crate) fn note_node_delta(&self, node_key: &[u8]) -> u32 {
+        /// Keys tracked at once; past it the table starts over, which only
+        /// makes some runs look shorter than they are.
+        const MAX_TRACKED: usize = 1 << 16;
+        let mut runs = self.node_delta_runs.lock();
+        if runs.len() >= MAX_TRACKED && !runs.contains_key(node_key) {
+            runs.clear();
+        }
+        let run = runs.entry(node_key.to_vec()).or_insert(0);
+        // Bounded far below u32::MAX: a writer ends the run with a whole
+        // write once it reaches its limit.
+        *run += 1;
+        *run
+    }
+
+    /// The property deltas written to `node_key` since its last whole write.
+    pub(crate) fn node_delta_run(&self, node_key: &[u8]) -> u32 {
+        self.node_delta_runs
+            .lock()
+            .get(node_key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `node_key` was written whole: its run of deltas is over.
+    pub(crate) fn note_node_whole_write(&self, node_key: &[u8]) {
+        self.node_delta_runs.lock().remove(node_key);
+    }
+
+    /// The set with its index tree's installation catalog.
+    #[must_use]
+    pub(crate) fn with_installations(
+        mut self,
+        installations: crate::engine::installation::Installations,
+    ) -> Self {
+        self.installations = Some(installations);
+        self
+    }
+
+    /// The index tree's installation catalog, when `part` is the index
+    /// partition and the set has one.
+    #[inline]
+    #[must_use]
+    pub(crate) fn installations_of(
+        &self,
+        part: Partition,
+    ) -> Option<&crate::engine::installation::Installations> {
+        if part == Partition::Idx {
+            self.installations.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// The index tree's installation catalog, when the set has one.
+    #[inline]
+    #[must_use]
+    pub(crate) fn installations(&self) -> Option<&crate::engine::installation::Installations> {
+        self.installations.as_ref()
     }
 
     /// The set.

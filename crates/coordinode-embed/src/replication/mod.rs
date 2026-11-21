@@ -192,7 +192,7 @@ impl Member {
         // The open's phases at debug level under the start's target, so a
         // slow start says where it waits (store, consensus, leadership).
         tracing::debug!(target: "coordinode::startup", "store opening");
-        StorageEngine::retire_embedded_journal(storage)?;
+        coordinode_storage::engine::core::Deployment::retire_embedded_journal(storage)?;
         let oracle = Arc::new(TimestampOracle::new());
         let engine = Arc::new(StorageEngine::open_with_oracle(
             storage,

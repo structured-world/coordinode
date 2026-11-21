@@ -31,7 +31,7 @@ fn bench_tree_lookup(c: &mut Criterion) {
     group.sample_size(50);
     let (_dir, engine) = mk_engine();
     group.bench_function("partition_node", |b| {
-        b.iter(|| engine.coordinator().tree(Partition::Node).unwrap())
+        b.iter(|| engine.tree(Partition::Node).unwrap())
     });
     group.finish();
 }
@@ -40,7 +40,9 @@ fn bench_snapshot(c: &mut Criterion) {
     let mut group = c.benchmark_group("coordinator_snapshot");
     group.sample_size(50);
     let (_dir, engine) = mk_engine();
-    group.bench_function("snapshot", |b| b.iter(|| engine.coordinator().snapshot()));
+    group.bench_function("snapshot", |b| {
+        b.iter(|| engine.scoped_coordinator().snapshot())
+    });
     group.bench_function("current_seqno", |b| {
         b.iter(|| engine.coordinator().current_seqno())
     });
@@ -75,10 +77,20 @@ fn bench_get_through_coordinator(c: &mut Criterion) {
         b.iter(|| engine.get(Partition::Node, b"hot").unwrap())
     });
     group.bench_function("hit_through_coordinator", |b| {
-        b.iter(|| engine.coordinator().get(Partition::Node, b"hot").unwrap())
+        b.iter(|| {
+            engine
+                .scoped_coordinator()
+                .get(Partition::Node, b"hot")
+                .unwrap()
+        })
     });
     group.bench_function("miss", |b| {
-        b.iter(|| engine.coordinator().get(Partition::Node, b"miss").unwrap())
+        b.iter(|| {
+            engine
+                .scoped_coordinator()
+                .get(Partition::Node, b"miss")
+                .unwrap()
+        })
     });
     group.finish();
 }
