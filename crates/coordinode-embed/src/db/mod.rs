@@ -1015,18 +1015,18 @@ impl Database {
                                 repaired = ?report.repaired,
                                 repaired_tables = ?report.repaired_tables,
                                 clean = report.clean_after,
-                                "auto-repaired corrupt partitions and tables on open"
+                                "auto-repaired corrupt trees and tables on open"
                             );
                         }
                         if !report.is_clean() {
                             tracing::error!(
-                                corrupt = ?report.corrupt_partitions,
+                                corrupt = ?report.corrupt_trees,
                                 corrupt_tables = ?report.corrupt_tables,
-                                refused_partitions = ?report.refused_partitions,
+                                refused_trees = ?report.refused_trees,
                                 refused_tables = ?report.refused_tables,
                                 checkpoint = ?report.checkpoint_used,
-                                "partitions or tables still need a rebuild the checkpoint \
-                                 and the journal cannot give; restore from an off-device backup"
+                                "trees or tables still need a rebuild the checkpoint and \
+                                 the journal cannot give; restore from an off-device backup"
                             );
                         }
                     }

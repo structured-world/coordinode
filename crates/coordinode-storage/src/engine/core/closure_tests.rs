@@ -172,7 +172,7 @@ fn a_ledger_that_cannot_be_read_leaves_the_rebuild_owed() {
     );
     assert_eq!(
         target.pending_rebuilds().expect("intents"),
-        [Partition::Deployment],
+        [TreeId::system(Partition::Deployment)],
         "the rebuild is no longer owed"
     );
 
@@ -186,7 +186,7 @@ fn a_ledger_that_cannot_be_read_leaves_the_rebuild_owed() {
     );
     assert_eq!(
         other.pending_rebuilds().expect("intents"),
-        [Partition::Deployment],
+        [TreeId::system(Partition::Deployment)],
         "the install is no longer owed"
     );
 }

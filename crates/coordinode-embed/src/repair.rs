@@ -23,9 +23,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use coordinode_core::schema::definition::encode_label_current_revision_key;
 use coordinode_core::txn::wake::Wake;
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::rebuild::{CHECKPOINT_PREFIX, Rebuild, RebuildRefusal};
 pub use coordinode_storage::engine::rebuild::{checkpoint_root, latest_checkpoint};
+use coordinode_storage::engine::scope::{NamespaceId, Scope, TreeId};
 use coordinode_storage::error::{StorageError, StorageResult};
 use coordinode_storage::scrub::{ScrubConfig, scrub_all_except};
 
@@ -75,30 +75,31 @@ pub fn prune_checkpoints(engine: &StorageEngine, root: &Path, keep: usize) -> St
 /// Outcome of a [`verify_and_repair`] pass.
 #[derive(Debug, Clone, Default)]
 pub struct RepairReport {
-    /// Distinct partitions needing a rebuild: found corrupt by the scrub, or
-    /// structurally repaired at engine open with data loss (ascending
-    /// discriminant).
-    pub corrupt_partitions: Vec<Partition>,
-    /// Partitions actually rebuilt from a checkpoint this pass.
-    pub repaired: Vec<Partition>,
-    /// Partitions left as they were because the checkpoint and the journal
-    /// cannot prove their state, with the reason.
-    pub refused_partitions: Vec<(Partition, RebuildRefusal)>,
-    /// `STORAGE COLUMNAR` tables needing a rebuild, by id: structurally
-    /// repaired at engine open with data loss, or a rebuild cut short.
-    pub corrupt_tables: Vec<String>,
+    /// Distinct trees needing a rebuild, of the system set or of any
+    /// namespace: found corrupt by the scrub, or structurally repaired at
+    /// engine open with data loss (in tree order).
+    pub corrupt_trees: Vec<TreeId>,
+    /// Trees actually rebuilt from a checkpoint this pass.
+    pub repaired: Vec<TreeId>,
+    /// Trees left as they were because the checkpoint and the journal cannot
+    /// prove their state, with the reason.
+    pub refused_trees: Vec<(TreeId, RebuildRefusal)>,
+    /// `STORAGE COLUMNAR` tables needing a rebuild, with their namespace:
+    /// structurally repaired at engine open with data loss, or a rebuild cut
+    /// short.
+    pub corrupt_tables: Vec<(NamespaceId, String)>,
     /// Tables actually rebuilt from a checkpoint this pass.
-    pub repaired_tables: Vec<String>,
+    pub repaired_tables: Vec<(NamespaceId, String)>,
     /// Tables left as they were because the checkpoint and the journal cannot
     /// prove their state, with the reason. Each stays reported until a later
     /// pass rebuilds it or it is restored from an off-device backup.
-    pub refused_tables: Vec<(String, RebuildRefusal)>,
+    pub refused_tables: Vec<((NamespaceId, String), RebuildRefusal)>,
     /// The subset of [`repaired`](Self::repaired) restored range-scoped:
     /// only the key ranges the open-time salvage dropped were cleared and
-    /// rebuilt, leaving every other SST untouched. Partitions repaired by a
-    /// full rebuild (scrub-detected corruption, or an unscopable loss) are
-    /// listed in `repaired` only.
-    pub scoped: Vec<Partition>,
+    /// rebuilt, leaving every other SST untouched. Trees repaired by a full
+    /// rebuild (scrub-detected corruption, or an unscopable loss) are listed
+    /// in `repaired` only.
+    pub scoped: Vec<TreeId>,
     /// The checkpoint used as the rebuild base, if repair ran.
     pub checkpoint_used: Option<PathBuf>,
     /// `true` if nothing is left to rebuild within [`checked`](Self::checked):
@@ -153,9 +154,9 @@ pub fn verify_and_repair(
     FULL_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The open verified the Schema tree before it read it; a version it has
     // not changed since is not verified again.
-    let verified = |part: Partition| engine.verified_at_open(part);
+    let verified = |id: TreeId| engine.verified_at_open(id.part);
     let scrub = scrub_all_except(engine, &ScrubConfig::default(), verified)?;
-    let found: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
+    let found: Vec<TreeId> = scrub.errors.iter().map(|e| e.tree).collect();
     repair(engine, checkpoint_root, found, CheckedScope::Store)
 }
 
@@ -182,21 +183,31 @@ pub fn repair_owed_on_open(
     repair(engine, checkpoint_root, Vec::new(), CheckedScope::Repaired)
 }
 
-/// The rebuild both passes share: the partitions `found` corrupt, with what
-/// the store knows it owes, from the latest checkpoint and the journal; then
-/// the check `checked` names.
+/// The engine bound to the namespace tree `id` belongs to, which rebuilds it:
+/// a tree of the system set is rebuilt through any namespace's engine, its
+/// partition resolving to the system set's tree there.
+fn engine_of(engine: &StorageEngine, id: TreeId) -> StorageResult<StorageEngine> {
+    match id.scope {
+        Scope::System => Ok(engine.clone()),
+        Scope::Namespace(namespace) => engine.deployment().engine(namespace),
+    }
+}
+
+/// The rebuild both passes share: the trees `found` corrupt, of any
+/// namespace, with what the store knows it owes, from the latest checkpoint
+/// and the journal; then the check `checked` names.
 fn repair(
     engine: &StorageEngine,
     checkpoint_root: &Path,
-    found: Vec<Partition>,
+    found: Vec<TreeId>,
     checked: CheckedScope,
 ) -> StorageResult<RepairReport> {
-    let verified = |part: Partition| engine.verified_at_open(part);
+    let verified = |id: TreeId| engine.verified_at_open(id.part);
     let mut full = found;
     // A rebuild cut short by a crash left its tree holding an unknown part of
     // its data; the tree scrubs clean, so only its intent says so.
     full.extend(engine.pending_rebuilds()?);
-    full.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
+    full.sort();
     full.dedup();
 
     // A tree structurally repaired at open with a LOSSY replay scope reads
@@ -204,30 +215,30 @@ fn repair(
     // writer), so the scrub cannot see the dropped key ranges. The engine's
     // open-repair record is the only evidence of that loss. When every loss
     // is key-scopable the rebuild is range-scoped (cost proportional to the
-    // loss); an unscopable loss, or a partition the scrub also flagged,
-    // takes the full rebuild.
-    let mut scoped_jobs: Vec<(Partition, Vec<coordinode_storage::engine::core::KeyRange>)> =
+    // loss); an unscopable loss, or a tree the scrub also flagged, takes the
+    // full rebuild.
+    let mut scoped_jobs: Vec<(TreeId, Vec<coordinode_storage::engine::core::KeyRange>)> =
         Vec::new();
     for r in engine.open_repairs() {
-        if !r.is_lossy() || full.contains(&r.partition) {
+        if !r.is_lossy() || full.contains(&r.tree) {
             continue;
         }
         match r.scoped_ranges() {
-            Some(ranges) if !ranges.is_empty() => scoped_jobs.push((r.partition, ranges)),
-            _ => full.push(r.partition),
+            Some(ranges) if !ranges.is_empty() => scoped_jobs.push((r.tree, ranges)),
+            _ => full.push(r.tree),
         }
     }
-    full.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
+    full.sort();
     full.dedup();
 
-    let mut corrupt: Vec<Partition> = full.clone();
-    corrupt.extend(scoped_jobs.iter().map(|(p, _)| *p));
-    corrupt.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
+    let mut corrupt: Vec<TreeId> = full.clone();
+    corrupt.extend(scoped_jobs.iter().map(|(id, _)| *id));
+    corrupt.sort();
     corrupt.dedup();
 
     // A columnar table repaired with loss at open, or whose rebuild a crash
     // cut short, is rebuilt from the checkpoint as a partition is.
-    let mut corrupt_tables = engine.lossy_table_repairs();
+    let mut corrupt_tables = engine.lossy_tables();
     corrupt_tables.extend(engine.pending_table_rebuilds()?);
     corrupt_tables.sort();
     corrupt_tables.dedup();
@@ -247,7 +258,7 @@ fn repair(
             "corruption detected but no checkpoint exists; restore from backup"
         );
         return Ok(RepairReport {
-            corrupt_partitions: corrupt,
+            corrupt_trees: corrupt,
             corrupt_tables,
             clean_after: false,
             checked,
@@ -255,59 +266,64 @@ fn repair(
         });
     };
 
-    // One floor + oplog slice covers every partition's replay-forward; each
+    // One floor + oplog slice covers every tree's replay-forward; each
     // rebuild skips what its checkpoint tree already holds.
     let from = engine.checkpoint_replay_floor(&checkpoint)?;
     let oplog_since = engine.oplog_read_since(from)?.unwrap_or_default();
 
     let mut repaired = Vec::with_capacity(corrupt.len());
     let mut scoped = Vec::with_capacity(scoped_jobs.len());
-    let mut refused_partitions = Vec::new();
-    let mut refuse = |part: Partition, reason: RebuildRefusal| {
+    let mut refused_trees = Vec::new();
+    let mut refuse = |id: TreeId, reason: RebuildRefusal| {
         tracing::error!(
-            partition = part.name(),
+            tree = %id,
             %reason,
-            "partition not rebuilt: its state cannot be proved; restore from backup"
+            "tree not rebuilt: its state cannot be proved; restore from backup"
         );
-        refused_partitions.push((part, reason));
+        refused_trees.push((id, reason));
     };
-    for &part in &full {
-        match engine.repair_partition_from_checkpoint(&checkpoint, &oplog_since, part)? {
-            Rebuild::Rebuilt { .. } => repaired.push(part),
-            Rebuild::Refused(reason) => refuse(part, reason),
-        }
-    }
-    for (part, ranges) in &scoped_jobs {
-        match engine.repair_partition_ranges_from_checkpoint(
+    for &id in &full {
+        match engine_of(engine, id)?.repair_partition_from_checkpoint(
             &checkpoint,
             &oplog_since,
-            *part,
+            id.part,
+        )? {
+            Rebuild::Rebuilt { .. } => repaired.push(id),
+            Rebuild::Refused(reason) => refuse(id, reason),
+        }
+    }
+    for (id, ranges) in &scoped_jobs {
+        match engine_of(engine, *id)?.repair_partition_ranges_from_checkpoint(
+            &checkpoint,
+            &oplog_since,
+            id.part,
             ranges,
         )? {
             Rebuild::Rebuilt { .. } => {
-                repaired.push(*part);
-                scoped.push(*part);
+                repaired.push(*id);
+                scoped.push(*id);
             }
-            Rebuild::Refused(reason) => refuse(*part, reason),
+            Rebuild::Refused(reason) => refuse(*id, reason),
         }
     }
     let mut repaired_tables = Vec::with_capacity(corrupt_tables.len());
     let mut refused_tables = Vec::new();
     for table in &corrupt_tables {
+        let (namespace, id) = table;
         // A columnar table's id is its label name, and its catalog entry is
         // the label's current-revision pointer: CREATE, ALTER and DROP all
         // write it.
-        let catalog_keys = [encode_label_current_revision_key(table)];
-        match engine.repair_table_from_checkpoint(
-            &checkpoint,
-            &oplog_since,
-            table,
-            &catalog_keys,
-        )? {
+        let catalog_keys = [encode_label_current_revision_key(id)];
+        match engine
+            .deployment()
+            .engine(*namespace)?
+            .repair_table_from_checkpoint(&checkpoint, &oplog_since, id, &catalog_keys)?
+        {
             Rebuild::Rebuilt { .. } => repaired_tables.push(table.clone()),
             Rebuild::Refused(reason) => {
                 tracing::error!(
-                    table = %table,
+                    table = %id,
+                    %namespace,
                     %reason,
                     "table not rebuilt: its state cannot be proved; restore from backup"
                 );
@@ -317,22 +333,22 @@ fn repair(
     }
 
     // The check after the repair: the whole store for a full pass; for the
-    // open's, the partitions it rebuilt and nothing else.
-    let unchecked = |part: Partition| match checked {
-        CheckedScope::Store => verified(part),
-        CheckedScope::Repaired => !repaired.contains(&part) || verified(part),
+    // open's, the trees it rebuilt and nothing else.
+    let unchecked = |id: TreeId| match checked {
+        CheckedScope::Store => verified(id),
+        CheckedScope::Repaired => !repaired.contains(&id) || verified(id),
     };
     let after_clean = match checked {
         CheckedScope::Repaired if repaired.is_empty() => true,
         _ => !scrub_all_except(engine, &ScrubConfig::default(), unchecked)?.has_errors(),
     };
     Ok(RepairReport {
-        corrupt_partitions: corrupt,
+        corrupt_trees: corrupt,
         repaired,
         corrupt_tables,
         repaired_tables,
-        clean_after: after_clean && refused_partitions.is_empty() && refused_tables.is_empty(),
-        refused_partitions,
+        clean_after: after_clean && refused_trees.is_empty() && refused_tables.is_empty(),
+        refused_trees,
         refused_tables,
         scoped,
         checkpoint_used: Some(checkpoint),

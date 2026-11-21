@@ -565,11 +565,11 @@ pub(crate) async fn serve(
                                     .increment(report.errors.len() as u64);
                                 for err in &report.errors {
                                     tracing::error!(
-                                        partition = err.partition.name(),
+                                        tree = %err.tree,
                                         detail = %err.message,
                                         "scrub detected corruption"
                                     );
-                                    corrupt.insert(err.partition);
+                                    corrupt.insert(err.tree);
                                 }
                             }
                             // A rebuild a crash interrupted left its tree with
@@ -577,12 +577,12 @@ pub(crate) async fn serve(
                             // clean, so only its intent says so.
                             match scrub_engine.pending_rebuilds() {
                                 Ok(pending) => {
-                                    for part in pending {
+                                    for id in pending {
                                         tracing::error!(
-                                            partition = part.name(),
-                                            "partition rebuild was interrupted"
+                                            tree = %id,
+                                            "tree rebuild was interrupted"
                                         );
-                                        corrupt.insert(part);
+                                        corrupt.insert(id);
                                     }
                                 }
                                 Err(e) => tracing::warn!(%e, "reading rebuild intents failed"),
@@ -592,7 +592,12 @@ pub(crate) async fn serve(
                                 // affected partition from healthy peers over
                                 // the swarm transport and re-install it. A
                                 // standalone node has no peer to repair from.
-                                for part in corrupt {
+                                // A peer's copy and the Raft log carry a
+                                // partition of the group's namespace, so the
+                                // tree is repaired by its partition.
+                                let parts: std::collections::BTreeSet<_> =
+                                    corrupt.into_iter().map(|id| id.part).collect();
+                                for part in parts {
                                     // 1) Replica-fetch repair from healthy peers.
                                     let repair_peers =
                                         coordinode_embed::replication::segment_peers(&scrub_raft);

@@ -68,7 +68,7 @@ fn a_records_transfer_cut_short_after_its_clear_stays_owed() {
     let target = rig.open_group(&config).expect("reopen the member");
     assert_eq!(
         target.pending_rebuilds().expect("intents"),
-        [Partition::Deployment],
+        [TreeId::system(Partition::Deployment)],
         "the transfer is no longer owed"
     );
     assert_eq!(

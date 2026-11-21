@@ -81,7 +81,7 @@ impl TreeOpener {
                     "partition tree structurally repaired at open"
                 );
                 repairs.push(OpenRepair {
-                    partition: part,
+                    tree: TreeId::namespace(namespace, part),
                     replay_scope: report.wal_replay_scope(),
                     report,
                 });

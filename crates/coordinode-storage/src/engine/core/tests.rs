@@ -1104,7 +1104,7 @@ fn open_repairs_partition_with_lost_manifest() {
         );
         let repairs = engine.open_repairs();
         assert_eq!(repairs.len(), 1, "exactly one partition was repaired");
-        assert_eq!(repairs[0].partition, Partition::Node);
+        assert_eq!(repairs[0].tree, engine.tree_id(Partition::Node));
         // Nothing was lost (every SST intact), so no replay is owed.
         assert!(matches!(
             repairs[0].replay_scope,

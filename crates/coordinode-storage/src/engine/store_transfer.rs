@@ -676,17 +676,14 @@ impl Deployment {
         let not_ready = |what: String| StorageError::CutNotReady {
             reason: format!("the repair of {what} has not installed its result"),
         };
-        if let Some(part) = Partition::all()
-            .iter()
-            .find(|&&part| self.is_under_repair(part))
-        {
-            return Err(not_ready(format!("partition {}", part.name())));
+        if let Some(id) = self.any_under_repair() {
+            return Err(not_ready(format!("the {id} tree")));
         }
-        if let Some(part) = self.pending_rebuilds()?.first() {
-            return Err(not_ready(format!("partition {}", part.name())));
+        if let Some(id) = self.pending_rebuilds()?.first() {
+            return Err(not_ready(format!("the {id} tree")));
         }
-        if let Some(table) = self.pending_table_rebuilds()?.first() {
-            return Err(not_ready(format!("table {table}")));
+        if let Some((namespace, table)) = self.pending_table_rebuilds()?.first() {
+            return Err(not_ready(format!("table {table} of {namespace}")));
         }
         Ok(())
     }

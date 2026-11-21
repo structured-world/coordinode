@@ -66,7 +66,7 @@ fn scrub_empty_engine() {
         .sum();
     assert_eq!(report.sst_files_checked as usize, tables);
     assert!(!report.has_errors());
-    assert_eq!(report.partition_counts.len(), Partition::all().len());
+    assert_eq!(report.tree_counts.len(), engine.coordinator().trees().len());
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn scrub_clean_data_reports_no_errors() {
     // Flushed data produced at least one SST with at least one block.
     assert!(report.sst_files_checked > 0, "expected flushed SSTs");
     assert!(report.blocks_checked > 0, "expected verified blocks");
-    assert_eq!(report.partition_counts.len(), Partition::all().len());
+    assert_eq!(report.tree_counts.len(), engine.coordinator().trees().len());
     assert!(report.duration.as_nanos() > 0);
 }
 
@@ -157,7 +157,7 @@ fn scrub_reports_disk_corruption_without_aborting() {
     // the table's layout puts around it.
     let victim = largest_file(
         &dir.path()
-            .join(crate::engine::scope::store_tree(Partition::Node).dir())
+            .join(engine.tree_id(Partition::Node).dir())
             .join("tables"),
     );
     let mut bytes = std::fs::read(&victim).expect("read sst");
@@ -174,7 +174,10 @@ fn scrub_reports_disk_corruption_without_aborting() {
         "corrupted block must be reported, got a clean report"
     );
     assert!(
-        report.errors.iter().any(|e| e.partition == Partition::Node),
+        report
+            .errors
+            .iter()
+            .any(|e| e.tree == engine.tree_id(Partition::Node)),
         "the corrupt block is in the Node partition"
     );
 }
@@ -196,7 +199,7 @@ fn scrub_reports_a_corrupt_blob_file() {
     // The values went to the partition's blob files, not its tables.
     let victim = largest_file(
         &dir.path()
-            .join(crate::engine::scope::store_tree(Partition::Blob).dir())
+            .join(engine.tree_id(Partition::Blob).dir())
             .join("blobs"),
     );
     let mut bytes = std::fs::read(&victim).expect("read blob file");
@@ -218,9 +221,9 @@ fn scrub_report_error_flag() {
     let with = ScrubReport {
         blocks_checked: 100,
         sst_files_checked: 4,
-        partition_counts: vec![],
+        tree_counts: vec![],
         errors: vec![VerifyError {
-            partition: Partition::Node,
+            tree: crate::engine::scope::TreeId::system(Partition::Deployment),
             message: "checksum mismatch".to_string(),
         }],
         duration: Duration::from_millis(50),

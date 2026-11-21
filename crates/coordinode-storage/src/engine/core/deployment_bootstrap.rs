@@ -39,6 +39,9 @@ use crate::oplog::entry::{OplogEntry, OplogOp};
 /// opened, so it stays as it was.
 const SOURCE_DIR: &str = "deployment-source";
 
+/// The deployment's records tree, of the system set.
+const RECORDS_TREE: TreeId = TreeId::system(Partition::Deployment);
+
 /// The key ranges, `[start, end)`, of this member's own records in the
 /// deployment tree: its routes and records (`meta:`) and its consensus state
 /// machine's (`raft:`).
@@ -96,7 +99,7 @@ impl Bootstrap<'_> {
         } else {
             RebuildIntents::default()
         };
-        let pending = intents.partitions.contains(&Partition::Deployment);
+        let pending = intents.trees.contains(&RECORDS_TREE);
         let lossy = self.repair.filter(|repair| repair.is_lossy());
         let checkpoint = if self.journaled && on_disk {
             latest_checkpoint(&checkpoint_root(data_dir))?
@@ -109,8 +112,7 @@ impl Bootstrap<'_> {
         // only once. A checkpoint on disk alone verifies nothing: a healthy
         // open reads every block's checksum as it reads the block, and a full
         // pass is the scrub's, which is off unless asked for.
-        let verifies =
-            self.journaled && (!intents.partitions.is_empty() || !intents.tables.is_empty());
+        let verifies = self.journaled && (!intents.trees.is_empty() || !intents.tables.is_empty());
         let mut verified = None;
         let mut corrupt = false;
         if verifies && !pending && lossy.is_none() {
@@ -157,7 +159,7 @@ impl Bootstrap<'_> {
         if owed {
             write_rebuild_intent_with(
                 data_dir,
-                RebuildTarget::Partition(Partition::Deployment),
+                RebuildTarget::Tree(RECORDS_TREE),
                 &encode_kept_rows(&kept)?,
                 self.footprints,
             )?;
@@ -183,7 +185,7 @@ impl Bootstrap<'_> {
     ) -> StorageResult<Rows> {
         let lost = || StorageError::DeploymentRecoveryRefused(RebuildRefusal::LocalStateLost);
         if pending {
-            return read_kept_rows(data_dir, Partition::Deployment)?.ok_or_else(lost);
+            return read_kept_rows(data_dir, RECORDS_TREE)?.ok_or_else(lost);
         }
         if let Some(repair) = lossy
             && !member_records_intact(repair, self.journaled)
@@ -327,11 +329,7 @@ impl DeploymentRebuild {
         if source_floor < records.retention_floor() {
             records.lower_retention_floor(source_floor)?;
         }
-        remove_rebuild_intent(
-            data_dir,
-            RebuildTarget::Partition(Partition::Deployment),
-            footprints,
-        )?;
+        remove_rebuild_intent(data_dir, RebuildTarget::Tree(RECORDS_TREE), footprints)?;
         if let Some(repair) = repair {
             records.acknowledge_repair_report(repair.report.id)?;
         }

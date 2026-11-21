@@ -133,16 +133,14 @@ pub struct Deployment {
     /// running at the same time, and no attempt outlives the process. Giving
     /// it durable identity would buy nothing and cost a write on every DDL.
     schema_generation: AtomicU64,
-    /// One bit per partition (its place in [`Partition::all`]) whose tree is
-    /// under repair: set before the first destructive step, cleared once the
-    /// repaired tree is installed. A repair that fails leaves its bit set,
-    /// with its intent on disk, until a repair of the partition finishes.
-    under_repair: core::sync::atomic::AtomicU64,
-    /// One bit per partition whose repair is running now, held by its
-    /// [`RepairActive`]: a second repair of the same partition is refused
-    /// while it runs, and a repair that fails releases it, leaving the
-    /// partition in [`Self::under_repair`] for the next one.
-    repair_active: core::sync::atomic::AtomicU64,
+    /// The trees under repair, and of them those whose repair runs now. A
+    /// tree is under repair from before the first destructive step until the
+    /// repaired tree is installed; a repair that fails leaves it so, with its
+    /// intent on disk, until a repair of the tree finishes. A running repair
+    /// is held by its [`PartitionRepair`]: a second one of the same tree is
+    /// refused while it runs. Read by a cut's page and a capture, never per
+    /// key. no-std: spin::Mutex
+    repairs: parking_lot::Mutex<RepairMarks>,
     /// Held while a metadata command is decided and applied, so each decision
     /// reads every earlier one; on the journalled path it also spans the
     /// journal append, which makes the decisions' order the journal's order.
@@ -627,8 +625,9 @@ pub enum LocalSync {
 /// lossy otherwise.
 #[derive(Debug)]
 pub struct OpenRepair {
-    /// The partition whose tree was repaired.
-    pub partition: Partition,
+    /// The tree that was repaired: a partition's, of the system set or of a
+    /// namespace's.
+    pub tree: TreeId,
     /// How far back a retained-oplog replay must reach to restore what the
     /// repair could not recover.
     pub replay_scope: lsm_tree::WalReplayScope,
@@ -1171,7 +1170,7 @@ impl Deployment {
                 "partition tree structurally repaired at open"
             );
             OpenRepair {
-                partition: Partition::Deployment,
+                tree: TreeId::system(Partition::Deployment),
                 replay_scope: report.wal_replay_scope(),
                 report,
             }
@@ -1292,7 +1291,7 @@ impl Deployment {
                     "partition tree structurally repaired at open"
                 );
                 open_repairs.push(OpenRepair {
-                    partition: part,
+                    tree: TreeId::system(part),
                     replay_scope: report.wal_replay_scope(),
                     report,
                 });
@@ -1402,7 +1401,7 @@ impl Deployment {
                     let entries = journal.read_all()?;
                     // A rebuild owed already keeps its intent as it is: the
                     // Schema tree's holds the records the rebuild puts back.
-                    let owed = read_rebuild_intents(config.data_dir())?.partitions;
+                    let owed = read_rebuild_intents(config.data_dir())?.trees;
                     let mut covered: HashMap<TreeId, TreeCoverage> = HashMap::new();
                     for (&part, tree) in &trees {
                         note_journal_coverage(
@@ -1442,12 +1441,12 @@ impl Deployment {
                     // A tree whose rebuild was cut short is left alone: its
                     // record no longer says what it holds, and the repair that
                     // follows rebuilds it from the checkpoint and this journal.
-                    let rebuilding = read_rebuild_intents(config.data_dir())?.partitions;
+                    let rebuilding = read_rebuild_intents(config.data_dir())?.trees;
                     if !crate::engine::local_journal::holes_covered(
                         &entries,
                         journal.next_index(),
                         &covered,
-                        |id: TreeId, _| rebuilding.contains(&id.part),
+                        |id: TreeId, _| rebuilding.contains(&id),
                     ) {
                         return Err(StorageError::CoverageUnprovable {
                             path: dir.display().to_string(),
@@ -1582,7 +1581,7 @@ impl Deployment {
                             let tree = tree.ok_or_else(|| StorageError::PartitionNotFound {
                                 name: id.name(),
                             })?;
-                            let skip = rebuilding.contains(&id.part)
+                            let skip = rebuilding.contains(id)
                                 || covered.get(id).is_some_and(|c| c.contains(entry.index, 0));
                             if !skip {
                                 apply_oplog_ops_at(
@@ -2040,8 +2039,8 @@ impl Deployment {
         // it is to install.
         let schema_owed = durable_intents
             && read_rebuild_intents(config.data_dir())?
-                .partitions
-                .contains(&Partition::Deployment);
+                .trees
+                .contains(&TreeId::system(Partition::Deployment));
         let coordinator = LocalMultiModalCoordinator::new(
             sets,
             Arc::clone(&seqno),
@@ -2062,8 +2061,7 @@ impl Deployment {
             coordinator,
             claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             schema_generation: AtomicU64::new(0),
-            under_repair: core::sync::atomic::AtomicU64::new(0),
-            repair_active: core::sync::atomic::AtomicU64::new(0),
+            repairs: parking_lot::Mutex::new(RepairMarks::default()),
             metadata_decisions: parking_lot::Mutex::new(()),
             operation_decisions: crate::engine::operations::DecisionLocks::default(),
             field_dictionary_generation: AtomicU64::new(0),
@@ -2158,7 +2156,7 @@ impl Deployment {
         // its report. A lossy one stays owed until a rebuild restores it.
         for repair in &engine.open_repairs {
             if !repair.is_lossy() {
-                engine.acknowledge_open_repair(repair.partition)?;
+                engine.acknowledge_open_repair(repair.tree)?;
             }
         }
         #[cfg(feature = "columnar")]
@@ -2192,21 +2190,46 @@ impl Deployment {
         &self.node_counts
     }
 
-    /// Let `partition`'s tree stop owing the report of the repair this open
-    /// ran on it, once its replay obligation is met: without it every later
-    /// open hands the same report out again. `false` when no repair of the
-    /// partition is owed.
+    /// The columnar tables of every open namespace whose tree an open
+    /// repaired with loss and which still owe a rebuild from a checkpoint
+    /// plus the journal, with their namespace. Empty in a build without
+    /// columnar support.
+    #[must_use]
+    pub fn lossy_tables(&self) -> Vec<(NamespaceId, String)> {
+        #[cfg(feature = "columnar")]
+        {
+            let mut out = Vec::new();
+            for set in self.coordinator.sets().namespace_sets() {
+                let Scope::Namespace(namespace) = set.scope() else {
+                    continue;
+                };
+                out.extend(
+                    set.table_repairs()
+                        .lock()
+                        .iter()
+                        .map(|repair| (namespace, repair.table.clone())),
+                );
+            }
+            out
+        }
+        #[cfg(not(feature = "columnar"))]
+        Vec::new()
+    }
+
+    /// Let tree `id` stop owing the report of the repair an open ran on it,
+    /// once its replay obligation is met: without it every later open hands
+    /// the same report out again. `false` when no repair of the tree is owed.
     ///
     /// # Errors
     ///
     /// The tree cannot install the version without the report.
-    fn acknowledge_open_repair(&self, partition: Partition) -> StorageResult<bool> {
+    fn acknowledge_open_repair(&self, id: TreeId) -> StorageResult<bool> {
         use lsm_tree::AbstractTree as _;
-        let Some(repair) = self.open_repairs.iter().find(|r| r.partition == partition) else {
+        let Some(repair) = self.open_repairs.iter().find(|r| r.tree == id) else {
             return Ok(false);
         };
         Ok(self
-            .tree_of(store_tree(partition))?
+            .tree_of(id)?
             .acknowledge_repair_report(repair.report.id)?)
     }
 
@@ -3111,8 +3134,7 @@ impl Deployment {
             // A namespace that opens after the store is one created since:
             // a repair of its trees has nothing earlier to lose.
             tracing::warn!(
-                %namespace,
-                partition = repair.partition.name(),
+                tree = %repair.tree,
                 lossy = repair.is_lossy(),
                 "a namespace's tree opened after the store was repaired"
             );
@@ -3847,6 +3869,22 @@ impl StorageEngine {
         )
     }
 
+    /// The checkpoint at `checkpoint_dir` opened read-only and bound to this
+    /// engine's namespace: `None` when the checkpoint holds no such namespace.
+    /// Another namespace's trees may hold the same keys and table names, so a
+    /// rebuild only ever reads its own namespace's copy.
+    ///
+    /// # Errors
+    ///
+    /// The checkpoint cannot be opened, or its catalog cannot be read.
+    fn checkpoint_view(&self, checkpoint_dir: &Path) -> StorageResult<Option<StorageEngine>> {
+        match Deployment::open_checkpoint(checkpoint_dir)?.engine(self.namespace) {
+            Ok(view) => Ok(Some(view)),
+            Err(StorageError::UnknownNamespace { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Rebuild a corrupt partition from a checkpoint plus oplog replay
     /// (WAL-replay-repair, repair path 2). Used when no healthy replica can
     /// serve the partition — the single-node / embedded / RF=1 case.
@@ -3880,18 +3918,13 @@ impl StorageEngine {
 
         // 1. Prove the state before touching the live partition, against the
         //    checkpoint's copy of this namespace's tree.
-        let ckpt = Deployment::open_checkpoint(checkpoint_dir)?;
-        let ckpt = match ckpt.engine(self.namespace) {
-            Ok(ckpt) => ckpt,
-            Err(StorageError::UnknownNamespace { .. }) => {
-                return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
-            }
-            Err(err) => return Err(err),
+        let Some(ckpt) = self.checkpoint_view(checkpoint_dir)? else {
+            return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
         };
         if ckpt
             .open_repairs()
             .iter()
-            .any(|r| r.partition == partition && r.is_lossy())
+            .any(|r| r.tree == ckpt.tree_id(partition) && r.is_lossy())
         {
             return Ok(Rebuild::Refused(RebuildRefusal::CheckpointDamaged));
         }
@@ -3915,7 +3948,7 @@ impl StorageEngine {
         // this node vote twice in one term, so none is reinstated. A rebuild
         // a crash cut short after its clear kept them in its intent, which
         // is read in place of the cleared tree.
-        let local = match read_kept_rows(&self.data_dir, partition)
+        let local = match read_kept_rows(&self.data_dir, self.tree_id(partition))
             .transpose()
             .unwrap_or_else(|| self.node_local_rows(partition))
         {
@@ -3944,7 +3977,7 @@ impl StorageEngine {
         //    that re-reads the corrupt block we are repairing and aborts with a
         //    ChecksumMismatch. The clear is on disk at once while the rebuilt
         //    data is not, so the intent goes first, with the records kept.
-        let repair = self.begin_rebuild_keeping(partition, &local)?;
+        let repair = self.begin_rebuild_keeping(self.tree_id(partition), &local)?;
         self.clear_partition_tree(partition, self.tree(partition)?)?;
         let mut versions = 0;
         for event in rebuild::tree_history(&source)? {
@@ -3996,7 +4029,7 @@ impl StorageEngine {
         self.finish_rebuild(repair)?;
         // The rebuilt tree is on disk: whatever an open-time repair of it
         // lost is restored.
-        self.acknowledge_open_repair(partition)?;
+        self.acknowledge_open_repair(self.tree_id(partition))?;
         Ok(Rebuild::Rebuilt { versions, replayed })
     }
 
@@ -4193,13 +4226,8 @@ impl StorageEngine {
         //    under one name.
         // The checkpoint's copy of this namespace's table: the same name may
         // be a table of another namespace too.
-        let ckpt = Deployment::open_checkpoint(checkpoint_dir)?;
-        let ckpt = match ckpt.engine(self.namespace) {
-            Ok(ckpt) => ckpt,
-            Err(StorageError::UnknownNamespace { .. }) => {
-                return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
-            }
-            Err(err) => return Err(err),
+        let Some(ckpt) = self.checkpoint_view(checkpoint_dir)? else {
+            return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
         };
         let Some(source) = ckpt.columnar_table_tree(table_id) else {
             return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
@@ -4223,7 +4251,7 @@ impl StorageEngine {
         //    not, so the intent goes first. The new tree is cleared before
         //    the history goes in: its floor then refuses every older snapshot
         //    until the whole history is back.
-        let target = RebuildTarget::Table(table_id);
+        let target = RebuildTarget::Table(self.namespace, table_id);
         // Held alone until the rebuilt table is installed (the end of this
         // call): no capture pins it dropped or half filled.
         let _alone = self.rebuild_alone()?;
@@ -4357,8 +4385,8 @@ impl Deployment {
     /// # Errors
     ///
     /// The intent directory cannot be read.
-    pub fn pending_rebuilds(&self) -> StorageResult<Vec<Partition>> {
-        Ok(read_rebuild_intents(&self.data_dir)?.partitions)
+    pub fn pending_rebuilds(&self) -> StorageResult<Vec<TreeId>> {
+        Ok(read_rebuild_intents(&self.data_dir)?.trees)
     }
 
     /// Whether the open verified every block of `partition`'s tree, before
@@ -4377,25 +4405,26 @@ impl Deployment {
     }
 
     /// The `STORAGE COLUMNAR` tables whose rebuild started and did not
-    /// finish, by id: like a partition's, only a new rebuild restores them.
+    /// finish, with their namespace: like a tree's, only a new rebuild
+    /// restores them.
     ///
     /// # Errors
     ///
     /// The intent directory cannot be read.
-    pub fn pending_table_rebuilds(&self) -> StorageResult<Vec<String>> {
+    pub fn pending_table_rebuilds(&self) -> StorageResult<Vec<(NamespaceId, String)>> {
         Ok(read_rebuild_intents(&self.data_dir)?.tables)
     }
 
-    /// Record, durably, that `partition` is about to be rebuilt. Written
-    /// before the tree is cleared and removed by [`Self::finish_rebuild`]
+    /// Record, durably, that tree `id` is about to be rebuilt. Written
+    /// before the tree is cleared and removed by [`StorageEngine::finish_rebuild`]
     /// once the rebuilt tree is on disk.
-    fn begin_rebuild(&self, partition: Partition) -> StorageResult<PartitionRepair<'_>> {
+    fn begin_rebuild(&self, id: TreeId) -> StorageResult<PartitionRepair<'_>> {
         let alone = self.rebuild_alone()?;
         // Published before the intent lands and before any tree is touched:
         // an observation from here on sees the repair, whatever step it is at.
-        let mut active = self.enter_repair(partition)?;
+        let mut active = self.enter_repair(id)?;
         active._alone = Some(alone);
-        write_rebuild_intent(&self.data_dir, RebuildTarget::Partition(partition))?;
+        write_rebuild_intent(&self.data_dir, RebuildTarget::Tree(id))?;
         Ok(active)
     }
 
@@ -4419,23 +4448,20 @@ impl Deployment {
     /// [`Self::begin_rebuild`] for a rebuild that puts `kept`, the tree's own
     /// records read before its clear, back after it: the intent holds them,
     /// so an open after a crash in between still has them.
-    fn begin_rebuild_keeping(
-        &self,
-        partition: Partition,
-        kept: &Rows,
-    ) -> StorageResult<PartitionRepair<'_>> {
+    fn begin_rebuild_keeping(&self, id: TreeId, kept: &Rows) -> StorageResult<PartitionRepair<'_>> {
         let alone = self.rebuild_alone()?;
-        let mut active = self.enter_repair(partition)?;
+        let mut active = self.enter_repair(id)?;
         active._alone = Some(alone);
-        self.record_kept(partition, kept)?;
+        self.record_kept(id, kept)?;
         Ok(active)
     }
 
-    /// Write the rebuild intent of `partition`, under a repair taken, with
-    /// the records of its own `kept` that the rebuild puts back after its
-    /// clear. Only the Schema trees have such records outside the consensus
+    /// Write the rebuild intent of tree `id`, under a repair taken, with the
+    /// records of its own `kept` that the rebuild puts back after its clear.
+    /// Only the Schema trees have such records outside the consensus
     /// partition, which no copy rebuilds.
-    fn record_kept(&self, partition: Partition, kept: &Rows) -> StorageResult<()> {
+    fn record_kept(&self, id: TreeId, kept: &Rows) -> StorageResult<()> {
+        let partition = id.part;
         if partition == Partition::Deployment {
             // From the clear on, the ledger in memory is not the tree's: a
             // stored record read for it from here on answers nothing.
@@ -4451,50 +4477,47 @@ impl Deployment {
         };
         write_rebuild_intent_with(
             &self.data_dir,
-            RebuildTarget::Partition(partition),
+            RebuildTarget::Tree(id),
             &kept,
             &self.footprints,
         )
     }
 
-    /// Take the repair of `partition` and mark it under repair until
+    /// Take the repair of tree `id` and mark it under repair until
     /// [`Self::leave_repair`].
     ///
     /// # Errors
     ///
-    /// Another repair of `partition` is running.
-    pub(crate) fn enter_repair(&self, partition: Partition) -> StorageResult<PartitionRepair<'_>> {
-        use core::sync::atomic::Ordering;
-        let bit = repair_bit(partition);
-        if self.repair_active.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+    /// Another repair of the tree is running.
+    pub(crate) fn enter_repair(&self, id: TreeId) -> StorageResult<PartitionRepair<'_>> {
+        let mut marks = self.repairs.lock();
+        if !marks.running.insert(id) {
             return Err(StorageError::InvalidConfig(format!(
-                "a repair of the {} partition is already running",
-                partition.name()
+                "a repair of the {id} tree is already running"
             )));
         }
-        let active = PartitionRepair {
+        marks.under.insert(id);
+        Ok(PartitionRepair {
             engine: self,
-            partition,
-            bit,
+            tree: id,
             _alone: None,
-        };
-        self.under_repair.fetch_or(bit, Ordering::AcqRel);
-        Ok(active)
+        })
     }
 
-    /// Whether `partition` is under repair: its tree may be cleared or hold
-    /// a copy only partly installed.
-    pub(crate) fn is_under_repair(&self, partition: Partition) -> bool {
-        self.under_repair
-            .load(core::sync::atomic::Ordering::Acquire)
-            & repair_bit(partition)
-            != 0
+    /// Whether tree `id` is under repair: it may be cleared or hold a copy
+    /// only partly installed.
+    pub(crate) fn is_under_repair(&self, id: TreeId) -> bool {
+        self.repairs.lock().under.contains(&id)
     }
 
-    /// End the repair of `partition`.
-    fn leave_repair(&self, partition: Partition) {
-        self.under_repair
-            .fetch_and(!repair_bit(partition), core::sync::atomic::Ordering::AcqRel);
+    /// A tree under repair, if any is.
+    pub(crate) fn any_under_repair(&self) -> Option<TreeId> {
+        self.repairs.lock().under.iter().next().copied()
+    }
+
+    /// End the repair of tree `id`.
+    fn leave_repair(&self, id: TreeId) {
+        self.repairs.lock().under.remove(&id);
     }
 
     /// Refuse a repair taken on another store.
@@ -4503,8 +4526,8 @@ impl Deployment {
             Ok(())
         } else {
             Err(StorageError::InvalidConfig(format!(
-                "the repair of the {} partition was taken on another store",
-                repair.partition.name()
+                "the repair of the {} tree was taken on another store",
+                repair.tree
             )))
         }
     }
@@ -4533,8 +4556,9 @@ impl StorageEngine {
         last: impl FnOnce() -> StorageResult<()>,
     ) -> StorageResult<()> {
         self.check_repair(&repair)?;
-        let partition = repair.partition;
-        self.flush_memtables(self.tree(partition)?)?;
+        let id = repair.tree;
+        let partition = id.part;
+        self.flush_memtables(&self.tree_of(id)?)?;
         if partition == Partition::Schema {
             // The dictionary was rebuilt: views read before it reread it.
             self.note_field_dictionary_change();
@@ -4545,16 +4569,12 @@ impl StorageEngine {
             // one answered from here on.
             self.reload_closure_frontier()?;
         }
-        remove_rebuild_intent(
-            &self.data_dir,
-            RebuildTarget::Partition(partition),
-            &self.footprints,
-        )?;
+        remove_rebuild_intent(&self.data_dir, RebuildTarget::Tree(id), &self.footprints)?;
         if partition == Partition::Deployment {
             self.ledger_owed
                 .store(false, std::sync::atomic::Ordering::Release);
         }
-        self.leave_repair(partition);
+        self.leave_repair(id);
         drop(repair);
         Ok(())
     }
@@ -4663,11 +4683,13 @@ impl StorageEngine {
         //    base holds. The checkpoint engine is dropped before the live
         //    engine is mutated.
         let (base, held): (Rows, TreeCoverage) = {
-            let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
+            let Some(ckpt) = self.checkpoint_view(checkpoint_dir)? else {
+                return Ok(Rebuild::Refused(RebuildRefusal::MissingFromCheckpoint));
+            };
             if ckpt
                 .open_repairs()
                 .iter()
-                .any(|r| r.partition == partition && r.is_lossy())
+                .any(|r| r.tree == ckpt.tree_id(partition) && r.is_lossy())
             {
                 return Ok(Rebuild::Refused(RebuildRefusal::CheckpointDamaged));
             }
@@ -4697,7 +4719,7 @@ impl StorageEngine {
         //    crash part way leaves the ranges' state unknown while the
         //    coverage record still claims the entries, so the intent turns
         //    the next open's repair into a full rebuild.
-        let repair = self.begin_rebuild(partition)?;
+        let repair = self.begin_rebuild(self.tree_id(partition))?;
         for (start, end) in &ranges {
             self.remove_range(partition, start, end)?;
         }
@@ -4715,10 +4737,7 @@ impl StorageEngine {
             }
             replayed += 1;
             let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
-            for op in ops.iter() {
-                if op_partition(op) != Some(partition) {
-                    continue;
-                }
+            for op in ops_of_tree(&ops, self.namespace, partition) {
                 match op {
                     OplogOp::Insert { key, .. }
                     | OplogOp::Delete { key, .. }
@@ -4749,7 +4768,7 @@ impl StorageEngine {
         }
         self.finish_rebuild(repair)?;
         // The lost ranges are restored and on disk.
-        self.acknowledge_open_repair(partition)?;
+        self.acknowledge_open_repair(self.tree_id(partition))?;
         Ok(Rebuild::Rebuilt {
             versions: base_len,
             replayed,
@@ -5110,7 +5129,7 @@ impl Deployment {
     ) -> StorageResult<()> {
         let partition = scope.partition();
         let not_ready = |reason: String| StorageError::CutNotReady { reason };
-        if self.is_under_repair(partition) {
+        if self.is_under_repair(store_tree(partition)) {
             return Err(not_ready(format!(
                 "the {} partition is under repair",
                 partition.name()
@@ -5953,7 +5972,7 @@ impl StorageEngine {
     fn scope_view_intact(&self, cut: &crate::engine::fixed_cut::FixedCut) -> StorageResult<()> {
         use lsm_tree::AbstractTree as _;
         let partition = cut.scope.partition();
-        if self.is_under_repair(partition)
+        if self.is_under_repair(self.tree_id(partition))
             || self.tree(partition)?.oldest_retained_seqno() >= cut.bound
         {
             return Err(StorageError::CutLost { bound: cut.bound });
@@ -8560,13 +8579,14 @@ impl StorageEngine {
         // records, a namespace's records of this node about its indexes) are
         // the store's, not the partition's data: read under the repair, kept
         // in its intent, and put back after the clear.
-        let repair = self.enter_repair(part)?;
+        let id = self.tree_id(part);
+        let repair = self.enter_repair(id)?;
         let kept = if matches!(part, Partition::Schema | Partition::Deployment) {
             self.node_local_rows(part)?
         } else {
             Rows::new()
         };
-        self.record_kept(part, &kept)?;
+        self.record_kept(id, &kept)?;
         self.clear_partition_tree(part, tree)?;
         cleared()?;
         for (key, value) in &kept {
@@ -10467,7 +10487,7 @@ pub(crate) fn remove_namespace_dirs(
 fn note_journal_coverage(
     id: TreeId,
     tree: &lsm_tree::AnyTree,
-    owed: &[Partition],
+    owed: &[TreeId],
     data_dir: &Path,
     covered: &mut HashMap<TreeId, TreeCoverage>,
 ) -> StorageResult<()> {
@@ -10483,8 +10503,8 @@ fn note_journal_coverage(
                 "a tree's journal coverage record is damaged; the tree is rebuilt from the \
                  latest checkpoint"
             );
-            if !owed.contains(&id.part) {
-                write_rebuild_intent(data_dir, RebuildTarget::Partition(id.part))?;
+            if !owed.contains(&id) {
+                write_rebuild_intent(data_dir, RebuildTarget::Tree(id))?;
             }
             Ok(())
         }
@@ -10853,8 +10873,7 @@ fn load_or_init_partition_routing(
 #[must_use = "the repair runs while this is held, and ends with its finish"]
 pub struct PartitionRepair<'e> {
     engine: &'e Deployment,
-    partition: Partition,
-    bit: u64,
+    tree: TreeId,
     /// The set of trees, held alone by a rebuild from a checkpoint until its
     /// result is installed: no capture pins its tree half rebuilt.
     _alone: Option<crate::engine::tree_set::TreeSetExclusive<'e>>,
@@ -10863,16 +10882,27 @@ pub struct PartitionRepair<'e> {
 impl PartitionRepair<'_> {
     /// The partition under repair.
     pub fn partition(&self) -> Partition {
-        self.partition
+        self.tree.part
+    }
+
+    /// The tree under repair.
+    pub fn tree(&self) -> TreeId {
+        self.tree
     }
 }
 
 impl Drop for PartitionRepair<'_> {
     fn drop(&mut self) {
-        self.engine
-            .repair_active
-            .fetch_and(!self.bit, core::sync::atomic::Ordering::AcqRel);
+        self.engine.repairs.lock().running.remove(&self.tree);
     }
+}
+
+/// The trees under repair, and those whose repair runs now
+/// ([`Deployment::enter_repair`]).
+#[derive(Debug, Default)]
+struct RepairMarks {
+    under: rustc_hash::FxHashSet<TreeId>,
+    running: rustc_hash::FxHashSet<TreeId>,
 }
 
 /// Why one log entry of a cut's continuation was not taken.
@@ -10889,16 +10919,6 @@ enum EntryOutcome {
 /// The path of the segment a continuation read holds while it reads it: no
 /// longer than a path the operating system takes.
 const READER_PATH_ROOM: u64 = 4 << 10;
-
-/// The bit of `partition` in [`StorageEngine::under_repair`]: its place in
-/// [`Partition::all`], which holds far fewer than 64 partitions.
-fn repair_bit(partition: Partition) -> u64 {
-    let place = Partition::all()
-        .iter()
-        .position(|&p| p == partition)
-        .unwrap_or(0);
-    1 << place
-}
 
 /// Flush all active memtables to SST on clean shutdown.
 ///
@@ -11573,24 +11593,31 @@ fn open_record<'a>(magic: &[u8; 8], bytes: &'a [u8]) -> Result<&'a [u8], &'stati
     Ok(payload)
 }
 
-/// The rebuild intent file of a `STORAGE COLUMNAR` table is its id behind
-/// this prefix, so a table never names a partition's.
+/// The rebuild intent file of a `STORAGE COLUMNAR` table is its namespace's
+/// directory name and its id behind this prefix, so a table never names a
+/// tree's.
 const TABLE_INTENT_PREFIX: &str = "table.";
 
 /// A tree a rebuild intent names.
 #[derive(Debug, Clone, Copy)]
 enum RebuildTarget<'a> {
-    Partition(Partition),
+    /// A partition's tree of the system set or of a namespace's.
+    Tree(TreeId),
+    /// A `STORAGE COLUMNAR` table of a namespace.
     #[cfg_attr(not(feature = "columnar"), allow(dead_code))]
-    Table(&'a str),
+    Table(NamespaceId, &'a str),
 }
 
 impl RebuildTarget<'_> {
-    /// The intent's file name.
+    /// The intent's file name: the tree's name with `.` between its parts
+    /// (neither a partition's name nor a namespace's directory holds one), or
+    /// the table's behind [`TABLE_INTENT_PREFIX`].
     fn file_name(self) -> String {
         match self {
-            Self::Partition(partition) => partition.name().to_string(),
-            Self::Table(table) => format!("{TABLE_INTENT_PREFIX}{table}"),
+            Self::Tree(id) => id.name().replace('/', "."),
+            Self::Table(namespace, table) => {
+                format!("{TABLE_INTENT_PREFIX}{}.{table}", namespace.dir_name())
+            }
         }
     }
 }
@@ -11637,13 +11664,13 @@ fn put_rebuild_intent(
     sync_dir(data_dir)
 }
 
-/// The node's own records of `partition` its pending rebuild keeps
+/// The node's own records of tree `id` its pending rebuild keeps
 /// ([`write_rebuild_intent_with`]): `None` when no rebuild of it is pending,
 /// or its intent holds none to prove them by.
-fn read_kept_rows(data_dir: &Path, partition: Partition) -> StorageResult<Option<Rows>> {
+fn read_kept_rows(data_dir: &Path, id: TreeId) -> StorageResult<Option<Rows>> {
     let path = data_dir
         .join(REBUILD_INTENT_DIR)
-        .join(RebuildTarget::Partition(partition).file_name());
+        .join(RebuildTarget::Tree(id).file_name());
     // no-std: StoragePort trait, caller-injected
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -11690,8 +11717,8 @@ fn remove_rebuild_intent(
 /// The trees whose rebuild started and did not finish.
 #[derive(Debug, Default)]
 struct RebuildIntents {
-    partitions: Vec<Partition>,
-    tables: Vec<String>,
+    trees: Vec<TreeId>,
+    tables: Vec<(NamespaceId, String)>,
 }
 
 fn read_rebuild_intents(data_dir: &Path) -> StorageResult<RebuildIntents> {
@@ -11709,16 +11736,16 @@ fn read_rebuild_intents(data_dir: &Path) -> StorageResult<RebuildIntents> {
         let name = entry.file_name();
         let unknown = || StorageError::Io(format!("unknown rebuild intent {name:?} in {dir:?}"));
         let name = name.to_str().ok_or_else(unknown)?;
-        if let Some(table) = name.strip_prefix(TABLE_INTENT_PREFIX) {
-            pending.tables.push(table.to_string());
+        if let Some(rest) = name.strip_prefix(TABLE_INTENT_PREFIX) {
+            let (namespace, table) = rest
+                .split_once('.')
+                .and_then(|(dir, table)| Some((NamespaceId::from_dir_name(dir)?, table)))
+                .ok_or_else(unknown)?;
+            pending.tables.push((namespace, table.to_string()));
             continue;
         }
-        let partition = Partition::all()
-            .iter()
-            .copied()
-            .find(|p| name == p.name())
-            .ok_or_else(unknown)?;
-        pending.partitions.push(partition);
+        let id = TreeId::parse(&name.replace('.', "/")).ok_or_else(unknown)?;
+        pending.trees.push(id);
     }
     Ok(pending)
 }

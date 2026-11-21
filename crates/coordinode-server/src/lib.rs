@@ -148,7 +148,8 @@ pub(crate) async fn run_with(
             if deep {
                 info!("deep verification: scrubbing all on-disk blocks...");
                 // Full-speed scrub (operator-invoked, not a background pass):
-                // verify every block's checksum across every partition.
+                // verify every block's checksum across every tree of every
+                // namespace.
                 let report = coordinode_storage::scrub::scrub_all(
                     &engine,
                     &coordinode_storage::scrub::ScrubConfig::default(),
@@ -163,7 +164,7 @@ pub(crate) async fn run_with(
                 if report.has_errors() {
                     for err in &report.errors {
                         tracing::error!(
-                            partition = err.partition.name(),
+                            tree = %err.tree,
                             detail = %err.message,
                             "corruption detected"
                         );

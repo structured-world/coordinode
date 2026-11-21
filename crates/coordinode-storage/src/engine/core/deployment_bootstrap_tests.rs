@@ -199,7 +199,7 @@ fn an_interrupted_records_rebuild_keeps_the_routes_of_the_other_trees() {
     );
     assert_eq!(
         engine.pending_rebuilds().expect("intents"),
-        [Partition::Deployment],
+        [TreeId::system(Partition::Deployment)],
         "with no checkpoint the rebuild stays owed"
     );
 }
@@ -473,8 +473,8 @@ fn a_rebuild_at_the_open_cut_short_is_finished_by_the_next_open() {
     assert_eq!(
         read_rebuild_intents(&store.primary())
             .expect("intents")
-            .partitions,
-        [Partition::Deployment],
+            .trees,
+        [TreeId::system(Partition::Deployment)],
         "the rebuild is no longer owed"
     );
     let engine = open_journaled(&store.config).expect("open after the cut");
@@ -500,7 +500,7 @@ fn a_rebuild_the_journal_cannot_cover_is_refused() {
         Err(e) => panic!("refused for another reason: {e}"),
         Ok(_) => panic!("opened without the entries the deployment tree lacks"),
     }
-    let kept = read_kept_rows(&store.primary(), Partition::Deployment)
+    let kept = read_kept_rows(&store.primary(), TreeId::system(Partition::Deployment))
         .expect("read the intent")
         .expect("the rebuild keeps its records");
     assert!(
@@ -700,8 +700,8 @@ fn a_records_copy_that_does_not_fit_the_endpoint_is_refused() {
     }
     assert_eq!(tree_files(&latest), checkpoint, "the checkpoint changed");
     assert_eq!(
-        read_rebuild_intents(&primary).expect("intents").partitions,
-        [Partition::Deployment],
+        read_rebuild_intents(&primary).expect("intents").trees,
+        [TreeId::system(Partition::Deployment)],
         "the rebuild is no longer owed"
     );
 
@@ -856,7 +856,7 @@ fn damaged_kept_records_refuse_the_open() {
     let intent = store
         .primary()
         .join(REBUILD_INTENT_DIR)
-        .join(Partition::Deployment.name());
+        .join(RebuildTarget::Tree(TreeId::system(Partition::Deployment)).file_name());
     let whole = std::fs::read(&intent).expect("read the intent");
     assert!(!whole.is_empty(), "the intent keeps the records");
 
@@ -911,7 +911,7 @@ fn a_cut_short_schema_rebuild_keeps_the_nodes_index_records() {
     let engine = open_journaled(&store.config).expect("reopen");
     assert_eq!(
         engine.pending_rebuilds().expect("intents"),
-        [Partition::Schema],
+        [engine.tree_id(Partition::Schema)],
         "the cut-short rebuild is owed"
     );
     let journal = engine

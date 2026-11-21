@@ -240,9 +240,75 @@ fn the_corruption_fixture_hits_data_in_a_small_table() {
         report
             .errors
             .iter()
-            .any(|error| error.partition == Partition::Node),
+            .any(|error| error.tree == engine.tree_id(Partition::Node)),
         "the injected data fault must be reported: {report:?}"
     );
+}
+
+/// A full check walks every namespace's trees: damage in one namespace's
+/// tree is found, reported as that namespace's, and rebuilt from that
+/// namespace's copy in the checkpoint and its own journalled writes, while
+/// another namespace holding the same keys keeps its own rows.
+#[test]
+fn a_full_check_repairs_the_namespace_whose_tree_is_damaged() {
+    use coordinode_core::txn::proposal::in_namespace;
+    use coordinode_storage::engine::core::Deployment;
+    use coordinode_storage::engine::scope::TreeId;
+
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    let deployment =
+        Deployment::open_embedded(&durable_cfg(&dir), Arc::clone(&oracle)).expect("open");
+    let a = deployment
+        .engine(deployment.create_namespace("a").expect("a"))
+        .expect("bind a");
+    let b = deployment
+        .engine(deployment.create_namespace("b").expect("b"))
+        .expect("bind b");
+    let write = |engine: &StorageEngine, range: std::ops::Range<u32>, value: &[u8]| {
+        for i in range {
+            engine
+                .commit_journaled(
+                    &in_namespace(
+                        engine.namespace(),
+                        [Mutation::Put {
+                            partition: PartitionId::Node,
+                            key: format!("node:0:{i:08}").into_bytes(),
+                            value: value.to_vec(),
+                        }],
+                    ),
+                    oracle.next().as_raw(),
+                )
+                .expect("commit");
+        }
+        engine.persist().expect("persist");
+    };
+    write(&a, 0..100, b"a-base");
+    write(&b, 0..100, b"b-base");
+    create_checkpoint(&b, &root).expect("checkpoint");
+    write(&a, 100..150, b"a-tail");
+    write(&b, 100..150, b"b-tail");
+
+    let b_node = TreeId::namespace(b.namespace(), Partition::Node);
+    let corrupted =
+        corrupt_post_checkpoint_tables(&dir.path().join(b_node.dir()).join("tables"), &root);
+    assert!(corrupted > 0, "a post-checkpoint table of b is damaged");
+
+    let report = verify_and_repair(&a, &root).expect("full check");
+    assert_eq!(report.corrupt_trees, vec![b_node], "{report:?}");
+    assert_eq!(report.repaired, vec![b_node], "{report:?}");
+    assert!(report.is_clean(), "{report:?}");
+    let read = |engine: &StorageEngine, i: u32| {
+        engine
+            .get(Partition::Node, format!("node:0:{i:08}").as_bytes())
+            .expect("read")
+            .map(|v| v.to_vec())
+    };
+    assert_eq!(read(&b, 42).as_deref(), Some(&b"b-base"[..]));
+    assert_eq!(read(&b, 142).as_deref(), Some(&b"b-tail"[..]));
+    assert_eq!(read(&a, 42).as_deref(), Some(&b"a-base"[..]));
+    assert_eq!(read(&a, 142).as_deref(), Some(&b"a-tail"[..]));
 }
 
 #[test]
@@ -383,7 +449,7 @@ fn verify_and_repair_is_clean_on_healthy_engine() {
     let report = verify_and_repair(&engine, &root).expect("verify");
     assert!(report.is_clean(), "healthy engine must report clean");
     assert!(report.repaired.is_empty());
-    assert!(report.corrupt_partitions.is_empty());
+    assert!(report.corrupt_trees.is_empty());
 }
 
 #[test]
@@ -444,11 +510,13 @@ fn repair_rebuilds_corrupt_partition_from_checkpoint_plus_oplog() {
     // Repair: base A from the checkpoint + replay B from the oplog.
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
     assert!(
-        report.corrupt_partitions.contains(&Partition::Node),
+        report
+            .corrupt_trees
+            .contains(&engine.tree_id(Partition::Node)),
         "scrub must flag the corrupt Node partition"
     );
     assert!(
-        report.repaired.contains(&Partition::Node),
+        report.repaired.contains(&engine.tree_id(Partition::Node)),
         "Node must be rebuilt: {report:?}"
     );
     assert!(
@@ -517,7 +585,7 @@ fn repair_rebuilds_a_partition_with_a_corrupt_blob_file() {
 
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
     assert!(
-        report.repaired.contains(&Partition::Blob),
+        report.repaired.contains(&engine.tree_id(Partition::Blob)),
         "the blob partition must be rebuilt: {report:?}"
     );
     assert!(report.is_clean(), "re-scrub after repair: {report:?}");
@@ -619,7 +687,7 @@ fn a_healthy_open_with_a_checkpoint_reads_nothing_in_full() {
     let report = repair_owed_on_open(db.engine(), &checkpoint_root(dir.path())).expect("repair");
     assert!(report.is_clean());
     assert_eq!(report.checked, CheckedScope::Repaired);
-    assert!(report.corrupt_partitions.is_empty() && report.repaired.is_empty());
+    assert!(report.corrupt_trees.is_empty() && report.repaired.is_empty());
 }
 
 /// Damage in a block nothing has read is not owed: the open's repair leaves
@@ -665,12 +733,16 @@ fn only_a_full_check_finds_damage_nothing_has_read() {
     let owed = repair_owed_on_open(&engine, &root).expect("repair owed");
     assert_eq!(owed.checked, CheckedScope::Repaired);
     assert!(
-        owed.repaired.is_empty() && owed.corrupt_partitions.is_empty(),
+        owed.repaired.is_empty() && owed.corrupt_trees.is_empty(),
         "nothing was owed: {owed:?}"
     );
     let full = verify_and_repair(&engine, &root).expect("full check");
     assert_eq!(full.checked, CheckedScope::Store);
-    assert_eq!(full.repaired, vec![Partition::Node], "{full:?}");
+    assert_eq!(
+        full.repaired,
+        vec![engine.tree_id(Partition::Node)],
+        "{full:?}"
+    );
     assert!(full.is_clean(), "{full:?}");
 }
 
@@ -840,7 +912,7 @@ fn lossy_open_repair_forces_checkpoint_rebuild() {
     let lossy = engine
         .open_repairs()
         .iter()
-        .find(|r| r.partition == Partition::Node)
+        .find(|r| r.tree == engine.tree_id(Partition::Node))
         .expect("Node open repair must be recorded");
     assert!(
         lossy.is_lossy(),
@@ -852,7 +924,7 @@ fn lossy_open_repair_forces_checkpoint_rebuild() {
     // scrubs clean, and the rebuild must restore both A and B in full.
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
     assert!(
-        report.repaired.contains(&Partition::Node),
+        report.repaired.contains(&engine.tree_id(Partition::Node)),
         "lossy open repair must force a rebuild: {report:?}"
     );
     assert!(report.is_clean(), "post-rebuild re-scrub: {report:?}");
@@ -926,16 +998,9 @@ fn a_lossy_table_repair_rebuilds_the_table_from_the_checkpoint() {
     let engine = open();
     assert_eq!(engine.lossy_table_repairs(), vec!["trades".to_string()]);
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
-    assert_eq!(
-        report.corrupt_tables,
-        vec!["trades".to_string()],
-        "{report:?}"
-    );
-    assert_eq!(
-        report.repaired_tables,
-        vec!["trades".to_string()],
-        "{report:?}"
-    );
+    let trades = vec![(engine.namespace(), "trades".to_string())];
+    assert_eq!(report.corrupt_tables, trades, "{report:?}");
+    assert_eq!(report.repaired_tables, trades, "{report:?}");
     assert!(report.is_clean(), "{report:?}");
     let rows = engine
         .columnar_scan("trades", u64::MAX)
@@ -988,20 +1053,19 @@ fn a_table_rebuild_cut_short_is_rebuilt_again() {
     // The intent a rebuild writes before it clears the table.
     let intents = dir.path().join("rebuild");
     std::fs::create_dir_all(&intents).expect("intent dir");
-    std::fs::write(intents.join("table.node"), b"").expect("intent");
+    let namespace = coordinode_storage::engine::scope::STORE_NAMESPACE;
+    std::fs::write(
+        intents.join(format!("table.{}.node", namespace.dir_name())),
+        b"",
+    )
+    .expect("intent");
 
     let engine = open();
-    assert_eq!(
-        engine.pending_table_rebuilds().expect("intents"),
-        vec!["node".to_string()]
-    );
+    let node = vec![(namespace, "node".to_string())];
+    assert_eq!(engine.pending_table_rebuilds().expect("intents"), node);
     assert!(engine.pending_rebuilds().expect("intents").is_empty());
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
-    assert_eq!(
-        report.repaired_tables,
-        vec!["node".to_string()],
-        "{report:?}"
-    );
+    assert_eq!(report.repaired_tables, node, "{report:?}");
     assert!(report.repaired.is_empty(), "{report:?}");
     assert!(report.is_clean(), "{report:?}");
     assert!(engine.pending_table_rebuilds().expect("intents").is_empty());
@@ -1037,7 +1101,14 @@ fn database_open_finishes_an_interrupted_table_rebuild() {
     };
     let intents = data_dir.join("rebuild");
     std::fs::create_dir_all(&intents).expect("intent dir");
-    std::fs::write(intents.join("table.trades"), b"").expect("intent");
+    std::fs::write(
+        intents.join(format!(
+            "table.{}.trades",
+            coordinode_storage::engine::scope::STORE_NAMESPACE.dir_name()
+        )),
+        b"",
+    )
+    .expect("intent");
 
     let db = crate::Database::open(&data_dir).expect("open repairs");
     assert!(
@@ -1105,7 +1176,12 @@ fn database_open_reports_a_table_rebuild_it_cannot_finish() {
     };
     let intents = data_dir.join("rebuild");
     std::fs::create_dir_all(&intents).expect("intent dir");
-    std::fs::write(intents.join("table.trades"), b"").expect("intent");
+    let namespace = coordinode_storage::engine::scope::STORE_NAMESPACE;
+    std::fs::write(
+        intents.join(format!("table.{}.trades", namespace.dir_name())),
+        b"",
+    )
+    .expect("intent");
 
     let errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(Errors(Arc::clone(&errors)));
@@ -1115,12 +1191,12 @@ fn database_open_reports_a_table_rebuild_it_cannot_finish() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("corrupt_tables=[\"trades\"]")),
+            .any(|e| e.contains("corrupt_tables=") && e.contains("\"trades\"")),
         "the open did not report the table: {errors:?}"
     );
     assert_eq!(
         db.engine().pending_table_rebuilds().expect("intents"),
-        vec!["trades".to_string()],
+        vec![(namespace, "trades".to_string())],
         "the intent is kept until a restore finishes it"
     );
 }
@@ -1159,7 +1235,7 @@ fn a_lossy_table_repair_without_a_checkpoint_reports_not_clean() {
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
     assert_eq!(
         report.corrupt_tables,
-        vec!["trades".to_string()],
+        vec![(engine.namespace(), "trades".to_string())],
         "{report:?}"
     );
     assert!(report.repaired_tables.is_empty(), "{report:?}");
@@ -1233,7 +1309,7 @@ fn a_table_rebuild_keeps_the_checkpoints_history() {
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
     assert_eq!(
         report.repaired_tables,
-        vec!["trades".to_string()],
+        vec![(engine.namespace(), "trades".to_string())],
         "{report:?}"
     );
     assert!(report.is_clean(), "{report:?}");
@@ -1315,7 +1391,10 @@ fn a_table_rebuild_from_a_damaged_checkpoint_copy_is_refused() {
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
     assert_eq!(
         report.refused_tables,
-        vec![("trades".to_string(), RebuildRefusal::CheckpointDamaged)],
+        vec![(
+            (engine.namespace(), "trades".to_string()),
+            RebuildRefusal::CheckpointDamaged
+        )],
         "{report:?}"
     );
     assert!(!report.is_clean(), "{report:?}");
@@ -1358,7 +1437,10 @@ fn a_table_missing_from_the_checkpoint_is_refused() {
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
     assert_eq!(
         report.refused_tables,
-        vec![("late".to_string(), RebuildRefusal::MissingFromCheckpoint)],
+        vec![(
+            (engine.namespace(), "late".to_string()),
+            RebuildRefusal::MissingFromCheckpoint
+        )],
         "{report:?}"
     );
     assert!(report.repaired_tables.is_empty(), "{report:?}");
@@ -1440,7 +1522,7 @@ fn a_table_rebuild_across_a_catalog_change_is_refused() {
     assert!(
         matches!(
             report.refused_tables.as_slice(),
-            [(table, RebuildRefusal::CatalogChanged { .. })] if table == "trades"
+            [((_, table), RebuildRefusal::CatalogChanged { .. })] if table == "trades"
         ),
         "{report:?}"
     );
@@ -1682,7 +1764,7 @@ fn a_checkpoint_after_a_rebuild_cut_short_is_refused() {
     engine.set_rebuild_cleared_hook(None);
     assert_eq!(
         engine.pending_table_rebuilds().expect("intents"),
-        vec!["trades".to_owned()],
+        vec![(engine.namespace(), "trades".to_owned())],
         "its intent stays"
     );
 
@@ -1734,7 +1816,9 @@ fn lossy_open_repair_without_checkpoint_reports_not_clean() {
     let engine = open(&dir);
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
     assert!(
-        report.corrupt_partitions.contains(&Partition::Node),
+        report
+            .corrupt_trees
+            .contains(&engine.tree_id(Partition::Node)),
         "the loss must be reported: {report:?}"
     );
     assert!(
@@ -1754,7 +1838,7 @@ fn lossy_open_repair_without_checkpoint_reports_not_clean() {
     let again = engine
         .open_repairs()
         .iter()
-        .find(|r| r.partition == Partition::Node)
+        .find(|r| r.tree == engine.tree_id(Partition::Node))
         .expect("the unrestored loss is reported again");
     assert!(again.is_lossy(), "{:?}", again.replay_scope);
 }
@@ -2399,12 +2483,13 @@ fn lossy_open_repair_losing_the_coverage_record_rebuilds_in_full() {
 
     let engine = open(&dir);
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    let node = engine.tree_id(Partition::Node);
     assert!(
-        report.repaired.contains(&Partition::Node),
+        report.repaired.contains(&node),
         "lossy open repair must be repaired: {report:?}"
     );
     assert!(
-        !report.scoped.contains(&Partition::Node),
+        !report.scoped.contains(&node),
         "a span that lost coverage markers must not be repaired range-scoped: {report:?}"
     );
     assert!(report.is_clean(), "{report:?}");
@@ -2514,12 +2599,13 @@ fn unscopable_loss_falls_back_to_full_rebuild() {
 
     let engine = open(&dir);
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    let node = engine.tree_id(Partition::Node);
     assert!(
-        report.repaired.contains(&Partition::Node),
+        report.repaired.contains(&node),
         "unscopable loss must still be repaired: {report:?}"
     );
     assert!(
-        !report.scoped.contains(&Partition::Node),
+        !report.scoped.contains(&node),
         "an unknowable loss must not claim a scoped repair: {report:?}"
     );
     assert!(report.is_clean(), "{report:?}");

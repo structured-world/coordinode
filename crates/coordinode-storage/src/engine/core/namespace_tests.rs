@@ -452,6 +452,112 @@ fn a_partition_rebuild_takes_only_its_own_namespaces_rows() {
     assert_eq!(node(&a, b"later").as_deref(), Some(&b"a"[..]));
 }
 
+/// Lost key ranges rebuilt from a checkpoint come from the checkpoint's copy
+/// of the same namespace, and only that namespace's journalled writes are
+/// replayed into them, though another namespace wrote the same keys.
+#[test]
+fn a_range_rebuild_takes_only_its_own_namespaces_rows() {
+    let dir = TempDir::new().expect("tmp");
+    let backups = TempDir::new().expect("tmp");
+    let (deployment, oracle) = open_deployment(&durable_cfg(&dir));
+    let a = deployment
+        .engine(deployment.create_namespace("a").expect("a"))
+        .expect("bind a");
+    let b = deployment
+        .engine(deployment.create_namespace("b").expect("b"))
+        .expect("bind b");
+    commit(&a, &oracle, vec![put(b"k", b"of-a")]);
+    commit(&b, &oracle, vec![put(b"k", b"of-b")]);
+    let checkpoint = backups.path().join("checkpoint");
+    deployment
+        .create_checkpoint(&checkpoint)
+        .expect("checkpoint");
+    commit(&a, &oracle, vec![put(b"later", b"a")]);
+    commit(&b, &oracle, vec![put(b"later", b"b")]);
+    let from = deployment
+        .checkpoint_replay_floor(&checkpoint)
+        .expect("floor");
+    let suffix = deployment
+        .oplog_read_since(from)
+        .expect("read journal")
+        .expect("journal");
+
+    let lost = [(b"a".to_vec(), b"z".to_vec())];
+    let rebuilt = b
+        .repair_partition_ranges_from_checkpoint(&checkpoint, &suffix, Partition::Node, &lost)
+        .expect("rebuild");
+    assert!(matches!(rebuilt, Rebuild::Rebuilt { .. }), "{rebuilt:?}");
+    assert_eq!(node(&b, b"k").as_deref(), Some(&b"of-b"[..]));
+    assert_eq!(node(&b, b"later").as_deref(), Some(&b"b"[..]));
+    assert_eq!(node(&a, b"k").as_deref(), Some(&b"of-a"[..]));
+    assert_eq!(node(&a, b"later").as_deref(), Some(&b"a"[..]));
+}
+
+/// A repair holds its own namespace's tree only: the same partition of
+/// another namespace can be repaired meanwhile, and neither shows the other
+/// under repair.
+#[test]
+fn a_repair_holds_only_its_own_namespaces_tree() {
+    let dir = TempDir::new().expect("tmp");
+    let (deployment, _) = open_deployment(&durable_cfg(&dir));
+    let a = deployment
+        .engine(deployment.create_namespace("a").expect("a"))
+        .expect("bind a");
+    let b = deployment
+        .engine(deployment.create_namespace("b").expect("b"))
+        .expect("bind b");
+    let a_node = a.tree_id(Partition::Node);
+    let b_node = b.tree_id(Partition::Node);
+
+    let held = deployment.enter_repair(b_node).expect("repair of b");
+    assert!(deployment.is_under_repair(b_node));
+    assert!(
+        !deployment.is_under_repair(a_node),
+        "a's tree shows b's repair"
+    );
+    let other = deployment
+        .enter_repair(a_node)
+        .expect("a's tree is refused while b's is repaired");
+    assert!(
+        deployment.enter_repair(b_node).is_err(),
+        "a second repair of b's tree ran"
+    );
+    drop((held, other));
+}
+
+/// A rebuild cut short leaves its own namespace's tree owed across a reopen,
+/// and only that one: the same partition of another namespace is not owed.
+#[test]
+fn a_rebuild_cut_short_stays_owed_by_its_own_namespaces_tree() {
+    let dir = TempDir::new().expect("tmp");
+    let config = durable_cfg(&dir);
+    let b_node = {
+        let (deployment, oracle) = open_deployment(&config);
+        let a = deployment
+            .engine(deployment.create_namespace("a").expect("a"))
+            .expect("bind a");
+        let b = deployment
+            .engine(deployment.create_namespace("b").expect("b"))
+            .expect("bind b");
+        commit(&a, &oracle, vec![put(b"k", b"a")]);
+        commit(&b, &oracle, vec![put(b"k", b"b")]);
+        let b_node = b.tree_id(Partition::Node);
+        assert!(
+            b.clear_partition_with(
+                Partition::Node,
+                b.tree(Partition::Node).expect("tree"),
+                || { Err(StorageError::Io("cut short".into())) }
+            )
+            .is_err()
+        );
+        b_node
+    };
+    let (deployment, _) = open_deployment(&config);
+    assert_eq!(deployment.pending_rebuilds().expect("intents"), [b_node]);
+    let a = deployment.engine_named("a").expect("a");
+    assert_eq!(node(&a, b"k").as_deref(), Some(&b"a"[..]));
+}
+
 /// A name a live namespace holds, or one no namespace may have, is refused
 /// and changes nothing.
 #[test]

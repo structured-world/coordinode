@@ -940,7 +940,7 @@ async fn install_cut_at(op: lsm_tree::fs::FaultOp, skip: u64) -> bool {
             engine
                 .pending_rebuilds()
                 .expect("intents")
-                .contains(&Partition::Counter),
+                .contains(&engine.tree_id(Partition::Counter)),
             "{op:?} {skip}: the interrupted install is known"
         );
     }
@@ -1971,7 +1971,7 @@ async fn a_lossy_salvage_of_the_raft_tree_keeps_the_vote() {
         engine
             .open_repairs()
             .iter()
-            .any(|r| r.partition == Partition::Raft),
+            .any(|r| r.tree.part == Partition::Raft),
         "the open salvaged the Raft tree: {:?}",
         engine.open_repairs()
     );
