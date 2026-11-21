@@ -159,6 +159,36 @@ fn a_store_of_several_namespaces_reopens_on_its_first() {
     assert_eq!(rows.len(), 1);
 }
 
+/// Each namespace keeps its own index maintenance default: setting it in one
+/// leaves the other's, an index created in each takes its own namespace's,
+/// and both hold across a reopen.
+#[test]
+fn the_index_maintenance_default_is_each_namespaces_own() {
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = |db: &mut Database, index: &str| -> Value {
+        db.execute_cypher(&format!("CREATE INDEX {index} ON :Doc(v)"))
+            .unwrap()[0]
+            .get("maintenance")
+            .cloned()
+            .unwrap()
+    };
+    {
+        let mut own = Database::open(dir.path()).unwrap();
+        own.create_namespace("derived").unwrap();
+        let mut derived = own.session("derived").unwrap();
+        derived
+            .execute_cypher("ALTER NAMESPACE SET INDEX MAINTENANCE DERIVED")
+            .unwrap();
+        assert_eq!(profile(&mut derived, "d1"), Value::String("DERIVED".into()));
+        assert_eq!(profile(&mut own, "o1"), Value::String("RESOLVED".into()));
+    }
+    let mut own = Database::open(dir.path()).unwrap();
+    let mut derived = own.session("derived").unwrap();
+    assert_eq!(profile(&mut derived, "d2"), Value::String("DERIVED".into()));
+    assert_eq!(profile(&mut own, "o2"), Value::String("RESOLVED".into()));
+}
+
 /// A name no namespace may have is refused before anything is written.
 #[test]
 fn an_invalid_namespace_name_is_refused() {
