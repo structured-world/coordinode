@@ -1,6 +1,8 @@
 use super::*;
 use crate::proto::v2::graph::schema_service_server::SchemaService;
 use crate::services::error_details::ERROR_DOMAIN;
+// Every call here names the namespace it works in, as every client does.
+use crate::services::namespace::NamedRequest as Request;
 use tonic_types::StatusExt;
 
 fn test_service() -> (SchemaServiceImpl, tempfile::TempDir) {
@@ -245,7 +247,7 @@ async fn a_malformed_declaration_names_its_field() {
 async fn a_publication_under_an_operation_is_answered_by_its_outcome() {
     let (svc, _dir) = test_service();
     let issuer = svc
-        .database
+        .database()
         .read()
         .enroll_issuer(coordinode_embed::operation::IssuerId([0x52; 16]))
         .expect("enroll");

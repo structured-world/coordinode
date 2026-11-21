@@ -249,7 +249,7 @@ impl Database {
     }
 
     /// Commit the command `mutation` through the write pipeline on its own.
-    fn propose_mutation(&self, mutation: Mutation) -> Result<(), DatabaseError> {
+    pub(super) fn propose_mutation(&self, mutation: Mutation) -> Result<(), DatabaseError> {
         // Held as not yet logged until the entry is handed over, so no
         // closed bound passes over it meanwhile.
         let (commit_ts, held) = self

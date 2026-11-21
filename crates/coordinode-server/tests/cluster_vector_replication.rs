@@ -837,7 +837,7 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
         body
     };
     let search = || {
-        tonic::Request::new(VectorSearchRequest {
+        coordinode_test_fixtures::client::named(VectorSearchRequest {
             label: "Item".to_string(),
             property: "embedding".to_string(),
             query_vector: Some(coordinode_server::proto::common::Vector {
@@ -976,7 +976,7 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
     let mut request = search().into_inner();
     request.query_vector.as_mut().unwrap().values = vec![2.0, 2.0];
     let response = n2_rpc
-        .vector_search(tonic::Request::new(request))
+        .vector_search(coordinode_test_fixtures::client::named(request))
         .await
         .unwrap()
         .into_inner();

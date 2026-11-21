@@ -4466,6 +4466,7 @@ mod id_lease;
 mod index_builds;
 mod index_maintenance;
 mod interactive;
+mod namespaces;
 mod package;
 mod projection;
 mod state_cut;
@@ -4484,6 +4485,7 @@ pub use fields::FieldDictionary;
 pub use interactive::{
     CommitOptions, RollbackOptions, TransactionEnd, TransactionOptions, draw_transaction_id,
 };
+pub use namespaces::NamespaceInfo;
 pub use package::{
     Disposition, EdgeTypeDeclaration, Intent, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,
     PackageConstraint, PublishedObject, Readiness, SchemaPackage, SchemaPublication,

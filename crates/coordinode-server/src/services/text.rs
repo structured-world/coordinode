@@ -31,12 +31,28 @@ const DEFAULT_TEXT_LIMIT: usize = 10;
 const MAX_TEXT_LIMIT: usize = 1000;
 
 pub struct TextServiceImpl {
-    database: Arc<RwLock<Database>>,
+    /// The database of the namespace each call names.
+    databases: super::namespace::Databases,
 }
 
 impl TextServiceImpl {
+    /// A service answering from `database`'s deployment, each call in the
+    /// namespace it names.
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
-        Self { database }
+        Self::serving(super::namespace::Databases::of(database))
+    }
+
+    /// A service answering from `databases`, each call in the namespace it
+    /// names.
+    pub fn serving(databases: super::namespace::Databases) -> Self {
+        Self { databases }
+    }
+
+    /// The database a test's calls reach, for the test to read and write
+    /// beside the service.
+    #[cfg(test)]
+    pub(crate) fn database(&self) -> &Arc<RwLock<Database>> {
+        self.databases.served_primary()
     }
 }
 
@@ -56,6 +72,7 @@ impl query::text_service_server::TextService for TextServiceImpl {
         &self,
         request: Request<query::TextSearchRequest>,
     ) -> Result<Response<query::TextSearchResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
 
         if req.label.is_empty() {
@@ -71,18 +88,19 @@ impl query::text_service_server::TextService for TextServiceImpl {
             n => n,
         };
 
-        super::blocking(|| self.search(&req, limit))
+        super::blocking(|| Self::search(&database, &req, limit))
     }
 }
 
 impl TextServiceImpl {
-    /// Search the label's text indexes for `req`, keeping `limit` results.
+    /// Search the label's text indexes in `database` for `req`, keeping
+    /// `limit` results.
     fn search(
-        &self,
+        database: &RwLock<Database>,
         req: &query::TextSearchRequest,
         limit: usize,
     ) -> Result<Response<query::TextSearchResponse>, Status> {
-        let db = self.database.read();
+        let db = database.read();
 
         let registry = db.text_index_registry();
 

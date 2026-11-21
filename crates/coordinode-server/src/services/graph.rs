@@ -35,18 +35,27 @@ fn cypher_ident(name: &str) -> String {
 }
 
 pub struct GraphServiceImpl {
-    database: Arc<RwLock<Database>>,
+    /// The database of the namespace each call names.
+    databases: super::namespace::Databases,
 }
 
 impl GraphServiceImpl {
+    /// A service answering from `database`'s deployment, each call in the
+    /// namespace it names.
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
-        Self { database }
+        Self::serving(super::namespace::Databases::of(database))
     }
 
-    /// Run the write `cypher` a typed call builds, carrying out `operation`
-    /// when the client named one.
+    /// A service answering from `databases`, each call in the namespace it
+    /// names.
+    pub fn serving(databases: super::namespace::Databases) -> Self {
+        Self { databases }
+    }
+
+    /// Run the write `cypher` a typed call builds in `database`, carrying out
+    /// `operation` when the client named one.
     fn write(
-        &self,
+        database: &RwLock<Database>,
         cypher: &str,
         params: std::collections::HashMap<String, Value>,
         operation: Option<coordinode_embed::operation::OperationDescriptor>,
@@ -56,7 +65,7 @@ impl GraphServiceImpl {
             ..Default::default()
         };
         super::blocking(|| {
-            self.database
+            database
                 .read()
                 .execute_cypher_shared_with(
                     cypher,
@@ -75,6 +84,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         &self,
         request: Request<graph::CreateNodeRequest>,
     ) -> Result<Response<graph::Node>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let operation = super::operation::optional_descriptor("operation", req.operation.as_ref())?;
 
@@ -105,8 +115,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
 
         let cypher = format!("CREATE (n{label_part}{props_part}) RETURN n");
 
-        let rows = self
-            .write(&cypher, params, operation)
+        let rows = Self::write(&database, &cypher, params, operation)
             .map_err(|e| db_err_to_status("create_node", e))?;
 
         let node_id = match rows.first().and_then(|r| r.get("n")) {
@@ -125,7 +134,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             element_id: NodeId::from_raw(node_id).to_element_id(),
             // The version the node was created at, so a caller that means to
             // write it again conditionally already has what to state.
-            version: super::blocking(|| node_version(&self.database.read(), node_id)),
+            version: super::blocking(|| node_version(&database.read(), node_id)),
         }))
     }
 
@@ -133,6 +142,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         &self,
         request: Request<graph::CreateNodesBatchRequest>,
     ) -> Result<Response<graph::CreateNodesBatchResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let operation = super::operation::optional_descriptor("operation", req.operation.as_ref())?;
         // The batch names its operation; one on an entry would bind part of
@@ -190,8 +200,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         params.insert("rows".to_string(), Value::Array(rows));
 
-        let result_rows = self
-            .write(&cypher, params, operation)
+        let result_rows = Self::write(&database, &cypher, params, operation)
             .map_err(|e| db_err_to_status("create_nodes_batch", e))?;
 
         if result_rows.len() != req.nodes.len() {
@@ -203,7 +212,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         }
 
         let nodes: Result<Vec<graph::Node>, Status> = super::blocking(|| {
-            let db = self.database.read();
+            let db = database.read();
             result_rows
                 .iter()
                 .enumerate()
@@ -236,6 +245,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         &self,
         request: Request<graph::GetNodeRequest>,
     ) -> Result<Response<graph::Node>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
 
         let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
@@ -248,7 +258,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         // get_node is read-only — shared lock lets parallel reads
         // proceed without blocking on each other.
         let rows = super::blocking(|| {
-            self.database.read().execute_cypher_shared(
+            database.read().execute_cypher_shared(
                 "MATCH (n) WHERE n = $id RETURN *",
                 Some(params),
                 None,
@@ -298,7 +308,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             element_id: NodeId::from_raw(node_id).to_element_id(),
             // What a reader needs to write this node back conditionally: the
             // version it is at, read in the same call as its contents.
-            version: super::blocking(|| node_version(&self.database.read(), node_id)),
+            version: super::blocking(|| node_version(&database.read(), node_id)),
         }))
     }
 
@@ -306,6 +316,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         &self,
         request: Request<graph::CreateEdgeRequest>,
     ) -> Result<Response<graph::Edge>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let operation = super::operation::optional_descriptor("operation", req.operation.as_ref())?;
 
@@ -338,8 +349,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
              RETURN src, dst"
         );
 
-        let rows = self
-            .write(&cypher, params, operation)
+        let rows = Self::write(&database, &cypher, params, operation)
             .map_err(|e| db_err_to_status("create_edge", e))?;
 
         let row = rows
@@ -381,6 +391,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         &self,
         request: Request<graph::TraverseRequest>,
     ) -> Result<Response<graph::TraverseResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
 
         if req.start_node_id == 0 {
@@ -430,7 +441,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
 
         // Traversal is read-only — shared lock for parallel reads.
         let rows = super::blocking(|| {
-            self.database
+            database
                 .read()
                 .execute_cypher_shared(&cypher, Some(params), None, None, None)
         })
@@ -440,7 +451,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         // Held across the mapping so every node in one traversal reports its
         // version against one view, rather than each taking its own lock and
         // its own moment.
-        let nodes = super::blocking(|| traversed_nodes(&self.database.read(), &rows));
+        let nodes = super::blocking(|| traversed_nodes(&database.read(), &rows));
 
         Ok(Response::new(graph::TraverseResponse {
             nodes,

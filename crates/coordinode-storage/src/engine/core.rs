@@ -717,21 +717,22 @@ impl StorageEngine {
     ///
     /// # Errors
     ///
-    /// A member's engine whose catalog holds no namespace, or several,
-    /// ([`StorageError::NoNamespace`], [`StorageError::SeveralNamespaces`]),
-    /// or the namespace's trees cannot be opened.
+    /// A member's engine whose catalog holds no namespace
+    /// ([`StorageError::NoNamespace`]), or the namespace's trees cannot be
+    /// opened.
     #[inline]
     fn bound(&self) -> StorageResult<&Bound> {
         match self.bound.get() {
             Some(bound) => Ok(bound),
-            None => self.bind_sole(),
+            None => self.bind_anchor(),
         }
     }
 
-    /// Bind a member's engine to its catalog's one namespace.
+    /// Bind a member's engine to its catalog's anchor namespace
+    /// ([`Deployment::anchor_namespace`]).
     #[cold]
-    fn bind_sole(&self) -> StorageResult<&Bound> {
-        let namespace = self.deployment.sole_namespace()?;
+    fn bind_anchor(&self) -> StorageResult<&Bound> {
+        let namespace = self.deployment.anchor_namespace()?;
         let set = self.deployment.namespace_set(namespace)?;
         Ok(self.bound.get_or_init(|| Bound { namespace, set }))
     }
@@ -743,14 +744,12 @@ impl StorageEngine {
         self.bound().is_ok()
     }
 
-    /// Bind a member's engine when its catalog now holds its one namespace:
-    /// `true` once bound, `false` while the catalog holds none yet.
+    /// Bind a member's engine once its catalog holds a namespace: `true` once
+    /// bound, `false` while the catalog holds none yet.
     ///
     /// # Errors
     ///
-    /// The catalog holds several namespaces
-    /// ([`StorageError::SeveralNamespaces`]), or it or the namespace's trees
-    /// cannot be read.
+    /// The catalog or the namespace's trees cannot be read.
     pub fn try_bind(&self) -> StorageResult<bool> {
         match self.bound() {
             Ok(_) => Ok(true),
@@ -7430,9 +7429,27 @@ impl Deployment {
         }
     }
 
-    /// The engine of a member of a group: bound to the catalog's one
-    /// namespace when it holds one, or, for a member whose namespace arrives
-    /// with its group's catalog, on its first use once it has. Creates no
+    /// The catalog's anchor namespace: the live namespace of the lowest id,
+    /// which a member's own database handle works in. Every other namespace
+    /// is reached by a session naming it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NoNamespace`] when the catalog holds none, or the
+    /// catalog cannot be read.
+    pub fn anchor_namespace(&self) -> StorageResult<NamespaceId> {
+        self.live_namespaces()?
+            .into_iter()
+            .map(|(id, _)| id)
+            .min()
+            .ok_or_else(|| StorageError::NoNamespace {
+                path: self.data_dir.display().to_string(),
+            })
+    }
+
+    /// The engine of a member of a group: bound to the catalog's anchor
+    /// namespace when it holds one, or, for a member whose namespaces arrive
+    /// with its group's catalog, on its first use once they have. Creates no
     /// namespace: a store that joins a group brings none of its own.
     #[must_use]
     pub fn member_engine(self: &Arc<Self>) -> StorageEngine {

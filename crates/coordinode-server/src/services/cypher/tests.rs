@@ -2684,7 +2684,9 @@ async fn grpc_alter_label_bumps_schema_revision_visible_via_list_labels() {
     // declared on first node create → revision 0 in the catalog response;
     // revision becomes positive once ALTER LABEL writes a schema body).
     let list1 = schema_svc
-        .list_labels(Request::new(graph_proto::ListLabelsRequest {}))
+        .list_labels(crate::services::namespace::named(
+            graph_proto::ListLabelsRequest {},
+        ))
         .await
         .expect("list 1")
         .into_inner();
@@ -2705,7 +2707,9 @@ async fn grpc_alter_label_bumps_schema_revision_visible_via_list_labels() {
         .expect("alter");
 
     let list2 = schema_svc
-        .list_labels(Request::new(graph_proto::ListLabelsRequest {}))
+        .list_labels(crate::services::namespace::named(
+            graph_proto::ListLabelsRequest {},
+        ))
         .await
         .expect("list 2")
         .into_inner();

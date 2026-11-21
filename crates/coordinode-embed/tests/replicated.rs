@@ -1649,6 +1649,71 @@ async fn open_outside_the_group(dir: &Path) -> Option<DatabaseError> {
     .unwrap()
 }
 
+/// A store holding two namespaces opens as a member that serves both: its own
+/// database works in the anchor namespace, a session of the other opens by
+/// name, and each holds its own rows. An embedding host's handle is one store
+/// of one namespace, and refuses that store by name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_serves_every_namespace_its_store_holds() {
+    use coordinode_embed::replication::Member;
+    use coordinode_storage::error::StorageError;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let deployment = coordinode_storage::engine::core::Deployment::open_embedded(
+            &storage(dir.path()),
+            Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new()),
+        )
+        .unwrap();
+        deployment.single_store().unwrap();
+        deployment.create_namespace("other").unwrap();
+    }
+
+    let mut member = Member::open(&storage(dir.path()), MemberOptions::new(1))
+        .await
+        .unwrap();
+    let own = Arc::clone(member.serve().await.unwrap());
+    assert_eq!(own.read().namespace(), NAMESPACE, "anchored at the first");
+    let other = member.served_database().in_namespace("other").unwrap();
+    own.write()
+        .execute_cypher("CREATE (:Shared {v: 1})")
+        .unwrap();
+    other
+        .write()
+        .execute_cypher("CREATE (:Shared {v: 2})")
+        .unwrap();
+    for (database, value) in [(&own, 1), (&other, 2)] {
+        let rows = database
+            .write()
+            .execute_cypher("MATCH (n:Shared) RETURN n.v AS v")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("v"),
+            Some(&coordinode_core::graph::types::Value::Int(value))
+        );
+    }
+    assert!(matches!(
+        member.served_database().in_namespace("nowhere"),
+        Err(DatabaseError::UnknownNamespace(_))
+    ));
+    member.stop_background().await;
+    member.node().shutdown().await.unwrap();
+    drop((own, other, member));
+
+    let refused = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+        .await
+        .err()
+        .expect("a host's handle of a store of two namespaces");
+    assert!(
+        matches!(
+            refused,
+            ReplicationError::Storage(StorageError::SeveralNamespaces { .. })
+        ),
+        "{refused:?}"
+    );
+}
+
 /// A store whose history is a group's log is opened only as a member: the
 /// non-replicated open refuses it, naming why, and writes nothing, so no
 /// write lands outside the log and the member reopens with everything it

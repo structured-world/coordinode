@@ -1,4 +1,6 @@
 use super::*;
+// Every call here names the namespace it works in, as every client does.
+use crate::services::namespace::NamedRequest as Request;
 
 // prepare_query: pass-through regardless of fuzzy flag.
 // Fuzzy expansion is handled at the QueryParser level via set_field_fuzzy
@@ -86,7 +88,7 @@ async fn text_search_over_an_index_not_ready_is_unavailable_with_retry_advice() 
     for (what, inject) in cases {
         let (svc, _dir) = test_service_with_text_index("Article", "body");
         {
-            let mut db = svc.database.write();
+            let mut db = svc.database().write();
             db.text_index_registry()
                 .with_index("Article", "body", |index, _| {
                     inject(index.inner());
@@ -100,7 +102,7 @@ async fn text_search_over_an_index_not_ready_is_unavailable_with_retry_advice() 
         // The worker folds the write into the index, which then refuses.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while svc
-            .database
+            .database()
             .read()
             .text_index_registry()
             .search("Article", "body", "rust", 10)
@@ -200,7 +202,7 @@ async fn text_search_finds_indexed_nodes() {
     let (svc, _dir) = test_service_with_text_index("Article", "body");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher(
             "CREATE (n:Article {body: 'Rust is a systems programming language for databases'})",
         )
@@ -251,7 +253,7 @@ async fn text_search_respects_limit() {
     let (svc, _dir) = test_service_with_text_index("Doc", "content");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         for i in 0..10 {
             let cypher =
                 format!("CREATE (n:Doc {{content: 'the quick brown fox document number {i}'}})");
@@ -292,7 +294,7 @@ async fn text_search_explicit_language_path_c() {
     let (svc, _dir) = test_service_with_text_index("Page", "body");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:Page {body: 'graph concepts and algorithms'})")
             .expect("create page");
     }
@@ -334,7 +336,7 @@ async fn text_search_fuzzy_matches_typo() {
     let (svc, _dir) = test_service_with_text_index("Note", "text");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         // "graph" does not get stemmed by English Snowball → stored as "graph".
         db.execute_cypher("CREATE (n:Note {text: 'graph query concepts'})")
             .expect("create note");
@@ -389,7 +391,7 @@ async fn text_search_ukrainian_index_path_a() {
     let svc = TextServiceImpl::new(Arc::new(RwLock::new(database)));
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:UkArticle {body: 'книга про програмування мовою Rust'})")
             .expect("create article 1");
         db.execute_cypher("CREATE (n:UkArticle {body: 'рецепти приготування їжі на кухні'})")
@@ -446,7 +448,7 @@ async fn text_search_multi_property_merge() {
     let svc = TextServiceImpl::new(Arc::new(RwLock::new(database)));
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         // node 1: "database" in title only
         db.execute_cypher(
             "CREATE (n:Post {title: 'Introduction to database systems', body: 'general overview'})",

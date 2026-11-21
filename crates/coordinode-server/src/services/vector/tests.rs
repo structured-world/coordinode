@@ -1,5 +1,7 @@
 use super::*;
 use crate::proto::query::vector_service_server::VectorService;
+// Every call here names the namespace it works in, as every client does.
+use crate::services::namespace::NamedRequest as Request;
 
 fn test_service() -> (VectorServiceImpl, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -81,7 +83,7 @@ async fn vector_search_finds_nearest_node() {
 
     // Insert nodes with embeddings via Cypher (through the DB directly).
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:Vec {embedding: [1.0, 0.0, 0.0]})")
             .expect("create node 1");
         db.execute_cypher("CREATE (n:Vec {embedding: [0.0, 1.0, 0.0]})")
@@ -128,7 +130,7 @@ async fn vector_search_finds_nearest_node() {
 async fn vector_search_result_node_has_well_formed_element_id() {
     let (svc, _dir) = test_service();
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:VecEid {embedding: [1.0, 0.0, 0.0]})")
             .expect("seed");
     }
@@ -214,7 +216,7 @@ async fn vector_search_reports_ready_health_and_hlc_header() {
 
     // Advance the index's freshness watermark as the oplog-tailing
     // maintenance worker would after applying writes up to HLC 4242.
-    svc.database
+    svc.database()
         .write()
         .vector_index_registry()
         .advance_indexed_hlc_all(4242);
@@ -322,7 +324,7 @@ async fn vector_search_reports_rebuilding_health() {
     let svc = VectorServiceImpl::new(Arc::new(RwLock::new(database)));
 
     let folded = {
-        let db = svc.database.write();
+        let db = svc.database().write();
         let reg = db.vector_index_registry();
         reg.advance_indexed_hlc_all(900);
         let folded = match reg.health_snapshot("Vec", "embedding") {
@@ -389,7 +391,7 @@ async fn vector_search_uses_hnsw_when_index_exists() {
     // on_vector_written is called from the Cypher executor CREATE path,
     // which uses ctx.vector_index_registry to update the HNSW graph.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         for i in 0..20 {
             let x = i as f64 / 20.0;
             let cypher = format!("CREATE (n:Vec {{embedding: [{x}, 0.0, 0.0]}})");
@@ -449,7 +451,7 @@ async fn vector_search_brute_force_without_index() {
 
     // Insert 10 nodes WITHOUT creating a vector index beforehand.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         for i in 0..10 {
             let x = i as f64 / 10.0;
             let cypher = format!("CREATE (n:NoIdx {{embedding: [{x}, 0.0, 0.0]}})");
@@ -493,7 +495,7 @@ async fn vector_search_returns_labels_and_properties() {
     let (svc, _dir) = test_service();
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:PropTest {emb: [1.0, 0.0], score: 42})")
             .expect("create node");
     }
@@ -552,7 +554,7 @@ async fn hybrid_search_returns_labels_and_properties() {
 
     let start_id: u64;
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (h:Hub {name: 'hub'})")
             .expect("hub");
         db.execute_cypher("CREATE (n:Member {name: 'alice', emb: [1.0, 0.0], rank: 7})")
@@ -627,7 +629,7 @@ async fn hybrid_search_respects_metric_parameter() {
 
     let start_id: u64;
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         // Hub
         db.execute_cypher("CREATE (h:HMetric {name: 'hub'})")
             .expect("hub");
@@ -707,7 +709,7 @@ async fn vector_search_respects_metric_parameter() {
     let (svc, _dir) = test_service();
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:MetricTest {emb: [3.0, 0.0]})")
             .expect("create node A");
         db.execute_cypher("CREATE (n:MetricTest {emb: [0.7, 0.7]})")
@@ -797,7 +799,7 @@ async fn vector_top_k_large_hnsw_matches_brute_force() {
         .collect();
 
     for svc in [&svc_hnsw, &svc_brute] {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         for v in &vectors {
             let cypher = format!(
                 "CREATE (n:Large {{vec: [{}, {}, {}, {}]}})",
@@ -901,7 +903,7 @@ async fn vector_top_k_below_threshold_uses_brute_force() {
     // 999 nodes — just below the 1000 threshold → always brute force.
     const N: usize = 999;
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         for i in 0..N {
             let x = i as f64 / N as f64;
             let cypher = format!("CREATE (n:Threshold {{v: [{x}, 0.0]}})");
@@ -948,7 +950,7 @@ async fn hybrid_search_large_traversal_uses_hnsw() {
     // Embeddings spread along the X axis so distances are predictable.
     const N_PERSONS: usize = 1100;
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (s:BigHub {name: 'hub'})")
             .expect("create hub");
 
@@ -970,7 +972,7 @@ async fn hybrid_search_large_traversal_uses_hnsw() {
 
     // Get start_node_id.
     let start_id = {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let rows = db
             .execute_cypher("MATCH (s:BigHub {name: 'hub'}) RETURN s")
             .expect("get hub id");
@@ -1046,7 +1048,7 @@ async fn hybrid_search_traversal_plus_vector_rank() {
     // p3: embedding [0.0, 0.0, 1.0]
     // p4: embedding [0.5, 0.5, 0.0]
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (s:Hub {name: 'start'})")
             .expect("create start");
         db.execute_cypher("CREATE (n:Person {name: 'p0', embedding: [1.0, 0.0, 0.0]})")
@@ -1072,7 +1074,7 @@ async fn hybrid_search_traversal_plus_vector_rank() {
 
     // Get start_node_id via a Cypher query.
     let start_id = {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let rows = db
             .execute_cypher("MATCH (s:Hub {name: 'start'}) RETURN s")
             .expect("get start id");
@@ -1125,7 +1127,7 @@ async fn vector_search_empty_result_on_no_label_match() {
 
     // Create nodes under a DIFFERENT label — the query should find nothing.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:Other {embedding: [1.0, 0.0, 0.0]})")
             .expect("create");
     }
@@ -1158,7 +1160,7 @@ async fn vector_search_top_k_larger_than_dataset() {
 
     // Only 3 nodes in the dataset.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:Small {v: [1.0, 0.0]})")
             .expect("n1");
         db.execute_cypher("CREATE (n:Small {v: [0.0, 1.0]})")
@@ -1207,7 +1209,7 @@ async fn vector_search_hnsw_matches_brute_force() {
         .collect();
 
     for svc in [&svc_hnsw, &svc_brute] {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         for v in &vectors {
             let cypher = format!(
                 "CREATE (n:Item {{vec: [{}, {}, {}, {}]}})",

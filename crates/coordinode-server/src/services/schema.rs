@@ -904,12 +904,29 @@ fn published_to_proto(o: &PublishedObject) -> schema::PublishedSchemaObject {
 }
 
 pub struct SchemaServiceImpl {
-    database: Arc<RwLock<Database>>,
+    /// The database of the namespace each call names: every namespace has a
+    /// schema of its own.
+    databases: super::namespace::Databases,
 }
 
 impl SchemaServiceImpl {
+    /// A service answering from `database`'s deployment, each call in the
+    /// namespace it names.
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
-        Self { database }
+        Self::serving(super::namespace::Databases::of(database))
+    }
+
+    /// A service answering from `databases`, each call in the namespace it
+    /// names.
+    pub fn serving(databases: super::namespace::Databases) -> Self {
+        Self { databases }
+    }
+
+    /// The database a test's calls reach, for the test to read and write
+    /// beside the service.
+    #[cfg(test)]
+    pub(crate) fn database(&self) -> &Arc<RwLock<Database>> {
+        self.databases.served_primary()
     }
 }
 
@@ -919,6 +936,7 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::CreateLabelRequest>,
     ) -> Result<Response<schema::Label>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let definition = label_from_proto(
             "",
@@ -935,7 +953,7 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
 
         let name = req.name;
         let label = super::blocking(|| -> Result<schema::Label, Status> {
-            let db = self.database.write();
+            let db = database.write();
             db.define_label(definition).map_err(db_error_to_status)?;
             db.label_schemas()
                 .map_err(db_error_to_status)?
@@ -953,6 +971,7 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::PublishSchemaRequest>,
     ) -> Result<Response<schema::PublishSchemaResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let mut req = request.into_inner();
         let operation =
             super::operation::optional_descriptor("operation", req.operation.take().as_ref())?;
@@ -960,7 +979,7 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         let published = super::blocking(|| -> Result<SchemaPublication, Status> {
             // Shared: publication commits through the catalog's own guards,
             // and the database serves everyone else meanwhile.
-            let db = self.database.read();
+            let db = database.read();
             match &operation {
                 Some(descriptor) => db.publish_schema_as(package, descriptor),
                 None => db.publish_schema(package),
@@ -977,6 +996,7 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::AwaitSchemaRequest>,
     ) -> Result<Response<schema::AwaitSchemaResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let wait = wait_from_proto("wait", req.wait)?.unwrap_or(Duration::ZERO);
         let operations: Vec<GenerationId> = req
@@ -985,7 +1005,7 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
             .map(GenerationId::from_raw)
             .collect();
         let waited = super::blocking(|| {
-            self.database
+            database
                 .read()
                 .await_operations(&operations, wait)
                 .map_err(db_error_to_status)
@@ -1012,10 +1032,11 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
 
     async fn list_labels(
         &self,
-        _request: Request<schema::ListLabelsRequest>,
+        request: Request<schema::ListLabelsRequest>,
     ) -> Result<Response<schema::ListLabelsResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let labels = super::blocking(|| -> Result<Vec<schema::Label>, Status> {
-            let db = self.database.read();
+            let db = database.read();
             let mut labels: std::collections::BTreeMap<String, schema::Label> = db
                 .label_schemas()
                 .map_err(db_error_to_status)?
@@ -1039,6 +1060,7 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::CreateEdgeTypeRequest>,
     ) -> Result<Response<schema::EdgeType>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let definition = edge_type_from_proto(
             "",
@@ -1050,7 +1072,7 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
 
         let name = req.name;
         let edge_type = super::blocking(|| -> Result<schema::EdgeType, Status> {
-            let db = self.database.write();
+            let db = database.write();
             db.define_edge_type(definition)
                 .map_err(db_error_to_status)?;
             db.edge_type_schemas()
@@ -1067,10 +1089,11 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
 
     async fn list_edge_types(
         &self,
-        _request: Request<schema::ListEdgeTypesRequest>,
+        request: Request<schema::ListEdgeTypesRequest>,
     ) -> Result<Response<schema::ListEdgeTypesResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let edge_types = super::blocking(|| -> Result<Vec<schema::EdgeType>, Status> {
-            let db = self.database.read();
+            let db = database.read();
             let mut types: std::collections::BTreeMap<String, schema::EdgeType> = db
                 .edge_type_schemas()
                 .map_err(db_error_to_status)?
@@ -1095,11 +1118,12 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::CreateConstraintRequest>,
     ) -> Result<Response<schema::Constraint>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let declaration = declaration_from_proto(request.into_inner())?;
         let created = super::blocking(|| -> Result<schema::Constraint, Status> {
             // Shared: the call may wait for the build, and the database
             // serves everyone else meanwhile.
-            let db = self.database.read();
+            let db = database.read();
             let created = db
                 .create_constraint(declaration)
                 .map_err(db_error_to_status)?;
@@ -1118,12 +1142,13 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::DropConstraintRequest>,
     ) -> Result<Response<()>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         if req.name.is_empty() {
             return Err(invalid_field("name", "a constraint name is required"));
         }
         super::blocking(|| {
-            self.database
+            database
                 .write()
                 .drop_constraint(&req.name, req.if_exists)
                 .map_err(db_error_to_status)
@@ -1133,10 +1158,11 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
 
     async fn list_constraints(
         &self,
-        _request: Request<schema::ListConstraintsRequest>,
+        request: Request<schema::ListConstraintsRequest>,
     ) -> Result<Response<schema::ListConstraintsResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let constraints = super::blocking(|| -> Result<Vec<schema::Constraint>, Status> {
-            let db = self.database.read();
+            let db = database.read();
             let constraints = db.constraints().map_err(db_error_to_status)?;
             let builds: rustc_hash::FxHashMap<GenerationId, BuildStatus> = db
                 .index_build_status()
@@ -1156,10 +1182,11 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
 
     async fn list_index_builds(
         &self,
-        _request: Request<schema::ListIndexBuildsRequest>,
+        request: Request<schema::ListIndexBuildsRequest>,
     ) -> Result<Response<schema::ListIndexBuildsResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let builds = super::blocking(|| {
-            self.database
+            database
                 .read()
                 .index_build_status()
                 .map_err(db_error_to_status)
@@ -1173,11 +1200,12 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::GetIndexBuildRequest>,
     ) -> Result<Response<schema::IndexBuild>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let operation = operation_from_proto(req.operation)?;
         let wait = wait_from_proto("wait", req.wait)?.unwrap_or(Duration::ZERO);
         let build = super::blocking(|| {
-            self.database
+            database
                 .read()
                 .index_build(operation, wait)
                 .map_err(db_error_to_status)
@@ -1190,10 +1218,11 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::CancelIndexBuildRequest>,
     ) -> Result<Response<schema::IndexBuild>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let operation = operation_from_proto(req.operation)?;
         let build = super::blocking(|| -> Result<schema::IndexBuild, Status> {
-            let db = self.database.read();
+            let db = database.read();
             let cancelled = db
                 .cancel_index_build(operation)
                 .map_err(db_error_to_status)?;
@@ -1219,9 +1248,10 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::ListIndexBuildRepairsRequest>,
     ) -> Result<Response<schema::ListIndexBuildRepairsResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let operation = operation_from_proto(request.into_inner().operation)?;
         let repairs = super::blocking(|| {
-            let db = self.database.read();
+            let db = database.read();
             if db
                 .index_build(operation, Duration::ZERO)
                 .map_err(db_error_to_status)?
@@ -1250,9 +1280,10 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::CheckIndexRequest>,
     ) -> Result<Response<schema::IndexCheck>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let selector = check_selector(request.into_inner().index)?;
         let check = super::blocking(|| -> Result<schema::IndexCheck, Status> {
-            let db = self.database.read();
+            let db = database.read();
             let operation = db.check_index(&selector).map_err(db_error_to_status)?;
             check_of(&db, operation, Duration::ZERO)
         })?;
@@ -1261,11 +1292,11 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
 
     async fn list_index_checks(
         &self,
-        _request: Request<schema::ListIndexChecksRequest>,
+        request: Request<schema::ListIndexChecksRequest>,
     ) -> Result<Response<schema::ListIndexChecksResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let checks = super::blocking(|| -> Result<Vec<schema::IndexCheck>, Status> {
-            Ok(self
-                .database
+            Ok(database
                 .read()
                 .index_checks()
                 .map_err(db_error_to_status)?
@@ -1280,10 +1311,11 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::GetIndexCheckRequest>,
     ) -> Result<Response<schema::IndexCheck>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let operation = operation_from_proto(req.operation)?;
         let wait = wait_from_proto("wait", req.wait)?.unwrap_or(Duration::ZERO);
-        let check = super::blocking(|| check_of(&self.database.read(), operation, wait))?;
+        let check = super::blocking(|| check_of(&database.read(), operation, wait))?;
         Ok(Response::new(check))
     }
 
@@ -1291,9 +1323,10 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::CancelIndexCheckRequest>,
     ) -> Result<Response<schema::IndexCheck>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let operation = operation_from_proto(request.into_inner().operation)?;
         let check = super::blocking(|| -> Result<schema::IndexCheck, Status> {
-            let db = self.database.read();
+            let db = database.read();
             db.cancel_index_check(operation)
                 .map_err(db_error_to_status)?;
             check_of(&db, operation, Duration::ZERO)
@@ -1305,11 +1338,12 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         request: Request<schema::ReindexRequest>,
     ) -> Result<Response<schema::IndexBuild>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
         let selector = reindex_selector(req.index)?;
         let wait = wait_from_proto("wait", req.wait)?.unwrap_or(Duration::ZERO);
         let build = super::blocking(|| -> Result<schema::IndexBuild, Status> {
-            let db = self.database.read();
+            let db = database.read();
             let operation = db.reindex(&selector, wait).map_err(db_error_to_status)?;
             db.index_build(operation, Duration::ZERO)
                 .map_err(db_error_to_status)?

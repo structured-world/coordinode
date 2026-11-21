@@ -23,8 +23,17 @@ async fn connect() -> (tokio_postgres::Client, TempDir) {
 async fn connect_in(slots: coordinode_session::CommandSlots) -> (tokio_postgres::Client, TempDir) {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::open(dir.path()).expect("open db");
-    let database = Arc::new(RwLock::new(db));
+    let port = listen(Arc::new(RwLock::new(db)), slots).await;
+    (
+        client(port, coordinode_core::namespace::DEFAULT_NAMESPACE).await,
+        dir,
+    )
+}
 
+/// Serve the pg protocol over `database`'s deployment on an ephemeral port,
+/// each connection's statements in a session of `slots`; the port.
+async fn listen(database: Arc<RwLock<Database>>, slots: coordinode_session::CommandSlots) -> u16 {
+    let databases = crate::services::namespace::Databases::of(database);
     // Bind to port 0 so the OS picks a free port, then read it back.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -35,7 +44,7 @@ async fn connect_in(slots: coordinode_session::CommandSlots) -> (tokio_postgres:
             let (socket, _) = listener.accept().await.expect("accept");
             let handlers = Arc::new(super::PgHandlers {
                 backend: Arc::new(super::PgBackend {
-                    database: Arc::clone(&database),
+                    databases: databases.clone(),
                     slots: slots.session(),
                 }),
             });
@@ -44,15 +53,69 @@ async fn connect_in(slots: coordinode_session::CommandSlots) -> (tokio_postgres:
             });
         }
     });
+    addr.port()
+}
 
-    let conn_str = format!("host=127.0.0.1 port={} user=postgres", addr.port());
+/// A client of the pg server on `port`, connected to the namespace `dbname`.
+async fn client(port: u16, dbname: &str) -> tokio_postgres::Client {
+    let conn_str = format!("host=127.0.0.1 port={port} user=postgres dbname={dbname}");
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .expect("connect");
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    (client, dir)
+    client
+}
+
+/// A connection works in the namespace its `database` names: two
+/// connections to two namespaces each see only their own table, and one
+/// naming a namespace the deployment does not hold is refused with
+/// `3D000 invalid_catalog_name`, as PostgreSQL refuses a missing database.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_works_in_the_namespace_it_names() {
+    let dir = TempDir::new().expect("temp dir");
+    let db = Database::open(dir.path()).expect("open db");
+    db.create_namespace("tenant_b").expect("create namespace");
+    let port = listen(
+        Arc::new(RwLock::new(db)),
+        coordinode_embed::replication::routing::CheckedRoutingLimits::default().command_slots(),
+    )
+    .await;
+
+    let a = client(port, coordinode_core::namespace::DEFAULT_NAMESPACE).await;
+    let b = client(port, "tenant_b").await;
+    for (conn, name) in [(&a, "a"), (&b, "b")] {
+        conn.simple_query("CREATE TABLE Owner (id BIGINT PRIMARY KEY, name STRING)")
+            .await
+            .expect("create table in each namespace");
+        conn.simple_query(&format!(
+            "INSERT INTO Owner (id, name) VALUES (1, '{name}')"
+        ))
+        .await
+        .expect("insert");
+    }
+    for (conn, name) in [(&a, "a"), (&b, "b")] {
+        let rows = data_rows(
+            &conn
+                .simple_query("SELECT name FROM Owner")
+                .await
+                .expect("select"),
+        );
+        assert_eq!(rows.len(), 1, "one row per namespace");
+        assert_eq!(rows[0].get("name").map(String::as_str), Some(name));
+    }
+
+    let nowhere = client(port, "nowhere").await;
+    let refused = nowhere
+        .simple_query("SELECT name FROM Owner")
+        .await
+        .expect_err("an unknown namespace is refused");
+    assert_eq!(
+        refused.as_db_error().map(|e| e.code().code()),
+        Some("3D000"),
+        "{refused:?}"
+    );
 }
 
 /// Collect the data rows of a simple query into a vector of column-keyed maps.

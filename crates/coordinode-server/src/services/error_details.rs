@@ -153,6 +153,15 @@ pub enum Reason {
     /// The request named a namespace the deployment does not hold. Metadata
     /// carries `namespace`. Nothing ran.
     UnknownNamespace,
+    /// A namespace creation named a name a live namespace holds. Metadata
+    /// carries `namespace`. Nothing was created.
+    NamespaceExists,
+    /// A namespace creation named a name no namespace may have. Metadata
+    /// carries `namespace`. Nothing was created.
+    NamespaceRefused,
+    /// A session named the namespace it works in for dropping; it is dropped
+    /// from a session of another. Metadata carries `namespace`.
+    NamespaceInUse,
     /// The member joined its group and has not caught up yet: it serves no
     /// data. Nothing ran; the call succeeds at a member that serves.
     NotServing,
@@ -350,6 +359,9 @@ impl Reason {
             Reason::MemberBusy => "MEMBER_BUSY",
             Reason::NamespaceRequired => "NAMESPACE_REQUIRED",
             Reason::UnknownNamespace => "UNKNOWN_NAMESPACE",
+            Reason::NamespaceExists => "NAMESPACE_EXISTS",
+            Reason::NamespaceRefused => "NAMESPACE_REFUSED",
+            Reason::NamespaceInUse => "NAMESPACE_IN_USE",
             Reason::NotServing => "NOT_SERVING",
             Reason::NotLeader => "NOT_LEADER",
             Reason::MemberReadOnly => "MEMBER_READ_ONLY",

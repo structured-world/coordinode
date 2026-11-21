@@ -1,6 +1,8 @@
 use super::*;
 use crate::proto::v2::graph::schema_service_server::SchemaService;
 use crate::services::error_details::ERROR_DOMAIN;
+// Every call here names the namespace it works in, as every client does.
+use crate::services::namespace::NamedRequest as Request;
 use coordinode_core::graph::types::Value;
 use tonic_types::StatusExt;
 
@@ -90,7 +92,7 @@ async fn list_labels_returns_existing_labels() {
 
     // Insert nodes with two different labels
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:Person {name: 'Alice'})")
             .expect("create");
         db.execute_cypher("CREATE (n:City {name: 'Kyiv'})")
@@ -153,7 +155,7 @@ async fn label_kinds_travel_through_the_catalog() {
     assert!(status.message().contains("auxiliary"), "{status:?}");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (:Scope:Goal {title: 'g'})")
             .expect("goal");
         let err = db
@@ -200,7 +202,7 @@ async fn label_kinds_travel_through_the_catalog() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_labels_answers_while_the_database_is_read() {
     let (svc, _dir) = test_service();
-    svc.database
+    svc.database()
         .write()
         .execute_cypher("CREATE (n:Person {name: 'Alice'})")
         .expect("create");
@@ -209,7 +211,7 @@ async fn list_labels_answers_while_the_database_is_read() {
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let reader = {
-        let database = Arc::clone(&svc.database);
+        let database = Arc::clone(svc.database());
         std::thread::spawn(move || {
             let _held = database.read();
             held_tx.send(()).expect("signal held");
@@ -248,7 +250,7 @@ async fn list_labels_answers_while_the_database_is_read() {
 async fn list_labels_drops_a_label_once_its_nodes_are_gone() {
     let (svc, _dir) = test_service();
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:Gone {name: 'a'}), (m:Kept {name: 'b'})")
             .expect("create");
         db.execute_cypher("MATCH (n:Gone) DELETE n")
@@ -285,7 +287,7 @@ async fn list_edge_types_returns_existing_types() {
     let (svc, _dir) = test_service();
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (a:P {name: 'A'})-[:KNOWS]->(b:P {name: 'B'})")
             .expect("create");
         db.execute_cypher("CREATE (c:P {name: 'C'})-[:LIKES]->(d:P {name: 'D'})")
@@ -395,7 +397,7 @@ async fn unknown_enum_values_are_refused_not_defaulted() {
     );
 
     // None of the refused requests reached the catalog.
-    let db = svc.database.read();
+    let db = svc.database().read();
     assert!(db.label_schemas().expect("labels").is_empty());
     assert!(db.constraints().expect("constraints").is_empty());
 }
@@ -448,7 +450,7 @@ async fn malformed_definitions_and_constraints_are_refused() {
         .expect_err("only a type constraint names a type");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
-    let db = svc.database.read();
+    let db = svc.database().read();
     assert!(db.label_schemas().expect("labels").is_empty());
     assert!(db.constraints().expect("constraints").is_empty());
 }
@@ -487,7 +489,7 @@ async fn create_label_persists_schema() {
         Some(Value::String("untitled".into()))
     );
 
-    let db = svc.database.read();
+    let db = svc.database().read();
     let stored = db
         .label_schemas()
         .expect("labels")
@@ -534,7 +536,7 @@ async fn a_label_is_defined_once() {
         ("label", "Article")
     );
     let stored = svc
-        .database
+        .database()
         .read()
         .label_schemas()
         .expect("labels")
@@ -552,11 +554,11 @@ async fn a_label_is_defined_once() {
 #[tokio::test]
 async fn a_constraint_build_outlives_its_call_and_is_inspected_by_operation() {
     let (svc, _dir) = test_service();
-    svc.database
+    svc.database()
         .write()
         .execute_cypher("CREATE (:Customer {email: 'a@x'})")
         .expect("seed");
-    let older = svc.database.read().begin_transaction().expect("begin");
+    let older = svc.database().read().begin_transaction().expect("begin");
 
     let mut request = unique("customer_email", "Customer", "email");
     request.wait = Some(prost_types::Duration::default());
@@ -570,7 +572,7 @@ async fn a_constraint_build_outlives_its_call_and_is_inspected_by_operation() {
     assert_ne!(build.state, schema::IndexBuildState::Published as i32);
     let operation = build.operation;
 
-    svc.database
+    svc.database()
         .read()
         .rollback_transaction(older)
         .expect("end the older transaction");
@@ -650,7 +652,7 @@ async fn a_constraint_build_outlives_its_call_and_is_inspected_by_operation() {
 async fn index_checks_over_grpc() {
     let (svc, _dir) = test_service();
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE INDEX c_city ON :Customer(city)")
             .expect("index");
         db.execute_cypher("CREATE (:Customer {city: 'oslo'})")
@@ -746,7 +748,7 @@ async fn index_checks_over_grpc() {
 #[tokio::test]
 async fn a_constraint_build_repairs_a_duplicate_and_lists_it() {
     let (svc, _dir) = test_service();
-    svc.database
+    svc.database()
         .write()
         .execute_cypher("CREATE (:Customer {email: 'same@x'}), (:Customer {email: 'same@x'})")
         .expect("seed");
@@ -806,7 +808,7 @@ async fn a_scoped_uniqueness_is_declared_listed_and_enforced_in_scope() {
     assert_eq!(created.scope, Some(scope));
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (:Customer {email: 'a@x', active: true})")
             .expect("first in scope");
         db.execute_cypher("CREATE (:Customer {email: 'a@x', active: false})")
@@ -868,7 +870,7 @@ async fn a_uniqueness_constraint_is_created_listed_enforced_and_dropped() {
     assert_eq!(listed, vec![created]);
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (c:Customer {email: 'x@test.com'})")
             .expect("first create");
         assert!(
@@ -1039,14 +1041,14 @@ async fn create_label_unique_property_enforces_constraint() {
 
     // First node — should succeed.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (c:Customer {email: 'x@test.com'})")
             .expect("first create");
     }
 
     // Second node with same email — must fail.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let result = db.execute_cypher("CREATE (c:Customer {email: 'x@test.com'})");
         assert!(
             result.is_err(),
@@ -1077,7 +1079,7 @@ async fn merge_on_existing_unique_node_does_not_error() {
 
     // Create initial node.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:TestNode {id: 'x1'})")
             .expect("create node");
     }
@@ -1086,7 +1088,7 @@ async fn merge_on_existing_unique_node_does_not_error() {
     // Bug: NodeScan misses the node → MERGE falls through to CREATE →
     //      B-tree unique index: "unique constraint violated on index testnode_id".
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let result =
             db.execute_cypher("MERGE (n:TestNode {id: 'x1'}) ON MATCH SET n.id = 'x1' RETURN n.id");
         assert!(
@@ -1339,7 +1341,7 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
         use coordinode_core::schema::definition::PropertyType;
         use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 
-        let db = svc.database.write();
+        let db = svc.database().write();
         let schema = LocalSchemaStore::new(db.engine())
             .load_label("Session")
             .expect("load")
@@ -1370,7 +1372,7 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
     let expired_us = now_us - 120 * 1_000_000; // 120s ago → past 60s TTL
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher(&format!("CREATE (s:Session {{started_at: {expired_us}}})"))
             .expect("create expired session");
         db.execute_cypher(&format!("CREATE (s:Session {{started_at: {now_us}}})"))
@@ -1379,7 +1381,7 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
 
     // Verify both nodes exist before reaping.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let rows = db
             .execute_cypher("MATCH (s:Session) RETURN s.started_at AS ts")
             .expect("match before reap");
@@ -1388,7 +1390,7 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
 
     // Run TtlReaper directly — no background thread, no waiting.
     let result = {
-        let db = svc.database.write();
+        let db = svc.database().write();
         coordinode_query::index::ttl_reaper::reap_computed_ttl(&db.engine_shared(), 1, 1000)
     };
 
@@ -1399,7 +1401,7 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
 
     // Verify only the fresh node remains.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let rows = db
             .execute_cypher("MATCH (s:Session) RETURN s.started_at AS ts")
             .expect("match after reap");
@@ -1538,7 +1540,7 @@ async fn strict_mode_set_unknown_property_rejected() {
         use coordinode_core::schema::definition::SchemaMode;
         use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 
-        let db = svc.database.write();
+        let db = svc.database().write();
         let schema = LocalSchemaStore::new(db.engine())
             .load_label("User")
             .expect("load")
@@ -1553,14 +1555,14 @@ async fn strict_mode_set_unknown_property_rejected() {
 
     // CREATE a User node with the declared property.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (u:User {name: 'Alice'})")
             .expect("CREATE with declared property must succeed on STRICT label");
     }
 
     // SET an unknown property on the STRICT label — must be rejected.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let result =
             db.execute_cypher("MATCH (u:User {name: 'Alice'}) SET u.unknown_field = 'boom'");
         assert!(
@@ -1593,14 +1595,14 @@ async fn flexible_mode_set_unknown_property_allowed() {
 
     // CREATE a Device node.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (d:Device {id: 'd1'})")
             .expect("CREATE should succeed");
     }
 
     // SET an undeclared property — must succeed on FLEXIBLE label.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("MATCH (d:Device {id: 'd1'}) SET d.firmware_version = '1.2.3'")
             .expect("SET undeclared property must succeed on FLEXIBLE label");
     }
@@ -1665,7 +1667,7 @@ async fn strict_mode_create_type_mismatch_rejected() {
     .expect("create_label should succeed");
 
     // CREATE with wrong type for declared property — must be rejected.
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     let result = db.execute_cypher("CREATE (s:Sensor {reading: 'not_a_float'})");
     assert!(
         result.is_err(),
@@ -1690,7 +1692,7 @@ async fn validated_mode_type_mismatch_rejected_but_extra_accepted() {
     .expect("create_label should succeed");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
 
         // Type mismatch on declared property — must be rejected even in VALIDATED.
         let result = db.execute_cypher("CREATE (l:Log {level: 'warn'})");
@@ -1724,14 +1726,14 @@ async fn strict_mode_create_with_unknown_property_rejected() {
 
     // CREATE with only the declared property — must succeed.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (p:Product {sku: 'SKU-001'})")
             .expect("CREATE with declared property must succeed on STRICT label");
     }
 
     // CREATE with an undeclared property — must be rejected.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let result =
             db.execute_cypher("CREATE (p:Product {sku: 'SKU-002', extra_field: 'forbidden'})");
         assert!(
@@ -1760,7 +1762,7 @@ async fn validated_mode_set_extra_accepted_mismatch_rejected() {
     .expect("create_label should succeed");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
 
         // Create node with only the declared property.
         db.execute_cypher("CREATE (m:Metric {value: 3.14})")
@@ -1801,7 +1803,7 @@ async fn strict_mode_create_missing_required_property_rejected() {
     .expect("create_label should succeed");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
 
         // CREATE with required `title` present — must succeed.
         db.execute_cypher("CREATE (t:Task {title: 'Buy milk', priority: 1})")
@@ -1847,7 +1849,7 @@ async fn multi_update_strict_node_fails_whole_query() {
     .expect("create_label should succeed");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
 
         // Create one STRICT node and one schemaless node.
         db.execute_cypher("CREATE (m:Monitored {host: 'server-01'})")
@@ -1890,14 +1892,14 @@ async fn strict_mode_merge_on_create_set_rejected_for_unknown_property() {
 
     // ON CREATE SET with declared property — must succeed (creates node).
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("MERGE (p:Product {sku: 'A1'}) ON CREATE SET p.price = 9.99")
             .expect("MERGE ON CREATE SET with declared property must succeed");
     }
 
     // ON MATCH SET with unknown property — must fail (node now exists → ON MATCH path).
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let result =
             db.execute_cypher("MERGE (p:Product {sku: 'A1'}) ON MATCH SET p.unknown_field = 'x'");
         assert!(
@@ -1924,21 +1926,21 @@ async fn strict_mode_replace_properties_rejects_unknown_key() {
     .expect("create_label Config");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (c:Config {host: 'localhost', port: 5432})")
             .expect("create Config node");
     }
 
     // Replace with only declared keys — must succeed.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("MATCH (c:Config) SET c = {host: 'db.internal', port: 3306}")
             .expect("SET n = {map} with declared keys must succeed");
     }
 
     // Replace introducing unknown key — must fail.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let result =
             db.execute_cypher("MATCH (c:Config) SET c = {host: 'x', port: 3306, extra: 'oops'}");
         assert!(
@@ -1965,21 +1967,21 @@ async fn strict_mode_merge_properties_rejects_unknown_key() {
     .expect("create_label AppService");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (s:AppService {name: 'api', version: '1.0'})")
             .expect("create AppService node");
     }
 
     // Merge with declared keys — must succeed.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("MATCH (s:AppService) SET s += {version: '2.0'}")
             .expect("SET n += {map} with declared keys must succeed");
     }
 
     // Merge introducing unknown key — must fail.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let result =
             db.execute_cypher("MATCH (s:AppService) SET s += {version: '3.0', secret: 'leaked'}");
         assert!(
@@ -2007,7 +2009,7 @@ async fn on_violation_skip_excludes_violating_nodes() {
     .expect("create_label Gadget");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (g:Gadget {name: 'light', status: 'on'})")
             .expect("create g1");
         db.execute_cypher("CREATE (g:Gadget {name: 'fan', status: 'off'})")
@@ -2016,7 +2018,7 @@ async fn on_violation_skip_excludes_violating_nodes() {
 
     // Without ON VIOLATION SKIP: setting unknown property on all Gadget nodes fails.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let result = db.execute_cypher("MATCH (g:Gadget) SET g.firmware = 'v1'");
         assert!(
             result.is_err(),
@@ -2027,7 +2029,7 @@ async fn on_violation_skip_excludes_violating_nodes() {
     // With ON VIOLATION SKIP: query succeeds; violating nodes are excluded from output.
     // 'firmware' is unknown → all Gadget nodes are skipped → empty result set.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let rows = db
             .execute_cypher(
                 "MATCH (g:Gadget) SET g.firmware = 'v1' ON VIOLATION SKIP RETURN g.name",
@@ -2042,7 +2044,7 @@ async fn on_violation_skip_excludes_violating_nodes() {
 
     // ON VIOLATION SKIP with a valid property: all nodes are updated, all returned.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let rows = db
             .execute_cypher(
                 "MATCH (g:Gadget) SET g.status = 'idle' ON VIOLATION SKIP RETURN g.name",
@@ -2066,13 +2068,13 @@ async fn strict_mode_property_path_rejects_unknown_root() {
     .expect("create_label Device");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (d:Device {serial: 'SN-001'})")
             .expect("create device");
     }
 
     // 'config' is not declared on Device (STRICT) — SET d.config.timeout = 30 must fail.
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     let result = db.execute_cypher("MATCH (d:Device) SET d.config.timeout = 30 RETURN d.serial");
     assert!(
         result.is_err(),
@@ -2094,14 +2096,14 @@ async fn strict_mode_doc_function_rejects_unknown_root() {
     .expect("create_label Shelf");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (s:Shelf {name: 'A1'})")
             .expect("create shelf");
     }
 
     // 'items' is not declared on Shelf (STRICT) — doc_push on unknown root prop must fail.
     // Syntax: `SET doc_push(n.prop, val)` — function call IS the set item.
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     let result = db.execute_cypher("MATCH (s:Shelf) SET doc_push(s.items, 'book')");
     assert!(
         result.is_err(),
@@ -2123,13 +2125,13 @@ async fn validated_mode_replace_properties_allows_unknown_key() {
     .expect("create_label Server");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (s:Server {host: 'db1'})")
             .expect("create server");
     }
 
     // Replace with map that has extra unknown key 'datacenter' — must succeed in VALIDATED.
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     let rows = db
         .execute_cypher(
             "MATCH (s:Server) SET s = {host: 'db2', datacenter: 'eu-west-1'} RETURN s.host",
@@ -2157,13 +2159,13 @@ async fn validated_mode_merge_properties_allows_unknown_key() {
     .expect("create_label Cache");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (c:Cache {size: 100})")
             .expect("create cache");
     }
 
     // Merge with unknown key 'policy' — must succeed in VALIDATED.
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     let rows = db
         .execute_cypher("MATCH (c:Cache) SET c += {size: 200, policy: 'lru'} RETURN c.size")
         .expect("SET n += {map} with unknown key on VALIDATED label must succeed");
@@ -2180,12 +2182,12 @@ async fn validated_mode_merge_properties_allows_unknown_key() {
 async fn labels_function_subscript_access() {
     let (svc, _dir) = test_service();
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (n:Robot {name: 'R2D2'})")
             .expect("create");
     }
 
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     let rows = db
         .execute_cypher("MATCH (n:Robot) RETURN labels(n)[0] AS lbl")
         .expect("labels(n)[0] must be supported");
@@ -2212,13 +2214,13 @@ async fn validated_mode_property_path_allows_unknown_root() {
     .expect("create_label Sensor");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (s:Sensor {id: 'S1'})")
             .expect("create sensor");
     }
 
     // 'readings' is not declared on Sensor (VALIDATED) — deep SET must succeed.
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     let result = db.execute_cypher("MATCH (s:Sensor) SET s.readings.temp = 42 RETURN s.id");
     assert!(
         result.is_ok(),
@@ -2240,13 +2242,13 @@ async fn validated_mode_doc_function_allows_unknown_root() {
     .expect("create_label Bin");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (b:Bin {tag: 'B1'})")
             .expect("create bin");
     }
 
     // 'items' is not declared on Bin (VALIDATED) — doc_push must succeed.
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     let result = db.execute_cypher("MATCH (b:Bin) SET doc_push(b.items, 'x')");
     assert!(
         result.is_ok(),
@@ -2268,7 +2270,7 @@ async fn on_violation_skip_with_property_path() {
     .expect("create_label Relay");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (r:Relay {state: 'open'})")
             .expect("create relay");
         db.execute_cypher("CREATE (r:Relay {state: 'closed'})")
@@ -2277,7 +2279,7 @@ async fn on_violation_skip_with_property_path() {
 
     // 'config' is not declared — without SKIP the whole query fails.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let result = db.execute_cypher("MATCH (r:Relay) SET r.config.timeout = 30 RETURN r.state");
         assert!(
             result.is_err(),
@@ -2287,7 +2289,7 @@ async fn on_violation_skip_with_property_path() {
 
     // With ON VIOLATION SKIP: query succeeds, all violating nodes excluded → empty result.
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         let rows = db
             .execute_cypher(
                 "MATCH (r:Relay) SET r.config.timeout = 30 ON VIOLATION SKIP RETURN r.state",
@@ -2327,14 +2329,14 @@ async fn schema_label_cache_multiple_paths_same_node() {
     .expect("create_label Config");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (c:Config)").expect("create node");
     }
 
     // Three PropertyPath items on the same node in one statement.
     // Each uses schema_label_for_node — only the first should hit the engine;
     // items 2 and 3 should read the cached label.
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     db.execute_cypher(
         "MATCH (c:Config) SET c.cfg.host = 'db1', c.cfg.port = 5432, c.cfg.ssl = true",
     )
@@ -2380,14 +2382,14 @@ async fn schema_label_cache_multiple_doc_functions_same_node() {
     .expect("create_label Queue");
 
     {
-        let mut db = svc.database.write();
+        let mut db = svc.database().write();
         db.execute_cypher("CREATE (q:Queue)").expect("create node");
     }
 
     // Three doc_push items on the same node in one statement.
     // 'jobs', 'errors', 'metrics' are all undeclared roots on VALIDATED →
     // all accepted. schema_label_for_node cache: 1 engine read for all three.
-    let mut db = svc.database.write();
+    let mut db = svc.database().write();
     db.execute_cypher(
             "MATCH (q:Queue) SET doc_push(q.jobs, 'job1'), doc_push(q.errors, 'err1'), doc_push(q.metrics, 42)",
         )

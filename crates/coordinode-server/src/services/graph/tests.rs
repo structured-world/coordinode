@@ -1,5 +1,7 @@
 use super::*;
 use crate::proto::graph::graph_service_server::GraphService;
+// Every call here names the namespace it works in, as every client does.
+use crate::services::namespace::NamedRequest as Request;
 
 fn test_service() -> (GraphServiceImpl, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -217,7 +219,7 @@ async fn create_node_persists() {
     .expect("create should succeed");
 
     let rows = {
-        let mut db = svc.database.write();
+        let mut db = svc.databases.served_primary().write();
         db.execute_cypher("MATCH (n:Thing {tag: 'persist-test'}) RETURN n.tag")
             .expect("cypher should succeed")
     };

@@ -1249,8 +1249,11 @@ pub(crate) async fn serve(
     // dispatch, passes at least `trigger_dispatch_interval` apart.
     member.start_background(trigger_dispatch_interval);
 
-    let graph_service = services::graph::GraphServiceImpl::new(Arc::clone(&database));
-    let schema_service = services::schema::SchemaServiceImpl::new(Arc::clone(&database));
+    // Each typed call works in the namespace it names, through the database
+    // the member serves for it.
+    let databases = services::namespace::Databases::serving(Arc::clone(member.served_database()));
+    let graph_service = services::graph::GraphServiceImpl::serving(databases.clone());
+    let schema_service = services::schema::SchemaServiceImpl::serving(databases.clone());
     // One path for every Cypher statement, whichever transport carries it:
     // the unary service and the session share the settings, fence and
     // forwarding; the database records each statement for the advisor.
@@ -1274,8 +1277,8 @@ pub(crate) async fn serve(
     };
     let cypher_service =
         services::cypher::CypherServiceImpl::from_executor(statement_executor.clone());
-    let vector_service = services::vector::VectorServiceImpl::new(Arc::clone(&database));
-    let text_service = services::text::TextServiceImpl::new(Arc::clone(&database));
+    let vector_service = services::vector::VectorServiceImpl::serving(databases.clone());
+    let text_service = services::text::TextServiceImpl::serving(databases.clone());
     let health_service = services::health::HealthServiceImpl;
     // CDC service: tails the Raft log up to the entries this node applied.
     // Empty stream in embedded mode: there is no Raft log. Shared with the
@@ -1307,8 +1310,8 @@ pub(crate) async fn serve(
 
     // BlobService writes through the database, whose commits go through the
     // same log as every other write.
-    let blob_service = services::blob::BlobServiceImpl::new(Arc::clone(&database))
-        .with_node(Arc::clone(&raft_node));
+    let blob_service =
+        services::blob::BlobServiceImpl::serving(databases).with_node(Arc::clone(&raft_node));
 
     // What the ops server answers from the database, now that the member
     // serves it: the gauges sampled per scrape, the series that go with what
@@ -1397,7 +1400,8 @@ pub(crate) async fn serve(
     if let Some(pg_addr) = pg_addr {
         match pg_addr.parse::<SocketAddr>() {
             Ok(pg_sockaddr) => {
-                let pg_db = Arc::clone(&database);
+                let pg_db =
+                    services::namespace::Databases::serving(Arc::clone(member.served_database()));
                 // SQL statements run in the member's slots, as every other
                 // command does.
                 let pg_slots = member.command_slots().clone();

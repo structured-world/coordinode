@@ -833,6 +833,34 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [("namespace", name.clone())],
             );
         }
+        // The catalog already holds a live namespace of the name.
+        DatabaseError::NamespaceExists(name) => {
+            return status_with_reason(
+                Code::AlreadyExists,
+                rendered,
+                Reason::NamespaceExists,
+                [("namespace", name.clone())],
+            );
+        }
+        // A name no namespace may have: the request is malformed.
+        DatabaseError::NamespaceRefused { name, .. } => {
+            return status_with_reason(
+                Code::InvalidArgument,
+                rendered,
+                Reason::NamespaceRefused,
+                [("namespace", name.clone())],
+            );
+        }
+        // The request is well formed, the session's state refuses it: it
+        // works in the namespace it names for dropping.
+        DatabaseError::NamespaceInUse(name) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::NamespaceInUse,
+                [("namespace", name.clone())],
+            );
+        }
         // A member still catching up with its group: the same call succeeds
         // shortly, or at once at a member that serves.
         DatabaseError::NotServing => {

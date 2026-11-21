@@ -26,15 +26,24 @@ use crate::services::error_details::{Reason, invalid_field, status_with_reason};
 /// write, with payload journaled on the members the write concern names,
 /// replaces both.
 pub struct BlobServiceImpl {
-    database: Arc<RwLock<Database>>,
+    /// The database of the namespace each call names: blobs belong to a
+    /// namespace like the nodes that name them.
+    databases: super::namespace::Databases,
     node: Option<Arc<coordinode_raft::cluster::RaftNode>>,
 }
 
 impl BlobServiceImpl {
-    /// A service over `database`, standalone.
+    /// A service over `database`'s deployment, standalone, each call in the
+    /// namespace it names.
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
+        Self::serving(super::namespace::Databases::of(database))
+    }
+
+    /// A service over `databases`, standalone, each call in the namespace it
+    /// names.
+    pub fn serving(databases: super::namespace::Databases) -> Self {
         Self {
-            database,
+            databases,
             node: None,
         }
     }
@@ -75,14 +84,18 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
         &self,
         request: Request<Streaming<graph::BlobChunk>>,
     ) -> Result<Response<graph::UploadBlobResponse>, Status> {
-        self.upload(request.into_inner()).await.map(Response::new)
+        let database = self.databases.for_call(request.metadata())?;
+        self.upload(database, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn download_blob(
         &self,
         request: Request<graph::DownloadBlobRequest>,
     ) -> Result<Response<Self::DownloadBlobStream>, Status> {
-        self.download(&request.into_inner().blob_id)
+        let database = self.databases.for_call(request.metadata())?;
+        Self::download(database, &request.into_inner().blob_id)
             .await
             .map(Response::new)
     }
@@ -91,7 +104,8 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
         &self,
         request: Request<graph::DeleteBlobRequest>,
     ) -> Result<Response<graph::DeleteBlobResponse>, Status> {
-        self.delete(&request.into_inner().blob_id)
+        let database = self.databases.for_call(request.metadata())?;
+        self.delete(database, &request.into_inner().blob_id)
             .await
             .map(Response::new)
     }
@@ -100,16 +114,21 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
         &self,
         request: Request<graph::GetBlobMetaRequest>,
     ) -> Result<Response<graph::BlobMeta>, Status> {
-        self.meta(&request.into_inner().blob_id)
+        let database = self.databases.for_call(request.metadata())?;
+        Self::meta(database, &request.into_inner().blob_id)
             .await
             .map(Response::new)
     }
 }
 
 impl BlobServiceImpl {
-    /// Store the object `stream` carries as a new blob, under the operation
-    /// its first message names, if any.
-    async fn upload<S>(&self, mut stream: S) -> Result<graph::UploadBlobResponse, Status>
+    /// Store the object `stream` carries as a new blob of `database`, under
+    /// the operation its first message names, if any.
+    async fn upload<S>(
+        &self,
+        database: Arc<RwLock<Database>>,
+        mut stream: S,
+    ) -> Result<graph::UploadBlobResponse, Status>
     where
         S: tokio_stream::Stream<Item = Result<graph::BlobChunk, Status>> + Unpin,
     {
@@ -147,7 +166,6 @@ impl BlobServiceImpl {
         // The chunks are durable before the blob naming them is published,
         // and both before the answer: an upload answered is one a crash
         // keeps. Flushing blocks, so it runs off the async runtime.
-        let database = Arc::clone(&self.database);
         let descriptor = operation;
         let uploaded = tokio::task::spawn_blocking(move || {
             database.read().upload_blob(&data, descriptor.as_ref())
@@ -188,11 +206,13 @@ impl BlobServiceImpl {
         })
     }
 
-    /// Stream the blob `blob_id` names back, chunk by chunk, as it stood
-    /// when the download began.
-    async fn download(&self, blob_id: &str) -> Result<DownloadStream, Status> {
+    /// Stream the blob of `database` that `blob_id` names back, chunk by
+    /// chunk, as it stood when the download began.
+    async fn download(
+        database: Arc<RwLock<Database>>,
+        blob_id: &str,
+    ) -> Result<DownloadStream, Status> {
         let id = parse_id(blob_id)?;
-        let database = Arc::clone(&self.database);
         let reader = tokio::task::spawn_blocking(move || database.read().open_blob(&id))
             .await
             .map_err(|e| Status::internal(format!("blob read did not finish: {e}")))?
@@ -224,12 +244,15 @@ impl BlobServiceImpl {
         Ok(ReceiverStream::new(rx))
     }
 
-    /// Delete the blob `blob_id` names.
-    async fn delete(&self, blob_id: &str) -> Result<graph::DeleteBlobResponse, Status> {
+    /// Delete the blob of `database` that `blob_id` names.
+    async fn delete(
+        &self,
+        database: Arc<RwLock<Database>>,
+        blob_id: &str,
+    ) -> Result<graph::DeleteBlobResponse, Status> {
         // A delete on one member of a group would leave the others' copy.
         self.refuse_in_a_group()?;
         let id = parse_id(blob_id)?;
-        let database = Arc::clone(&self.database);
         let deleted = tokio::task::spawn_blocking(move || database.read().delete_blob(&id))
             .await
             .map_err(|e| Status::internal(format!("blob delete did not finish: {e}")))?
@@ -243,10 +266,12 @@ impl BlobServiceImpl {
         Ok(graph::DeleteBlobResponse { chunks_deleted: 0 })
     }
 
-    /// The metadata of the blob `blob_id` names.
-    async fn meta(&self, blob_id: &str) -> Result<graph::BlobMeta, Status> {
+    /// The metadata of the blob of `database` that `blob_id` names.
+    async fn meta(
+        database: Arc<RwLock<Database>>,
+        blob_id: &str,
+    ) -> Result<graph::BlobMeta, Status> {
         let id = parse_id(blob_id)?;
-        let database = Arc::clone(&self.database);
         let record: OwnerRecord =
             tokio::task::spawn_blocking(move || database.read().blob_record(&id))
                 .await

@@ -153,20 +153,190 @@ pub type ServedDatabase = Arc<Served>;
 
 /// Starts what a namespace's session of a member runs beside it (its
 /// transaction tenure, idle reaper and leader-only work) and returns it
-/// ready to serve.
-pub type SessionStarter = Arc<dyn Fn(Database) -> Arc<RwLock<Database>> + Send + Sync>;
+/// ready to serve, with that work.
+type SessionStarter =
+    Arc<dyn Fn(Database) -> (Arc<RwLock<Database>>, SessionRuntime) + Send + Sync>;
+
+/// What a session of a member runs beside it, stopped when the session
+/// closes: its own stop signal, so closing one session stops its work alone.
+#[derive(Default)]
+struct SessionRuntime {
+    /// Tells the session's tasks to finish between passes.
+    stop: Option<tokio::sync::watch::Sender<bool>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    followers: Vec<follower::IndexDefinitionFollower>,
+    /// Where a closed session's work is seen through: closing happens on
+    /// whatever thread a command runs on.
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl SessionRuntime {
+    /// Signal the work to stop and see it through in the background.
+    fn close(mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.send_replace(true);
+        }
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        runtime.spawn(self.finish());
+    }
+
+    /// Signal the work to stop and wait for it: each task finishes its pass
+    /// and lets go of the session, and the followers are joined.
+    async fn finish(mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.send_replace(true);
+        }
+        for task in self.tasks.drain(..) {
+            if let Err(e) = task.await {
+                tracing::error!(%e, "a session background task failed");
+            }
+        }
+        let followers = std::mem::take(&mut self.followers);
+        if !followers.is_empty()
+            // Joining their threads blocks: off the async runtime.
+            && let Err(e) = tokio::task::spawn_blocking(move || drop(followers)).await
+        {
+            tracing::error!(%e, "stopping a session's index definition followers failed");
+        }
+    }
+
+    /// Stop the work at once, for a member going away without waiting.
+    fn abort(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.send_replace(true);
+        }
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+/// An open session of a further namespace.
+struct ServedSession {
+    database: Arc<RwLock<Database>>,
+    runtime: SessionRuntime,
+    /// When a command last reached it: the session idle longest closes
+    /// first.
+    used: std::time::Instant,
+}
+
+impl ServedSession {
+    /// Whether the session may close now: no command holds it and it holds
+    /// no open transaction, whose client would lose it.
+    fn closable(&self) -> bool {
+        Arc::strong_count(&self.database) == 1
+            && self
+                .database
+                .read()
+                .transactions_view()
+                .transactions()
+                .is_empty()
+    }
+}
+
+/// How long a session of a further namespace stays open with no command
+/// reaching it, by default.
+pub const DEFAULT_NAMESPACE_IDLE_CLOSE: Duration = Duration::from_secs(300);
+
+/// How many sessions of further namespaces a member keeps open at once, by
+/// default: each holds its namespace's trees and indexes open.
+pub const DEFAULT_MAX_OPEN_NAMESPACES: usize = 1024;
+
+/// How the sessions of further namespaces are bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionLimits {
+    /// A session no command reached for this long closes; reopened on the
+    /// next command naming its namespace.
+    pub idle_close: Duration,
+    /// Sessions open at once at most: past it, the one idle longest closes,
+    /// and a command naming another namespace while every open session is
+    /// in use waits as a busy member's does.
+    pub max_open: usize,
+}
+
+impl Default for SessionLimits {
+    fn default() -> Self {
+        Self {
+            idle_close: DEFAULT_NAMESPACE_IDLE_CLOSE,
+            max_open: DEFAULT_MAX_OPEN_NAMESPACES,
+        }
+    }
+}
 
 /// The member's database over the namespace it opened with, and a session
-/// for each further namespace a command named, opened on first use and kept.
+/// for each further namespace a command named, opened on first use and
+/// closed once idle.
 #[derive(Default)]
 pub struct Served {
     /// The database the member opened. no-std: once_cell::race::OnceBox
     primary: std::sync::OnceLock<Arc<RwLock<Database>>>,
-    /// Sessions of further namespaces, by name. no-std: spin::Mutex
-    sessions: parking_lot::Mutex<HashMap<String, Arc<RwLock<Database>>>>,
+    /// Sessions of further namespaces, and their bounds. no-std: spin::Mutex
+    sessions: parking_lot::Mutex<OpenSessions>,
     /// How a session is started beside its member; a session of a store
     /// without a member needs nothing started.
     starter: std::sync::OnceLock<SessionStarter>,
+}
+
+/// The open sessions of further namespaces, by name, under their bounds.
+#[derive(Default)]
+struct OpenSessions {
+    by_name: HashMap<String, ServedSession>,
+    limits: SessionLimits,
+    /// When idle sessions are looked for next: a pass walks every open
+    /// session, so it runs a fraction of the idle bound apart rather than
+    /// on every command.
+    next_sweep: Option<std::time::Instant>,
+}
+
+impl OpenSessions {
+    /// Close the idle sessions when a pass is due.
+    fn sweep_if_due(&mut self, now: std::time::Instant) {
+        if self.next_sweep.is_some_and(|due| now < due) {
+            return;
+        }
+        // A quarter of the bound apart: a session closes at most a quarter
+        // late. Not more often than a second, whatever the bound.
+        let period = (self.limits.idle_close / 4).max(Duration::from_secs(1));
+        self.next_sweep = now.checked_add(period);
+        self.close_idle(now, 0);
+    }
+
+    /// Close every session idle past the bound that may close, and, while
+    /// more than `room` sessions short of the bound are open, the closable
+    /// one idle longest. Whether there is room for `room` more.
+    fn close_idle(&mut self, now: std::time::Instant, room: usize) -> bool {
+        let idle_close = self.limits.idle_close;
+        let expired: Vec<String> = self
+            .by_name
+            .iter()
+            .filter(|(_, s)| now.duration_since(s.used) >= idle_close && s.closable())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in expired {
+            if let Some(session) = self.by_name.remove(&name) {
+                tracing::debug!(namespace = %name, "idle namespace session closed");
+                session.runtime.close();
+            }
+        }
+        while self.by_name.len() + room > self.limits.max_open {
+            let Some(name) = self
+                .by_name
+                .iter()
+                .filter(|(_, s)| s.closable())
+                .min_by_key(|(_, s)| s.used)
+                .map(|(name, _)| name.clone())
+            else {
+                return false;
+            };
+            if let Some(session) = self.by_name.remove(&name) {
+                tracing::debug!(namespace = %name, "namespace session closed for room");
+                session.runtime.close();
+            }
+        }
+        true
+    }
 }
 
 impl Served {
@@ -185,36 +355,99 @@ impl Served {
     }
 
     /// Start every session of a further namespace with `starter`.
-    pub fn start_sessions_with(&self, starter: SessionStarter) {
+    fn start_sessions_with(&self, starter: SessionStarter) {
         // Set once, by the member that serves: a second call keeps the first.
         let _ = self.starter.set(starter);
     }
 
+    /// Bound the sessions of further namespaces by `limits` from here on.
+    pub fn set_session_limits(&self, limits: SessionLimits) {
+        let mut sessions = self.sessions.lock();
+        sessions.limits = limits;
+        // The next command looks for idle sessions under the new bound.
+        sessions.next_sweep = None;
+    }
+
+    /// The bounds on the sessions of further namespaces.
+    pub fn session_limits(&self) -> SessionLimits {
+        self.sessions.lock().limits
+    }
+
     /// The database serving the namespace named `namespace`: the member's
     /// own when it is that namespace, otherwise a session of it, opened on
-    /// first use. A session is bound to its namespace for its whole life.
+    /// first use and closed once idle. A session is bound to its namespace
+    /// for its whole life.
     ///
     /// # Errors
     ///
     /// [`DatabaseError::NotServing`] before the member serves;
     /// [`DatabaseError::UnknownNamespace`] for a name the deployment holds
-    /// no live namespace of; what opening the session refuses.
+    /// no live namespace of; [`DatabaseError::MemberBusy`] when as many
+    /// sessions as the bound allows are open and every one is in use; what
+    /// opening the session refuses.
     pub fn in_namespace(&self, namespace: &str) -> Result<Arc<RwLock<Database>>, DatabaseError> {
         let primary = self.primary.get().ok_or(DatabaseError::NotServing)?;
         if primary.read().namespace() == namespace {
             return Ok(Arc::clone(primary));
         }
-        let mut sessions = self.sessions.lock();
-        if let Some(session) = sessions.get(namespace) {
-            return Ok(Arc::clone(session));
+        let live = coordinode_storage::engine::metadata::namespace_by_name(
+            primary.read().engine_handle().deployment(),
+            namespace,
+        )?;
+        let now = std::time::Instant::now();
+        {
+            let mut sessions = self.sessions.lock();
+            sessions.sweep_if_due(now);
+            if let Some(session) = sessions.by_name.get_mut(namespace) {
+                // A session outlives its namespace only in this map: one
+                // dropped since, or dropped and created again under its name,
+                // is the session of another namespace and is not served.
+                if live == Some(session.database.read().engine_handle().namespace()) {
+                    session.used = now;
+                    return Ok(Arc::clone(&session.database));
+                }
+                if let Some(stale) = sessions.by_name.remove(namespace) {
+                    stale.runtime.close();
+                }
+            }
+            if live.is_none() {
+                return Err(DatabaseError::UnknownNamespace(namespace.to_owned()));
+            }
+            if !sessions.close_idle(now, 1) {
+                return Err(DatabaseError::MemberBusy);
+            }
         }
+        // Opened outside the lock: an open reads the namespace's catalog and
+        // brings its indexes up, and commands of other namespaces go on
+        // meanwhile.
         let session = primary.read().session(namespace)?;
-        let session = match self.starter.get() {
+        let (database, runtime) = match self.starter.get() {
             Some(start) => start(session),
-            None => Arc::new(RwLock::new(session)),
+            None => (Arc::new(RwLock::new(session)), SessionRuntime::default()),
         };
-        sessions.insert(namespace.to_owned(), Arc::clone(&session));
-        Ok(session)
+        let mut sessions = self.sessions.lock();
+        if let Some(raced) = sessions.by_name.get_mut(namespace)
+            && raced.database.read().engine_handle().namespace()
+                == database.read().engine_handle().namespace()
+        {
+            // Another command opened it first: that one serves.
+            raced.used = now;
+            let served = Arc::clone(&raced.database);
+            drop(sessions);
+            runtime.close();
+            return Ok(served);
+        }
+        if let Some(replaced) = sessions.by_name.insert(
+            namespace.to_owned(),
+            ServedSession {
+                database: Arc::clone(&database),
+                runtime,
+                used: now,
+            },
+        ) {
+            replaced.runtime.close();
+        }
+        Ok(database)
     }
 
     /// Every database served now: the member's own first, then each open
@@ -224,14 +457,30 @@ impl Served {
             .get()
             .into_iter()
             .cloned()
-            .chain(self.sessions.lock().values().cloned())
+            .chain(
+                self.sessions
+                    .lock()
+                    .by_name
+                    .values()
+                    .map(|s| Arc::clone(&s.database)),
+            )
             .collect()
     }
 
     /// Run `f` over the open sessions with no session opening meanwhile.
-    fn with_sessions(&self, f: impl FnOnce(&mut dyn Iterator<Item = &Arc<RwLock<Database>>>)) {
-        let sessions = self.sessions.lock();
-        f(&mut sessions.values());
+    fn with_sessions(&self, f: impl FnOnce(&mut dyn Iterator<Item = &mut ServedSession>)) {
+        let mut sessions = self.sessions.lock();
+        f(&mut sessions.by_name.values_mut());
+    }
+
+    /// Close every open session, handing back the work each ran.
+    fn close_sessions(&self) -> Vec<SessionRuntime> {
+        self.sessions
+            .lock()
+            .by_name
+            .drain()
+            .map(|(_, session)| session.runtime)
+            .collect()
     }
 }
 
@@ -270,11 +519,9 @@ pub struct Member {
     sessions: SessionWork,
 }
 
-/// The work the sessions of further namespaces run beside them.
+/// What the sessions of further namespaces start beside them.
 #[derive(Clone, Default)]
 struct SessionWork {
-    tasks: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    followers: Arc<parking_lot::Mutex<Vec<follower::IndexDefinitionFollower>>>,
     /// Set once the member's background work started: a session opened
     /// from then on starts its own at once.
     trigger_interval: Arc<std::sync::OnceLock<Duration>>,
@@ -395,14 +642,15 @@ impl Member {
             storage,
             Arc::clone(&oracle),
         )?;
-        // A member that joins brings no namespace of its own: its namespace
-        // arrives with the group's catalog. A member that forms a group, or
-        // runs alone, starts the store's one namespace.
+        // A member that joins brings no namespace of its own: its namespaces
+        // arrive with the group's catalog. A member that forms a group, or
+        // runs alone, serves the namespaces its store holds, anchored at the
+        // one of the lowest id; a fresh store starts its one namespace.
         let joins = matches!(
             options.peering.as_ref().map(|peering| &peering.founding),
             Some(Founding::Join(_))
         );
-        let engine = Arc::new(if joins {
+        let engine = Arc::new(if joins || !deployment.live_namespaces()?.is_empty() {
             deployment.member_engine()
         } else {
             deployment.single_store()?
@@ -547,22 +795,32 @@ impl Member {
         // runs the same work beside it.
         let starter: SessionStarter = {
             let node = Arc::clone(&self.node);
-            let stop = self.stop.subscribe();
             let work = self.sessions.clone();
             let has_peers = self.handler.is_some();
             let runtime = tokio::runtime::Handle::current();
             Arc::new(move |session: Database| {
                 // Opened on whatever thread the command runs on.
                 let _runtime = runtime.enter();
+                // Its own stop: a session closes alone, and the member's
+                // stop closes every session.
+                let (stop_tx, stop) = tokio::sync::watch::channel(false);
                 let (session, mut tasks) = serve_beside(&node, session, &stop);
+                let mut followers = Vec::new();
                 if let Some(interval) = work.trigger_interval.get() {
                     let (more, follower) =
                         leader_work(&node, &session, has_peers, *interval, &stop);
                     tasks.extend(more);
-                    work.followers.lock().push(follower);
+                    followers.push(follower);
                 }
-                work.tasks.lock().extend(tasks);
-                session
+                (
+                    session,
+                    SessionRuntime {
+                        stop: Some(stop_tx),
+                        tasks,
+                        followers,
+                        runtime: Some(runtime.clone()),
+                    },
+                )
             })
         };
         self.database.start_sessions_with(starter);
@@ -601,10 +859,20 @@ impl Member {
         self.database.with_sessions(|sessions| {
             let _ = work.trigger_interval.set(trigger_dispatch_interval);
             for session in sessions {
-                let (tasks, follower) =
-                    leader_work(node, session, has_peers, trigger_dispatch_interval, &stop);
-                work.tasks.lock().extend(tasks);
-                work.followers.lock().push(follower);
+                // Stopped with the session: under its own stop signal.
+                let Some(session_stop) = session.runtime.stop.as_ref().map(|s| s.subscribe())
+                else {
+                    continue;
+                };
+                let (tasks, follower) = leader_work(
+                    node,
+                    &session.database,
+                    has_peers,
+                    trigger_dispatch_interval,
+                    &session_stop,
+                );
+                session.runtime.tasks.extend(tasks);
+                session.runtime.followers.push(follower);
             }
         });
         // A member that stands last leads only while no other member can, and
@@ -626,18 +894,15 @@ impl Member {
     /// follower is joined.
     pub async fn stop_background(&mut self) {
         self.stop.send_replace(true);
-        let session_tasks: Vec<_> = self.sessions.tasks.lock().drain(..).collect();
-        for task in self.background.drain(..).chain(session_tasks) {
+        for session in self.database.close_sessions() {
+            session.finish().await;
+        }
+        for task in self.background.drain(..) {
             if let Err(e) = task.await {
                 tracing::error!(%e, "a member background task failed");
             }
         }
-        let followers: Vec<_> = self
-            .follower
-            .take()
-            .into_iter()
-            .chain(self.sessions.followers.lock().drain(..))
-            .collect();
+        let followers: Vec<_> = self.follower.take().into_iter().collect();
         if !followers.is_empty() {
             // Joining their threads blocks: off the async runtime.
             if let Err(e) = tokio::task::spawn_blocking(move || drop(followers)).await {
@@ -747,8 +1012,8 @@ impl Drop for Member {
         for task in self.background.drain(..) {
             task.abort();
         }
-        for task in self.sessions.tasks.lock().drain(..) {
-            task.abort();
+        for mut session in self.database.close_sessions() {
+            session.abort();
         }
     }
 }
@@ -903,8 +1168,17 @@ impl ReplicatedDatabase {
         }
         // With its peers served, a joining member waits here until the group
         // has added it and its namespace has arrived.
-        let database = match member.serve().await {
-            Ok(database) => Arc::clone(database),
+        // An embedding host's handle is one store of one namespace, as a
+        // `Database` it opens is: a store holding several is refused by name.
+        let served = match member.serve().await.map(Arc::clone) {
+            Ok(database) => match member.engine().sole_namespace() {
+                Ok(_) => Ok(database),
+                Err(err) => Err(ReplicationError::from(err)),
+            },
+            Err(err) => Err(err),
+        };
+        let database = match served {
+            Ok(database) => database,
             Err(err) => {
                 if let Some((stop, task)) = listener.take() {
                     drop(stop);

@@ -1,0 +1,103 @@
+//! The deployment's namespace catalog: creating, dropping and listing the
+//! namespaces a deployment holds.
+//!
+//! A catalog change is a command of the deployment, not of the namespace the
+//! handle works in: it commits through the same write path as every other
+//! write, so a member of a group changes the catalog through the group's log
+//! and every member applies it in the same order.
+
+use coordinode_core::namespace::{NamespaceState, validate_namespace_name};
+use coordinode_core::txn::proposal::{MetadataCommand, Mutation};
+use coordinode_storage::engine::metadata;
+
+use super::{Database, DatabaseError};
+
+/// A namespace of the deployment's catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceInfo {
+    /// The namespace's name, as sessions name it.
+    pub name: String,
+    /// Whether it is live, or being dropped: a dropping namespace is named
+    /// by no session, and its name is free again.
+    pub dropping: bool,
+}
+
+impl Database {
+    /// Create the namespace `name` in the deployment's catalog. It holds no
+    /// data; a session naming it works in it from here on.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::NamespaceRefused`] for a name no namespace may have;
+    /// [`DatabaseError::NamespaceExists`] when a live namespace holds it,
+    /// including one a concurrent creation took first; the write path's
+    /// errors (a follower answers [`DatabaseError::NotLeader`]).
+    pub fn create_namespace(&self, name: &str) -> Result<(), DatabaseError> {
+        validate_namespace_name(name).map_err(|e| DatabaseError::NamespaceRefused {
+            name: name.to_owned(),
+            reason: e.to_string(),
+        })?;
+        let deployment = self.engine.deployment();
+        if metadata::namespace_by_name(deployment, name)?.is_some() {
+            return Err(DatabaseError::NamespaceExists(name.to_owned()));
+        }
+        // The token tells this creation's record from a concurrent one of
+        // the same name, which the log orders first and this one then loses.
+        let token = metadata::namespace_token();
+        self.propose_mutation(Mutation::Command(MetadataCommand::CreateNamespace {
+            name: name.to_owned(),
+            token,
+        }))?;
+        let id = metadata::namespace_by_name(deployment, name)?
+            .ok_or_else(|| DatabaseError::NamespaceExists(name.to_owned()))?;
+        match metadata::namespace_record(deployment, id)? {
+            Some(record) if record.token == token => Ok(()),
+            _ => Err(DatabaseError::NamespaceExists(name.to_owned())),
+        }
+    }
+
+    /// Drop the live namespace `name` from the deployment's catalog: from
+    /// here on no session names it, and its data goes with it.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::UnknownNamespace`] when no live namespace has the
+    /// name; [`DatabaseError::NamespaceInUse`] for the namespace this handle
+    /// works in, which is dropped from another; the write path's errors.
+    pub fn drop_namespace(&self, name: &str) -> Result<(), DatabaseError> {
+        let deployment = self.engine.deployment();
+        let Some(id) = metadata::namespace_by_name(deployment, name)? else {
+            return Err(DatabaseError::UnknownNamespace(name.to_owned()));
+        };
+        // PostgreSQL refuses to drop the database a connection is open on
+        // (DROP DATABASE: "cannot drop the currently open database").
+        if id == self.engine.namespace() {
+            return Err(DatabaseError::NamespaceInUse(name.to_owned()));
+        }
+        self.propose_mutation(Mutation::Command(MetadataCommand::DropNamespace {
+            name: name.to_owned(),
+        }))?;
+        // A concurrent drop of the same namespace the log ordered first
+        // leaves the same outcome: the namespace is gone.
+        Ok(())
+    }
+
+    /// The namespaces of the deployment's catalog, in creation order.
+    ///
+    /// # Errors
+    ///
+    /// The catalog cannot be read.
+    pub fn namespaces(&self) -> Result<Vec<NamespaceInfo>, DatabaseError> {
+        Ok(metadata::namespaces(self.engine.deployment())?
+            .into_iter()
+            .map(|(_, record)| NamespaceInfo {
+                name: record.name,
+                dropping: record.state == NamespaceState::Dropping,
+            })
+            .collect())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests;

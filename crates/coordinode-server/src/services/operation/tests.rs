@@ -228,7 +228,7 @@ async fn a_typed_creation_retried_creates_once() {
     let s = services();
     let op = enroll(&s).await;
     let create = || {
-        Request::new(graph::CreateNodeRequest {
+        crate::services::namespace::named(graph::CreateNodeRequest {
             labels: vec!["Typed".to_string()],
             properties: std::collections::HashMap::new(),
             operation: Some(op.clone()),
@@ -248,14 +248,16 @@ async fn a_typed_creation_retried_creates_once() {
 
     let refused = s
         .graph
-        .create_nodes_batch(Request::new(graph::CreateNodesBatchRequest {
-            nodes: vec![graph::CreateNodeRequest {
-                labels: vec!["Typed".to_string()],
-                properties: std::collections::HashMap::new(),
-                operation: Some(op.clone()),
-            }],
-            operation: None,
-        }))
+        .create_nodes_batch(crate::services::namespace::named(
+            graph::CreateNodesBatchRequest {
+                nodes: vec![graph::CreateNodeRequest {
+                    labels: vec!["Typed".to_string()],
+                    properties: std::collections::HashMap::new(),
+                    operation: Some(op.clone()),
+                }],
+                operation: None,
+            },
+        ))
         .await
         .unwrap_err();
     assert_eq!(refused.code(), Code::InvalidArgument);

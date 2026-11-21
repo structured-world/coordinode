@@ -118,6 +118,9 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::NotServing => "NotServing",
         E::UnknownNamespace(_) => "UnknownNamespace",
         E::NamespaceRequired => "NamespaceRequired",
+        E::NamespaceExists(_) => "NamespaceExists",
+        E::NamespaceRefused { .. } => "NamespaceRefused",
+        E::NamespaceInUse(_) => "NamespaceInUse",
         E::Mismatched(_) => "Mismatched",
         E::SettingsRefused(_) => "SettingsRefused",
         E::ReadFence { .. } => "ReadFence",
@@ -591,6 +594,12 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
         E::NotServing => Kind::NotServing(wire::Empty {}),
         E::UnknownNamespace(name) => Kind::UnknownNamespace(text(name)),
         E::NamespaceRequired => Kind::NamespaceRequired(wire::Empty {}),
+        E::NamespaceExists(name) => Kind::NamespaceExists(text(name)),
+        E::NamespaceRefused { name, reason } => Kind::NamespaceRefused(wire::NamespaceRefused {
+            name,
+            reason: cut(reason),
+        }),
+        E::NamespaceInUse(name) => Kind::NamespaceInUse(text(name)),
         E::CapacityExhausted {
             endpoint_id,
             used_bytes,
@@ -995,6 +1004,12 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
         Kind::NotServing(_) => E::NotServing,
         Kind::UnknownNamespace(name) => E::UnknownNamespace(name.message),
         Kind::NamespaceRequired(_) => E::NamespaceRequired,
+        Kind::NamespaceExists(name) => E::NamespaceExists(name.message),
+        Kind::NamespaceRefused(r) => E::NamespaceRefused {
+            name: r.name,
+            reason: r.reason,
+        },
+        Kind::NamespaceInUse(name) => E::NamespaceInUse(name.message),
         Kind::CapacityExhausted(c) => E::CapacityExhausted {
             endpoint_id: c.endpoint_id,
             used_bytes: c.used_bytes,

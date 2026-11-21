@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream;
-use parking_lot::RwLock;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
@@ -34,7 +33,6 @@ use pgwire::tokio::process_socket;
 use std::collections::BTreeMap;
 
 use coordinode_core::graph::types::Value;
-use coordinode_embed::Database;
 use coordinode_session::{CommandSlots, SessionSlots};
 
 mod catalog;
@@ -46,7 +44,10 @@ mod catalog;
 /// through the database write lock (it seeds the plan cache), which is adequate
 /// for the trusted, low-concurrency access this binding currently targets.
 struct PgBackend {
-    database: Arc<RwLock<Database>>,
+    /// The databases a connection's `database` startup parameter selects
+    /// from: a connection works in the namespace it named when it started,
+    /// and in no other.
+    databases: crate::services::namespace::Databases,
     /// This connection's slots within the member's, the ones every other
     /// way a command reaches the member takes too.
     slots: SessionSlots,
@@ -222,13 +223,22 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         // data_exception: vectors their metric cannot evaluate, as pgvector
         // answers vectors of different dimensions or with a NaN component.
         DatabaseError::VectorDomain(_) | DatabaseError::VectorRefused { .. } => "22000",
+        // invalid_catalog_name: what PostgreSQL answers a connection whose
+        // `database` it does not hold; a namespace is that database here.
+        DatabaseError::NamespaceRequired | DatabaseError::UnknownNamespace(_) => "3D000",
+        // duplicate_database, invalid_name, object_in_use: what PostgreSQL
+        // answers CREATE DATABASE of a taken or malformed name, and DROP
+        // DATABASE of the one the connection is open on.
+        DatabaseError::NamespaceExists(_) => "42P04",
+        DatabaseError::NamespaceRefused { .. } => "42602",
+        DatabaseError::NamespaceInUse(_) => "55006",
         _ => "XX000",
     }
 }
 
 #[async_trait]
 impl SimpleQueryHandler for PgBackend {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
@@ -246,14 +256,26 @@ impl SimpleQueryHandler for PgBackend {
                 e.to_string(),
             )))
         };
+        // The namespace the connection named at startup: the startup
+        // parameters are fixed for the connection's life, so it works in
+        // that namespace alone.
+        let database = self
+            .databases
+            .in_namespace(
+                client
+                    .metadata()
+                    .get(pgwire::api::METADATA_DATABASE)
+                    .map(String::as_str),
+            )
+            .map_err(refused)?;
         // Held until the statement ends; one past the member's or this
         // connection's slots did not run.
         let _slot = self
             .slots
             .take()
             .ok_or_else(|| refused(coordinode_embed::db::DatabaseError::MemberBusy))?;
-        let rows = crate::services::blocking(|| self.database.write().execute_sql(query))
-            .map_err(refused)?;
+        let rows =
+            crate::services::blocking(|| database.write().execute_sql(query)).map_err(refused)?;
 
         if !returns_rows(query) {
             return Ok(vec![Response::Execution(command_tag(query))]);
@@ -277,14 +299,15 @@ impl PgWireServerHandlers for PgHandlers {
 
 /// Bind the Postgres wire listener on `addr` and serve connections until the
 /// task is dropped. Each accepted socket is handled on its own task, its
-/// statements running in a session of `slots`, the member's.
+/// statements running in a session of `slots`, the member's, in the
+/// namespace of `databases` its `database` startup parameter names.
 ///
 /// # Errors
 ///
 /// Returns an error if the listen address cannot be bound.
 pub async fn serve(
     addr: SocketAddr,
-    database: Arc<RwLock<Database>>,
+    databases: crate::services::namespace::Databases,
     slots: CommandSlots,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
@@ -300,7 +323,7 @@ pub async fn serve(
         // A connection is a session: its own slots within the member's.
         let handlers = Arc::new(PgHandlers {
             backend: Arc::new(PgBackend {
-                database: Arc::clone(&database),
+                databases: databases.clone(),
                 slots: slots.session(),
             }),
         });

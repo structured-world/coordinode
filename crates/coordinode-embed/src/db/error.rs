@@ -516,6 +516,26 @@ pub enum DatabaseError {
     #[error("a session must name the namespace it works in")]
     NamespaceRequired,
 
+    /// A namespace creation named a name a live namespace already holds.
+    /// Nothing was created.
+    #[error("a namespace named {0} already exists")]
+    NamespaceExists(String),
+
+    /// A namespace creation named a name no namespace may have. Nothing was
+    /// created.
+    #[error("namespace {name} refused: {reason}")]
+    NamespaceRefused {
+        /// The namespace named.
+        name: String,
+        /// Why it was refused.
+        reason: String,
+    },
+
+    /// A session named the namespace it works in for dropping: a namespace
+    /// is dropped from a session of another. Nothing changed.
+    #[error("namespace {0} is the one this session works in")]
+    NamespaceInUse(String),
+
     /// The write reached a member that does not run its group's version: it
     /// is read-only. Nothing was applied. Names both versions and the leader
     /// when known.

@@ -307,6 +307,15 @@ fn every_variant() -> Vec<DatabaseError> {
         },
         E::WriteBackpressure,
         E::MemberBusy,
+        E::NotServing,
+        E::UnknownNamespace("tenant".into()),
+        E::NamespaceRequired,
+        E::NamespaceExists("tenant".into()),
+        E::NamespaceRefused {
+            name: "".into(),
+            reason: "a namespace has a name".into(),
+        },
+        E::NamespaceInUse("tenant".into()),
         E::CapacityExhausted {
             endpoint_id: "hot".into(),
             used_bytes: 10,

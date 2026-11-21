@@ -135,12 +135,28 @@ fn set_indexed_hlc_header<T>(resp: &mut Response<T>, health: Option<&query::Vect
 }
 
 pub struct VectorServiceImpl {
-    database: Arc<RwLock<Database>>,
+    /// The database of the namespace each call names.
+    databases: super::namespace::Databases,
 }
 
 impl VectorServiceImpl {
+    /// A service answering from `database`'s deployment, each call in the
+    /// namespace it names.
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
-        Self { database }
+        Self::serving(super::namespace::Databases::of(database))
+    }
+
+    /// A service answering from `databases`, each call in the namespace it
+    /// names.
+    pub fn serving(databases: super::namespace::Databases) -> Self {
+        Self { databases }
+    }
+
+    /// The database a test's calls reach, for the test to read and write
+    /// beside the service.
+    #[cfg(test)]
+    pub(crate) fn database(&self) -> &Arc<RwLock<Database>> {
+        self.databases.served_primary()
     }
 }
 
@@ -150,6 +166,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         &self,
         request: Request<query::VectorSearchRequest>,
     ) -> Result<Response<query::VectorSearchResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
 
         let query_vector = req
@@ -194,7 +211,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         // consistent with the snapshot the query ran against. The registry
         // keys on the raw (unescaped) label/property.
         let (rows, index_health) = super::blocking(|| {
-            let db = self.database.read();
+            let db = database.read();
             // A statement's failure: a query vector the metric cannot
             // evaluate is the caller's, answered INVALID_ARGUMENT.
             let rows = db
@@ -209,7 +226,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         })?;
 
         let results: Vec<query::VectorResult> = super::blocking(|| {
-            let db = self.database.read();
+            let db = database.read();
             rows.into_iter()
                 .filter_map(|row| {
                     row_to_vector_result(row, |id| {
@@ -234,6 +251,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         &self,
         request: Request<query::HybridSearchRequest>,
     ) -> Result<Response<query::HybridSearchResponse>, Status> {
+        let database = self.databases.for_call(request.metadata())?;
         let req = request.into_inner();
 
         let query_vector = req
@@ -277,7 +295,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         // Hybrid search is read-only — take the shared read lock so
         // concurrent search requests run in parallel.
         let rows = super::blocking(|| {
-            self.database
+            database
                 .read()
                 .execute_cypher_shared(&cypher, Some(params), None, None, None)
         })
@@ -285,7 +303,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         .rows;
 
         let results: Vec<query::VectorResult> = super::blocking(|| {
-            let db = self.database.read();
+            let db = database.read();
             rows.into_iter()
                 .filter_map(|row| {
                     row_to_vector_result(row, |id| {

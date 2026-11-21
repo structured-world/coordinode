@@ -6,16 +6,22 @@ use coordinode_embed::operation::IssuerId;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use parking_lot::RwLock;
 use tokio_stream::StreamExt as _;
-use tonic::Request;
 
 use super::BlobServiceImpl;
 use crate::proto::graph;
 use crate::proto::graph::blob_service_server::BlobService;
+// Every call here names the namespace it works in, as every client does.
+use crate::services::namespace::NamedRequest as Request;
 
 fn open_service() -> (BlobServiceImpl, Arc<RwLock<Database>>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let database = Arc::new(RwLock::new(Database::open(dir.path()).expect("open")));
     (BlobServiceImpl::new(Arc::clone(&database)), database, dir)
+}
+
+/// The database `service` answers from when a call names its namespace.
+fn own(service: &BlobServiceImpl) -> Arc<RwLock<Database>> {
+    service.databases.own().expect("serving")
 }
 
 /// The messages of an upload of `data`, in client-sized parts, the first
@@ -40,7 +46,7 @@ fn messages(
 /// Upload `data` through the service.
 async fn upload(service: &BlobServiceImpl, data: &[u8]) -> graph::UploadBlobResponse {
     service
-        .upload(tokio_stream::iter(messages(data, None)))
+        .upload(own(service), tokio_stream::iter(messages(data, None)))
         .await
         .expect("upload")
 }
@@ -48,7 +54,7 @@ async fn upload(service: &BlobServiceImpl, data: &[u8]) -> graph::UploadBlobResp
 /// Every chunk of the blob `blob_id` names, concatenated, or the status the
 /// download ended with.
 async fn download(service: &BlobServiceImpl, blob_id: &str) -> Result<Vec<u8>, tonic::Status> {
-    let mut stream = service.download(blob_id).await?;
+    let mut stream = BlobServiceImpl::download(own(service), blob_id).await?;
     let mut data = Vec::new();
     while let Some(chunk) = stream.next().await {
         data.extend_from_slice(&chunk?.data);
@@ -102,7 +108,7 @@ async fn independent_uploads_of_the_same_bytes_are_separate_blobs() {
     );
 
     service
-        .delete(&first.blob_id)
+        .delete(own(&service), &first.blob_id)
         .await
         .expect("delete the first");
     let gone = download(&service, &first.blob_id)
@@ -137,11 +143,17 @@ async fn an_upload_retried_under_its_operation_names_its_blob() {
     let data = vec![0x71_u8; 100_000];
 
     let stored = service
-        .upload(tokio_stream::iter(messages(&data, Some(reference.clone()))))
+        .upload(
+            own(&service),
+            tokio_stream::iter(messages(&data, Some(reference.clone()))),
+        )
         .await
         .expect("upload");
     let retried = service
-        .upload(tokio_stream::iter(messages(&data, Some(reference))))
+        .upload(
+            own(&service),
+            tokio_stream::iter(messages(&data, Some(reference))),
+        )
         .await
         .expect_err("a settled retry stores nothing");
     assert_eq!(retried.code(), tonic::Code::FailedPrecondition);
@@ -166,7 +178,7 @@ async fn an_operation_on_a_later_message_is_refused() {
         second.operation = Some(crate::proto::operation::OperationRef::default());
     }
     let refused = service
-        .upload(tokio_stream::iter(parts))
+        .upload(own(&service), tokio_stream::iter(parts))
         .await
         .expect_err("refused");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
@@ -202,14 +214,19 @@ async fn a_download_survives_deletion_and_cleanup_of_its_blob() {
         .expect("record")
         .expect("present");
 
-    let mut stream = service.download(&stored.blob_id).await.expect("open");
+    let mut stream = BlobServiceImpl::download(own(&service), &stored.blob_id)
+        .await
+        .expect("open");
     let mut read = stream
         .next()
         .await
         .expect("first chunk")
         .expect("chunk")
         .data;
-    service.delete(&stored.blob_id).await.expect("delete");
+    service
+        .delete(own(&service), &stored.blob_id)
+        .await
+        .expect("delete");
     // Collected under the running download, by this pass or by the worker
     // the deletion woke: every copy retired and its payload deleted, the
     // compaction left waiting for the download.
@@ -322,7 +339,10 @@ async fn a_blob_write_in_a_group_is_refused_before_it_is_written() {
             .await
             .expect_err("delete refused in a group"),
         service
-            .upload(tokio_stream::iter(messages(b"refused", None)))
+            .upload(
+                own(&service),
+                tokio_stream::iter(messages(b"refused", None)),
+            )
             .await
             .expect_err("upload refused in a group"),
     ] {
