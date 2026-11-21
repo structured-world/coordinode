@@ -361,6 +361,55 @@ fn a_drop_removes_the_namespace_and_nothing_else() {
     assert!(!a_dir.exists(), "the dropped namespace came back");
 }
 
+/// A drop removes the namespace's directory on every endpoint its trees can
+/// be placed on, hot and cold alike, and nothing of another namespace on
+/// either.
+#[test]
+fn a_drop_removes_the_namespace_on_every_tier() {
+    let hot = TempDir::new().expect("hot");
+    let cold = TempDir::new().expect("cold");
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let (deployment, oracle) = open_deployment(&config);
+    let a_id = deployment.create_namespace("a").expect("a");
+    let b_id = deployment.create_namespace("b").expect("b");
+    for id in [a_id, b_id] {
+        let engine = deployment.engine(id).expect("bind");
+        commit(&engine, &oracle, vec![put(b"k", b"v")]);
+        engine.persist().expect("persist");
+    }
+    // Whatever placement put on the cold tier: a file the namespace holds
+    // there, which the drop must take with the rest.
+    for id in [a_id, b_id] {
+        let on_cold = cold.path().join(Scope::Namespace(id).dir()).join("placed");
+        std::fs::create_dir_all(&on_cold).expect("cold dir");
+        std::fs::write(on_cold.join("segment"), b"x").expect("cold file");
+    }
+    deployment.drop_namespace("a").expect("drop");
+    for root in [hot.path(), cold.path()] {
+        let gone = root.join(Scope::Namespace(a_id).dir());
+        assert!(!gone.exists(), "left on {root:?}: {:?}", walk(&gone));
+        assert!(
+            root.join(Scope::Namespace(b_id).dir()).exists(),
+            "another namespace's files went on {root:?}"
+        );
+    }
+}
+
 /// Two namespaces each with a `STORAGE COLUMNAR` table of the same name keep
 /// their own rows, and a crash before any flush replays each journalled row
 /// into its own namespace's table, never the other's.
