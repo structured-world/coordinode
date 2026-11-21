@@ -1,6 +1,7 @@
-# openraft from its upstream main branch, unchanged, published under this name
-# until an openraft release carries what the workspace needs; then it goes and
-# the workspace depends on openraft again.
+# openraft from its upstream main branch, unchanged but for one file taken from
+# a later main commit (see COPYRIGHT), published under this name until an
+# openraft release carries what the workspace needs; then it goes and the
+# workspace depends on openraft again.
 [package]
 name = "coordinode-openraft"
 description = "openraft (Advanced Raft consensus) from its upstream main branch, as CoordiNode uses it"

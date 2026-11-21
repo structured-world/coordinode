@@ -3,8 +3,11 @@ Copyright the Databend authors and the openraft contributors.
 
 This crate is openraft from https://github.com/databendlabs/openraft, commit
 8175ca602330a4534a25190d9b64a182859cec9c of its main branch, published under
-the name coordinode-openraft. Its source is unchanged; Cargo.toml is
-rewritten for the new package name and README.md describes this package.
+the name coordinode-openraft. Its source is unchanged, except
+src/core/balancer.rs, which is that file as of the later main commit
+b89a3bf271ea4762576ecdb58b2bf7e407849131 (the API drain budget grows back
+from one message per round). Cargo.toml is rewritten for the new package name
+and README.md describes this package.
 
 openraft is dual-licensed under the MIT License or the Apache License,
 version 2.0, at your option. This crate is distributed under the MIT License,
