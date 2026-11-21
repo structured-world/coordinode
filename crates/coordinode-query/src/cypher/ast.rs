@@ -72,6 +72,8 @@ impl Query {
                 | Clause::AlterIndex(_)
                 | Clause::Reindex(_)
                 | Clause::AlterNamespaceIndexDefault(_)
+                | Clause::CreateNamespace(_)
+                | Clause::DropNamespace(_)
                 | Clause::CreateVectorIndex(_)
                 | Clause::DropVectorIndex(_)
                 | Clause::CreateEdgeType(_)
@@ -153,6 +155,13 @@ pub enum Clause {
     Reindex(ReindexClause),
     /// `ALTER NAMESPACE SET INDEX MAINTENANCE ...`: the namespace default.
     AlterNamespaceIndexDefault(ProfileChoice),
+    /// `CREATE NAMESPACE <name> [IF NOT EXISTS]`: a namespace of the
+    /// deployment's catalog.
+    CreateNamespace(NamespaceClause),
+    /// `DROP NAMESPACE <name> [IF EXISTS]`.
+    DropNamespace(NamespaceClause),
+    /// `SHOW NAMESPACES`: the deployment's namespaces.
+    ShowNamespaces,
     CreateVectorIndex(CreateVectorIndexClause),
     DropVectorIndex(DropVectorIndexClause),
     CreateEdgeType(CreateEdgeTypeClause),
@@ -420,6 +429,17 @@ pub struct ReindexClause {
     pub name: String,
     /// The label the statement says the index covers.
     pub label: Option<String>,
+}
+
+/// `CREATE NAMESPACE name [IF NOT EXISTS]` or `DROP NAMESPACE name [IF
+/// EXISTS]`: a change of the deployment's namespace catalog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamespaceClause {
+    /// The namespace's name.
+    pub name: String,
+    /// `IF NOT EXISTS` on a creation, `IF EXISTS` on a drop: the state the
+    /// statement asks for already holds, and it succeeds doing nothing.
+    pub if_state_holds: bool,
 }
 
 /// `ALTER INDEX idx SET MAINTENANCE RESOLVED | DERIVED | INHERIT`: an

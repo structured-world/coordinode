@@ -4,6 +4,48 @@ fn plan(sql: &str) -> LogicalOp {
     SqlFrontend::new().parse(sql).expect("parse sql").plan.root
 }
 
+/// The namespace catalog statements lower to the catalog operators, the
+/// existence guard and a quoted name carried, one spelling one fingerprint;
+/// a malformed one is refused rather than parsed as something else.
+#[test]
+fn namespace_catalog_statements_lower_to_catalog_operators() {
+    assert_eq!(
+        plan("CREATE NAMESPACE tenant_a"),
+        LogicalOp::CreateNamespace {
+            name: "tenant_a".into(),
+            if_not_exists: false,
+        }
+    );
+    assert_eq!(
+        plan("create namespace if not exists \"Tenant B\";"),
+        LogicalOp::CreateNamespace {
+            name: "Tenant B".into(),
+            if_not_exists: true,
+        }
+    );
+    assert_eq!(
+        plan("DROP NAMESPACE IF EXISTS tenant_a"),
+        LogicalOp::DropNamespace {
+            name: "tenant_a".into(),
+            if_exists: true,
+        }
+    );
+    assert_eq!(plan("SHOW NAMESPACES"), LogicalOp::ShowNamespaces);
+    let frontend = SqlFrontend::new();
+    assert_eq!(
+        frontend.fingerprint("show   namespaces").unwrap(),
+        frontend.fingerprint("SHOW NAMESPACES;").unwrap()
+    );
+    assert!(!frontend.parse("SHOW NAMESPACES").unwrap().writes.clauses);
+    for sql in [
+        "CREATE NAMESPACE",
+        "CREATE NAMESPACE IF EXISTS a",
+        "DROP NAMESPACE a b",
+    ] {
+        assert!(frontend.parse(sql).is_err(), "{sql}");
+    }
+}
+
 #[test]
 fn select_lowers_to_project_filter_nodescan() {
     let root = plan("SELECT id, name FROM Account WHERE id = 1");

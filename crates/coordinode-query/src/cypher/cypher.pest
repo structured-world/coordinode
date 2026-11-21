@@ -32,6 +32,9 @@ clause = {
   | alter_index_clause
   | reindex_clause
   | alter_namespace_clause
+  | create_namespace_clause
+  | drop_namespace_clause
+  | show_namespaces_clause
   | create_encrypted_index_clause
   | create_text_index_clause
   | create_vector_index_clause
@@ -316,6 +319,13 @@ reindex_clause = { kw_reindex ~ identifier ~ (kw_on ~ ":" ~ identifier)? }
 // ALTER NAMESPACE SET INDEX MAINTENANCE RESOLVED | DERIVED: the default of
 // the namespace the statement runs in.
 alter_namespace_clause = { kw_alter ~ kw_namespace ~ kw_set ~ kw_index ~ kw_maintenance ~ index_maintenance }
+
+// The deployment's namespace catalog, worded as Neo4j words its database
+// catalog: CREATE NAMESPACE name [IF NOT EXISTS], DROP NAMESPACE name
+// [IF EXISTS], SHOW NAMESPACES.
+create_namespace_clause = { kw_create ~ kw_namespace ~ identifier ~ if_not_exists? }
+drop_namespace_clause   = { kw_drop ~ kw_namespace ~ identifier ~ if_exists? }
+show_namespaces_clause  = { kw_show ~ kw_namespaces }
 
 // --- CREATE EDGE TYPE ---
 
@@ -1082,6 +1092,7 @@ kw_disable     = @{ ^"disable" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_maintenance = @{ ^"maintenance" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_reindex     = @{ ^"reindex" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_namespace   = @{ ^"namespace" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_namespaces  = @{ ^"namespaces" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_constraint  = @{ ^"constraint" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_require     = @{ ^"require" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_if          = @{ ^"if" ~ !(ASCII_ALPHANUMERIC | "_") }

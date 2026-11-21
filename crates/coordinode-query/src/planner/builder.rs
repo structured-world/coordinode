@@ -853,6 +853,15 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::AlterNamespaceIndexDefault(choice) => Ok(LogicalOp::SetNamespaceIndexDefault {
             profile: index_profile(*choice),
         }),
+        Clause::CreateNamespace(c) => Ok(LogicalOp::CreateNamespace {
+            name: c.name.clone(),
+            if_not_exists: c.if_state_holds,
+        }),
+        Clause::DropNamespace(c) => Ok(LogicalOp::DropNamespace {
+            name: c.name.clone(),
+            if_exists: c.if_state_holds,
+        }),
+        Clause::ShowNamespaces => Ok(LogicalOp::ShowNamespaces),
         Clause::CreateVectorIndex(c) => {
             // A trailing extension clause (e.g. an engine-extension's `SHARDED BY
             // ...`) after the known CREATE VECTOR INDEX syntax routes to an

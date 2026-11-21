@@ -4188,3 +4188,39 @@ async fn calls_naming_two_namespaces_work_in_each_alone() {
         );
     }
 }
+
+/// A namespace created by a statement over gRPC is served to the next call
+/// naming it; a repeated creation is ALREADY_EXISTS naming the namespace,
+/// and once dropped the namespace is NOT_FOUND again.
+#[tokio::test]
+async fn a_namespace_created_by_a_statement_serves_the_next_call() {
+    let (svc, _dir) = test_service();
+    let default = coordinode_core::namespace::DEFAULT_NAMESPACE;
+    svc.execute_cypher(in_namespace("CREATE NAMESPACE fresh", Some(default)))
+        .await
+        .expect("create");
+    svc.execute_cypher(in_namespace("CREATE (:Here {v: 1})", Some("fresh")))
+        .await
+        .expect("a call naming the new namespace");
+
+    let repeat = svc
+        .execute_cypher(in_namespace("CREATE NAMESPACE fresh", Some(default)))
+        .await
+        .expect_err("a second creation");
+    assert_eq!(repeat.code(), tonic::Code::AlreadyExists);
+    let info = tonic_types::StatusExt::get_details_error_info(&repeat).expect("error info");
+    assert_eq!(info.reason, "NAMESPACE_EXISTS");
+    assert_eq!(
+        info.metadata.get("namespace").map(String::as_str),
+        Some("fresh")
+    );
+
+    svc.execute_cypher(in_namespace("DROP NAMESPACE fresh", Some(default)))
+        .await
+        .expect("drop");
+    let gone = svc
+        .execute_cypher(in_namespace("MATCH (n:Here) RETURN n", Some("fresh")))
+        .await
+        .expect_err("a dropped namespace");
+    assert_eq!(gone.code(), tonic::Code::NotFound);
+}

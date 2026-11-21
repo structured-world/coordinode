@@ -68,6 +68,44 @@ async fn client(port: u16, dbname: &str) -> tokio_postgres::Client {
     client
 }
 
+/// `CREATE NAMESPACE` over the wire answers its own command tag, `SHOW
+/// NAMESPACES` lists it, and a connection naming it works in it; a second
+/// creation is `42P04 duplicate_database`.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_creates_a_namespace_a_connection_then_names() {
+    let (client_default, dir) = connect().await;
+    let messages = client_default
+        .simple_query("CREATE NAMESPACE tenant_c")
+        .await
+        .expect("create namespace");
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, SimpleQueryMessage::CommandComplete(_))),
+        "{messages:?}"
+    );
+    let names: Vec<String> = data_rows(
+        &client_default
+            .simple_query("SHOW NAMESPACES")
+            .await
+            .expect("show"),
+    )
+    .into_iter()
+    .filter_map(|row| row.get("name").cloned())
+    .collect();
+    assert!(names.contains(&"tenant_c".to_owned()), "{names:?}");
+
+    let refused = client_default
+        .simple_query("CREATE NAMESPACE tenant_c")
+        .await
+        .expect_err("a second creation");
+    assert_eq!(
+        refused.as_db_error().map(|e| e.code().code()),
+        Some("42P04")
+    );
+    drop(dir);
+}
+
 /// A connection works in the namespace its `database` names: two
 /// connections to two namespaces each see only their own table, and one
 /// naming a namespace the deployment does not hold is refused with

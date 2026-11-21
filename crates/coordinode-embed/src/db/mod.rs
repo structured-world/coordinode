@@ -3246,6 +3246,8 @@ impl Database {
                 }),
                 btree_index_registry: Some(self.index_registry.as_ref()),
                 index_builds: Some(&self.index_builds),
+                // The deployment's catalog, through the embedded API's path.
+                namespace_catalog: Some(self),
                 // Extension-op handlers for this Database (empty by default). An
                 // enterprise layer / integration test populates it via
                 // Database::register_extension so SHARDED-BY-style extension ops

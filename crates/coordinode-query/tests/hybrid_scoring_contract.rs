@@ -74,6 +74,7 @@ fn make_test_ctx<'a>(
         vector_indexes: None,
         btree_index_registry: None,
         index_builds: None,
+        namespace_catalog: None,
         extensions: None,
         vector_loader: None,
         mvcc_oracle: None,

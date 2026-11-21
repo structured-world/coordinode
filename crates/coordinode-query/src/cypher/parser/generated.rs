@@ -101,6 +101,9 @@ pub enum Rule {
     r#index_maintenance,
     r#reindex_clause,
     r#alter_namespace_clause,
+    r#create_namespace_clause,
+    r#drop_namespace_clause,
+    r#show_namespaces_clause,
     r#create_edge_type_clause,
     r#edge_type_properties,
     r#edge_discriminated_by,
@@ -403,6 +406,7 @@ pub enum Rule {
     r#kw_maintenance,
     r#kw_reindex,
     r#kw_namespace,
+    r#kw_namespaces,
     r#kw_constraint,
     r#kw_require,
     r#kw_if,
@@ -506,6 +510,9 @@ impl Rule {
             Rule::r#index_maintenance,
             Rule::r#reindex_clause,
             Rule::r#alter_namespace_clause,
+            Rule::r#create_namespace_clause,
+            Rule::r#drop_namespace_clause,
+            Rule::r#show_namespaces_clause,
             Rule::r#create_edge_type_clause,
             Rule::r#edge_type_properties,
             Rule::r#edge_discriminated_by,
@@ -808,6 +815,7 @@ impl Rule {
             Rule::r#kw_maintenance,
             Rule::r#kw_reindex,
             Rule::r#kw_namespace,
+            Rule::r#kw_namespaces,
             Rule::r#kw_constraint,
             Rule::r#kw_require,
             Rule::r#kw_if,
@@ -1073,6 +1081,9 @@ impl ::pest::Parser<Rule> for CypherParser {
                                     .or_else(|state| { self::r#alter_index_clause(state) })
                                     .or_else(|state| { self::r#reindex_clause(state) })
                                     .or_else(|state| { self::r#alter_namespace_clause(state) })
+                                    .or_else(|state| { self::r#create_namespace_clause(state) })
+                                    .or_else(|state| { self::r#drop_namespace_clause(state) })
+                                    .or_else(|state| { self::r#show_namespaces_clause(state) })
                                     .or_else(|state| {
                                         self::r#create_encrypted_index_clause(state)
                                     })
@@ -3944,6 +3955,78 @@ impl ::pest::Parser<Rule> for CypherParser {
                                             .and_then(|state| { self::r#kw_maintenance(state) })
                                             .and_then(|state| { super::hidden::skip(state) })
                                             .and_then(|state| { self::r#index_maintenance(state) })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#create_namespace_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#create_namespace_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_create(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_namespace(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#identifier(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state.optional(|state| { self::r#if_not_exists(state) })
+                                            })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#drop_namespace_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#drop_namespace_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_drop(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_namespace(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#identifier(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state.optional(|state| { self::r#if_exists(state) })
+                                            })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#show_namespaces_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#show_namespaces_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_show(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_namespaces(state) })
                                     })
                             },
                         )
@@ -13805,6 +13888,41 @@ impl ::pest::Parser<Rule> for CypherParser {
                 }
                 #[inline]
                 #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_namespaces(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_namespaces,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("namespaces")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
                 pub fn r#kw_constraint(
                     state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
                 ) -> ::pest::ParseResult<
@@ -14425,6 +14543,15 @@ impl ::pest::Parser<Rule> for CypherParser {
                     Rule::r#alter_namespace_clause => {
                         rules::r#alter_namespace_clause(state)
                     }
+                    Rule::r#create_namespace_clause => {
+                        rules::r#create_namespace_clause(state)
+                    }
+                    Rule::r#drop_namespace_clause => {
+                        rules::r#drop_namespace_clause(state)
+                    }
+                    Rule::r#show_namespaces_clause => {
+                        rules::r#show_namespaces_clause(state)
+                    }
                     Rule::r#create_edge_type_clause => {
                         rules::r#create_edge_type_clause(state)
                     }
@@ -14797,6 +14924,7 @@ impl ::pest::Parser<Rule> for CypherParser {
                     Rule::r#kw_maintenance => rules::r#kw_maintenance(state),
                     Rule::r#kw_reindex => rules::r#kw_reindex(state),
                     Rule::r#kw_namespace => rules::r#kw_namespace(state),
+                    Rule::r#kw_namespaces => rules::r#kw_namespaces(state),
                     Rule::r#kw_constraint => rules::r#kw_constraint(state),
                     Rule::r#kw_require => rules::r#kw_require(state),
                     Rule::r#kw_if => rules::r#kw_if(state),

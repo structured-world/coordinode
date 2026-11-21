@@ -202,6 +202,8 @@ fn attempt(
         vector_indexes: None,
         btree_index_registry: Some(env.registry()),
         index_builds: Some(service),
+        // A repair statement changes no namespace catalog.
+        namespace_catalog: None,
         extensions: None,
         vector_loader: None,
         mvcc_oracle: oracle,

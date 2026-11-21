@@ -59,6 +59,25 @@ impl SqlFrontend {
 
 impl QueryFrontend for SqlFrontend {
     fn parse(&self, text: &str) -> Result<ParsedQuery, FrontendError> {
+        if let Some((root, canonical)) = namespace_statement(text)? {
+            let fingerprint = crate::advisor::fingerprint::fingerprint(&canonical);
+            return Ok(ParsedQuery {
+                writes: StatementWrites {
+                    clauses: !matches!(root, LogicalOp::ShowNamespaces),
+                    calls: Vec::new(),
+                },
+                plan: LogicalPlan {
+                    root,
+                    snapshot_ts: None,
+                    vector_consistency: VectorConsistencyMode::default(),
+                    read_consistency: ReadConsistencyMode::default(),
+                },
+                canonical,
+                fingerprint,
+                vector_consistency_hinted: false,
+                vector_build_wait: None,
+            });
+        }
         let statements = parse_bounded(text)?;
         let [statement] = statements.as_slice() else {
             return Err(FrontendError::Message(
@@ -92,6 +111,10 @@ impl QueryFrontend for SqlFrontend {
     }
 
     fn fingerprint(&self, text: &str) -> Result<(String, u64), FrontendError> {
+        if let Some((_, canonical)) = namespace_statement(text)? {
+            let fingerprint = crate::advisor::fingerprint::fingerprint(&canonical);
+            return Ok((canonical, fingerprint));
+        }
         let statements = parse_bounded(text)?;
         let canonical = canonical_sql(&statements)?;
         let fingerprint = crate::advisor::fingerprint::fingerprint(&canonical);
@@ -159,6 +182,97 @@ fn parse_bounded(text: &str) -> Result<Vec<Statement>, FrontendError> {
         .with_tokens_with_locations(tokens)
         .parse_statements()
         .map_err(sql_err)
+}
+
+/// The deployment's namespace catalog statements, which the SQL grammar
+/// has no words for: `CREATE NAMESPACE [IF NOT EXISTS] name`, `DROP
+/// NAMESPACE [IF EXISTS] name` and `SHOW NAMESPACES`, worded as MySQL words
+/// its database catalog. Recognised from the same tokens the parser reads,
+/// so a quoted name is the text inside its quotes. `None` for any other
+/// statement.
+fn namespace_statement(text: &str) -> Result<Option<(LogicalOp, String)>, FrontendError> {
+    if text.len() > MAX_INPUT_BYTES {
+        return Ok(None);
+    }
+    let Ok(tokens) = Tokenizer::new(&GenericDialect, text).tokenize() else {
+        // Not a statement of these: the parser reports what is wrong.
+        return Ok(None);
+    };
+    let mut words = tokens
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .peekable();
+    let keyword = |token: Option<&&Token>, word: &str| matches!(token, Some(Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word));
+    let verb = match words.next() {
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_ascii_uppercase(),
+        _ => return Ok(None),
+    };
+    match verb.as_str() {
+        "SHOW" => {
+            if !keyword(words.peek(), "NAMESPACES") {
+                return Ok(None);
+            }
+            words.next();
+            end_of_statement(&mut words)?;
+            Ok(Some((
+                LogicalOp::ShowNamespaces,
+                "SHOW NAMESPACES".to_owned(),
+            )))
+        }
+        "CREATE" | "DROP" => {
+            if !keyword(words.peek(), "NAMESPACE") {
+                return Ok(None);
+            }
+            words.next();
+            let create = verb == "CREATE";
+            let mut guard = false;
+            if keyword(words.peek(), "IF") {
+                words.next();
+                if create && !keyword(words.next().as_ref(), "NOT") {
+                    return Err(unsupported("CREATE NAMESPACE IF without NOT EXISTS"));
+                }
+                if !keyword(words.next().as_ref(), "EXISTS") {
+                    return Err(unsupported("NAMESPACE IF without EXISTS"));
+                }
+                guard = true;
+            }
+            let name = match words.next() {
+                Some(Token::Word(w)) => w.value.clone(),
+                _ => return Err(unsupported(&format!("{verb} NAMESPACE without a name"))),
+            };
+            end_of_statement(&mut words)?;
+            let guard_text = match (create, guard) {
+                (true, true) => "IF NOT EXISTS ",
+                (false, true) => "IF EXISTS ",
+                (_, false) => "",
+            };
+            let canonical = format!("{verb} NAMESPACE {guard_text}{name}");
+            let op = if create {
+                LogicalOp::CreateNamespace {
+                    name,
+                    if_not_exists: guard,
+                }
+            } else {
+                LogicalOp::DropNamespace {
+                    name,
+                    if_exists: guard,
+                }
+            };
+            Ok(Some((op, canonical)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Nothing but an optional `;` after a namespace statement.
+fn end_of_statement<'a>(words: &mut impl Iterator<Item = &'a Token>) -> Result<(), FrontendError> {
+    match words.next() {
+        None | Some(Token::EOF) => Ok(()),
+        Some(Token::SemiColon) if matches!(words.next(), None | Some(Token::EOF)) => Ok(()),
+        Some(other) => Err(unsupported(&format!(
+            "`{other}` after a namespace statement"
+        ))),
+    }
 }
 
 fn sql_err(e: sqlparser::parser::ParserError) -> FrontendError {

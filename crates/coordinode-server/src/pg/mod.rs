@@ -143,17 +143,21 @@ fn returns_rows(query: &str) -> bool {
 /// affected-row count is not surfaced by the execution path yet, so it is
 /// reported as 0.
 fn command_tag(query: &str) -> Tag {
-    let verb = query
-        .split_whitespace()
+    let mut words = query.split_whitespace();
+    let verb = words.next().unwrap_or("").to_ascii_uppercase();
+    // The object a CREATE or DROP names: a namespace is the one other than
+    // a table this frontend creates and drops.
+    let namespace = words
         .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    match verb.as_str() {
-        "INSERT" => Tag::new("INSERT").with_oid(0).with_rows(0),
-        "UPDATE" => Tag::new("UPDATE").with_rows(0),
-        "DELETE" => Tag::new("DELETE").with_rows(0),
-        "CREATE" => Tag::new("CREATE TABLE"),
-        "DROP" => Tag::new("DROP TABLE"),
+        .is_some_and(|object| object.eq_ignore_ascii_case("namespace"));
+    match (verb.as_str(), namespace) {
+        ("INSERT", _) => Tag::new("INSERT").with_oid(0).with_rows(0),
+        ("UPDATE", _) => Tag::new("UPDATE").with_rows(0),
+        ("DELETE", _) => Tag::new("DELETE").with_rows(0),
+        ("CREATE", true) => Tag::new("CREATE NAMESPACE"),
+        ("DROP", true) => Tag::new("DROP NAMESPACE"),
+        ("CREATE", false) => Tag::new("CREATE TABLE"),
+        ("DROP", false) => Tag::new("DROP TABLE"),
         _ => Tag::new("OK"),
     }
 }
@@ -242,13 +246,6 @@ impl SimpleQueryHandler for PgBackend {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        // Answer driver / client introspection probes (version(), SHOW, ...)
-        // without touching the execution path — they reference server built-ins
-        // the SQL frontend does not implement.
-        if let Some(rows) = catalog::intercept(query) {
-            return Ok(vec![query_response(&rows)?]);
-        }
-
         let refused = |e: coordinode_embed::db::DatabaseError| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -258,16 +255,20 @@ impl SimpleQueryHandler for PgBackend {
         };
         // The namespace the connection named at startup: the startup
         // parameters are fixed for the connection's life, so it works in
-        // that namespace alone.
-        let database = self
-            .databases
-            .in_namespace(
-                client
-                    .metadata()
-                    .get(pgwire::api::METADATA_DATABASE)
-                    .map(String::as_str),
-            )
-            .map_err(refused)?;
+        // that namespace alone, and one the deployment does not hold answers
+        // nothing, as PostgreSQL answers no connection to a missing database.
+        let namespace = client
+            .metadata()
+            .get(pgwire::api::METADATA_DATABASE)
+            .map(String::as_str);
+        let database = self.databases.in_namespace(namespace).map_err(refused)?;
+
+        // Answer driver / client introspection probes (version(), SHOW, ...)
+        // without touching the execution path: they reference server
+        // built-ins the SQL frontend does not implement.
+        if let Some(rows) = catalog::intercept(query, namespace.unwrap_or_default()) {
+            return Ok(vec![query_response(&rows)?]);
+        }
         // Held until the statement ends; one past the member's or this
         // connection's slots did not run.
         let _slot = self

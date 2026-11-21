@@ -906,6 +906,13 @@ impl From<ExecutionError> for DatabaseError {
                 intent_differs,
             },
             E::Unsupported(what) => Self::Unsupported(what),
+            // The catalog's own error, carried through the statement.
+            E::Catalog(failure) => match failure.downcast::<DatabaseError>() {
+                Ok(own) => *own,
+                Err(other) => Self::Other(other.to_string()),
+            },
+            E::NamespaceExists(name) => Self::NamespaceExists(name),
+            E::UnknownNamespace(name) => Self::UnknownNamespace(name),
             E::Procedure(refusal) => Self::Procedure(refusal),
             E::Conflict(message) => Self::TransactionConflict {
                 transaction: None,

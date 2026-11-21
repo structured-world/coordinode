@@ -2330,6 +2330,49 @@ fn alter_index_and_namespace_maintenance() {
     }
 }
 
+/// The namespace catalog statements: a name, plain or backtick-quoted, and
+/// the existence guard each form takes; a name is required.
+#[test]
+fn namespace_catalog_statements() {
+    for (query, name, guarded) in [
+        ("CREATE NAMESPACE tenant_a", "tenant_a", false),
+        (
+            "create namespace `tenant-b` IF NOT EXISTS",
+            "tenant-b",
+            true,
+        ),
+    ] {
+        match &parse_ok(query).clauses[0] {
+            Clause::CreateNamespace(c) => {
+                assert_eq!((c.name.as_str(), c.if_state_holds), (name, guarded));
+            }
+            other => panic!("expected CreateNamespace, got {other:?}"),
+        }
+    }
+    for (query, guarded) in [
+        ("DROP NAMESPACE tenant_a", false),
+        ("DROP NAMESPACE tenant_a IF EXISTS", true),
+    ] {
+        match &parse_ok(query).clauses[0] {
+            Clause::DropNamespace(c) => {
+                assert_eq!((c.name.as_str(), c.if_state_holds), ("tenant_a", guarded));
+            }
+            other => panic!("expected DropNamespace, got {other:?}"),
+        }
+    }
+    assert!(matches!(
+        parse_ok("SHOW NAMESPACES").clauses[0],
+        Clause::ShowNamespaces
+    ));
+    for query in [
+        "CREATE NAMESPACE",
+        "DROP NAMESPACE IF EXISTS",
+        "CREATE NAMESPACE a IF EXISTS",
+    ] {
+        assert!(parse(query).is_err(), "{query}");
+    }
+}
+
 /// `REINDEX name` and `REINDEX name ON :Label` name the index and, in the
 /// second form, the label the statement expects it on.
 #[test]

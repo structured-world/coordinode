@@ -326,6 +326,13 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
                 })?;
             clauses.push(Clause::AlterNamespaceIndexDefault(profile));
         }
+        Rule::create_namespace_clause => {
+            clauses.push(Clause::CreateNamespace(namespace_clause(pair, "CREATE")?));
+        }
+        Rule::drop_namespace_clause => {
+            clauses.push(Clause::DropNamespace(namespace_clause(pair, "DROP")?));
+        }
+        Rule::show_namespaces_clause => clauses.push(Clause::ShowNamespaces),
         Rule::create_vector_index_clause => {
             let c = build_create_vector_index_clause(pair)?;
             clauses.push(Clause::CreateVectorIndex(c));
@@ -1263,6 +1270,35 @@ fn maintenance_choice(text: &str) -> Result<IndexMaintenanceChoice, ParseError> 
         return Ok(IndexMaintenanceChoice::Inherit);
     }
     profile_choice(text).map(IndexMaintenanceChoice::Profile)
+}
+
+/// The name and existence guard of a `CREATE` or `DROP NAMESPACE` clause
+/// (`verb` names which, for the error). A backtick-quoted name is the text
+/// between the backticks.
+fn namespace_clause(pair: Pair<'_, Rule>, verb: &str) -> Result<NamespaceClause, ParseError> {
+    let mut name = None;
+    let mut if_state_holds = false;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => {
+                let text = inner.as_str();
+                name = Some(
+                    text.strip_prefix('`')
+                        .and_then(|t| t.strip_suffix('`'))
+                        .unwrap_or(text)
+                        .to_string(),
+                );
+            }
+            Rule::if_not_exists | Rule::if_exists => if_state_holds = true,
+            _ => {}
+        }
+    }
+    let name =
+        name.ok_or_else(|| ParseError::Invalid(format!("{verb} NAMESPACE requires a name")))?;
+    Ok(NamespaceClause {
+        name,
+        if_state_holds,
+    })
 }
 
 fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeClause, ParseError> {

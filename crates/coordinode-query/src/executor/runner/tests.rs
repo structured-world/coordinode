@@ -497,6 +497,7 @@ fn make_ctx<'a>(
         vector_indexes: None,
         btree_index_registry: None,
         index_builds: None,
+        namespace_catalog: None,
         extensions: None,
         vector_loader: None,
         mvcc_oracle: None,
@@ -6275,6 +6276,7 @@ fn make_ctx_with_btree<'a>(
     ExecutionContext {
         btree_index_registry: Some(&env.registry),
         index_builds: Some(builds),
+        namespace_catalog: None,
         ..make_ctx(&env.engine, interner, allocator)
     }
 }

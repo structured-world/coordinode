@@ -425,6 +425,9 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::AlterIndexMaintenance { .. }
         | LogicalOp::Reindex { .. }
         | LogicalOp::SetNamespaceIndexDefault { .. }
+        | LogicalOp::CreateNamespace { .. }
+        | LogicalOp::DropNamespace { .. }
+        | LogicalOp::ShowNamespaces
         | LogicalOp::IndexScan { .. } => vec![],
         // A counter read: its fallback scan runs only when the counter
         // cannot answer, so it is not the access path to advise on.

@@ -581,6 +581,17 @@ pub enum LogicalOp {
     /// Set the namespace default profile for key-shaped indexes.
     SetNamespaceIndexDefault { profile: crate::index::IndexProfile },
 
+    /// Create namespace `name` in the deployment's catalog; with
+    /// `if_not_exists`, a live namespace of the name is success.
+    CreateNamespace { name: String, if_not_exists: bool },
+
+    /// Drop namespace `name` from the deployment's catalog; with
+    /// `if_exists`, an unknown name is success.
+    DropNamespace { name: String, if_exists: bool },
+
+    /// List the deployment's namespaces.
+    ShowNamespaces,
+
     /// CREATE VECTOR INDEX: build an HNSW index on a label's vector property.
     ///
     /// Backfills existing nodes; future inserts/updates maintain the index incrementally.
@@ -1094,6 +1105,9 @@ impl LogicalOp {
             Self::AlterIndexMaintenance { .. } => "AlterIndexMaintenance",
             Self::Reindex { .. } => "Reindex",
             Self::SetNamespaceIndexDefault { .. } => "SetNamespaceIndexDefault",
+            Self::CreateNamespace { .. } => "CreateNamespace",
+            Self::DropNamespace { .. } => "DropNamespace",
+            Self::ShowNamespaces => "ShowNamespaces",
             Self::CreateVectorIndex { .. } => "CreateVectorIndex",
             Self::DropVectorIndex { .. } => "DropVectorIndex",
             Self::CreateEdgeType { .. } => "CreateEdgeType",
@@ -1204,6 +1218,9 @@ impl LogicalOp {
             | LogicalOp::AlterIndexMaintenance { .. }
             | LogicalOp::Reindex { .. }
             | LogicalOp::SetNamespaceIndexDefault { .. }
+            | LogicalOp::CreateNamespace { .. }
+            | LogicalOp::DropNamespace { .. }
+            | LogicalOp::ShowNamespaces
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
             | LogicalOp::CreateEdgeType { .. }
@@ -1530,6 +1547,9 @@ impl LogicalOp {
             | LogicalOp::AlterIndexMaintenance { .. }
             | LogicalOp::Reindex { .. }
             | LogicalOp::SetNamespaceIndexDefault { .. }
+            | LogicalOp::CreateNamespace { .. }
+            | LogicalOp::DropNamespace { .. }
+            | LogicalOp::ShowNamespaces
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
             | LogicalOp::CreateEdgeType { .. }
@@ -2183,6 +2203,9 @@ fn estimate_op_cost(
         | LogicalOp::AlterIndexMaintenance { .. }
         | LogicalOp::Reindex { .. }
         | LogicalOp::SetNamespaceIndexDefault { .. }
+        | LogicalOp::CreateNamespace { .. }
+        | LogicalOp::DropNamespace { .. }
+        | LogicalOp::ShowNamespaces
         | LogicalOp::CreateVectorIndex { .. }
         | LogicalOp::DropVectorIndex { .. }
         | LogicalOp::CreateEdgeType { .. }
@@ -2952,6 +2975,13 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         LogicalOp::SetNamespaceIndexDefault { profile } => {
             output.push_str(&format!("{prefix}SetNamespaceIndexDefault({profile:?})\n"));
         }
+        LogicalOp::CreateNamespace { name, .. } => {
+            output.push_str(&format!("{prefix}CreateNamespace({name})\n"));
+        }
+        LogicalOp::DropNamespace { name, .. } => {
+            output.push_str(&format!("{prefix}DropNamespace({name})\n"));
+        }
+        LogicalOp::ShowNamespaces => output.push_str(&format!("{prefix}ShowNamespaces\n")),
         LogicalOp::CreateVectorIndex {
             name,
             label,

@@ -43,12 +43,16 @@ fn one(column: &str, value: &str) -> Vec<Row> {
 
 /// If `query` is a recognized catalog / introspection probe, return its
 /// synthesized result; otherwise `None` so the caller runs the real SQL path.
-pub fn intercept(query: &str) -> Option<Vec<Row>> {
+/// `database` is the namespace the connection named, which is its database.
+pub fn intercept(query: &str, database: &str) -> Option<Vec<Row>> {
     let normalized = query.trim().trim_end_matches(';').to_ascii_lowercase();
     let collapsed: String = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
 
     // `SHOW <param>` -> one row, one column named after the parameter.
-    if let Some(rest) = collapsed.strip_prefix("show ") {
+    // `SHOW NAMESPACES` is a statement of the catalog, not a parameter.
+    if let Some(rest) = collapsed.strip_prefix("show ")
+        && rest.trim() != "namespaces"
+    {
         let param = rest.trim();
         return Some(one(param, show_value(param)));
     }
@@ -62,7 +66,7 @@ pub fn intercept(query: &str) -> Option<Vec<Row>> {
         return Some(one("current_schema", "public"));
     }
     if collapsed.contains("current_database") || collapsed.contains("current_catalog") {
-        return Some(one("current_database", "coordinode"));
+        return Some(one("current_database", database));
     }
     if collapsed.contains("session_user") {
         return Some(one("session_user", "postgres"));

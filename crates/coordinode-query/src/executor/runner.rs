@@ -428,6 +428,21 @@ pub enum ExecutionError {
     #[error("catalog change refused: {0}")]
     CatalogRefused(String),
 
+    /// The host's namespace catalog refused a change, as the host reported
+    /// it; the host reads its own error back.
+    #[error("{0}")]
+    Catalog(crate::executor::namespaces::CatalogFailure),
+
+    /// `CREATE NAMESPACE` without `IF NOT EXISTS` named a name a live
+    /// namespace holds. Nothing changed.
+    #[error("a namespace named {0} already exists")]
+    NamespaceExists(String),
+
+    /// `DROP NAMESPACE` without `IF EXISTS` named a name no live namespace
+    /// has. Nothing changed.
+    #[error("no namespace named {0}")]
+    UnknownNamespace(String),
+
     /// L1 cycle protection trip: cumulative trigger cascade depth
     /// for the current originating mutation exceeded its limit. `chain` lists
     /// the trigger names that fired, in firing order, to help diagnose the
@@ -1369,6 +1384,10 @@ pub struct ExecutionContext<'a> {
     /// CONSTRAINT admit a build with the index's publication and wait for
     /// its outcome here; the build itself does not belong to the statement.
     pub index_builds: Option<&'a crate::index::IndexBuildService>,
+    /// The deployment's namespace catalog, which `CREATE`, `DROP` and `SHOW
+    /// NAMESPACE` change and list; `None` for a host that keeps none, which
+    /// refuses them.
+    pub namespace_catalog: Option<&'a dyn crate::executor::namespaces::NamespaceCatalog>,
     /// Registry of extension-op handlers (EE-populated, CE default empty).
     /// Reached only by the [`LogicalOp::Extension`] dispatch arm; `None` /
     /// empty in pure-CE contexts means no extension ops are dispatchable.
@@ -7268,6 +7287,17 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::SetNamespaceIndexDefault { profile } => {
             execute_set_namespace_index_default(*profile, ctx)
         }
+
+        LogicalOp::CreateNamespace {
+            name,
+            if_not_exists,
+        } => crate::executor::namespaces::create(ctx.namespace_catalog, name, *if_not_exists),
+
+        LogicalOp::DropNamespace { name, if_exists } => {
+            crate::executor::namespaces::drop(ctx.namespace_catalog, name, *if_exists)
+        }
+
+        LogicalOp::ShowNamespaces => crate::executor::namespaces::show(ctx.namespace_catalog),
 
         LogicalOp::CreateVectorIndex {
             name,

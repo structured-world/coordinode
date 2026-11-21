@@ -296,6 +296,36 @@ The type label and the labels it implies cannot be removed.
 
 ### DDL Clauses
 
+#### CREATE / DROP / SHOW NAMESPACE ✅
+
+A namespace is what a database is inside a PostgreSQL or MySQL server: its
+own schema, indexes and data in a deployment that holds several. The
+statements change and list the deployment's catalog, whichever namespace the
+session issuing them works in:
+
+```cypher
+CREATE NAMESPACE tenant_a                 -- refused if the name is taken
+CREATE NAMESPACE tenant_a IF NOT EXISTS   -- succeeds doing nothing if it is
+SHOW NAMESPACES                           -- name, state ('live' | 'dropping')
+DROP NAMESPACE tenant_a                   -- refused if there is none
+DROP NAMESPACE tenant_a IF EXISTS
+```
+
+- `CREATE` and `DROP` return one row: `namespace` and `changed` (`false`
+  when the existence guard found the state already so).
+- A taken name is refused with `NAMESPACE_EXISTS` (gRPC `ALREADY_EXISTS`,
+  SQLSTATE `42P04`), an unknown one with `UNKNOWN_NAMESPACE` (`NOT_FOUND`,
+  `3D000`), a name no namespace may have with `NAMESPACE_REFUSED`
+  (`INVALID_ARGUMENT`, `42602`).
+- A session does not drop the namespace it works in (`NAMESPACE_IN_USE`,
+  `FAILED_PRECONDITION`, `55006`), as PostgreSQL does not drop the database
+  a connection is open on.
+- A dropped namespace's data goes with it; its name is free, and a namespace
+  created again under it starts empty.
+- The SQL frontend takes the same statements in MySQL's word order:
+  `CREATE NAMESPACE [IF NOT EXISTS] name`, `DROP NAMESPACE [IF EXISTS] name`,
+  `SHOW NAMESPACES`.
+
 #### CREATE NODE TYPE / CREATE EDGE TYPE ✅ 🔷
 
 CoordiNode extension. Declares a label or edge-type schema upfront so the engine knows the property contract (and, for `TEMPORAL` types, the bitemporal storage layout). Both forms accept an optional `TEMPORAL` modifier and an optional `WITH (...)` property declaration block.

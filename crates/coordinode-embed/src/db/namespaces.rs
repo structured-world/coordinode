@@ -8,6 +8,7 @@
 
 use coordinode_core::namespace::{NamespaceState, validate_namespace_name};
 use coordinode_core::txn::proposal::{MetadataCommand, Mutation};
+use coordinode_query::executor::namespaces::{CatalogFailure, CatalogOutcome, NamespaceEntry};
 use coordinode_storage::engine::metadata;
 
 use super::{Database, DatabaseError};
@@ -93,6 +94,36 @@ impl Database {
             .map(|(_, record)| NamespaceInfo {
                 name: record.name,
                 dropping: record.state == NamespaceState::Dropping,
+            })
+            .collect())
+    }
+}
+
+/// The statements' path to the catalog is the embedded API's: one way a
+/// namespace is created or dropped, whichever surface asks.
+impl coordinode_query::executor::namespaces::NamespaceCatalog for Database {
+    fn create_namespace(&self, name: &str) -> Result<CatalogOutcome, CatalogFailure> {
+        match Database::create_namespace(self, name) {
+            Ok(()) => Ok(CatalogOutcome::Changed),
+            Err(DatabaseError::NamespaceExists(_)) => Ok(CatalogOutcome::AlreadySo),
+            Err(e) => Err(Box::new(e)),
+        }
+    }
+
+    fn drop_namespace(&self, name: &str) -> Result<CatalogOutcome, CatalogFailure> {
+        match Database::drop_namespace(self, name) {
+            Ok(()) => Ok(CatalogOutcome::Changed),
+            Err(DatabaseError::UnknownNamespace(_)) => Ok(CatalogOutcome::AlreadySo),
+            Err(e) => Err(Box::new(e)),
+        }
+    }
+
+    fn namespaces(&self) -> Result<Vec<NamespaceEntry>, CatalogFailure> {
+        Ok(Database::namespaces(self)?
+            .into_iter()
+            .map(|n| NamespaceEntry {
+                name: n.name,
+                dropping: n.dropping,
             })
             .collect())
     }

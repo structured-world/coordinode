@@ -395,6 +395,9 @@ impl<'a> Analyzer<'a> {
             | Clause::AlterIndex(_)
             | Clause::Reindex(_)
             | Clause::AlterNamespaceIndexDefault(_)
+            | Clause::CreateNamespace(_)
+            | Clause::DropNamespace(_)
+            | Clause::ShowNamespaces
             | Clause::CreateVectorIndex(_)
             | Clause::DropVectorIndex(_)
             | Clause::CreateEdgeType(_)

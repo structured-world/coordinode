@@ -39,6 +39,67 @@ fn a_created_namespace_holds_its_own_data() {
     ));
 }
 
+/// Cypher and SQL change and list the catalog through the same path as the
+/// embedded API: a namespace created by one statement is listed by the
+/// other's and opens a session; the existence guard turns a repeat into a
+/// row saying nothing changed, and without it the repeat is refused by
+/// name; a session does not drop its own namespace.
+#[test]
+fn statements_change_and_list_the_catalog() {
+    let (mut database, _dir) = open();
+    let created = database
+        .execute_cypher("CREATE NAMESPACE tenant_a")
+        .unwrap();
+    assert_eq!(
+        created[0].get("changed"),
+        Some(&coordinode_core::graph::types::Value::Bool(true))
+    );
+    database.execute_sql("CREATE NAMESPACE tenant_b").unwrap();
+    let listed: Vec<String> = database
+        .execute_sql("SHOW NAMESPACES")
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| match row.get("name") {
+            Some(coordinode_core::graph::types::Value::String(name)) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            database.namespace().to_owned(),
+            "tenant_a".into(),
+            "tenant_b".into()
+        ]
+    );
+    database.session("tenant_b").unwrap();
+
+    let repeat = database
+        .execute_cypher("CREATE NAMESPACE tenant_a IF NOT EXISTS")
+        .unwrap();
+    assert_eq!(
+        repeat[0].get("changed"),
+        Some(&coordinode_core::graph::types::Value::Bool(false))
+    );
+    assert!(matches!(
+        database.execute_cypher("CREATE NAMESPACE tenant_a"),
+        Err(DatabaseError::NamespaceExists(name)) if name == "tenant_a"
+    ));
+    database.execute_sql("DROP NAMESPACE tenant_a").unwrap();
+    assert!(matches!(
+        database.execute_sql("DROP NAMESPACE tenant_a"),
+        Err(DatabaseError::UnknownNamespace(_))
+    ));
+    database
+        .execute_cypher("DROP NAMESPACE tenant_a IF EXISTS")
+        .unwrap();
+    let own = format!("DROP NAMESPACE {}", database.namespace());
+    assert!(matches!(
+        database.execute_cypher(&own),
+        Err(DatabaseError::NamespaceInUse(_))
+    ));
+}
+
 /// A name no namespace may have is refused before anything is written.
 #[test]
 fn an_invalid_namespace_name_is_refused() {
