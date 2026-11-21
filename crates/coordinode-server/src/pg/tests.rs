@@ -95,6 +95,23 @@ async fn sql_creates_a_namespace_a_connection_then_names() {
     .collect();
     assert!(names.contains(&"tenant_c".to_owned()), "{names:?}");
 
+    // Its storage settings change over the wire and are listed.
+    client_default
+        .simple_query("ALTER NAMESPACE tenant_c SET STORAGE (compression: 'zstd:5')")
+        .await
+        .expect("alter namespace storage");
+    let compression: Vec<String> = data_rows(
+        &client_default
+            .simple_query("SHOW NAMESPACES")
+            .await
+            .expect("show"),
+    )
+    .into_iter()
+    .filter(|row| row.get("name").map(String::as_str) == Some("tenant_c"))
+    .filter_map(|row| row.get("compression").cloned())
+    .collect();
+    assert_eq!(compression, vec!["zstd:5".to_owned()]);
+
     let refused = client_default
         .simple_query("CREATE NAMESPACE tenant_c")
         .await

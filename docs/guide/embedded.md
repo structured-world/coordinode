@@ -168,7 +168,21 @@ for ns in db.namespaces()? {
     println!("{} dropping={}", ns.name, ns.dropping);
 }
 db.drop_namespace("tenant_a")?;        // its data goes with it
+
+// Its own codecs: unset fields inherit the deployment's.
+use coordinode_core::namespace::{BlockCodec, NamespaceStorage};
+db.create_namespace_with("archive", NamespaceStorage {
+    cold_compression: Some(BlockCodec::Zstd(9)),
+    ..NamespaceStorage::default()
+})?;
+db.set_namespace_storage("archive", NamespaceStorage {
+    compression: Some(BlockCodec::Zstd(3)),   // changes only this setting
+    ..NamespaceStorage::default()
+})?;
 ```
+
+A storage change applies to each tree's next flush or compaction; nothing
+already written is rewritten for it.
 
 A catalog change commits through the same write path as every other write,
 so a member of a replicated group changes the catalog through the group's log

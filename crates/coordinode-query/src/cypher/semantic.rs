@@ -397,6 +397,7 @@ impl<'a> Analyzer<'a> {
             | Clause::AlterNamespaceIndexDefault(_)
             | Clause::CreateNamespace(_)
             | Clause::DropNamespace(_)
+            | Clause::SetNamespaceStorage(_)
             | Clause::ShowNamespaces
             | Clause::CreateVectorIndex(_)
             | Clause::DropVectorIndex(_)

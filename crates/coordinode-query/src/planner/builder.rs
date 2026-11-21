@@ -856,6 +856,11 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::CreateNamespace(c) => Ok(LogicalOp::CreateNamespace {
             name: c.name.clone(),
             if_not_exists: c.if_state_holds,
+            storage: c.storage,
+        }),
+        Clause::SetNamespaceStorage(c) => Ok(LogicalOp::SetNamespaceStorage {
+            name: c.name.clone(),
+            change: c.change,
         }),
         Clause::DropNamespace(c) => Ok(LogicalOp::DropNamespace {
             name: c.name.clone(),

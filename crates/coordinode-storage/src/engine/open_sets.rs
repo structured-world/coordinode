@@ -52,6 +52,9 @@ pub struct SetTrees {
     /// Set whenever the set is reached, cleared by each pass that looks for
     /// idle sets: a set found clear was reached by nothing for a whole pass.
     touched: std::sync::atomic::AtomicBool,
+    /// The namespace's storage settings as the catalog holds them now: what
+    /// a table tree opened later writes with. no-std: spin::RwLock
+    storage: Arc<RwLock<coordinode_core::namespace::NamespaceStorage>>,
 }
 
 /// What a dropped namespace's set removes when it goes.
@@ -92,7 +95,31 @@ impl SetTrees {
             table_repairs: parking_lot::Mutex::new(Vec::new()),
             index_copy_qualifier: RwLock::new(None),
             touched: std::sync::atomic::AtomicBool::new(true),
+            storage: Arc::new(RwLock::new(
+                coordinode_core::namespace::NamespaceStorage::default(),
+            )),
         }
+    }
+
+    /// The set with its namespace's storage settings.
+    #[must_use]
+    pub(crate) fn with_storage(
+        self,
+        storage: coordinode_core::namespace::NamespaceStorage,
+    ) -> Self {
+        *self.storage.write() = storage;
+        self
+    }
+
+    /// The cell holding the namespace's storage settings, shared with what
+    /// opens its table trees.
+    pub(crate) fn storage_cell(&self) -> Arc<RwLock<coordinode_core::namespace::NamespaceStorage>> {
+        Arc::clone(&self.storage)
+    }
+
+    /// Record the namespace's storage settings the catalog now holds.
+    pub(crate) fn set_storage(&self, storage: coordinode_core::namespace::NamespaceStorage) {
+        *self.storage.write() = storage;
     }
 
     /// Note that the set was reached.

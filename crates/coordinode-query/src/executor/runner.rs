@@ -7291,10 +7291,20 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::CreateNamespace {
             name,
             if_not_exists,
-        } => crate::executor::namespaces::create(ctx.namespace_catalog, name, *if_not_exists),
+            storage,
+        } => crate::executor::namespaces::create(
+            ctx.namespace_catalog,
+            name,
+            *if_not_exists,
+            *storage,
+        ),
 
         LogicalOp::DropNamespace { name, if_exists } => {
             crate::executor::namespaces::drop(ctx.namespace_catalog, name, *if_exists)
+        }
+
+        LogicalOp::SetNamespaceStorage { name, change } => {
+            crate::executor::namespaces::set_storage(ctx.namespace_catalog, name, *change)
         }
 
         LogicalOp::ShowNamespaces => crate::executor::namespaces::show(ctx.namespace_catalog),

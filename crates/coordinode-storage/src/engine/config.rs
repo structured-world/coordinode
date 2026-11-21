@@ -1465,6 +1465,59 @@ impl StorageConfig {
             .prefix_extractor(Arc::new(ColonSeparatedPrefix))
     }
 
+    /// The per-level data-block compression of namespace `storage`'s `part`
+    /// tree: for each level, the namespace's codec of that level's band (hot
+    /// below `cold_level_threshold`, cold at and above it) when it sets one,
+    /// else the deployment's for the partition (its override, else the hot
+    /// or cold codec).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a zstd codec in a build without
+    /// zstd.
+    ///
+    /// [`StorageError::InvalidConfig`]: crate::error::StorageError::InvalidConfig
+    pub(crate) fn namespace_compression_policy(
+        &self,
+        part: Partition,
+        storage: &coordinode_core::namespace::NamespaceStorage,
+    ) -> crate::error::StorageResult<lsm_tree::config::CompressionPolicy> {
+        use coordinode_core::namespace::BlockCodec;
+        let codec = |own: BlockCodec| -> crate::error::StorageResult<CompressionCodec> {
+            Ok(match own {
+                BlockCodec::None => CompressionCodec::None,
+                BlockCodec::Lz4 => CompressionCodec::Lz4,
+                #[cfg(feature = "zstd")]
+                BlockCodec::Zstd(level) => CompressionCodec::zstd(level)?,
+                #[cfg(not(feature = "zstd"))]
+                BlockCodec::Zstd(_) => {
+                    return Err(crate::error::StorageError::InvalidConfig(
+                        "this build has no zstd; a namespace codec of zstd cannot apply".into(),
+                    ));
+                }
+            })
+        };
+        let overridden = self
+            .partition_compression
+            .as_ref()
+            .and_then(|overrides| overrides.iter().find(|&&(p, _)| p == part))
+            .map(|&(_, codec)| codec);
+        let hot = match storage.compression {
+            Some(own) => codec(own)?,
+            None => overridden.unwrap_or(self.compression.hot_codec),
+        };
+        let cold = match storage.cold_compression {
+            Some(own) => codec(own)?,
+            None => overridden.unwrap_or(self.compression.cold_codec),
+        };
+        Ok(CompressionConfig {
+            hot_codec: hot,
+            cold_codec: cold,
+            cold_level_threshold: self.compression.cold_level_threshold,
+        }
+        .to_compression_policy())
+    }
+
     /// What a tree config under `dir` (relative to each endpoint) shares
     /// across trees: `part`'s compression (its override, else the global
     /// policy), sync mode, filesystem, per-level `routing` and page ECC.

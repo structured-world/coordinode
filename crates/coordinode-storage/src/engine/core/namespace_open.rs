@@ -51,10 +51,15 @@ impl TreeOpener {
     ///
     /// A tree cannot be opened or repaired, or its installations cannot be
     /// read.
+    ///
+    /// The trees write with the namespace's storage settings as `records`,
+    /// the deployment's records tree, holds them now.
     pub(crate) fn open_namespace(
         &self,
         namespace: NamespaceId,
+        records: &lsm_tree::AnyTree,
     ) -> StorageResult<(SetTrees, Vec<OpenRepair>)> {
+        let storage = storage_at(records, namespace)?;
         let mut set = SetTrees::new(Scope::Namespace(namespace));
         let mut repairs = Vec::new();
         let thresholds = self.config.backpressure.to_thresholds();
@@ -65,6 +70,9 @@ impl TreeOpener {
                     TreeId::namespace(namespace, part),
                     Arc::clone(&self.seqno),
                     self.routing.get(&part),
+                )
+                .data_block_compression_policy(
+                    self.config.namespace_compression_policy(part, &storage)?,
                 )
                 .use_cache(Arc::clone(&self.cache))
                 .write_buffer_budget(Arc::clone(&self.write_buffer))
@@ -101,10 +109,10 @@ impl TreeOpener {
                 name: Partition::Idx.name().to_string(),
             })?;
         let installations = crate::engine::installation::Installations::load(idx)?;
-        let set = set.with_installations(installations);
+        let set = set.with_installations(installations).with_storage(storage);
         #[cfg(feature = "columnar")]
         let set = {
-            let (registry, table_repairs) = self.open_tables(namespace)?;
+            let (registry, table_repairs) = self.open_tables(namespace, set.storage_cell())?;
             set.with_columnar(registry, table_repairs)
         };
         Ok((set, repairs))
@@ -118,10 +126,14 @@ impl TreeOpener {
     ///
     /// The registry's directory cannot be made or read, or a table tree
     /// cannot be opened or repaired.
+    ///
+    /// A table tree opened at any time writes with the namespace's storage
+    /// settings `storage` holds then.
     #[cfg(feature = "columnar")]
     fn open_tables(
         &self,
         namespace: NamespaceId,
+        storage: Arc<parking_lot::RwLock<coordinode_core::namespace::NamespaceStorage>>,
     ) -> StorageResult<(
         Arc<crate::columnar::ColumnarTableRegistry>,
         Vec<crate::columnar::TableRepair>,
@@ -138,12 +150,23 @@ impl TreeOpener {
             let seqno = Arc::clone(&self.seqno);
             let routing = self.routing.get(&Partition::Node).cloned();
             move |table_id: &str| {
-                config.to_table_tree_config(
+                let tree = config.to_table_tree_config(
                     namespace,
                     table_id,
                     Arc::clone(&seqno),
                     routing.as_ref(),
-                )
+                );
+                // A table holds node rows: it takes the node partition's codecs
+                // of the namespace. A codec the build cannot write was refused
+                // for the namespace's partitions already; the table keeps the
+                // deployment's then.
+                match config.namespace_compression_policy(Partition::Node, &storage.read()) {
+                    Ok(policy) => tree.data_block_compression_policy(policy),
+                    Err(e) => {
+                        tracing::warn!(%namespace, error = %e, "table keeps the deployment's codecs");
+                        tree
+                    }
+                }
             }
         };
         let (registry, repairs) = crate::columnar::ColumnarTableRegistry::open(
@@ -226,6 +249,28 @@ pub(crate) fn catalog_at(
         out.push((id, NamespaceRecord::decode(&value).ok_or_else(malformed)?));
     }
     Ok(out)
+}
+
+/// The storage settings of namespace `id` the catalog in `records` holds
+/// now; none set for a namespace it records nothing of.
+///
+/// # Errors
+///
+/// The record does not decode, or the read fails.
+pub(crate) fn storage_at(
+    records: &lsm_tree::AnyTree,
+    id: NamespaceId,
+) -> StorageResult<coordinode_core::namespace::NamespaceStorage> {
+    use lsm_tree::AbstractTree as _;
+    let key = coordinode_core::namespace::namespace_record_key(id);
+    match records.get(&key, lsm_tree::SeqNo::MAX)? {
+        None => Ok(coordinode_core::namespace::NamespaceStorage::default()),
+        Some(bytes) => NamespaceRecord::decode(&bytes)
+            .map(|record| record.storage)
+            .ok_or_else(|| {
+                StorageError::Serialization(format!("the catalog record of {id} does not decode"))
+            }),
+    }
 }
 
 /// Whether the catalog in `records` holds namespace `id` live at `seqno`.

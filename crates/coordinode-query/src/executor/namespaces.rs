@@ -22,6 +22,8 @@ pub struct NamespaceEntry {
     pub name: String,
     /// Whether it is being dropped; its name is free again.
     pub dropping: bool,
+    /// Its data-block storage settings; unset ones inherit the deployment's.
+    pub storage: coordinode_core::namespace::NamespaceStorage,
 }
 
 /// What a namespace catalog statement found already so, which its existence
@@ -44,14 +46,32 @@ pub enum CatalogOutcome {
     note = "the embedded database implements it over its deployment's catalog"
 )]
 pub trait NamespaceCatalog: Send + Sync {
-    /// Create namespace `name`. [`CatalogOutcome::AlreadySo`] when a live
-    /// namespace holds the name.
+    /// Create namespace `name` with the data-block storage settings
+    /// `storage`. [`CatalogOutcome::AlreadySo`] when a live namespace holds
+    /// the name.
     ///
     /// # Errors
     ///
     /// The host's refusal: a name no namespace may have, a write it could
     /// not commit.
-    fn create_namespace(&self, name: &str) -> Result<CatalogOutcome, CatalogFailure>;
+    fn create_namespace(
+        &self,
+        name: &str,
+        storage: coordinode_core::namespace::NamespaceStorage,
+    ) -> Result<CatalogOutcome, CatalogFailure>;
+
+    /// Change the storage settings `change` names of the live namespace
+    /// `name`, keeping the others.
+    ///
+    /// # Errors
+    ///
+    /// The host's refusal: no live namespace of the name, a write it could
+    /// not commit.
+    fn set_namespace_storage(
+        &self,
+        name: &str,
+        change: coordinode_core::namespace::NamespaceStorage,
+    ) -> Result<(), CatalogFailure>;
 
     /// Drop namespace `name`. [`CatalogOutcome::AlreadySo`] when no live
     /// namespace has the name.
@@ -85,9 +105,10 @@ pub(crate) fn create(
     host: Option<&dyn NamespaceCatalog>,
     name: &str,
     if_not_exists: bool,
+    storage: coordinode_core::namespace::NamespaceStorage,
 ) -> Result<Vec<Row>, ExecutionError> {
     let outcome = catalog(host)?
-        .create_namespace(name)
+        .create_namespace(name, storage)
         .map_err(ExecutionError::Catalog)?;
     if outcome == CatalogOutcome::AlreadySo && !if_not_exists {
         return Err(ExecutionError::NamespaceExists(name.to_owned()));
@@ -111,8 +132,24 @@ pub(crate) fn drop(
     Ok(vec![changed_row(name, outcome)])
 }
 
-/// `SHOW NAMESPACES`: a row per namespace, its name and state.
+/// `ALTER NAMESPACE name SET STORAGE (...)`: one row naming the namespace.
+pub(crate) fn set_storage(
+    host: Option<&dyn NamespaceCatalog>,
+    name: &str,
+    change: coordinode_core::namespace::NamespaceStorage,
+) -> Result<Vec<Row>, ExecutionError> {
+    catalog(host)?
+        .set_namespace_storage(name, change)
+        .map_err(ExecutionError::Catalog)?;
+    Ok(vec![changed_row(name, CatalogOutcome::Changed)])
+}
+
+/// `SHOW NAMESPACES`: a row per namespace, its name, state and the storage
+/// settings it sets (null for one it inherits from the deployment).
 pub(crate) fn show(host: Option<&dyn NamespaceCatalog>) -> Result<Vec<Row>, ExecutionError> {
+    let codec = |codec: Option<coordinode_core::namespace::BlockCodec>| {
+        codec.map_or(Value::Null, |codec| Value::String(codec.to_string()))
+    };
     Ok(catalog(host)?
         .namespaces()
         .map_err(ExecutionError::Catalog)?
@@ -123,6 +160,15 @@ pub(crate) fn show(host: Option<&dyn NamespaceCatalog>) -> Result<Vec<Row>, Exec
             row.insert(
                 "state".into(),
                 Value::String(if entry.dropping { "dropping" } else { "live" }.into()),
+            );
+            row.insert("compression".into(), codec(entry.storage.compression));
+            row.insert(
+                "cold_compression".into(),
+                codec(entry.storage.cold_compression),
+            );
+            row.insert(
+                "dictionaries".into(),
+                entry.storage.dictionaries.map_or(Value::Null, Value::Bool),
             );
             row
         })

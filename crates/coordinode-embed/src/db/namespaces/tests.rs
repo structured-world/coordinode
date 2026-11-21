@@ -219,6 +219,61 @@ fn transactions_of_two_namespaces_never_conflict() {
         .expect("the second namespace commits the same value");
 }
 
+/// Statements set a namespace's storage settings: a creation's `WITH (...)`
+/// in Cypher or SQL, an `ALTER ... SET STORAGE` changing only what it names;
+/// `SHOW NAMESPACES` reports them, null where the deployment's apply. An
+/// unknown namespace is refused by name.
+#[test]
+fn statements_set_a_namespaces_storage() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::namespace::{BlockCodec, NamespaceStorage};
+    let (mut database, _dir) = open();
+    database
+        .execute_cypher(
+            "CREATE NAMESPACE packed WITH (compression: 'lz4', cold_compression: 'zstd:9')",
+        )
+        .unwrap();
+    database
+        .execute_sql(
+            "ALTER NAMESPACE packed SET STORAGE (compression: 'zstd:3', dictionaries: false)",
+        )
+        .unwrap();
+    let packed = database
+        .namespaces()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "packed")
+        .unwrap();
+    assert_eq!(
+        packed.storage,
+        NamespaceStorage {
+            compression: Some(BlockCodec::Zstd(3)),
+            cold_compression: Some(BlockCodec::Zstd(9)),
+            dictionaries: Some(false),
+        }
+    );
+    let rows = database.execute_cypher("SHOW NAMESPACES").unwrap();
+    let row = |name: &str| {
+        rows.iter()
+            .find(|r| r.get("name") == Some(&Value::String(name.into())))
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(
+        row("packed").get("cold_compression"),
+        Some(&Value::String("zstd:9".into()))
+    );
+    assert_eq!(
+        row(database.namespace()).get("compression"),
+        Some(&Value::Null),
+        "a namespace that sets nothing inherits the deployment's"
+    );
+    assert!(matches!(
+        database.execute_cypher("ALTER NAMESPACE nowhere SET STORAGE (compression: 'lz4')"),
+        Err(DatabaseError::UnknownNamespace(_))
+    ));
+}
+
 /// A name no namespace may have is refused before anything is written.
 #[test]
 fn an_invalid_namespace_name_is_refused() {

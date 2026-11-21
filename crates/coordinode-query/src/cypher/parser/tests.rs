@@ -2364,6 +2364,41 @@ fn namespace_catalog_statements() {
         parse_ok("SHOW NAMESPACES").clauses[0],
         Clause::ShowNamespaces
     ));
+    use coordinode_core::namespace::{BlockCodec, NamespaceStorage};
+    match &parse_ok(
+        "CREATE NAMESPACE n WITH (compression: 'lz4', cold_compression: 'zstd:9', \
+         dictionaries: true)",
+    )
+    .clauses[0]
+    {
+        Clause::CreateNamespace(c) => assert_eq!(
+            c.storage,
+            NamespaceStorage {
+                compression: Some(BlockCodec::Lz4),
+                cold_compression: Some(BlockCodec::Zstd(9)),
+                dictionaries: Some(true),
+            }
+        ),
+        other => panic!("expected CreateNamespace, got {other:?}"),
+    }
+    match &parse_ok("ALTER NAMESPACE n SET STORAGE (compression: 'zstd:3')").clauses[0] {
+        Clause::SetNamespaceStorage(c) => {
+            assert_eq!(c.name, "n");
+            assert_eq!(c.change.compression, Some(BlockCodec::Zstd(3)));
+            assert_eq!(
+                c.change.cold_compression, None,
+                "unnamed settings stay unset"
+            );
+        }
+        other => panic!("expected SetNamespaceStorage, got {other:?}"),
+    }
+    for query in [
+        "CREATE NAMESPACE n WITH (compression: 'gzip')",
+        "CREATE NAMESPACE n WITH (dictionaries: 'yes')",
+        "ALTER NAMESPACE n SET STORAGE ()",
+    ] {
+        assert!(parse(query).is_err(), "{query}");
+    }
     for query in [
         "CREATE NAMESPACE",
         "DROP NAMESPACE IF EXISTS",

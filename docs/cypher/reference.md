@@ -326,6 +326,29 @@ DROP NAMESPACE tenant_a IF EXISTS
   `CREATE NAMESPACE [IF NOT EXISTS] name`, `DROP NAMESPACE [IF EXISTS] name`,
   `SHOW NAMESPACES`.
 
+Each namespace may set its own data-block compression:
+
+```cypher
+CREATE NAMESPACE archive WITH (compression: 'lz4', cold_compression: 'zstd:9', dictionaries: true)
+ALTER NAMESPACE archive SET STORAGE (compression: 'zstd:3')   -- changes only what it names
+```
+
+- `compression` is the codec of the hot levels, `cold_compression` of the
+  cold ones (the deployment's `cold_level_threshold` separates them): `none`,
+  `lz4`, `zstd` (level 3) or `zstd:<level>`, `-128` to `22`. `dictionaries`
+  switches the per-label zstd dictionaries for the namespace's eligible
+  output.
+- A setting the namespace does not set inherits the deployment's (the
+  partition's override, else its hot or cold codec). `SHOW NAMESPACES`
+  reports `compression`, `cold_compression` and `dictionaries`, null where
+  the deployment's apply.
+- A change applies to what the namespace writes next: each tree's next flush
+  or compaction, on every member. Nothing is rewritten for it; existing
+  tables read back with the codec they recorded, and compaction moves data
+  to the new codec as it rewrites it.
+- The SQL frontend takes the same `WITH (...)` and `ALTER NAMESPACE ... SET
+  STORAGE (...)`.
+
 #### CREATE NODE TYPE / CREATE EDGE TYPE ✅ 🔷
 
 CoordiNode extension. Declares a label or edge-type schema upfront so the engine knows the property contract (and, for `TEMPORAL` types, the bitemporal storage layout). Both forms accept an optional `TEMPORAL` modifier and an optional `WITH (...)` property declaration block.

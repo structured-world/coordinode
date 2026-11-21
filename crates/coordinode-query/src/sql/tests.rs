@@ -9,11 +9,13 @@ fn plan(sql: &str) -> LogicalOp {
 /// a malformed one is refused rather than parsed as something else.
 #[test]
 fn namespace_catalog_statements_lower_to_catalog_operators() {
+    use coordinode_core::namespace::{BlockCodec, NamespaceStorage};
     assert_eq!(
         plan("CREATE NAMESPACE tenant_a"),
         LogicalOp::CreateNamespace {
             name: "tenant_a".into(),
             if_not_exists: false,
+            storage: NamespaceStorage::default(),
         }
     );
     assert_eq!(
@@ -21,6 +23,32 @@ fn namespace_catalog_statements_lower_to_catalog_operators() {
         LogicalOp::CreateNamespace {
             name: "Tenant B".into(),
             if_not_exists: true,
+            storage: NamespaceStorage::default(),
+        }
+    );
+    assert_eq!(
+        plan(
+            "CREATE NAMESPACE n WITH (compression: 'lz4', cold_compression: 'zstd:9', \
+             dictionaries: true)"
+        ),
+        LogicalOp::CreateNamespace {
+            name: "n".into(),
+            if_not_exists: false,
+            storage: NamespaceStorage {
+                compression: Some(BlockCodec::Lz4),
+                cold_compression: Some(BlockCodec::Zstd(9)),
+                dictionaries: Some(true),
+            },
+        }
+    );
+    assert_eq!(
+        plan("ALTER NAMESPACE n SET STORAGE (compression: 'zstd:3')"),
+        LogicalOp::SetNamespaceStorage {
+            name: "n".into(),
+            change: NamespaceStorage {
+                compression: Some(BlockCodec::Zstd(3)),
+                ..NamespaceStorage::default()
+            },
         }
     );
     assert_eq!(
@@ -41,6 +69,10 @@ fn namespace_catalog_statements_lower_to_catalog_operators() {
         "CREATE NAMESPACE",
         "CREATE NAMESPACE IF EXISTS a",
         "DROP NAMESPACE a b",
+        "CREATE NAMESPACE n WITH (compression: 'gzip')",
+        "CREATE NAMESPACE n WITH (level: 'lz4')",
+        "ALTER NAMESPACE n SET STORAGE ()",
+        "ALTER NAMESPACE n RENAME TO m",
     ] {
         assert!(frontend.parse(sql).is_err(), "{sql}");
     }

@@ -31,6 +31,7 @@ clause = {
   | alter_node_type_implies_clause
   | alter_index_clause
   | reindex_clause
+  | alter_namespace_storage_clause
   | alter_namespace_clause
   | create_namespace_clause
   | drop_namespace_clause
@@ -323,9 +324,14 @@ alter_namespace_clause = { kw_alter ~ kw_namespace ~ kw_set ~ kw_index ~ kw_main
 // The deployment's namespace catalog, worded as Neo4j words its database
 // catalog: CREATE NAMESPACE name [IF NOT EXISTS], DROP NAMESPACE name
 // [IF EXISTS], SHOW NAMESPACES.
-create_namespace_clause = { kw_create ~ kw_namespace ~ identifier ~ if_not_exists? }
+create_namespace_clause = { kw_create ~ kw_namespace ~ identifier ~ if_not_exists? ~ (kw_with ~ storage_settings)? }
 drop_namespace_clause   = { kw_drop ~ kw_namespace ~ identifier ~ if_exists? }
 show_namespaces_clause  = { kw_show ~ kw_namespaces }
+// ALTER NAMESPACE name SET STORAGE (compression: 'zstd:3'): changes only
+// the settings it names.
+alter_namespace_storage_clause = { kw_alter ~ kw_namespace ~ identifier ~ kw_set ~ kw_storage ~ storage_settings }
+storage_settings = { "(" ~ storage_setting ~ ("," ~ storage_setting)* ~ ")" }
+storage_setting  = { identifier ~ ":" ~ (string_literal | boolean_literal) }
 
 // --- CREATE EDGE TYPE ---
 

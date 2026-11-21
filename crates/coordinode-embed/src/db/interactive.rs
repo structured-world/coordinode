@@ -572,6 +572,7 @@ impl Database {
 
     /// Whether this database holds an open interactive transaction, which
     /// closing it would lose.
+    #[cfg(feature = "replication")]
     pub(crate) fn holds_open_transactions(&self) -> bool {
         !self.interactive.contexts.lock().is_empty()
     }

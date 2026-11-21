@@ -404,6 +404,11 @@ fn write_clause(buf: &mut String, clause: &Clause) {
             buf.push_str("DROP NAMESPACE ");
             buf.push_str(&c.name);
         }
+        Clause::SetNamespaceStorage(c) => {
+            buf.push_str("ALTER NAMESPACE ");
+            buf.push_str(&c.name);
+            buf.push_str(" SET STORAGE");
+        }
         Clause::ShowNamespaces => buf.push_str("SHOW NAMESPACES"),
         Clause::CreateVectorIndex(c) => {
             buf.push_str("CREATE VECTOR INDEX ");

@@ -6,7 +6,7 @@
 //! write, so a member of a group changes the catalog through the group's log
 //! and every member applies it in the same order.
 
-use coordinode_core::namespace::{NamespaceState, validate_namespace_name};
+use coordinode_core::namespace::{NamespaceState, NamespaceStorage, validate_namespace_name};
 use coordinode_core::txn::proposal::{MetadataCommand, Mutation};
 use coordinode_query::executor::namespaces::{CatalogFailure, CatalogOutcome, NamespaceEntry};
 use coordinode_storage::engine::metadata;
@@ -21,6 +21,8 @@ pub struct NamespaceInfo {
     /// Whether it is live, or being dropped: a dropping namespace is named
     /// by no session, and its name is free again.
     pub dropping: bool,
+    /// Its data-block storage settings; unset ones inherit the deployment's.
+    pub storage: NamespaceStorage,
 }
 
 impl Database {
@@ -82,6 +84,21 @@ impl Database {
     /// including one a concurrent creation took first; the write path's
     /// errors (a follower answers [`DatabaseError::NotLeader`]).
     pub fn create_namespace(&self, name: &str) -> Result<(), DatabaseError> {
+        self.create_namespace_with(name, NamespaceStorage::default())
+    }
+
+    /// [`Self::create_namespace`] with the data-block storage settings
+    /// `storage`: the codec of its hot and cold levels and whether it uses
+    /// the per-label dictionaries. Each unset one inherits the deployment's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_namespace`].
+    pub fn create_namespace_with(
+        &self,
+        name: &str,
+        storage: NamespaceStorage,
+    ) -> Result<(), DatabaseError> {
         validate_namespace_name(name).map_err(|e| DatabaseError::NamespaceRefused {
             name: name.to_owned(),
             reason: e.to_string(),
@@ -96,6 +113,7 @@ impl Database {
         self.propose_mutation(Mutation::Command(MetadataCommand::CreateNamespace {
             name: name.to_owned(),
             token,
+            storage,
         }))?;
         let id = metadata::namespace_by_name(deployment, name)?
             .ok_or_else(|| DatabaseError::NamespaceExists(name.to_owned()))?;
@@ -131,6 +149,29 @@ impl Database {
         Ok(())
     }
 
+    /// Change the storage settings `change` names of the live namespace
+    /// `name`, keeping the others: its trees write with them from their next
+    /// flush or compaction, on every member; nothing already written is
+    /// rewritten for it.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::UnknownNamespace`] when no live namespace has the
+    /// name; the write path's errors.
+    pub fn set_namespace_storage(
+        &self,
+        name: &str,
+        change: NamespaceStorage,
+    ) -> Result<(), DatabaseError> {
+        if metadata::namespace_by_name(self.engine.deployment(), name)?.is_none() {
+            return Err(DatabaseError::UnknownNamespace(name.to_owned()));
+        }
+        self.propose_mutation(Mutation::Command(MetadataCommand::SetNamespaceStorage {
+            name: name.to_owned(),
+            change,
+        }))
+    }
+
     /// Close the trees of every namespace of the deployment that no handle
     /// holds and nothing reached since the previous call, flushing them
     /// first; each opens again from disk on its next use. A replicated
@@ -156,6 +197,7 @@ impl Database {
             .map(|(_, record)| NamespaceInfo {
                 name: record.name,
                 dropping: record.state == NamespaceState::Dropping,
+                storage: record.storage,
             })
             .collect())
     }
@@ -164,12 +206,24 @@ impl Database {
 /// The statements' path to the catalog is the embedded API's: one way a
 /// namespace is created or dropped, whichever surface asks.
 impl coordinode_query::executor::namespaces::NamespaceCatalog for Database {
-    fn create_namespace(&self, name: &str) -> Result<CatalogOutcome, CatalogFailure> {
-        match Database::create_namespace(self, name) {
+    fn create_namespace(
+        &self,
+        name: &str,
+        storage: NamespaceStorage,
+    ) -> Result<CatalogOutcome, CatalogFailure> {
+        match Database::create_namespace_with(self, name, storage) {
             Ok(()) => Ok(CatalogOutcome::Changed),
             Err(DatabaseError::NamespaceExists(_)) => Ok(CatalogOutcome::AlreadySo),
             Err(e) => Err(Box::new(e)),
         }
+    }
+
+    fn set_namespace_storage(
+        &self,
+        name: &str,
+        change: NamespaceStorage,
+    ) -> Result<(), CatalogFailure> {
+        Ok(Database::set_namespace_storage(self, name, change)?)
     }
 
     fn drop_namespace(&self, name: &str) -> Result<CatalogOutcome, CatalogFailure> {
@@ -186,6 +240,7 @@ impl coordinode_query::executor::namespaces::NamespaceCatalog for Database {
             .map(|n| NamespaceEntry {
                 name: n.name,
                 dropping: n.dropping,
+                storage: n.storage,
             })
             .collect())
     }

@@ -333,6 +333,9 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             clauses.push(Clause::DropNamespace(namespace_clause(pair, "DROP")?));
         }
         Rule::show_namespaces_clause => clauses.push(Clause::ShowNamespaces),
+        Rule::alter_namespace_storage_clause => {
+            clauses.push(Clause::SetNamespaceStorage(namespace_storage_clause(pair)?));
+        }
         Rule::create_vector_index_clause => {
             let c = build_create_vector_index_clause(pair)?;
             clauses.push(Clause::CreateVectorIndex(c));
@@ -1272,24 +1275,18 @@ fn maintenance_choice(text: &str) -> Result<IndexMaintenanceChoice, ParseError> 
     profile_choice(text).map(IndexMaintenanceChoice::Profile)
 }
 
-/// The name and existence guard of a `CREATE` or `DROP NAMESPACE` clause
-/// (`verb` names which, for the error). A backtick-quoted name is the text
-/// between the backticks.
+/// The name, existence guard and storage settings of a `CREATE` or `DROP
+/// NAMESPACE` clause (`verb` names which, for the error). A backtick-quoted
+/// name is the text between the backticks.
 fn namespace_clause(pair: Pair<'_, Rule>, verb: &str) -> Result<NamespaceClause, ParseError> {
     let mut name = None;
     let mut if_state_holds = false;
+    let mut storage = coordinode_core::namespace::NamespaceStorage::default();
     for inner in pair.into_inner() {
         match inner.as_rule() {
-            Rule::identifier => {
-                let text = inner.as_str();
-                name = Some(
-                    text.strip_prefix('`')
-                        .and_then(|t| t.strip_suffix('`'))
-                        .unwrap_or(text)
-                        .to_string(),
-                );
-            }
+            Rule::identifier => name = Some(unquoted(inner.as_str())),
             Rule::if_not_exists | Rule::if_exists => if_state_holds = true,
+            Rule::storage_settings => storage = storage_settings(inner)?,
             _ => {}
         }
     }
@@ -1298,7 +1295,74 @@ fn namespace_clause(pair: Pair<'_, Rule>, verb: &str) -> Result<NamespaceClause,
     Ok(NamespaceClause {
         name,
         if_state_holds,
+        storage,
     })
+}
+
+/// `ALTER NAMESPACE name SET STORAGE (...)`.
+fn namespace_storage_clause(pair: Pair<'_, Rule>) -> Result<NamespaceStorageClause, ParseError> {
+    let mut name = None;
+    let mut change = None;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => name = Some(unquoted(inner.as_str())),
+            Rule::storage_settings => change = Some(storage_settings(inner)?),
+            _ => {}
+        }
+    }
+    Ok(NamespaceStorageClause {
+        name: name.ok_or_else(|| ParseError::Invalid("ALTER NAMESPACE requires a name".into()))?,
+        change: change.ok_or_else(|| {
+            ParseError::Invalid("ALTER NAMESPACE ... SET STORAGE requires its settings".into())
+        })?,
+    })
+}
+
+/// An identifier's text: the text between the backticks of a quoted one.
+fn unquoted(text: &str) -> String {
+    text.strip_prefix('`')
+        .and_then(|t| t.strip_suffix('`'))
+        .unwrap_or(text)
+        .to_string()
+}
+
+/// The storage settings `(key: value, ...)` names.
+fn storage_settings(
+    pair: Pair<'_, Rule>,
+) -> Result<coordinode_core::namespace::NamespaceStorage, ParseError> {
+    use coordinode_core::namespace::{NamespaceStorage, StorageSetting};
+    enum Parsed {
+        Text(String),
+        Bool(bool),
+    }
+    let mut settings: Vec<(String, Parsed)> = Vec::new();
+    for setting in pair.into_inner() {
+        let mut parts = setting.into_inner();
+        let key = parts
+            .next()
+            .map(|p| unquoted(p.as_str()))
+            .ok_or_else(|| ParseError::Invalid("a storage setting needs a name".into()))?;
+        let value = parts
+            .next()
+            .ok_or_else(|| ParseError::Invalid(format!("storage setting '{key}' needs a value")))?;
+        let value = if value.as_rule() == Rule::string_literal {
+            match build_string_literal(value)? {
+                Expr::Literal(Value::String(text)) => Parsed::Text(text),
+                _ => return Err(ParseError::Invalid("a storage setting value".into())),
+            }
+        } else {
+            Parsed::Bool(value.as_str().eq_ignore_ascii_case("true"))
+        };
+        settings.push((key, value));
+    }
+    NamespaceStorage::from_settings(settings.iter().map(|(key, value)| {
+        let value = match value {
+            Parsed::Text(text) => StorageSetting::Text(text),
+            Parsed::Bool(on) => StorageSetting::Bool(*on),
+        };
+        (key.as_str(), value)
+    }))
+    .map_err(ParseError::Invalid)
 }
 
 fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeClause, ParseError> {

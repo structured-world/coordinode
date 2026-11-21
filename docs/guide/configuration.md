@@ -855,6 +855,15 @@ oplog is not compressed (for the inter-node wire, see `wire_compression_level`).
 An unknown codec, a level zstd cannot store, a threshold past `7`, an unknown
 partition and an unknown key are refused when the file is read.
 
+A namespace may set its own codecs, kept in the deployment's catalog rather
+than this file (`CREATE NAMESPACE n WITH (compression: 'lz4', cold_compression:
+'zstd:9')`, `ALTER NAMESPACE n SET STORAGE (...)`, see the Cypher reference).
+For each band of levels the namespace's codec wins; a band it does not set
+takes the partition's entry under `partitions`, else `hot` or `cold`.
+`cold_level_threshold` stays the deployment's and splits the bands for every
+namespace. A namespace's change applies live, from each of its trees' next
+flush or compaction, with no restart.
+
 ## Storage topology
 
 By default a node uses a single storage endpoint: a durable HDD warm-tier

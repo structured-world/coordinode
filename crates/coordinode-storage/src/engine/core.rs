@@ -1411,7 +1411,7 @@ impl Deployment {
             }
         }
         for id in to_open {
-            let (set, repairs) = opener.open_namespace(id)?;
+            let (set, repairs) = opener.open_namespace(id, &deployment_tree)?;
             open_repairs.extend(repairs);
             namespace_sets.insert(id, set);
         }
@@ -1588,7 +1588,8 @@ impl Deployment {
                                         lsm_tree::SeqNo::MAX,
                                     )?
                                 {
-                                    let (set, repairs) = opener.open_namespace(id)?;
+                                    let (set, repairs) =
+                                        opener.open_namespace(id, &deployment_tree)?;
                                     open_repairs.extend(repairs);
                                     for (tree_id, tree) in set.iter() {
                                         note_journal_coverage(
@@ -3222,7 +3223,9 @@ impl Deployment {
                 tree.wait();
             }
         }
-        let (set, repairs) = self.opener.open_namespace(namespace)?;
+        let (set, repairs) = self
+            .opener
+            .open_namespace(namespace, self.system_tree(Partition::Deployment)?)?;
         for repair in repairs {
             // A namespace that opens after the store is one created since:
             // a repair of its trees has nothing earlier to lose.
@@ -7500,6 +7503,23 @@ impl Deployment {
     /// one a live namespace holds, or a store holding a group's history; a
     /// write failure.
     pub fn create_namespace(&self, name: &str) -> StorageResult<NamespaceId> {
+        self.create_namespace_with(
+            name,
+            coordinode_core::namespace::NamespaceStorage::default(),
+        )
+    }
+
+    /// [`Self::create_namespace`] with the data-block storage settings
+    /// `storage`; unset ones inherit the deployment's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_namespace`].
+    pub fn create_namespace_with(
+        &self,
+        name: &str,
+        storage: coordinode_core::namespace::NamespaceStorage,
+    ) -> StorageResult<NamespaceId> {
         let refused = |reason: String| StorageError::NamespaceRefused {
             name: name.to_owned(),
             reason,
@@ -7513,6 +7533,7 @@ impl Deployment {
             coordinode_core::txn::proposal::MetadataCommand::CreateNamespace {
                 name: name.to_owned(),
                 token,
+                storage,
             },
         )?;
         let taken = || refused("a live namespace has the name".into());
@@ -7549,6 +7570,50 @@ impl Deployment {
             },
         )?;
         Ok(id)
+    }
+
+    /// Change the storage settings `change` names of the live namespace
+    /// `name`, keeping the others; its trees write with them from their next
+    /// flush or compaction. For a store that is not a member of a group.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NoSuchNamespace`] when no live namespace has the
+    /// name; [`StorageError::NamespaceRefused`] on a store holding a group's
+    /// history; a write failure.
+    pub fn set_namespace_storage(
+        &self,
+        name: &str,
+        change: coordinode_core::namespace::NamespaceStorage,
+    ) -> StorageResult<()> {
+        self.namespace_id(name)?;
+        self.refuse_local_catalog_change()
+            .map_err(|e| StorageError::NamespaceRefused {
+                name: name.to_owned(),
+                reason: e.to_string(),
+            })?;
+        self.commit_command(
+            coordinode_core::txn::proposal::MetadataCommand::SetNamespaceStorage {
+                name: name.to_owned(),
+                change,
+            },
+        )
+    }
+
+    /// The storage settings of the live namespace called `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NoSuchNamespace`] when none is; the catalog cannot be
+    /// read.
+    pub fn namespace_storage(
+        &self,
+        name: &str,
+    ) -> StorageResult<coordinode_core::namespace::NamespaceStorage> {
+        let id = self.namespace_id(name)?;
+        Ok(crate::engine::metadata::namespace_record(self, id)?
+            .map(|record| record.storage)
+            .unwrap_or_default())
     }
 
     /// The live namespace called `name`.
@@ -7648,8 +7713,59 @@ impl Deployment {
             let Some(id) = decode_namespace_record_key(key) else {
                 continue;
             };
-            if NamespaceRecord::decode(value).is_some_and(|r| r.state == NamespaceState::Dropping) {
-                self.retire_namespace(id);
+            match NamespaceRecord::decode(value) {
+                Some(record) if record.state == NamespaceState::Dropping => {
+                    self.retire_namespace(id);
+                }
+                Some(record) => self.apply_namespace_storage(id, record.storage),
+                None => {}
+            }
+        }
+    }
+
+    /// Have namespace `id`'s open trees write with `storage` from their next
+    /// flush or compaction on, and tables opened later too: a committed
+    /// change applies where it lands, without a rewrite. Data already
+    /// written keeps the codec its tables recorded until compaction rewrites
+    /// it. A namespace not open takes the settings when it opens.
+    fn apply_namespace_storage(
+        &self,
+        id: NamespaceId,
+        storage: coordinode_core::namespace::NamespaceStorage,
+    ) {
+        let Some(set) = self.coordinator.sets().namespace(id) else {
+            return;
+        };
+        set.set_storage(storage);
+        let retune = |part: Partition, tree: &lsm_tree::AnyTree| {
+            let policy = match self
+                .opener
+                .config
+                .namespace_compression_policy(part, &storage)
+            {
+                Ok(policy) => policy,
+                Err(e) => {
+                    tracing::warn!(%id, error = %e, "namespace codecs not applied");
+                    return;
+                }
+            };
+            let inner = match tree {
+                lsm_tree::AnyTree::Standard(t) => t,
+                lsm_tree::AnyTree::Blob(bt) => &bt.index,
+            };
+            if let Err(e) = inner
+                .update_runtime_config(|cfg| cfg.data_block_compression_policy = policy.clone())
+            {
+                tracing::warn!(%id, error = %e, "namespace codecs not applied to a tree");
+            }
+        };
+        for (tree_id, tree) in set.iter() {
+            retune(tree_id.part, tree);
+        }
+        #[cfg(feature = "columnar")]
+        if let Some(registry) = set.columnar() {
+            for table_id in registry.table_ids() {
+                registry.with_live(&table_id, |tree| retune(Partition::Node, tree));
             }
         }
     }
@@ -8237,7 +8353,8 @@ impl Deployment {
                     | MetadataCommand::RecordDeployment { .. }
                     | MetadataCommand::ConditionalRegistryWrite { .. }
                     | MetadataCommand::CreateNamespace { .. }
-                    | MetadataCommand::DropNamespace { .. } => DictionaryChange::None,
+                    | MetadataCommand::DropNamespace { .. }
+                    | MetadataCommand::SetNamespaceStorage { .. } => DictionaryChange::None,
                 };
             }
             effects.extend(decided_effects);

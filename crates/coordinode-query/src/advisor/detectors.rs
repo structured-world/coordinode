@@ -427,6 +427,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::SetNamespaceIndexDefault { .. }
         | LogicalOp::CreateNamespace { .. }
         | LogicalOp::DropNamespace { .. }
+        | LogicalOp::SetNamespaceStorage { .. }
         | LogicalOp::ShowNamespaces
         | LogicalOp::IndexScan { .. } => vec![],
         // A counter read: its fallback scan runs only when the counter

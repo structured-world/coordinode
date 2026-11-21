@@ -104,6 +104,9 @@ pub enum Rule {
     r#create_namespace_clause,
     r#drop_namespace_clause,
     r#show_namespaces_clause,
+    r#alter_namespace_storage_clause,
+    r#storage_settings,
+    r#storage_setting,
     r#create_edge_type_clause,
     r#edge_type_properties,
     r#edge_discriminated_by,
@@ -513,6 +516,9 @@ impl Rule {
             Rule::r#create_namespace_clause,
             Rule::r#drop_namespace_clause,
             Rule::r#show_namespaces_clause,
+            Rule::r#alter_namespace_storage_clause,
+            Rule::r#storage_settings,
+            Rule::r#storage_setting,
             Rule::r#create_edge_type_clause,
             Rule::r#edge_type_properties,
             Rule::r#edge_discriminated_by,
@@ -1080,6 +1086,9 @@ impl ::pest::Parser<Rule> for CypherParser {
                                     })
                                     .or_else(|state| { self::r#alter_index_clause(state) })
                                     .or_else(|state| { self::r#reindex_clause(state) })
+                                    .or_else(|state| {
+                                        self::r#alter_namespace_storage_clause(state)
+                                    })
                                     .or_else(|state| { self::r#alter_namespace_clause(state) })
                                     .or_else(|state| { self::r#create_namespace_clause(state) })
                                     .or_else(|state| { self::r#drop_namespace_clause(state) })
@@ -3981,6 +3990,18 @@ impl ::pest::Parser<Rule> for CypherParser {
                                             .and_then(|state| {
                                                 state.optional(|state| { self::r#if_not_exists(state) })
                                             })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state
+                                                    .optional(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#kw_with(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#storage_settings(state) })
+                                                            })
+                                                    })
+                                            })
                                     })
                             },
                         )
@@ -4027,6 +4048,116 @@ impl ::pest::Parser<Rule> for CypherParser {
                                         self::r#kw_show(state)
                                             .and_then(|state| { super::hidden::skip(state) })
                                             .and_then(|state| { self::r#kw_namespaces(state) })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#alter_namespace_storage_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#alter_namespace_storage_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_alter(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_namespace(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#identifier(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_set(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_storage(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#storage_settings(state) })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#storage_settings(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#storage_settings,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        state
+                                            .match_string("(")
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#storage_setting(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state
+                                                    .sequence(|state| {
+                                                        state
+                                                            .optional(|state| {
+                                                                state
+                                                                    .sequence(|state| {
+                                                                        state
+                                                                            .match_string(",")
+                                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                                            .and_then(|state| { self::r#storage_setting(state) })
+                                                                    })
+                                                                    .and_then(|state| {
+                                                                        state
+                                                                            .repeat(|state| {
+                                                                                state
+                                                                                    .sequence(|state| {
+                                                                                        super::hidden::skip(state)
+                                                                                            .and_then(|state| {
+                                                                                                state
+                                                                                                    .sequence(|state| {
+                                                                                                        state
+                                                                                                            .match_string(",")
+                                                                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                                                                            .and_then(|state| { self::r#storage_setting(state) })
+                                                                                                    })
+                                                                                            })
+                                                                                    })
+                                                                            })
+                                                                    })
+                                                            })
+                                                    })
+                                            })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { state.match_string(")") })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#storage_setting(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#storage_setting,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#identifier(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { state.match_string(":") })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                self::r#string_literal(state)
+                                                    .or_else(|state| { self::r#boolean_literal(state) })
+                                            })
                                     })
                             },
                         )
@@ -14552,6 +14683,11 @@ impl ::pest::Parser<Rule> for CypherParser {
                     Rule::r#show_namespaces_clause => {
                         rules::r#show_namespaces_clause(state)
                     }
+                    Rule::r#alter_namespace_storage_clause => {
+                        rules::r#alter_namespace_storage_clause(state)
+                    }
+                    Rule::r#storage_settings => rules::r#storage_settings(state),
+                    Rule::r#storage_setting => rules::r#storage_setting(state),
                     Rule::r#create_edge_type_clause => {
                         rules::r#create_edge_type_clause(state)
                     }

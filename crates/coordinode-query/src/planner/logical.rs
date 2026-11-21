@@ -583,7 +583,17 @@ pub enum LogicalOp {
 
     /// Create namespace `name` in the deployment's catalog; with
     /// `if_not_exists`, a live namespace of the name is success.
-    CreateNamespace { name: String, if_not_exists: bool },
+    CreateNamespace {
+        name: String,
+        if_not_exists: bool,
+        storage: coordinode_core::namespace::NamespaceStorage,
+    },
+
+    /// Change the storage settings `change` names of namespace `name`.
+    SetNamespaceStorage {
+        name: String,
+        change: coordinode_core::namespace::NamespaceStorage,
+    },
 
     /// Drop namespace `name` from the deployment's catalog; with
     /// `if_exists`, an unknown name is success.
@@ -1107,6 +1117,7 @@ impl LogicalOp {
             Self::SetNamespaceIndexDefault { .. } => "SetNamespaceIndexDefault",
             Self::CreateNamespace { .. } => "CreateNamespace",
             Self::DropNamespace { .. } => "DropNamespace",
+            Self::SetNamespaceStorage { .. } => "SetNamespaceStorage",
             Self::ShowNamespaces => "ShowNamespaces",
             Self::CreateVectorIndex { .. } => "CreateVectorIndex",
             Self::DropVectorIndex { .. } => "DropVectorIndex",
@@ -1220,6 +1231,7 @@ impl LogicalOp {
             | LogicalOp::SetNamespaceIndexDefault { .. }
             | LogicalOp::CreateNamespace { .. }
             | LogicalOp::DropNamespace { .. }
+            | LogicalOp::SetNamespaceStorage { .. }
             | LogicalOp::ShowNamespaces
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
@@ -1549,6 +1561,7 @@ impl LogicalOp {
             | LogicalOp::SetNamespaceIndexDefault { .. }
             | LogicalOp::CreateNamespace { .. }
             | LogicalOp::DropNamespace { .. }
+            | LogicalOp::SetNamespaceStorage { .. }
             | LogicalOp::ShowNamespaces
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
@@ -2205,6 +2218,7 @@ fn estimate_op_cost(
         | LogicalOp::SetNamespaceIndexDefault { .. }
         | LogicalOp::CreateNamespace { .. }
         | LogicalOp::DropNamespace { .. }
+        | LogicalOp::SetNamespaceStorage { .. }
         | LogicalOp::ShowNamespaces
         | LogicalOp::CreateVectorIndex { .. }
         | LogicalOp::DropVectorIndex { .. }
@@ -2980,6 +2994,9 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         }
         LogicalOp::DropNamespace { name, .. } => {
             output.push_str(&format!("{prefix}DropNamespace({name})\n"));
+        }
+        LogicalOp::SetNamespaceStorage { name, .. } => {
+            output.push_str(&format!("{prefix}SetNamespaceStorage({name})\n"));
         }
         LogicalOp::ShowNamespaces => output.push_str(&format!("{prefix}ShowNamespaces\n")),
         LogicalOp::CreateVectorIndex {

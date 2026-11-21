@@ -1544,6 +1544,77 @@ async fn a_namespace_created_on_the_leader_serves_on_every_member() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A namespace's storage settings travel through the group's log: set on
+/// the leader at creation and changed there, every member's catalog holds
+/// the merged settings; a follower refuses the change, naming the leader.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_namespaces_storage_settings_reach_every_member() {
+    use coordinode_core::namespace::{BlockCodec, NamespaceStorage};
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        members[0]
+            .database()
+            .read()
+            .create_namespace_with(
+                "archive",
+                NamespaceStorage {
+                    cold_compression: Some(BlockCodec::Zstd(9)),
+                    ..NamespaceStorage::default()
+                },
+            )
+            .unwrap();
+        let change = NamespaceStorage {
+            compression: Some(BlockCodec::Lz4),
+            ..NamespaceStorage::default()
+        };
+        // The follower names the namespace once it has applied the creation.
+        wait_until("the follower holds the namespace", || {
+            members[1]
+                .database()
+                .read()
+                .namespaces()
+                .is_ok_and(|all| all.iter().any(|n| n.name == "archive"))
+        })
+        .await;
+        let refused = members[1]
+            .database()
+            .read()
+            .set_namespace_storage("archive", change);
+        assert!(
+            matches!(
+                refused,
+                Err(DatabaseError::NotLeader { leader_id: Some(1) })
+            ),
+            "{refused:?}"
+        );
+        members[0]
+            .database()
+            .read()
+            .set_namespace_storage("archive", change)
+            .unwrap();
+        let expected = NamespaceStorage {
+            compression: Some(BlockCodec::Lz4),
+            cold_compression: Some(BlockCodec::Zstd(9)),
+            dictionaries: None,
+        };
+        for m in &members {
+            wait_until("the member's catalog holds the settings", || {
+                m.database().read().namespaces().is_ok_and(|all| {
+                    all.iter()
+                        .any(|n| n.name == "archive" && n.storage == expected)
+                })
+            })
+            .await;
+        }
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A j:memory write on the leader is answered once the leader's log holds
 /// it, and goes through the group's log like any write: it reaches every
 /// member exactly once, its label count included.

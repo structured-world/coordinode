@@ -240,17 +240,27 @@ fn namespace_statement(text: &str) -> Result<Option<(LogicalOp, String)>, Fronte
                 Some(Token::Word(w)) => w.value.clone(),
                 _ => return Err(unsupported(&format!("{verb} NAMESPACE without a name"))),
             };
+            let storage = if create && keyword(words.peek(), "WITH") {
+                words.next();
+                storage_settings(&mut words)?
+            } else {
+                coordinode_core::namespace::NamespaceStorage::default()
+            };
             end_of_statement(&mut words)?;
             let guard_text = match (create, guard) {
                 (true, true) => "IF NOT EXISTS ",
                 (false, true) => "IF EXISTS ",
                 (_, false) => "",
             };
-            let canonical = format!("{verb} NAMESPACE {guard_text}{name}");
+            let canonical = format!(
+                "{verb} NAMESPACE {guard_text}{name}{}",
+                storage_text(" WITH ", &storage)
+            );
             let op = if create {
                 LogicalOp::CreateNamespace {
                     name,
                     if_not_exists: guard,
+                    storage,
                 }
             } else {
                 LogicalOp::DropNamespace {
@@ -260,8 +270,102 @@ fn namespace_statement(text: &str) -> Result<Option<(LogicalOp, String)>, Fronte
             };
             Ok(Some((op, canonical)))
         }
+        // ALTER NAMESPACE name SET STORAGE (...); any other ALTER is the
+        // parser's.
+        "ALTER" => {
+            if !keyword(words.peek(), "NAMESPACE") {
+                return Ok(None);
+            }
+            words.next();
+            let name = match words.next() {
+                Some(Token::Word(w)) => w.value.clone(),
+                _ => return Err(unsupported("ALTER NAMESPACE without a name")),
+            };
+            if !keyword(words.next().as_ref(), "SET") || !keyword(words.next().as_ref(), "STORAGE")
+            {
+                return Err(unsupported("ALTER NAMESPACE other than SET STORAGE"));
+            }
+            let change = storage_settings(&mut words)?;
+            end_of_statement(&mut words)?;
+            let canonical = format!(
+                "ALTER NAMESPACE {name} SET STORAGE{}",
+                storage_text(" ", &change)
+            );
+            Ok(Some((
+                LogicalOp::SetNamespaceStorage { name, change },
+                canonical,
+            )))
+        }
         _ => Ok(None),
     }
+}
+
+/// The settings `(key: value, ...)` of a namespace statement, read from its
+/// tokens.
+fn storage_settings<'a>(
+    words: &mut impl Iterator<Item = &'a Token>,
+) -> Result<coordinode_core::namespace::NamespaceStorage, FrontendError> {
+    use coordinode_core::namespace::{NamespaceStorage, StorageSetting};
+    if !matches!(words.next(), Some(Token::LParen)) {
+        return Err(unsupported("storage settings start with '('"));
+    }
+    let mut settings: Vec<(String, StorageSetting<'a>)> = Vec::new();
+    loop {
+        let key = match words.next() {
+            Some(Token::Word(w)) => w.value.clone(),
+            _ => return Err(unsupported("a storage setting needs a name")),
+        };
+        if !matches!(words.next(), Some(Token::Colon)) {
+            return Err(unsupported(&format!("storage setting '{key}' needs ':'")));
+        }
+        let value = match words.next() {
+            Some(Token::SingleQuotedString(text) | Token::DoubleQuotedString(text)) => {
+                StorageSetting::Text(text.as_str())
+            }
+            Some(Token::Word(w))
+                if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("true") =>
+            {
+                StorageSetting::Bool(true)
+            }
+            Some(Token::Word(w))
+                if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("false") =>
+            {
+                StorageSetting::Bool(false)
+            }
+            _ => {
+                return Err(unsupported(&format!(
+                    "storage setting '{key}' needs a value"
+                )));
+            }
+        };
+        settings.push((key, value));
+        match words.next() {
+            Some(Token::Comma) => {}
+            Some(Token::RParen) => break,
+            _ => return Err(unsupported("storage settings end with ')'")),
+        }
+    }
+    NamespaceStorage::from_settings(settings.iter().map(|(key, value)| (key.as_str(), *value)))
+        .map_err(FrontendError::Message)
+}
+
+/// The settings `storage` names, as a statement spells them, after `lead`;
+/// empty when it names none.
+fn storage_text(lead: &str, storage: &coordinode_core::namespace::NamespaceStorage) -> String {
+    let mut parts = Vec::new();
+    if let Some(codec) = storage.compression {
+        parts.push(format!("compression: '{codec}'"));
+    }
+    if let Some(codec) = storage.cold_compression {
+        parts.push(format!("cold_compression: '{codec}'"));
+    }
+    if let Some(on) = storage.dictionaries {
+        parts.push(format!("dictionaries: {on}"));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("{lead}({})", parts.join(", "))
 }
 
 /// Nothing but an optional `;` after a namespace statement.

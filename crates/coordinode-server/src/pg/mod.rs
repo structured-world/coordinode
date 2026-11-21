@@ -156,6 +156,7 @@ fn command_tag(query: &str) -> Tag {
         ("DELETE", _) => Tag::new("DELETE").with_rows(0),
         ("CREATE", true) => Tag::new("CREATE NAMESPACE"),
         ("DROP", true) => Tag::new("DROP NAMESPACE"),
+        ("ALTER", true) => Tag::new("ALTER NAMESPACE"),
         ("CREATE", false) => Tag::new("CREATE TABLE"),
         ("DROP", false) => Tag::new("DROP TABLE"),
         _ => Tag::new("OK"),

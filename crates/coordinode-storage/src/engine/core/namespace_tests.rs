@@ -361,6 +361,105 @@ fn a_drop_removes_the_namespace_and_nothing_else() {
     assert!(!a_dir.exists(), "the dropped namespace came back");
 }
 
+/// Bytes of every file under `dir`.
+fn bytes_under(dir: &std::path::Path) -> u64 {
+    walk(dir)
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// Commit `rows` highly compressible node rows into `engine`, keys starting
+/// at `from`, and write them to tables.
+fn write_compressible(engine: &StorageEngine, oracle: &TimestampOracle, from: u32, rows: u32) {
+    let value = vec![b'a'; 1024];
+    let mutations = (from..from + rows)
+        .map(|i| put(format!("row-{i:08}").as_bytes(), &value))
+        .collect();
+    commit(engine, oracle, mutations);
+    engine.persist().expect("persist");
+}
+
+/// Each namespace writes with its own codecs: the same rows take a fraction
+/// of the space in a namespace set to zstd that they take in one set to no
+/// compression, observed on disk. A change applies to the next tables the
+/// open namespace writes and holds across a reopen.
+#[test]
+fn each_namespace_writes_with_its_own_codecs() {
+    use coordinode_core::namespace::{BlockCodec, NamespaceStorage};
+    let dir = TempDir::new().expect("tmp");
+    let config = durable_cfg(&dir);
+    let (deployment, oracle) = open_deployment(&config);
+    let plain_id = deployment
+        .create_namespace_with(
+            "plain",
+            NamespaceStorage {
+                compression: Some(BlockCodec::None),
+                cold_compression: Some(BlockCodec::None),
+                dictionaries: None,
+            },
+        )
+        .expect("plain");
+    let packed_id = deployment
+        .create_namespace_with(
+            "packed",
+            NamespaceStorage {
+                compression: Some(BlockCodec::Zstd(9)),
+                ..NamespaceStorage::default()
+            },
+        )
+        .expect("packed");
+    let node_dir = |id| {
+        dir.path()
+            .join(TreeId::namespace(id, Partition::Node).dir())
+    };
+    let plain = deployment.engine(plain_id).expect("plain");
+    let packed = deployment.engine(packed_id).expect("packed");
+    write_compressible(&plain, &oracle, 0, 500);
+    write_compressible(&packed, &oracle, 0, 500);
+    let (plain_bytes, packed_bytes) = (
+        bytes_under(&node_dir(plain_id)),
+        bytes_under(&node_dir(packed_id)),
+    );
+    assert!(
+        packed_bytes * 5 < plain_bytes,
+        "zstd {packed_bytes} bytes against uncompressed {plain_bytes}"
+    );
+
+    // Changed while open: the next tables of the namespace are zstd.
+    deployment
+        .set_namespace_storage(
+            "plain",
+            NamespaceStorage {
+                compression: Some(BlockCodec::Zstd(9)),
+                ..NamespaceStorage::default()
+            },
+        )
+        .expect("alter");
+    write_compressible(&plain, &oracle, 500, 500);
+    let grown = bytes_under(&node_dir(plain_id)) - plain_bytes;
+    assert!(
+        grown * 5 < plain_bytes,
+        "rows written after the change took {grown} bytes"
+    );
+    drop((plain, packed));
+    drop(deployment);
+
+    let (deployment, _) = open_deployment(&config);
+    assert_eq!(
+        deployment.namespace_storage("plain").expect("settings"),
+        NamespaceStorage {
+            compression: Some(BlockCodec::Zstd(9)),
+            cold_compression: Some(BlockCodec::None),
+            dictionaries: None,
+        },
+        "the change kept the setting it did not name, across a reopen"
+    );
+    let plain = deployment.engine_named("plain").expect("plain again");
+    assert_eq!(node(&plain, b"row-00000000").map(|v| v.len()), Some(1024));
+}
+
 /// A drop removes the namespace's directory on every endpoint its trees can
 /// be placed on, hot and cold alike, and nothing of another namespace on
 /// either.

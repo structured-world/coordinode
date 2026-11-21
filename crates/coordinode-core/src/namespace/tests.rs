@@ -42,20 +42,32 @@ fn names_admit_one_spelling() {
 /// have) decode to nothing rather than to a guess.
 #[test]
 fn records_round_trip_and_refuse_foreign_bytes() {
+    let set = NamespaceStorage {
+        compression: Some(BlockCodec::Lz4),
+        cold_compression: Some(BlockCodec::Zstd(9)),
+        dictionaries: Some(false),
+    };
     for state in [NamespaceState::Live, NamespaceState::Dropping] {
-        let record = NamespaceRecord {
-            name: "tenant-a".into(),
-            state,
-            token: [7; NAMESPACE_TOKEN_LEN],
-        };
-        assert_eq!(NamespaceRecord::decode(&record.encode()), Some(record));
+        for storage in [NamespaceStorage::default(), set] {
+            let record = NamespaceRecord {
+                name: "tenant-a".into(),
+                state,
+                token: [7; NAMESPACE_TOKEN_LEN],
+                storage,
+            };
+            assert_eq!(NamespaceRecord::decode(&record.encode()), Some(record));
+        }
     }
     let good = NamespaceRecord {
         name: "a".into(),
         state: NamespaceState::Live,
         token: [1; NAMESPACE_TOKEN_LEN],
+        storage: NamespaceStorage::default(),
     }
     .encode();
+    let mut unknown_codec = good.clone();
+    unknown_codec[1 + NAMESPACE_TOKEN_LEN] = 9;
+    assert_eq!(NamespaceRecord::decode(&unknown_codec), None);
     let mut unknown_state = good.clone();
     unknown_state[0] = 2;
     assert_eq!(NamespaceRecord::decode(&unknown_state), None);
@@ -64,6 +76,60 @@ fn records_round_trip_and_refuse_foreign_bytes() {
     bad_name.push(b'.');
     assert_eq!(NamespaceRecord::decode(&bad_name), None);
     assert_eq!(NamespaceRecord::decode(&[]), None);
+}
+
+/// Codec names parse case-insensitively, a bare `zstd` at its default level,
+/// and print back in the spelling that parses; a level out of range or an
+/// unknown name is refused.
+#[test]
+fn codecs_parse_and_print_back() {
+    for (text, codec) in [
+        ("none", BlockCodec::None),
+        ("LZ4", BlockCodec::Lz4),
+        ("zstd", BlockCodec::Zstd(DEFAULT_ZSTD_LEVEL)),
+        ("zstd:9", BlockCodec::Zstd(9)),
+        ("zstd:-5", BlockCodec::Zstd(-5)),
+    ] {
+        assert_eq!(BlockCodec::parse(text), Ok(codec), "{text}");
+        assert_eq!(BlockCodec::parse(&codec.to_string()), Ok(codec));
+    }
+    for text in ["gzip", "zstd:23", "zstd:x", "zstd:"] {
+        assert!(BlockCodec::parse(text).is_err(), "{text}");
+    }
+}
+
+/// Settings name only what a statement names, and a change keeps every
+/// setting it does not name; an unknown, repeated or mistyped setting is
+/// refused.
+#[test]
+fn storage_settings_parse_and_change_only_what_they_name() {
+    let created = NamespaceStorage::from_settings([
+        ("compression", StorageSetting::Text("lz4")),
+        ("cold_compression", StorageSetting::Text("zstd:9")),
+        ("dictionaries", StorageSetting::Bool(true)),
+    ])
+    .unwrap();
+    let change =
+        NamespaceStorage::from_settings([("compression", StorageSetting::Text("zstd:3"))]).unwrap();
+    assert_eq!(
+        created.with(change),
+        NamespaceStorage {
+            compression: Some(BlockCodec::Zstd(3)),
+            cold_compression: Some(BlockCodec::Zstd(9)),
+            dictionaries: Some(true),
+        }
+    );
+    for bad in [
+        vec![("level", StorageSetting::Text("1"))],
+        vec![("compression", StorageSetting::Bool(true))],
+        vec![("dictionaries", StorageSetting::Text("yes"))],
+        vec![
+            ("compression", StorageSetting::Text("lz4")),
+            ("compression", StorageSetting::Text("none")),
+        ],
+    ] {
+        assert!(NamespaceStorage::from_settings(bad).is_err());
+    }
 }
 
 /// Record keys list in id order and name back the id they were made for;

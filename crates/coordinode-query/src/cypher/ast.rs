@@ -74,6 +74,7 @@ impl Query {
                 | Clause::AlterNamespaceIndexDefault(_)
                 | Clause::CreateNamespace(_)
                 | Clause::DropNamespace(_)
+                | Clause::SetNamespaceStorage(_)
                 | Clause::CreateVectorIndex(_)
                 | Clause::DropVectorIndex(_)
                 | Clause::CreateEdgeType(_)
@@ -160,6 +161,8 @@ pub enum Clause {
     CreateNamespace(NamespaceClause),
     /// `DROP NAMESPACE <name> [IF EXISTS]`.
     DropNamespace(NamespaceClause),
+    /// `ALTER NAMESPACE <name> SET STORAGE (...)`.
+    SetNamespaceStorage(NamespaceStorageClause),
     /// `SHOW NAMESPACES`: the deployment's namespaces.
     ShowNamespaces,
     CreateVectorIndex(CreateVectorIndexClause),
@@ -440,6 +443,17 @@ pub struct NamespaceClause {
     /// `IF NOT EXISTS` on a creation, `IF EXISTS` on a drop: the state the
     /// statement asks for already holds, and it succeeds doing nothing.
     pub if_state_holds: bool,
+    /// The storage settings a creation's `WITH (...)` names; none for a drop.
+    pub storage: coordinode_core::namespace::NamespaceStorage,
+}
+
+/// `ALTER NAMESPACE name SET STORAGE (...)`: the settings it changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamespaceStorageClause {
+    /// The namespace's name.
+    pub name: String,
+    /// The settings named; the others are kept.
+    pub change: coordinode_core::namespace::NamespaceStorage,
 }
 
 /// `ALTER INDEX idx SET MAINTENANCE RESOLVED | DERIVED | INHERIT`: an

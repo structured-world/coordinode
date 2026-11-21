@@ -477,6 +477,9 @@ pub enum MetadataCommand {
         name: String,
         /// Identifies the creation.
         token: [u8; crate::namespace::NAMESPACE_TOKEN_LEN],
+        /// Its data-block storage settings; unset ones inherit the
+        /// deployment's.
+        storage: crate::namespace::NamespaceStorage,
     },
     /// Begin dropping the live namespace `name`: the name is free at once,
     /// and the namespace's record marks it dropping until its trees are
@@ -484,6 +487,15 @@ pub enum MetadataCommand {
     DropNamespace {
         /// The name of the namespace to drop.
         name: String,
+    },
+    /// Change the storage settings `change` names of the live namespace
+    /// `name`, keeping the others; data written from then on follows them.
+    /// Refused, writing nothing, when no live namespace has the name.
+    SetNamespaceStorage {
+        /// The name of the namespace.
+        name: String,
+        /// The settings to change; unset ones are kept.
+        change: crate::namespace::NamespaceStorage,
     },
 }
 
@@ -501,7 +513,8 @@ impl MetadataCommand {
             | Self::RecordGroupPair { .. }
             | Self::RecordDeployment { .. }
             | Self::CreateNamespace { .. }
-            | Self::DropNamespace { .. } => PartitionId::Deployment,
+            | Self::DropNamespace { .. }
+            | Self::SetNamespaceStorage { .. } => PartitionId::Deployment,
             Self::ConditionalRegistryWrite { .. } => PartitionId::Registry,
         }
     }
@@ -524,8 +537,10 @@ impl MetadataCommand {
                 let put: usize = put.iter().map(|(k, v)| k.len() + v.len()).sum();
                 expect + put
             }
-            Self::CreateNamespace { name, token } => name.len() + token.len() + 2,
+            // The settings are a few fixed-width fields.
+            Self::CreateNamespace { name, token, .. } => name.len() + token.len() + 16,
             Self::DropNamespace { name } => name.len() + 2,
+            Self::SetNamespaceStorage { name, .. } => name.len() + 16,
         }
     }
 }

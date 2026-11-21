@@ -96,11 +96,41 @@ pub(crate) fn decide(
         MetadataCommand::ConditionalRegistryWrite { expect, put } => {
             decide_registry_write(deployment, expect, put)
         }
-        MetadataCommand::CreateNamespace { name, token } => {
-            decide_namespace_creation(deployment, name, token)
-        }
+        MetadataCommand::CreateNamespace {
+            name,
+            token,
+            storage,
+        } => decide_namespace_creation(deployment, name, token, *storage),
         MetadataCommand::DropNamespace { name } => decide_namespace_drop(deployment, name),
+        MetadataCommand::SetNamespaceStorage { name, change } => {
+            decide_namespace_storage(deployment, name, *change)
+        }
     }
+}
+
+/// The record of the live namespace `name` with the settings `change`
+/// names replaced. None when no live namespace has the name.
+fn decide_namespace_storage(
+    engine: &Deployment,
+    name: &str,
+    change: coordinode_core::namespace::NamespaceStorage,
+) -> StorageResult<Vec<Mutation>> {
+    let Some(id) = namespace_by_name(engine, name)? else {
+        return Ok(Vec::new());
+    };
+    let Some(record) = namespace_record(engine, id)? else {
+        return Err(StorageError::Serialization(format!(
+            "namespace {name:?} is named in the catalog without a record of {id}"
+        )));
+    };
+    let changed = NamespaceRecord {
+        storage: record.storage.with(change),
+        ..record
+    };
+    Ok(vec![deployment_put(
+        namespace_record_key(id),
+        changed.encode(),
+    )])
 }
 
 /// The records creating namespace `name` under the next id: its record,
@@ -111,6 +141,7 @@ fn decide_namespace_creation(
     engine: &Deployment,
     name: &str,
     token: &[u8; NAMESPACE_TOKEN_LEN],
+    storage: coordinode_core::namespace::NamespaceStorage,
 ) -> StorageResult<Vec<Mutation>> {
     if let Err(e) = validate_namespace_name(name) {
         tracing::warn!(name, error = %e, "namespace creation refused");
@@ -129,6 +160,7 @@ fn decide_namespace_creation(
         name: name.to_owned(),
         state: NamespaceState::Live,
         token: *token,
+        storage,
     };
     Ok(vec![
         deployment_put(namespace_record_key(id), record.encode()),
