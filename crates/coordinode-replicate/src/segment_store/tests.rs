@@ -698,13 +698,11 @@ async fn a_copy_ahead_installs_at_its_position_and_raises_the_floor() {
         "the partition is replaced, not written over"
     );
     let coverage = local.raft_coverage().expect("coverage");
-    assert!(
-        coverage.holds(Partition::Node, 19, 0),
-        "the peer's position"
-    );
-    assert!(!coverage.holds(Partition::Node, 20, 0));
-    assert_eq!(fence.state.lock().floor(Partition::Node), 20);
-    assert!(fence.state.lock().skips(Partition::Node, 15));
+    let node = local.tree_id(Partition::Node);
+    assert!(coverage.holds(node, 19, 0), "the peer's position");
+    assert!(!coverage.holds(node, 20, 0));
+    assert_eq!(fence.state.lock().floor(node), 20);
+    assert!(fence.state.lock().skips(node, 15));
 }
 
 /// A copy behind this node's applies lacks entries this node applied and

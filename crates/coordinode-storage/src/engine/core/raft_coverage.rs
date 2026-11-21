@@ -20,11 +20,8 @@ use super::{Deployment, PartitionRepair, Rows, StorageEngine, claim_checkpoint_d
 use crate::engine::MAX_DERIVED_EFFECTS;
 use crate::engine::coverage::{self, Domain, Mark, TreeCoverage};
 use crate::engine::partition::Partition;
+use crate::engine::scope::{NamespaceId, TreeId};
 use crate::error::{StorageError, StorageResult};
-use crate::placement::partition_wire_tag;
-
-/// One slot per partition wire tag.
-const FLOOR_SLOTS: usize = 16;
 
 /// The seqno a replaced partition's rows are written at: below every commit
 /// timestamp, so each entry applied after the replacement wins over the row
@@ -37,8 +34,8 @@ pub const INSTALLED_ROW_SEQNO: lsm_tree::SeqNo = 0;
 pub(super) const PARTITION_CAPTURE_DIR: &str = "partition-capture";
 
 /// Where this node's Raft applies stand: one past the last applied entry,
-/// and, per partition, the entry below which the partition already holds
-/// everything because it was installed from a peer further along.
+/// and, per tree, the entry below which the tree already holds everything
+/// because it was installed from a peer further along.
 ///
 /// The Raft state machine owns it and changes it only while applying;
 /// anything else reads or changes it through a [`RaftApplyFence`], with the
@@ -46,16 +43,19 @@ pub(super) const PARTITION_CAPTURE_DIR: &str = "partition-capture";
 #[derive(Debug, Default)]
 pub struct RaftApplyState {
     next: u64,
-    floors: [u64; FLOOR_SLOTS],
+    /// The trees ahead of the applies, each with its floor. Empty but for
+    /// the time between a tree's install from a peer and the applies passing
+    /// it, so the check every applied mutation makes is a scan of nothing.
+    floors: Vec<(TreeId, u64)>,
 }
 
 impl RaftApplyState {
-    /// Applies standing at `next`, with no partition ahead of them.
+    /// Applies standing at `next`, with no tree ahead of them.
     #[must_use]
     pub fn new(next: u64) -> Self {
         Self {
             next,
-            floors: [0; FLOOR_SLOTS],
+            floors: Vec::new(),
         }
     }
 
@@ -70,40 +70,36 @@ impl RaftApplyState {
         self.next = index + 1;
     }
 
-    /// Every partition now holds exactly the entries below `next`: a
-    /// snapshot install.
+    /// Every tree now holds exactly the entries below `next`: a snapshot
+    /// install.
     pub fn reset(&mut self, next: u64) {
         *self = Self::new(next);
     }
 
-    /// Whether `partition` already holds entry `index`, because it was
-    /// installed at a later position than the applies had reached.
+    /// Whether `tree` already holds entry `index`, because it was installed
+    /// at a later position than the applies had reached.
     #[must_use]
-    pub fn skips(&self, partition: Partition, index: u64) -> bool {
-        index < self.floor(partition)
+    pub fn skips(&self, tree: TreeId, index: u64) -> bool {
+        index < self.floor(tree)
     }
 
-    /// The entry below which `partition` holds everything; `0` when it is
-    /// not ahead of the applies.
+    /// The entry below which `tree` holds everything; `0` when it is not
+    /// ahead of the applies.
     #[must_use]
-    pub fn floor(&self, partition: Partition) -> u64 {
-        self.floors[slot(partition)]
+    pub fn floor(&self, tree: TreeId) -> u64 {
+        self.floors
+            .iter()
+            .find(|(id, _)| *id == tree)
+            .map_or(0, |(_, floor)| *floor)
     }
 
-    /// `partition` now holds every entry below `next`.
-    pub fn raise_floor(&mut self, partition: Partition, next: u64) {
-        let floor = &mut self.floors[slot(partition)];
-        *floor = (*floor).max(next);
+    /// `tree` now holds every entry below `next`.
+    pub fn raise_floor(&mut self, tree: TreeId, next: u64) {
+        match self.floors.iter_mut().find(|(id, _)| *id == tree) {
+            Some((_, floor)) => *floor = (*floor).max(next),
+            None => self.floors.push((tree, next)),
+        }
     }
-}
-
-fn slot(partition: Partition) -> usize {
-    let tag = usize::from(partition_wire_tag(partition));
-    debug_assert!(
-        tag < FLOOR_SLOTS,
-        "partition tag {tag} past the floor slots"
-    );
-    tag
 }
 
 /// Pauses this node's Raft applies so a caller can read or replace a
@@ -198,11 +194,38 @@ fn node_local_prefixes(partition: Partition) -> &'static [&'static [u8]] {
     }
 }
 
-/// What every partition tree records of the Raft entries it holds, read
-/// when the state machine opens.
+/// The tree mutation `m` writes, under the namespace marker `namespace`:
+/// a deployment partition's tree is the system set's, any other the
+/// namespace's. `None` for a marker, which writes nothing and is kept
+/// whatever is skipped, and for a namespace partition's write no marker
+/// names, which no tree skips.
+fn tree_of(m: &Mutation, namespace: Option<NamespaceId>) -> Option<TreeId> {
+    let part = match m {
+        Mutation::Put { partition, .. }
+        | Mutation::Delete { partition, .. }
+        | Mutation::Merge { partition, .. }
+        | Mutation::RemoveRange { partition, .. } => Partition::from(*partition),
+        // A command's effects are records of the partition it names.
+        Mutation::Command(command) => Partition::from(command.partition()),
+        Mutation::Operation(_) => Partition::Deployment,
+        // Resolved before the apply; its entries are index records.
+        Mutation::Derive(_) => Partition::Idx,
+        // Writes nothing; it goes with the node rows it describes.
+        Mutation::Effects(_) => Partition::Node,
+        Mutation::Namespace(_) => return None,
+    };
+    if part.is_deployment() {
+        Some(TreeId::system(part))
+    } else {
+        namespace.map(|ns| TreeId::namespace(ns, part))
+    }
+}
+
+/// What every tree records of the Raft entries it holds, read when the
+/// state machine opens.
 #[derive(Debug)]
 pub struct RaftCoverage {
-    trees: HashMap<Partition, TreeCoverage>,
+    trees: HashMap<TreeId, TreeCoverage>,
 }
 
 impl RaftCoverage {
@@ -214,12 +237,11 @@ impl RaftCoverage {
         self.trees.values().any(TreeCoverage::has_record)
     }
 
-    /// Whether proposal `sub` of log entry `index` is physically in the tree
-    /// of `partition`.
+    /// Whether proposal `sub` of log entry `index` is physically in `tree`.
     #[must_use]
-    pub fn holds(&self, partition: Partition, index: u64, sub: u32) -> bool {
+    pub fn holds(&self, tree: TreeId, index: u64, sub: u32) -> bool {
         self.trees
-            .get(&partition)
+            .get(&tree)
             .is_some_and(|c| c.contains(index, sub))
     }
 
@@ -234,14 +256,19 @@ impl RaftCoverage {
             .min_by_key(|(next, _)| *next)
     }
 
-    /// One past the entries `partition`'s tree holds all of, `None` when it
-    /// records no base.
+    /// One past the entries `tree` holds all of, `None` when it records no
+    /// base.
     #[must_use]
-    pub fn base_of(&self, partition: Partition) -> Option<u64> {
+    pub fn base_of(&self, tree: TreeId) -> Option<u64> {
         self.trees
-            .get(&partition)
+            .get(&tree)
             .and_then(TreeCoverage::base)
             .map(|(next, _)| next)
+    }
+
+    /// Every tree the record was read from.
+    pub fn trees(&self) -> impl Iterator<Item = TreeId> + '_ {
+        self.trees.keys().copied()
     }
 
     /// One past the highest entry any tree records: from there on, no tree
@@ -263,16 +290,17 @@ impl Deployment {
     ///
     /// A tree read failure, or a malformed record.
     pub fn raft_coverage(&self) -> StorageResult<RaftCoverage> {
-        let mut trees = HashMap::with_capacity(Partition::all().len());
-        for (id, tree) in &self.coordinator.trees() {
-            trees.insert(id.part, TreeCoverage::read(tree, Domain::Raft)?);
+        let open = self.coordinator.trees();
+        let mut trees = HashMap::with_capacity(open.len());
+        for (id, tree) in &open {
+            trees.insert(*id, TreeCoverage::read(tree, Domain::Raft)?);
         }
         Ok(RaftCoverage { trees })
     }
 
     /// Apply proposal `sub` of log entry `index` at `commit_ts`, with its
-    /// coverage marker, into every partition the proposal touches except
-    /// those `skip` says already hold it. Returns how many mutations landed.
+    /// coverage marker, into every tree the proposal touches except those
+    /// `skip` says already hold it. Returns how many mutations landed.
     ///
     /// # Errors
     ///
@@ -283,7 +311,7 @@ impl Deployment {
         commit_ts: u64,
         index: u64,
         sub: u32,
-        skip: impl Fn(Partition) -> bool,
+        skip: impl Fn(TreeId) -> bool,
     ) -> StorageResult<usize> {
         let mark = Mark {
             domain: Domain::Raft,
@@ -322,22 +350,20 @@ impl Deployment {
         let resolved =
             coordinode_core::index::derive::resolve_unit(mutations, MAX_DERIVED_EFFECTS)?;
         let mutations = resolved.as_ref();
-        let partition_of = |m: &Mutation| match m {
-            Mutation::Put { partition, .. }
-            | Mutation::Delete { partition, .. }
-            | Mutation::Merge { partition, .. }
-            | Mutation::RemoveRange { partition, .. } => Some(Partition::from(*partition)),
-            // A command's effects are records of the partition it names.
-            Mutation::Command(command) => Some(Partition::from(command.partition())),
-            Mutation::Operation(_) => Some(Partition::Deployment),
-            // Resolved above; its entries are index records.
-            Mutation::Derive(_) => Some(Partition::Idx),
-            // Writes nothing; it goes with the node rows it describes.
-            Mutation::Effects(_) => Some(Partition::Node),
-            // Names the namespace of what follows: kept whatever is skipped.
-            Mutation::Namespace(_) => None,
+        // Which mutations a tree that already holds the entry takes none of,
+        // each tree named by the namespace marker before the mutation.
+        let skipped: Vec<bool> = {
+            let mut namespace = None;
+            mutations
+                .iter()
+                .map(|m| {
+                    if let Mutation::Namespace(id) = m {
+                        namespace = Some(*id);
+                    }
+                    tree_of(m, namespace).is_some_and(&skip)
+                })
+                .collect()
         };
-        let skipped = |m: &Mutation| partition_of(m).is_some_and(&skip);
         let writes = |ms: &[Mutation]| {
             ms.iter()
                 .filter(|m| !matches!(m, Mutation::Namespace(_)))
@@ -346,9 +372,14 @@ impl Deployment {
         // A committed entry: a read that sees any of its writes is not ahead
         // of the ceiling, which is raised before the first lands.
         self.note_raft_effects(commit_ts);
-        if mutations.iter().any(skipped) {
-            // A partition that already holds the entry takes none of it.
-            let kept: Vec<Mutation> = mutations.iter().filter(|m| !skipped(m)).cloned().collect();
+        if skipped.iter().any(|&s| s) {
+            // A tree that already holds the entry takes none of it.
+            let kept: Vec<Mutation> = mutations
+                .iter()
+                .zip(&skipped)
+                .filter(|(_, skipped)| !**skipped)
+                .map(|(m, _)| m.clone())
+                .collect();
             let landed = writes(&kept);
             let staged = self.applied_feed.stage(index, commit_ts, &kept);
             if landed > 0 {
@@ -380,13 +411,13 @@ impl Deployment {
         from: u64,
         next: u64,
         payload: &[u8],
-        ahead: impl Fn(Partition) -> bool,
+        ahead: impl Fn(TreeId) -> bool,
     ) {
         // Above every marker below `next`: those proposals were applied, and
         // the oracle advanced past their commit_ts, before this call.
         let at = self.next_seqno();
         for (id, tree) in &self.coordinator.trees() {
-            if !ahead(id.part) {
+            if !ahead(*id) {
                 coverage::write_fold(tree, Domain::Raft, from, next, payload, at);
             }
         }
@@ -578,7 +609,7 @@ impl StorageEngine {
         mut rows_of: impl FnMut(Partition) -> StorageResult<Rows>,
         next: u64,
         payload: &[u8],
-        ahead: &[(Partition, RaftPosition)],
+        ahead: &[(TreeId, RaftPosition)],
         index_inventory: Option<&[u8]>,
     ) -> StorageResult<()> {
         // Every partition's repair is held until its tree is installed and
@@ -590,11 +621,14 @@ impl StorageEngine {
         }
         self.reset_raft_coverage(next, payload)?;
         // Written over the reset's base at a later seqno, and durable before
-        // the intents go: the applies leave such a partition alone until they
+        // the intents go: the applies leave such a tree alone until they
         // pass its position, which the caller raises as its floor.
-        for (partition, position) in ahead {
-            if position.next > next && partitions.contains(partition) {
-                let tree = self.tree(*partition)?;
+        for (id, position) in ahead {
+            let replaced = partitions
+                .iter()
+                .any(|&partition| self.tree_id(partition) == *id);
+            if position.next > next && replaced {
+                let tree = self.tree(id.part)?;
                 coverage::write_fold(
                     tree,
                     Domain::Raft,
@@ -757,7 +791,7 @@ impl StorageEngine {
                 });
             }
             self.install_raft_partition(partition, &copy.rows, position.next, &position.payload)?;
-            applies.raise_floor(partition, position.next);
+            applies.raise_floor(self.tree_id(partition), position.next);
             Ok(())
         })
     }

@@ -371,7 +371,7 @@ fn a_retransmitted_unit_in_the_log_applies_once() {
     assert!(unit_skipped(&engine, at(3)).unwrap());
     // Delivered again: the applying unit's partitions already hold it.
     engine
-        .apply_raft_proposal(&unit, ts, 2, 0, |part| part == Partition::Counter)
+        .apply_raft_proposal(&unit, ts, 2, 0, |tree| tree.part == Partition::Counter)
         .unwrap();
     assert_eq!(counter(&engine), 1);
     assert!(!unit_skipped(&engine, at(2)).unwrap());

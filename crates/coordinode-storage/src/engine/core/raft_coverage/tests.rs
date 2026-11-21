@@ -59,11 +59,15 @@ fn an_apply_marks_exactly_the_partitions_it_touched() {
     assert_eq!(applied, 2);
 
     let coverage = engine.raft_coverage().expect("read");
-    assert!(coverage.holds(Partition::Node, 7, 1));
-    assert!(coverage.holds(Partition::Adj, 7, 1));
-    assert!(!coverage.holds(Partition::Counter, 7, 1), "untouched tree");
+    let tree = |part| engine.tree_id(part);
+    assert!(coverage.holds(tree(Partition::Node), 7, 1));
+    assert!(coverage.holds(tree(Partition::Adj), 7, 1));
     assert!(
-        !coverage.holds(Partition::Node, 7, 0),
+        !coverage.holds(tree(Partition::Counter), 7, 1),
+        "untouched tree"
+    );
+    assert!(
+        !coverage.holds(tree(Partition::Node), 7, 0),
         "another proposal of the entry"
     );
     assert_eq!(coverage.skip_until(), 8);
@@ -83,8 +87,9 @@ fn a_skipped_partition_gets_neither_the_effect_nor_the_marker() {
         .expect("first apply");
     let before = engine.get(Partition::Adj, b"adj:R:out:1").expect("get");
 
+    let adj = engine.tree_id(Partition::Adj);
     let applied = engine
-        .apply_raft_proposal(&node_and_adj(), ts, 3, 0, |p| p == Partition::Adj)
+        .apply_raft_proposal(&node_and_adj(), ts, 3, 0, |tree| tree == adj)
         .expect("replay");
     assert_eq!(applied, 1, "only the Node put is re-applied");
     assert_eq!(
@@ -92,6 +97,77 @@ fn a_skipped_partition_gets_neither_the_effect_nor_the_marker() {
         before,
         "the skipped merge must not be applied twice"
     );
+}
+
+/// A replay skips a tree, not a partition: an entry writing the same
+/// partition of two namespaces, replayed where one namespace's tree already
+/// holds it, lands in the other namespace's tree and records it there only.
+#[test]
+fn a_skip_holds_one_namespaces_tree_only() {
+    let dir = TempDir::new().expect("dir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(TimestampOracle::new());
+    let deployment = Deployment::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+    let a = deployment
+        .engine(deployment.create_namespace("a").expect("a"))
+        .expect("bind a");
+    let b = deployment
+        .engine(deployment.create_namespace("b").expect("b"))
+        .expect("bind b");
+    deployment.reset_raft_coverage(0, &[]).expect("establish");
+    let put = |value: &[u8]| Mutation::Put {
+        partition: PartitionId::Node,
+        key: b"k".to_vec(),
+        value: value.to_vec(),
+    };
+    let mut unit = coordinode_core::txn::proposal::in_namespace(a.namespace(), [put(b"of-a")]);
+    unit.extend(coordinode_core::txn::proposal::in_namespace(
+        b.namespace(),
+        [put(b"of-b")],
+    ));
+    let a_node = a.tree_id(Partition::Node);
+    let applied = deployment
+        .apply_raft_proposal(&unit, oracle.next().as_raw(), 5, 0, |tree| tree == a_node)
+        .expect("apply");
+
+    assert_eq!(applied, 1, "only b's write lands");
+    assert_eq!(a.get(Partition::Node, b"k").expect("read a"), None);
+    assert_eq!(
+        b.get(Partition::Node, b"k").expect("read b").as_deref(),
+        Some(&b"of-b"[..])
+    );
+    let coverage = deployment.raft_coverage().expect("read");
+    assert!(coverage.holds(b.tree_id(Partition::Node), 5, 0));
+    assert!(
+        !coverage.holds(a_node, 5, 0),
+        "the skipped tree is not marked"
+    );
+}
+
+/// The applies' floor is a tree's: raising one namespace's tree leaves the
+/// same partition of another namespace behind it.
+#[test]
+fn a_floor_is_one_trees() {
+    let a = TreeId::namespace(NamespaceId::from_raw(1), Partition::Node);
+    let b = TreeId::namespace(NamespaceId::from_raw(2), Partition::Node);
+    let mut applies = RaftApplyState::new(3);
+    applies.raise_floor(a, 10);
+    assert!(applies.skips(a, 9));
+    assert!(!applies.skips(a, 10));
+    assert!(
+        !applies.skips(b, 9),
+        "another namespace's tree skips nothing"
+    );
+    applies.raise_floor(a, 7);
+    assert_eq!(applies.floor(a), 10, "a floor never goes back");
+    applies.reset(12);
+    assert_eq!(applies.floor(a), 0);
 }
 
 #[test]
@@ -108,10 +184,17 @@ fn a_fold_replaces_the_markers_below_it_with_a_base() {
 
     let coverage = engine.raft_coverage().expect("read");
     assert_eq!(coverage.resume_point(), Some((2, b"id-of-1".as_slice())));
-    assert!(coverage.holds(Partition::Node, 0, 0), "below the base");
-    assert!(coverage.holds(Partition::Node, 2, 0), "its marker survives");
+    let tree = |part| engine.tree_id(part);
     assert!(
-        coverage.holds(Partition::Counter, 1, 0),
+        coverage.holds(tree(Partition::Node), 0, 0),
+        "below the base"
+    );
+    assert!(
+        coverage.holds(tree(Partition::Node), 2, 0),
+        "its marker survives"
+    );
+    assert!(
+        coverage.holds(tree(Partition::Counter), 1, 0),
         "a base covers every tree, touched or not"
     );
     assert_eq!(coverage.skip_until(), 3);
@@ -143,10 +226,13 @@ fn a_reset_does_not_hide_markers_written_after_it_below_its_seqno() {
     let check = |stage: &str| {
         let coverage = engine.raft_coverage().expect("read");
         assert!(
-            coverage.holds(Partition::Node, 10, 0),
+            coverage.holds(engine.tree_id(Partition::Node), 10, 0),
             "{stage}: the entry after the snapshot is recorded"
         );
-        assert!(coverage.holds(Partition::Adj, 10, 0), "{stage}");
+        assert!(
+            coverage.holds(engine.tree_id(Partition::Adj), 10, 0),
+            "{stage}"
+        );
     };
     check("in the memtable");
     // Compaction brings the marker's table and the tombstone's together,
@@ -181,11 +267,11 @@ fn a_reset_is_durable_and_leaves_no_marker() {
     let coverage = engine.raft_coverage().expect("read");
     assert_eq!(coverage.resume_point(), Some((10, b"id-of-9".as_slice())));
     assert!(
-        coverage.holds(Partition::Counter, 9, 0),
+        coverage.holds(engine.tree_id(Partition::Counter), 9, 0),
         "the base covers it"
     );
     assert!(
-        !coverage.holds(Partition::Node, 10, 0),
+        !coverage.holds(engine.tree_id(Partition::Node), 10, 0),
         "nothing past the snapshot is recorded"
     );
     assert_eq!(coverage.skip_until(), 10, "the old marker is gone");

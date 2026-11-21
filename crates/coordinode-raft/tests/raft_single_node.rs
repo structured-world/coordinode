@@ -141,15 +141,14 @@ async fn a_stopped_node_records_every_entry_it_applied() {
 
     let coverage = engine.raft_coverage().expect("coverage");
     let held = coverage.skip_until();
-    for &part in Partition::all() {
-        if part == Partition::Raft {
+    for tree in coverage.trees() {
+        if tree.part == Partition::Raft {
             continue;
         }
-        let base = coverage.base_of(part).unwrap_or(0);
+        let base = coverage.base_of(tree).unwrap_or(0);
         assert!(
             base >= held,
-            "{} records the log only below {base}, but trees hold entries below {held}",
-            part.name()
+            "{tree} records the log only below {base}, but trees hold entries below {held}"
         );
     }
 }
@@ -179,17 +178,12 @@ async fn a_node_stopped_with_work_still_running_claims_no_final_prefix() {
             bypass_rate_limiter: false,
         })
         .expect("write");
-    let before = engine
-        .raft_coverage()
-        .expect("coverage")
-        .base_of(Partition::Node);
+    let node_tree = engine.tree_id(Partition::Node);
+    let before = engine.raft_coverage().expect("coverage").base_of(node_tree);
     let held = node.hold_consensus_work();
     node.set_work_drain(std::time::Duration::from_millis(100));
     node.shutdown().await.expect("shutdown");
-    let after = engine
-        .raft_coverage()
-        .expect("coverage")
-        .base_of(Partition::Node);
+    let after = engine.raft_coverage().expect("coverage").base_of(node_tree);
     drop(held);
     drop(node);
     assert_eq!(
@@ -262,7 +256,7 @@ async fn an_apply_stopped_through_shutdown_is_not_recorded_and_reopens() {
             let coverage = engine.raft_coverage().expect("coverage");
             parts
                 .iter()
-                .map(|&part| coverage.base_of(part))
+                .map(|&part| coverage.base_of(engine.tree_id(part)))
                 .collect::<Vec<_>>()
         };
         let before = bases(&engine);

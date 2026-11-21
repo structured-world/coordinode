@@ -634,12 +634,15 @@ pub fn rebuild_partition_from_checkpoint(
                     if held.holds(index, sub) {
                         continue;
                     }
+                    // Only the rebuilt tree takes the entry; every other
+                    // tree, of this namespace or another, already holds it.
+                    let rebuilt = engine.tree_id(partition);
                     engine.apply_raft_proposal(
                         &proposal.mutations,
                         proposal.commit_ts.as_raw(),
                         index,
                         sub,
-                        |p| p != partition,
+                        |tree| tree != rebuilt,
                     )?;
                 }
                 if let Some(closure) = &mut closure {
@@ -2414,8 +2417,8 @@ impl CoordinodeStateMachine {
                 proposal.commit_ts.as_raw(),
                 index,
                 sub,
-                |part| {
-                    applies.skips(part, index) || replay.is_some_and(|c| c.holds(part, index, sub))
+                |tree| {
+                    applies.skips(tree, index) || replay.is_some_and(|c| c.holds(tree, index, sub))
                 },
             )
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -2470,12 +2473,18 @@ impl CoordinodeStateMachine {
             .as_ref()
             .filter(|_| index < self.skip_until);
         let held =
-            |part| applies.skips(part, index) || replay.is_some_and(|c| c.holds(part, index, sub));
+            |tree| applies.skips(tree, index) || replay.is_some_and(|c| c.holds(tree, index, sub));
         // Records the deployment tree already holds are not written again, so
         // an entry applied again retires nothing: its removals would not land.
         let records = self
             .engine
-            .closure_record(closed_below, index, held(Partition::Deployment))
+            .closure_record(
+                closed_below,
+                index,
+                held(coordinode_storage::engine::scope::TreeId::system(
+                    Partition::Deployment,
+                )),
+            )
             .map_err(|e| io::Error::other(format!("plan the closed bound: {e}")))?;
         if let Some((records, at)) = records {
             self.engine

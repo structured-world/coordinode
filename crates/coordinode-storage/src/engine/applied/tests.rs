@@ -255,8 +255,8 @@ fn a_skipped_partition_reports_nothing() {
     let sub = engine.subscribe_applied(Partition::Node, 16);
 
     engine
-        .apply_raft_proposal(&unit([put(PartitionId::Node, b"a")]), 5, 1, 0, |p| {
-            p == Partition::Node
+        .apply_raft_proposal(&unit([put(PartitionId::Node, b"a")]), 5, 1, 0, |tree| {
+            tree.part == Partition::Node
         })
         .expect("apply");
 

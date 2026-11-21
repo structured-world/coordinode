@@ -3397,8 +3397,8 @@ fn interrupted_cleanup_reopens_exact_and_completes() {
         .expect("plan")
     {
         engine
-            .apply_raft_proposal(&records, at, closing, 0, |part| {
-                part == Partition::Deployment
+            .apply_raft_proposal(&records, at, closing, 0, |tree| {
+                tree.part == Partition::Deployment
             })
             .expect("skipped");
     }

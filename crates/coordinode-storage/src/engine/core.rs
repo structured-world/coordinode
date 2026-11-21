@@ -5128,15 +5128,16 @@ impl Deployment {
         join_end: u64,
     ) -> StorageResult<()> {
         let partition = scope.partition();
+        let tree = store_tree(partition);
         let not_ready = |reason: String| StorageError::CutNotReady { reason };
-        if self.is_under_repair(store_tree(partition)) {
+        if self.is_under_repair(tree) {
             return Err(not_ready(format!(
                 "the {} partition is under repair",
                 partition.name()
             )));
         }
         let Some(fence) = self.raft_fence() else {
-            return match self.raft_coverage()?.base_of(partition) {
+            return match self.raft_coverage()?.base_of(tree) {
                 Some(next) if next == join_end => Ok(()),
                 held => Err(not_ready(format!(
                     "the {} tree is shown to hold its group's log through {}, not through \
@@ -5156,11 +5157,11 @@ impl Deployment {
                     applies.next(),
                     join_end
                 )));
-            } else if applies.floor(partition) > applies.next() {
+            } else if applies.floor(tree) > applies.next() {
                 verdict = Err(not_ready(format!(
                     "the {} partition was installed at entry {}, ahead of the applies at {}",
                     partition.name(),
-                    applies.floor(partition),
+                    applies.floor(tree),
                     applies.next()
                 )));
             }
@@ -6749,25 +6750,24 @@ impl Deployment {
     pub fn pin_capture_cut(&self) -> StorageResult<(lsm_tree::SeqNo, Option<SnapshotPin>)> {
         use lsm_tree::AbstractTree as _;
         let refuse = |reason: String| StorageError::CaptureRefused { reason };
-        let included = || {
-            Partition::all()
-                .iter()
-                .copied()
-                .filter(|&p| p != Partition::Raft)
-        };
         let (cut, pin) = if self.group_history {
             let ledger = self.stored_closure_ledger()?;
             let coverage = self.raft_coverage()?;
-            for part in included() {
-                match coverage.base_of(part) {
+            // Every tree of every namespace but the node-local consensus one.
+            let mut included: Vec<TreeId> = coverage
+                .trees()
+                .filter(|id| id.part != Partition::Raft)
+                .collect();
+            included.sort();
+            for id in included {
+                match coverage.base_of(id) {
                     Some(next) if next > ledger.last_index() => {}
                     held => {
                         return Err(refuse(format!(
                             "its closed bound accounts for its group's log through entry {}, \
-                             but its {} tree is shown to hold that log only below {}; open \
+                             but its {id} tree is shown to hold that log only below {}; open \
                              it as a member until its trees hold the entries, then capture",
                             ledger.last_index(),
-                            part.name(),
                             held.unwrap_or(0)
                         )));
                     }
@@ -7407,6 +7407,29 @@ impl Deployment {
             Some(set) => set.retire_on_drop(dirs, self.footprints.clone()),
             None => remove_namespace_dirs(&dirs, &self.footprints),
         }
+    }
+
+    /// Retire every open namespace the catalog no longer holds live: what a
+    /// catalog replaced whole (a snapshot of another member installed) leaves
+    /// to settle, since no drop command passed through this store for it.
+    /// A namespace the new catalog holds and this store has not opened opens
+    /// on first use, as any created since the open.
+    ///
+    /// # Errors
+    ///
+    /// The catalog cannot be read.
+    pub fn adopt_catalog(&self) -> StorageResult<()> {
+        let live: std::collections::BTreeSet<NamespaceId> = self
+            .live_namespaces()?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        for namespace in self.coordinator.sets().namespace_ids() {
+            if !live.contains(&namespace) {
+                self.retire_namespace(namespace);
+            }
+        }
+        Ok(())
     }
 
     /// The value of `key` in the system set's `part` at `snapshot`.
@@ -9572,7 +9595,9 @@ impl Deployment {
             .0
             .plan(commits, below, index, 0, &StoredBreakpoints(self))?;
         if !held && let Some((records, at)) = closure_writes(&replay.0, &plan, below) {
-            self.apply_raft_proposal(&records, at, index, sub, |p| p != Partition::Deployment)?;
+            self.apply_raft_proposal(&records, at, index, sub, |tree| {
+                tree.part != Partition::Deployment
+            })?;
         }
         replay.0.install(&plan);
         Ok(())

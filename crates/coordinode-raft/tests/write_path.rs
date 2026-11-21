@@ -452,7 +452,8 @@ async fn an_applied_proposal_is_recorded_in_its_tree() {
     // Raft's own entries, which write no Node row: the newest one need not
     // be the proposal, but the proposal is among them.
     assert!(
-        (before..last).any(|index| coverage.holds(Partition::Node, index, 0)),
+        (before..last)
+            .any(|index| { coverage.holds(engine_read.tree_id(Partition::Node), index, 0) }),
         "the Node tree records the proposal it holds"
     );
 

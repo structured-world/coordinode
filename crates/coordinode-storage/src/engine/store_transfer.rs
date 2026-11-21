@@ -560,7 +560,7 @@ impl Deployment {
             // travels only with a transfer to another member.
             let position = match applies {
                 Some(applies)
-                    if scope == PinScope::Replicated && applies.floor(part) > applies.next() =>
+                    if scope == PinScope::Replicated && applies.floor(*id) > applies.next() =>
                 {
                     TreeCoverage::read(tree, Domain::Raft)?
                         .base()
@@ -833,7 +833,7 @@ impl Deployment {
 pub struct ReceivedStore {
     dir: PathBuf,
     inventory: Option<Vec<u8>>,
-    positions: Vec<(Partition, RaftPosition)>,
+    positions: Vec<(TreeId, RaftPosition)>,
 }
 
 impl ReceivedStore {
@@ -850,10 +850,9 @@ impl ReceivedStore {
         self.inventory.as_deref()
     }
 
-    /// The partitions that stand past the transfer's position, each with
-    /// its own.
+    /// The trees that stand past the transfer's position, each with its own.
     #[must_use]
-    pub fn positions(&self) -> &[(Partition, RaftPosition)] {
+    pub fn positions(&self) -> &[(TreeId, RaftPosition)] {
         &self.positions
     }
 }
@@ -916,7 +915,7 @@ pub fn receive_store(reader: &mut impl Read, dir: &Path) -> StorageResult<Receiv
 
     for tree in trees {
         if let (TreeName::Partition(id), Some(position)) = (&tree.name, &tree.position) {
-            received.positions.push((id.part, position.clone()));
+            received.positions.push((*id, position.clone()));
         }
         restore_tree(dir, tree)?;
     }

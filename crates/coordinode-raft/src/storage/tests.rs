@@ -745,7 +745,10 @@ async fn installing_a_snapshot_rebinds_every_tree_to_it() {
         coverage.resume_point(),
         Some((21, rmp_serde::to_vec(&snapshot_id).unwrap().as_slice()))
     );
-    assert!(coverage.holds(Partition::Node, 5, 0), "below the snapshot");
+    assert!(
+        coverage.holds(engine.tree_id(Partition::Node), 5, 0),
+        "below the snapshot"
+    );
     assert_eq!(coverage.skip_until(), 21, "the pre-snapshot marker is gone");
 
     let mut reopened = CoordinodeStateMachine::new(engine).expect("reopen");
@@ -957,12 +960,11 @@ async fn install_cut_at(op: lsm_tree::fs::FaultOp, skip: u64) -> bool {
         "{op:?} {skip}: exactly the copy"
     );
     assert!(engine.pending_rebuilds().expect("intents").is_empty());
-    assert!(
-        engine
-            .raft_coverage()
-            .expect("coverage")
-            .holds(Partition::Counter, 6, 0)
-    );
+    assert!(engine.raft_coverage().expect("coverage").holds(
+        engine.tree_id(Partition::Counter),
+        6,
+        0
+    ));
     drop(sm);
     stopped
 }
@@ -1416,11 +1418,12 @@ async fn a_partition_installed_ahead_is_left_alone_until_the_applies_pass_it() {
         "six from the copy, then entries 7 and 8"
     );
     let coverage = engine.raft_coverage().expect("coverage");
+    let counter = engine.tree_id(Partition::Counter);
     assert!(
-        coverage.holds(Partition::Counter, 6, 0),
+        coverage.holds(counter, 6, 0),
         "the fold at 5 kept the copy's base"
     );
-    assert!(coverage.holds(Partition::Counter, 8, 0));
+    assert!(coverage.holds(counter, 8, 0));
 }
 
 /// A snapshot sent while a partition stands ahead of the applies carries
@@ -1551,6 +1554,92 @@ async fn an_entry_after_the_snapshot_wins_over_the_installed_value() {
         Some(b"v2".as_slice()),
         "the follower must read the entry committed after the snapshot"
     );
+}
+
+/// A snapshot carries every namespace of the leader's catalog with its
+/// trees: the follower serves each one's rows after the install, under the
+/// same id, and a namespace the follower held that the leader's catalog does
+/// not name is gone, its directories with it.
+#[tokio::test]
+async fn a_snapshot_installs_every_namespace_of_the_leader() {
+    use coordinode_core::txn::proposal::in_namespace;
+    use openraft::entry::RaftEntry;
+
+    let (_leader_dir, leader) = test_engine();
+    let other = leader
+        .deployment()
+        .create_namespace("other")
+        .expect("create other");
+    let put = |value: &[u8]| Mutation::Put {
+        partition: PartitionId::Node,
+        key: b"node:1:k".to_vec(),
+        value: value.to_vec(),
+    };
+    let mut mutations = in_namespace(leader.namespace(), [put(b"of-default")]);
+    mutations.extend(in_namespace(other, [put(b"of-other")]));
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&leader)).expect("open leader");
+    apply_entries(
+        &mut sm,
+        vec![Entry::new_normal(
+            log_id(1, 1),
+            Request::single(RaftProposal {
+                id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
+                mutations,
+                commit_ts: Timestamp::from_raw(10),
+                start_ts: Timestamp::from_raw(9),
+                bypass_rate_limiter: false,
+            }),
+        )],
+    )
+    .await;
+    let (meta, bytes) = sent(pinned(&mut sm).await);
+
+    let (follower_dir, follower) = test_engine();
+    // Ids are handed out by each store alone: the follower's second
+    // namespace takes the id the leader's "other" has, and its third one an
+    // id the leader's catalog does not hold.
+    follower
+        .deployment()
+        .create_namespace("second")
+        .expect("create second");
+    let stale = follower
+        .deployment()
+        .create_namespace("stale")
+        .expect("create stale");
+    assert_ne!(stale, other);
+    // Its trees open, so its directories exist.
+    drop(follower.deployment().engine(stale).expect("bind stale"));
+    let stale_dir = follower_dir
+        .path()
+        .join(coordinode_storage::engine::scope::Scope::Namespace(stale).dir());
+    assert!(stale_dir.exists());
+    let mut fsm = CoordinodeStateMachine::new(Arc::clone(&follower)).expect("open follower");
+    fsm.install_snapshot(&meta, received(&follower, &bytes))
+        .await
+        .expect("install");
+
+    let deployment = follower.deployment();
+    let names: Vec<String> = deployment
+        .live_namespaces()
+        .expect("catalog")
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    assert_eq!(names, vec!["default".to_owned(), "other".to_owned()]);
+    assert_eq!(deployment.namespace_id("other").expect("other"), other);
+    let read = |engine: &StorageEngine| {
+        engine
+            .get(Partition::Node, b"node:1:k")
+            .expect("read")
+            .map(|v| v.to_vec())
+    };
+    assert_eq!(read(&follower).as_deref(), Some(&b"of-default"[..]));
+    assert_eq!(
+        read(&deployment.engine(other).expect("bind other")).as_deref(),
+        Some(&b"of-other"[..]),
+        "the second namespace's rows did not arrive"
+    );
+    assert!(!stale_dir.exists(), "the follower's own namespace stayed");
 }
 
 /// An entry putting `value` under `key` in the Node partition at `ts`.

@@ -147,7 +147,7 @@ fn a_conditional_registry_write_follows_the_registry_partition() {
             oracle.next().as_raw(),
             1,
             0,
-            |p| p != Partition::Registry,
+            |tree| tree.part != Partition::Registry,
         )
         .unwrap();
     assert_eq!(read().as_deref(), Some(&b"live"[..]));
@@ -157,8 +157,8 @@ fn a_conditional_registry_write_follows_the_registry_partition() {
         &[(b"consumer:r", b"ended")],
     );
     engine
-        .apply_raft_proposal(&[ending], oracle.next().as_raw(), 2, 0, |p| {
-            p == Partition::Registry
+        .apply_raft_proposal(&[ending], oracle.next().as_raw(), 2, 0, |tree| {
+            tree.part == Partition::Registry
         })
         .unwrap();
     assert_eq!(read().as_deref(), Some(&b"live"[..]));

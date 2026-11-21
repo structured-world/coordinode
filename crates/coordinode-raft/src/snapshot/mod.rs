@@ -1497,17 +1497,23 @@ impl<'b> ImageVisit<'b> for Installing<'_, 'b> {
 
 /// Install `received`, a Raft snapshot standing at log position `next`
 /// (`payload` is the log id of entry `next - 1`), as the store's complete
-/// data generation: every replicated partition is replaced, not written
-/// over, one at a time, and every tree is bound to `next`, or to its own
-/// position for a partition the snapshot holds further along. The entries
-/// after it then apply at their own commit timestamps over the installed
-/// rows, which a write over the old contents at this node's next seqno would
-/// hide. This node's own records (its Raft state, its routing) stay.
+/// data generation: the deployment's records and every namespace the
+/// snapshot's catalog holds are replaced, not written over, one partition
+/// at a time, and every tree is bound to `next`, or to its own position for
+/// a tree the snapshot holds further along. The entries after it then apply
+/// at their own commit timestamps over the installed rows, which a write
+/// over the old contents at this node's next seqno would hide. This node's
+/// own records (its Raft state, its routing) stay. A namespace this store
+/// held that the snapshot's catalog does not name is retired.
+///
+/// Everything the install reads is checked before anything is replaced:
+/// every namespace's field dictionary, the history domain, and that the
+/// snapshot holds the namespace `engine` is bound to.
 ///
 /// # Errors
 ///
-/// The received store cannot be opened or read, its field dictionary fails
-/// its check, or the install fails.
+/// The received store cannot be opened or read, a check fails, or the
+/// install fails.
 pub fn install_received(
     engine: &StorageEngine,
     received: &ReceivedStore,
@@ -1517,24 +1523,47 @@ pub fn install_received(
     let storage = |what: &str, e: coordinode_storage::error::StorageError| {
         io::Error::other(format!("{what}: {e}"))
     };
-    let source = StorageEngine::open_checkpoint(received.dir())
-        .map_err(|e| storage("open the received snapshot", e))?;
-    let schema = source
-        .replicated_rows(Partition::Schema)
-        .map_err(|e| storage("read the snapshot's schema", e))?;
-    verify_field_dictionary(&schema)?;
-    drop(schema);
+    let source_deployment =
+        coordinode_storage::engine::core::Deployment::open_checkpoint(received.dir())
+            .map_err(|e| storage("open the received snapshot", e))?;
+    let namespaces = source_deployment
+        .live_namespaces()
+        .map_err(|e| storage("read the snapshot's catalog", e))?;
+    if !namespaces.iter().any(|(id, _)| *id == engine.namespace()) {
+        return Err(io::Error::other(format!(
+            "the snapshot's catalog does not hold {}, the namespace this member serves",
+            engine.namespace()
+        )));
+    }
+    let mut sources = Vec::with_capacity(namespaces.len());
+    for (id, name) in &namespaces {
+        let source = source_deployment
+            .engine(*id)
+            .map_err(|e| storage("open a namespace of the snapshot", e))?;
+        let schema = source
+            .replicated_rows(Partition::Schema)
+            .map_err(|e| storage(&format!("read the schema of namespace {name}"), e))?;
+        verify_field_dictionary(&schema)?;
+        sources.push(source);
+    }
+    let own = sources
+        .iter()
+        .position(|source| source.namespace() == engine.namespace())
+        .ok_or_else(|| io::Error::other("the member's namespace left the snapshot's catalog"))?;
     // The received store is the source's whole copy, its own binding
     // included: its history's domain is that binding.
-    let source_domain = coordinode_storage::engine::metadata::bound_deployment(&source)
+    let source_domain = coordinode_storage::engine::metadata::bound_deployment(&sources[own])
         .map_err(|e| storage("read the snapshot's history domain", e))?;
-    let carries_history = source
-        .prefix_scan(Partition::NodeHistory, &[])
-        .map_err(|e| storage("read the snapshot's history", e))?
-        .next()
-        .is_some();
+    let mut carries_history = false;
+    for source in &sources {
+        carries_history |= source
+            .prefix_scan(Partition::NodeHistory, &[])
+            .map_err(|e| storage("read the snapshot's history", e))?
+            .next()
+            .is_some();
+    }
     let adopt = check_history_domain(engine, source_domain, carries_history)?;
-    let partitions: Vec<Partition> = snapshot_partitions().collect();
+    let deployment = engine.deployment();
     engine.with_metadata_exclusive(|| {
         // Bound before the history lands, so it never stands unbound.
         if let Some(domain) = adopt {
@@ -1547,26 +1576,72 @@ pub fn install_received(
                 .map_err(|e| storage("bind the snapshot's history domain", e))?;
         }
         let mut total_written = 0usize;
-        engine
-            .install_raft_image(
-                &partitions,
-                |partition| {
-                    let rows = source.replicated_rows(partition)?;
-                    total_written += rows.len();
-                    Ok(rows)
-                },
-                next,
-                payload,
-                received.positions(),
-                received.index_inventory(),
-            )
-            .map_err(|e| storage("install the snapshot's partitions", e))?;
-        let tables = source
-            .columnar_tables_at(source.snapshot())
-            .map_err(|e| storage("read the snapshot's columnar tables", e))?;
-        let tables = install_tables(engine, Some(tables))?;
+        let mut tables = 0usize;
+        // The deployment's records first, with the member's own namespace:
+        // the catalog they carry is the one every namespace after them is
+        // bound by.
+        let mut order: Vec<usize> = vec![own];
+        order.extend((0..sources.len()).filter(|&i| i != own));
+        for (step, &at) in order.iter().enumerate() {
+            let source = &sources[at];
+            let target = if step == 0 {
+                engine.clone()
+            } else {
+                deployment
+                    .engine(source.namespace())
+                    .map_err(|e| storage("open a namespace of the install", e))?
+            };
+            let partitions: Vec<Partition> = snapshot_partitions()
+                .filter(|part| step == 0 || !part.is_deployment())
+                .collect();
+            let ahead: Vec<_> = received
+                .positions()
+                .iter()
+                .filter(|(tree, _)| partitions.iter().any(|&part| target.tree_id(part) == *tree))
+                .cloned()
+                .collect();
+            // The sender's inventory names the copies of its own namespace's
+            // index; another namespace's copies stay unknown here, so each
+            // is checked before it serves.
+            let inventory = if step == 0 {
+                received.index_inventory()
+            } else {
+                None
+            };
+            target
+                .install_raft_image(
+                    &partitions,
+                    |partition| {
+                        let rows = source.replicated_rows(partition)?;
+                        total_written += rows.len();
+                        Ok(rows)
+                    },
+                    next,
+                    payload,
+                    &ahead,
+                    inventory,
+                )
+                .map_err(|e| storage("install the snapshot's partitions", e))?;
+            let source_tables = source
+                .columnar_tables_at(source.snapshot())
+                .map_err(|e| storage("read the snapshot's columnar tables", e))?;
+            tables += install_tables(&target, Some(source_tables))?;
+            if step == 0 {
+                // The catalog now is the snapshot's: a namespace it does not
+                // hold goes.
+                deployment
+                    .adopt_catalog()
+                    .map_err(|e| storage("adopt the snapshot's catalog", e))?;
+            }
+        }
         engine.note_field_dictionary_change();
-        tracing::info!(total_written, tables, next, "snapshot installed");
+        tracing::info!(
+            total_written,
+            tables,
+            namespaces = sources.len(),
+            next,
+            "snapshot installed"
+        );
         Ok(())
     })
 }

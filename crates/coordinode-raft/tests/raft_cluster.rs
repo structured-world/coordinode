@@ -7283,7 +7283,7 @@ async fn a_partition_rebuilt_from_a_checkpoint_holds_each_entry_once() {
         let coverage = n1.engine.raft_coverage().expect("coverage");
         let applied = n1.node.applied_index();
         assert!(
-            coverage.holds(Partition::Adj, applied, 0),
+            coverage.holds(n1.engine.tree_id(Partition::Adj), applied, 0),
             "the rebuilt tree records every applied entry"
         );
 
