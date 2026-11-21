@@ -1486,7 +1486,43 @@ async fn a_namespace_created_on_the_leader_serves_on_every_member() {
             );
         }
 
-        members[0]
+        // The leader is cut off: the member that leads next serves the
+        // namespace and takes writes into it, and the old leader holds them
+        // once it is back.
+        nemesis::isolate(1, &[2, 3]);
+        wait_until("another member leads", || {
+            matches!(members[1].leader(), Some(2 | 3))
+        })
+        .await;
+        let new = (members[1].leader().unwrap() - 1) as usize;
+        members[new]
+            .member()
+            .served_database()
+            .in_namespace("tenant")
+            .unwrap()
+            .write()
+            .execute_cypher("CREATE (:InTenant {v: 2})")
+            .unwrap();
+        nemesis::heal();
+        wait_until(
+            "the old leader holds the tenant's write made without it",
+            || {
+                members[0]
+                    .member()
+                    .served_database()
+                    .in_namespace("tenant")
+                    .ok()
+                    .and_then(|db| {
+                        db.write()
+                            .execute_cypher("MATCH (n:InTenant) RETURN n")
+                            .ok()
+                    })
+                    .is_some_and(|rows| rows.len() == 2)
+            },
+        )
+        .await;
+
+        members[new]
             .database()
             .read()
             .drop_namespace("tenant")

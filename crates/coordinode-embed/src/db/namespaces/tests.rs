@@ -189,6 +189,36 @@ fn the_index_maintenance_default_is_each_namespaces_own() {
     assert_eq!(profile(&mut own, "o2"), Value::String("RESOLVED".into()));
 }
 
+/// Transactions of two namespaces writing the same label, property and
+/// unique value at once never conflict: each namespace's keys, claims and
+/// constraints are its own, and both commit.
+#[test]
+fn transactions_of_two_namespaces_never_conflict() {
+    let (database, _dir) = open();
+    database.create_namespace("other").unwrap();
+    let mut own = database;
+    let mut other = own.session("other").unwrap();
+    for db in [&mut own, &mut other] {
+        db.execute_cypher("CREATE CONSTRAINT user_email FOR (n:User) REQUIRE n.email IS UNIQUE")
+            .unwrap();
+        db.execute_cypher("CREATE (:Counter {k: 'c', n: 0})")
+            .unwrap();
+    }
+    let a = own.begin_transaction().unwrap();
+    let b = other.begin_transaction().unwrap();
+    for (db, txn) in [(&own, a), (&other, b)] {
+        db.execute_in_transaction(txn, "CREATE (:User {email: 'same@x'})", None)
+            .unwrap();
+        db.execute_in_transaction(txn, "MATCH (c:Counter {k: 'c'}) SET c.n = c.n + 1", None)
+            .unwrap();
+    }
+    own.commit_transaction(a)
+        .expect("the first namespace commits");
+    other
+        .commit_transaction(b)
+        .expect("the second namespace commits the same value");
+}
+
 /// A name no namespace may have is refused before anything is written.
 #[test]
 fn an_invalid_namespace_name_is_refused() {
