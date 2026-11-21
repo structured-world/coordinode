@@ -810,6 +810,34 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
             }
             return status_with_reason(Code::Unavailable, rendered, Reason::ReadNotReady, metadata);
         }
+        // A call or session that names no namespace: a fault in the request,
+        // which must say where it works.
+        DatabaseError::NamespaceRequired => {
+            return status_with_reason(
+                Code::InvalidArgument,
+                rendered,
+                Reason::NamespaceRequired,
+                [(
+                    "header",
+                    crate::services::namespace::NAMESPACE_HEADER.to_owned(),
+                )],
+            );
+        }
+        // A namespace the deployment does not hold: the resource named is
+        // absent, as a missing database is in another server.
+        DatabaseError::UnknownNamespace(name) => {
+            return status_with_reason(
+                Code::NotFound,
+                rendered,
+                Reason::UnknownNamespace,
+                [("namespace", name.clone())],
+            );
+        }
+        // A member still catching up with its group: the same call succeeds
+        // shortly, or at once at a member that serves.
+        DatabaseError::NotServing => {
+            return status_with_reason(Code::Unavailable, rendered, Reason::NotServing, []);
+        }
         // Settings that cannot be served together: the request is fine on
         // its own terms, the combination is not.
         DatabaseError::SettingsRefused(_) => return Status::failed_precondition(rendered),
@@ -1091,38 +1119,55 @@ impl CypherServiceImpl {
         self
     }
 
+    /// The database a call naming no namespace works in, for tests that
+    /// inspect it.
+    #[cfg(test)]
     fn database(&self) -> &Arc<RwLock<Database>> {
         self.executor.database()
     }
 
-    /// Run the autonomous statement `req` at `leader` with the settings this
-    /// member resolved, and answer with what the leader answered.
-    async fn run_at(
-        &self,
-        leader: u64,
-        req: query::ExecuteCypherRequest,
-        requested: &Requested,
-        source: Option<SourceContext>,
-        start: std::time::Instant,
-    ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
-        let statement = RoutedStatement {
-            actor: ActingContext::Trusted,
-            params: convert_params(&req.parameters),
-            query: req.query,
-            settings: routed_settings(requested),
-            transaction: None,
-            operation: requested.operation,
-            deadline: time_left(requested.deadline),
-            source,
-            start: None,
-        };
-        let answer = self
-            .executor
-            .route(leader, statement, &AdmissionSignal::new(|| {}))
-            .await
-            .map_err(db_error_to_status)?;
-        Ok(routed_response(answer, start, self.executor.history()))
+    /// The executor bound to the namespace a call's `metadata` names.
+    ///
+    /// # Errors
+    ///
+    /// The name is unreadable, unknown, or missing where the deployment holds
+    /// several namespaces.
+    fn bound(&self, metadata: &tonic::metadata::MetadataMap) -> Result<StatementExecutor, Status> {
+        let namespace = super::namespace::from_metadata(metadata)?;
+        self.executor
+            .in_namespace(namespace.as_deref())
+            .map_err(db_error_to_status)
     }
+}
+
+/// Run the autonomous statement `req` at `leader` with the settings this
+/// member resolved, in `executor`'s namespace, and answer with what the
+/// leader answered.
+async fn run_at(
+    executor: &StatementExecutor,
+    leader: u64,
+    req: query::ExecuteCypherRequest,
+    requested: &Requested,
+    source: Option<SourceContext>,
+    start: std::time::Instant,
+) -> Result<Response<query::ExecuteCypherResponse>, Status> {
+    let statement = RoutedStatement {
+        namespace: executor.namespace(),
+        actor: ActingContext::Trusted,
+        params: convert_params(&req.parameters),
+        query: req.query,
+        settings: routed_settings(requested),
+        transaction: None,
+        operation: requested.operation,
+        deadline: time_left(requested.deadline),
+        source,
+        start: None,
+    };
+    let answer = executor
+        .route(leader, statement, &AdmissionSignal::new(|| {}))
+        .await
+        .map_err(db_error_to_status)?;
+    Ok(routed_response(answer, start, executor.history()))
 }
 
 /// What is left until `deadline`, zero once it passed; `None` without one.
@@ -1271,6 +1316,8 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             .ok_or_else(|| db_error_to_status(DatabaseError::MemberBusy))?;
         let source_ctx = extract_source_context(&request);
         let deadline = grpc_deadline(request.metadata());
+        // The call works in the namespace it names, and only there.
+        let executor = self.bound(request.metadata())?;
         let cancel = coordinode_core::budget::CancelFlag::new();
         let _cancel_on_drop = CancelOnDrop(cancel.clone());
         let req = request.into_inner();
@@ -1280,8 +1327,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // Resolve and check the settings, fence the read and wait for the
         // causal position. A statement that needs the leader runs there.
         let requested = requested_from_proto(&req, deadline, &cancel)?;
-        let admitted = self
-            .executor
+        let admitted = executor
             .admit(&req.query, &requested, false)
             .await
             .map_err(db_error_to_status)?;
@@ -1290,9 +1336,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         let admitted = match admitted {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
-                return self
-                    .run_at(leader_id, req, &requested, source_ctx, start)
-                    .await;
+                return run_at(&executor, leader_id, req, &requested, source_ctx, start).await;
             }
         };
 
@@ -1305,8 +1349,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 Some(convert_params(&req.parameters))
             };
             match super::blocking(|| {
-                self.executor
-                    .execute(&req.query, params, source_ctx.as_ref(), &admitted)
+                executor.execute(&req.query, params, source_ctx.as_ref(), &admitted)
             }) {
                 Ok(result) => result,
                 Err(e) => {
@@ -1317,9 +1360,10 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                     // not a repeat.
                     match leader_hint(&e) {
                         Some(leader_id) => {
-                            return self
-                                .run_at(leader_id, req, &requested, source_ctx, start)
-                                .await;
+                            return run_at(
+                                &executor, leader_id, req, &requested, source_ctx, start,
+                            )
+                            .await;
                         }
                         None => return Err(db_error_to_status(e)),
                     }
@@ -1399,12 +1443,13 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         request: Request<query::ExplainCypherRequest>,
     ) -> Result<Response<query::ExplainCypherResponse>, Status> {
+        let executor = self.bound(request.metadata())?;
         let req = request.into_inner();
 
         // The plan ExecuteCypher would run, index selection and push-down
         // included, so what is explained is what executes.
         let (plan, suggest_result, stats) = super::blocking(|| {
-            let db = self.database().read();
+            let db = executor.database().read();
             let stats = db.compute_stats();
             let plan = db.explain_plan(&req.query, stats.as_ref())?;
             let suggest = db.suggest_for(&plan, stats.as_ref());

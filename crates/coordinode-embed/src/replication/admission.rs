@@ -164,7 +164,10 @@ impl Admitter {
     /// An admitter over a standalone `database`, with the built-in defaults:
     /// every statement runs here, unfenced.
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
-        Self::serving(Arc::new(std::sync::OnceLock::from(database)))
+        let served = super::ServedDatabase::default();
+        // A fresh registry serves nothing yet: the set cannot fail.
+        let _ = served.set(database);
+        Self::serving(served)
     }
 
     /// An admitter over the database a member serves once it has caught up
@@ -201,6 +204,18 @@ impl Admitter {
     /// its group yet.
     pub fn database(&self) -> Result<&Arc<RwLock<Database>>, DatabaseError> {
         self.database.get().ok_or(DatabaseError::NotServing)
+    }
+
+    /// The database serving the namespace named `namespace`: a command of a
+    /// session bound to it runs there and nowhere else.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::NotServing`] on a member that has not caught up with
+    /// its group yet; [`DatabaseError::UnknownNamespace`] for a namespace the
+    /// deployment does not hold.
+    pub fn database_in(&self, namespace: &str) -> Result<Arc<RwLock<Database>>, DatabaseError> {
+        self.database.in_namespace(namespace)
     }
 
     /// The consensus node, when this member has one.

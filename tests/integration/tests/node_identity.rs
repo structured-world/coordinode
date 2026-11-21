@@ -217,12 +217,15 @@ async fn a_port_that_requires_client_certificates_serves_only_those_clients() {
     // Served once the member leads.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let answer = CypherServiceClient::new(app())
-            .execute_cypher(ExecuteCypherRequest {
-                query: "RETURN 1".to_string(),
-                ..Default::default()
-            })
-            .await;
+        let answer = CypherServiceClient::with_interceptor(
+            app(),
+            coordinode_integration::harness::NameNamespace,
+        )
+        .execute_cypher(ExecuteCypherRequest {
+            query: "RETURN 1".to_string(),
+            ..Default::default()
+        })
+        .await;
         if answer.is_ok() {
             break;
         }
@@ -240,13 +243,17 @@ async fn a_port_that_requires_client_certificates_serves_only_those_clients() {
         .expect_err("a client certificate is not a node");
     assert_eq!(vote.code(), tonic::Code::Unauthenticated, "{vote:?}");
 
+    // Each names the namespace, so a refusal is the transport's alone.
     let refused = |channel: Channel, who: &'static str| async move {
-        let answer = CypherServiceClient::new(channel)
-            .execute_cypher(ExecuteCypherRequest {
-                query: "RETURN 1".to_string(),
-                ..Default::default()
-            })
-            .await;
+        let answer = CypherServiceClient::with_interceptor(
+            channel,
+            coordinode_integration::harness::NameNamespace,
+        )
+        .execute_cypher(ExecuteCypherRequest {
+            query: "RETURN 1".to_string(),
+            ..Default::default()
+        })
+        .await;
         assert!(answer.is_err(), "{who} was served");
     };
     refused(

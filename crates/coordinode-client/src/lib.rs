@@ -9,7 +9,10 @@
 //! # tokio_test::block_on(async {
 //! use coordinode_client::CoordinodeClient;
 //!
-//! let mut client = CoordinodeClient::connect("http://localhost:7080")
+//! // A server serves tenant data to a client that names its namespace.
+//! let mut client = CoordinodeClient::builder("http://localhost:7080")
+//!     .namespace("default")
+//!     .build()
 //!     .await
 //!     .unwrap();
 //!
@@ -33,6 +36,7 @@
 //! use coordinode_client::CoordinodeClient;
 //!
 //! let mut client = CoordinodeClient::builder("http://localhost:7080")
+//!     .namespace("default")          // ← the namespace every call works in
 //!     .debug_source_tracking(true)   // ← attach file:line to every query
 //!     .app_name("my-service")
 //!     .app_version(env!("CARGO_PKG_VERSION"))
@@ -600,6 +604,7 @@ impl CoordinodeClient {
             operation: None,
         });
 
+        self.config.name_namespace(request.metadata_mut());
         if let Some(loc) = location {
             source::inject_grpc_metadata(request.metadata_mut(), loc, &self.config);
         }

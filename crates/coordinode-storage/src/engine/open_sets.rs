@@ -46,6 +46,9 @@ pub struct SetTrees {
     /// and which still owe what it lost. no-std: spin::Mutex
     #[cfg(feature = "columnar")]
     table_repairs: parking_lot::Mutex<Vec<crate::columnar::TableRepair>>,
+    /// The index layer's handling of transferred copies of the namespace's
+    /// indexes: each namespace has an index catalog of its own.
+    index_copy_qualifier: RwLock<Option<Arc<dyn crate::engine::index_copies::IndexCopyQualifier>>>,
 }
 
 /// What a dropped namespace's set removes when it goes.
@@ -84,7 +87,25 @@ impl SetTrees {
             columnar: None,
             #[cfg(feature = "columnar")]
             table_repairs: parking_lot::Mutex::new(Vec::new()),
+            index_copy_qualifier: RwLock::new(None),
         }
+    }
+
+    /// The index layer's handling of the namespace's transferred index
+    /// copies, once it registered one.
+    pub(crate) fn index_copy_qualifier(
+        &self,
+    ) -> Option<Arc<dyn crate::engine::index_copies::IndexCopyQualifier>> {
+        self.index_copy_qualifier.read().clone()
+    }
+
+    /// Register the index layer's handling of the namespace's transferred
+    /// index copies.
+    pub(crate) fn set_index_copy_qualifier(
+        &self,
+        qualifier: Arc<dyn crate::engine::index_copies::IndexCopyQualifier>,
+    ) {
+        *self.index_copy_qualifier.write() = Some(qualifier);
     }
 
     /// The set with its namespace's table registry and the repairs its open

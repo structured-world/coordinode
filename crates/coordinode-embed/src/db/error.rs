@@ -505,6 +505,17 @@ pub enum DatabaseError {
     #[error("this member has not caught up with its group yet and serves no data")]
     NotServing,
 
+    /// A session named a namespace the deployment holds no live namespace
+    /// of: never created, or dropped. No session is opened; nothing ran.
+    #[error("no namespace named {0}")]
+    UnknownNamespace(String),
+
+    /// A tenant-data session named no namespace: which namespace it works in
+    /// is the caller's explicit choice, however many the deployment holds,
+    /// never derived from the catalog. Nothing ran.
+    #[error("a session must name the namespace it works in")]
+    NamespaceRequired,
+
     /// The write reached a member that does not run its group's version: it
     /// is read-only. Nothing was applied. Names both versions and the leader
     /// when known.

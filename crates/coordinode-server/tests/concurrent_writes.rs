@@ -82,10 +82,12 @@ async fn more_writes_than_workers_all_commit() {
                 .await
                 .unwrap();
                 client
-                    .execute_cypher(query::ExecuteCypherRequest {
-                        query: format!("CREATE (:W {{i: {i}}})"),
-                        ..Default::default()
-                    })
+                    .execute_cypher(coordinode_test_fixtures::client::named(
+                        query::ExecuteCypherRequest {
+                            query: format!("CREATE (:W {{i: {i}}})"),
+                            ..Default::default()
+                        },
+                    ))
                     .await
             })
         })

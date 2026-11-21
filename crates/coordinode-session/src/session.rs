@@ -106,10 +106,17 @@ impl SessionManager {
     /// Open a new session for `peer`, registering it so it is visible to
     /// introspection until its stream closes.
     pub fn open(&self, peer: String) -> Session {
+        self.open_on(peer, Arc::clone(&self.engine))
+    }
+
+    /// Open a new session for `peer` whose statements run on `engine`, the
+    /// engine of the namespace the session was established in: fixed for
+    /// the session's life.
+    pub fn open_on(&self, peer: String, engine: Arc<dyn CursorEngine>) -> Session {
         let session_id = self.registry.register_session(peer);
         Session {
             session_id,
-            engine: Arc::clone(&self.engine),
+            engine,
             registry: Arc::clone(&self.registry),
             connection: self.connection.clone(),
             settings: Mutex::new(ConnectionSettings::default()),

@@ -20,17 +20,33 @@ impl Drop for Server {
     }
 }
 
+/// The namespace a fresh server opens with, which a client names.
+const NAMESPACE: &str = "default";
+
 fn request(port: u16, path: &str, body: Option<&str>) -> std::io::Result<String> {
+    request_in(port, path, body, None)
+}
+
+/// [`request`] naming `namespace` in the namespace header.
+fn request_in(
+    port: u16,
+    path: &str,
+    body: Option<&str>,
+    namespace: Option<&str>,
+) -> std::io::Result<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let method = if body.is_some() { "POST" } else { "GET" };
     let body = body.unwrap_or_default();
+    let namespace = namespace
+        .map(|name| format!("X-CoordiNode-Namespace: {name}\r\n"))
+        .unwrap_or_default();
     // HTTP/1.0 closes after the response, avoiding a second HTTP implementation
     // in this test and allowing the response body to be read to EOF.
     write!(
         stream,
-        "{method} {path} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.0\r\nHost: localhost\r\n{namespace}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )?;
     let mut response = String::new();
@@ -71,10 +87,21 @@ fn rest_write_is_visible_over_grpc() -> Result<(), Box<dyn std::error::Error>> {
         assert!(Instant::now() < deadline, "server did not become ready");
         std::thread::sleep(Duration::from_millis(100));
     }
-    let response = request(
+    // A REST call that names no namespace is refused before it runs.
+    let unnamed = request(
+        rest,
+        "/v1/query/cypher",
+        Some(r#"{"query":"CREATE (:RestProbe {value: 1})"}"#),
+    )?;
+    assert!(
+        unnamed.starts_with("HTTP/1.0 400") || unnamed.starts_with("HTTP/1.1 400"),
+        "a REST call naming no namespace was served: {unnamed}"
+    );
+    let response = request_in(
         rest,
         "/v1/query/cypher",
         Some(r#"{"query":"CREATE (:RestProbe {value: 37})"}"#),
+        Some(NAMESPACE),
     )?;
     assert!(
         response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"),
@@ -92,14 +119,18 @@ fn rest_write_is_visible_over_grpc() -> Result<(), Box<dyn std::error::Error>> {
             ExecuteCypherRequest, cypher_service_client::CypherServiceClient,
         };
         let mut client = CypherServiceClient::connect(format!("http://127.0.0.1:{grpc}")).await?;
-        let response = client
-            .execute_cypher(ExecuteCypherRequest {
-                query: "MATCH (n:RestProbe {value: 37}) RETURN n.value".into(),
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
-        assert_eq!(response.rows.len(), 1, "gRPC sees the REST commit");
+        let mut call = tonic::Request::new(ExecuteCypherRequest {
+            query: "MATCH (n:RestProbe) RETURN n.value".into(),
+            ..Default::default()
+        });
+        call.metadata_mut()
+            .insert("x-coordinode-namespace", NAMESPACE.parse()?);
+        let response = client.execute_cypher(call).await?.into_inner();
+        assert_eq!(
+            response.rows.len(),
+            1,
+            "gRPC sees the REST commit, and nothing of the refused call"
+        );
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     Ok(())

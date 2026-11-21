@@ -101,10 +101,12 @@ impl Server {
                 let mut client = CypherServiceClient::connect(format!("http://127.0.0.1:{grpc}"))
                     .await
                     .map_err(|e| e.to_string())?;
-                let call = client.execute_cypher(ExecuteCypherRequest {
-                    query,
-                    ..Default::default()
-                });
+                let call = client.execute_cypher(coordinode_test_fixtures::client::named(
+                    ExecuteCypherRequest {
+                        query,
+                        ..Default::default()
+                    },
+                ));
                 match tokio::time::timeout(Duration::from_secs(30), call).await {
                     Ok(Ok(response)) => Ok(response.into_inner().rows.len()),
                     Ok(Err(status)) => Err(status.to_string()),

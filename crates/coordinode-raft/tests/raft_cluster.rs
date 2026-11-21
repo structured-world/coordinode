@@ -2291,8 +2291,10 @@ async fn a_snapshot_carries_the_sealed_index_inventory() {
         let (e1, e2) = (open(dir1.path()), member_engine_at(dir2.path()));
         let leader_layer = InventoryRecorder::new(b"leader inventory");
         let member_layer = InventoryRecorder::new(b"member inventory");
-        e1.set_index_copy_qualifier(Arc::clone(&leader_layer) as _);
-        e2.set_index_copy_qualifier(Arc::clone(&member_layer) as _);
+        e1.set_index_copy_qualifier(Arc::clone(&leader_layer) as _)
+            .expect("register the leader's index layer");
+        // The joiner holds no namespace until the snapshot brings one: its
+        // index layer registers once it is there.
 
         let n1 = RaftNode::open_cluster_with_options(
             1,
@@ -2348,7 +2350,14 @@ async fn a_snapshot_carries_the_sealed_index_inventory() {
         await_condition(
             Duration::from_secs(20),
             "the snapshot never reached node 2",
-            || !member_layer.received.lock().expect("lock").is_empty(),
+            // The record is begun empty before the trees are replaced and
+            // takes the inventory once they are.
+            || {
+                e2.is_bound()
+                    && e2
+                        .index_transfer_inventory()
+                        .is_ok_and(|kept| kept.is_some_and(|inventory| inventory.is_some()))
+            },
         )
         .await;
         assert!(
@@ -2358,11 +2367,15 @@ async fn a_snapshot_carries_the_sealed_index_inventory() {
                 >= 1,
             "the pin sent took the inventory"
         );
+        // Installed before any index layer of the namespace was open there:
+        // the inventory is kept with the transfer's record for it.
         assert_eq!(
-            member_layer.received.lock().expect("lock")[0].as_deref(),
-            Some(&b"leader inventory+sealed"[..]),
+            e2.index_transfer_inventory().expect("read"),
+            Some(Some(b"leader inventory+sealed".to_vec())),
             "the inventory taken with the pin, sealed when sent"
         );
+        e2.set_index_copy_qualifier(Arc::clone(&member_layer) as _)
+            .expect("register the member's index layer");
 
         let before = member_layer
             .captures

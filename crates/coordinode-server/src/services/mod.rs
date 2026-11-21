@@ -6,6 +6,7 @@ pub mod cypher;
 pub mod error_details;
 pub mod graph;
 pub mod health;
+pub mod namespace;
 pub mod operation;
 pub mod routing;
 pub mod schema;

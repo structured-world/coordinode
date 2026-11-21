@@ -207,6 +207,7 @@ async fn transaction(member: &ReplicatedDatabase, k: usize) {
     ingress
         .execute_in_transaction(
             RoutedStatement {
+                namespace: coordinode_core::namespace::DEFAULT_NAMESPACE.to_owned(),
                 actor: ActingContext::Trusted,
                 query: "CREATE (:InTxn {k: $k})".to_owned(),
                 params: std::collections::HashMap::from([(
@@ -229,6 +230,7 @@ async fn transaction(member: &ReplicatedDatabase, k: usize) {
     ingress
         .commit(
             RoutedCommit {
+                namespace: coordinode_core::namespace::DEFAULT_NAMESPACE.to_owned(),
                 actor: ActingContext::Trusted,
                 transaction: id,
                 operation: None,
@@ -676,6 +678,7 @@ async fn slow_consumer(leader: &ReplicatedDatabase, follower: &ReplicatedDatabas
     }
     let query = "MATCH (n:Large) RETURN n.k AS k, n.payload AS payload";
     let routed = || RoutedStatement {
+        namespace: coordinode_core::namespace::DEFAULT_NAMESPACE.to_owned(),
         actor: ActingContext::Trusted,
         query: query.to_owned(),
         params: Default::default(),

@@ -17,6 +17,33 @@ use crate::proto::{
     v2::graph::schema_service_client::SchemaServiceClient,
 };
 
+/// The namespace a server started here opens with: a fresh store's own.
+pub const NAMESPACE: &str = "default";
+
+/// The metadata key a client names its namespace under.
+pub const NAMESPACE_HEADER: &str = "x-coordinode-namespace";
+
+/// Names [`NAMESPACE`] on every call, as every client of tenant data does.
+#[derive(Debug, Clone, Copy)]
+pub struct NameNamespace;
+
+impl tonic::service::Interceptor for NameNamespace {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        request.metadata_mut().insert(
+            NAMESPACE_HEADER,
+            tonic::metadata::MetadataValue::from_static(NAMESPACE),
+        );
+        Ok(request)
+    }
+}
+
+/// A channel whose calls name [`NAMESPACE`].
+pub type NamedChannel =
+    tonic::service::interceptor::InterceptedService<tonic::transport::Channel, NameNamespace>;
+
 /// A running coordinode process bound to an ephemeral port + temp data dir.
 ///
 /// Killed (and data dir removed) when dropped. Use [`CoordinodeProcess::restart`]
@@ -696,15 +723,16 @@ impl CoordinodeProcess {
         (status, body)
     }
 
-    /// Build a `SchemaServiceClient` connected to this process.
-    pub async fn schema_client(&self) -> SchemaServiceClient<tonic::transport::Channel> {
+    /// Build a `SchemaServiceClient` connected to this process, naming its
+    /// namespace on every call.
+    pub async fn schema_client(&self) -> SchemaServiceClient<NamedChannel> {
         self.serving().await;
         let channel = tonic::transport::Endpoint::from_shared(self.endpoint())
             .expect("valid endpoint")
             .connect()
             .await
             .expect("connect to schema service");
-        SchemaServiceClient::new(channel)
+        SchemaServiceClient::with_interceptor(channel, NameNamespace)
     }
 
     /// Wait until this process serves clients: a member that joined its
@@ -722,15 +750,16 @@ impl CoordinodeProcess {
         }
     }
 
-    /// Build a `CypherServiceClient` connected to this process.
-    pub async fn cypher_client(&self) -> CypherServiceClient<tonic::transport::Channel> {
+    /// Build a `CypherServiceClient` connected to this process, naming its
+    /// namespace on every call.
+    pub async fn cypher_client(&self) -> CypherServiceClient<NamedChannel> {
         self.serving().await;
         let channel = tonic::transport::Endpoint::from_shared(self.endpoint())
             .expect("valid endpoint")
             .connect()
             .await
             .expect("connect to cypher service");
-        CypherServiceClient::new(channel)
+        CypherServiceClient::with_interceptor(channel, NameNamespace)
     }
 
     /// Build a `ClusterServiceClient` connected to this process.
@@ -884,7 +913,7 @@ impl CoordinodeProcess {
             let channel = tonic::transport::Endpoint::from_shared(self.endpoint())
                 .expect("valid endpoint")
                 .connect_lazy();
-            let mut client = CypherServiceClient::new(channel);
+            let mut client = CypherServiceClient::with_interceptor(channel, NameNamespace);
             let result = client
                 .execute_cypher(ExecuteCypherRequest {
                     query: "RETURN 1".to_string(),

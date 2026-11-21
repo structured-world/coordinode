@@ -1725,9 +1725,14 @@ async fn followers_reach_the_leader(members: &[ReplicatedDatabase]) {
     }
 }
 
+/// The namespace every member of these groups serves: the one the founder's
+/// single store created.
+const NAMESPACE: &str = coordinode_core::namespace::DEFAULT_NAMESPACE;
+
 /// A transaction command a host sends through `ingress`.
 fn in_transaction(id: TransactionId, query: &str) -> RoutedStatement {
     RoutedStatement {
+        namespace: NAMESPACE.to_owned(),
         actor: ActingContext::Trusted,
         query: query.to_owned(),
         params: Default::default(),
@@ -1742,6 +1747,7 @@ fn in_transaction(id: TransactionId, query: &str) -> RoutedStatement {
 
 fn begin_of(id: TransactionId) -> RoutedBegin {
     RoutedBegin {
+        namespace: NAMESPACE.to_owned(),
         transaction: id,
         actor: ActingContext::Trusted,
         read_concern: None,
@@ -1755,6 +1761,7 @@ fn begin_of(id: TransactionId) -> RoutedBegin {
 
 fn commit_of(id: TransactionId) -> RoutedCommit {
     RoutedCommit {
+        namespace: NAMESPACE.to_owned(),
         actor: ActingContext::Trusted,
         transaction: id,
         operation: None,
@@ -2049,6 +2056,7 @@ async fn a_routed_write_takes_effect_once_across_a_leader_change() {
             .expect("a router to member 1")
             .execute(
                 RoutedStatement {
+                    namespace: NAMESPACE.to_owned(),
                     actor: ActingContext::Trusted,
                     query: "CREATE (:Stale {k: 1})".into(),
                     params: Default::default(),

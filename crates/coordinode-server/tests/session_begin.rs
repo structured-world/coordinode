@@ -34,8 +34,11 @@ impl Session {
             .await
             .unwrap();
         let (send, outgoing) = mpsc::channel(16);
+        // The session is bound to the namespace its stream names.
         let frames = client
-            .session(ReceiverStream::new(outgoing))
+            .session(coordinode_test_fixtures::client::named(
+                ReceiverStream::new(outgoing),
+            ))
             .await
             .unwrap()
             .into_inner();

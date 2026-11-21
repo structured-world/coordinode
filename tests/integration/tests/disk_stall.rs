@@ -75,10 +75,11 @@ fn lost_attempts(acked: &BTreeSet<Attempt>, held: &BTreeSet<Attempt>) -> Vec<Att
 /// Create `:Stalled {seq, via}` through the member at `port`, acknowledged
 /// at majority with the journal; why not when it is refused.
 async fn write_seq(port: u16, seq: i64) -> Result<(), String> {
-    let mut client = CypherServiceClient::new(
+    let mut client = CypherServiceClient::with_interceptor(
         channel(port, Duration::from_secs(10))
             .await
             .ok_or_else(|| "no connection".to_string())?,
+        coordinode_integration::harness::NameNamespace,
     );
     let mut parameters = HashMap::new();
     parameters.insert(
@@ -111,10 +112,11 @@ async fn write_seq(port: u16, seq: i64) -> Result<(), String> {
 
 /// The `:Stalled` attempts the member at `port` holds, read from itself.
 async fn held(port: u16) -> Result<BTreeSet<Attempt>, String> {
-    let mut client = CypherServiceClient::new(
+    let mut client = CypherServiceClient::with_interceptor(
         channel(port, Duration::from_secs(5))
             .await
             .ok_or_else(|| "no connection".to_string())?,
+        coordinode_integration::harness::NameNamespace,
     );
     let rows = client
         .execute_cypher(ExecuteCypherRequest {

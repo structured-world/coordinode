@@ -27,6 +27,7 @@ mod index_copy;
 pub mod ingress;
 pub mod routing;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -145,10 +146,94 @@ impl MemberOptions {
     }
 }
 
-/// The database a member serves, once it serves: shared with what answers
+/// The databases a member serves, once it serves: shared with what answers
 /// the calls peers route here, which may arrive before a joining member has
-/// caught up. no-std: once_cell::race::OnceBox
-pub type ServedDatabase = Arc<std::sync::OnceLock<Arc<RwLock<Database>>>>;
+/// caught up.
+pub type ServedDatabase = Arc<Served>;
+
+/// Starts what a namespace's session of a member runs beside it (its
+/// transaction tenure, idle reaper and leader-only work) and returns it
+/// ready to serve.
+pub type SessionStarter = Arc<dyn Fn(Database) -> Arc<RwLock<Database>> + Send + Sync>;
+
+/// The member's database over the namespace it opened with, and a session
+/// for each further namespace a command named, opened on first use and kept.
+#[derive(Default)]
+pub struct Served {
+    /// The database the member opened. no-std: once_cell::race::OnceBox
+    primary: std::sync::OnceLock<Arc<RwLock<Database>>>,
+    /// Sessions of further namespaces, by name. no-std: spin::Mutex
+    sessions: parking_lot::Mutex<HashMap<String, Arc<RwLock<Database>>>>,
+    /// How a session is started beside its member; a session of a store
+    /// without a member needs nothing started.
+    starter: std::sync::OnceLock<SessionStarter>,
+}
+
+impl Served {
+    /// The database the member opened, once it serves.
+    pub fn get(&self) -> Option<&Arc<RwLock<Database>>> {
+        self.primary.get()
+    }
+
+    /// Serve `database` as the member's own.
+    ///
+    /// # Errors
+    ///
+    /// Gives `database` back when the member already serves one.
+    pub fn set(&self, database: Arc<RwLock<Database>>) -> Result<(), Arc<RwLock<Database>>> {
+        self.primary.set(database)
+    }
+
+    /// Start every session of a further namespace with `starter`.
+    pub fn start_sessions_with(&self, starter: SessionStarter) {
+        // Set once, by the member that serves: a second call keeps the first.
+        let _ = self.starter.set(starter);
+    }
+
+    /// The database serving the namespace named `namespace`: the member's
+    /// own when it is that namespace, otherwise a session of it, opened on
+    /// first use. A session is bound to its namespace for its whole life.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::NotServing`] before the member serves;
+    /// [`DatabaseError::UnknownNamespace`] for a name the deployment holds
+    /// no live namespace of; what opening the session refuses.
+    pub fn in_namespace(&self, namespace: &str) -> Result<Arc<RwLock<Database>>, DatabaseError> {
+        let primary = self.primary.get().ok_or(DatabaseError::NotServing)?;
+        if primary.read().namespace() == namespace {
+            return Ok(Arc::clone(primary));
+        }
+        let mut sessions = self.sessions.lock();
+        if let Some(session) = sessions.get(namespace) {
+            return Ok(Arc::clone(session));
+        }
+        let session = primary.read().session(namespace)?;
+        let session = match self.starter.get() {
+            Some(start) => start(session),
+            None => Arc::new(RwLock::new(session)),
+        };
+        sessions.insert(namespace.to_owned(), Arc::clone(&session));
+        Ok(session)
+    }
+
+    /// Every database served now: the member's own first, then each open
+    /// session.
+    pub fn all(&self) -> Vec<Arc<RwLock<Database>>> {
+        self.primary
+            .get()
+            .into_iter()
+            .cloned()
+            .chain(self.sessions.lock().values().cloned())
+            .collect()
+    }
+
+    /// Run `f` over the open sessions with no session opening meanwhile.
+    fn with_sessions(&self, f: impl FnOnce(&mut dyn Iterator<Item = &Arc<RwLock<Database>>>)) {
+        let sessions = self.sessions.lock();
+        f(&mut sessions.values());
+    }
+}
 
 /// A database over a store that is a member of a replicated group: the
 /// engine, the consensus node, the database over its replicated pipeline and
@@ -180,6 +265,104 @@ pub struct Member {
     /// Tells the background tasks to finish: each stops between passes, so
     /// none is cut off holding the database.
     stop: tokio::sync::watch::Sender<bool>,
+    /// What the sessions of further namespaces run beside them, started as
+    /// each session opens.
+    sessions: SessionWork,
+}
+
+/// The work the sessions of further namespaces run beside them.
+#[derive(Clone, Default)]
+struct SessionWork {
+    tasks: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    followers: Arc<parking_lot::Mutex<Vec<follower::IndexDefinitionFollower>>>,
+    /// Set once the member's background work started: a session opened
+    /// from then on starts its own at once.
+    trigger_interval: Arc<std::sync::OnceLock<Duration>>,
+}
+
+/// Make `database` ready to serve beside `node`: its idle reaper woken by
+/// its begins, the size of its group, its peers as the source of index
+/// copies, and the work no database of a member runs without (its
+/// transaction tenure and idle reaper), returned with it.
+fn serve_beside(
+    node: &Arc<RaftNode>,
+    mut database: Database,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> (Arc<RwLock<Database>>, Vec<tokio::task::JoinHandle<()>>) {
+    // The idle reaper sleeps while no transaction is open; a begin wakes it.
+    let begun = Arc::new(tokio::sync::Notify::new());
+    {
+        let begun = Arc::clone(&begun);
+        database.set_interactive_begun_hook(Arc::new(move || begun.notify_one()));
+    }
+    // Weak: the node outlives none of the database's users, and a node
+    // that is gone answers as a group of unknown size.
+    {
+        let node = Arc::downgrade(node);
+        database.set_group_members(Arc::new(move || {
+            node.upgrade()
+                .map_or(usize::MAX, |node| node.member_count())
+        }));
+    }
+    // A copy of an index found damaged on this member alone is replaced from
+    // a peer's copy of the same namespace's index; a member without peers
+    // answers from its records instead.
+    if node.connections().is_some() {
+        database.set_index_copy_source(Arc::new(index_copy::PeerIndexCopy {
+            installer: Arc::new(SegmentInstaller::new(database.engine_handle())),
+            node: Arc::clone(node),
+            runtime: tokio::runtime::Handle::current(),
+        }));
+    }
+    let database = Arc::new(RwLock::new(database));
+    let tasks = vec![
+        // A member that is not told when it stops leading would keep
+        // transactions of a lost lead.
+        background::spawn_execution_tenure(Arc::clone(&database), Arc::clone(node), stop.clone()),
+        // An idle transaction ends with its timeout outcome whether or not
+        // anything else ever begins.
+        background::spawn_idle_reaper(
+            Arc::clone(&database),
+            begun,
+            background::REAPER_GRANULARITY,
+            stop.clone(),
+        ),
+    ];
+    (database, tasks)
+}
+
+/// Start what `database` does while its member leads (finishing interrupted
+/// index builds, dispatching AFTER COMMIT triggers when the member has
+/// peers) and the follower bringing its index definitions live.
+fn leader_work(
+    node: &Arc<RaftNode>,
+    database: &Arc<RwLock<Database>>,
+    has_peers: bool,
+    trigger_interval: Duration,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> (
+    Vec<tokio::task::JoinHandle<()>>,
+    follower::IndexDefinitionFollower,
+) {
+    let engine = database.read().engine_handle();
+    let follower = follower::IndexDefinitionFollower::spawn(&engine, Arc::downgrade(database));
+    let mut tasks = Vec::new();
+    // With peers a body's writes go through the leader; a member alone runs
+    // them as it commits.
+    if has_peers {
+        tasks.push(background::spawn_trigger_dispatch(
+            Arc::clone(database),
+            Arc::clone(node),
+            trigger_interval,
+            stop.clone(),
+        ));
+    }
+    tasks.push(background::spawn_index_build_resumer(
+        Arc::clone(database),
+        Arc::clone(node),
+        stop.clone(),
+    ));
+    (tasks, follower)
 }
 
 impl Member {
@@ -296,6 +479,7 @@ impl Member {
             follower: None,
             background: Vec::new(),
             stop: tokio::sync::watch::Sender::new(false),
+            sessions: SessionWork::default(),
         };
         // A member whose store holds its namespace serves from the open; one
         // that joins serves once its namespace arrives (`serve`).
@@ -354,52 +538,34 @@ impl Member {
         let (leader, term) = node.next_leadership_change((None, u64::MAX)).await;
         tracing::debug!(target: "coordinode::startup", ?leader, term, "leadership known");
         database.set_execution_tenure(node.node_id(), leader, term);
-        // The idle reaper sleeps while no transaction is open; a begin wakes
-        // it.
-        let begun = Arc::new(tokio::sync::Notify::new());
-        let mut database = database;
-        {
-            let begun = Arc::clone(&begun);
-            database.set_interactive_begun_hook(Arc::new(move || begun.notify_one()));
-        }
-        // Weak: the node outlives none of the database's users, and a node
-        // that is gone answers as a group of unknown size.
-        {
-            let node = Arc::downgrade(node);
-            database.set_group_members(Arc::new(move || {
-                node.upgrade()
-                    .map_or(usize::MAX, |node| node.member_count())
-            }));
-        }
-        // A copy of an index found damaged on this member alone is replaced
-        // from a peer's copy; a member without peers answers from its records
-        // instead.
-        if node.connections().is_some() {
-            database.set_index_copy_source(Arc::new(index_copy::PeerIndexCopy {
-                installer: Arc::new(SegmentInstaller::new(Arc::clone(&self.engine))),
-                node: Arc::clone(node),
-                runtime: tokio::runtime::Handle::current(),
-            }));
-        }
-        let database = Arc::new(RwLock::new(database));
-        // Not part of the optional background work: a member that is not
-        // told when it stops leading would keep transactions of a lost lead.
-        self.background.push(background::spawn_execution_tenure(
-            Arc::clone(&database),
-            Arc::clone(node),
-            self.stop.subscribe(),
-        ));
-        // Not optional either: an idle transaction ends with its timeout
-        // outcome whether or not anything else ever begins.
-        self.background.push(background::spawn_idle_reaper(
-            Arc::clone(&database),
-            begun,
-            background::REAPER_GRANULARITY,
-            self.stop.subscribe(),
-        ));
+        let (database, tasks) = serve_beside(node, database, &self.stop.subscribe());
+        self.background.extend(tasks);
         if self.database.set(database).is_err() {
             return Err(DatabaseError::Other("the member's database opened twice".into()).into());
         }
+        // A session of a further namespace, opened when a command names it,
+        // runs the same work beside it.
+        let starter: SessionStarter = {
+            let node = Arc::clone(&self.node);
+            let stop = self.stop.subscribe();
+            let work = self.sessions.clone();
+            let has_peers = self.handler.is_some();
+            let runtime = tokio::runtime::Handle::current();
+            Arc::new(move |session: Database| {
+                // Opened on whatever thread the command runs on.
+                let _runtime = runtime.enter();
+                let (session, mut tasks) = serve_beside(&node, session, &stop);
+                if let Some(interval) = work.trigger_interval.get() {
+                    let (more, follower) =
+                        leader_work(&node, &session, has_peers, *interval, &stop);
+                    tasks.extend(more);
+                    work.followers.lock().push(follower);
+                }
+                work.tasks.lock().extend(tasks);
+                session
+            })
+        };
+        self.database.start_sessions_with(starter);
         Ok(())
     }
 
@@ -417,25 +583,30 @@ impl Member {
             tracing::debug!("background work asked for before the member serves");
             return;
         };
-        self.follower = Some(follower::IndexDefinitionFollower::spawn(
-            &self.engine,
-            Arc::downgrade(&database),
-        ));
-        // With peers a body's writes go through the leader; a member alone
-        // runs them as it commits.
-        if self.handler.is_some() {
-            self.background.push(background::spawn_trigger_dispatch(
-                Arc::clone(&database),
-                Arc::clone(&self.node),
-                trigger_dispatch_interval,
-                self.stop.subscribe(),
-            ));
-        }
-        self.background.push(background::spawn_index_build_resumer(
-            Arc::clone(&database),
-            Arc::clone(&self.node),
-            self.stop.subscribe(),
-        ));
+        let stop = self.stop.subscribe();
+        let has_peers = self.handler.is_some();
+        let (tasks, follower) = leader_work(
+            &self.node,
+            &database,
+            has_peers,
+            trigger_dispatch_interval,
+            &stop,
+        );
+        self.background.extend(tasks);
+        self.follower = Some(follower);
+        // Sessions opened before now start theirs here, later ones as they
+        // open: decided under the lock sessions open under, so none is
+        // started twice or missed.
+        let (node, work) = (&self.node, &self.sessions);
+        self.database.with_sessions(|sessions| {
+            let _ = work.trigger_interval.set(trigger_dispatch_interval);
+            for session in sessions {
+                let (tasks, follower) =
+                    leader_work(node, session, has_peers, trigger_dispatch_interval, &stop);
+                work.tasks.lock().extend(tasks);
+                work.followers.lock().push(follower);
+            }
+        });
         // A member that stands last leads only while no other member can, and
         // gives the lead back once another has caught up.
         if self.preference == ElectionPreference::Last && self.handler.is_some() {
@@ -455,15 +626,22 @@ impl Member {
     /// follower is joined.
     pub async fn stop_background(&mut self) {
         self.stop.send_replace(true);
-        for task in self.background.drain(..) {
+        let session_tasks: Vec<_> = self.sessions.tasks.lock().drain(..).collect();
+        for task in self.background.drain(..).chain(session_tasks) {
             if let Err(e) = task.await {
                 tracing::error!(%e, "a member background task failed");
             }
         }
-        if let Some(follower) = self.follower.take() {
-            // Joining its thread blocks: off the async runtime.
-            if let Err(e) = tokio::task::spawn_blocking(move || drop(follower)).await {
-                tracing::error!(%e, "stopping the index definition follower failed");
+        let followers: Vec<_> = self
+            .follower
+            .take()
+            .into_iter()
+            .chain(self.sessions.followers.lock().drain(..))
+            .collect();
+        if !followers.is_empty() {
+            // Joining their threads blocks: off the async runtime.
+            if let Err(e) = tokio::task::spawn_blocking(move || drop(followers)).await {
+                tracing::error!(%e, "stopping the index definition followers failed");
             }
         }
     }
@@ -567,6 +745,9 @@ impl Drop for Member {
         // The tasks hold the node, so they would keep it alive and never see
         // it go: they are stopped here.
         for task in self.background.drain(..) {
+            task.abort();
+        }
+        for task in self.sessions.tasks.lock().drain(..) {
             task.abort();
         }
     }

@@ -1591,11 +1591,14 @@ async fn a_session_on_a_follower_works_on_the_leaders_transaction() {
             .await
             .expect("connect");
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let inbound = SessionServiceClient::new(channel)
-            .session(ReceiverStream::new(rx))
-            .await
-            .expect("open session")
-            .into_inner();
+        let inbound = SessionServiceClient::with_interceptor(
+            channel,
+            coordinode_integration::harness::NameNamespace,
+        )
+        .session(ReceiverStream::new(rx))
+        .await
+        .expect("open session")
+        .into_inner();
         (tx, inbound)
     }
     async fn terminal(inbound: &mut tonic::Streaming<ServerFrame>, want: u64) -> Event {
@@ -1792,11 +1795,14 @@ async fn a_lost_committed_answer_across_a_leader_stop_resolves_committed() {
             .await
             .expect("connect");
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let mut inbound = SessionServiceClient::new(channel)
-            .session(ReceiverStream::new(rx))
-            .await
-            .expect("open session")
-            .into_inner();
+        let mut inbound = SessionServiceClient::with_interceptor(
+            channel,
+            coordinode_integration::harness::NameNamespace,
+        )
+        .session(ReceiverStream::new(rx))
+        .await
+        .expect("open session")
+        .into_inner();
         let txid = draw_transaction_id();
         tx.send(ClientFrame {
             request_id: 1,
@@ -1983,11 +1989,14 @@ async fn commits_across_a_leader_stop(stall_leader_log: bool) {
     let mut sessions = Vec::new();
     for (side, channel) in [channel, direct].into_iter().enumerate() {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let mut inbound = SessionServiceClient::new(channel)
-            .session(ReceiverStream::new(rx))
-            .await
-            .expect("open session")
-            .into_inner();
+        let mut inbound = SessionServiceClient::with_interceptor(
+            channel,
+            coordinode_integration::harness::NameNamespace,
+        )
+        .session(ReceiverStream::new(rx))
+        .await
+        .expect("open session")
+        .into_inner();
         let first = side as u64 * TRANSACTIONS;
         let mut commits = Vec::new();
         for i in first..first + TRANSACTIONS {

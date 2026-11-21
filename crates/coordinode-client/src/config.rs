@@ -27,6 +27,23 @@ pub struct ClientConfig {
     /// How long a causal read may wait on the serving member for its bound;
     /// `None` refuses a read whose bound is not met yet at once.
     pub(crate) causal_wait: Option<std::time::Duration>,
+
+    /// The namespace every call and the session work in, as the metadata
+    /// value naming it; a server refuses tenant data to a client that names
+    /// none.
+    pub(crate) namespace: Option<tonic::metadata::AsciiMetadataValue>,
+}
+
+/// The metadata key a call names its namespace under.
+pub(crate) const NAMESPACE_HEADER: &str = "x-coordinode-namespace";
+
+impl ClientConfig {
+    /// Name this client's namespace in `meta`, when it has one.
+    pub(crate) fn name_namespace(&self, meta: &mut tonic::metadata::MetadataMap) {
+        if let Some(namespace) = &self.namespace {
+            meta.insert(NAMESPACE_HEADER, namespace.clone());
+        }
+    }
 }
 
 /// How the client carries statements to the server.
@@ -58,6 +75,7 @@ impl ClientConfig {
 /// use coordinode_client::CoordinodeClient;
 ///
 /// let mut client = CoordinodeClient::builder("http://localhost:7080")
+///     .namespace("default")
 ///     .debug_source_tracking(true)
 ///     .app_name("my-service")
 ///     .app_version("v1.2.3")
@@ -73,6 +91,7 @@ pub struct CoordinodeClientBuilder {
     pub(crate) app_version: String,
     pub(crate) transport: Transport,
     pub(crate) causal_wait: Option<std::time::Duration>,
+    pub(crate) namespace: Option<String>,
 }
 
 impl CoordinodeClientBuilder {
@@ -85,7 +104,16 @@ impl CoordinodeClientBuilder {
             app_version: String::new(),
             transport: Transport::default(),
             causal_wait: None,
+            namespace: None,
         }
+    }
+
+    /// Work in the namespace named `name`: every call names it, and the
+    /// session is bound to it when it opens. A server serves tenant data only
+    /// to a client that names its namespace, however many it holds.
+    pub fn namespace(mut self, name: impl Into<String>) -> Self {
+        self.namespace = Some(name.into());
+        self
     }
 
     /// Let a causal read wait up to `wait` on the serving member for a bound
@@ -133,7 +161,16 @@ impl CoordinodeClientBuilder {
     }
 
     /// Connect to the server and return a ready [`super::CoordinodeClient`].
+    ///
+    /// # Errors
+    ///
+    /// [`super::ClientError::InvalidMetadata`] for a namespace name that is
+    /// not header text; a connection failure.
     pub async fn build(self) -> Result<super::CoordinodeClient, super::ClientError> {
+        let namespace = self
+            .namespace
+            .map(|name| name.parse::<tonic::metadata::AsciiMetadataValue>())
+            .transpose()?;
         let config = ClientConfig {
             endpoint: self.endpoint.clone(),
             debug_source_tracking: self.debug_source_tracking,
@@ -141,6 +178,7 @@ impl CoordinodeClientBuilder {
             app_version: self.app_version,
             transport: self.transport,
             causal_wait: self.causal_wait,
+            namespace,
         };
         super::CoordinodeClient::connect_with_config(config).await
     }

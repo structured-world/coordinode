@@ -880,10 +880,11 @@ impl IndexRegistry {
     ///
     /// The guards could not be read or decoded: no copy is known to be safe.
     pub fn recover_local_guards(&self, engine: &StorageEngine) -> Result<(), StoreError> {
-        // A transfer installed without its inventory being taken: no copy it
+        // A transfer installed before this namespace's index layer opened:
+        // the inventory it kept is taken now, and with none kept no copy it
         // brought counts as proved.
-        if engine.index_transfer_pending()? {
-            super::transfer::take_inventory(engine, None)?;
+        if let Some(inventory) = engine.index_transfer_inventory()? {
+            super::transfer::take_inventory(engine, inventory.as_deref())?;
             self.recovery_flushes.fetch_add(1, Ordering::Relaxed);
         }
         let store = LocalIndexStore::new(engine);

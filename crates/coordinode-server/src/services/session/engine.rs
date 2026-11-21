@@ -164,12 +164,14 @@ impl DatabaseCursorEngine {
     /// An autonomous session statement as routed to the leader: the settings
     /// the session named go with it, the leader does not know the session.
     fn autonomous(
+        &self,
         query: &str,
         params: Option<HashMap<String, Value>>,
         requested: &Requested,
         source: Option<SourceContext>,
     ) -> RoutedStatement {
         RoutedStatement {
+            namespace: self.executor.namespace(),
             actor: ActingContext::Trusted,
             query: query.to_string(),
             params: params.unwrap_or_default(),
@@ -203,6 +205,7 @@ async fn unless_cancelled<T>(
 /// A statement of `transaction` as routed to the leader that holds it: the
 /// session's vector settings go with it, its concerns are the transaction's.
 fn transaction_statement(
+    namespace: String,
     query: &str,
     params: Option<HashMap<String, Value>>,
     settings: &ConnectionSettings,
@@ -210,6 +213,7 @@ fn transaction_statement(
     transaction: &InTransaction,
 ) -> RoutedStatement {
     RoutedStatement {
+        namespace,
         actor: ActingContext::Trusted,
         query: query.to_string(),
         params: params.unwrap_or_default(),
@@ -293,7 +297,14 @@ impl CursorEngine for DatabaseCursorEngine {
             // Another member leads: the statement runs there, and has its
             // place once the leader says so.
             if let Some(leader) = self.transaction_leader()? {
-                let statement = transaction_statement(query, params, settings, source, transaction);
+                let statement = transaction_statement(
+                    self.executor.namespace(),
+                    query,
+                    params,
+                    settings,
+                    source,
+                    transaction,
+                );
                 return self.routed(leader, statement, &transaction.admission, cancel);
             }
             // The transaction's first statement opens it, in the same step.
@@ -364,8 +375,14 @@ impl CursorEngine for DatabaseCursorEngine {
                 })?;
                 let params = (!params.is_empty()).then_some(params);
                 let source = source.as_deref().and_then(source_context);
-                let statement =
-                    transaction_statement(&query, params, &settings, source, &transaction);
+                let statement = transaction_statement(
+                    engine.executor.namespace(),
+                    &query,
+                    params,
+                    &settings,
+                    source,
+                    &transaction,
+                );
                 engine
                     .routed_async(leader, statement, &transaction.admission, cancel)
                     .await
@@ -397,7 +414,7 @@ impl CursorEngine for DatabaseCursorEngine {
                     } = call;
                     let params = (!params.is_empty()).then_some(params);
                     let source = source.as_deref().and_then(source_context);
-                    let statement = Self::autonomous(&query, params, &requested, source);
+                    let statement = engine.autonomous(&query, params, &requested, source);
                     return engine
                         .routed_async(leader, statement, &AdmissionSignal::new(|| {}), cancel)
                         .await;
@@ -450,7 +467,12 @@ impl CursorEngine for DatabaseCursorEngine {
                 let router = executor.router(leader).map_err(engine_error)?;
                 unless_cancelled(
                     &cancel,
-                    router.begin(RoutedBegin::new(transaction, ActingContext::Trusted, start)),
+                    router.begin(RoutedBegin::new(
+                        executor.namespace(),
+                        transaction,
+                        ActingContext::Trusted,
+                        start,
+                    )),
                 )
                 .await?;
                 Ok(BeginStep::Begun)
@@ -488,7 +510,12 @@ impl CursorEngine for DatabaseCursorEngine {
             let router = self.executor.router(leader).map_err(engine_error)?;
             return self.block_on_routed(
                 cancel,
-                router.begin(RoutedBegin::new(transaction, ActingContext::Trusted, start)),
+                router.begin(RoutedBegin::new(
+                    self.executor.namespace(),
+                    transaction,
+                    ActingContext::Trusted,
+                    start,
+                )),
             );
         }
         self.begin_here(transaction, start, Some(cancel))
@@ -504,6 +531,7 @@ impl CursorEngine for DatabaseCursorEngine {
         if let Some(leader) = self.transaction_leader()? {
             let router = self.executor.router(leader).map_err(engine_error)?;
             let commit = RoutedCommit {
+                namespace: self.executor.namespace(),
                 actor: ActingContext::Trusted,
                 transaction,
                 operation: operation.copied(),
@@ -563,7 +591,7 @@ impl DatabaseCursorEngine {
         let admitted = match admission {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
-                let statement = Self::autonomous(query, params, requested, source);
+                let statement = self.autonomous(query, params, requested, source);
                 return self.routed(leader_id, statement, &AdmissionSignal::new(|| {}), cancel);
             }
         };
@@ -619,7 +647,7 @@ impl DatabaseCursorEngine {
             Ok(result) => result,
             Err(e) => match (leader_hint(&e), retry) {
                 (Some(leader_id), Some(params)) => {
-                    let statement = Self::autonomous(query, params, requested, source);
+                    let statement = self.autonomous(query, params, requested, source);
                     return self.routed(leader_id, statement, &AdmissionSignal::new(|| {}), cancel);
                 }
                 _ => return Err(engine_error(e)),
@@ -698,6 +726,7 @@ impl DatabaseCursorEngine {
         if let Some(leader) = self.transaction_leader()? {
             let router = self.executor.router(leader).map_err(engine_error)?;
             let rollback = RoutedRollback {
+                namespace: self.executor.namespace(),
                 actor: ActingContext::Trusted,
                 transaction,
                 abandoned: end == TransactionEnd::StreamLost,

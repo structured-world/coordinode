@@ -35,6 +35,12 @@ impl ServerCommandExecutor {
         Self { executor }
     }
 
+    /// The executor of the namespace a routed command names: it runs there
+    /// and nowhere else.
+    fn bound(&self, namespace: &str) -> Result<StatementExecutor, DatabaseError> {
+        self.executor.in_namespace(Some(namespace))
+    }
+
     /// Establish a transaction start's causal bound here before its snapshot
     /// is pinned, within the command's `deadline` and `cancel`. Called from
     /// the blocking pool, where waiting on the runtime is allowed.
@@ -65,6 +71,7 @@ impl CommandExecutor for ServerCommandExecutor {
         admitted: &AdmissionSignal,
         answer: &mut AnswerWriter,
     ) -> Result<RoutedStats, DatabaseError> {
+        let bound = self.bound(&statement.namespace)?;
         if statement.transaction.is_some() {
             if let Some(start) = &statement.start {
                 self.await_start_bound(
@@ -75,7 +82,7 @@ impl CommandExecutor for ServerCommandExecutor {
                 )?;
             }
             return executor::write_in_transaction(
-                self.executor.database(),
+                bound.database(),
                 statement,
                 cancel,
                 admitted,
@@ -88,18 +95,18 @@ impl CommandExecutor for ServerCommandExecutor {
         let requested = executor::routed_requested(&statement, cancel);
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|e| DatabaseError::Other(format!("no runtime to fence the read on: {e}")))?;
-        let fenced =
-            leading(runtime.block_on(self.executor.admit(&statement.query, &requested, true))?)?;
-        run_fenced(&self.executor, statement, &fenced, answer)
+        let fenced = leading(runtime.block_on(bound.admit(&statement.query, &requested, true))?)?;
+        run_fenced(&bound, statement, &fenced, answer)
     }
 
     fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
+        let bound = self.bound(&begin.namespace)?;
         self.await_start_bound(begin.after_ts, begin.causal_wait, None, None)?;
-        executor::begin(&self.executor.database().read(), begin)
+        executor::begin(&bound.database().read(), begin)
     }
 
     fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, DatabaseError> {
-        executor::commit(&self.executor.database().read(), commit)
+        executor::commit(&self.bound(&commit.namespace)?.database().read(), commit)
     }
 
     fn operation(
@@ -111,7 +118,10 @@ impl CommandExecutor for ServerCommandExecutor {
     }
 
     fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError> {
-        executor::rollback(&self.executor.database().read(), rollback)
+        executor::rollback(
+            &self.bound(&rollback.namespace)?.database().read(),
+            rollback,
+        )
     }
 
     fn prepare(
@@ -122,7 +132,9 @@ impl CommandExecutor for ServerCommandExecutor {
         if !self.executor.needs_fence() {
             return None;
         }
-        let executor = self.executor.clone();
+        // A namespace that cannot be resolved leaves the statement to
+        // `execute`, which answers with the refusal.
+        let executor = self.bound(&slot.as_ref()?.namespace).ok()?;
         let cancel = cancel.clone();
         if slot.as_ref()?.transaction.is_some() {
             // A transaction's first statement waits here for its start's

@@ -63,7 +63,7 @@ fn statement(
     query: &str,
     operation: Option<wire::OperationRef>,
 ) -> Request<query::ExecuteCypherRequest> {
-    Request::new(query::ExecuteCypherRequest {
+    crate::services::namespace::named(query::ExecuteCypherRequest {
         query: query.to_string(),
         operation,
         ..Default::default()

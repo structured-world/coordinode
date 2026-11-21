@@ -69,9 +69,12 @@ async fn channel(port: u16, timeout: Duration) -> Option<tonic::transport::Chann
         .ok()
 }
 
-async fn cypher_client(port: u16) -> Option<CypherServiceClient<tonic::transport::Channel>> {
-    Some(CypherServiceClient::new(
+async fn cypher_client(
+    port: u16,
+) -> Option<CypherServiceClient<coordinode_integration::harness::NamedChannel>> {
+    Some(CypherServiceClient::with_interceptor(
         channel(port, Duration::from_secs(5)).await?,
+        coordinode_integration::harness::NameNamespace,
     ))
 }
 

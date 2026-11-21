@@ -43,6 +43,9 @@ pub enum Placement {
 /// An autonomous statement a host runs on a member.
 #[derive(Debug, Clone)]
 pub struct Statement {
+    /// The namespace the statement's session is bound to; `None` is the one
+    /// the host's handle is bound to.
+    pub namespace: Option<String>,
     /// The statement's text.
     pub query: String,
     /// Its parameters.
@@ -62,6 +65,7 @@ impl Statement {
     /// the trusted host and free to run wherever it must.
     pub fn new(query: impl Into<String>) -> Self {
         Self {
+            namespace: None,
             query: query.into(),
             params: HashMap::new(),
             requested: Requested::default(),
@@ -104,8 +108,19 @@ impl Ingress {
         &self.admitter
     }
 
-    fn database(&self) -> Result<Arc<RwLock<Database>>, DatabaseError> {
-        self.admitter.database().map(Arc::clone)
+    /// The database serving `namespace`.
+    fn database(&self, namespace: &str) -> Result<Arc<RwLock<Database>>, DatabaseError> {
+        self.admitter.database_in(namespace)
+    }
+
+    /// The namespace a statement naming `namespace` runs in: the one it
+    /// names, or the namespace the member's own database is bound to, as an
+    /// embedding host's handle is bound to its store's.
+    fn namespace_of(&self, namespace: Option<&str>) -> Result<String, DatabaseError> {
+        match namespace {
+            Some(namespace) => Ok(namespace.to_owned()),
+            None => Ok(self.admitter.database()?.read().namespace().to_owned()),
+        }
     }
 
     /// `value` as answered by `ran_at`, `None` for this member, with the
@@ -143,6 +158,11 @@ impl Ingress {
         if statement.placement == Placement::LeaderLocal {
             self.require_leading()?;
         }
+        // Fixed before the statement goes anywhere: here and at the leader it
+        // runs in the one namespace its session is bound to.
+        let mut statement = statement;
+        let namespace = self.namespace_of(statement.namespace.as_deref())?;
+        statement.namespace = Some(namespace.clone());
         let admitted = match self.admitter.fence(checked, false).await? {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader) => return self.route(leader, statement).await,
@@ -153,7 +173,7 @@ impl Ingress {
         // so only a follower keeps a copy.
         let retry = (!admitted.served_by_leader && statement.placement == Placement::Anywhere)
             .then(|| statement.clone());
-        let db = self.database()?;
+        let db = self.database(&namespace)?;
         let Statement {
             query,
             params,
@@ -181,6 +201,7 @@ impl Ingress {
         statement: Statement,
     ) -> Result<Routed<RoutedAnswer>, DatabaseError> {
         let Statement {
+            namespace,
             query,
             params,
             requested,
@@ -194,6 +215,7 @@ impl Ingress {
             });
         }
         let routed = RoutedStatement {
+            namespace: self.namespace_of(namespace.as_deref())?,
             actor,
             query,
             params,
@@ -288,7 +310,7 @@ impl Ingress {
     ) -> Result<Routed<()>, DatabaseError> {
         let ran_at = match self.leader_for(placement)? {
             None => {
-                let db = self.database()?;
+                let db = self.database(&begin.namespace)?;
                 blocking(move || executor::begin(&db.read(), begin)).await?;
                 None
             }
@@ -321,7 +343,7 @@ impl Ingress {
     ) -> Result<Routed<RoutedAnswer>, DatabaseError> {
         let (answer, ran_at) = match self.leader_for(placement)? {
             None => {
-                let db = self.database()?;
+                let db = self.database(&statement.namespace)?;
                 let (admitted, cancel) = (admitted.clone(), cancel.clone());
                 let answer = blocking(move || {
                     executor::run_in_transaction(&db.read(), statement, &cancel, &admitted)
@@ -358,7 +380,7 @@ impl Ingress {
     ) -> Result<Routed<CommitReceipt>, DatabaseError> {
         let (receipt, ran_at) = match self.leader_for(placement)? {
             None => {
-                let db = self.database()?;
+                let db = self.database(&commit.namespace)?;
                 (
                     blocking(move || executor::commit(&db.read(), commit)).await?,
                     None,
@@ -389,7 +411,7 @@ impl Ingress {
     ) -> Result<Routed<()>, DatabaseError> {
         let ran_at = match self.leader_for(placement)? {
             None => {
-                let db = self.database()?;
+                let db = self.database(&rollback.namespace)?;
                 blocking(move || executor::rollback(&db.read(), rollback)).await?;
                 None
             }
@@ -420,7 +442,9 @@ impl Ingress {
     ) -> Result<Routed<RoutedOperationAnswer>, DatabaseError> {
         let (answer, ran_at) = match self.leader_for(placement)? {
             None => {
-                let db = self.database()?;
+                // Operation records are the deployment's: any namespace's
+                // database decides them, the member's own here.
+                let db = Arc::clone(self.admitter.database()?);
                 (
                     blocking(move || executor::run_operation(&db.read(), call)).await?,
                     None,

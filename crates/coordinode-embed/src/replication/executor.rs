@@ -290,6 +290,7 @@ fn rows_in_transaction(
     admitted: &AdmissionSignal,
 ) -> Result<Vec<Row>, DatabaseError> {
     let RoutedStatement {
+        namespace,
         actor,
         query,
         params,
@@ -307,7 +308,7 @@ fn rows_in_transaction(
     // The first statement opens the transaction it runs in; a start naming
     // an open ID is refused before the statement runs.
     if let Some(start) = start {
-        begin(db, RoutedBegin::new(id, actor.clone(), start))?;
+        begin(db, RoutedBegin::new(namespace, id, actor.clone(), start))?;
     }
     let options = StatementOptions {
         vector_consistency: settings.vector_consistency,

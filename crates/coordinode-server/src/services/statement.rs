@@ -59,6 +59,53 @@ impl StatementExecutor {
         }
     }
 
+    /// An executor over the databases a member serves: its own, and a
+    /// session of each further namespace a client names, started beside the
+    /// member as it opens.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::NotServing`] before the member serves.
+    pub fn serving(
+        served: coordinode_embed::replication::ServedDatabase,
+    ) -> Result<Self, DatabaseError> {
+        let database = Arc::clone(served.get().ok_or(DatabaseError::NotServing)?);
+        Ok(Self {
+            admitter: Admitter::serving(served),
+            writer: Arc::new(ReplicatedWriter::new(database)),
+            slow_query: Some(DEFAULT_SLOW_QUERY),
+            slots: CheckedRoutingLimits::default().command_slots(),
+        })
+    }
+
+    /// This executor bound to the namespace a client session named: every
+    /// statement of the session runs there. A tenant-data session names its
+    /// namespace explicitly, however many the deployment holds; none is
+    /// derived from the catalog. The settings, slots and consensus node are
+    /// shared.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::NamespaceRequired`] when the session named none;
+    /// [`DatabaseError::UnknownNamespace`] for a namespace the deployment
+    /// does not hold.
+    pub fn in_namespace(&self, namespace: Option<&str>) -> Result<Self, DatabaseError> {
+        let namespace = namespace.ok_or(DatabaseError::NamespaceRequired)?;
+        let database = self.admitter.database_in(namespace)?;
+        if Arc::ptr_eq(&database, self.writer.database()) {
+            return Ok(self.clone());
+        }
+        Ok(Self {
+            writer: Arc::new(ReplicatedWriter::new(database)),
+            ..self.clone()
+        })
+    }
+
+    /// The name of the namespace this executor's statements run in.
+    pub(crate) fn namespace(&self) -> String {
+        self.writer.database().read().namespace().to_owned()
+    }
+
     /// Run commands in `slots`, the member's: the ones its peers' routed
     /// commands take theirs from too.
     pub fn with_command_slots(mut self, slots: CommandSlots) -> Self {

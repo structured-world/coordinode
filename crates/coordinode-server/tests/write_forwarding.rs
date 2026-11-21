@@ -32,10 +32,12 @@ async fn a_write_sent_to_a_follower_is_carried_to_the_leader() {
     .unwrap();
 
     let response = client
-        .execute_cypher(query::ExecuteCypherRequest {
-            query: "CREATE (:Forwarded {tag: 'via-follower'})".to_string(),
-            ..Default::default()
-        })
+        .execute_cypher(coordinode_test_fixtures::client::named(
+            query::ExecuteCypherRequest {
+                query: "CREATE (:Forwarded {tag: 'via-follower'})".to_string(),
+                ..Default::default()
+            },
+        ))
         .await
         .expect("a write to a follower must reach the leader");
 
@@ -105,11 +107,15 @@ async fn operation_identity_works_through_a_follower() {
     };
 
     cypher
-        .execute_cypher(write(enrolled.next_sequence))
+        .execute_cypher(coordinode_test_fixtures::client::named(write(
+            enrolled.next_sequence,
+        )))
         .await
         .expect("a bound write through a follower");
     let refused = cypher
-        .execute_cypher(write(enrolled.next_sequence))
+        .execute_cypher(coordinode_test_fixtures::client::named(write(
+            enrolled.next_sequence,
+        )))
         .await
         .expect_err("its retry runs nothing");
     let info = refused.get_details_error_info().expect("ErrorInfo");

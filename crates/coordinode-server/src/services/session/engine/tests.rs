@@ -669,7 +669,7 @@ async fn a_cancel_stops_a_statement_waiting_on_the_leader() {
         let engine = Arc::clone(&engine);
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
-            let statement = DatabaseCursorEngine::autonomous(
+            let statement = engine.autonomous(
                 "RETURN 1 AS one",
                 None,
                 &crate::services::statement::Requested::default(),

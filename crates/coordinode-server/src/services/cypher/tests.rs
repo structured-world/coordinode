@@ -99,8 +99,12 @@ fn test_service() -> (CypherServiceImpl, tempfile::TempDir) {
     (svc, dir)
 }
 
+/// A call naming the namespace a fresh store opens with, as every client
+/// names the namespace it works in.
+use crate::services::namespace::named;
+
 fn cypher_request(q: &str) -> Request<query::ExecuteCypherRequest> {
-    Request::new(query::ExecuteCypherRequest {
+    named(query::ExecuteCypherRequest {
         query: q.to_string(),
         parameters: std::collections::HashMap::new(),
         read_preference: 0,   // omitted → the server default (Primary here)
@@ -720,7 +724,7 @@ async fn interactive_transaction_commit() {
     // the wire too: a SNAPSHOT read pinned AT commit_ts sees it, one pinned
     // one tick earlier does not.
     let pinned = |at_timestamp: u64| {
-        Request::new(query::ExecuteCypherRequest {
+        named(query::ExecuteCypherRequest {
             query: "MATCH (n:TxNode) RETURN n".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -795,7 +799,7 @@ async fn grpc_explain_shows_the_plan_that_executes() {
         .expect("seed");
 
     let plan = svc
-        .explain_cypher(Request::new(query::ExplainCypherRequest {
+        .explain_cypher(named(query::ExplainCypherRequest {
             query: "MATCH (n:User {name: 'Alice'}) RETURN n".to_string(),
             parameters: Default::default(),
         }))
@@ -917,6 +921,7 @@ async fn grpc_source_tracking_round_trip() {
     // Connect via CoordinodeClient with source tracking enabled, one unary
     // call per statement: this test covers the metadata path.
     let mut client = coordinode_client::CoordinodeClient::builder(format!("http://{addr}"))
+        .namespace(coordinode_core::namespace::DEFAULT_NAMESPACE)
         .debug_source_tracking(true)
         .app_name("test-service")
         .app_version("0.0.1")
@@ -989,6 +994,7 @@ async fn session_source_tracking_with_params_round_trip() {
     });
 
     let mut client = coordinode_client::CoordinodeClient::builder(format!("http://{addr}"))
+        .namespace(coordinode_core::namespace::DEFAULT_NAMESPACE)
         .debug_source_tracking(true)
         .app_name("param-service")
         .build()
@@ -1679,7 +1685,7 @@ fn causal_request(
     after_position: Option<crate::proto::replication::HistoryPosition>,
     wait_ms: u32,
 ) -> Request<query::ExecuteCypherRequest> {
-    Request::new(query::ExecuteCypherRequest {
+    named(query::ExecuteCypherRequest {
         query: query.to_string(),
         read_concern: Some(crate::proto::replication::ReadConcern {
             level,
@@ -2042,8 +2048,8 @@ async fn no_read_is_answered_from_a_hole_below_an_applied_commit() {
     assert!(read_at < low, "read at {read_at}, at or past L {low}");
 
     // A named time at H is not ready, by the read concern and in the query.
-    let named = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+    let named_time = svc
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "MATCH (n:Hole) RETURN n.v".to_string(),
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 4, // SNAPSHOT
@@ -2054,7 +2060,11 @@ async fn no_read_is_answered_from_a_hole_below_an_applied_commit() {
         }))
         .await
         .expect_err("at_timestamp H while L is open");
-    assert_eq!(named.code(), tonic::Code::Unavailable, "{named:?}");
+    assert_eq!(
+        named_time.code(),
+        tonic::Code::Unavailable,
+        "{named_time:?}"
+    );
     let as_of = svc
         .execute_cypher(cypher_request(&format!(
             "MATCH (n:Hole) RETURN n.v AS OF TIMESTAMP {high}"
@@ -2118,7 +2128,7 @@ async fn no_read_is_answered_from_a_hole_below_an_applied_commit() {
     );
     // The named time is inclusive: once complete, at_timestamp = H holds H.
     let at_high = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "MATCH (n:Hole) RETURN n.v".to_string(),
             read_concern: Some(crate::proto::replication::ReadConcern {
                 level: 4, // SNAPSHOT
@@ -2309,7 +2319,7 @@ async fn no_causal_bound_is_valid_with_any_level() {
     for level in [0u32, 1, 2, 4] {
         // 0=UNSPECIFIED, 1=LOCAL, 2=MAJORITY, 4=SNAPSHOT
         let result = svc
-            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+            .execute_cypher(named(query::ExecuteCypherRequest {
                 query: "MATCH (n) RETURN n".to_string(),
                 parameters: std::collections::HashMap::new(),
                 read_preference: 0,
@@ -2340,7 +2350,7 @@ async fn causal_write_without_concern_uses_the_majority_default() {
     let (svc, _dir) = test_service();
 
     let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "CREATE (n:CausalWrite {x: 1})".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -2371,7 +2381,7 @@ async fn causal_write_with_w1_rejected() {
     let (svc, _dir) = test_service();
 
     let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "CREATE (n:CausalWrite {x: 2})".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -2406,7 +2416,7 @@ async fn causal_write_with_majority_accepted() {
     let (svc, _dir) = test_service();
 
     let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "CREATE (n:CausalWrite {x: 3})".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -2483,13 +2493,13 @@ async fn causal_gate_classifies_a_call_by_its_procedure_mode() {
     };
 
     let refused = svc
-        .execute_cypher(Request::new(call("CALL app.touch()")))
+        .execute_cypher(named(call("CALL app.touch()")))
         .await
         .expect_err("a writing procedure is a write");
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
 
     let read = svc
-        .execute_cypher(Request::new(call("CALL db.advisor.queryStats()")))
+        .execute_cypher(named(call("CALL db.advisor.queryStats()")))
         .await;
     assert!(
         read.is_ok(),
@@ -2515,7 +2525,7 @@ async fn execute_cypher_lists_procedures_and_refuses_an_unknown_one() {
     };
 
     let listed = svc
-        .execute_cypher(Request::new(request(
+        .execute_cypher(named(request(
             "CALL dbms.procedures() YIELD name WHERE name = 'dbms.functions' RETURN name",
         )))
         .await
@@ -2524,7 +2534,7 @@ async fn execute_cypher_lists_procedures_and_refuses_an_unknown_one() {
     assert_eq!(listed.rows.len(), 1);
 
     let refused = svc
-        .execute_cypher(Request::new(request("CALL db.nosuch()")))
+        .execute_cypher(named(request("CALL db.nosuch()")))
         .await
         .expect_err("unknown procedure");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
@@ -2546,7 +2556,7 @@ async fn causal_read_without_write_concern_accepted() {
     let (svc, _dir) = test_service();
 
     let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "MATCH (n:CausalWrite) RETURN n".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -2628,7 +2638,7 @@ async fn grpc_write_concern_majority_accepted_in_standalone() {
     let (svc, _dir) = test_service();
 
     let resp = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "CREATE (n:Durable {id: 1})".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -2721,7 +2731,7 @@ async fn grpc_alter_label_bumps_schema_revision_visible_via_list_labels() {
 async fn grpc_at_timestamp_rejected_without_snapshot_level() {
     let (svc, _dir) = test_service();
     let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "MATCH (n) RETURN n".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -2761,7 +2771,7 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
 
     // Read pinned to ts=1 (epoch + 1µs, far below the horizon).
     let status = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "MATCH (n:Past) RETURN n.id".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -2793,7 +2803,7 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
     // between the two calls.
     let oldest = oldest + 1_000_000;
     let at = |ts: u64| {
-        Request::new(query::ExecuteCypherRequest {
+        named(query::ExecuteCypherRequest {
             query: "MATCH (n:Past) RETURN n.id".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -3148,7 +3158,7 @@ async fn grpc_at_timestamp_max_sees_latest() {
         .expect("create");
 
     let resp = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "MATCH (n:Top) RETURN n.id".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -3176,7 +3186,7 @@ async fn grpc_snapshot_without_at_timestamp_returns_latest() {
         .await
         .expect("create");
     let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "MATCH (n:Now) RETURN n.id".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -3206,7 +3216,7 @@ async fn grpc_snapshot_without_at_timestamp_returns_latest() {
 async fn grpc_write_concern_memory_accepted() {
     let (svc, _dir) = test_service();
     let resp = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "CREATE (n:Telemetry {id: 1})".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -3236,7 +3246,7 @@ async fn an_early_answered_write_carries_no_causal_index() {
         .await
         .expect("journaled write");
     let resp = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "CREATE (n:Telemetry {id: 1})".to_string(),
             write_concern: Some(crate::proto::replication::WriteConcern {
                 w: Some(replication::write_concern::W::Acks(1)),
@@ -3266,7 +3276,7 @@ async fn an_early_answered_write_carries_no_causal_index() {
 async fn grpc_causal_bound_and_at_timestamp_mutually_exclusive() {
     let (svc, _dir) = test_service();
     let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "MATCH (n) RETURN n".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -3295,7 +3305,7 @@ async fn grpc_causal_bound_and_at_timestamp_mutually_exclusive() {
 async fn grpc_write_concern_journal_with_timeout_accepted() {
     let (svc, _dir) = test_service();
     let resp = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "CREATE (n:Durable {id: 1})".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -3320,7 +3330,7 @@ async fn grpc_write_concern_journal_with_timeout_accepted() {
 async fn grpc_write_concern_cache_accepted() {
     let (svc, _dir) = test_service();
     let resp = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "CREATE (n:Analytics {id: 1})".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -3457,7 +3467,7 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
     // Step 3: send a CREATE through the handler. Must surface as
     // ResourceExhausted with structured metadata.
     let result = svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+        .execute_cypher(named(query::ExecuteCypherRequest {
             query: "CREATE (n:GatedByCapacity)".to_string(),
             parameters: std::collections::HashMap::new(),
             read_preference: 0,
@@ -3649,7 +3659,7 @@ async fn a_replicated_lookup_through_a_wrong_entry_answers_within_the_request_li
     let (executor, node, _dir) = crate::services::statement::tests::raft().await;
     let service = CypherServiceImpl::from_executor(executor.clone());
     let run = |query: &str, limit_mb: Option<u32>| {
-        let request = Request::new(query::ExecuteCypherRequest {
+        let request = named(query::ExecuteCypherRequest {
             query: query.to_string(),
             query_memory_limit_mb: limit_mb,
             ..Default::default()
@@ -4076,4 +4086,101 @@ async fn a_member_out_of_command_slots_refuses_every_command_before_it_runs() {
         .execute_cypher("MATCH (n:Busy) RETURN n.via AS via")
         .expect("read");
     assert_eq!(rows.len(), 1, "nothing of the refused commands ran");
+}
+
+/// A call `query` naming `namespace`; `None` names none.
+fn in_namespace(query: &str, namespace: Option<&str>) -> Request<query::ExecuteCypherRequest> {
+    let mut request = Request::new(query::ExecuteCypherRequest {
+        query: query.to_string(),
+        ..Default::default()
+    });
+    if let Some(namespace) = namespace {
+        request.metadata_mut().insert(
+            crate::services::namespace::NAMESPACE_HEADER,
+            namespace.parse().expect("metadata value"),
+        );
+    }
+    request
+}
+
+/// A call that names no namespace is refused before it runs, even where the
+/// deployment holds one namespace: which namespace a session works in is its
+/// own explicit choice, never derived from how many there are.
+#[tokio::test]
+async fn a_call_naming_no_namespace_is_refused_before_it_runs() {
+    use tonic_types::StatusExt;
+
+    let (svc, _dir) = test_service();
+    let refused = svc
+        .execute_cypher(in_namespace("CREATE (:Unbound)", None))
+        .await
+        .expect_err("no namespace named");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    let info = refused.get_details_error_info().expect("ErrorInfo");
+    assert_eq!(info.reason, "NAMESPACE_REQUIRED");
+    let rows = svc
+        .database()
+        .write()
+        .execute_cypher("MATCH (n:Unbound) RETURN n")
+        .expect("read");
+    assert!(rows.is_empty(), "nothing of the refused call ran");
+}
+
+/// A call naming a namespace the deployment does not hold is refused as a
+/// missing resource, naming it.
+#[tokio::test]
+async fn a_call_naming_an_unknown_namespace_is_refused() {
+    use tonic_types::StatusExt;
+
+    let (svc, _dir) = test_service();
+    let refused = svc
+        .execute_cypher(in_namespace("RETURN 1", Some("nowhere")))
+        .await
+        .expect_err("unknown namespace");
+    assert_eq!(refused.code(), tonic::Code::NotFound, "{refused:?}");
+    let info = refused.get_details_error_info().expect("ErrorInfo");
+    assert_eq!(info.reason, "UNKNOWN_NAMESPACE");
+    assert_eq!(
+        info.metadata.get("namespace").map(String::as_str),
+        Some("nowhere")
+    );
+}
+
+/// Two namespaces of one deployment, each reached by naming it: the same
+/// labels and keys written in each stay in it, and a read in one never sees
+/// the other's.
+#[tokio::test]
+async fn calls_naming_two_namespaces_work_in_each_alone() {
+    let (svc, _dir) = test_service();
+    svc.database()
+        .read()
+        .engine()
+        .create_namespace("other")
+        .expect("create other");
+    let default = coordinode_core::namespace::DEFAULT_NAMESPACE;
+    for (namespace, value) in [(default, 1), ("other", 2)] {
+        svc.execute_cypher(in_namespace(
+            &format!("CREATE (:Shared {{k: 'x', v: {value}}})"),
+            Some(namespace),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("write in {namespace}: {e}"));
+    }
+    for (namespace, value) in [(default, 1), ("other", 2)] {
+        let rows = svc
+            .execute_cypher(in_namespace(
+                "MATCH (n:Shared {k: 'x'}) RETURN n.v AS v",
+                Some(namespace),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("read in {namespace}: {e}"))
+            .into_inner()
+            .rows;
+        assert_eq!(rows.len(), 1, "{namespace} holds its own node alone");
+        assert_eq!(
+            rows[0].values[0].value,
+            Some(common::property_value::Value::IntValue(value)),
+            "{namespace} reads its own value"
+        );
+    }
 }

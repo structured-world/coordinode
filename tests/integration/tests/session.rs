@@ -153,7 +153,11 @@ async fn open_stream(
         .connect()
         .await
         .expect("connect");
-    let mut client = SessionServiceClient::new(channel);
+    // The session is bound to the namespace its stream names.
+    let mut client = SessionServiceClient::with_interceptor(
+        channel,
+        coordinode_integration::harness::NameNamespace,
+    );
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
     let inbound = client
         .session(ReceiverStream::new(rx))
@@ -193,7 +197,10 @@ async fn run_session(
         .connect()
         .await
         .expect("connect to session service");
-    let mut client = SessionServiceClient::new(channel);
+    let mut client = SessionServiceClient::with_interceptor(
+        channel,
+        coordinode_integration::harness::NameNamespace,
+    );
 
     let response = client
         .session(tokio_stream::iter(frames))

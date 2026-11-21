@@ -203,11 +203,14 @@ async fn a_draining_server_is_alive_but_not_ready() {
     })
     .await
     .expect("send the first frame");
-    let mut inbound = SessionServiceClient::new(channel)
-        .session(tokio_stream::wrappers::ReceiverStream::new(rx))
-        .await
-        .expect("open session")
-        .into_inner();
+    let mut inbound = SessionServiceClient::with_interceptor(
+        channel,
+        coordinode_integration::harness::NameNamespace,
+    )
+    .session(tokio_stream::wrappers::ReceiverStream::new(rx))
+    .await
+    .expect("open session")
+    .into_inner();
     inbound
         .message()
         .await

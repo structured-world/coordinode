@@ -545,6 +545,19 @@ impl Database {
         self.interactive.set_tenure(owner, leader, term);
     }
 
+    /// Take `other`'s execution tenure: a namespace's session of a group
+    /// member opens transactions exactly when the member's other sessions do.
+    pub(crate) fn carry_tenure_from(&self, other: &Self) {
+        let tenure = *other.interactive.tenure.lock();
+        let mut mine = self.interactive.tenure.lock();
+        *mine = tenure;
+    }
+
+    /// What ends an idle transaction when its start names nothing.
+    pub(crate) fn interactive_timeout_outcome(&self) -> TimeoutOutcome {
+        *self.interactive.timeout_outcome.lock()
+    }
+
     /// What ends a transaction that stays idle past the idle timeout, when
     /// its start names nothing ([`TimeoutOutcome::Rollback`] until set).
     /// Applies to transactions begun from now on.

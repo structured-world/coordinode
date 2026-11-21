@@ -332,7 +332,8 @@ fn a_receiver_keeps_qualified_proofs_and_marks_the_rest() {
     let receiver_registry = Arc::new(IndexRegistry::new());
     receiver
         .engine
-        .set_index_copy_qualifier(Arc::new(CopyQualifier::new(Arc::clone(&receiver_registry))));
+        .set_index_copy_qualifier(Arc::new(CopyQualifier::new(Arc::clone(&receiver_registry))))
+        .expect("register");
     install(&receiver.engine, &sender.env.engine, Some(&sealed));
     let (marked, proved) = marked_and_proved(&receiver.engine);
     assert_eq!(
@@ -358,7 +359,8 @@ fn a_receiver_keeps_qualified_proofs_and_marks_the_rest() {
 
     let bare = TestEnv::open();
     bare.engine
-        .set_index_copy_qualifier(Arc::new(CopyQualifier::new(Arc::new(IndexRegistry::new()))));
+        .set_index_copy_qualifier(Arc::new(CopyQualifier::new(Arc::new(IndexRegistry::new()))))
+        .expect("register");
     install(&bare.engine, &sender.env.engine, None);
     let (marked, proved) = marked_and_proved(&bare.engine);
     let mut both = vec![
@@ -375,7 +377,8 @@ fn receiver() -> Arc<TestEnv> {
     let receiver = TestEnv::open();
     receiver
         .engine
-        .set_index_copy_qualifier(Arc::new(CopyQualifier::new(Arc::new(IndexRegistry::new()))));
+        .set_index_copy_qualifier(Arc::new(CopyQualifier::new(Arc::new(IndexRegistry::new()))))
+        .expect("register");
     receiver
 }
 

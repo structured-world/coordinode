@@ -506,8 +506,12 @@ async fn open_session(
 /// The member the routers in these tests reach.
 const MEMBER: u64 = 3;
 
+/// The namespace every routed command of these tests names.
+const NAMESPACE: &str = "tenant";
+
 fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
     RoutedStatement {
+        namespace: NAMESPACE.to_owned(),
         actor: principal(),
         query: "MATCH (n) RETURN n.k AS k".into(),
         params: HashMap::from([("limit".to_string(), Value::Int(3))]),
@@ -569,13 +573,38 @@ fn a_start_crosses_unchanged() {
             start: Some(start),
             ..statement(Some(txid()))
         };
-        let arrived =
-            statement_from_wire(statement_to_wire(sent).expect("encoded")).expect("decoded");
+        let arrived = statement_from_wire(
+            statement_to_wire(sent).expect("encoded"),
+            NAMESPACE.to_owned(),
+        )
+        .expect("decoded");
         assert_eq!(arrived.start, Some(start));
     }
-    let none = statement_from_wire(statement_to_wire(statement(Some(txid()))).expect("encoded"))
-        .expect("decoded");
+    let none = statement_from_wire(
+        statement_to_wire(statement(Some(txid()))).expect("encoded"),
+        NAMESPACE.to_owned(),
+    )
+    .expect("decoded");
     assert_eq!(none.start, None);
+}
+
+/// A routed data command names the namespace its session is bound to, which
+/// reaches the member as sent; one naming none is refused, never run in a
+/// namespace of the member's choosing.
+#[test]
+fn a_routed_command_carries_its_namespace() {
+    let wire = statement_to_wire(statement(None)).expect("encoded");
+    let arrived = statement_from_wire(wire.clone(), NAMESPACE.to_owned()).expect("decoded");
+    assert_eq!(arrived.namespace, NAMESPACE);
+    let refused = statement_from_wire(wire, String::new()).expect_err("no namespace");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    let begin = RoutedBegin::new(
+        NAMESPACE.to_owned(),
+        txid(),
+        principal(),
+        TransactionStart::default(),
+    );
+    assert!(begin_from_wire(begin_to_wire(begin), String::new()).is_err());
 }
 
 /// An answer that fits one batch travels as one message: its columns, rows
@@ -602,6 +631,7 @@ async fn a_small_answer_is_one_message() {
             request: Some(wire::routed_request::Request::Execute(Box::new(
                 statement_to_wire(statement(None)).expect("encoded"),
             ))),
+            namespace: NAMESPACE.to_owned(),
         })
         .expect("sent");
     let reply = replies.message().await.expect("reply").expect("a reply");
@@ -1020,6 +1050,7 @@ async fn a_commit_whose_answer_is_lost_is_not_an_abort() {
     let router = serve(Arc::clone(&executor)).await;
     let err = router
         .commit(RoutedCommit {
+            namespace: NAMESPACE.to_owned(),
             actor: principal(),
             transaction: txid(),
             operation: None,
@@ -1136,6 +1167,7 @@ async fn transaction_commands_cross_both_ways() {
     let router = serve(Arc::clone(&executor)).await;
     router
         .begin(RoutedBegin {
+            namespace: NAMESPACE.to_owned(),
             transaction: txid(),
             actor: principal(),
             read_concern: Some(ReadConcernLevel::Snapshot),
@@ -1149,6 +1181,7 @@ async fn transaction_commands_cross_both_ways() {
         .expect("begun");
     let receipt = router
         .commit(RoutedCommit {
+            namespace: NAMESPACE.to_owned(),
             actor: principal(),
             transaction: txid(),
             operation: None,
@@ -1163,6 +1196,7 @@ async fn transaction_commands_cross_both_ways() {
     for abandoned in [false, true] {
         let err = router
             .rollback(RoutedRollback {
+                namespace: NAMESPACE.to_owned(),
                 actor: principal(),
                 transaction: txid(),
                 abandoned,
@@ -1193,7 +1227,7 @@ async fn transaction_commands_cross_both_ways() {
 fn a_command_without_an_actor_is_refused() {
     let mut wire = statement_to_wire(statement(None)).expect("encoded");
     wire.actor = None;
-    let err = statement_from_wire(wire).expect_err("refused");
+    let err = statement_from_wire(wire, NAMESPACE.to_owned()).expect_err("refused");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
@@ -1364,6 +1398,7 @@ async fn a_number_in_use_is_refused_and_a_cancel_stops_its_command() {
         request: Some(wire::routed_request::Request::Execute(Box::new(
             statement_to_wire(statement(None)).expect("encoded"),
         ))),
+        namespace: NAMESPACE.to_owned(),
     };
     requests.send(execute()).expect("sent");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1384,6 +1419,7 @@ async fn a_number_in_use_is_refused_and_a_cancel_stops_its_command() {
         .send(wire::RoutedRequest {
             call: 7,
             request: Some(wire::routed_request::Request::Cancel(wire::RoutedCancel {})),
+            namespace: String::new(),
         })
         .expect("cancel sent");
     while !executor.cancelled.load(Ordering::Acquire) {
@@ -1407,6 +1443,7 @@ async fn a_lost_session_stops_its_statements() {
             request: Some(wire::routed_request::Request::Execute(Box::new(
                 statement_to_wire(statement(Some(txid()))).expect("encoded"),
             ))),
+            namespace: NAMESPACE.to_owned(),
         })
         .expect("sent");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1441,6 +1478,7 @@ fn in_transaction(call: u64, transaction: Option<TransactionId>) -> wire::Routed
         request: Some(wire::routed_request::Request::Execute(Box::new(
             statement_to_wire(statement(transaction)).expect("encoded"),
         ))),
+        namespace: NAMESPACE.to_owned(),
     }
 }
 
@@ -1665,6 +1703,7 @@ async fn a_routed_rollback_runs_on_a_member_out_of_slots() {
 
     let err = router
         .rollback(RoutedRollback {
+            namespace: NAMESPACE.to_owned(),
             actor: principal(),
             transaction: txid(),
             abandoned: false,
@@ -1716,13 +1755,16 @@ fn a_routed_command_waiting_to_run_holds_no_thread() {
                     })
                     .expect("encoded"),
                 ))),
+                namespace: NAMESPACE.to_owned(),
             })
             .expect("sent");
         requests
             .send(wire::RoutedRequest {
                 call: 3,
+                namespace: NAMESPACE.to_owned(),
                 request: Some(wire::routed_request::Request::Begin(begin_to_wire(
                     RoutedBegin {
+                        namespace: NAMESPACE.to_owned(),
                         transaction: txid(),
                         actor: principal(),
                         read_concern: None,
@@ -1746,6 +1788,7 @@ fn a_routed_command_waiting_to_run_holds_no_thread() {
                 .send(wire::RoutedRequest {
                     call,
                     request: Some(wire::routed_request::Request::Cancel(wire::RoutedCancel {})),
+                    namespace: String::new(),
                 })
                 .expect("cancel sent");
         }

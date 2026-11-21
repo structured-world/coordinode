@@ -39,11 +39,14 @@ impl Session {
             .await
             .expect("connect");
         let (tx, rx) = mpsc::channel::<ClientFrame>(32);
-        let inbound = SessionServiceClient::new(channel)
-            .session(ReceiverStream::new(rx))
-            .await
-            .expect("open session")
-            .into_inner();
+        let inbound = SessionServiceClient::with_interceptor(
+            channel,
+            coordinode_integration::harness::NameNamespace,
+        )
+        .session(ReceiverStream::new(rx))
+        .await
+        .expect("open session")
+        .into_inner();
         Self { tx, inbound }
     }
 
@@ -306,7 +309,9 @@ async fn the_driver_drains_and_resumes_after_its_acknowledgement() {
     };
 
     let proc = CoordinodeProcess::start().await;
-    let mut client = CoordinodeClient::connect(proc.endpoint())
+    let mut client = CoordinodeClient::builder(proc.endpoint())
+        .namespace(coordinode_integration::harness::NAMESPACE)
+        .build()
         .await
         .expect("connect");
     for i in 0..20 {

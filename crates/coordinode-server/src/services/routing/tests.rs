@@ -45,8 +45,13 @@ async fn both_ways() -> (Arc<ServerCommandExecutor>, CommandRouter, tempfile::Te
     (executor, CommandRouter::new(1, channel), dir)
 }
 
+/// The namespace a fresh store opens with, which every routed command here
+/// names.
+const NAMESPACE: &str = coordinode_core::namespace::DEFAULT_NAMESPACE;
+
 fn statement(query: &str) -> RoutedStatement {
     RoutedStatement {
+        namespace: NAMESPACE.to_owned(),
         actor: ActingContext::Trusted,
         query: query.to_owned(),
         params: HashMap::new(),
@@ -167,6 +172,7 @@ async fn transaction_control_fails_the_same_way_on_both_paths() {
     let (executor, router, _dir) = both_ways().await;
     let id = TransactionId::from_raw([0x5a; 16]);
     let begin = || RoutedBegin {
+        namespace: NAMESPACE.to_owned(),
         transaction: id,
         actor: ActingContext::Trusted,
         read_concern: None,
@@ -193,6 +199,7 @@ async fn transaction_control_fails_the_same_way_on_both_paths() {
 
     let unknown = TransactionId::from_raw([0x77; 16]);
     let commit = || RoutedCommit {
+        namespace: NAMESPACE.to_owned(),
         actor: ActingContext::Trusted,
         transaction: unknown,
         operation: None,
@@ -212,6 +219,7 @@ async fn transaction_control_fails_the_same_way_on_both_paths() {
     assert_same("commit of an unknown transaction", local, routed);
 
     let rollback = || RoutedRollback {
+        namespace: NAMESPACE.to_owned(),
         actor: ActingContext::Trusted,
         transaction: unknown,
         abandoned: false,

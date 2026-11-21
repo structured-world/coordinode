@@ -103,8 +103,16 @@ This single query combines **graph traversal** + **vector similarity**:
 ```bash
 curl -s -X POST http://localhost:7081/v1/query/cypher \
   -H "Content-Type: application/json" \
+  -H "X-CoordiNode-Namespace: default" \
   -d @examples/quickstart/hybrid-query.json | python3 -m json.tool
 ```
+
+Every call that reads or writes data names the namespace it works in, here
+`default`, the one a fresh server creates. A gRPC client names it in the
+`x-coordinode-namespace` metadata of each call, or of its session stream when
+the stream opens; a call that names none is refused with `INVALID_ARGUMENT`,
+reason `NAMESPACE_REQUIRED`, and one naming a namespace the server does not
+hold with `NOT_FOUND`, reason `UNKNOWN_NAMESPACE`.
 
 The query (from `hybrid-query.json`):
 
@@ -179,6 +187,7 @@ CoordiNode has a built-in query advisor that analyzes your queries and suggests 
 ```bash
 curl -s -X POST http://localhost:7081/v1/query/cypher/explain \
   -H "Content-Type: application/json" \
+  -H "X-CoordiNode-Namespace: default" \
   -d '{"query": "MATCH (u:User) WHERE u.email = $email RETURN u", "parameters": {}}' \
   | python3 -m json.tool
 ```

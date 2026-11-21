@@ -147,6 +147,15 @@ same fields on `StorageConfig` that the server reads from its config file.
 `Database::open_in_memory()` opens a database that lives in memory only, for
 tests and demos: nothing reaches the disk and nothing survives the process.
 
+The handle `Database::open` returns works in the store's one namespace,
+`default` on a fresh store; `namespace()` names it. A store holding further
+namespaces gives a session of each with `session(name)`: a `Database` bound to
+that namespace for its whole life, with its own schema, indexes and data, and
+the deployment's log, clock, NodeId leases and change consumers shared with
+the handle it came from. Labels and keys written through one session are not
+seen through another. A name the store does not hold is
+`DatabaseError::UnknownNamespace`.
+
 ## Transactions and errors
 
 A statement run on its own commits on its own. An interactive transaction

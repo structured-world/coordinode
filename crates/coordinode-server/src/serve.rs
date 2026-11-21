@@ -1255,15 +1255,18 @@ pub(crate) async fn serve(
     // the unary service and the session share the settings, fence and
     // forwarding; the database records each statement for the advisor.
     let statement_executor = {
-        let executor = services::statement::StatementExecutor::new(Arc::clone(&database))
-            .with_statement_defaults(statement_defaults)
-            // The member's slots: its clients' commands and the ones its
-            // peers route here run in the same ones.
-            .with_command_slots(member.command_slots().clone())
-            .with_slow_query_threshold(Some(slow_query_ms.map_or(
-                services::statement::DEFAULT_SLOW_QUERY,
-                std::time::Duration::from_millis,
-            )));
+        // Over every namespace the member serves: a client session names its
+        // namespace, whose session opens beside the member on first use.
+        let executor =
+            services::statement::StatementExecutor::serving(Arc::clone(member.served_database()))?
+                .with_statement_defaults(statement_defaults)
+                // The member's slots: its clients' commands and the ones its
+                // peers route here run in the same ones.
+                .with_command_slots(member.command_slots().clone())
+                .with_slow_query_threshold(Some(slow_query_ms.map_or(
+                    services::statement::DEFAULT_SLOW_QUERY,
+                    std::time::Duration::from_millis,
+                )));
         match raft_node_shared {
             Some(ref rn) => executor.with_raft_node(Arc::clone(rn)),
             None => executor,
@@ -1361,6 +1364,11 @@ pub(crate) async fn serve(
         }];
         config.listen.http = rest_addr.clone();
         config.service.name = "coordinode".into();
+        // A REST call names its namespace as a gRPC call does: the header
+        // reaches the service it is transcoded to.
+        config
+            .forwarded_headers
+            .push(services::namespace::NAMESPACE_HEADER.to_owned());
         // The proxy would otherwise mount its own /health and /metrics on the
         // REST port, reporting proxy state. CoordiNode publishes those for the
         // database itself on the ops port, where the documented endpoints live.

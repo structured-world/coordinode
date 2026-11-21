@@ -401,14 +401,16 @@ async fn create_node_visible_via_cypher_service() {
 
     // Verify via CypherService that the node exists.
     let resp = cypher_svc
-        .execute_cypher(Request::new(query::ExecuteCypherRequest {
-            query: "MATCH (n:RegTest) RETURN n".to_string(),
-            parameters: std::collections::HashMap::new(),
-            read_preference: 0, // unspecified → the server default
-            read_concern: None, // omitted → the server default
-            write_concern: None,
-            ..Default::default()
-        }))
+        .execute_cypher(crate::services::namespace::named(
+            query::ExecuteCypherRequest {
+                query: "MATCH (n:RegTest) RETURN n".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0, // unspecified → the server default
+                read_concern: None, // omitted → the server default
+                write_concern: None,
+                ..Default::default()
+            },
+        ))
         .await
         .expect("execute_cypher should succeed")
         .into_inner();

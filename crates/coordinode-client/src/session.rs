@@ -37,6 +37,8 @@ impl SessionLink {
     ) -> Result<Arc<Self>, ClientError> {
         let (out, rx) = mpsc::channel(OUTBOUND);
         let mut request = tonic::Request::new(ReceiverStream::new(rx));
+        // The session is bound to the client's namespace when it opens.
+        config.name_namespace(request.metadata_mut());
         if config.debug_source_tracking {
             crate::source::inject_app_metadata(request.metadata_mut(), config);
         }

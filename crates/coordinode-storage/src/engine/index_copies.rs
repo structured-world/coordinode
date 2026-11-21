@@ -23,6 +23,10 @@ use crate::error::StorageResult;
 /// leaves it, and the next open takes every copy as unknown.
 pub const INDEX_TRANSFER_KEY: &[u8] = b"meta:idxtransfer";
 
+/// The first byte of an [`INDEX_TRANSFER_KEY`] record that keeps the
+/// transfer's inventory after it; an empty record keeps none.
+const KEPT_INVENTORY: u8 = 1;
+
 /// The index layer's side of a transfer of index copies. The inventory is
 /// opaque to the engine, which stores, carries and hands it back.
 #[diagnostic::on_unimplemented(
@@ -81,14 +85,24 @@ pub trait IndexCopyQualifier: Send + Sync {
 }
 
 impl StorageEngine {
-    /// Register the index layer's handling of transferred index copies.
-    pub fn set_index_copy_qualifier(&self, qualifier: std::sync::Arc<dyn IndexCopyQualifier>) {
-        *self.index_copy_qualifier.write() = Some(qualifier);
+    /// Register the index layer's handling of transferred copies of this
+    /// engine's namespace's indexes.
+    ///
+    /// # Errors
+    ///
+    /// The engine's namespace could not be bound.
+    pub fn set_index_copy_qualifier(
+        &self,
+        qualifier: std::sync::Arc<dyn IndexCopyQualifier>,
+    ) -> StorageResult<()> {
+        self.set()?.set_index_copy_qualifier(qualifier);
+        Ok(())
     }
 
-    /// The registered handling of transferred index copies, if any.
+    /// The registered handling of transferred copies of this engine's
+    /// namespace's indexes, if any; none for an engine not bound to one.
     pub fn index_copy_qualifier(&self) -> Option<std::sync::Arc<dyn IndexCopyQualifier>> {
-        self.index_copy_qualifier.read().clone()
+        self.set().ok()?.index_copy_qualifier()
     }
 
     /// Record, durably, that a transfer is about to replace the index
@@ -128,19 +142,52 @@ impl StorageEngine {
         Ok(self.get(Partition::Schema, INDEX_TRANSFER_KEY)?.is_some())
     }
 
-    /// The transfer begun with [`Self::begin_index_transfer`] installed its
-    /// copies, with `inventory` as it carried it: the registered qualifier
-    /// takes it. Without one the record stays, and whoever opens the index
-    /// layer next takes every copy as unknown.
+    /// The inventory a transfer installed before any index layer of this
+    /// engine's namespace was open to take it: `None` when no transfer is
+    /// pending, `Some(None)` for one whose inventory is not known (the
+    /// transfer carried none, or a crash cut it short).
     ///
     /// # Errors
     ///
-    /// The qualifier's errors.
+    /// A read failure.
+    pub fn index_transfer_inventory(&self) -> StorageResult<Option<Option<Vec<u8>>>> {
+        Ok(self
+            .get(Partition::Schema, INDEX_TRANSFER_KEY)?
+            .map(|record| match record.split_first() {
+                Some((&KEPT_INVENTORY, inventory)) => Some(inventory.to_vec()),
+                _ => None,
+            }))
+    }
+
+    /// The transfer begun with [`Self::begin_index_transfer`] installed its
+    /// copies, with `inventory` as it carried it: the registered qualifier
+    /// takes it. Without one (a member whose namespace's index layer opens
+    /// only after the transfer brought the namespace) the inventory is kept
+    /// with the record, durably, and the index layer takes it when it opens
+    /// ([`Self::index_transfer_inventory`]).
+    ///
+    /// # Errors
+    ///
+    /// The qualifier's errors, or the record could not be written.
     pub fn index_transfer_installed(&self, inventory: Option<&[u8]>) -> StorageResult<()> {
-        match self.index_copy_qualifier() {
-            Some(qualifier) => qualifier.installed(self, inventory),
-            None => Ok(()),
+        if let Some(qualifier) = self.index_copy_qualifier() {
+            return qualifier.installed(self, inventory);
         }
+        let Some(inventory) = inventory else {
+            // The record as begun says the inventory is not known.
+            return Ok(());
+        };
+        let mut record = Vec::with_capacity(inventory.len() + 1);
+        record.push(KEPT_INVENTORY);
+        record.extend_from_slice(inventory);
+        self.commit_local(
+            vec![crate::engine::core::LocalWrite::Put {
+                partition: Partition::Schema,
+                key: INDEX_TRANSFER_KEY.to_vec(),
+                value: record,
+            }],
+            crate::engine::core::LocalSync::BeforeUse,
+        )
     }
 
     /// The inventory of this engine's index copies at a capture taken now,

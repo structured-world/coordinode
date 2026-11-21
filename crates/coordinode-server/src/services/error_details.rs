@@ -146,6 +146,16 @@ pub enum Reason {
     /// command's session does. The command was refused before anything of it
     /// ran; retry after the advised delay.
     MemberBusy,
+    /// The call or session named no namespace: a tenant-data request names
+    /// the namespace it works in. Metadata carries `header`, where to name
+    /// it. Nothing ran.
+    NamespaceRequired,
+    /// The request named a namespace the deployment does not hold. Metadata
+    /// carries `namespace`. Nothing ran.
+    UnknownNamespace,
+    /// The member joined its group and has not caught up yet: it serves no
+    /// data. Nothing ran; the call succeeds at a member that serves.
+    NotServing,
     /// The write reached a node that is not the leader. Nothing was applied.
     /// Metadata carries `leader_id` when the cluster has named one, so the
     /// caller can retry at the right node instead of guessing.
@@ -338,6 +348,9 @@ impl Reason {
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
             Reason::MemberBusy => "MEMBER_BUSY",
+            Reason::NamespaceRequired => "NAMESPACE_REQUIRED",
+            Reason::UnknownNamespace => "UNKNOWN_NAMESPACE",
+            Reason::NotServing => "NOT_SERVING",
             Reason::NotLeader => "NOT_LEADER",
             Reason::MemberReadOnly => "MEMBER_READ_ONLY",
             Reason::OutsideRetention => "OUTSIDE_RETENTION",

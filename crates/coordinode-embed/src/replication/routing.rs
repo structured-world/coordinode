@@ -234,6 +234,8 @@ pub struct RoutedSettings {
 /// One statement to run at the member that executes it.
 #[derive(Debug, Clone)]
 pub struct RoutedStatement {
+    /// The namespace the statement's session is bound to: it runs there.
+    pub namespace: String,
     /// Who the statement acts for, as the ingress verified it.
     pub actor: ActingContext,
     /// The statement's text.
@@ -274,9 +276,15 @@ pub struct TransactionStart {
 }
 
 impl RoutedBegin {
-    /// Open `transaction` for `actor` as `start` says.
-    pub fn new(transaction: TransactionId, actor: ActingContext, start: TransactionStart) -> Self {
+    /// Open `transaction` in `namespace` for `actor` as `start` says.
+    pub fn new(
+        namespace: String,
+        transaction: TransactionId,
+        actor: ActingContext,
+        start: TransactionStart,
+    ) -> Self {
         Self {
+            namespace,
             transaction,
             actor,
             read_concern: start.read_concern,
@@ -341,6 +349,8 @@ pub struct RoutedAnswer {
 /// Open an interactive transaction at the leader.
 #[derive(Debug, Clone)]
 pub struct RoutedBegin {
+    /// The namespace the transaction's session is bound to: it runs there.
+    pub namespace: String,
     /// The ID the client drew for it.
     pub transaction: TransactionId,
     /// Who the transaction acts for; every later command must act for the
@@ -363,6 +373,8 @@ pub struct RoutedBegin {
 /// Commit an interactive transaction at the leader.
 #[derive(Debug, Clone)]
 pub struct RoutedCommit {
+    /// The namespace the transaction runs in.
+    pub namespace: String,
     /// Who the commit acts for.
     pub actor: ActingContext,
     /// The transaction.
@@ -379,6 +391,8 @@ pub struct RoutedCommit {
 /// Roll back an interactive transaction at the leader.
 #[derive(Debug, Clone)]
 pub struct RoutedRollback {
+    /// The namespace the transaction runs in.
+    pub namespace: String,
     /// Who the rollback acts for.
     pub actor: ActingContext,
     /// The transaction.
@@ -954,6 +968,7 @@ impl<E: CommandExecutor> ServedSession<E> {
         use wire::routed_request::Request as R;
 
         let call = request.call;
+        let namespace = request.namespace;
         match request.request {
             Some(R::Credit(frames)) => {
                 if let Some(running) = self.running.lock().get(&call) {
@@ -988,7 +1003,7 @@ impl<E: CommandExecutor> ServedSession<E> {
                 );
                 return;
             };
-            match rollback_from_wire(rollback) {
+            match rollback_from_wire(rollback, namespace) {
                 Ok(rollback) => self.answer(call, slot, move |e| {
                     wire::routed_reply::Reply::RolledBack(wire::RoutedRolledBack {
                         error: e
@@ -1013,10 +1028,9 @@ impl<E: CommandExecutor> ServedSession<E> {
             return;
         };
         let result = match request.request {
-            Some(R::Execute(statement)) => {
-                statement_from_wire(*statement).map(|statement| self.execute(call, statement, slot))
-            }
-            Some(R::Begin(begin)) => begin_from_wire(begin).map(|begin| {
+            Some(R::Execute(statement)) => statement_from_wire(*statement, namespace)
+                .map(|statement| self.execute(call, statement, slot)),
+            Some(R::Begin(begin)) => begin_from_wire(begin, namespace).map(|begin| {
                 let cancel = CancelFlag::new();
                 let waiting = self
                     .executor
@@ -1032,7 +1046,7 @@ impl<E: CommandExecutor> ServedSession<E> {
                     })
                 });
             }),
-            Some(R::Commit(commit)) => commit_from_wire(commit).map(|commit| {
+            Some(R::Commit(commit)) => commit_from_wire(commit, namespace).map(|commit| {
                 self.answer(call, slot, move |e| {
                     wire::routed_reply::Reply::Committed(match e.commit(commit) {
                         Ok(receipt) => wire::RoutedCommitted {
@@ -1199,6 +1213,7 @@ impl<E: CommandExecutor> ServedSession<E> {
         // ingress leaves its client unable to know what it did, and a
         // statement never runs twice: the transaction is aborted.
         let abandon = statement.transaction.map(|transaction| RoutedRollback {
+            namespace: statement.namespace.clone(),
             actor: statement.actor.clone(),
             transaction,
             abandoned: true,
@@ -1542,6 +1557,7 @@ impl CommandRouter {
     fn start(
         &self,
         request: wire::routed_request::Request,
+        namespace: String,
         deadline: Option<Duration>,
     ) -> Result<Call, DatabaseError> {
         let statement = matches!(request, wire::routed_request::Request::Execute(_));
@@ -1556,7 +1572,7 @@ impl CommandRouter {
                 }
             }
         };
-        session.start(request, statement, deadline, self.member)
+        session.start(request, namespace, statement, deadline, self.member)
     }
 
     /// An answer this member cannot read: whatever the command did is
@@ -1611,8 +1627,10 @@ impl CommandRouter {
         admitted: &AdmissionSignal,
     ) -> Result<RoutedRows, DatabaseError> {
         let deadline = statement.deadline;
+        let namespace = statement.namespace.clone();
         let mut call = self.start(
             wire::routed_request::Request::Execute(Box::new(statement_to_wire(statement)?)),
+            namespace,
             deadline,
         )?;
         // The answer opens with its columns, after the admission of a
@@ -1660,9 +1678,10 @@ impl CommandRouter {
     async fn short(
         &self,
         request: wire::routed_request::Request,
+        namespace: String,
         deadline: Option<Duration>,
     ) -> Result<wire::routed_reply::Reply, DatabaseError> {
-        let mut call = self.start(request, deadline)?;
+        let mut call = self.start(request, namespace, deadline)?;
         let reply = call.next().await?;
         call.ended();
         Ok(reply)
@@ -1675,9 +1694,11 @@ impl CommandRouter {
     ///
     /// Why the member did not open it, or how its answer was lost.
     pub async fn begin(&self, begin: RoutedBegin) -> Result<(), DatabaseError> {
+        let namespace = begin.namespace.clone();
         match self
             .short(
                 wire::routed_request::Request::Begin(begin_to_wire(begin)),
+                namespace,
                 None,
             )
             .await?
@@ -1694,9 +1715,11 @@ impl CommandRouter {
     /// What the commit failed with, or how its answer was lost.
     pub async fn commit(&self, commit: RoutedCommit) -> Result<CommitReceipt, DatabaseError> {
         let deadline = commit.deadline;
+        let namespace = commit.namespace.clone();
         let committed = match self
             .short(
                 wire::routed_request::Request::Commit(commit_to_wire(commit)),
+                namespace,
                 deadline,
             )
             .await?
@@ -1717,9 +1740,11 @@ impl CommandRouter {
     ///
     /// Why the rollback was refused, or how its answer was lost.
     pub async fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError> {
+        let namespace = rollback.namespace.clone();
         match self
             .short(
                 wire::routed_request::Request::Rollback(rollback_to_wire(rollback)),
+                namespace,
                 None,
             )
             .await?
@@ -1745,6 +1770,8 @@ impl CommandRouter {
                     actor: Some(actor_to_wire(actor)),
                     call: Some(operation_call_to_wire(call)),
                 }),
+                // Operation records are the deployment's, of no namespace.
+                String::new(),
                 None,
             )
             .await?
@@ -1910,6 +1937,7 @@ impl Session {
     fn start(
         self: &Arc<Self>,
         request: wire::routed_request::Request,
+        namespace: String,
         statement: bool,
         deadline: Option<Duration>,
         member: u64,
@@ -1938,6 +1966,7 @@ impl Session {
             .send(wire::RoutedRequest {
                 call: id,
                 request: Some(request),
+                namespace,
             })
             .map_err(|_| DatabaseError::PeerUnreachable {
                 member,
@@ -1954,6 +1983,8 @@ impl Session {
             .send(wire::RoutedRequest {
                 call,
                 request: Some(request),
+                // Credit and cancel follow a call that named its namespace.
+                namespace: String::new(),
             })
             .is_err()
         {
@@ -2451,8 +2482,23 @@ fn timeout_outcome_from_wire(outcome: u32) -> Result<Option<TimeoutOutcome>, Sta
     }
 }
 
-fn statement_from_wire(statement: wire::RoutedStatement) -> Result<RoutedStatement, Status> {
+/// The namespace a routed command names, which a data command must: one
+/// without is refused rather than run in some namespace of the member's.
+fn namespace_from_wire(namespace: String) -> Result<String, Status> {
+    if namespace.is_empty() {
+        return Err(Status::invalid_argument(
+            "a routed command names no namespace",
+        ));
+    }
+    Ok(namespace)
+}
+
+fn statement_from_wire(
+    statement: wire::RoutedStatement,
+    namespace: String,
+) -> Result<RoutedStatement, Status> {
     Ok(RoutedStatement {
+        namespace: namespace_from_wire(namespace)?,
         actor: actor_from_wire(statement.actor)?,
         params: if statement.parameters.is_empty() {
             HashMap::new()
@@ -2526,9 +2572,10 @@ fn begin_to_wire(begin: RoutedBegin) -> wire::RoutedBegin {
     }
 }
 
-fn begin_from_wire(begin: wire::RoutedBegin) -> Result<RoutedBegin, Status> {
+fn begin_from_wire(begin: wire::RoutedBegin, namespace: String) -> Result<RoutedBegin, Status> {
     let settings = settings_from_wire(begin.settings)?;
     Ok(RoutedBegin {
+        namespace: namespace_from_wire(namespace)?,
         transaction: transaction_id_from_wire(&begin.transaction_id)?,
         actor: actor_from_wire(begin.actor)?,
         read_concern: settings.read_concern,
@@ -2557,8 +2604,9 @@ fn commit_to_wire(commit: RoutedCommit) -> wire::RoutedCommit {
     }
 }
 
-fn commit_from_wire(commit: wire::RoutedCommit) -> Result<RoutedCommit, Status> {
+fn commit_from_wire(commit: wire::RoutedCommit, namespace: String) -> Result<RoutedCommit, Status> {
     Ok(RoutedCommit {
+        namespace: namespace_from_wire(namespace)?,
         actor: actor_from_wire(commit.actor)?,
         transaction: transaction_id_from_wire(&commit.transaction_id)?,
         operation: operation_from_wire(&commit.operation)?,
@@ -2582,8 +2630,12 @@ fn rollback_to_wire(rollback: RoutedRollback) -> wire::RoutedRollback {
     }
 }
 
-fn rollback_from_wire(rollback: wire::RoutedRollback) -> Result<RoutedRollback, Status> {
+fn rollback_from_wire(
+    rollback: wire::RoutedRollback,
+    namespace: String,
+) -> Result<RoutedRollback, Status> {
     Ok(RoutedRollback {
+        namespace: namespace_from_wire(namespace)?,
         actor: actor_from_wire(rollback.actor)?,
         transaction: transaction_id_from_wire(&rollback.transaction_id)?,
         abandoned: rollback.abandoned,

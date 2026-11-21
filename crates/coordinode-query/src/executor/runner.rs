@@ -1190,8 +1190,10 @@ pub trait ExtensionHandler: Send + Sync {
 /// extensions registered, so [`LogicalOp::Extension`] never appears in a CE
 /// plan); the EE server populates it once at startup and shares it by
 /// reference into every [`ExecutionContext`]. Lookup is one hash probe on the
-/// cold extension path; the query hot path never touches it.
-#[derive(Default)]
+/// cold extension path; the query hot path never touches it. A clone shares
+/// the handlers: every namespace's session of a deployment dispatches to the
+/// same ones.
+#[derive(Default, Clone)]
 pub struct ExtensionRegistry {
     handlers: std::collections::HashMap<String, std::sync::Arc<dyn ExtensionHandler>>,
 }

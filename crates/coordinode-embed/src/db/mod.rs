@@ -308,8 +308,10 @@ pub struct Database {
     /// a lock held for the statement, and new names are registered through
     /// the write pipeline before any data uses them.
     fields: Arc<fields::FieldDictionary>,
-    /// Hands out NodeIds from leases the proposal pipeline grants.
-    allocator: NodeIdAllocator,
+    /// Hands out NodeIds from leases the proposal pipeline grants; one for
+    /// the deployment, shared by the sessions of every namespace, since a
+    /// NodeId is unique across the deployment.
+    allocator: Arc<NodeIdAllocator>,
     shard_id: u16,
     /// Live session registry for operational introspection, injected by the
     /// server (`SHOW SESSIONS` / `SHOW TRANSACTIONS`). `None` in embedded use,
@@ -418,8 +420,9 @@ pub struct Database {
     /// Dropped on Database::drop (graceful shutdown).
     _ttl_reaper_handle: Option<coordinode_query::index::ttl_reaper::TtlReaperHandle>,
     /// Removes, as flushes land, the journal segments the trees cover on a
-    /// store with a hard limit. Stopped first on drop.
-    journal_reclaim: Option<coordinode_storage::engine::journal_reclaim::JournalReclaimer>,
+    /// store with a hard limit. One for the deployment, shared by every
+    /// namespace's session and stopped when the last of them closes.
+    journal_reclaim: Option<Arc<coordinode_storage::engine::journal_reclaim::JournalReclaimer>>,
     /// `true` in cluster mode (writes applied by the Raft state machine), where
     /// the AFTER COMMIT trigger queue is drained by a leader-gated background
     /// worker. `false` in embedded single-node mode, where the queue is drained
@@ -473,8 +476,22 @@ pub struct Database {
     _blob_collector_worker: coordinode_storage::blob::gc::CollectorWorker,
     /// Change-stream consumers registered with this database and the
     /// history kept for them; `None` for a store without a journal of its
-    /// own.
-    consumers: Option<consumers::Consumers>,
+    /// own. The journal is the deployment's: every namespace's session
+    /// shares its registry.
+    consumers: Option<Arc<consumers::Consumers>>,
+    /// The name of the namespace this session works in.
+    namespace_name: String,
+}
+
+/// What every namespace's session of one deployment shares: the services
+/// that act for the deployment as a whole and must exist once in it.
+#[derive(Clone)]
+struct DeploymentServices {
+    allocator: Arc<NodeIdAllocator>,
+    proposal_id_gen: Arc<ProposalIdGenerator>,
+    group_members: Arc<parking_lot::RwLock<Option<blob::GroupMembers>>>,
+    consumers: Option<Arc<consumers::Consumers>>,
+    journal_reclaim: Option<Arc<coordinode_storage::engine::journal_reclaim::JournalReclaimer>>,
 }
 
 /// A query whose parse + analyze + logical-plan-build succeeded, kept
@@ -776,7 +793,8 @@ fn statement_budget(
 
 impl Drop for Database {
     fn drop(&mut self) {
-        // Joined before anything closes: a round in flight holds the engine.
+        // Joined before anything closes when this is the last session of the
+        // deployment: a round in flight holds the engine.
         drop(self.journal_reclaim.take());
         // Index builds are the one background task a Database can leave
         // behind: each holds an `Arc` on the engine and would go on inserting
@@ -828,7 +846,7 @@ impl Database {
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
         // Embedded: HNSW updated inline, no oplog-tailing worker.
-        Self::finish_open(&path, oracle, engine, pipeline, false)
+        Self::finish_open(&path, oracle, engine, pipeline, false, None)
     }
 
     /// Open an in-memory database backed by `lsm_tree::fs::MemFs`.
@@ -867,7 +885,7 @@ impl Database {
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
         // Embedded in-memory: HNSW updated inline, no oplog-tailing worker.
-        Self::finish_open(&virtual_path, oracle, engine, pipeline, false)
+        Self::finish_open(&virtual_path, oracle, engine, pipeline, false, None)
     }
 
     /// Initialize a database from pre-opened engine, oracle, and pipeline.
@@ -896,7 +914,92 @@ impl Database {
         }
         // Cluster mode (RaftProposalPipeline): the state machine applies writes,
         // so the oplog-tailing worker maintains HNSW (no inline index path).
-        Self::finish_open(path.as_ref(), oracle, engine, pipeline, true)
+        Self::finish_open(path.as_ref(), oracle, engine, pipeline, true, None)
+    }
+
+    /// A session of this database's deployment working in the namespace
+    /// `namespace`: its own schema, indexes and data, with the services the
+    /// deployment holds once (its log, clock, NodeId leases and change
+    /// consumers) shared with this handle. The session is bound to the
+    /// namespace for its whole life; the settings of this handle (memory and
+    /// wait limits, trigger dispatch, transaction timeouts and retries) carry
+    /// over to it.
+    ///
+    /// A session of a member of a group opens no transaction until its
+    /// member tells it the member leads ([`Self::set_execution_tenure`]).
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::UnknownNamespace`] when the deployment holds no live
+    /// namespace of that name; what opening its indexes refuses.
+    pub fn session(&self, namespace: &str) -> Result<Self, DatabaseError> {
+        let engine = match self.engine.engine_named(namespace) {
+            Ok(engine) => engine,
+            Err(
+                coordinode_storage::error::StorageError::NoSuchNamespace { .. }
+                | coordinode_storage::error::StorageError::UnknownNamespace { .. },
+            ) => {
+                return Err(DatabaseError::UnknownNamespace(namespace.to_owned()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if engine.namespace() == self.engine.namespace() {
+            return Err(DatabaseError::Semantic(format!(
+                "this handle is already bound to namespace {namespace}"
+            )));
+        }
+        let mut session = Self::finish_open(
+            self.engine.data_dir(),
+            Arc::clone(&self.oracle),
+            Arc::new(engine),
+            Arc::clone(&self.pipeline),
+            self.cluster_mode,
+            Some(DeploymentServices {
+                allocator: Arc::clone(&self.allocator),
+                proposal_id_gen: Arc::clone(&self.proposal_id_gen),
+                group_members: Arc::clone(&self.group_members),
+                consumers: self.consumers.clone(),
+                journal_reclaim: self.journal_reclaim.clone(),
+            }),
+        )?;
+        session.carry_settings_from(self);
+        Ok(session)
+    }
+
+    /// The name of the namespace this handle works in.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace_name
+    }
+
+    /// Take over `other`'s settings: what the host or the server configured
+    /// for its sessions, not what a statement changed for itself.
+    fn carry_settings_from(&mut self, other: &Self) {
+        self.operations = other.operations.clone();
+        self.auto_advisory.store(
+            other
+                .auto_advisory
+                .load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.vector_consistency = other.vector_consistency;
+        self.vector_build_wait = other.vector_build_wait;
+        self.query_memory_limit = other.query_memory_limit;
+        self.read_concern = other.read_concern;
+        self.write_concern = other.write_concern;
+        self.stats_ttl = other.stats_ttl;
+        self.extension_registry = other.extension_registry.clone();
+        self.procedure_registry = other.procedure_registry.clone();
+        self.adaptive_config = other.adaptive_config.clone();
+        self.trigger_dispatch_config = other.trigger_dispatch_config;
+        self.set_interactive_idle_timeout(other.interactive_idle_timeout);
+        self.autocommit_attempts = other.autocommit_attempts;
+        self.autocommit_backoff = other.autocommit_backoff;
+        self.operation_admission_window = other.operation_admission_window;
+        self.max_interactive_txn_bytes = other.max_interactive_txn_bytes;
+        self.interactive_begun = other.interactive_begun.clone();
+        self.set_interactive_timeout_outcome(other.interactive_timeout_outcome());
+        self.carry_tenure_from(other);
     }
 
     /// Create a checkpoint (repair base + oplog copy) under
@@ -978,14 +1081,19 @@ impl Database {
         // indexes follow the applied entries through a worker. Embedded mode
         // updates HNSW inline on the write path and applies no Raft entries.
         follow_raft_applies: bool,
+        // The deployment's services when this opens a further namespace's
+        // session of a deployment already open; `None` opens the deployment.
+        shared: Option<DeploymentServices>,
     ) -> Result<Self, DatabaseError> {
         // What opening the database writes (repair, registries, schema) is
         // the store's own work: bounded, and allowed past a limit the
         // database no longer fits, so it opens to be read.
         let _opening = engine.footprints().open_phase();
+        let opens_deployment = shared.is_none();
         // A capture checks the table trees it takes against the catalog.
         engine.set_catalog_inventory(Arc::new(coordinode_modality::schema::CatalogTables));
-        // Repair on open, for an engine with its own journal: what the store
+        // Repair on open, once per deployment, for an engine with its own
+        // journal: what the store
         // already knows it owes (a rebuild a crash cut short, a salvage that
         // lost data) is rebuilt from the latest checkpoint and the journal
         // BEFORE any state is read below, or reported when it cannot be. The
@@ -993,7 +1101,7 @@ impl Database {
         // make it scrub the store, which is the background scrub's or an
         // operator's `verify_and_repair()`. Cluster engines (no journal)
         // skip this. A repair failure is logged, not fatal.
-        if engine.has_journal() {
+        if opens_deployment && engine.has_journal() {
             let root = crate::repair::checkpoint_root(engine.data_dir());
             // The journal keeps what a rebuild from the newest checkpoint
             // replays; a floor that cannot be read keeps the whole journal.
@@ -1049,9 +1157,12 @@ impl Database {
         // copies, and a transfer received says what the sender proved.
         engine.set_index_copy_qualifier(Arc::new(
             coordinode_query::index::transfer::CopyQualifier::new(Arc::clone(&index_registry)),
-        ));
+        ))?;
 
-        let proposal_id_gen = Arc::new(ProposalIdGenerator::with_base(fresh_proposal_id_base()));
+        let proposal_id_gen = match &shared {
+            Some(shared) => Arc::clone(&shared.proposal_id_gen),
+            None => Arc::new(ProposalIdGenerator::with_base(fresh_proposal_id_base())),
+        };
 
         // The verified field dictionary, before anything reads stored data:
         // a damaged or missing one refuses the open rather than serving
@@ -1159,14 +1270,22 @@ impl Database {
         // Every NodeId comes from a lease the log granted, taken on the first
         // CREATE and then kept one lease ahead in the background, so a crash
         // or a change of leader never reissues one (CE single-shard: hint 0).
-        let reserver = id_lease::PrefetchingReserver::start(id_lease::LogLeaseReserver::new(
-            Arc::clone(&engine),
-            Arc::clone(&pipeline),
-            Arc::clone(&proposal_id_gen),
-            Arc::clone(&oracle),
-        ))
-        .map_err(|e| DatabaseError::Other(format!("start the NodeId lease worker: {e}")))?;
-        let allocator = NodeIdAllocator::leased(0, Arc::new(reserver));
+        // One allocator for the deployment: a NodeId is unique across it.
+        let allocator = match &shared {
+            Some(shared) => Arc::clone(&shared.allocator),
+            None => {
+                let reserver = id_lease::PrefetchingReserver::start(
+                    id_lease::LogLeaseReserver::new(
+                        Arc::clone(&engine),
+                        Arc::clone(&pipeline),
+                        Arc::clone(&proposal_id_gen),
+                        Arc::clone(&oracle),
+                    ),
+                )
+                .map_err(|e| DatabaseError::Other(format!("start the NodeId lease worker: {e}")))?;
+                Arc::new(NodeIdAllocator::leased(0, Arc::new(reserver)))
+            }
+        };
 
         // Start COMPUTED TTL background reaper (default: 60s interval, 1000 batch).
         let ttl_reaper_config = coordinode_query::index::ttl_reaper::TtlReaperConfig::default();
@@ -1193,8 +1312,10 @@ impl Database {
         // Orphan blob collection runs on its own thread, woken by releases
         // and by the work it knows falls due; a group that holds other
         // members collects nothing (see `blob::GroupMembers`).
-        let group_members: Arc<parking_lot::RwLock<Option<blob::GroupMembers>>> =
-            Arc::new(parking_lot::RwLock::new(None));
+        let group_members: Arc<parking_lot::RwLock<Option<blob::GroupMembers>>> = match &shared {
+            Some(shared) => Arc::clone(&shared.group_members),
+            None => Arc::new(parking_lot::RwLock::new(None)),
+        };
         let blob_collector = coordinode_storage::blob::gc::BlobCollector::new(
             coordinode_storage::blob::BlobStore::through_pipeline(
                 Arc::clone(&engine),
@@ -1207,11 +1328,27 @@ impl Database {
         );
         let blob_collector_worker = blob_collector.spawn();
 
-        // Registrations recorded in an earlier run hold their history again
-        // from here, before anything this open starts purges the journal.
-        let consumers = consumers::Consumers::open(&engine, &pipeline)?;
-        // After the registrations above hold their history again.
-        let journal_reclaim = engine.deployment().start_journal_reclaim()?;
+        let (consumers, journal_reclaim) = match shared {
+            Some(shared) => (shared.consumers, shared.journal_reclaim),
+            None => {
+                // Registrations recorded in an earlier run hold their history
+                // again from here, before anything this open starts purges the
+                // journal.
+                let consumers = consumers::Consumers::open(&engine, &pipeline)?.map(Arc::new);
+                // After the registrations above hold their history again.
+                let journal_reclaim = engine.deployment().start_journal_reclaim()?.map(Arc::new);
+                (consumers, journal_reclaim)
+            }
+        };
+        let namespace_name = engine
+            .deployment()
+            .live_namespaces()?
+            .into_iter()
+            .find(|(id, _)| *id == engine.namespace())
+            .map(|(_, name)| name)
+            .ok_or_else(|| {
+                DatabaseError::Other("the database's namespace is not in the catalog".to_owned())
+            })?;
 
         let db = Self {
             engine,
@@ -1268,6 +1405,7 @@ impl Database {
             blob_collector,
             _blob_collector_worker: blob_collector_worker,
             consumers,
+            namespace_name,
         };
         // A store that owns its log takes up its unfinished index builds now;
         // a cluster member does it once it leads, since the builds are
@@ -3558,6 +3696,12 @@ impl Database {
     /// Get the underlying storage engine.
     pub fn engine(&self) -> &StorageEngine {
         &self.engine
+    }
+
+    /// The storage engine as a shared handle, for work that outlives a
+    /// borrow of the database (a member's index copy source, a follower).
+    pub fn engine_handle(&self) -> Arc<StorageEngine> {
+        Arc::clone(&self.engine)
     }
 
     /// Get a shared reference to the storage engine.

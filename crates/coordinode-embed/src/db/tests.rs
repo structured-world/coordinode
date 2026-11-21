@@ -1,5 +1,52 @@
 use super::*;
 
+/// A session of another namespace works in that namespace alone: the same
+/// labels and keys written through each handle stay with it, a NodeId is
+/// drawn from the deployment's one allocator, and a name the deployment does
+/// not hold, or the handle's own, opens no session.
+#[test]
+fn a_session_of_another_namespace_works_in_it_alone() {
+    use coordinode_core::graph::types::Value;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    assert_eq!(
+        db.namespace(),
+        coordinode_core::namespace::DEFAULT_NAMESPACE
+    );
+    db.engine().create_namespace("other").expect("create other");
+    let mut other = db.session("other").expect("a session of other");
+    assert_eq!(other.namespace(), "other");
+
+    let mine = db
+        .execute_cypher("CREATE (n:Shared {k: 'x', v: 1}) RETURN id(n) AS id")
+        .expect("write in default");
+    let theirs = other
+        .execute_cypher("CREATE (n:Shared {k: 'x', v: 2}) RETURN id(n) AS id")
+        .expect("write in other");
+    assert_ne!(
+        mine[0].get("id"),
+        theirs[0].get("id"),
+        "a NodeId is unique across the deployment"
+    );
+    for (handle, value) in [(&mut db, 1), (&mut other, 2)] {
+        let rows = handle
+            .execute_cypher("MATCH (n:Shared {k: 'x'}) RETURN n.v AS v")
+            .expect("read");
+        assert_eq!(rows.len(), 1, "each namespace holds its own node alone");
+        assert_eq!(rows[0].get("v"), Some(&Value::Int(value)));
+    }
+
+    assert!(matches!(
+        db.session("nowhere"),
+        Err(DatabaseError::UnknownNamespace(name)) if name == "nowhere"
+    ));
+    assert!(
+        db.session(coordinode_core::namespace::DEFAULT_NAMESPACE)
+            .is_err()
+    );
+}
+
 /// An auto-commit statement refused at commit because another commit in
 /// flight holds its node (here one conditioned on the node, as a background
 /// index repair is) applied nothing, and runs again once that commit lands:

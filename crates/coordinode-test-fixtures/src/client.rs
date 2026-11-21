@@ -11,6 +11,23 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::pki::Credentials;
 
+/// The namespace a fresh server's store opens with.
+pub const NAMESPACE: &str = "default";
+
+/// The metadata key a client names its namespace under.
+pub const NAMESPACE_HEADER: &str = "x-coordinode-namespace";
+
+/// `message` as a call naming [`NAMESPACE`], as a client of tenant data names
+/// the namespace it works in.
+pub fn named<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert(
+        NAMESPACE_HEADER,
+        tonic::metadata::MetadataValue::from_static(NAMESPACE),
+    );
+    request
+}
+
 /// A channel to `authority` (`host:port`) over TLS, presenting `identity`
 /// when given. The server is not verified: these clients test what the
 /// server decides about them.

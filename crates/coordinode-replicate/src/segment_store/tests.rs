@@ -1356,7 +1356,8 @@ async fn a_generation_pull_carries_the_peers_standing_proof() {
     let layer = std::sync::Arc::new(PeerProof {
         proved: std::sync::atomic::AtomicBool::new(true),
     });
-    peer.set_index_copy_qualifier(std::sync::Arc::clone(&layer) as _);
+    peer.set_index_copy_qualifier(std::sync::Arc::clone(&layer) as _)
+        .expect("register");
     let target = serve(&peer).await;
 
     let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));

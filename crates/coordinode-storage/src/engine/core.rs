@@ -318,11 +318,6 @@ pub struct Deployment {
     /// holds what this process proved about the copy: only what it wrote
     /// durably is known to survive a power cut, not bytes merely read back.
     promise_copy: parking_lot::Mutex<crate::engine::promise::CopyWriter>,
-    /// The index layer's handling of transferred index copies, once it
-    /// registers it. no-std: spin::RwLock.
-    pub(crate) index_copy_qualifier: parking_lot::RwLock<
-        Option<std::sync::Arc<dyn crate::engine::index_copies::IndexCopyQualifier>>,
-    >,
     /// Consumers watching the writes a partition receives (see
     /// [`Self::tap_writes`]).
     write_taps: Arc<crate::engine::tap::WriteTaps>,
@@ -2190,7 +2185,6 @@ impl Deployment {
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
             promise_copy: parking_lot::Mutex::new(crate::engine::promise::CopyWriter::default()),
-            index_copy_qualifier: parking_lot::RwLock::new(None),
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
             applied_feed: Arc::new(crate::engine::applied::AppliedFeed::default()),
             index_feed_capacity: config.index_feed_capacity.max(1),

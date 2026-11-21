@@ -55,6 +55,9 @@ const BUFFER: usize = 256;
 /// gRPC binding for the session core.
 pub struct SessionSvc {
     manager: SessionManager,
+    /// The statement path every session takes, bound to its session's
+    /// namespace when the session opens.
+    executor: StatementExecutor,
     /// What subscriptions read through; without it a subscription is refused.
     change_streams: Option<Arc<ChangeEventServiceImpl>>,
     /// The cluster this node belongs to, whose history qualifies the log
@@ -71,9 +74,10 @@ impl SessionSvc {
         // A session's commands take the member's slots, as unary calls and
         // the commands peers route here do.
         let slots = executor.command_slots().clone();
-        let engine = Arc::new(DatabaseCursorEngine::from_executor(executor));
+        let engine = Arc::new(DatabaseCursorEngine::from_executor(executor.clone()));
         Self {
             manager: SessionManager::new(engine, registry).with_command_slots(slots),
+            executor,
             change_streams: None,
             cluster: None,
         }
@@ -161,6 +165,15 @@ impl SessionServiceTrait for SessionSvc {
             .map(|a| a.to_string())
             .unwrap_or_default();
         let client = ClientApp::from_metadata(request.metadata());
+        // The session works in the namespace its stream named when it opened,
+        // for its whole life: a session that cannot be bound performs nothing.
+        let namespace = super::namespace::from_metadata(request.metadata())?;
+        let bound = self
+            .executor
+            .in_namespace(namespace.as_deref())
+            .map_err(super::cypher::db_error_to_status)?;
+        let engine: Arc<dyn coordinode_session::CursorEngine> =
+            Arc::new(DatabaseCursorEngine::from_executor(bound));
         let mut inbound = request.into_inner();
         let (op_tx, op_rx) = mpsc::channel::<InOp>(BUFFER);
         let (ev_tx, mut ev_rx) = mpsc::channel::<OutEvent>(BUFFER);
@@ -170,7 +183,7 @@ impl SessionServiceTrait for SessionSvc {
 
         // The core: concurrent dispatch + correlation + single writer, all
         // transport-agnostic.
-        tokio::spawn(self.manager.open(peer).run(op_rx, ev_tx.clone()));
+        tokio::spawn(self.manager.open_on(peer, engine).run(op_rx, ev_tx.clone()));
 
         // Reader: map each proto frame to a neutral op. A frame with no op, or
         // one whose settings the server cannot honour, is a malformed request,

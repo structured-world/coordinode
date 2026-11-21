@@ -12,11 +12,13 @@ fn builder_defaults() {
         app_version: builder.app_version.clone(),
         transport: builder.transport,
         causal_wait: builder.causal_wait,
+        namespace: None,
     };
     assert_eq!(
         config.causal_wait, None,
         "a causal read waits for nothing unless the client allows it"
     );
+    assert_eq!(builder.namespace, None, "no namespace unless named");
     assert!(
         !config.debug_source_tracking,
         "tracking disabled by default"
@@ -34,11 +36,13 @@ fn builder_defaults() {
 #[test]
 fn builder_custom() {
     let builder = CoordinodeClient::builder("http://prod:7080")
+        .namespace("tenant")
         .debug_source_tracking(true)
         .app_name("my-svc")
         .app_version("v2.0")
         .causal_wait(std::time::Duration::from_millis(300));
 
+    assert_eq!(builder.namespace.as_deref(), Some("tenant"));
     assert_eq!(
         builder.causal_wait,
         Some(std::time::Duration::from_millis(300))
@@ -61,6 +65,7 @@ fn source_tracking_flag_reflects_config() {
         app_version: String::new(),
         transport: Transport::default(),
         causal_wait: None,
+        namespace: None,
     };
     let config_off = ClientConfig {
         debug_source_tracking: false,

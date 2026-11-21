@@ -761,7 +761,7 @@ checkpoint_interval_secs: 2
 /// strongest acknowledgement a client can ask for.
 async fn write_acked(
     client: &mut coordinode_integration::proto::query::cypher_service_client::CypherServiceClient<
-        tonic::transport::Channel,
+        coordinode_integration::harness::NamedChannel,
     >,
     stream: &str,
     seq: i64,

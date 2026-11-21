@@ -110,9 +110,7 @@ async fn causal_reads_are_monotonic() {
 #[tokio::test]
 async fn a_token_from_another_clock_is_refused_as_not_ready() {
     let server = CoordinodeProcess::start().await;
-    let mut client = CoordinodeClient::connect(server.endpoint())
-        .await
-        .expect("connect coordinode-client");
+    let mut client = named_client(&server).await;
     let err = client
         .execute_causal_read("MATCH (n) RETURN n LIMIT 1", CausalToken::from(u64::MAX))
         .await
@@ -127,10 +125,20 @@ async fn a_token_from_another_clock_is_refused_as_not_ready() {
     );
 }
 
+/// A client working in the server's namespace.
+async fn named_client(server: &CoordinodeProcess) -> CoordinodeClient {
+    CoordinodeClient::builder(server.endpoint())
+        .namespace(coordinode_integration::harness::NAMESPACE)
+        .build()
+        .await
+        .expect("connect coordinode-client")
+}
+
 /// A client that lets causal reads wait for the member to catch up with
 /// their bound.
 async fn causal_client(server: &CoordinodeProcess) -> CoordinodeClient {
     CoordinodeClient::builder(server.endpoint())
+        .namespace(coordinode_integration::harness::NAMESPACE)
         .causal_wait(std::time::Duration::from_secs(5))
         .build()
         .await
@@ -185,9 +193,7 @@ async fn causal_write_with_params_round_trip() {
 async fn zero_token_causal_read_is_accepted() {
     let server = CoordinodeProcess::start().await;
 
-    let mut client = CoordinodeClient::connect(server.endpoint())
-        .await
-        .expect("connect coordinode-client");
+    let mut client = named_client(&server).await;
 
     let (rows, token) = client
         .execute_causal_read("MATCH (n) RETURN n LIMIT 0", CausalToken::default())

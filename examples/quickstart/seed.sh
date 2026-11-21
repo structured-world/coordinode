@@ -15,6 +15,8 @@ set -euo pipefail
 
 BASE_URL="${COORDINODE_REST_URL:-http://localhost:7081}"
 CYPHER_URL="${BASE_URL}/v1/query/cypher"
+# Every data call names its namespace; a fresh server creates `default`.
+NAMESPACE="${COORDINODE_NAMESPACE:-default}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_FILE="${SCRIPT_DIR}/seed-data.json"
 
@@ -29,6 +31,7 @@ cypher() {
     local result
     result=$(curl -sf -X POST "$CYPHER_URL" \
         -H "Content-Type: application/json" \
+        -H "X-CoordiNode-Namespace: $NAMESPACE" \
         -d "$body" 2>&1) || {
         echo "  FAILED"
         echo "  Response: $result"
@@ -132,4 +135,5 @@ echo ""
 echo "Try the hybrid query:"
 echo "  curl -s -X POST $CYPHER_URL \\"
 echo "    -H 'Content-Type: application/json' \\"
+echo "    -H 'X-CoordiNode-Namespace: $NAMESPACE' \\"
 echo "    -d @examples/quickstart/hybrid-query.json | python3 -m json.tool"
