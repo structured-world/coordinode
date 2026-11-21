@@ -688,7 +688,8 @@ impl CoordinodeProcess {
     }
 
     /// Send one HTTP/1.1 request with an optional JSON body to this process's
-    /// REST port; returns the status code and the raw response body.
+    /// REST port, naming [`NAMESPACE`] as every client of tenant data does;
+    /// returns the status code and the raw response body.
     pub fn rest_request(&self, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
         use std::io::{Read, Write};
 
@@ -701,7 +702,7 @@ impl CoordinodeProcess {
         let body = body.unwrap_or("");
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+             {NAMESPACE_HEADER}: {NAMESPACE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream

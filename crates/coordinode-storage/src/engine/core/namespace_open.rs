@@ -37,6 +37,7 @@ pub(crate) struct TreeOpener {
     /// places the levels of the namespace's columnar tables.
     pub(crate) routing: HashMap<Partition, PartitionRouting>,
     /// Every columnar table's write-pressure series, of every namespace.
+    #[cfg(feature = "columnar")]
     pub(crate) table_metrics: Arc<crate::engine::owned_metrics::TableMetrics>,
 }
 

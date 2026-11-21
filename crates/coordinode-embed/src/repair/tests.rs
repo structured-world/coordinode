@@ -135,16 +135,18 @@ fn corrupt_post_checkpoint_tables(tables_dir: &Path, checkpoint_root: &Path) -> 
     corrupted
 }
 
-/// The tables some checkpoint under `checkpoint_root` holds for the
-/// partition whose live tables are in `tables_dir`, by file name. A name
-/// alone does not tie a live table to one of these: a checkpoint links the
-/// tables it pinned under their live names, but writes its own tables for the
-/// memtable contents it carried, numbered in the checkpoint, which a table
-/// the live tree writes later can share. [`in_checkpoint`] decides.
+/// The tables some checkpoint under `checkpoint_root` holds for a partition
+/// like the one whose live tables are in `tables_dir`, by file name, every
+/// file of a name kept. A name alone does not tie a live table to one of
+/// these: a checkpoint links the tables it pinned under their live names, but
+/// writes its own tables for the memtable contents it carried, numbered in
+/// the checkpoint, which a table the live tree writes later can share; and
+/// the same partition of another namespace numbers its tables from the same
+/// start. [`in_checkpoint`] decides.
 fn checkpoint_table_names(
     tables_dir: &Path,
     checkpoint_root: &Path,
-) -> std::collections::HashMap<std::ffi::OsString, std::path::PathBuf> {
+) -> std::collections::HashMap<std::ffi::OsString, Vec<std::path::PathBuf>> {
     let partition = tables_dir
         .parent()
         .and_then(Path::file_name)
@@ -169,7 +171,10 @@ fn checkpoint_table_names(
             if entry.file_type().expect("file type").is_dir() {
                 stack.push(entry.path());
             } else if in_tables {
-                names.insert(entry.file_name(), entry.path());
+                names
+                    .entry(entry.file_name())
+                    .or_insert_with(Vec::new)
+                    .push(entry.path());
             }
         }
     }
@@ -178,18 +183,21 @@ fn checkpoint_table_names(
 
 /// Whether the live table file `live` is one a checkpoint holds: a file of
 /// the same name there with the same bytes, linked or copied. Portable where
-/// inode numbers are not.
+/// inode numbers are not, and independent of the order a directory lists
+/// same-named tables of other trees in.
 fn in_checkpoint(
     live: &Path,
-    checkpoint: &std::collections::HashMap<std::ffi::OsString, std::path::PathBuf>,
+    checkpoint: &std::collections::HashMap<std::ffi::OsString, Vec<std::path::PathBuf>>,
 ) -> bool {
     let Some(name) = live.file_name() else {
         return false;
     };
-    checkpoint.get(name).is_some_and(|held| {
-        std::fs::read(held).expect("read checkpoint table")
-            == std::fs::read(live).expect("read live table")
-    })
+    let Some(held) = checkpoint.get(name) else {
+        return false;
+    };
+    let live = std::fs::read(live).expect("read live table");
+    held.iter()
+        .any(|held| std::fs::read(held).expect("read checkpoint table") == live)
 }
 
 /// Even a tiny SST must receive damage in its data section, rather than only

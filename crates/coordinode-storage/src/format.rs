@@ -254,7 +254,7 @@ fn refuse_flat_layout(dir: &Path) -> StorageResult<()> {
         let entry = entry.map_err(|e| io_at("list", dir, e))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let is_tree = name == crate::columnar::TABLES_DIR
+        let is_tree = name == crate::engine::scope::TABLES_DIR
             || crate::engine::partition::Partition::all()
                 .iter()
                 .any(|part| part.name() == name);

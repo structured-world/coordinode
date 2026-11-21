@@ -84,6 +84,21 @@ fn put(key: &[u8], value: &[u8]) -> Mutation {
     }
 }
 
+/// Whether `dir`, a dropped namespace's directory, is gone within a bound:
+/// it goes once the last of its trees closes, which the background work
+/// still running in a tree after the drop (a flush's file pool, its deleter)
+/// may delay a little past the drop itself.
+fn removed_once_closed(dir: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while dir.exists() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
 /// Every file under `dir`, for a failure to name what stayed.
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
@@ -215,15 +230,12 @@ fn an_idle_namespace_closes_and_opens_again_with_its_rows() {
 
     // Dropped while closed: its directories go with it.
     deployment.drop_namespace("idle").expect("drop");
-    let gone = namespace_dirs(&deployment.endpoints, idle_id);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while gone.iter().any(|d| d.exists()) {
+    for gone in namespace_dirs(&deployment.endpoints, idle_id) {
         assert!(
-            std::time::Instant::now() < deadline,
+            removed_once_closed(&gone),
             "a closed namespace's files stayed: {:?}",
-            gone.iter().flat_map(|d| walk(d)).collect::<Vec<_>>()
+            walk(&gone)
         );
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -331,7 +343,7 @@ fn a_drop_removes_the_namespace_and_nothing_else() {
 
     assert_eq!(deployment.drop_namespace("a").expect("drop"), a_id);
     assert!(
-        !a_dir.exists(),
+        removed_once_closed(&a_dir),
         "the dropped namespace's trees stay: {:?}",
         walk(&a_dir)
     );
@@ -359,6 +371,43 @@ fn a_drop_removes_the_namespace_and_nothing_else() {
         vec![(b_id, "b".to_owned()), (again, "a".to_owned())]
     );
     assert!(!a_dir.exists(), "the dropped namespace came back");
+}
+
+/// A dropped namespace's directories go only once its trees are closed:
+/// while anything of a tree still works in its directory (here a handle a
+/// background pass took before the drop), removing the directory under it
+/// races that work and leaves files behind. Once the last handle goes, the
+/// directories are removed without another call.
+#[test]
+fn a_drop_removes_the_directories_once_the_trees_are_closed() {
+    let dir = TempDir::new().expect("tmp");
+    let config = durable_cfg(&dir);
+    let (deployment, oracle) = open_deployment(&config);
+    let a_id = deployment.create_namespace("a").expect("a");
+    {
+        let a = deployment.engine(a_id).expect("a");
+        commit(&a, &oracle, vec![put(b"k", b"a")]);
+        a.persist().expect("persist");
+    }
+    let held = deployment
+        .coordinator
+        .sets()
+        .namespace(a_id)
+        .and_then(|set| set.get(Partition::Node).cloned())
+        .expect("a's node tree is open");
+    let a_dir = dir.path().join(Scope::Namespace(a_id).dir());
+
+    deployment.drop_namespace("a").expect("drop");
+    assert!(
+        a_dir.exists(),
+        "the directories went while a tree still worked in them"
+    );
+    drop(held);
+    assert!(
+        removed_once_closed(&a_dir),
+        "the closed trees' directories stay: {:?}",
+        walk(&a_dir)
+    );
 }
 
 /// A node row's value: compressible, and its own for every row and
@@ -632,7 +681,11 @@ fn a_drop_removes_the_namespace_on_every_tier() {
     deployment.drop_namespace("a").expect("drop");
     for root in [hot.path(), cold.path()] {
         let gone = root.join(Scope::Namespace(a_id).dir());
-        assert!(!gone.exists(), "left on {root:?}: {:?}", walk(&gone));
+        assert!(
+            removed_once_closed(&gone),
+            "left on {root:?}: {:?}",
+            walk(&gone)
+        );
         assert!(
             root.join(Scope::Namespace(b_id).dir()).exists(),
             "another namespace's files went on {root:?}"

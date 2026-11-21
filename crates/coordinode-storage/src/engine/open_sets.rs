@@ -68,14 +68,26 @@ impl Drop for SetTrees {
         let Some(retire) = self.retire.get_mut().take() else {
             return;
         };
-        // The set's own handles first, so nothing of it keeps a file open.
-        self.trees = Default::default();
+        // Close the set's trees and remove the directories once the last of
+        // them no longer works in them: a tree outlives this handle while its
+        // background work or a pass's handle still holds it.
+        #[cfg_attr(not(feature = "columnar"), expect(unused_mut))]
+        let mut closing: Vec<lsm_tree::TreeClose> = self
+            .trees
+            .iter_mut()
+            .filter_map(Option::take)
+            .map(AnyTree::close)
+            .collect();
         self.installations = None;
         #[cfg(feature = "columnar")]
-        {
-            self.columnar = None;
+        if let Some(registry) = self.columnar.take() {
+            closing.extend(registry.close_all());
         }
-        crate::engine::core::remove_namespace_dirs(&retire.dirs, &retire.footprints);
+        crate::engine::core::remove_namespace_dirs_once_closed(
+            closing,
+            retire.dirs,
+            retire.footprints,
+        );
     }
 }
 
@@ -113,6 +125,7 @@ impl SetTrees {
 
     /// The cell holding the namespace's storage settings, shared with what
     /// opens its table trees.
+    #[cfg(feature = "columnar")]
     pub(crate) fn storage_cell(&self) -> Arc<RwLock<coordinode_core::namespace::NamespaceStorage>> {
         Arc::clone(&self.storage)
     }
@@ -143,6 +156,7 @@ impl SetTrees {
     /// meanwhile. The signals report when each tree no longer touches its
     /// directory, which a reopen waits for.
     pub(crate) fn close(mut self) -> Vec<lsm_tree::TreeClose> {
+        #[cfg_attr(not(feature = "columnar"), expect(unused_mut))]
         let mut closing: Vec<lsm_tree::TreeClose> = self
             .trees
             .iter_mut()
@@ -416,6 +430,7 @@ impl OpenSets {
     }
 
     /// Every open namespace's set now, in id order.
+    #[cfg(feature = "columnar")]
     #[must_use]
     pub(crate) fn namespace_sets(&self) -> Vec<Arc<SetTrees>> {
         self.namespaces.read().values().cloned().collect()

@@ -104,8 +104,7 @@ pub fn columnar_batch_rows(batch: &ColumnBatch) -> StorageResult<Vec<(Vec<u8>, V
         .collect())
 }
 
-/// The directory, under every endpoint, that holds the table trees.
-pub(crate) const TABLES_DIR: &str = "tables";
+pub(crate) use crate::engine::scope::TABLES_DIR;
 
 /// A registry of per-table columnar trees, keyed by table id.
 ///

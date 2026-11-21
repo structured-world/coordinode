@@ -1391,6 +1391,7 @@ impl Deployment {
             capacity: Arc::clone(&capacity_pool),
             repair_policy,
             routing: data_routing,
+            #[cfg(feature = "columnar")]
             table_metrics: Arc::clone(&table_metrics),
         };
         // Every namespace the catalog holds live, and every one whose trees
@@ -7780,19 +7781,11 @@ impl Deployment {
             // A namespace closed for being idle: its directories go once the
             // last of its closed trees no longer touches them, without the
             // apply waiting for that.
-            (None, Some(closing)) if !closing.is_empty() => {
-                let left = Arc::new(std::sync::atomic::AtomicUsize::new(closing.len()));
-                let removal = Arc::new((dirs, self.footprints.clone()));
-                for tree in closing {
-                    let (left, removal) = (Arc::clone(&left), Arc::clone(&removal));
-                    tree.on_closed(move || {
-                        if left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-                            remove_namespace_dirs(&removal.0, &removal.1);
-                        }
-                    });
-                }
-            }
-            (None, _) => remove_namespace_dirs(&dirs, &self.footprints),
+            (None, closing) => remove_namespace_dirs_once_closed(
+                closing.unwrap_or_default(),
+                dirs,
+                self.footprints.clone(),
+            ),
         }
     }
 
@@ -10996,6 +10989,34 @@ pub(crate) fn remove_namespace_dirs(
                 footprints.removed_partly(dir);
             }
         }
+    }
+}
+
+/// Remove `dirs`, a dropped namespace's directories, once every one of
+/// `closing`, its closed trees, no longer touches them: a tree's background
+/// work (its file pool, its deleter, a handle a pass still holds) writes in
+/// its directory until then, and a removal racing it leaves files behind.
+/// Nothing waits meanwhile; the last tree to close removes them.
+pub(crate) fn remove_namespace_dirs_once_closed(
+    closing: Vec<lsm_tree::TreeClose>,
+    dirs: Vec<PathBuf>,
+    footprints: crate::engine::footprint::Footprints,
+) {
+    if closing.is_empty() {
+        remove_namespace_dirs(&dirs, &footprints);
+        return;
+    }
+    let left = Arc::new(std::sync::atomic::AtomicUsize::new(closing.len()));
+    let removal = Arc::new((dirs, footprints));
+    for tree in closing {
+        let (left, removal) = (Arc::clone(&left), Arc::clone(&removal));
+        tree.on_closed(move || {
+            // AcqRel: the closing that brings the count to zero sees every
+            // other tree's closing before it removes the directories.
+            if left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                remove_namespace_dirs(&removal.0, &removal.1);
+            }
+        });
     }
 }
 

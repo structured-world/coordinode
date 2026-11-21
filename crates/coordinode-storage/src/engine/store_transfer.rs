@@ -52,8 +52,7 @@ use crate::error::{StorageError, StorageResult};
 const MAGIC: [u8; 4] = *b"CNST";
 /// The stream's shape after its magic; a receiver refuses any other.
 const VERSION: u8 = 1;
-/// The directory of a namespace's `STORAGE COLUMNAR` table trees.
-const TABLES_DIR: &str = "tables";
+use crate::engine::scope::TABLES_DIR;
 /// The name prefix of a `STORAGE COLUMNAR` table's tree within its
 /// namespace.
 const TABLE_PREFIX: &str = "tables/";
