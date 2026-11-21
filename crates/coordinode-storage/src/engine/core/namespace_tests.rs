@@ -558,6 +558,109 @@ fn a_rebuild_cut_short_stays_owed_by_its_own_namespaces_tree() {
     assert_eq!(node(&a, b"k").as_deref(), Some(&b"a"[..]));
 }
 
+/// The tiered cache keeps each namespace's values apart: a value one
+/// namespace read into the cache is never served to another reading the same
+/// key, and a write in one namespace leaves the other's cached value served.
+#[test]
+fn the_tiered_cache_keeps_namespaces_apart() {
+    let dir = TempDir::new().expect("tmp");
+    let cache_dir = TempDir::new().expect("tmp");
+    let mut config = durable_cfg(&dir);
+    config.cache = crate::cache::config::TieredCacheConfig {
+        layers: vec![crate::cache::config::CacheLayerConfig {
+            path: cache_dir.path().join("layer0.cache"),
+            max_bytes: 1 << 20,
+            max_entries: 1000,
+            compaction_threshold: 0.5,
+        }],
+        compaction_interval_secs: 0,
+        ..Default::default()
+    };
+    let (deployment, oracle) = open_deployment(&config);
+    let a = deployment
+        .engine(deployment.create_namespace("a").expect("a"))
+        .expect("bind a");
+    let b = deployment
+        .engine(deployment.create_namespace("b").expect("b"))
+        .expect("bind b");
+    commit(&a, &oracle, vec![put(b"k", b"of-a")]);
+    commit(&b, &oracle, vec![put(b"k", b"of-b")]);
+
+    // a's read fills the cache; b's read of the same key is b's own row.
+    assert_eq!(node(&a, b"k").as_deref(), Some(&b"of-a"[..]));
+    assert_eq!(node(&b, b"k").as_deref(), Some(&b"of-b"[..]));
+    assert_eq!(node(&a, b"k").as_deref(), Some(&b"of-a"[..]));
+
+    commit(&b, &oracle, vec![put(b"k", b"of-b-2")]);
+    assert_eq!(node(&b, b"k").as_deref(), Some(&b"of-b-2"[..]));
+    assert_eq!(node(&a, b"k").as_deref(), Some(&b"of-a"[..]));
+    let values = a.multi_get(Partition::Node, &[b"k"]).expect("multi get");
+    assert_eq!(values[0].as_deref(), Some(&b"of-a"[..]));
+}
+
+/// A tap on one namespace's partition sees that namespace's writes only:
+/// another namespace's writes and range deletes to the same partition reach
+/// it neither as keys nor as a replacement.
+#[test]
+fn a_write_tap_sees_its_own_namespace_only() {
+    use crate::engine::tap::Tapped;
+    let dir = TempDir::new().expect("tmp");
+    let (deployment, oracle) = open_deployment(&durable_cfg(&dir));
+    let a = deployment
+        .engine(deployment.create_namespace("a").expect("a"))
+        .expect("bind a");
+    let b = deployment
+        .engine(deployment.create_namespace("b").expect("b"))
+        .expect("bind b");
+    let (tap, _) = a.tap_writes(Partition::Node).expect("tap");
+
+    commit(&b, &oracle, vec![put(b"of-b", b"1")]);
+    b.put(Partition::Node, b"direct-b", b"1")
+        .expect("direct put");
+    assert_eq!(
+        tap.take(),
+        Tapped::Keys(Vec::new()),
+        "a's tap took b's writes"
+    );
+
+    b.remove_range(Partition::Node, b"a", b"z")
+        .expect("range delete");
+    assert_eq!(
+        tap.take(),
+        Tapped::Keys(Vec::new()),
+        "b's range delete replaced a's tap"
+    );
+
+    commit(&a, &oracle, vec![put(b"of-a", b"1")]);
+    assert_eq!(tap.take(), Tapped::Keys(vec![b"of-a".to_vec()]));
+}
+
+/// A follower of one namespace's applied commits hears of that namespace's
+/// keys only: another namespace's commit to the same partition queues it no
+/// event, and its own commit queues one with its own key.
+#[test]
+fn an_applied_feed_reports_its_own_namespace_only() {
+    use crate::engine::applied::AppliedEvent;
+    let dir = TempDir::new().expect("tmp");
+    let (deployment, oracle) = open_deployment(&durable_cfg(&dir));
+    let a = deployment
+        .engine(deployment.create_namespace("a").expect("a"))
+        .expect("bind a");
+    let b = deployment
+        .engine(deployment.create_namespace("b").expect("b"))
+        .expect("bind b");
+    let feed = a.subscribe_applied(Partition::Node, 16);
+
+    commit(&b, &oracle, vec![put(b"of-b", b"1")]);
+    assert_eq!(feed.try_next(), None, "a's feed heard of b's commit");
+
+    commit(&a, &oracle, vec![put(b"of-a", b"1")]);
+    match feed.try_next() {
+        Some(AppliedEvent::Keys { keys, .. }) => assert_eq!(&*keys, &[b"of-a".to_vec()]),
+        other => panic!("a's own commit was not reported: {other:?}"),
+    }
+}
+
 /// A name a live namespace holds, or one no namespace may have, is refused
 /// and changes nothing.
 #[test]

@@ -3382,9 +3382,9 @@ impl StorageEngine {
         )?;
         self.flush_memtables(tree)?;
         // Cached values were read from the old copy.
-        self.write_taps.replaced(Partition::Idx);
+        self.write_taps.replaced(self.tree_id(Partition::Idx));
         if let Some(cache) = &self.tiered_cache {
-            cache.clear_partition(Partition::Idx);
+            cache.clear_partition(self.tree_id(Partition::Idx));
         }
         Ok(())
     }
@@ -7192,9 +7192,9 @@ impl Deployment {
         self.coordinator
             .flush_trigger()
             .wrote(part, added, memtable);
-        self.write_taps.wrote(part, [key]);
+        self.write_taps.wrote(TreeId::system(part), [key]);
         if let Some(cache) = &self.tiered_cache {
-            cache.remove(part, key);
+            cache.remove(TreeId::system(part), key);
         }
         Ok(())
     }
@@ -7492,14 +7492,16 @@ impl StorageEngine {
     pub fn get(&self, part: Partition, key: &[u8]) -> StorageResult<Option<bytes::Bytes>> {
         // Check tiered cache first. A miss takes the key's ticket before the
         // tree read, so the value is cached only if no write was invalidated
-        // since.
+        // since. Entries are this namespace's tree's: the same key of
+        // another namespace is another entry.
+        let id = self.tree_id(part);
         let ticket = match &self.tiered_cache {
             Some(cache) => {
-                if let Some(value) = cache.get(part, key) {
-                    self.access_tracker.record(part, key);
+                if let Some(value) = cache.get(id, key) {
+                    self.access_tracker.record(id, key);
                     return Ok(Some(value));
                 }
-                Some(cache.ticket(part, key))
+                Some(cache.ticket(id, key))
             }
             None => None,
         };
@@ -7517,9 +7519,9 @@ impl StorageEngine {
                 let bytes = bytes::Bytes::copy_from_slice(&v);
                 if let (Some(cache), Some(ticket)) = (&self.tiered_cache, ticket) {
                     let weight = self.resolve_cache_weight(cache, part, &bytes);
-                    cache.fill(part, key, &bytes, weight, ticket);
+                    cache.fill(id, key, &bytes, weight, ticket);
                 }
-                self.access_tracker.record(part, key);
+                self.access_tracker.record(id, key);
                 Ok(Some(bytes))
             }
             None => Ok(None),
@@ -7586,14 +7588,15 @@ impl StorageEngine {
         let mut miss_idx: Vec<usize> = Vec::with_capacity(keys.len());
         let mut miss_keys: Vec<&[u8]> = Vec::with_capacity(keys.len());
         let mut tickets = Vec::with_capacity(if ticket == 0 { 0 } else { keys.len() });
+        let id = self.tree_id(part);
         for (i, key) in keys.iter().enumerate() {
             if let Some(cache) = &self.tiered_cache {
-                if let Some(value) = cache.get(part, key) {
-                    self.access_tracker.record(part, key);
+                if let Some(value) = cache.get(id, key) {
+                    self.access_tracker.record(id, key);
                     each(i, Some(StoredValue::Cached(&value)))?;
                     continue;
                 }
-                tickets.push(cache.ticket(part, key));
+                tickets.push(cache.ticket(id, key));
             }
             miss_idx.push(i);
             miss_keys.push(key);
@@ -7610,12 +7613,12 @@ impl StorageEngine {
                 each(slot, None)?;
                 continue;
             };
-            self.access_tracker.record(part, keys[slot]);
+            self.access_tracker.record(id, keys[slot]);
             match (&self.tiered_cache, tickets.get(n)) {
                 (Some(cache), Some(ticket)) => {
                     let bytes = bytes::Bytes::copy_from_slice(&v);
                     let weight = self.resolve_cache_weight(cache, part, &bytes);
-                    cache.fill(part, keys[slot], &bytes, weight, *ticket);
+                    cache.fill(id, keys[slot], &bytes, weight, *ticket);
                     each(slot, Some(StoredValue::Cached(&bytes)))?;
                 }
                 _ => each(slot, Some(StoredValue::Tree(&v)))?,
@@ -7642,9 +7645,10 @@ impl StorageEngine {
             batch.insert(staging, value);
         }
         self.apply_single(part, batch)?;
-        self.write_taps.wrote(part, [key]);
+        let id = self.tree_id(part);
+        self.write_taps.wrote(id, [key]);
         if let Some(cache) = &self.tiered_cache {
-            cache.remove(part, key);
+            cache.remove(id, key);
         }
         Ok(())
     }
@@ -7683,9 +7687,10 @@ impl StorageEngine {
             }
             self.apply_single(part, batch)?;
         }
-        self.write_taps.wrote(part, [key]);
+        let id = self.tree_id(part);
+        self.write_taps.wrote(id, [key]);
         if let Some(cache) = &self.tiered_cache {
-            cache.remove(part, key);
+            cache.remove(id, key);
         }
         Ok(())
     }
@@ -7717,9 +7722,10 @@ impl StorageEngine {
         }
         self.coordinator.flush_trigger().wrote_unmeasured();
         drop(_landing);
-        self.write_taps.replaced(part);
+        let id = self.tree_id(part);
+        self.write_taps.replaced(id);
         if let Some(cache) = &self.tiered_cache {
-            cache.clear_partition(part);
+            cache.clear_partition(id);
         }
         Ok(())
     }
@@ -7745,9 +7751,10 @@ impl StorageEngine {
             batch.merge(staging, operand);
         }
         self.apply_single(part, batch)?;
-        self.write_taps.wrote(part, [key]);
+        let id = self.tree_id(part);
+        self.write_taps.wrote(id, [key]);
         if let Some(cache) = &self.tiered_cache {
-            cache.remove(part, key);
+            cache.remove(id, key);
         }
         Ok(())
     }
@@ -8607,9 +8614,10 @@ impl StorageEngine {
         if let Some(installations) = self.installations_of(part) {
             installations.rewrite(tree, self.next_seqno())?;
         }
-        self.write_taps.replaced(part);
+        let id = self.tree_id(part);
+        self.write_taps.replaced(id);
         if let Some(cache) = &self.tiered_cache {
-            cache.clear_partition(part);
+            cache.clear_partition(id);
         }
         Ok(())
     }
@@ -9452,7 +9460,9 @@ impl Deployment {
         }
         // Subscribed before the check that follows, so a bound raised between
         // the two still wakes the wait.
-        let feed = self.subscribe_applied(Partition::Registry, 16);
+        let feed = self
+            .applied_feed
+            .subscribe(TreeId::system(Partition::Registry), 16, false);
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if reached() {
@@ -9822,10 +9832,14 @@ impl Deployment {
         }
         Ok(rows)
     }
+}
 
-    /// Open a tap on `partition` and return it with a snapshot: every write
-    /// to the partition is either visible at the snapshot or delivered by
-    /// the tap, whatever timestamp it lands at.
+impl StorageEngine {
+    /// Open a tap on this namespace's `partition` and return it with a
+    /// snapshot: every write to the namespace's tree is either visible at the
+    /// snapshot or delivered by the tap, whatever timestamp it lands at.
+    /// Another namespace's writes to the same partition reach no tap of this
+    /// one.
     ///
     /// A write finishing before the tap opens is at or below the returned
     /// seqno. On a Raft store an apply lands at the leader's timestamp,
@@ -9842,25 +9856,28 @@ impl Deployment {
         &self,
         partition: Partition,
     ) -> StorageResult<(crate::engine::tap::WriteTap, lsm_tree::SeqNo)> {
-        let tap = self.write_taps.open(partition);
+        let tap = self.write_taps.open(self.tree_id(partition));
         let at = self.tap_snapshot()?;
         Ok((tap, at))
     }
 
-    /// Follow the commits applied to `partition` from now on, queueing at
-    /// most `capacity` events; see [`crate::engine::applied`].
+    /// Follow the commits applied to this namespace's `partition` (the
+    /// system set's for a deployment partition) from now on, queueing at
+    /// most `capacity` events; see [`crate::engine::applied`]. Another
+    /// namespace's commits to the same partition are not reported.
     ///
     /// Reported, after they are in the store: the entries the Raft state
-    /// machine applies through [`Self::apply_raft_proposal`] (with their log
-    /// index), and the local commits of an engine without Raft through
-    /// [`Self::commit_journaled`] (with their journal index) or
-    /// [`Self::apply_proposal_at`] (with index 0).
+    /// machine applies through [`Deployment::apply_raft_proposal`] (with
+    /// their log index), and the local commits of an engine without Raft
+    /// through [`Deployment::commit_journaled`] (with their journal index) or
+    /// [`Deployment::apply_proposal_at`] (with index 0).
     pub fn subscribe_applied(
         &self,
         partition: Partition,
         capacity: usize,
     ) -> crate::engine::applied::AppliedSubscription {
-        self.applied_feed.subscribe(partition, capacity, false)
+        self.applied_feed
+            .subscribe(self.tree_id(partition), capacity, false)
     }
 
     /// [`Self::subscribe_applied`] whose events stay after they are handed
@@ -9874,9 +9891,12 @@ impl Deployment {
         partition: Partition,
         capacity: usize,
     ) -> crate::engine::applied::AppliedSubscription {
-        self.applied_feed.subscribe(partition, capacity, true)
+        self.applied_feed
+            .subscribe(self.tree_id(partition), capacity, true)
     }
+}
 
+impl Deployment {
     /// How many applied commits a derived-index worker's retained
     /// subscription holds ([`StorageConfig::index_feed_capacity`]).
     pub fn index_feed_capacity(&self) -> usize {

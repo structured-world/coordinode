@@ -1,5 +1,22 @@
 use super::*;
 
+/// Namespace 1, the namespace most tests cache keys of.
+const NS: NamespaceId = NamespaceId::from_raw(1);
+const NODE: TreeId = TreeId::namespace(NS, Partition::Node);
+const ADJ: TreeId = TreeId::namespace(NS, Partition::Adj);
+const COUNTER: TreeId = TreeId::namespace(NS, Partition::Counter);
+const BLOB: TreeId = TreeId::namespace(NS, Partition::Blob);
+
+/// `part`'s tree: the system set's for a deployment partition, namespace
+/// 1's otherwise.
+fn tree(part: Partition) -> TreeId {
+    if part.is_deployment() {
+        TreeId::system(part)
+    } else {
+        TreeId::namespace(NS, part)
+    }
+}
+
 fn one_layer_config(dir: &std::path::Path, max_bytes: u64) -> TieredCacheConfig {
     TieredCacheConfig {
         layers: vec![CacheLayerConfig {
@@ -42,9 +59,9 @@ fn single_layer_put_get() {
     let config = one_layer_config(dir.path(), 1024 * 1024);
     let cache = TieredCache::open(&config).expect("open");
 
-    cache.put(Partition::Node, b"key1", b"value1");
+    cache.put(NODE, b"key1", b"value1");
     assert_eq!(
-        cache.get(Partition::Node, b"key1").as_deref(),
+        cache.get(NODE, b"key1").as_deref(),
         Some(b"value1".as_slice())
     );
 }
@@ -55,7 +72,7 @@ fn single_layer_miss() {
     let config = one_layer_config(dir.path(), 1024 * 1024);
     let cache = TieredCache::open(&config).expect("open");
 
-    assert!(cache.get(Partition::Node, b"missing").is_none());
+    assert!(cache.get(NODE, b"missing").is_none());
 }
 
 #[test]
@@ -64,9 +81,9 @@ fn single_layer_remove() {
     let config = one_layer_config(dir.path(), 1024 * 1024);
     let cache = TieredCache::open(&config).expect("open");
 
-    cache.put(Partition::Node, b"k", b"v");
-    cache.remove(Partition::Node, b"k");
-    assert!(cache.get(Partition::Node, b"k").is_none());
+    cache.put(NODE, b"k", b"v");
+    cache.remove(NODE, b"k");
+    assert!(cache.get(NODE, b"k").is_none());
 }
 
 #[test]
@@ -77,18 +94,44 @@ fn clear_partition_drops_only_that_partition() {
 
     // Two partitions cached; clear one, the other must survive — this is what a
     // range delete relies on to invalidate cached keys without nuking the world.
-    cache.put(Partition::Node, b"n1", b"v");
-    cache.put(Partition::Node, b"n2", b"v");
-    cache.put(Partition::Counter, b"c1", b"v");
+    cache.put(NODE, b"n1", b"v");
+    cache.put(NODE, b"n2", b"v");
+    cache.put(COUNTER, b"c1", b"v");
 
-    cache.clear_partition(Partition::Node);
+    cache.clear_partition(NODE);
 
-    assert!(cache.get(Partition::Node, b"n1").is_none());
-    assert!(cache.get(Partition::Node, b"n2").is_none());
-    assert_eq!(
-        cache.get(Partition::Counter, b"c1").as_deref(),
-        Some(&b"v"[..])
-    );
+    assert!(cache.get(NODE, b"n1").is_none());
+    assert!(cache.get(NODE, b"n2").is_none());
+    assert_eq!(cache.get(COUNTER, b"c1").as_deref(), Some(&b"v"[..]));
+}
+
+/// The same key of the same partition in two namespaces is two entries: each
+/// namespace reads its own value, a removal in one leaves the other's, and
+/// clearing one namespace's tree drops none of the other's entries.
+#[test]
+fn namespaces_keep_their_own_entries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = TieredCache::open(&one_layer_config(dir.path(), 1024 * 1024)).expect("open");
+    let other = TreeId::namespace(NamespaceId::from_raw(2), Partition::Node);
+
+    cache.put(NODE, b"k", b"one");
+    cache.put(other, b"k", b"two");
+    assert_eq!(cache.get(NODE, b"k").as_deref(), Some(&b"one"[..]));
+    assert_eq!(cache.get(other, b"k").as_deref(), Some(&b"two"[..]));
+
+    cache.remove(other, b"k");
+    assert!(cache.get(other, b"k").is_none());
+    assert_eq!(cache.get(NODE, b"k").as_deref(), Some(&b"one"[..]));
+
+    cache.put(other, b"k", b"two");
+    cache.clear_partition(NODE);
+    assert!(cache.get(NODE, b"k").is_none());
+    // The other namespace's entry is still in the layer: only the shared
+    // partition generation moved, so a fill taken now is served again.
+    assert_eq!(cache.total_entries(), 1);
+    let ticket = cache.ticket(other, b"k");
+    cache.fill(other, b"k", b"two", 1.0, ticket);
+    assert_eq!(cache.get(other, b"k").as_deref(), Some(&b"two"[..]));
 }
 
 #[test]
@@ -97,12 +140,9 @@ fn single_layer_overwrite() {
     let config = one_layer_config(dir.path(), 1024 * 1024);
     let cache = TieredCache::open(&config).expect("open");
 
-    cache.put(Partition::Node, b"k", b"v1");
-    cache.put(Partition::Node, b"k", b"v2");
-    assert_eq!(
-        cache.get(Partition::Node, b"k").as_deref(),
-        Some(b"v2".as_slice())
-    );
+    cache.put(NODE, b"k", b"v1");
+    cache.put(NODE, b"k", b"v2");
+    assert_eq!(cache.get(NODE, b"k").as_deref(), Some(b"v2".as_slice()));
 }
 
 #[test]
@@ -111,17 +151,11 @@ fn single_layer_partitions_isolated() {
     let config = one_layer_config(dir.path(), 1024 * 1024);
     let cache = TieredCache::open(&config).expect("open");
 
-    cache.put(Partition::Node, b"k", b"node");
-    cache.put(Partition::Adj, b"k", b"adj");
+    cache.put(NODE, b"k", b"node");
+    cache.put(ADJ, b"k", b"adj");
 
-    assert_eq!(
-        cache.get(Partition::Node, b"k").as_deref(),
-        Some(b"node".as_slice())
-    );
-    assert_eq!(
-        cache.get(Partition::Adj, b"k").as_deref(),
-        Some(b"adj".as_slice())
-    );
+    assert_eq!(cache.get(NODE, b"k").as_deref(), Some(b"node".as_slice()));
+    assert_eq!(cache.get(ADJ, b"k").as_deref(), Some(b"adj".as_slice()));
 }
 
 /// A reopened layer is empty: its file holds puts but not the invalidations
@@ -133,10 +167,10 @@ fn a_reopened_layer_starts_cold() {
 
     {
         let cache = TieredCache::open(&config).expect("open");
-        cache.put(Partition::Node, b"k", b"v");
+        cache.put(NODE, b"k", b"v");
     }
     let cache = TieredCache::open(&config).expect("reopen");
-    assert!(cache.get(Partition::Node, b"k").is_none());
+    assert!(cache.get(NODE, b"k").is_none());
     assert!(cache.is_empty());
 }
 
@@ -147,23 +181,20 @@ fn a_fill_read_before_an_invalidation_is_not_served() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = TieredCache::open(&one_layer_config(dir.path(), 1024 * 1024)).expect("open");
 
-    let ticket = cache.ticket(Partition::Node, b"k");
-    cache.remove(Partition::Node, b"k");
-    cache.fill(Partition::Node, b"k", b"old", 1.0, ticket);
-    assert!(cache.get(Partition::Node, b"k").is_none());
+    let ticket = cache.ticket(NODE, b"k");
+    cache.remove(NODE, b"k");
+    cache.fill(NODE, b"k", b"old", 1.0, ticket);
+    assert!(cache.get(NODE, b"k").is_none());
 
-    let ticket = cache.ticket(Partition::Node, b"p");
-    cache.clear_partition(Partition::Node);
-    cache.fill(Partition::Node, b"p", b"old", 1.0, ticket);
-    assert!(cache.get(Partition::Node, b"p").is_none());
+    let ticket = cache.ticket(NODE, b"p");
+    cache.clear_partition(NODE);
+    cache.fill(NODE, b"p", b"old", 1.0, ticket);
+    assert!(cache.get(NODE, b"p").is_none());
 
     // A fill taken after the invalidation is served.
-    let ticket = cache.ticket(Partition::Node, b"k");
-    cache.fill(Partition::Node, b"k", b"new", 1.0, ticket);
-    assert_eq!(
-        cache.get(Partition::Node, b"k").as_deref(),
-        Some(&b"new"[..])
-    );
+    let ticket = cache.ticket(NODE, b"k");
+    cache.fill(NODE, b"k", b"new", 1.0, ticket);
+    assert_eq!(cache.get(NODE, b"k").as_deref(), Some(&b"new"[..]));
 }
 
 /// An entry that drained to a slower layer keeps the generations it was
@@ -174,22 +205,22 @@ fn a_drained_entry_stays_bound_to_its_read() {
     let cache = TieredCache::open(&two_layer_config(dir.path())).expect("open");
 
     // The lowest weight: the first entry the fast layer evicts.
-    let ticket = cache.ticket(Partition::Node, b"key_0");
-    cache.fill(Partition::Node, b"key_0", &[7u8; 64], 0.1, ticket);
+    let ticket = cache.ticket(NODE, b"key_0");
+    cache.fill(NODE, b"key_0", &[7u8; 64], 0.1, ticket);
     // Invalidated while cached, as by a write whose removal ran before the
     // entry drained: the copy the drain writes must carry the old stamp.
     cache
-        .key_generation(compute_cache_key(Partition::Node, b"key_0"))
+        .key_generation(compute_cache_key(NODE, b"key_0"))
         .fetch_add(1, Ordering::SeqCst);
     for i in 1..20 {
-        cache.put(Partition::Node, format!("key_{i}").as_bytes(), &[1u8; 64]);
+        cache.put(NODE, format!("key_{i}").as_bytes(), &[1u8; 64]);
     }
     let slow = &cache.layers[1];
     assert!(
-        slow.get(Partition::Node, b"key_0").is_some(),
+        slow.get(NODE, b"key_0").is_some(),
         "key_0 drained to the slow layer"
     );
-    assert!(cache.get(Partition::Node, b"key_0").is_none());
+    assert!(cache.get(NODE, b"key_0").is_none());
 }
 
 #[test]
@@ -198,9 +229,9 @@ fn single_layer_stats() {
     let config = one_layer_config(dir.path(), 1024 * 1024);
     let cache = TieredCache::open(&config).expect("open");
 
-    cache.put(Partition::Node, b"k", b"v");
-    let _ = cache.get(Partition::Node, b"k");
-    let _ = cache.get(Partition::Node, b"miss");
+    cache.put(NODE, b"k", b"v");
+    let _ = cache.get(NODE, b"k");
+    let _ = cache.get(NODE, b"miss");
 
     let stats = cache.stats();
     assert_eq!(stats.total_hits, 1);
@@ -216,7 +247,7 @@ fn single_layer_rejects_huge() {
     let cache = TieredCache::open(&config).expect("open");
 
     let huge = vec![0u8; 17 * 1024 * 1024];
-    cache.put(Partition::Blob, b"huge", &huge);
+    cache.put(BLOB, b"huge", &huge);
     assert!(cache.is_empty());
 }
 
@@ -227,10 +258,10 @@ fn single_layer_compaction() {
     let cache = TieredCache::open(&config).expect("open");
 
     for i in 0..10u32 {
-        cache.put(Partition::Node, format!("k{i}").as_bytes(), &[0xFF; 100]);
+        cache.put(NODE, format!("k{i}").as_bytes(), &[0xFF; 100]);
     }
     for i in 0..5u32 {
-        cache.put(Partition::Node, format!("k{i}").as_bytes(), &[0xAA; 100]);
+        cache.put(NODE, format!("k{i}").as_bytes(), &[0xAA; 100]);
     }
 
     let before = cache.stats();
@@ -253,7 +284,7 @@ fn two_layer_drain_through_on_eviction() {
     // Fill layer 0 beyond capacity — evicted entries should drain to layer 1.
     for i in 0..10u32 {
         let key = format!("key_{i:04}");
-        cache.put(Partition::Node, key.as_bytes(), &[0xFF; 32]);
+        cache.put(NODE, key.as_bytes(), &[0xFF; 32]);
     }
 
     let stats = cache.stats();
@@ -269,11 +300,31 @@ fn two_layer_drain_through_on_eviction() {
     let mut found = 0;
     for i in 0..10u32 {
         let key = format!("key_{i:04}");
-        if cache.get(Partition::Node, key.as_bytes()).is_some() {
+        if cache.get(NODE, key.as_bytes()).is_some() {
             found += 1;
         }
     }
     assert!(found > 0, "should find entries across layers");
+}
+
+/// An entry drained to a slower layer keeps its namespace: the same key of
+/// another namespace does not find it there.
+#[test]
+fn a_drained_entry_keeps_its_namespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = TieredCache::open(&two_layer_config(dir.path())).expect("open");
+    let other = TreeId::namespace(NamespaceId::from_raw(2), Partition::Node);
+
+    cache.put_weighted(NODE, b"key_0", &[7u8; 64], 0.1);
+    for i in 1..20 {
+        cache.put(NODE, format!("key_{i}").as_bytes(), &[1u8; 64]);
+    }
+    assert!(
+        cache.layers[1].get(NODE, b"key_0").is_some(),
+        "key_0 drained to the slow layer"
+    );
+    assert!(cache.get(other, b"key_0").is_none());
+    assert!(cache.get(NODE, b"key_0").is_some());
 }
 
 #[test]
@@ -284,18 +335,18 @@ fn two_layer_deep_hit_promotes_to_fast() {
 
     // Fill layer 0 to force drain
     for i in 0..8u32 {
-        cache.put(Partition::Node, format!("fill_{i}").as_bytes(), &[0xFF; 32]);
+        cache.put(NODE, format!("fill_{i}").as_bytes(), &[0xFF; 32]);
     }
 
     // "target" should have been drained to layer 1
     // Now read it — should promote back to layer 0
     let target_key = b"fill_0";
-    if cache.get(Partition::Node, target_key).is_some() {
+    if cache.get(NODE, target_key).is_some() {
         // After read-promotion, layer 0 should have a hit next time
         let stats_before = cache.stats();
         let hits_before = stats_before.layers[0].hits;
 
-        let _ = cache.get(Partition::Node, target_key);
+        let _ = cache.get(NODE, target_key);
 
         let stats_after = cache.stats();
         // Either layer 0 or layer 1 served it
@@ -311,12 +362,12 @@ fn two_layer_remove_clears_both() {
 
     // Force entry into both layers
     for i in 0..8u32 {
-        cache.put(Partition::Node, format!("key_{i}").as_bytes(), &[0xFF; 32]);
+        cache.put(NODE, format!("key_{i}").as_bytes(), &[0xFF; 32]);
     }
 
     // Remove should clear from all layers
-    cache.remove(Partition::Node, b"key_0");
-    assert!(cache.get(Partition::Node, b"key_0").is_none());
+    cache.remove(NODE, b"key_0");
+    assert!(cache.get(NODE, b"key_0").is_none());
 }
 
 #[test]
@@ -325,8 +376,8 @@ fn empty_config_disabled() {
     let cache = TieredCache::open(&config).expect("open");
     assert_eq!(cache.layer_count(), 0);
     assert!(cache.is_empty());
-    assert!(cache.get(Partition::Node, b"k").is_none());
-    cache.put(Partition::Node, b"k", b"v"); // no-op
+    assert!(cache.get(NODE, b"k").is_none());
+    cache.put(NODE, b"k", b"v"); // no-op
 }
 
 #[test]
@@ -338,7 +389,7 @@ fn all_partitions_across_layers() {
     for &part in Partition::all() {
         let key = format!("{:?}", part);
         let val = format!("val_{:?}", part);
-        cache.put(part, key.as_bytes(), val.as_bytes());
+        cache.put(tree(part), key.as_bytes(), val.as_bytes());
     }
 
     assert_eq!(cache.total_entries(), Partition::all().len());
@@ -347,7 +398,7 @@ fn all_partitions_across_layers() {
         let key = format!("{:?}", part);
         let expected = format!("val_{:?}", part);
         assert_eq!(
-            cache.get(part, key.as_bytes()).as_deref(),
+            cache.get(tree(part), key.as_bytes()).as_deref(),
             Some(expected.as_bytes()),
             "mismatch for {:?}",
             part
@@ -375,10 +426,10 @@ fn background_compaction_runs() {
 
     // Write entries then overwrite half (creates dead space)
     for i in 0..20u32 {
-        cache.put(Partition::Node, format!("k{i}").as_bytes(), &[0xFF; 100]);
+        cache.put(NODE, format!("k{i}").as_bytes(), &[0xFF; 100]);
     }
     for i in 0..10u32 {
-        cache.put(Partition::Node, format!("k{i}").as_bytes(), &[0xAA; 100]);
+        cache.put(NODE, format!("k{i}").as_bytes(), &[0xAA; 100]);
     }
 
     let before = cache.stats();
@@ -400,9 +451,7 @@ fn background_compaction_runs() {
     assert_eq!(after.layers[0].live_entries, 20);
     for i in 0..20u32 {
         assert!(
-            cache
-                .get(Partition::Node, format!("k{i}").as_bytes())
-                .is_some(),
+            cache.get(NODE, format!("k{i}").as_bytes()).is_some(),
             "entry k{i} lost after compaction"
         );
     }
@@ -423,7 +472,7 @@ fn background_thread_stops_on_drop() {
     // Open and immediately drop — background thread should stop cleanly
     {
         let cache = TieredCache::open(&config).expect("open");
-        cache.put(Partition::Node, b"k", b"v");
+        cache.put(NODE, b"k", b"v");
     }
     // If we get here without hanging, the thread stopped cleanly
 }
@@ -439,16 +488,16 @@ fn weighted_eviction_prefers_low_weight() {
     let cache = TieredCache::open(&config).expect("open");
 
     // Insert high-weight entry
-    cache.put_weighted(Partition::Node, b"hot", b"hot_value_data", 10.0);
+    cache.put_weighted(NODE, b"hot", b"hot_value_data", 10.0);
     // Insert low-weight entry
-    cache.put_weighted(Partition::Node, b"cold", b"cold_value_data", 0.1);
+    cache.put_weighted(NODE, b"cold", b"cold_value_data", 0.1);
 
     // Force eviction: insert a third entry that exceeds capacity
-    cache.put_weighted(Partition::Node, b"new", b"new_value_data_", 1.0);
+    cache.put_weighted(NODE, b"new", b"new_value_data_", 1.0);
 
     // High-weight "hot" should survive; low-weight "cold" should be evicted
-    let hot = cache.get(Partition::Node, b"hot");
-    let cold = cache.get(Partition::Node, b"cold");
+    let hot = cache.get(NODE, b"hot");
+    let cold = cache.get(NODE, b"cold");
 
     assert!(hot.is_some(), "high-weight entry should survive eviction");
     // "cold" may or may not be evicted depending on exact sizing,
@@ -467,28 +516,28 @@ fn weighted_eviction_prefers_low_weight() {
 #[test]
 fn weighted_eviction_bulk() {
     let dir = tempfile::tempdir().expect("tempdir");
-    // ~5 entries fit (each ~50 bytes with header)
+    // ~5 entries fit (each ~55 bytes with header)
     let config = one_layer_config(dir.path(), 400);
     let cache = TieredCache::open(&config).expect("open");
 
     // Insert 5 entries with descending weight: w=5, w=4, w=3, w=2, w=1
     for i in 0..5u8 {
         let key = [b'k', i];
-        let value = [b'v'; 30]; // ~30 bytes + 15 header = ~45 bytes each
-        cache.put_weighted(Partition::Node, &key, &value, (5 - i) as f32);
+        let value = [b'v'; 30]; // 30 bytes + 2 key + 23 header = 55 bytes each
+        cache.put_weighted(NODE, &key, &value, (5 - i) as f32);
     }
 
     // Force eviction: insert 3 more entries, displacing the lowest-weight ones
     for i in 10..13u8 {
         let key = [b'k', i];
         let value = [b'v'; 30];
-        cache.put_weighted(Partition::Node, &key, &value, 5.0);
+        cache.put_weighted(NODE, &key, &value, 5.0);
     }
 
     // Highest-weight original entries (w=5 at k[0], w=4 at k[1])
     // should survive; lowest (w=1 at k[4], w=2 at k[3]) should be gone.
-    let w5 = cache.get(Partition::Node, &[b'k', 0]);
-    let w1 = cache.get(Partition::Node, &[b'k', 4]);
+    let w5 = cache.get(NODE, &[b'k', 0]);
+    let w1 = cache.get(NODE, &[b'k', 4]);
 
     // At minimum, highest weight should survive over lowest
     if w5.is_none() && w1.is_some() {
@@ -559,8 +608,8 @@ fn default_put_uses_unit_weight() {
     let config = one_layer_config(dir.path(), 10 * 1024);
     let cache = TieredCache::open(&config).expect("open");
 
-    cache.put(Partition::Node, b"default", b"value");
-    let v = cache.get(Partition::Node, b"default");
+    cache.put(NODE, b"default", b"value");
+    let v = cache.get(NODE, b"default");
     assert!(v.is_some(), "default put should work");
 }
 

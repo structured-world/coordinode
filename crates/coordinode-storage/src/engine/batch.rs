@@ -469,11 +469,21 @@ impl<'a> WriteBatch<'a> {
             return;
         };
         for mutation in &self.mutations {
+            // The tree the mutation landed in: a deployment partition's is
+            // the system set's, any other the staging set's.
+            let (at, part) = mutation.target();
+            let tree = match self.sets.get(usize::from(at)) {
+                Some(set) if !part.is_deployment() => crate::engine::scope::TreeId {
+                    scope: set.scope(),
+                    part,
+                },
+                _ => crate::engine::scope::TreeId::system(part),
+            };
             match mutation {
-                Mutation::Put { partition, key, .. }
-                | Mutation::Delete { partition, key, .. }
-                | Mutation::Merge { partition, key, .. } => cache.remove(*partition, key),
-                Mutation::RemoveRange { partition, .. } => cache.clear_partition(*partition),
+                Mutation::Put { key, .. }
+                | Mutation::Delete { key, .. }
+                | Mutation::Merge { key, .. } => cache.remove(tree, key),
+                Mutation::RemoveRange { .. } => cache.clear_partition(tree),
             }
         }
     }
@@ -542,7 +552,13 @@ fn apply_group(
         .coordinator()
         .flush_trigger()
         .wrote(part, added, memtable);
-    engine.write_taps().applied(part, group);
+    engine.write_taps().applied(
+        crate::engine::scope::TreeId {
+            scope: set.scope(),
+            part,
+        },
+        group,
+    );
     Ok(())
 }
 

@@ -13,9 +13,12 @@
 //! Append-only file with variable-size entries:
 //! ```text
 //! [MAGIC: 4B]["CNDC"]
-//! [Entry: key_hash(8B) | partition(1B) | key_len(2B) | value_len(4B) | key | value]
+//! [Entry: key_hash(8B) | namespace(8B) | partition(1B) | key_len(2B) | value_len(4B) | key | value]
 //! ...
 //! ```
+//!
+//! An entry belongs to one tree, a partition of a namespace (namespace 0 is
+//! the system set): the same key of two namespaces is two entries.
 //!
 //! # Cluster-ready
 //! Per-node local cache. Each CE replica has its own tiered cache.
@@ -32,12 +35,13 @@ use coordinode_core::txn::wake::Wake;
 use tracing::{debug, info, warn};
 
 use crate::engine::partition::Partition;
+use crate::engine::scope::{NamespaceId, TreeId};
 
-use super::access::{CacheKey, compute_cache_key};
+use super::access::{CacheKey, compute_cache_key, namespace_tag};
 use super::config::{CacheLayerConfig, TieredCacheConfig};
 
 const MAGIC: &[u8; 4] = b"CNDC";
-const ENTRY_HEADER_SIZE: usize = 8 + 1 + 2 + 4; // key_hash + partition + key_len + value_len
+const ENTRY_HEADER_SIZE: usize = 8 + 8 + 1 + 2 + 4; // key_hash + namespace + partition + key_len + value_len
 const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024; // 16MB — skip blobs
 
 /// Bounds of the number of key stripes the invalidation generations are kept
@@ -79,10 +83,10 @@ struct EntryMeta {
     /// Eviction priority weight. Higher weight = stays in cache longer.
     /// Default 1.0. Labels configured as "hot" get higher weights.
     weight: f32,
-    /// Partition discriminant (`part as u8`), mirrored from the entry header so
-    /// a partition-scoped invalidation (`clear_partition`, used by range delete)
-    /// can filter the index without reading each backing entry.
-    partition: u8,
+    /// The entry's tree, mirrored from the entry header so a tree-scoped
+    /// invalidation (`clear_partition`, used by range delete) can filter the
+    /// index without reading each backing entry.
+    tree: TreeId,
     /// The generations the value was read under; it is served only while
     /// they are current.
     stamp: FillTicket,
@@ -101,7 +105,7 @@ pub struct FillTicket {
 
 /// An entry evicted from a layer, on its way to the next one.
 struct Drained {
-    part: Partition,
+    tree: TreeId,
     key: Vec<u8>,
     value: Vec<u8>,
     stamp: FillTicket,
@@ -164,8 +168,8 @@ impl CacheLayer {
     }
 
     /// Read from this layer: the value and the generations it was read under.
-    fn get(&self, part: Partition, key: &[u8]) -> Option<(bytes::Bytes, FillTicket)> {
-        let cache_key = compute_cache_key(part, key);
+    fn get(&self, tree: TreeId, key: &[u8]) -> Option<(bytes::Bytes, FillTicket)> {
+        let cache_key = compute_cache_key(tree, key);
 
         let meta = {
             let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
@@ -182,8 +186,8 @@ impl CacheLayer {
 
         let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         match Self::read_entry(&mut file, &meta) {
-            Ok((read_part, read_key, value)) => {
-                if read_part == part && read_key == key {
+            Ok((read_tree, read_key, value)) => {
+                if read_tree == tree && read_key == key {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                     Some((bytes::Bytes::from(value), meta.stamp))
                 } else {
@@ -205,7 +209,7 @@ impl CacheLayer {
     /// during eviction.
     fn put(
         &self,
-        part: Partition,
+        tree: TreeId,
         key: &[u8],
         value: &[u8],
         weight: f32,
@@ -215,7 +219,7 @@ impl CacheLayer {
             return Vec::new();
         }
 
-        let cache_key = compute_cache_key(part, key);
+        let cache_key = compute_cache_key(tree, key);
         let total_size = ENTRY_HEADER_SIZE + key.len() + value.len();
 
         // Evict if over capacity — collect evicted entries for drain-through
@@ -236,7 +240,7 @@ impl CacheLayer {
             }
         };
 
-        if Self::write_entry(&mut file, cache_key, part, key, value).is_err() {
+        if Self::write_entry(&mut file, cache_key, tree, key, value).is_err() {
             return drained;
         }
 
@@ -253,7 +257,7 @@ impl CacheLayer {
             value_size: value.len() as u32,
             key_len: key.len() as u16,
             weight,
-            partition: part as u8,
+            tree,
             stamp,
         };
         idx.insert(cache_key, meta);
@@ -268,8 +272,8 @@ impl CacheLayer {
     }
 
     /// Remove entry from this layer.
-    fn remove(&self, part: Partition, key: &[u8]) {
-        let cache_key = compute_cache_key(part, key);
+    fn remove(&self, tree: TreeId, key: &[u8]) {
+        let cache_key = compute_cache_key(tree, key);
         let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
         if let Some(meta) = idx.remove(&cache_key) {
             self.live_bytes
@@ -289,17 +293,16 @@ impl CacheLayer {
         }
     }
 
-    /// Drop every index entry for `part`. Used by a range delete to invalidate
-    /// all cached keys of the affected partition: the cache cannot range-query,
+    /// Drop every index entry of `tree`. Used by a range delete to invalidate
+    /// all cached keys of the affected tree: the cache cannot range-query,
     /// and a range tombstone leaves the shadowed keys physically present, so a
     /// stale cache hit would otherwise return a deleted value. Orphaned file
     /// bytes are reclaimed by the next compaction, mirroring [`Self::remove`].
-    fn clear_partition(&self, part: Partition) {
-        let target = part as u8;
+    fn clear_partition(&self, tree: TreeId) {
         let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
         let mut freed = 0u64;
         idx.retain(|_, meta| {
-            if meta.partition == target {
+            if meta.tree == tree {
                 freed += u64::from(meta.total_size);
                 false
             } else {
@@ -431,9 +434,9 @@ impl CacheLayer {
 
         for (key, meta) in &keys_to_remove {
             // Read entry data for drain-through before removing
-            if let Ok((part, key, value)) = Self::read_entry(&mut file, meta) {
+            if let Ok((tree, key, value)) = Self::read_entry(&mut file, meta) {
                 drained.push(Drained {
-                    part,
+                    tree,
                     key,
                     value,
                     stamp: meta.stamp,
@@ -463,12 +466,13 @@ impl CacheLayer {
     fn write_entry(
         file: &mut File,
         cache_key: CacheKey,
-        part: Partition,
+        tree: TreeId,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), std::io::Error> {
         file.write_all(&cache_key.to_le_bytes())?;
-        file.write_all(&[part as u8])?;
+        file.write_all(&namespace_tag(tree).to_le_bytes())?;
+        file.write_all(&[tree.part as u8])?;
         #[allow(clippy::cast_possible_truncation)]
         {
             file.write_all(&(key.len() as u16).to_le_bytes())?;
@@ -482,18 +486,21 @@ impl CacheLayer {
     fn read_entry(
         file: &mut File,
         meta: &EntryMeta,
-    ) -> Result<(Partition, Vec<u8>, Vec<u8>), std::io::Error> {
+    ) -> Result<(TreeId, Vec<u8>, Vec<u8>), std::io::Error> {
         file.seek(SeekFrom::Start(meta.offset))?;
 
         let mut header = [0u8; ENTRY_HEADER_SIZE];
         file.read_exact(&mut header)?;
 
-        let partition = partition_from_byte(header[8]).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("a cache entry of unknown partition {}", header[8]),
-            )
-        })?;
+        let mut namespace = [0u8; 8];
+        namespace.copy_from_slice(&header[8..16]);
+        let tree =
+            tree_from_header(u64::from_le_bytes(namespace), header[16]).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("a cache entry of unknown partition {}", header[16]),
+                )
+            })?;
 
         let mut key_buf = vec![0u8; meta.key_len as usize];
         file.read_exact(&mut key_buf)?;
@@ -501,7 +508,7 @@ impl CacheLayer {
         let mut value_buf = vec![0u8; meta.value_size as usize];
         file.read_exact(&mut value_buf)?;
 
-        Ok((partition, key_buf, value_buf))
+        Ok((tree, key_buf, value_buf))
     }
 
     fn read_entry_raw(file: &mut File, meta: &EntryMeta) -> Result<Vec<u8>, std::io::Error> {
@@ -619,13 +626,17 @@ impl TieredCache {
         })
     }
 
-    /// The generations of `part`/`key` now. A value read from the trees is
+    /// The generations of `tree`/`key` now. A value read from the trees is
     /// cached with the ticket taken BEFORE the read: a write whose
     /// invalidation follows the ticket then makes the cached value stale.
-    pub fn ticket(&self, part: Partition, key: &[u8]) -> FillTicket {
-        self.ticket_of(compute_cache_key(part, key), part)
+    pub fn ticket(&self, tree: TreeId, key: &[u8]) -> FillTicket {
+        self.ticket_of(compute_cache_key(tree, key), tree.part)
     }
 
+    /// The generations of `cache_key` now. The partition generation is kept
+    /// per partition, shared by its trees in every namespace: clearing one
+    /// namespace's tree only also makes the others' cached values of the
+    /// partition miss once, and the read path stays one array index.
     fn ticket_of(&self, cache_key: CacheKey, part: Partition) -> FillTicket {
         FillTicket {
             key: self.key_generation(cache_key).load(Ordering::SeqCst),
@@ -645,22 +656,22 @@ impl TieredCache {
     ///
     /// On hit at layer N, the value is promoted to layer 0 (if N > 0)
     /// for faster future access.
-    pub fn get(&self, part: Partition, key: &[u8]) -> Option<bytes::Bytes> {
-        let cache_key = compute_cache_key(part, key);
+    pub fn get(&self, tree: TreeId, key: &[u8]) -> Option<bytes::Bytes> {
+        let cache_key = compute_cache_key(tree, key);
         for (i, layer) in self.layers.iter().enumerate() {
-            let Some((value, stamp)) = layer.get(part, key) else {
+            let Some((value, stamp)) = layer.get(tree, key) else {
                 continue;
             };
             // Checked after the read: an invalidation the entry predates is
             // seen here even when it landed after the entry was found.
-            if stamp != self.ticket_of(cache_key, part) {
+            if stamp != self.ticket_of(cache_key, tree.part) {
                 layer.remove_stale(cache_key, stamp);
                 continue;
             }
             // Promote to faster layer on hit at deeper layer, still under
             // the generations it was read under.
             if i > 0 {
-                let drained = self.layers[0].put(part, key, &value, 1.0, stamp);
+                let drained = self.layers[0].put(tree, key, &value, 1.0, stamp);
                 self.drain_to_next(0, drained);
             }
             return Some(value);
@@ -668,28 +679,28 @@ impl TieredCache {
         None
     }
 
-    /// Cache `value` as the current value of `part`/`key`, with default
+    /// Cache `value` as the current value of `tree`/`key`, with default
     /// weight (1.0). Evicted entries drain to slower layers. A value read
     /// from the trees goes through [`fill`](Self::fill) instead.
-    pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) {
-        self.put_weighted(part, key, value, 1.0);
+    pub fn put(&self, tree: TreeId, key: &[u8], value: &[u8]) {
+        self.put_weighted(tree, key, value, 1.0);
     }
 
     /// [`put`](Self::put) with a specific eviction weight. Higher weight =
     /// entry stays in cache longer during eviction.
-    pub fn put_weighted(&self, part: Partition, key: &[u8], value: &[u8], weight: f32) {
-        self.fill(part, key, value, weight, self.ticket(part, key));
+    pub fn put_weighted(&self, tree: TreeId, key: &[u8], value: &[u8], weight: f32) {
+        self.fill(tree, key, value, weight, self.ticket(tree, key));
     }
 
     /// Cache `value`, read from the trees after `ticket` was taken, with an
     /// eviction weight. A value whose ticket is already stale is not stored,
     /// and one that turns stale later is not served.
-    pub fn fill(&self, part: Partition, key: &[u8], value: &[u8], weight: f32, ticket: FillTicket) {
-        if self.layers.is_empty() || ticket != self.ticket(part, key) {
+    pub fn fill(&self, tree: TreeId, key: &[u8], value: &[u8], weight: f32, ticket: FillTicket) {
+        if self.layers.is_empty() || ticket != self.ticket(tree, key) {
             return;
         }
 
-        let drained = self.layers[0].put(part, key, value, weight, ticket);
+        let drained = self.layers[0].put(tree, key, value, weight, ticket);
         self.drain_to_next(0, drained);
     }
 
@@ -718,27 +729,27 @@ impl TieredCache {
         self.label_weights.is_empty()
     }
 
-    /// Invalidate `part`/`key` once a write to it is visible to reads: every
+    /// Invalidate `tree`/`key` once a write to it is visible to reads: every
     /// value of it cached, or read before now and cached later, is stale.
-    pub fn remove(&self, part: Partition, key: &[u8]) {
-        let cache_key = compute_cache_key(part, key);
+    pub fn remove(&self, tree: TreeId, key: &[u8]) {
+        let cache_key = compute_cache_key(tree, key);
         // The generation moves first: an entry a concurrent fill or drain
         // puts back after the removal below still carries the old one.
         self.key_generation(cache_key)
             .fetch_add(1, Ordering::SeqCst);
         for layer in self.layers.iter() {
-            layer.remove(part, key);
+            layer.remove(tree, key);
         }
     }
 
-    /// Invalidate every cached entry for `part` across all layers, once a
-    /// change to the whole partition is visible to reads. Called by a range
+    /// Invalidate every cached entry of `tree` across all layers, once a
+    /// change to the whole tree is visible to reads. Called by a range
     /// delete, which cannot enumerate the affected keys cheaply and must not
     /// leave a stale cache hit shadowing a range-tombstoned key.
-    pub fn clear_partition(&self, part: Partition) {
-        self.partition_generations[usize::from(part as u8)].fetch_add(1, Ordering::SeqCst);
+    pub fn clear_partition(&self, tree: TreeId) {
+        self.partition_generations[usize::from(tree.part as u8)].fetch_add(1, Ordering::SeqCst);
         for layer in self.layers.iter() {
-            layer.clear_partition(part);
+            layer.clear_partition(tree);
         }
     }
 
@@ -833,7 +844,7 @@ impl TieredCache {
         for entry in entries {
             // Drained entries get default weight (evicted = already "cooler").
             let further_drained =
-                self.layers[next].put(entry.part, &entry.key, &entry.value, 1.0, entry.stamp);
+                self.layers[next].put(entry.tree, &entry.key, &entry.value, 1.0, entry.stamp);
             // Recursively drain deeper
             if !further_drained.is_empty() {
                 self.drain_to_next(next, further_drained);
@@ -842,13 +853,18 @@ impl TieredCache {
     }
 }
 
-/// The partition an entry header names by its discriminant (`part as u8`),
-/// which is its position in [`Partition::all`]; `None` for none.
-fn partition_from_byte(b: u8) -> Option<Partition> {
-    Partition::all()
+/// The tree an entry header names by its namespace (0 for the system set)
+/// and its partition discriminant (`part as u8`, its position in
+/// [`Partition::all`]); `None` for a partition no discriminant names.
+fn tree_from_header(namespace: u64, part: u8) -> Option<TreeId> {
+    let part = Partition::all()
         .iter()
         .copied()
-        .find(|&part| part as u8 == b)
+        .find(|&p| p as u8 == part)?;
+    Some(match namespace {
+        0 => TreeId::system(part),
+        id => TreeId::namespace(NamespaceId::from_raw(id), part),
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

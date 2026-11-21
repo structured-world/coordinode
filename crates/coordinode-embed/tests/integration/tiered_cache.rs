@@ -94,7 +94,7 @@ fn access_tracker_records_reads() {
 
     let stats = engine
         .access_tracker()
-        .get(Partition::Node, b"hot_key")
+        .get(engine.tree_id(Partition::Node), b"hot_key")
         .expect("should be tracked");
     assert_eq!(stats.count, 5, "should have 5 accesses");
 }

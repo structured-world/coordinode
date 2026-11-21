@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::engine::partition::Partition;
+use crate::engine::scope::{Scope, TreeId};
 
-/// Composite cache key: hash of (partition, key bytes).
+/// Composite cache key: hash of (tree, key bytes).
 pub type CacheKey = u64;
 
 /// Per-key access statistics.
@@ -59,9 +59,9 @@ impl AccessTracker {
         }
     }
 
-    /// Record an access to the given key.
-    pub fn record(&self, part: Partition, key: &[u8]) {
-        let cache_key = compute_cache_key(part, key);
+    /// Record an access to `key` of `tree`.
+    pub fn record(&self, tree: TreeId, key: &[u8]) {
+        let cache_key = compute_cache_key(tree, key);
         let now = unix_now();
 
         // Fast path: try read lock first to check if entry exists
@@ -86,9 +86,9 @@ impl AccessTracker {
             .or_insert_with(|| AccessStats::new(now));
     }
 
-    /// Get access stats for a key, if tracked.
-    pub fn get(&self, part: Partition, key: &[u8]) -> Option<AccessStats> {
-        let cache_key = compute_cache_key(part, key);
+    /// Get access stats for `key` of `tree`, if tracked.
+    pub fn get(&self, tree: TreeId, key: &[u8]) -> Option<AccessStats> {
+        let cache_key = compute_cache_key(tree, key);
         let stats = self.stats.read().unwrap_or_else(|e| e.into_inner());
         stats.get(&cache_key).copied()
     }
@@ -166,13 +166,25 @@ pub struct AggregateStats {
     pub hottest_count: u32,
 }
 
-/// Compute a cache key from partition + key bytes.
-/// Uses xxh3 for fast, high-quality hashing.
-pub fn compute_cache_key(part: Partition, key: &[u8]) -> CacheKey {
+/// Compute a cache key from the tree (its namespace and partition) and the
+/// key bytes: the same key of two namespaces is two entries. Uses xxh3 for
+/// fast, high-quality hashing.
+pub fn compute_cache_key(tree: TreeId, key: &[u8]) -> CacheKey {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-    hasher.update(&[part as u8]);
+    hasher.update(&namespace_tag(tree).to_le_bytes());
+    hasher.update(&[tree.part as u8]);
     hasher.update(key);
     hasher.digest()
+}
+
+/// The namespace part of a tree's identity in the cache: the namespace id,
+/// or 0 for the system set, which no namespace id takes.
+#[must_use]
+pub(crate) fn namespace_tag(tree: TreeId) -> u64 {
+    match tree.scope {
+        Scope::System => 0,
+        Scope::Namespace(namespace) => namespace.as_raw(),
+    }
 }
 
 /// Current unix timestamp in seconds (truncated to u32).

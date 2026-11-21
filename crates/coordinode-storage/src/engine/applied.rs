@@ -32,6 +32,7 @@ use coordinode_core::txn::wake::Wake;
 use parking_lot::RwLock;
 
 use crate::engine::partition::Partition;
+use crate::engine::scope::{NamespaceId, Scope, TreeId};
 
 /// What happened to a subscribed partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +84,8 @@ impl std::fmt::Debug for AppliedFeed {
 
 #[derive(Debug)]
 struct Subscriber {
-    partition: Partition,
+    /// The tree followed: a partition of one namespace, or of the system set.
+    tree: TreeId,
     /// Whether events stay after they are handed out.
     retained: bool,
     /// Most events the queue holds, handed out and retained ones included.
@@ -311,7 +313,12 @@ impl AppliedSubscription {
 
     /// The partition this subscription follows.
     pub fn partition(&self) -> Partition {
-        self.subscriber.partition
+        self.subscriber.tree.part
+    }
+
+    /// The tree this subscription follows.
+    pub fn tree(&self) -> TreeId {
+        self.subscriber.tree
     }
 }
 
@@ -332,17 +339,17 @@ impl AppliedFeed {
         self.open.load(Ordering::Acquire)
     }
 
-    /// Subscribe to the entries applied to `partition` from now on, queueing
-    /// at most `capacity` of them; `retained` keeps each event after it is
+    /// Subscribe to the entries applied to `tree` from now on, queueing at
+    /// most `capacity` of them; `retained` keeps each event after it is
     /// handed out until [`AppliedPosition::release`] passes it.
     pub(crate) fn subscribe(
         self: &Arc<Self>,
-        partition: Partition,
+        tree: TreeId,
         capacity: usize,
         retained: bool,
     ) -> AppliedSubscription {
         let subscriber = Arc::new(Subscriber {
-            partition,
+            tree,
             retained,
             capacity: capacity.max(1),
             delivered: AtomicU64::new(0),
@@ -403,15 +410,14 @@ impl AppliedFeed {
         }
     }
 
-    /// Report that `partition` was replaced wholesale, or every partition
-    /// when `None`.
+    /// Report that `tree` was replaced wholesale, or every tree when `None`.
     #[inline]
-    pub(crate) fn replaced(&self, partition: Option<Partition>) {
+    pub(crate) fn replaced(&self, tree: Option<TreeId>) {
         if self.open.load(Ordering::Acquire) == 0 {
             return;
         }
         for subscriber in self.subscribers.read().iter() {
-            if partition.is_none_or(|p| p == subscriber.partition) {
+            if tree.is_none_or(|t| t == subscriber.tree) {
                 let seq = stage(subscriber, |_| AppliedEvent::Replaced);
                 publish(subscriber, seq);
             }
@@ -424,21 +430,29 @@ impl AppliedFeed {
         for subscriber in self.subscribers.read().iter() {
             let mut keys = Vec::new();
             let mut replaced = false;
+            // The namespace the mutations from here on write: the last
+            // marker's. A deployment partition's tree is the system set's
+            // whatever marker precedes it.
+            let mut namespace: Option<NamespaceId> = None;
+            let follows = |part: Partition, namespace: Option<NamespaceId>| {
+                follows_tree(subscriber.tree, part, namespace)
+            };
             for mutation in mutations {
                 match mutation {
+                    Mutation::Namespace(id) => namespace = Some(*id),
                     // An engine-reserved key is the engine's own bookkeeping
                     // (the closure ledger): no consumer reads it.
                     Mutation::Put { partition, key, .. }
                     | Mutation::Delete { partition, key }
                     | Mutation::Merge { partition, key, .. } => {
-                        if Partition::from(*partition) == subscriber.partition
+                        if follows(Partition::from(*partition), namespace)
                             && !crate::engine::coverage::is_reserved(key)
                         {
                             keys.push(key.clone());
                         }
                     }
                     Mutation::RemoveRange { partition, .. } => {
-                        if Partition::from(*partition) == subscriber.partition {
+                        if follows(Partition::from(*partition), namespace) {
                             replaced = true;
                         }
                     }
@@ -451,7 +465,7 @@ impl AppliedFeed {
                             ..
                         },
                     ) => {
-                        if subscriber.partition == Partition::Registry {
+                        if follows(Partition::Registry, namespace) {
                             keys.extend(put.iter().map(|(key, _)| key.clone()));
                         }
                     }
@@ -459,27 +473,25 @@ impl AppliedFeed {
                     // applies and are not in the entry, so a follower of its
                     // partition rereads.
                     Mutation::Command(command) => {
-                        if Partition::from(command.partition()) == subscriber.partition {
+                        if follows(Partition::from(command.partition()), namespace) {
                             replaced = true;
                         }
                     }
                     Mutation::Operation(_) => {
-                        if subscriber.partition == Partition::Deployment {
+                        if follows(Partition::Deployment, namespace) {
                             replaced = true;
                         }
                     }
                     // Derived entry keys are likewise decided as the unit
                     // applies, so an index-partition follower rereads.
                     Mutation::Derive(_) => {
-                        if subscriber.partition == Partition::Idx {
+                        if follows(Partition::Idx, namespace) {
                             replaced = true;
                         }
                     }
                     // Writes nothing: the keys it names are written by the
                     // unit's own row changes, staged above.
                     Mutation::Effects(_) => {}
-                    // Writes nothing; the store holds one namespace's data.
-                    Mutation::Namespace(_) => {}
                 }
             }
             let seq = if replaced {
@@ -499,6 +511,17 @@ impl AppliedFeed {
         }
         staged
     }
+}
+
+/// Whether a write to `part`, under the namespace marker `namespace`, lands
+/// in `tree`: a deployment partition's write lands in the system set's tree,
+/// any other in the tree of the namespace its marker names.
+fn follows_tree(tree: TreeId, part: Partition, namespace: Option<NamespaceId>) -> bool {
+    tree.part == part
+        && match tree.scope {
+            Scope::System => part.is_deployment(),
+            Scope::Namespace(followed) => !part.is_deployment() && namespace == Some(followed),
+        }
 }
 
 /// An entry announced to the subscribers and not yet published. Publishing

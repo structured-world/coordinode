@@ -644,7 +644,7 @@ impl StorageEngine {
         self.finish_rebuild_with(repair, || self.establish_replaced(partition, None))?;
         // The partition was replaced wholesale, from a peer's copy or a
         // checkpoint: followers of the applies read it afresh.
-        self.applied_feed.replaced(Some(partition));
+        self.applied_feed.replaced(Some(self.tree_id(partition)));
         Ok(())
     }
 

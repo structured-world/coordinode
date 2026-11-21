@@ -1,4 +1,5 @@
-//! Taps on the stream of writes a partition receives.
+//! Taps on the stream of writes a tree receives: a partition of one
+//! namespace, so a tap never sees another namespace's writes.
 //!
 //! A consumer that derives state from a partition (an index built beside
 //! live writes) needs two things at once: the partition's content at some
@@ -23,6 +24,7 @@ use rustc_hash::FxHashSet;
 
 use crate::engine::batch::Mutation;
 use crate::engine::partition::Partition;
+use crate::engine::scope::TreeId;
 
 /// The taps open on one engine.
 #[derive(Debug, Default)]
@@ -35,7 +37,7 @@ pub(crate) struct WriteTaps {
 
 #[derive(Debug)]
 struct TapBuffer {
-    partition: Partition,
+    tree: TreeId,
     state: Mutex<TapState>,
 }
 
@@ -66,7 +68,12 @@ pub struct WriteTap {
 impl WriteTap {
     /// The partition this tap watches.
     pub fn partition(&self) -> Partition {
-        self.buffer.partition
+        self.buffer.tree.part
+    }
+
+    /// The tree this tap watches.
+    pub fn tree(&self) -> TreeId {
+        self.buffer.tree
     }
 
     /// Everything written since the last call, leaving the tap empty.
@@ -98,13 +105,13 @@ impl Drop for WriteTap {
 }
 
 impl WriteTaps {
-    /// Open a tap on `partition`. The fence after publishing it pairs with
+    /// Open a tap on `tree`. The fence after publishing it pairs with
     /// the one every write takes before reading [`Self::open`]: a write that
     /// reads zero there finished before this fence, so a snapshot taken
     /// after this returns holds it.
-    pub(crate) fn open(self: &Arc<Self>, partition: Partition) -> WriteTap {
+    pub(crate) fn open(self: &Arc<Self>, tree: TreeId) -> WriteTap {
         let buffer = Arc::new(TapBuffer {
-            partition,
+            tree,
             state: Mutex::new(TapState::default()),
         });
         {
@@ -119,10 +126,10 @@ impl WriteTaps {
         }
     }
 
-    /// Record that `keys` of `partition` were written. Call after the write
-    /// is in the tree.
+    /// Record that `keys` of `tree` were written. Call after the write is in
+    /// the tree.
     #[inline]
-    pub(crate) fn wrote<'k>(&self, partition: Partition, keys: impl IntoIterator<Item = &'k [u8]>) {
+    pub(crate) fn wrote<'k>(&self, tree: TreeId, keys: impl IntoIterator<Item = &'k [u8]>) {
         // The write is in the tree before this fence, and the tap is
         // published before the fence that opening one takes, so of the two
         // fences whichever comes first decides: either this load sees the tap
@@ -131,13 +138,13 @@ impl WriteTaps {
         if self.open.load(Ordering::Relaxed) == 0 {
             return;
         }
-        self.deliver(partition, keys);
+        self.deliver(tree, keys);
     }
 
-    /// Record one partition's group of an applied batch: its keys, or a
+    /// Record one tree's group of an applied batch: its keys, or a
     /// replacement when the group carries a range tombstone.
     #[inline]
-    pub(crate) fn applied(&self, partition: Partition, group: &[&Mutation]) {
+    pub(crate) fn applied(&self, tree: TreeId, group: &[&Mutation]) {
         fence(Ordering::SeqCst);
         if self.open.load(Ordering::Relaxed) == 0 {
             return;
@@ -146,11 +153,11 @@ impl WriteTaps {
             .iter()
             .any(|m| matches!(m, Mutation::RemoveRange { .. }))
         {
-            self.mark_replaced(partition);
+            self.mark_replaced(tree);
             return;
         }
         self.deliver(
-            partition,
+            tree,
             group.iter().filter_map(|m| match m {
                 Mutation::Put { key, .. }
                 | Mutation::Delete { key, .. }
@@ -160,20 +167,20 @@ impl WriteTaps {
         );
     }
 
-    /// Record that `partition` was replaced wholesale.
+    /// Record that `tree` was replaced wholesale.
     #[inline]
-    pub(crate) fn replaced(&self, partition: Partition) {
+    pub(crate) fn replaced(&self, tree: TreeId) {
         fence(Ordering::SeqCst);
         if self.open.load(Ordering::Relaxed) == 0 {
             return;
         }
-        self.mark_replaced(partition);
+        self.mark_replaced(tree);
     }
 
     #[cold]
-    fn mark_replaced(&self, partition: Partition) {
+    fn mark_replaced(&self, tree: TreeId) {
         for tap in self.taps.read().iter() {
-            if tap.partition == partition {
+            if tap.tree == tree {
                 let mut state = tap.state.lock();
                 state.replaced = true;
                 state.keys.clear();
@@ -182,9 +189,9 @@ impl WriteTaps {
     }
 
     #[cold]
-    fn deliver<'k>(&self, partition: Partition, keys: impl IntoIterator<Item = &'k [u8]>) {
+    fn deliver<'k>(&self, tree: TreeId, keys: impl IntoIterator<Item = &'k [u8]>) {
         let taps = self.taps.read();
-        let mut matching = taps.iter().filter(|t| t.partition == partition).peekable();
+        let mut matching = taps.iter().filter(|t| t.tree == tree).peekable();
         if matching.peek().is_none() {
             return;
         }
