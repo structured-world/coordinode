@@ -361,103 +361,234 @@ fn a_drop_removes_the_namespace_and_nothing_else() {
     assert!(!a_dir.exists(), "the dropped namespace came back");
 }
 
-/// Bytes of every file under `dir`.
-fn bytes_under(dir: &std::path::Path) -> u64 {
-    walk(dir)
-        .iter()
-        .filter_map(|path| std::fs::metadata(path).ok())
-        .map(|meta| meta.len())
-        .sum()
+/// A node row's value: compressible, and its own for every row and
+/// namespace, so a read proves the exact value came back.
+fn row_value(namespace: &str, row: u32) -> Vec<u8> {
+    format!("{namespace}:{row:08};").repeat(64).into_bytes()
 }
 
-/// Commit `rows` highly compressible node rows into `engine`, keys starting
-/// at `from`, and write them to tables.
-fn write_compressible(engine: &StorageEngine, oracle: &TimestampOracle, from: u32, rows: u32) {
-    let value = vec![b'a'; 1024];
-    let mutations = (from..from + rows)
-        .map(|i| put(format!("row-{i:08}").as_bytes(), &value))
+/// Commit node rows `rows` of `namespace` into `engine` and flush them into
+/// one new table.
+fn write_rows(
+    engine: &StorageEngine,
+    oracle: &TimestampOracle,
+    namespace: &str,
+    rows: std::ops::Range<u32>,
+) {
+    let mutations = rows
+        .map(|i| put(format!("row-{i:08}").as_bytes(), &row_value(namespace, i)))
         .collect();
     commit(engine, oracle, mutations);
     engine.persist().expect("persist");
 }
 
-/// Each namespace writes with its own codecs: the same rows take a fraction
-/// of the space in a namespace set to zstd that they take in one set to no
-/// compression, observed on disk. A change applies to the next tables the
-/// open namespace writes and holds across a reopen.
+/// Every row of `rows` of `namespace` reads back its exact value.
+fn assert_rows(engine: &StorageEngine, namespace: &str, rows: std::ops::Range<u32>) {
+    for i in rows {
+        assert_eq!(
+            node(engine, format!("row-{i:08}").as_bytes()),
+            Some(row_value(namespace, i)),
+            "row {i} of {namespace}"
+        );
+    }
+}
+
+/// One installed table of a node tree, as it lies on disk.
+#[derive(Debug, PartialEq)]
+struct InstalledTable {
+    id: lsm_tree::TableId,
+    level: usize,
+    /// The data-block codec the table's own metadata records: the codec is
+    /// not repeated per block, a block's header only says it is compressed.
+    codec: lsm_tree::CompressionType,
+    bytes: Vec<u8>,
+}
+
+/// The installed tables of `engine`'s node tree, in id order.
+fn node_tables(engine: &StorageEngine) -> Vec<InstalledTable> {
+    use lsm_tree::AbstractTree;
+    let version = engine
+        .tree(Partition::Node)
+        .expect("tree")
+        .current_version();
+    let mut tables = Vec::new();
+    for level in 0..version.level_count() {
+        let Some(runs) = version.level(level) else {
+            continue;
+        };
+        for table in runs.iter().flat_map(|run| run.iter()) {
+            tables.push(InstalledTable {
+                id: table.id(),
+                level,
+                codec: table.metadata.data_block_compression,
+                bytes: std::fs::read(table.path.as_path()).expect("table bytes"),
+            });
+        }
+    }
+    tables.sort_by_key(|t| t.id);
+    tables
+}
+
+/// The namespace compression policy on real tables, the hot band: two
+/// namespaces on one endpoint flush with their own codecs; changing one
+/// namespace's codec while its tree is open rewrites nothing, leaves its
+/// installed table under the same identity and bytes, and only its next
+/// flush writes the new codec while the other namespace keeps its own; both
+/// generations read back exactly after a cold reopen.
 #[test]
-fn each_namespace_writes_with_its_own_codecs() {
+fn a_namespace_codec_change_applies_to_its_next_tables_only() {
     use coordinode_core::namespace::{BlockCodec, NamespaceStorage};
+    use lsm_tree::CompressionType;
     let dir = TempDir::new().expect("tmp");
     let config = durable_cfg(&dir);
     let (deployment, oracle) = open_deployment(&config);
-    let plain_id = deployment
-        .create_namespace_with(
-            "plain",
-            NamespaceStorage {
-                compression: Some(BlockCodec::None),
-                cold_compression: Some(BlockCodec::None),
-                dictionaries: None,
-            },
-        )
-        .expect("plain");
-    let packed_id = deployment
-        .create_namespace_with(
-            "packed",
-            NamespaceStorage {
-                compression: Some(BlockCodec::Zstd(9)),
-                ..NamespaceStorage::default()
-            },
-        )
-        .expect("packed");
-    let node_dir = |id| {
-        dir.path()
-            .join(TreeId::namespace(id, Partition::Node).dir())
+    let hot = |codec| NamespaceStorage {
+        compression: Some(codec),
+        ..NamespaceStorage::default()
     };
-    let plain = deployment.engine(plain_id).expect("plain");
-    let packed = deployment.engine(packed_id).expect("packed");
-    write_compressible(&plain, &oracle, 0, 500);
-    write_compressible(&packed, &oracle, 0, 500);
-    let (plain_bytes, packed_bytes) = (
-        bytes_under(&node_dir(plain_id)),
-        bytes_under(&node_dir(packed_id)),
+    let first_id = deployment
+        .create_namespace_with("first", hot(BlockCodec::Lz4))
+        .expect("first");
+    let second_id = deployment
+        .create_namespace_with("second", hot(BlockCodec::None))
+        .expect("second");
+    let first = deployment.engine(first_id).expect("first");
+    let second = deployment.engine(second_id).expect("second");
+    write_rows(&first, &oracle, "first", 0..500);
+    write_rows(&second, &oracle, "second", 0..500);
+    let first_before = node_tables(&first);
+    let second_before = node_tables(&second);
+    // A flush writes with the hot codec, wherever the engine then installs
+    // the table (into an empty tree it goes straight to the bottom level).
+    assert_eq!(
+        first_before.iter().map(|t| t.codec).collect::<Vec<_>>(),
+        vec![CompressionType::Lz4]
     );
-    assert!(
-        packed_bytes * 5 < plain_bytes,
-        "zstd {packed_bytes} bytes against uncompressed {plain_bytes}"
+    assert_eq!(
+        second_before.iter().map(|t| t.codec).collect::<Vec<_>>(),
+        vec![CompressionType::None]
     );
 
-    // Changed while open: the next tables of the namespace are zstd.
     deployment
-        .set_namespace_storage(
-            "plain",
+        .set_namespace_storage("first", hot(BlockCodec::Zstd(3)))
+        .expect("alter");
+    assert_eq!(
+        node_tables(&first),
+        first_before,
+        "the change rewrote a table"
+    );
+    assert_eq!(node_tables(&second), second_before);
+
+    write_rows(&first, &oracle, "first", 500..1000);
+    write_rows(&second, &oracle, "second", 500..1000);
+    let first_after = node_tables(&first);
+    assert_eq!(first_after.len(), 2, "{first_after:?}");
+    assert_eq!(
+        first_after[0], first_before[0],
+        "the table written before the change stays installed, the same bytes"
+    );
+    assert_eq!(first_after[1].codec, CompressionType::Zstd(3));
+    assert_eq!(
+        node_tables(&second)
+            .iter()
+            .map(|t| t.codec)
+            .collect::<Vec<_>>(),
+        vec![CompressionType::None, CompressionType::None],
+        "the other namespace keeps its codec"
+    );
+    drop((first, second));
+    drop(deployment);
+
+    let (deployment, _) = open_deployment(&config);
+    for name in ["first", "second"] {
+        let engine = deployment.engine_named(name).expect("reopened");
+        assert_rows(&engine, name, 0..1000);
+    }
+}
+
+/// The namespace compression policy on real tables, the cold band: a
+/// compaction onto a cold level writes the namespace's own cold codec,
+/// whatever its hot codec; a namespace that sets no cold codec takes the
+/// deployment's; and a change naming only the cold codec keeps the hot one
+/// across a reopen, which replays the catalog.
+#[cfg(feature = "zstd")]
+#[test]
+fn a_cold_level_takes_the_namespaces_own_cold_codec() {
+    use coordinode_core::namespace::{BlockCodec, NamespaceStorage};
+    use lsm_tree::CompressionType;
+    let dir = TempDir::new().expect("tmp");
+    let config = durable_cfg(&dir);
+    let (deployment, oracle) = open_deployment(&config);
+    let first_id = deployment
+        .create_namespace_with(
+            "first",
             NamespaceStorage {
-                compression: Some(BlockCodec::Zstd(9)),
+                compression: Some(BlockCodec::Zstd(3)),
                 ..NamespaceStorage::default()
             },
         )
-        .expect("alter");
-    write_compressible(&plain, &oracle, 500, 500);
-    let grown = bytes_under(&node_dir(plain_id)) - plain_bytes;
+        .expect("first");
+    let second_id = deployment
+        .create_namespace_with(
+            "second",
+            NamespaceStorage {
+                compression: Some(BlockCodec::None),
+                ..NamespaceStorage::default()
+            },
+        )
+        .expect("second");
+    deployment
+        .set_namespace_storage(
+            "first",
+            NamespaceStorage {
+                cold_compression: Some(BlockCodec::Lz4),
+                ..NamespaceStorage::default()
+            },
+        )
+        .expect("alter cold");
+    let first = deployment.engine(first_id).expect("first");
+    let second = deployment.engine(second_id).expect("second");
+    for (engine, name) in [(&first, "first"), (&second, "second")] {
+        write_rows(engine, &oracle, name, 0..500);
+        write_rows(engine, &oracle, name, 500..1000);
+        engine.major_compact(Partition::Node).expect("compact");
+    }
+    let cold_from = usize::from(config.compression.cold_level_threshold);
+    let codecs = |engine: &StorageEngine| {
+        let tables = node_tables(engine);
+        assert!(
+            !tables.is_empty() && tables.iter().all(|t| t.level >= cold_from),
+            "the compaction wrote onto a cold level: {tables:?}"
+        );
+        tables.iter().map(|t| t.codec).collect::<Vec<_>>()
+    };
+    assert!(codecs(&first).iter().all(|c| *c == CompressionType::Lz4));
+    // The deployment's cold codec is zstd at its default level.
     assert!(
-        grown * 5 < plain_bytes,
-        "rows written after the change took {grown} bytes"
+        codecs(&second)
+            .iter()
+            .all(|c| *c == CompressionType::Zstd(3))
     );
-    drop((plain, packed));
+    drop((first, second));
     drop(deployment);
 
     let (deployment, _) = open_deployment(&config);
     assert_eq!(
-        deployment.namespace_storage("plain").expect("settings"),
+        deployment.namespace_storage("first").expect("settings"),
         NamespaceStorage {
-            compression: Some(BlockCodec::Zstd(9)),
-            cold_compression: Some(BlockCodec::None),
+            compression: Some(BlockCodec::Zstd(3)),
+            cold_compression: Some(BlockCodec::Lz4),
             dictionaries: None,
         },
-        "the change kept the setting it did not name, across a reopen"
+        "the cold change kept the hot codec it did not name"
     );
-    let plain = deployment.engine_named("plain").expect("plain again");
-    assert_eq!(node(&plain, b"row-00000000").map(|v| v.len()), Some(1024));
+    for name in ["first", "second"] {
+        assert_rows(
+            &deployment.engine_named(name).expect("reopened"),
+            name,
+            0..1000,
+        );
+    }
 }
 
 /// A drop removes the namespace's directory on every endpoint its trees can
