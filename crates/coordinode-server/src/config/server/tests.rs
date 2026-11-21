@@ -1101,6 +1101,34 @@ fn trigger_dispatch_knobs_parse_from_config_file_only() {
     );
 }
 
+/// The namespace session bounds come from the file, each unset one at its
+/// default, and a bound of no open session is refused at load.
+#[test]
+fn namespace_session_limits_parse_from_the_file() {
+    use coordinode_embed::replication::SessionLimits;
+    assert_eq!(
+        ServerConfig::default().namespace_session_limits(),
+        SessionLimits::default()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "namespace_idle_close_secs: 30\nmax_open_namespaces: 16\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(
+        c.namespace_session_limits(),
+        SessionLimits {
+            idle_close: std::time::Duration::from_secs(30),
+            max_open: 16,
+        }
+    );
+    std::fs::write(&path, "max_open_namespaces: 0\n").unwrap();
+    assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
+}
+
 /// With no blob collection keys in the file, the collector runs under its
 /// built-in policy.
 #[test]

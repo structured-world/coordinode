@@ -570,6 +570,12 @@ impl Database {
         &self.interactive
     }
 
+    /// Whether this database holds an open interactive transaction, which
+    /// closing it would lose.
+    pub(crate) fn holds_open_transactions(&self) -> bool {
+        !self.interactive.contexts.lock().is_empty()
+    }
+
     /// Begin an interactive multi-statement transaction with the database's
     /// settings, acting for the host, under a newly drawn ID.
     ///

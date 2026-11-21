@@ -679,6 +679,20 @@ pub struct ServerConfig {
     /// the earliest scheduled retry, never on a timer of its own. Restart to
     /// change. `None` = 1000.
     pub trigger_dispatch_interval_ms: Option<u64>,
+    // ── Namespace sessions ───────────────────────────────────────────────────
+    // Fine tunables: config-file only, no CLI flag; live through
+    // `Served::set_session_limits`, the seam the future `setParameters`
+    // command drives.
+    /// A namespace's session no command reached for this many seconds
+    /// closes, letting go of the namespace's trees and indexes; it reopens on
+    /// the next command naming the namespace. `None` = 300.
+    pub namespace_idle_close_secs: Option<u64>,
+    /// Namespace sessions a member keeps open at once at most: past it the
+    /// one idle longest closes, and a command naming another namespace while
+    /// every open session is in use is refused as busy. At least 1: a bound
+    /// of none would refuse every namespace but the member's own. `None` =
+    /// 1024.
+    pub max_open_namespaces: Option<NonZeroUsize>,
     /// Keys belonging to whatever was registered on the [`crate::ServerBuilder`].
     ///
     /// The base server never reads this table; it exists so a registered
@@ -807,6 +821,8 @@ impl Default for ServerConfig {
             trigger_default_retry_attempts: None,
             trigger_default_backoff_ms: None,
             trigger_dispatch_interval_ms: None,
+            namespace_idle_close_secs: None,
+            max_open_namespaces: None,
             extensions: BTreeMap::new(),
         }
     }
@@ -1039,6 +1055,21 @@ impl ServerConfig {
     #[must_use]
     pub fn trigger_dispatch_interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.trigger_dispatch_interval_ms.unwrap_or(1000))
+    }
+
+    /// The bounds on a member's namespace sessions: the file's values, each
+    /// unset one at its default.
+    #[must_use]
+    pub fn namespace_session_limits(&self) -> coordinode_embed::replication::SessionLimits {
+        let d = coordinode_embed::replication::SessionLimits::default();
+        coordinode_embed::replication::SessionLimits {
+            idle_close: self
+                .namespace_idle_close_secs
+                .map_or(d.idle_close, std::time::Duration::from_secs),
+            max_open: self
+                .max_open_namespaces
+                .map_or(d.max_open, NonZeroUsize::get),
+        }
     }
 
     /// The election timing the group runs: the profile, with each value the

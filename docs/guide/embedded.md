@@ -156,6 +156,27 @@ the handle it came from. Labels and keys written through one session are not
 seen through another. A name the store does not hold is
 `DatabaseError::UnknownNamespace`.
 
+The deployment's catalog of namespaces is reached from any handle:
+
+```rust,ignore
+db.create_namespace("tenant_a")?;      // empty; a session of it opens at once
+let mut tenant = db.session("tenant_a")?;
+tenant.execute_cypher("CREATE (:Order {id: 1})")?;
+for ns in db.namespaces()? {
+    println!("{} dropping={}", ns.name, ns.dropping);
+}
+db.drop_namespace("tenant_a")?;        // its data goes with it
+```
+
+A catalog change commits through the same write path as every other write,
+so a member of a replicated group changes the catalog through the group's log
+and every member applies it in the same order. A name a live namespace holds
+is `DatabaseError::NamespaceExists`; a name no namespace may have,
+`NamespaceRefused`. A handle does not drop the namespace it works in
+(`NamespaceInUse`), as PostgreSQL does not drop the database a connection is
+open on. Once a namespace is dropped no session of it opens, and its name is
+free: a namespace created again under it starts empty.
+
 ## Transactions and errors
 
 A statement run on its own commits on its own. An interactive transaction

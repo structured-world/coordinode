@@ -226,13 +226,7 @@ impl ServedSession {
     /// Whether the session may close now: no command holds it and it holds
     /// no open transaction, whose client would lose it.
     fn closable(&self) -> bool {
-        Arc::strong_count(&self.database) == 1
-            && self
-                .database
-                .read()
-                .transactions_view()
-                .transactions()
-                .is_empty()
+        Arc::strong_count(&self.database) == 1 && !self.database.read().holds_open_transactions()
     }
 }
 

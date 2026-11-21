@@ -176,6 +176,8 @@ the key is unset.
 | `trigger_default_retry_attempts` | `3` | live (setParameter) | Default total execution attempts for an AFTER COMMIT trigger that declares no `ON ERROR` clause, before its event is dead-lettered into `trigger_failures`. Per-trigger `ON ERROR RETRY n` overrides it. |
 | `trigger_default_backoff_ms` | `1000` | live (setParameter) | Default base retry backoff in ms for AFTER COMMIT triggers with no `ON ERROR` clause; per-attempt wait is `backoff * 2^attempt`. Per-trigger `WITH BACKOFF ms` overrides it. |
 | `trigger_dispatch_interval_ms` | `1000` | restart | Shortest gap between two passes of the leader's AFTER COMMIT dispatch worker, in ms. The worker wakes on each replicated write and at the earliest scheduled retry; with nothing queued it does not wake at all. |
+| `namespace_idle_close_secs` | `300` | live (`Served::set_session_limits`) | Seconds a namespace's session stays open with no command reaching it. A session opens on the first command naming its namespace and holds the namespace's trees and indexes open; once closed it reopens on the next command. A session holding an open transaction stays open. |
+| `max_open_namespaces` | `1024` | live (`Served::set_session_limits`) | Namespace sessions a member keeps open at once. Past it the session idle longest closes; a command naming another namespace while every open session is in use is refused as busy (`MEMBER_BUSY`). Zero is refused. |
 | `extensions` | empty | restart | Settings belonging to a distribution built on top of this server; see below. |
 
 The three `live` knobs are runtime-tunable on a running database by an owner via

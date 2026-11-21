@@ -112,7 +112,10 @@ Every call that reads or writes data names the namespace it works in, here
 `x-coordinode-namespace` metadata of each call, or of its session stream when
 the stream opens; a call that names none is refused with `INVALID_ARGUMENT`,
 reason `NAMESPACE_REQUIRED`, and one naming a namespace the server does not
-hold with `NOT_FOUND`, reason `UNKNOWN_NAMESPACE`.
+hold with `NOT_FOUND`, reason `UNKNOWN_NAMESPACE`. A PostgreSQL client names
+it as the connection's database (`psql "host=localhost port=7085
+dbname=default"`); a connection to a database the server does not hold is
+refused with SQLSTATE `3D000`, as PostgreSQL refuses a missing database.
 
 The query (from `hybrid-query.json`):
 

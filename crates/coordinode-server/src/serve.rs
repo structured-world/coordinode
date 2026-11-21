@@ -153,6 +153,7 @@ pub(crate) async fn serve(
     // (config-file surface; applied to the Database / worker below).
     let trigger_dispatch_cfg = cfg.trigger_dispatch_config();
     let trigger_dispatch_interval = cfg.trigger_dispatch_interval();
+    let namespace_session_limits = cfg.namespace_session_limits();
     let blob_gc_policy = cfg.blob_gc_policy();
     let statement_defaults = cfg.statement_defaults();
     let peer_timeouts = cfg.peer_timeouts();
@@ -281,6 +282,9 @@ pub(crate) async fn serve(
         trigger_default_retry_attempts: _,
         trigger_default_backoff_ms: _,
         trigger_dispatch_interval_ms: _,
+        // Already captured above (namespace_session_limits) before the move.
+        namespace_idle_close_secs: _,
+        max_open_namespaces: _,
         extensions: extension_config,
     } = cfg;
     let peers = if peers_vec.is_empty() {
@@ -1251,6 +1255,9 @@ pub(crate) async fn serve(
 
     // Each typed call works in the namespace it names, through the database
     // the member serves for it.
+    member
+        .served_database()
+        .set_session_limits(namespace_session_limits);
     let databases = services::namespace::Databases::serving(Arc::clone(member.served_database()));
     let graph_service = services::graph::GraphServiceImpl::serving(databases.clone());
     let schema_service = services::schema::SchemaServiceImpl::serving(databases.clone());

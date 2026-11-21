@@ -1649,6 +1649,129 @@ async fn open_outside_the_group(dir: &Path) -> Option<DatabaseError> {
     .unwrap()
 }
 
+/// A served database over a store holding namespaces `default`, `a`, `b`.
+fn served_over_three(dir: &std::path::Path) -> coordinode_embed::replication::ServedDatabase {
+    let database = coordinode_embed::Database::open(dir).unwrap();
+    database.create_namespace("a").unwrap();
+    database.create_namespace("b").unwrap();
+    let served = coordinode_embed::replication::ServedDatabase::default();
+    assert!(
+        served
+            .set(Arc::new(parking_lot::RwLock::new(database)))
+            .is_ok()
+    );
+    served
+}
+
+/// Past the open bound a session of another namespace takes the place of
+/// the one idle longest: the bound holds, and the closed namespace reopens
+/// on its next command with its data. While every open session is in use,
+/// a session of another namespace is refused as a busy member's command.
+#[test]
+fn the_open_session_bound_closes_the_idlest_and_refuses_when_all_are_in_use() {
+    use coordinode_embed::replication::SessionLimits;
+
+    let dir = tempfile::tempdir().unwrap();
+    let served = served_over_three(dir.path());
+    served.set_session_limits(SessionLimits {
+        idle_close: Duration::from_secs(3600),
+        max_open: 1,
+    });
+    served
+        .in_namespace("a")
+        .unwrap()
+        .write()
+        .execute_cypher("CREATE (:Kept {v: 1})")
+        .unwrap();
+    let a = Arc::downgrade(&served.in_namespace("a").unwrap());
+    let b = served.in_namespace("b").unwrap();
+    assert!(a.upgrade().is_none(), "the idlest session closed for room");
+    assert_eq!(served.all().len(), 2, "the member's own and one session");
+
+    // `b` is held by a command in flight: `a` finds no room.
+    assert!(matches!(
+        served.in_namespace("a"),
+        Err(DatabaseError::MemberBusy)
+    ));
+    drop(b);
+    let rows = served
+        .in_namespace("a")
+        .unwrap()
+        .write()
+        .execute_cypher("MATCH (n:Kept) RETURN n.v AS v")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "a reopened namespace keeps its data");
+}
+
+/// An open session of a namespace dropped since is not served again: the
+/// next command naming it is refused by name and the session closes, and a
+/// namespace created again under the name gets a session of its own.
+#[test]
+fn a_session_of_a_dropped_namespace_is_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let served = served_over_three(dir.path());
+    served
+        .in_namespace("a")
+        .unwrap()
+        .write()
+        .execute_cypher("CREATE (:Gone {v: 1})")
+        .unwrap();
+    let a = Arc::downgrade(&served.in_namespace("a").unwrap());
+    let own = Arc::clone(served.get().unwrap());
+    own.read().drop_namespace("a").unwrap();
+    assert!(matches!(
+        served.in_namespace("a"),
+        Err(DatabaseError::UnknownNamespace(_))
+    ));
+    assert!(
+        a.upgrade().is_none(),
+        "the dropped namespace's session closed"
+    );
+
+    own.read().create_namespace("a").unwrap();
+    assert!(
+        served
+            .in_namespace("a")
+            .unwrap()
+            .write()
+            .execute_cypher("MATCH (n:Gone) RETURN n")
+            .unwrap()
+            .is_empty(),
+        "the namespace created again starts empty"
+    );
+}
+
+/// A session no command reached for the idle bound closes; one holding an
+/// open transaction stays open, so its client does not lose it.
+#[test]
+fn an_idle_session_closes_unless_it_holds_a_transaction() {
+    use coordinode_embed::replication::SessionLimits;
+
+    let dir = tempfile::tempdir().unwrap();
+    let served = served_over_three(dir.path());
+    served.set_session_limits(SessionLimits {
+        idle_close: Duration::ZERO,
+        max_open: 8,
+    });
+    let a = Arc::downgrade(&served.in_namespace("a").unwrap());
+    let b = served.in_namespace("b").unwrap();
+    b.read().begin_transaction().unwrap();
+    drop(b);
+    let b = Arc::downgrade(&served.in_namespace("b").unwrap());
+    // Every idle session is looked at again under the bound just set.
+    served.set_session_limits(SessionLimits {
+        idle_close: Duration::ZERO,
+        max_open: 8,
+    });
+    // The next command naming a session's namespace looks for idle ones.
+    drop(served.in_namespace("b").unwrap());
+    assert!(a.upgrade().is_none(), "an idle session closed");
+    assert!(
+        b.upgrade().is_some(),
+        "a session holding an open transaction stays open"
+    );
+}
+
 /// A store holding two namespaces opens as a member that serves both: its own
 /// database works in the anchor namespace, a session of the other opens by
 /// name, and each holds its own rows. An embedding host's handle is one store
