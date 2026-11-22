@@ -2780,6 +2780,85 @@ async fn two_members_race_for_an_exclusive_role_and_one_wins() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A singleton role carrying the right to write moves from the machine that
+/// held it to another: from that log position the old holder is refused
+/// and the new one writes, through every member, and both stay so after
+/// leadership moves.
+#[cfg(feature = "tenancy")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_role_taken_by_another_machine_holds_across_a_leader_change() {
+    use coordinode_embed::PrincipalId;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        {
+            let mut leader = members[0].database().write();
+            for statement in [
+                "CREATE ROLE coordinator IN NAMESPACE default \
+                 EXCLUSIVE AMONG (PRINCIPAL 'm1' IN 'idp', PRINCIPAL 'm2' IN 'idp') \
+                 HELD BY PRINCIPAL 'm1' IN 'idp'",
+                "GRANT writer ON NAMESPACE default TO ROLE coordinator IN NAMESPACE default",
+            ] {
+                leader.execute_cypher(statement).expect(statement);
+            }
+        }
+        let write = |subject: &str, n: i64| Statement {
+            actor: acting_as(subject),
+            ..Statement::new(format!("CREATE (:Coordinated {{n: {n}}})"))
+        };
+        members[1]
+            .ingress()
+            .execute(write("m1", 1))
+            .await
+            .expect("the holder on machine 1 writes");
+        // Machine 2's candidate takes the role through its own member.
+        members[2]
+            .ingress()
+            .execute(Statement {
+                actor: acting_as("m2"),
+                ..Statement::new(
+                    "TRANSFER ROLE coordinator IN NAMESPACE default \
+                     FROM PRINCIPAL 'm1' IN 'idp' TO PRINCIPAL 'm2' IN 'idp'",
+                )
+            })
+            .await
+            .expect("m2 takes the role");
+
+        members[0].transfer_leadership(2).await.unwrap();
+        assert!(members[1].is_leader().await);
+        for m in [&members[0], &members[2]] {
+            wait_until("the member follows 2", || m.leader() == Some(2)).await;
+        }
+        for m in &members {
+            match m.ingress().execute(write("m1", 2)).await {
+                Err(DatabaseError::AccessRefused(refusal)) => {
+                    assert_eq!(refusal.principal, PrincipalId::new("m1", "idp").unwrap());
+                }
+                other => panic!("expected the old holder refused, got {other:?}"),
+            }
+        }
+        members[2]
+            .ingress()
+            .execute(write("m2", 3))
+            .await
+            .expect("the new holder writes on machine 2");
+
+        for m in &members {
+            wait_until("only the holders' writes reach every member", || {
+                count(m, "Coordinated") == 2
+            })
+            .await;
+        }
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A transaction belongs to the caller that opened it, whichever member a
 /// command comes through: a command acting for another subject, issuer or
 /// namespace under the same ID is refused as if no such transaction were

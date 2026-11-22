@@ -358,6 +358,57 @@ fn a_catalog_statement_needs_its_own_right_and_no_other() {
     assert_eq!(role.holders, vec![id("m2")]);
 }
 
+/// A role's eligible set is its home namespace's admin's alone: the admin of
+/// another namespace the role holds a grant on has no say over who may hold
+/// it, and the set stays as it was. The home's admin changes it.
+#[test]
+fn only_the_homes_admin_changes_a_roles_eligible_set() {
+    let (db, _dir) = open();
+    db.create_namespace("shared").expect("a second namespace");
+    let host = |query: &str| {
+        db.execute_cypher_shared(query, None, None, None, None)
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+    };
+    host(
+        "CREATE ROLE coordinator IN NAMESPACE default \
+         EXCLUSIVE AMONG (PRINCIPAL 'm1' IN 'idp', PRINCIPAL 'm2' IN 'idp') \
+         HELD BY PRINCIPAL 'm1' IN 'idp'",
+    );
+    host("GRANT writer ON NAMESPACE shared TO ROLE coordinator IN NAMESPACE default");
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("shared", "sam", NamespaceRole::Admin),
+    )
+    .expect("sam administers shared");
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "hana", NamespaceRole::Admin),
+    )
+    .expect("hana administers the role's home");
+
+    let set_m2 =
+        "ALTER ROLE coordinator IN NAMESPACE default SET ELIGIBLE (PRINCIPAL 'm2' IN 'idp')";
+    refused_for(
+        run_as(&db, "sam", set_m2),
+        "sam",
+        MissingRight::Namespace {
+            namespace: default_namespace(&db),
+            role: NamespaceRole::Admin,
+        },
+    );
+    let role = |db: &Database| {
+        db.role(&ActingContext::Trusted, "default", "coordinator")
+            .expect("read")
+            .expect("the role")
+    };
+    assert_eq!(role(&db).eligible, Some(vec![id("m1"), id("m2")]));
+
+    run_as(&db, "hana", set_m2).expect("the home's admin changes the set");
+    let after = role(&db);
+    assert_eq!(after.eligible, Some(vec![id("m2")]));
+    assert!(after.holders.is_empty(), "m1 left the set and the role");
+}
+
 /// A principal with no right on the namespace reads nothing of it: the read
 /// is refused before it runs, naming the reader role it lacks.
 #[test]

@@ -138,30 +138,97 @@ fn a_foreign_principal_reaches_nothing_of_an_issuer() {
     );
 }
 
-/// An issuer the explicitly trusted host enrolled belongs to no principal:
-/// a principal reaches nothing of it, and an issuer that was never enrolled
-/// is refused the same way. The host keeps reaching it.
+/// An issuer the explicitly trusted host enrolled belongs to no principal,
+/// whatever its operations' state: a principal, even one holding the rights
+/// a write needs, reaches nothing of a committed, an unresolved or a retired
+/// operation of it, cannot claim it by enrolling it first, and its attempts
+/// change nothing, so an unresolved operation stays unresolved rather than
+/// becoming aborted. An issuer never enrolled is refused the same way. The
+/// host keeps every outcome and settles them itself.
 #[test]
 fn an_ownerless_issuer_is_the_hosts_alone() {
     let (db, _dir) = open();
+    db.change_access(
+        &ActingContext::Trusted,
+        AccessChange::Grant {
+            namespace: "default".into(),
+            grantee: GranteeName::Principal(id("alice")),
+            role: NamespaceRole::Writer,
+        },
+    )
+    .expect("grant writer");
     let issuer = IssuerId([0x7b; 16]);
     let enrolled = db.enroll_issuer(issuer).expect("the host enrolls");
-    let op = enrolled.next().expect("a descriptor");
+    let retired = enrolled.next().expect("a descriptor");
+    let committed = enrolled.next().expect("a second");
+    let unresolved = enrolled.next().expect("a third");
+    db.execute_cypher_shared_with(
+        "CREATE (:Hosted {k: 1})",
+        None,
+        None,
+        &StatementOptions {
+            operation: Some(committed),
+            ..StatementOptions::default()
+        },
+    )
+    .expect("the host writes under its operation");
+    db.retire_operations(&committed)
+        .expect("the host retires the operation below it");
 
     let alice = acting("alice");
     refused(db.enroll_issuer_as(&alice, issuer), "alice", issuer);
+    for op in [&retired, &committed, &unresolved] {
+        refused(
+            db.resolve_operation_as(&alice, op, Resolve::Lookup),
+            "alice",
+            issuer,
+        );
+    }
     refused(
-        db.resolve_operation_as(&alice, &op, Resolve::Lookup),
+        db.resolve_operation_as(&alice, &unresolved, Resolve::Exclude),
+        "alice",
+        issuer,
+    );
+    refused(
+        db.retire_operations_as(&alice, &unresolved),
+        "alice",
+        issuer,
+    );
+    refused(
+        db.execute_cypher_shared_with(
+            "CREATE (:Claimed {k: 1})",
+            None,
+            None,
+            &StatementOptions {
+                actor: Some(alice.clone()),
+                operation: Some(unresolved),
+                ..StatementOptions::default()
+            },
+        ),
         "alice",
         issuer,
     );
     let never = IssuerId([0x7c; 16]);
     refused(db.resume_issuer_as(&alice, never, 1, 1), "alice", never);
 
+    let lookup = |op| {
+        db.resolve_operation(op, Resolve::Lookup)
+            .expect("the host looks it up")
+    };
+    assert_eq!(lookup(&retired), OperationOutcome::Retired);
+    assert!(matches!(
+        lookup(&committed),
+        OperationOutcome::Committed { .. }
+    ));
     assert_eq!(
-        db.resolve_operation(&op, Resolve::Lookup)
-            .expect("the host looks it up"),
-        OperationOutcome::Unknown
+        lookup(&unresolved),
+        OperationOutcome::Unknown,
+        "alice's exclusion did not settle it"
+    );
+    assert_eq!(
+        db.resolve_operation(&unresolved, Resolve::Exclude)
+            .expect("the host excludes it"),
+        OperationOutcome::Aborted
     );
     db.enroll_issuer(issuer).expect("the host enrolls it again");
 }
