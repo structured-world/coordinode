@@ -103,10 +103,17 @@ fn as_of_accepts_an_rfc3339_timestamp() {
     commit_anchor(&mut db, 2);
 
     let instant = |ts: u64| {
-        jiff::Timestamp::from_microsecond(i64::try_from(ts).expect("fits")).expect("in range")
+        time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ts) * 1_000).expect("in range")
+    };
+    let format = |at: time::OffsetDateTime| {
+        at.format(&time::format_description::well_known::Rfc3339)
+            .expect("formats")
+    };
+    let at_offset = |ts: u64, hours: i8| {
+        format(instant(ts).to_offset(time::UtcOffset::from_hms(hours, 0, 0).expect("offset")))
     };
     // The UTC form, `Z` for the offset.
-    let rfc3339 = |ts: u64| instant(ts).to_string();
+    let rfc3339 = |ts: u64| format(instant(ts));
     let count = |db: &mut Database, at: &str| {
         db.execute_cypher(&format!("MATCH (n:Anchor) RETURN n AS OF TIMESTAMP '{at}'"))
             .map(|rows| rows.len())
@@ -117,17 +124,13 @@ fn as_of_accepts_an_rfc3339_timestamp() {
     );
     assert_eq!(count(&mut db, &rfc3339(first - 1)).expect("before it"), 0);
     // A zone offset names the same instant as its UTC form.
-    let offset = instant(first)
-        .display_with_offset(jiff::tz::offset(3))
-        .to_string();
+    let offset = at_offset(first, 3);
     assert!(offset.ends_with("+03:00"), "the offset form: {offset}");
     assert_eq!(count(&mut db, &offset).expect("offset form"), 1);
-    // An RFC 9557 zone name after the offset: the offset names the instant.
-    let named = format!(
-        "{}[America/New_York]",
-        instant(first).display_with_offset(jiff::tz::offset(-4))
-    );
-    assert_eq!(count(&mut db, &named).expect("named zone form"), 1);
+    // An RFC 9557 zone name after the offset is no RFC 3339 instant: it is
+    // refused rather than read for its offset alone.
+    let named = format!("{}[America/New_York]", at_offset(first, -4));
+    assert!(count(&mut db, &named).is_err(), "{named} was read");
 }
 
 /// A string that is not an RFC 3339 timestamp is refused, never read as the

@@ -2491,10 +2491,11 @@ fn as_of_timestamp_string_is_parsed_as_rfc3339() {
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
         - 3600 * 1_000_000;
-    let rfc3339 = jiff::Timestamp::from_microsecond(recent_ts)
+    let rfc3339 = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(recent_ts) * 1_000)
         .expect("in range")
-        .display_with_offset(jiff::tz::offset(-5))
-        .to_string();
+        .to_offset(time::UtcOffset::from_hms(-5, 0, 0).expect("offset"))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("formats");
     assert!(rfc3339.ends_with("-05:00"), "the offset form: {rfc3339}");
 
     let plan = LogicalPlan {

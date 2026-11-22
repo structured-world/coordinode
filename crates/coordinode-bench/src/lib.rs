@@ -26,8 +26,8 @@
 
 use std::path::Path;
 
-use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 pub mod error;
 pub mod fingerprint;
@@ -47,7 +47,8 @@ pub struct BenchReport {
     /// Schema version — bump on breaking changes.
     pub schema_version: u32,
     /// Wall-clock timestamp of the run (UTC).
-    pub timestamp: Timestamp,
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: OffsetDateTime,
     /// Git metadata (commit SHA, branch, dirty flag).
     pub git: GitMetadata,
     /// Host hardware fingerprint.
@@ -91,7 +92,7 @@ impl BenchReport {
     ) -> BenchOpResult<Self> {
         Ok(Self {
             schema_version: SCHEMA_VERSION,
-            timestamp: Timestamp::now(),
+            timestamp: OffsetDateTime::now_utc(),
             git: git_metadata()?,
             hardware: hardware_fingerprint(),
             modality: modality.into(),
@@ -128,7 +129,17 @@ impl BenchReport {
     ) -> BenchOpResult<std::path::PathBuf> {
         let dir = base.as_ref().join(&self.modality).join(&self.dataset);
         std::fs::create_dir_all(&dir)?;
-        let stamp = self.timestamp.strftime("%Y%m%d-%H%M%S");
+        // The run's instant in UTC, `YYYYMMDD-HHMMSS`.
+        let at = self.timestamp.to_offset(time::UtcOffset::UTC);
+        let stamp = format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            at.year(),
+            u8::from(at.month()),
+            at.day(),
+            at.hour(),
+            at.minute(),
+            at.second()
+        );
         let file_name = match tag {
             Some(t) if !t.is_empty() => {
                 format!(

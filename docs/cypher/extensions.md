@@ -406,12 +406,14 @@ RETURN u.name, u.email
 AS OF TIMESTAMP '2026-03-15T10:00:00Z'
 
 -- RFC 3339, zone offset required: '2026-03-15T10:00:00Z', '2026-03-15T13:00:00+03:00'
--- An RFC 9557 zone name may follow the offset: '2026-03-15T06:00:00-04:00[America/New_York]'
--- Microsecond precision: '2026-03-15T10:00:00.123456Z'
+-- T, t or a space between date and time: '2026-03-15 10:00:00Z'
+-- Microsecond precision: '2026-03-15T10:00:00.123456Z' (further digits are dropped)
 -- Or the raw HLC value (microseconds since the Unix epoch) as an integer
 ```
 
-The `AS OF TIMESTAMP` clause applies to the entire query. All MATCH patterns read from the MVCC snapshot at the given timestamp. A string that is not an RFC 3339 timestamp (a bare date, a missing zone offset) is refused rather than read as the current state.
+The `AS OF TIMESTAMP` clause applies to the entire query. All MATCH patterns read from the MVCC snapshot at the given timestamp. A string that is not an RFC 3339 timestamp is refused rather than read as the current state: a bare date, a missing zone offset, an offset without its colon or minutes, the ISO 8601 basic format, a decimal comma, a year of more than four digits, or a bracketed zone name (RFC 9557) after the offset. A leap second (`23:59:60`) is read as the last instant of its minute.
+
+A time before the Unix epoch is refused: no commit is that old. A time the store's clock has not reached yet is refused as not ready (`READ_NOT_READY`), since a commit can still be stamped at or before it; it is never answered with the current state.
 
 **Retention:** 5 minutes by default (`retention_window_secs`, server and embedded alike). A query older than the retention horizon is refused with `OUT_OF_RANGE` (reason `OUTSIDE_RETENTION`, metadata `oldest_readable_ts`) rather than answered from partially collected history.
 

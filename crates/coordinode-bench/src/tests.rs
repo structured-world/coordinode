@@ -7,13 +7,13 @@ fn record_and_serialise_round_trips() {
     // sandbox tests).
     let report = BenchReport {
         schema_version: SCHEMA_VERSION,
-        timestamp: Timestamp::now(),
+        timestamp: OffsetDateTime::now_utc(),
         git: GitMetadata {
             sha: "abc123def4567890".into(),
             sha_short: "abc123d".into(),
             branch: "main".into(),
             dirty: false,
-            commit_date: Timestamp::now(),
+            commit_date: OffsetDateTime::now_utc(),
         },
         hardware: HardwareFingerprint {
             cpu_brand: "Test CPU".into(),
@@ -43,13 +43,13 @@ fn record_and_serialise_round_trips() {
 fn record_metric_inserts_into_map() {
     let mut report = BenchReport {
         schema_version: SCHEMA_VERSION,
-        timestamp: Timestamp::now(),
+        timestamp: OffsetDateTime::now_utc(),
         git: GitMetadata {
             sha: "abc".into(),
             sha_short: "abc".into(),
             branch: "main".into(),
             dirty: false,
-            commit_date: Timestamp::now(),
+            commit_date: OffsetDateTime::now_utc(),
         },
         hardware: HardwareFingerprint {
             cpu_brand: String::new(),

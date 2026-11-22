@@ -4,9 +4,10 @@
 
 use std::process::Command;
 
-use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::error::{BenchError, BenchResult};
 
@@ -26,7 +27,8 @@ pub struct GitMetadata {
     /// measurements are still recorded but flagged in the chart.
     pub dirty: bool,
     /// Author commit date of the SHA (NOT the bench run time).
-    pub commit_date: Timestamp,
+    #[serde(with = "time::serde::rfc3339")]
+    pub commit_date: OffsetDateTime,
 }
 
 /// Hardware fingerprint of the host running the bench. Populated
@@ -61,9 +63,9 @@ pub fn git_metadata() -> BenchResult<GitMetadata> {
     let dirty_output = run_git(&["status", "--porcelain"])?;
     let dirty = !dirty_output.is_empty();
     let commit_date_raw = run_git(&["log", "-1", "--format=%cI"])?;
-    // `%cI` is strict ISO 8601 with the committer's offset.
-    let commit_date: Timestamp = commit_date_raw
-        .parse()
+    // `%cI` is strict ISO 8601 with the committer's offset, an RFC 3339
+    // instant.
+    let commit_date = OffsetDateTime::parse(&commit_date_raw, &Rfc3339)
         .map_err(|e| BenchError::Git(format!("parse commit date: {e}")))?;
     Ok(GitMetadata {
         sha,

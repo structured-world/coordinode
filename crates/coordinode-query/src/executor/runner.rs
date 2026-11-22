@@ -5724,19 +5724,14 @@ pub fn execute_no_commit(
         let resolved_ts: Option<i64> = match ts_val {
             Value::Timestamp(ts) => Some(ts),
             // The HLC value is wall-clock microseconds since the Unix epoch,
-            // so an RFC 3339 instant (RFC 3339 §5.6, zone offset required;
-            // RFC 9557 extends it with a bracketed zone name) names the same
-            // point on it.
-            Value::String(ref s) => Some(
-                s.parse::<jiff::Timestamp>()
-                    .map_err(|e| {
-                        ExecutionError::Unsupported(format!(
-                            "AS OF TIMESTAMP '{s}' is not an RFC 3339 timestamp \
-                             (for example 2026-03-15T10:00:00Z): {e}"
-                        ))
-                    })?
-                    .as_microsecond(),
-            ),
+            // so an RFC 3339 instant (RFC 3339 §5.6, zone offset required)
+            // names the same point on it.
+            Value::String(ref s) => Some(super::instant::parse_instant_us(s).map_err(|e| {
+                ExecutionError::Unsupported(format!(
+                    "AS OF TIMESTAMP '{s}' is not an RFC 3339 timestamp \
+                     (for example 2026-03-15T10:00:00Z): {e}"
+                ))
+            })?),
             Value::Int(ts) => Some(ts),
             _ => {
                 return Err(ExecutionError::Unsupported(

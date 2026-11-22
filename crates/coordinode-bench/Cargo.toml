@@ -10,7 +10,7 @@ publish = false  # internal harness, never to crates.io
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 # Run and commit instants, serialized as RFC 3339 strings.
-jiff = { workspace = true, features = ["serde"] }
+time = { workspace = true, features = ["std", "formatting", "serde"] }
 sysinfo = "0.40"
 clap = { version = "4", features = ["derive"] }
 thiserror = { workspace = true }

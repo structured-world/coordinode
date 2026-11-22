@@ -20,5 +20,5 @@ fn git_metadata_works_in_repo() {
     };
     assert_eq!(meta.sha.len(), 40, "full SHA must be 40 chars");
     assert_eq!(meta.sha_short.len(), 7, "short SHA must be 7 chars");
-    assert!(meta.commit_date <= Timestamp::now());
+    assert!(meta.commit_date <= OffsetDateTime::now_utc());
 }
