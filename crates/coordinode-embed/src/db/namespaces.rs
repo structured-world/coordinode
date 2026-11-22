@@ -173,32 +173,8 @@ impl Database {
         actor: Option<PrincipalId>,
         name: &str,
     ) -> Result<(), DatabaseError> {
-        let deployment = self.engine.deployment();
-        let found = metadata::namespace_by_name(deployment, name)?;
-        // A principal without admin on it learns nothing of whether it
-        // exists: refused here as the apply would refuse it.
-        if let Some(principal) = &actor {
-            use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole};
-            use coordinode_storage::engine::access;
-            let missing = match found {
-                None => Some(MissingRight::DeploymentAdmin),
-                Some(namespace) => {
-                    let admin = access::deployment_rights(deployment, principal)?.admin
-                        || access::effective_role(deployment, principal, namespace)?
-                            == Some(NamespaceRole::Admin);
-                    (!admin).then_some(MissingRight::Namespace {
-                        namespace,
-                        role: NamespaceRole::Admin,
-                    })
-                }
-            };
-            if let Some(missing) = missing {
-                return Err(DatabaseError::AccessRefused(AccessRefusal {
-                    principal: principal.clone(),
-                    missing,
-                }));
-            }
-        }
+        let found = metadata::namespace_by_name(self.engine.deployment(), name)?;
+        self.refuse_unless_admin(actor.as_ref(), found)?;
         let Some(id) = found else {
             return Err(DatabaseError::UnknownNamespace(name.to_owned()));
         };
@@ -243,7 +219,9 @@ impl Database {
         name: &str,
         change: NamespaceStorage,
     ) -> Result<(), DatabaseError> {
-        if metadata::namespace_by_name(self.engine.deployment(), name)?.is_none() {
+        let found = metadata::namespace_by_name(self.engine.deployment(), name)?;
+        self.refuse_unless_admin(actor.as_ref(), found)?;
+        if found.is_none() {
             return Err(DatabaseError::UnknownNamespace(name.to_owned()));
         }
         self.propose_command_as(
@@ -253,6 +231,70 @@ impl Database {
                 change,
             },
         )
+    }
+
+    /// Refuse `actor` a change to the namespace `found` unless it is admin
+    /// there: a principal without admin learns nothing of whether the name
+    /// exists, as a missing one is refused like a foreign one. The apply
+    /// still decides; this only answers early. The trusted host passes.
+    fn refuse_unless_admin(
+        &self,
+        actor: Option<&PrincipalId>,
+        found: Option<coordinode_core::namespace::NamespaceId>,
+    ) -> Result<(), DatabaseError> {
+        use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole};
+        use coordinode_storage::engine::access;
+        let Some(principal) = actor else {
+            return Ok(());
+        };
+        let deployment = self.engine.deployment();
+        let held = match found {
+            Some(namespace) if !access::deployment_rights(deployment, principal)?.admin => {
+                access::effective_role(deployment, principal, namespace)?
+                    .map(|role| (namespace, role))
+            }
+            Some(_) => return Ok(()),
+            None => None,
+        };
+        // Only a principal already holding a role on the namespace is told
+        // which right it lacks there; to any other, an existing namespace
+        // and a missing one look the same.
+        let missing = match held {
+            Some((_, NamespaceRole::Admin)) => return Ok(()),
+            Some((namespace, _)) => MissingRight::Namespace {
+                namespace,
+                role: NamespaceRole::Admin,
+            },
+            None => MissingRight::DeploymentAdmin,
+        };
+        Err(DatabaseError::AccessRefused(AccessRefusal {
+            principal: principal.clone(),
+            missing,
+        }))
+    }
+
+    /// The deployment's namespaces as `actor` may list them: the trusted
+    /// host, a deployment admin, or a holder of the right to create
+    /// namespaces; any other principal is refused.
+    pub(super) fn namespaces_as(
+        &self,
+        actor: Option<&PrincipalId>,
+    ) -> Result<Vec<super::NamespaceInfo>, DatabaseError> {
+        if let Some(principal) = actor {
+            let rights = coordinode_storage::engine::access::deployment_rights(
+                self.engine.deployment(),
+                principal,
+            )?;
+            if !(rights.create_namespace || rights.admin) {
+                return Err(DatabaseError::AccessRefused(
+                    coordinode_core::access::AccessRefusal {
+                        principal: principal.clone(),
+                        missing: coordinode_core::access::MissingRight::CreateNamespace,
+                    },
+                ));
+            }
+        }
+        self.namespaces()
     }
 
     /// Close the trees of every namespace of the deployment that no handle
@@ -323,8 +365,12 @@ impl coordinode_query::executor::namespaces::NamespaceCatalog for Database {
         }
     }
 
-    fn namespaces(&self) -> Result<Vec<NamespaceEntry>, CatalogFailure> {
-        Ok(Database::namespaces(self)?
+    fn namespaces(
+        &self,
+        actor: Option<&PrincipalId>,
+    ) -> Result<Vec<NamespaceEntry>, CatalogFailure> {
+        Ok(self
+            .namespaces_as(actor)?
             .into_iter()
             .map(|n| NamespaceEntry {
                 name: n.name,

@@ -402,9 +402,15 @@ REVOKE admin ON DEPLOYMENT FROM PRINCIPAL 'root' IN 's'
   (its home's admin only); a holder left out loses the role in the same
   change, and `SET ELIGIBLE ()` takes it from everyone. `GRANT ROLE` does not
   take `EXCLUSIVE AMONG`: the set is the role's, named and changed as above.
-- `CREATE NAMESPACE` right lets its holder create namespaces and list them,
-  becoming admin of each it creates; it gives no right on any other
-  namespace. `admin ON DEPLOYMENT` reaches every namespace.
+- `CREATE NAMESPACE` right lets its holder create namespaces and list them
+  (`SHOW NAMESPACES`), becoming admin of each it creates; it gives no right
+  on any other namespace. `admin ON DEPLOYMENT` reaches every namespace.
+- The catalog statements (`CREATE`, `ALTER`, `DROP`, `SHOW NAMESPACES` and
+  the access statements above) need only the right each names, not a right
+  on the namespace the session works in: a principal holding only the right
+  to create namespaces creates them, and one that is only in a role's
+  eligible set takes the role. A principal with no role on a namespace is
+  refused a change to it the same way whether it exists or not.
 - Inside an explicit transaction these statements commit with its other
   writes, in one change at one timestamp: removing a principal from a role's
   eligible set and deleting the data only it could read happen together or

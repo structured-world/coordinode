@@ -276,6 +276,88 @@ fn a_namespace_statement_acts_for_its_principal() {
     run_as(&db, "carol", "DROP NAMESPACE carols").expect("the creator, its admin, drops it");
 }
 
+/// A statement on the deployment's catalog is decided by the right it needs,
+/// not by a right on the session's namespace: a principal holding only the
+/// right to create namespaces creates and lists them, and a principal that is
+/// only in an exclusive role's eligible set takes the role. A reader of the
+/// session's namespace lists nothing, and a principal without any role on a
+/// namespace is refused alike whether it exists or not.
+#[test]
+fn a_catalog_statement_needs_its_own_right_and_no_other() {
+    let (db, _dir) = open();
+    db.change_access(
+        &ActingContext::Trusted,
+        AccessChange::DeploymentRights {
+            principal: id("carol"),
+            create_namespace: Some(true),
+            admin: None,
+        },
+    )
+    .expect("grant the right to create namespaces");
+    run_as(&db, "carol", "CREATE NAMESPACE carols").expect("carol creates, with no data rights");
+    run_as(&db, "carol", "SHOW NAMESPACES").expect("and lists the catalog");
+    refused_for(
+        run_as(&db, "carol", "MATCH (n) RETURN n"),
+        "carol",
+        MissingRight::Namespace {
+            namespace: default_namespace(&db),
+            role: NamespaceRole::Reader,
+        },
+    );
+
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "rita", NamespaceRole::Reader),
+    )
+    .expect("grant reader");
+    refused_for(
+        run_as(&db, "rita", "SHOW NAMESPACES"),
+        "rita",
+        MissingRight::CreateNamespace,
+    );
+    // Rita holds no role on carols: an existing namespace and a missing one
+    // are refused the same.
+    for name in ["carols", "nowhere"] {
+        refused_for(
+            run_as(
+                &db,
+                "rita",
+                &format!("ALTER NAMESPACE {name} SET STORAGE (compression: 'lz4')"),
+            ),
+            "rita",
+            MissingRight::DeploymentAdmin,
+        );
+        refused_for(
+            run_as(&db, "rita", &format!("DROP NAMESPACE {name}")),
+            "rita",
+            MissingRight::DeploymentAdmin,
+        );
+    }
+
+    db.execute_cypher_shared(
+        "CREATE ROLE coordinator IN NAMESPACE default \
+         EXCLUSIVE AMONG (PRINCIPAL 'm1' IN 'idp', PRINCIPAL 'm2' IN 'idp') \
+         HELD BY PRINCIPAL 'm1' IN 'idp'",
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("the host creates the role");
+    run_as(
+        &db,
+        "m2",
+        "TRANSFER ROLE coordinator IN NAMESPACE default \
+         FROM PRINCIPAL 'm1' IN 'idp' TO PRINCIPAL 'm2' IN 'idp'",
+    )
+    .expect("an eligible principal takes the role with no other right");
+    let role = db
+        .role(&ActingContext::Trusted, "default", "coordinator")
+        .expect("read")
+        .expect("the role");
+    assert_eq!(role.holders, vec![id("m2")]);
+}
+
 /// A principal with no right on the namespace reads nothing of it: the read
 /// is refused before it runs, naming the reader role it lacks.
 #[test]
@@ -602,22 +684,14 @@ fn a_creator_works_in_catalog_scope_without_a_data_session() {
         .collect();
     assert!(names.contains(&"carols".to_owned()) && names.contains(&"theirs".to_owned()));
 
-    let theirs = coordinode_storage::engine::metadata::namespace_by_name(deployment, "theirs")
-        .unwrap()
-        .unwrap();
-    refused_for(
-        carol.drop_namespace("theirs"),
-        "carol",
-        MissingRight::Namespace {
-            namespace: theirs,
-            role: NamespaceRole::Admin,
-        },
-    );
-    refused_for(
-        carol.drop_namespace("nowhere"),
-        "carol",
-        MissingRight::DeploymentAdmin,
-    );
+    // Carol holds no role on theirs: refused as for a missing name.
+    for name in ["theirs", "nowhere"] {
+        refused_for(
+            carol.drop_namespace(name),
+            "carol",
+            MissingRight::DeploymentAdmin,
+        );
+    }
     carol
         .drop_namespace("carols")
         .expect("carol drops what it created");

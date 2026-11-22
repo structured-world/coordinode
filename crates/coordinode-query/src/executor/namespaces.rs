@@ -89,12 +89,16 @@ pub trait NamespaceCatalog: Send + Sync {
         name: &str,
     ) -> Result<CatalogOutcome, CatalogFailure>;
 
-    /// The catalog's namespaces, in creation order.
+    /// The catalog's namespaces, in creation order, listed for `actor`.
     ///
     /// # Errors
     ///
-    /// The catalog cannot be read.
-    fn namespaces(&self) -> Result<Vec<NamespaceEntry>, CatalogFailure>;
+    /// The host's refusal: a principal without the right to list the
+    /// catalog; the catalog cannot be read.
+    fn namespaces(
+        &self,
+        actor: Option<&PrincipalId>,
+    ) -> Result<Vec<NamespaceEntry>, CatalogFailure>;
 }
 
 /// The catalog a statement reaches, or the refusal of a host that gave none.
@@ -156,12 +160,15 @@ pub(crate) fn set_storage(
 
 /// `SHOW NAMESPACES`: a row per namespace, its name, state and the storage
 /// settings it sets (null for one it inherits from the deployment).
-pub(crate) fn show(host: Option<&dyn NamespaceCatalog>) -> Result<Vec<Row>, ExecutionError> {
+pub(crate) fn show(
+    host: Option<&dyn NamespaceCatalog>,
+    actor: Option<&PrincipalId>,
+) -> Result<Vec<Row>, ExecutionError> {
     let codec = |codec: Option<coordinode_core::namespace::BlockCodec>| {
         codec.map_or(Value::Null, |codec| Value::String(codec.to_string()))
     };
     Ok(catalog(host)?
-        .namespaces()
+        .namespaces(actor)
         .map_err(ExecutionError::Catalog)?
         .into_iter()
         .map(|entry| {

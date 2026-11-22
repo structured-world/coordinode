@@ -7348,7 +7348,9 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             )
         }
 
-        LogicalOp::ShowNamespaces => crate::executor::namespaces::show(ctx.namespace_catalog),
+        LogicalOp::ShowNamespaces => {
+            crate::executor::namespaces::show(ctx.namespace_catalog, ctx.actor.as_ref())
+        }
 
         // Staged with the statement's own transaction: it commits in one log
         // entry with whatever else the transaction writes, acting for the

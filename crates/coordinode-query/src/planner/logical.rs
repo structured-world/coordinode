@@ -1077,6 +1077,23 @@ pub enum LogicalOp {
 }
 
 impl LogicalOp {
+    /// Whether the statement is a change to, or a listing of, the
+    /// deployment's catalog rather than an access to the data of the
+    /// namespace it runs in: its own right decides it (to create or list
+    /// namespaces, admin on the namespace it names, or the grant rules where
+    /// an access change applies), not a right on the session's namespace.
+    #[must_use]
+    pub fn is_deployment_catalog_statement(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateNamespace { .. }
+                | Self::DropNamespace { .. }
+                | Self::SetNamespaceStorage { .. }
+                | Self::ShowNamespaces
+                | Self::Access(_)
+        )
+    }
+
     /// The operator's name, as EXPLAIN shows it.
     pub fn operator_name(&self) -> &'static str {
         match self {

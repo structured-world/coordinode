@@ -3283,8 +3283,15 @@ impl Database {
             // Every statement of a principal reads its namespace: admitted
             // only while it holds a right there, read from the catalog now, so
             // a revocation stops the next statement of a session already open.
-            // Its writes are checked again where the log applies them.
-            if let Some(principal) = &actor {
+            // Its writes are checked again where the log applies them. A
+            // statement on the deployment's catalog reads no data of the
+            // namespace: its own right decides it, so a principal holding only
+            // the right to create namespaces, or only a place in a role's
+            // eligible set, reaches what that right allows.
+            if let Some(principal) = actor
+                .as_ref()
+                .filter(|_| !plan.root.is_deployment_catalog_statement())
+            {
                 coordinode_storage::engine::access::may_read(
                     self.engine.deployment(),
                     principal,

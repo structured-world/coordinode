@@ -122,14 +122,7 @@ impl CatalogScope<'_> {
     /// [`DatabaseError::AccessRefused`] for any other principal; the
     /// catalog cannot be read.
     pub fn namespaces(&self) -> Result<Vec<super::NamespaceInfo>, DatabaseError> {
-        let rights = access::deployment_rights(self.db.engine.deployment(), &self.principal)?;
-        if !(rights.create_namespace || rights.admin) {
-            return Err(DatabaseError::AccessRefused(AccessRefusal {
-                principal: self.principal.clone(),
-                missing: MissingRight::CreateNamespace,
-            }));
-        }
-        self.db.namespaces()
+        self.db.namespaces_as(Some(&self.principal))
     }
 
     /// Commit `change` to the grant catalog, acting for the principal: the
