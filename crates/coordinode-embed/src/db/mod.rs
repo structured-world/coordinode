@@ -718,6 +718,9 @@ struct QuerySession {
         crate::operation::OperationId,
         crate::operation::IntentDigest,
     )>,
+    /// The principal an auto-commit statement acts for; `None` for the
+    /// embedding host's own trusted access.
+    actor: Option<coordinode_core::access::PrincipalId>,
 }
 
 /// A statement's causal bounds: what of a read concern its read must meet.
@@ -1814,6 +1817,33 @@ impl Database {
     ///
     /// Consumes any one-shot `snapshot_read_ts` so a second query in
     /// the same session sees the default (latest) read timestamp.
+    /// The principal a statement acting for `actor` commits as: `None` for
+    /// the host's trusted access.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::NamespaceMismatch`] for a principal bound to another
+    /// namespace than this database's; [`DatabaseError::SettingsRefused`]
+    /// for a principal whose subject or trust scope no grant can name.
+    fn statement_principal(
+        &self,
+        actor: Option<&coordinode_core::txn::command::ActingContext>,
+    ) -> Result<Option<coordinode_core::access::PrincipalId>, DatabaseError> {
+        use coordinode_core::txn::command::ActingContext;
+        let Some(ActingContext::Principal(principal)) = actor else {
+            return Ok(None);
+        };
+        if *principal.namespace != *self.namespace() {
+            return Err(DatabaseError::NamespaceMismatch {
+                principal: principal.namespace.to_string(),
+                session: self.namespace().to_owned(),
+            });
+        }
+        coordinode_core::access::PrincipalId::new(&principal.subject, &principal.trust_scope)
+            .map(Some)
+            .map_err(|e| DatabaseError::SettingsRefused(e.to_string()))
+    }
+
     fn capture_session(&mut self) -> QuerySession {
         QuerySession {
             read_concern: self.read_concern,
@@ -1825,6 +1855,9 @@ impl Database {
             after_commit_generation: 0,
             budget: statement_budget(self.query_memory_limit, None, None),
             operation: None,
+            // The handle's own statements: the embedding host's trusted
+            // access.
+            actor: None,
         }
     }
 
@@ -2655,6 +2688,7 @@ impl Database {
             after_commit_generation: 0,
             budget: self.options_budget(options)?,
             operation: None,
+            actor: self.statement_principal(options.actor.as_ref())?,
         };
         if let Some(rc) = &options.read_concern {
             session.apply_read_concern(rc)?;
@@ -2739,6 +2773,7 @@ impl Database {
             after_commit_generation: 0,
             budget: statement_budget(self.query_memory_limit, None, None),
             operation: None,
+            actor: None,
         };
         let params = params.filter(|p| !p.is_empty());
         let mut paging = Some(ScanPaging {
@@ -3200,9 +3235,15 @@ impl Database {
                     if let Some((op, intent)) = session.operation {
                         txn.bind_operation(op, intent);
                     }
+                    if let Some(actor) = &session.actor {
+                        txn.act_as(actor.clone());
+                    }
                     txn
                 }
             };
+            // Every commit of the statement acts for the transaction's
+            // principal, its catalog changes and DDL entries included.
+            let actor = txn.actor().cloned();
             // The statement's view of the field dictionary: every binding
             // applied before it started, refreshed here when one has landed
             // since (a registration, a replica apply, a replay, a snapshot).
@@ -3278,6 +3319,7 @@ impl Database {
                 // The injected pipeline (Raft in cluster mode) — NOT a local
                 // engine-applying one. Writing past it breaks replication.
                 proposal_pipeline: Some(self.pipeline.as_ref()),
+                actor,
                 proposal_id_gen: Some(&self.proposal_id_gen),
                 read_concern: session.read_concern,
                 write_concern: session.write_concern,
@@ -4462,6 +4504,7 @@ fn query_memory_limit_from_mib(text: &str) -> Result<u64, SessionSettingRefused>
     checked_query_memory_limit(bytes)
 }
 
+mod access;
 mod after_commit;
 mod blob;
 mod catalog;
@@ -4478,13 +4521,16 @@ mod namespaces;
 mod package;
 mod projection;
 mod state_cut;
+pub use access::AccessChange;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use blob::{BlobId, GroupMembers, UploadedBlob};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
 pub use changes::{ChangeInterest, ChangePage};
+pub use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole, PrincipalId};
 pub use coordinode_core::txn::command::{
     ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,
 };
+pub use coordinode_core::txn::proposal::GranteeName;
 pub use coordinode_storage::blob::gc::{
     CleanedUpReport, CompactionReport, GcPass, GcPolicy, GcStatus, Reconciliation,
 };

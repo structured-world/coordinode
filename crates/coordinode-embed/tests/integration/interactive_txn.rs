@@ -551,9 +551,23 @@ fn a_transaction_commits_only_at_the_node_version_it_read() {
 fn a_commit_carries_the_versions_its_caller_built_on() {
     use coordinode_core::graph::node::NodeId;
     use coordinode_embed::db::{CommitOptions, ExpectedVersion, StatementOptions};
-    use coordinode_embed::{ActingContext, DatabaseError, Principal, TransactionOptions};
+    use coordinode_embed::{
+        AccessChange, ActingContext, DatabaseError, GranteeName, NamespaceRole, Principal,
+        PrincipalId, TransactionOptions,
+    };
 
     let mut db = open_db();
+    // alice writes with the right a write needs; what is checked here is the
+    // version her commit names.
+    db.change_access(
+        &ActingContext::Trusted,
+        AccessChange::Grant {
+            namespace: "default".into(),
+            grantee: GranteeName::Principal(PrincipalId::new("alice", "idp").expect("principal")),
+            role: NamespaceRole::Writer,
+        },
+    )
+    .expect("grant alice writer");
     db.execute_cypher("CREATE (n:Account {balance: 100})")
         .expect("create");
     let account = NodeId::from_raw(1);

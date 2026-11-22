@@ -1452,6 +1452,11 @@ pub struct ExecutionContext<'a> {
     /// When `None`, legacy direct-write behavior is used (backward
     /// compatibility with tests that don't set up a pipeline).
     pub proposal_pipeline: Option<&'a dyn ProposalPipeline>,
+    /// The principal the statement acts for: every commit it makes, its
+    /// catalog changes and DDL entries included, names it and is applied
+    /// only where it holds the rights. `None` for the store's own work and
+    /// for an explicitly trusted caller.
+    pub actor: Option<coordinode_core::access::PrincipalId>,
     /// Proposal ID generator. Shared across all transactions on this node.
     pub proposal_id_gen: Option<&'a ProposalIdGenerator>,
     /// Read concern level for this query. Controls snapshot selection:
@@ -3782,6 +3787,11 @@ impl<'a> ExecutionContext<'a> {
             Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
             None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
         };
+        // A catalog change is the statement's and acts for its principal,
+        // checked where the log applies it like the statement's own writes.
+        if let Some(actor) = &self.actor {
+            txn.act_as(actor.clone());
+        }
         // What the change reads and stages is the statement's: charged to its
         // memory, so a change that does not fit is refused before its commit.
         txn.charge_writes_to(Some(std::sync::Arc::clone(&self.budget)));
@@ -7316,17 +7326,26 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             storage,
         } => crate::executor::namespaces::create(
             ctx.namespace_catalog,
+            ctx.actor.as_ref(),
             name,
             *if_not_exists,
             *storage,
         ),
 
-        LogicalOp::DropNamespace { name, if_exists } => {
-            crate::executor::namespaces::drop(ctx.namespace_catalog, name, *if_exists)
-        }
+        LogicalOp::DropNamespace { name, if_exists } => crate::executor::namespaces::drop(
+            ctx.namespace_catalog,
+            ctx.actor.as_ref(),
+            name,
+            *if_exists,
+        ),
 
         LogicalOp::SetNamespaceStorage { name, change } => {
-            crate::executor::namespaces::set_storage(ctx.namespace_catalog, name, *change)
+            crate::executor::namespaces::set_storage(
+                ctx.namespace_catalog,
+                ctx.actor.as_ref(),
+                name,
+                *change,
+            )
         }
 
         LogicalOp::ShowNamespaces => crate::executor::namespaces::show(ctx.namespace_catalog),

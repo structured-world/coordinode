@@ -1,11 +1,51 @@
 use super::*;
 
+use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole, PrincipalId};
 use coordinode_core::graph::types::VectorMetric;
+use coordinode_core::namespace::NamespaceId;
 use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
 use coordinode_core::schema::definition::{MAX_ARRAY_NESTING, PropertyType};
 
 fn txid() -> TransactionId {
     TransactionId::from_raw([0x2a; 16])
+}
+
+fn alice() -> PrincipalId {
+    PrincipalId::new("alice", "https://issuer.example").expect("a valid principal")
+}
+
+/// An access refusal on the wire whose principal or right this member cannot
+/// take is unreadable, never a refusal of another principal or right: a
+/// caller decides on both.
+#[test]
+fn an_access_refusal_this_member_cannot_take_is_unreadable() {
+    use wire::access_refused::Missing;
+    let refusal = |subject: &str, missing: Option<Missing>| {
+        wire::RoutedError {
+            kind: Some(Kind::AccessRefused(wire::AccessRefused {
+                subject: subject.into(),
+                trust_scope: "https://issuer.example".into(),
+                missing,
+            })),
+        }
+        .encode_to_vec()
+    };
+    let on = |role: i32| {
+        Some(Missing::Namespace(wire::NamespaceRight {
+            namespace_id: 1,
+            role,
+        }))
+    };
+    // A role this member does not know, and the unspecified role.
+    assert!(decode(&refusal("alice", on(99))).is_err());
+    assert!(decode(&refusal("alice", on(0))).is_err());
+    // No right named.
+    assert!(decode(&refusal("alice", None)).is_err());
+    // A principal no member admits: an empty subject, an overlong one.
+    let create = Some(Missing::CreateNamespace(wire::Empty {}));
+    assert!(decode(&refusal("", create)).is_err());
+    let overlong = "a".repeat(coordinode_core::access::MAX_PRINCIPAL_PART_BYTES + 1);
+    assert!(decode(&refusal(&overlong, create)).is_err());
 }
 
 /// One error of every variant an executing member can answer with, each with
@@ -316,6 +356,39 @@ fn every_variant() -> Vec<DatabaseError> {
             reason: "a namespace has a name".into(),
         },
         E::NamespaceInUse("tenant".into()),
+        E::AccessRefused(AccessRefusal {
+            principal: alice(),
+            missing: MissingRight::Namespace {
+                namespace: NamespaceId::from_raw(41),
+                role: NamespaceRole::Writer,
+            },
+        }),
+        E::AccessRefused(AccessRefusal {
+            principal: alice(),
+            missing: MissingRight::Namespace {
+                namespace: NamespaceId::from_raw(7),
+                role: NamespaceRole::Admin,
+            },
+        }),
+        E::AccessRefused(AccessRefusal {
+            principal: alice(),
+            missing: MissingRight::Namespace {
+                namespace: NamespaceId::from_raw(9),
+                role: NamespaceRole::Reader,
+            },
+        }),
+        E::AccessRefused(AccessRefusal {
+            principal: alice(),
+            missing: MissingRight::CreateNamespace,
+        }),
+        E::AccessRefused(AccessRefusal {
+            principal: alice(),
+            missing: MissingRight::DeploymentAdmin,
+        }),
+        E::NamespaceMismatch {
+            principal: "tenant-a".into(),
+            session: "tenant-b".into(),
+        },
         E::CapacityExhausted {
             endpoint_id: "hot".into(),
             used_bytes: 10,

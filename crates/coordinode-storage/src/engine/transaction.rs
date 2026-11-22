@@ -287,6 +287,10 @@ fn proposal_err_to_commit(err: ProposalError) -> CommitError {
         // the leader, and it needs the id to do that.
         ProposalError::NotLeader { leader_id } => CommitError::NotLeader { leader_id },
         ProposalError::Mismatched(m) => CommitError::Mismatched(m),
+        // Committed as a refusal: a definite outcome that changed nothing.
+        ProposalError::AccessRefused(refusal) => {
+            CommitError::Storage(StorageError::AccessRefused(refusal))
+        }
         // Nothing was proposed, and a new attempt takes a new timestamp: the
         // answer is the one to a conflict.
         e @ (ProposalError::BelowClosedBound { .. } | ProposalError::LeaderNotReady { .. }) => {
@@ -449,6 +453,9 @@ pub struct Transaction<'a> {
         coordinode_core::txn::operation::OperationId,
         coordinode_core::txn::operation::IntentDigest,
     )>,
+    /// The principal this transaction acts for ([`Self::act_as`]): its commit
+    /// names it, and every member checks the commit's grants against it.
+    actor: Option<coordinode_core::access::PrincipalId>,
     /// What this attempt's row changes mean to the change feed where they
     /// cannot say it themselves ([`Self::note_node_basis`],
     /// [`Self::note_removed_edge`]). Sealed with the unit.
@@ -583,6 +590,8 @@ pub struct TransactionState {
     budget_refusal: Option<coordinode_core::budget::BudgetStop>,
     /// Parked with the write buffer whose changes it describes.
     effects: EffectContext,
+    /// Parked: every statement of the transaction acts for its principal.
+    actor: Option<coordinode_core::access::PrincipalId>,
 }
 
 /// Bytes the write buffer holds for one staged key beside the key and value
@@ -778,8 +787,23 @@ impl<'a> Transaction<'a> {
             overlap_wait: None,
             kept_counts: rustc_hash::FxHashMap::default(),
             operation: None,
+            actor: None,
             effects: EffectContext::default(),
         }
+    }
+
+    /// Act for `principal`: the commit names it, and is applied only if the
+    /// principal holds every right it needs at the commit's place in the
+    /// log; otherwise it applies nothing and reports why
+    /// ([`StorageError::AccessRefused`]).
+    pub fn act_as(&mut self, principal: coordinode_core::access::PrincipalId) {
+        self.actor = Some(principal);
+    }
+
+    /// The principal this transaction acts for, if it acts for one.
+    #[must_use]
+    pub fn actor(&self) -> Option<&coordinode_core::access::PrincipalId> {
+        self.actor.as_ref()
     }
 
     /// Carry out client operation `op`, meaning `intent`, with this attempt:
@@ -983,6 +1007,7 @@ impl<'a> Transaction<'a> {
             post_state_checks: self.post_state_checks,
             budget_refusal: self.budget_refusal,
             effects: self.effects,
+            actor: self.actor,
         }
     }
 
@@ -1020,6 +1045,7 @@ impl<'a> Transaction<'a> {
             post_state_checks: std::mem::take(&mut self.post_state_checks),
             budget_refusal: self.budget_refusal.take(),
             effects: std::mem::take(&mut self.effects),
+            actor: self.actor.clone(),
         }
     }
 
@@ -1067,6 +1093,7 @@ impl<'a> Transaction<'a> {
             overlap_wait: None,
             kept_counts: rustc_hash::FxHashMap::default(),
             operation: None,
+            actor: state.actor,
             effects: state.effects,
         }
     }
@@ -2749,6 +2776,11 @@ impl<'a> Transaction<'a> {
         // One mutation list for both application paths below: proposed
         // through the pipeline, or applied directly at commit_ts.
         let mut mutations = self.seal_unit(wb);
+        // The principal first: the positions the sealed work names count
+        // after it, in the unit's body.
+        if let Some(actor) = &self.actor {
+            mutations.insert(0, Mutation::Actor(actor.clone()));
+        }
         // The records keyed by this commit, now that it has its timestamp,
         // after the sealed work whose record sources name earlier positions,
         // in a fixed order.

@@ -8,9 +8,11 @@
 //! decoded, and only free text is cut to fit; a field a caller decides on is
 //! carried whole or the failure is reported as unreadable.
 
+use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole, PrincipalId};
 use coordinode_core::budget::BudgetStop;
 use coordinode_core::graph::types::VectorMetric;
 use coordinode_core::group::DeploymentId;
+use coordinode_core::namespace::NamespaceId;
 use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
 use coordinode_core::schema::definition::{ConstraintKind, MAX_ARRAY_NESTING, PropertyType};
 use coordinode_core::txn::command::TransactionId;
@@ -121,6 +123,8 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::NamespaceExists(_) => "NamespaceExists",
         E::NamespaceRefused { .. } => "NamespaceRefused",
         E::NamespaceInUse(_) => "NamespaceInUse",
+        E::AccessRefused(_) => "AccessRefused",
+        E::NamespaceMismatch { .. } => "NamespaceMismatch",
         E::Mismatched(_) => "Mismatched",
         E::SettingsRefused(_) => "SettingsRefused",
         E::ReadFence { .. } => "ReadFence",
@@ -271,6 +275,55 @@ pub(super) fn outcome_from_wire(outcome: &wire::RoutedOutcome) -> Result<Operati
             ));
         }
     })
+}
+
+fn access_refusal_to_wire(refusal: AccessRefusal) -> wire::AccessRefused {
+    use wire::access_refused::Missing;
+    let missing = match refusal.missing {
+        MissingRight::Namespace { namespace, role } => Missing::Namespace(wire::NamespaceRight {
+            namespace_id: namespace.as_raw(),
+            role: match role {
+                NamespaceRole::Reader => wire::NamespaceRole::Reader,
+                NamespaceRole::Writer => wire::NamespaceRole::Writer,
+                NamespaceRole::Admin => wire::NamespaceRole::Admin,
+            }
+            .into(),
+        }),
+        MissingRight::CreateNamespace => Missing::CreateNamespace(wire::Empty {}),
+        MissingRight::DeploymentAdmin => Missing::DeploymentAdmin(wire::Empty {}),
+    };
+    wire::AccessRefused {
+        subject: refusal.principal.subject.to_string(),
+        trust_scope: refusal.principal.trust_scope.to_string(),
+        missing: Some(missing),
+    }
+}
+
+/// The refusal `r` carries; its principal is checked as a member admits one,
+/// and a right or role this member does not know is an error.
+fn access_refusal_from_wire(r: wire::AccessRefused) -> Result<AccessRefusal, String> {
+    use wire::access_refused::Missing;
+    let principal =
+        PrincipalId::new(&r.subject, &r.trust_scope).map_err(|e| format!("access_refused: {e}"))?;
+    let missing = match r.missing.ok_or("access_refused: no right named")? {
+        Missing::Namespace(n) => MissingRight::Namespace {
+            namespace: NamespaceId::from_raw(n.namespace_id),
+            role: match wire::NamespaceRole::try_from(n.role) {
+                Ok(wire::NamespaceRole::Reader) => NamespaceRole::Reader,
+                Ok(wire::NamespaceRole::Writer) => NamespaceRole::Writer,
+                Ok(wire::NamespaceRole::Admin) => NamespaceRole::Admin,
+                Ok(wire::NamespaceRole::Unspecified) | Err(_) => {
+                    return Err(format!(
+                        "access_refused: a namespace role {} this member does not know",
+                        n.role
+                    ));
+                }
+            },
+        },
+        Missing::CreateNamespace(_) => MissingRight::CreateNamespace,
+        Missing::DeploymentAdmin(_) => MissingRight::DeploymentAdmin,
+    };
+    Ok(AccessRefusal { principal, missing })
 }
 
 fn procedure_to_wire(refusal: ProcedureError) -> wire::ProcedureRefused {
@@ -600,6 +653,10 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             reason: cut(reason),
         }),
         E::NamespaceInUse(name) => Kind::NamespaceInUse(text(name)),
+        E::AccessRefused(refusal) => Kind::AccessRefused(access_refusal_to_wire(refusal)),
+        E::NamespaceMismatch { principal, session } => {
+            Kind::NamespaceMismatch(wire::NamespaceMismatch { principal, session })
+        }
         E::CapacityExhausted {
             endpoint_id,
             used_bytes,
@@ -1010,6 +1067,11 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             reason: r.reason,
         },
         Kind::NamespaceInUse(name) => E::NamespaceInUse(name.message),
+        Kind::AccessRefused(r) => E::AccessRefused(access_refusal_from_wire(r)?),
+        Kind::NamespaceMismatch(m) => E::NamespaceMismatch {
+            principal: m.principal,
+            session: m.session,
+        },
         Kind::CapacityExhausted(c) => E::CapacityExhausted {
             endpoint_id: c.endpoint_id,
             used_bytes: c.used_bytes,

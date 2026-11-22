@@ -123,6 +123,31 @@ impl std::fmt::Display for Request {
 pub struct Response {
     /// Number of mutations applied.
     pub mutations_applied: usize,
+    /// The proposals of the entry, by position, that applied as a refusal
+    /// because their principal lacked a right, each with the refusal's
+    /// encoded bytes ([`coordinode_core::access::AccessRefusal::encode`]).
+    pub refused: Vec<(u32, Vec<u8>)>,
+}
+
+impl Response {
+    /// A response that applied `count` mutations and refused nothing.
+    #[must_use]
+    pub fn applied(count: usize) -> Self {
+        Self {
+            mutations_applied: count,
+            refused: Vec::new(),
+        }
+    }
+
+    /// Why the proposal at position `sub` of the entry was refused, if it
+    /// was.
+    #[must_use]
+    pub fn refusal_of(&self, sub: u32) -> Option<coordinode_core::access::AccessRefusal> {
+        self.refused
+            .iter()
+            .find(|(at, _)| *at == sub)
+            .and_then(|(_, bytes)| coordinode_core::access::AccessRefusal::decode(bytes))
+    }
 }
 
 impl std::fmt::Display for Response {
@@ -1789,6 +1814,9 @@ struct DedupEntry {
     size: usize,
     /// When this proposal was last seen (for GC).
     seen: Instant,
+    /// The refusal its first apply decided, encoded: a duplicate answers
+    /// the same.
+    refused: Option<Vec<u8>>,
 }
 
 /// The version pairs a group recorded, oldest first. A handful over the life
@@ -2399,6 +2427,7 @@ impl CoordinodeStateMachine {
                 );
                 return Ok(Response {
                     mutations_applied: 0,
+                    refused: entry.refused.iter().map(|r| (sub, r.clone())).collect(),
                 });
             }
         }
@@ -2435,6 +2464,18 @@ impl CoordinodeStateMachine {
         {
             oracle.advance_to(proposal.commit_ts);
         }
+        // A unit acting for a principal may have applied as a refusal: its
+        // proposer is told why, from the mark the apply left.
+        let refused = if coordinode_core::txn::proposal::actor_of(&proposal.mutations).is_some() {
+            coordinode_storage::engine::access::unit_refusal(
+                &self.engine,
+                coordinode_core::txn::operation::LogPosition { index, sub },
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .map(|refusal| refusal.encode())
+        } else {
+            None
+        };
 
         // Record in dedup map
         if !bound {
@@ -2447,6 +2488,7 @@ impl CoordinodeStateMachine {
                 DedupEntry {
                     size: proposal_size,
                     seen: Instant::now(),
+                    refused: refused.clone(),
                 },
             );
         }
@@ -2456,6 +2498,7 @@ impl CoordinodeStateMachine {
 
         Ok(Response {
             mutations_applied: count,
+            refused: refused.into_iter().map(|r| (sub, r)).collect(),
         })
     }
 
@@ -2658,6 +2701,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             let response = match &entry.payload {
                 openraft::entry::EntryPayload::Normal(request) => {
                     let mut total = 0;
+                    let mut refused = Vec::new();
                     let mut records_pair = false;
                     let mut records_deployment = false;
                     for (sub, proposal) in request.proposals.iter().enumerate() {
@@ -2666,6 +2710,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                         })?;
                         let r = self.apply_proposal_under(proposal, index, sub, &gate.applies)?;
                         total += r.mutations_applied;
+                        refused.extend(r.refused);
                         self.applied_commit_ts.fetch_max(
                             proposal.commit_ts.as_raw(),
                             core::sync::atomic::Ordering::Release,
@@ -2701,11 +2746,10 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                     self.apply_closure(request.closed_below, index, sub, &gate.applies)?;
                     Response {
                         mutations_applied: total,
+                        refused,
                     }
                 }
-                _ => Response {
-                    mutations_applied: 0,
-                },
+                _ => Response::applied(0),
             };
 
             *self

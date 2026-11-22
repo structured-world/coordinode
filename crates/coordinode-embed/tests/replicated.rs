@@ -2485,6 +2485,84 @@ async fn a_routed_write_takes_effect_once_across_a_leader_change() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A write routed from a follower is authorized where the leader's log
+/// applies it: once a revocation is in the log, the principal's next write
+/// through the follower is refused with the typed refusal naming it and the
+/// role it lacked, and changes nothing on any member.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revocation_refuses_the_next_write_routed_from_a_follower() {
+    use coordinode_core::txn::command::Principal;
+    use coordinode_embed::{AccessChange, GranteeName, MissingRight, NamespaceRole, PrincipalId};
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let bob_id = PrincipalId::new("bob", "idp").expect("principal");
+        let bob = ActingContext::Principal(Principal {
+            subject: "bob".into(),
+            trust_scope: "idp".into(),
+            namespace: "default".into(),
+        });
+        let change = |change: AccessChange| {
+            members[0]
+                .database()
+                .read()
+                .change_access(&ActingContext::Trusted, change)
+        };
+        let write = |n: i64| Statement {
+            actor: bob.clone(),
+            ..Statement::new(format!("CREATE (:Routed {{n: {n}}})"))
+        };
+
+        change(AccessChange::Grant {
+            namespace: "default".into(),
+            grantee: GranteeName::Principal(bob_id.clone()),
+            role: NamespaceRole::Writer,
+        })
+        .expect("grant bob writer");
+        members[1]
+            .ingress()
+            .execute(write(1))
+            .await
+            .expect("bob writes through follower 2");
+
+        change(AccessChange::Revoke {
+            namespaces: vec!["default".into()],
+            grantee: GranteeName::Principal(bob_id.clone()),
+        })
+        .expect("revoke bob");
+        match members[1].ingress().execute(write(2)).await {
+            Err(DatabaseError::AccessRefused(refusal)) => {
+                assert_eq!(refusal.principal, bob_id);
+                assert!(
+                    matches!(
+                        refusal.missing,
+                        MissingRight::Namespace {
+                            role: NamespaceRole::Writer,
+                            ..
+                        }
+                    ),
+                    "{refusal:?}"
+                );
+            }
+            other => panic!("expected bob refused after the revocation, got {other:?}"),
+        }
+
+        for m in &members {
+            wait_until("the first write reaches every member", || {
+                count(m, "Routed") == 1
+            })
+            .await;
+        }
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A transaction belongs to the caller that opened it, whichever member a
 /// command comes through: a command acting for another subject, issuer or
 /// namespace under the same ID is refused as if no such transaction were
@@ -2505,7 +2583,23 @@ async fn a_transaction_answers_only_the_caller_that_opened_it() {
                 namespace: namespace.into(),
             })
         };
-        let alice = acting("alice", "idp", "app");
+        let alice = acting("alice", "idp", "default");
+        // alice writes with the right a write needs; what is checked here is
+        // that her transaction answers nobody else.
+        members[0]
+            .database()
+            .read()
+            .change_access(
+                &ActingContext::Trusted,
+                coordinode_embed::AccessChange::Grant {
+                    namespace: "default".into(),
+                    grantee: coordinode_embed::GranteeName::Principal(
+                        coordinode_embed::PrincipalId::new("alice", "idp").expect("principal"),
+                    ),
+                    role: coordinode_embed::NamespaceRole::Writer,
+                },
+            )
+            .expect("grant alice writer");
         let id = draw_transaction_id();
         let as_actor = |actor: &ActingContext, query: &str| RoutedStatement {
             actor: actor.clone(),
@@ -2541,8 +2635,8 @@ async fn a_transaction_answers_only_the_caller_that_opened_it() {
             .expect("alice writes");
 
         for intruder in [
-            acting("mallory", "idp", "app"),
-            acting("alice", "other-idp", "app"),
+            acting("mallory", "idp", "default"),
+            acting("alice", "other-idp", "default"),
             acting("alice", "idp", "other-app"),
             ActingContext::Trusted,
         ] {

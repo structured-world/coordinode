@@ -634,6 +634,7 @@ impl Database {
         if timeout_outcome == TimeoutOutcome::Commit && options.operation.is_none() {
             return Err(DatabaseError::OperationRequired(id));
         }
+        let principal = self.statement_principal(options.actor.as_ref())?;
         self.reap_idle_transactions(self.interactive_idle_timeout);
         let tenure = self.interactive.current()?;
         let read_concern = options.read_concern.unwrap_or(self.read_concern);
@@ -699,6 +700,10 @@ impl Database {
                 read_ts,
             )
         };
+        // Its commit acts for the principal it was begun for.
+        if let Some(principal) = principal {
+            txn.act_as(principal);
+        }
         let state = txn.take_state();
         // Every statement reads this snapshot, so a causal bound past it is
         // refused here rather than answered from before it. The snapshot,
@@ -845,6 +850,8 @@ impl Database {
             budget: self.options_budget(options).map_err(failed)?,
             // The transaction's commit carries its operation.
             operation: None,
+            // Its parked state carries the principal it was begun for.
+            actor: None,
         };
         // The chain a commit of the transaction binds as its intent: every
         // statement it ran, in order.

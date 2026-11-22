@@ -536,6 +536,23 @@ pub enum DatabaseError {
     #[error("namespace {0} is the one this session works in")]
     NamespaceInUse(String),
 
+    /// The principal lacked a right at the write's place in the log: the
+    /// write committed as a refusal and changed nothing. Names the
+    /// principal, and the namespace with the least role that would have
+    /// sufficed, or the deployment right.
+    #[error("access refused: {0}")]
+    AccessRefused(coordinode_core::access::AccessRefusal),
+
+    /// A statement acted for a principal bound to another namespace than the
+    /// one this database works in. Nothing ran.
+    #[error("the principal is bound to namespace {principal}, this session works in {session}")]
+    NamespaceMismatch {
+        /// The namespace the principal is bound to.
+        principal: String,
+        /// The namespace this session works in.
+        session: String,
+    },
+
     /// The write reached a member that does not run its group's version: it
     /// is read-only. Nothing was applied. Names both versions and the leader
     /// when known.
@@ -829,6 +846,7 @@ impl From<StorageError> for DatabaseError {
                 oldest_readable: watermark - 1,
             },
             StorageError::IndexEntry(entry) => Self::IndexEntry(entry),
+            StorageError::AccessRefused(refusal) => Self::AccessRefused(refusal),
             // A read stopped by its memory budget, as one through a store is.
             StorageError::Budget(stop) => Self::Budget(stop),
             other => Self::Storage(StorageFailure {

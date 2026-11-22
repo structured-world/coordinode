@@ -417,21 +417,33 @@ pub fn run_operation(
     })
 }
 
-/// Run an admitted autonomous statement on `db` and answer with its result.
+/// Run an admitted autonomous statement on `db`, acting for `actor`, and
+/// answer with its result.
 ///
 /// # Errors
 ///
 /// What the statement failed with.
 pub fn run_admitted(
     db: &Database,
+    actor: &ActingContext,
     query: &str,
     params: HashMap<String, Value>,
     source: Option<&coordinode_query::advisor::source::SourceContext>,
     admitted: &Admitted,
 ) -> Result<RoutedAnswer, DatabaseError> {
     let params = (!params.is_empty()).then_some(params);
-    let result = db.execute_cypher_shared_with(query, params, source, &admitted.options())?;
+    let result = db.execute_cypher_shared_with(query, params, source, &acting(admitted, actor))?;
     Ok(answer(&result, admitted))
+}
+
+/// The settings `admitted` runs under, acting for `actor`: every commit of
+/// the statement names that principal and is applied only where it holds
+/// the rights.
+fn acting(admitted: &Admitted, actor: &ActingContext) -> StatementOptions {
+    StatementOptions {
+        actor: Some(actor.clone()),
+        ..admitted.options()
+    }
 }
 
 /// [`run_admitted`] writing its rows to `answer`: a read that pages is
@@ -443,6 +455,7 @@ pub fn run_admitted(
 /// What the statement failed with.
 pub fn write_admitted(
     database: &RwLock<Database>,
+    actor: &ActingContext,
     query: &str,
     params: HashMap<String, Value>,
     source: Option<&coordinode_query::advisor::source::SourceContext>,
@@ -453,10 +466,12 @@ pub fn write_admitted(
     if database.read().keyset_pageable(query) {
         return write_paged(database, query, params, source, admitted, answer);
     }
-    let result =
-        database
-            .read()
-            .execute_cypher_shared_with(query, params, source, &admitted.options())?;
+    let result = database.read().execute_cypher_shared_with(
+        query,
+        params,
+        source,
+        &acting(admitted, actor),
+    )?;
     write_rows(&result.rows, answer);
     Ok(stats(&result.write_stats, admitted))
 }
@@ -518,6 +533,7 @@ impl CommandExecutor for MemberCommandExecutor {
             };
         write_admitted(
             self.admitter.database()?,
+            &statement.actor,
             &statement.query,
             statement.params,
             statement.source.as_ref(),
@@ -644,6 +660,7 @@ impl PreparedRouted for MemberFenced {
         } = *self;
         write_admitted(
             admitter.database()?,
+            &statement.actor,
             &statement.query,
             statement.params,
             statement.source.as_ref(),

@@ -76,6 +76,7 @@ fn make_test_ctx<'a>(
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
         proposal_pipeline: None,
+        actor: None,
         proposal_id_gen: None,
         read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Local,
         write_concern: coordinode_core::txn::write_concern::WriteConcern::majority(),

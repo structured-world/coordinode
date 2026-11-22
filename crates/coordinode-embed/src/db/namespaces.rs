@@ -6,8 +6,9 @@
 //! write, so a member of a group changes the catalog through the group's log
 //! and every member applies it in the same order.
 
+use coordinode_core::access::PrincipalId;
 use coordinode_core::namespace::{NamespaceState, NamespaceStorage, validate_namespace_name};
-use coordinode_core::txn::proposal::{MetadataCommand, Mutation};
+use coordinode_core::txn::proposal::MetadataCommand;
 use coordinode_query::executor::namespaces::{CatalogFailure, CatalogOutcome, NamespaceEntry};
 use coordinode_storage::engine::metadata;
 
@@ -99,6 +100,18 @@ impl Database {
         name: &str,
         storage: NamespaceStorage,
     ) -> Result<(), DatabaseError> {
+        self.create_namespace_as(None, name, storage)
+    }
+
+    /// [`Self::create_namespace_with`] acting for `actor`: a principal
+    /// creates only with the right to create namespaces, and becomes admin of
+    /// what it created in the same change.
+    fn create_namespace_as(
+        &self,
+        actor: Option<PrincipalId>,
+        name: &str,
+        storage: NamespaceStorage,
+    ) -> Result<(), DatabaseError> {
         validate_namespace_name(name).map_err(|e| DatabaseError::NamespaceRefused {
             name: name.to_owned(),
             reason: e.to_string(),
@@ -110,11 +123,14 @@ impl Database {
         // The token tells this creation's record from a concurrent one of
         // the same name, which the log orders first and this one then loses.
         let token = metadata::namespace_token();
-        self.propose_mutation(Mutation::Command(MetadataCommand::CreateNamespace {
-            name: name.to_owned(),
-            token,
-            storage,
-        }))?;
+        self.propose_command_as(
+            actor,
+            MetadataCommand::CreateNamespace {
+                name: name.to_owned(),
+                token,
+                storage,
+            },
+        )?;
         let id = metadata::namespace_by_name(deployment, name)?
             .ok_or_else(|| DatabaseError::NamespaceExists(name.to_owned()))?;
         match metadata::namespace_record(deployment, id)? {
@@ -132,6 +148,16 @@ impl Database {
     /// name; [`DatabaseError::NamespaceInUse`] for the namespace this handle
     /// works in, which is dropped from another; the write path's errors.
     pub fn drop_namespace(&self, name: &str) -> Result<(), DatabaseError> {
+        self.drop_namespace_as(None, name)
+    }
+
+    /// [`Self::drop_namespace`] acting for `actor`, which needs admin on the
+    /// namespace.
+    fn drop_namespace_as(
+        &self,
+        actor: Option<PrincipalId>,
+        name: &str,
+    ) -> Result<(), DatabaseError> {
         let deployment = self.engine.deployment();
         let Some(id) = metadata::namespace_by_name(deployment, name)? else {
             return Err(DatabaseError::UnknownNamespace(name.to_owned()));
@@ -141,9 +167,12 @@ impl Database {
         if id == self.engine.namespace() {
             return Err(DatabaseError::NamespaceInUse(name.to_owned()));
         }
-        self.propose_mutation(Mutation::Command(MetadataCommand::DropNamespace {
-            name: name.to_owned(),
-        }))?;
+        self.propose_command_as(
+            actor,
+            MetadataCommand::DropNamespace {
+                name: name.to_owned(),
+            },
+        )?;
         // A concurrent drop of the same namespace the log ordered first
         // leaves the same outcome: the namespace is gone.
         Ok(())
@@ -163,13 +192,27 @@ impl Database {
         name: &str,
         change: NamespaceStorage,
     ) -> Result<(), DatabaseError> {
+        self.set_namespace_storage_as(None, name, change)
+    }
+
+    /// [`Self::set_namespace_storage`] acting for `actor`, which needs admin
+    /// on the namespace.
+    fn set_namespace_storage_as(
+        &self,
+        actor: Option<PrincipalId>,
+        name: &str,
+        change: NamespaceStorage,
+    ) -> Result<(), DatabaseError> {
         if metadata::namespace_by_name(self.engine.deployment(), name)?.is_none() {
             return Err(DatabaseError::UnknownNamespace(name.to_owned()));
         }
-        self.propose_mutation(Mutation::Command(MetadataCommand::SetNamespaceStorage {
-            name: name.to_owned(),
-            change,
-        }))
+        self.propose_command_as(
+            actor,
+            MetadataCommand::SetNamespaceStorage {
+                name: name.to_owned(),
+                change,
+            },
+        )
     }
 
     /// Close the trees of every namespace of the deployment that no handle
@@ -208,10 +251,11 @@ impl Database {
 impl coordinode_query::executor::namespaces::NamespaceCatalog for Database {
     fn create_namespace(
         &self,
+        actor: Option<&PrincipalId>,
         name: &str,
         storage: NamespaceStorage,
     ) -> Result<CatalogOutcome, CatalogFailure> {
-        match Database::create_namespace_with(self, name, storage) {
+        match self.create_namespace_as(actor.cloned(), name, storage) {
             Ok(()) => Ok(CatalogOutcome::Changed),
             Err(DatabaseError::NamespaceExists(_)) => Ok(CatalogOutcome::AlreadySo),
             Err(e) => Err(Box::new(e)),
@@ -220,14 +264,19 @@ impl coordinode_query::executor::namespaces::NamespaceCatalog for Database {
 
     fn set_namespace_storage(
         &self,
+        actor: Option<&PrincipalId>,
         name: &str,
         change: NamespaceStorage,
     ) -> Result<(), CatalogFailure> {
-        Ok(Database::set_namespace_storage(self, name, change)?)
+        Ok(self.set_namespace_storage_as(actor.cloned(), name, change)?)
     }
 
-    fn drop_namespace(&self, name: &str) -> Result<CatalogOutcome, CatalogFailure> {
-        match Database::drop_namespace(self, name) {
+    fn drop_namespace(
+        &self,
+        actor: Option<&PrincipalId>,
+        name: &str,
+    ) -> Result<CatalogOutcome, CatalogFailure> {
+        match self.drop_namespace_as(actor.cloned(), name) {
             Ok(()) => Ok(CatalogOutcome::Changed),
             Err(DatabaseError::UnknownNamespace(_)) => Ok(CatalogOutcome::AlreadySo),
             Err(e) => Err(Box::new(e)),

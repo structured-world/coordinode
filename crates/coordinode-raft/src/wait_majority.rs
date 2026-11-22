@@ -403,8 +403,17 @@ async fn submit_batch(
                 )
                 .increment(1);
                 metrics::histogram!("coordinode_raft_batch_duration_seconds").record(elapsed);
-                for entry in batch {
-                    let _ = entry.response_tx.send(Ok(()));
+                // A proposal's position in the entry is its place in the
+                // batch: the entry carries them in this order.
+                for (sub, entry) in batch.into_iter().enumerate() {
+                    let answer = match u32::try_from(sub)
+                        .ok()
+                        .and_then(|sub| response.data.refusal_of(sub))
+                    {
+                        Some(refusal) => Err(ProposalError::AccessRefused(refusal)),
+                        None => Ok(()),
+                    };
+                    let _ = entry.response_tx.send(answer);
                 }
                 return;
             }

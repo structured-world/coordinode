@@ -22,6 +22,20 @@ fn principal(subject: &str) -> ActingContext {
     })
 }
 
+/// Grant `subject` of the `host` scope `role` on the default namespace, as
+/// the store's own work.
+fn grant(db: &Database, subject: &str, role: coordinode_core::access::NamespaceRole) {
+    use coordinode_core::access::PrincipalId;
+    use coordinode_core::txn::proposal::{GranteeName, MetadataCommand, Mutation};
+    let principal = PrincipalId::new(subject, "host").expect("a valid principal");
+    db.propose_mutation(Mutation::Command(MetadataCommand::GrantAccess {
+        namespace: "default".into(),
+        grantee: GranteeName::Principal(principal),
+        role,
+    }))
+    .expect("grant");
+}
+
 fn count(db: &Database, label: &str) -> usize {
     db.execute_cypher_shared(
         &format!("MATCH (n:{label}) RETURN n"),
@@ -1098,6 +1112,9 @@ fn another_caller_cannot_use_a_transaction() {
         );
     }
 
+    // The owner writes with the rights a write needs; bob's refusals above
+    // are for the transaction he does not own, whatever his rights.
+    grant(&db, "alice", coordinode_core::access::NamespaceRole::Writer);
     db.execute_in_transaction_with(id, "CREATE (:Owned {k: 1})", None, &as_alice)
         .expect("the owner's statement");
     db.commit_transaction_with(

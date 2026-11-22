@@ -358,6 +358,8 @@ impl Database {
             after_commit_generation: 0,
             budget: super::statement_budget(self.query_memory_limit, None, None),
             operation: None,
+            // The host's own typed catalog call.
+            actor: None,
         };
         self.run_plan(
             Statement {

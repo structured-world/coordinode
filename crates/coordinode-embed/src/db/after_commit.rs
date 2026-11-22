@@ -389,6 +389,9 @@ impl Database {
             // client deadline to inherit.
             budget: super::statement_budget(self.query_memory_limit, None, None),
             operation: None,
+            // A trigger body is the store's own work under the definition
+            // an admin of the namespace published.
+            actor: None,
         };
         let params = if params.is_empty() {
             None

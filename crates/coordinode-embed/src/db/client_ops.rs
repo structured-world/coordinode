@@ -250,6 +250,11 @@ impl Database {
 
     /// Commit the command `mutation` through the write pipeline on its own.
     pub(super) fn propose_mutation(&self, mutation: Mutation) -> Result<(), DatabaseError> {
+        self.propose_mutations(vec![mutation])
+    }
+
+    /// Commit `mutations` as one unit through the write pipeline.
+    pub(super) fn propose_mutations(&self, mutations: Vec<Mutation>) -> Result<(), DatabaseError> {
         // Held as not yet logged until the entry is handed over, so no
         // closed bound passes over it meanwhile.
         let (commit_ts, held) = self
@@ -258,7 +263,7 @@ impl Database {
             .obligate(|| self.oracle.next().as_raw());
         let proposal = RaftProposal {
             id: self.proposal_id_gen.next(),
-            mutations: vec![mutation],
+            mutations,
             commit_ts: Timestamp::from_raw(commit_ts),
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: true,
@@ -271,6 +276,7 @@ impl Database {
             .map_err(|e| match e {
                 ProposalError::NotLeader { leader_id } => DatabaseError::NotLeader { leader_id },
                 ProposalError::Mismatched(m) => DatabaseError::Mismatched(m),
+                ProposalError::AccessRefused(refusal) => DatabaseError::AccessRefused(refusal),
                 other => DatabaseError::Other(format!("operation record: {other}")),
             })
     }

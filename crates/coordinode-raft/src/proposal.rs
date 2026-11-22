@@ -562,6 +562,10 @@ impl RaftProposalPipeline {
                         committed_index,
                         "raft proposal committed"
                     );
+                    // The entry carries this one proposal, at position 0.
+                    if let Some(refusal) = response.data.refusal_of(0) {
+                        return Err(ProposalError::AccessRefused(refusal));
+                    }
                     // The committed log index is this write's faithful causal
                     // `operationTime` — surfaced so the gRPC layer returns it
                     // instead of sampling the node's current applied index.

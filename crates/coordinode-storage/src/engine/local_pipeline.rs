@@ -43,6 +43,7 @@ pub fn storage_to_proposal_err(e: StorageError) -> ProposalError {
             available_bytes,
             min_free_bytes,
         },
+        StorageError::AccessRefused(refusal) => ProposalError::AccessRefused(refusal),
         other => ProposalError::Storage(other.to_string()),
     }
 }

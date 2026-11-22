@@ -175,13 +175,21 @@ impl Ingress {
             .then(|| statement.clone());
         let db = self.database(&namespace)?;
         let Statement {
+            actor,
             query,
             params,
             source,
             ..
         } = statement;
         let ran = blocking(move || {
-            executor::run_admitted(&db.read(), &query, params, source.as_ref(), &admitted)
+            executor::run_admitted(
+                &db.read(),
+                &actor,
+                &query,
+                params,
+                source.as_ref(),
+                &admitted,
+            )
         })
         .await;
         match (ran, retry) {

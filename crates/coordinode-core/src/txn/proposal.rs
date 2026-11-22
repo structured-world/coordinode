@@ -250,6 +250,17 @@ pub fn decided_at_apply(mutations: &[Mutation]) -> bool {
             .any(|m| matches!(m, Mutation::Operation(_)))
 }
 
+/// The operations of a unit after its acting principal: what applies once
+/// the principal's grants are checked, and what the positions DERIVED work
+/// names count in.
+#[must_use]
+pub fn unit_body(mutations: &[Mutation]) -> &[Mutation] {
+    match mutations.split_first() {
+        Some((Mutation::Actor(_), rest)) => rest,
+        _ => mutations,
+    }
+}
+
 /// The principal `mutations` act for, if they name one.
 #[must_use]
 pub fn actor_of(mutations: &[Mutation]) -> Option<&crate::access::PrincipalId> {
@@ -1037,6 +1048,13 @@ pub enum ProposalError {
     /// Storage-level error during apply.
     #[error("storage error: {0}")]
     Storage(String),
+
+    /// The unit's principal lacked a right at the unit's place in the log:
+    /// it committed as a refusal and changed nothing. Definite, not of
+    /// unknown outcome: a retry of the same unit is refused alike while the
+    /// grants stay as they are.
+    #[error("access refused: {0}")]
+    AccessRefused(crate::access::AccessRefusal),
 
     /// A targeted storage endpoint reached its hard limit and is no
     /// longer accepting writes. Carries the endpoint id and limit

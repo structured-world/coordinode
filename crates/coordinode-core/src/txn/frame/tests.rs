@@ -1141,6 +1141,32 @@ fn the_acting_principal_round_trips_as_the_first_operation() {
     assert_eq!(rows.mutations, unit.mutations);
 }
 
+/// DERIVED work in a unit acting for a principal names its record source by
+/// its position in the unit's body, after the principal: what the apply
+/// resolves once the principal is checked and left out.
+#[test]
+fn derived_sources_count_after_the_acting_principal() {
+    let mut mutations = vec![actor("alice")];
+    mutations.extend(crate::txn::proposal::in_namespace(
+        NS,
+        [
+            put(PartitionId::Node, b"node:1:42", b"record-bytes"),
+            derive(42, DerivedSource::UnitRecord(1)),
+        ],
+    ));
+    let unit = unnamed(mutations);
+    check_proposal(&unit).expect("checks");
+    let frame = encode_proposal(&unit).expect("encode");
+    assert_eq!(decode(&frame).expect("decode"), unit);
+    // Counted from the start of the whole unit, the source names the marker.
+    let mut wrong = unit.clone();
+    wrong.mutations[3] = derive(42, DerivedSource::UnitRecord(2));
+    assert!(matches!(
+        encode_proposal(&wrong),
+        Err(FrameError::BadSource { .. })
+    ));
+}
+
 /// A unit acts for one principal: a second one, or one after the unit's
 /// first operation, is refused by the encoder before the unit reaches a log
 /// and by the decoder of a frame that carries one anyway. Otherwise the

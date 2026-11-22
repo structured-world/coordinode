@@ -793,10 +793,11 @@ fn check_runs(runs: &[u32], earlier: &[Mutation]) -> Result<(), FrameError> {
     }
 }
 
-/// Whether the operation at `ordinal` of `earlier` puts a node record.
+/// Whether the operation at `ordinal` of `earlier` puts a node record,
+/// counted in the unit's body after its acting principal.
 fn names_record(earlier: &[Mutation], ordinal: u32) -> bool {
     matches!(
-        earlier.get(ordinal as usize),
+        super::proposal::unit_body(earlier).get(ordinal as usize),
         Some(Mutation::Put {
             partition: PartitionId::Node,
             ..

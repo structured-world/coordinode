@@ -6,6 +6,7 @@
 //! statement commits it through its own catalog path ([`NamespaceCatalog`]),
 //! the one its embedded API uses too.
 
+use coordinode_core::access::PrincipalId;
 use coordinode_core::graph::types::Value;
 
 use super::row::Row;
@@ -47,40 +48,46 @@ pub enum CatalogOutcome {
 )]
 pub trait NamespaceCatalog: Send + Sync {
     /// Create namespace `name` with the data-block storage settings
-    /// `storage`. [`CatalogOutcome::AlreadySo`] when a live namespace holds
-    /// the name.
+    /// `storage`, acting for `actor`. [`CatalogOutcome::AlreadySo`] when a
+    /// live namespace holds the name.
     ///
     /// # Errors
     ///
-    /// The host's refusal: a name no namespace may have, a write it could
-    /// not commit.
+    /// The host's refusal: a name no namespace may have, a principal without
+    /// the right to create namespaces, a write it could not commit.
     fn create_namespace(
         &self,
+        actor: Option<&PrincipalId>,
         name: &str,
         storage: coordinode_core::namespace::NamespaceStorage,
     ) -> Result<CatalogOutcome, CatalogFailure>;
 
     /// Change the storage settings `change` names of the live namespace
-    /// `name`, keeping the others.
+    /// `name`, keeping the others, acting for `actor`.
     ///
     /// # Errors
     ///
-    /// The host's refusal: no live namespace of the name, a write it could
-    /// not commit.
+    /// The host's refusal: no live namespace of the name, a principal
+    /// without admin on it, a write it could not commit.
     fn set_namespace_storage(
         &self,
+        actor: Option<&PrincipalId>,
         name: &str,
         change: coordinode_core::namespace::NamespaceStorage,
     ) -> Result<(), CatalogFailure>;
 
-    /// Drop namespace `name`. [`CatalogOutcome::AlreadySo`] when no live
-    /// namespace has the name.
+    /// Drop namespace `name`, acting for `actor`.
+    /// [`CatalogOutcome::AlreadySo`] when no live namespace has the name.
     ///
     /// # Errors
     ///
-    /// The host's refusal: the namespace the statement runs in, a write it
-    /// could not commit.
-    fn drop_namespace(&self, name: &str) -> Result<CatalogOutcome, CatalogFailure>;
+    /// The host's refusal: the namespace the statement runs in, a principal
+    /// without admin on it, a write it could not commit.
+    fn drop_namespace(
+        &self,
+        actor: Option<&PrincipalId>,
+        name: &str,
+    ) -> Result<CatalogOutcome, CatalogFailure>;
 
     /// The catalog's namespaces, in creation order.
     ///
@@ -103,12 +110,13 @@ fn catalog(
 /// whether the statement created it.
 pub(crate) fn create(
     host: Option<&dyn NamespaceCatalog>,
+    actor: Option<&PrincipalId>,
     name: &str,
     if_not_exists: bool,
     storage: coordinode_core::namespace::NamespaceStorage,
 ) -> Result<Vec<Row>, ExecutionError> {
     let outcome = catalog(host)?
-        .create_namespace(name, storage)
+        .create_namespace(actor, name, storage)
         .map_err(ExecutionError::Catalog)?;
     if outcome == CatalogOutcome::AlreadySo && !if_not_exists {
         return Err(ExecutionError::NamespaceExists(name.to_owned()));
@@ -120,11 +128,12 @@ pub(crate) fn create(
 /// whether the statement dropped it.
 pub(crate) fn drop(
     host: Option<&dyn NamespaceCatalog>,
+    actor: Option<&PrincipalId>,
     name: &str,
     if_exists: bool,
 ) -> Result<Vec<Row>, ExecutionError> {
     let outcome = catalog(host)?
-        .drop_namespace(name)
+        .drop_namespace(actor, name)
         .map_err(ExecutionError::Catalog)?;
     if outcome == CatalogOutcome::AlreadySo && !if_exists {
         return Err(ExecutionError::UnknownNamespace(name.to_owned()));
@@ -135,11 +144,12 @@ pub(crate) fn drop(
 /// `ALTER NAMESPACE name SET STORAGE (...)`: one row naming the namespace.
 pub(crate) fn set_storage(
     host: Option<&dyn NamespaceCatalog>,
+    actor: Option<&PrincipalId>,
     name: &str,
     change: coordinode_core::namespace::NamespaceStorage,
 ) -> Result<Vec<Row>, ExecutionError> {
     catalog(host)?
-        .set_namespace_storage(name, change)
+        .set_namespace_storage(actor, name, change)
         .map_err(ExecutionError::Catalog)?;
     Ok(vec![changed_row(name, CatalogOutcome::Changed)])
 }

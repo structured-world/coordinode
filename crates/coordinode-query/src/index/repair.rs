@@ -222,6 +222,8 @@ fn attempt(
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
         proposal_pipeline: log.map(|(pipeline, _)| pipeline),
+        // The store's own repair of values it already holds.
+        actor: None,
         proposal_id_gen: log.map(|(_, ids)| ids),
         read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
         // A build's writes are durable whatever a session writes at.
