@@ -327,18 +327,18 @@ impl Deployment {
         // tells raw readers of the log, and its proposer, why.
         let _access = self.access_guard(mutations);
         let refusal_mark;
-        let mutations = match crate::engine::access::check_unit(self, mutations)? {
-            crate::engine::access::Checked::Unchecked(m)
-            | crate::engine::access::Checked::Granted(m) => m,
-            crate::engine::access::Checked::Refused(refusal) => {
-                refusal_mark = [Mutation::Put {
-                    partition: coordinode_core::txn::proposal::PartitionId::Deployment,
-                    key: crate::engine::operations::skipped_unit_key(at),
-                    value: refusal.encode(),
-                }];
-                &refusal_mark[..]
-            }
-        };
+        let (actor, mutations) =
+            match crate::engine::access::check_unit(self, mutations)?.applying() {
+                Ok(applying) => applying,
+                Err(refusal) => {
+                    refusal_mark = [Mutation::Put {
+                        partition: coordinode_core::txn::proposal::PartitionId::Deployment,
+                        key: crate::engine::operations::skipped_unit_key(at),
+                        value: refusal.encode(),
+                    }];
+                    (None, &refusal_mark[..])
+                }
+            };
         // A unit bound to a client operation is decided first, holding the
         // issuer's lock through the apply: the next decision about the
         // operation reads this one's record. A unit its binding refuses
@@ -403,7 +403,7 @@ impl Deployment {
             let landed = writes(&kept);
             let staged = self.applied_feed.stage(index, commit_ts, &kept);
             if landed > 0 {
-                self.apply_proposal_covered(&kept, commit_ts, Some(mark))?;
+                self.apply_proposal_covered(&kept, commit_ts, Some(mark), actor)?;
             }
             staged.publish();
             self.note_raft_applied(index, commit_ts);
@@ -412,7 +412,7 @@ impl Deployment {
             // Staged before the write lands: a reader that sees it is told
             // the derived indexes may not hold it yet.
             let staged = self.applied_feed.stage(index, commit_ts, mutations);
-            self.apply_proposal_covered(mutations, commit_ts, Some(mark))?;
+            self.apply_proposal_covered(mutations, commit_ts, Some(mark), actor)?;
             #[cfg(test)]
             self.applied_feed.pause_after_write();
             staged.publish();

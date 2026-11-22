@@ -547,6 +547,18 @@ impl WritePressure {
     }
 }
 
+/// A unit's hold on grant changes, kept through its check and apply.
+pub(crate) enum AccessHold<'a> {
+    /// The unit neither acts for a principal nor changes grants.
+    None,
+    /// The unit acts for a principal: grant changes wait for it.
+    Shared(#[expect(dead_code, reason = "held for its drop")] parking_lot::RwLockReadGuard<'a, ()>),
+    /// The unit changes grants: units acting for principals wait for it.
+    Exclusive(
+        #[expect(dead_code, reason = "held for its drop")] parking_lot::RwLockWriteGuard<'a, ()>,
+    ),
+}
+
 /// The partition a resolved mutation writes, `None` for one that writes none.
 fn mutation_partition(mutation: &Mutation) -> Option<Partition> {
     match mutation {
@@ -8300,6 +8312,7 @@ impl Deployment {
         &self,
         mutations: &[Mutation],
         commit_ts: u64,
+        actor: Option<&coordinode_core::access::PrincipalId>,
     ) -> StorageResult<(Vec<Mutation>, DictionaryChange)> {
         use coordinode_core::txn::proposal::MetadataCommand;
         let mut effects = Vec::with_capacity(mutations.len() + 1);
@@ -8334,9 +8347,9 @@ impl Deployment {
             let decided_effects = if mutation.requires_namespace() {
                 let namespace = namespace.ok_or(coordinode_core::txn::proposal::Unscoped { at })?;
                 let scope = self.engine(namespace)?;
-                crate::engine::metadata::decide(self, Some(&scope), command, commit_ts)?
+                crate::engine::metadata::decide(self, Some(&scope), command, commit_ts, actor)?
             } else {
-                crate::engine::metadata::decide(self, None, command, commit_ts)?
+                crate::engine::metadata::decide(self, None, command, commit_ts, actor)?
             };
             if !decided_effects.is_empty() {
                 dictionary = match command {
@@ -8349,7 +8362,17 @@ impl Deployment {
                     | MetadataCommand::ConditionalRegistryWrite { .. }
                     | MetadataCommand::CreateNamespace { .. }
                     | MetadataCommand::DropNamespace { .. }
-                    | MetadataCommand::SetNamespaceStorage { .. } => DictionaryChange::None,
+                    | MetadataCommand::SetNamespaceStorage { .. }
+                    | MetadataCommand::GrantAccess { .. }
+                    | MetadataCommand::RevokeAccess { .. }
+                    | MetadataCommand::TransferAccess { .. }
+                    | MetadataCommand::SetDeploymentRights { .. }
+                    | MetadataCommand::CreateRole { .. }
+                    | MetadataCommand::DropRole { .. }
+                    | MetadataCommand::SetRoleEligible { .. }
+                    | MetadataCommand::GrantRole { .. }
+                    | MetadataCommand::RevokeRole { .. }
+                    | MetadataCommand::TransferRole { .. } => DictionaryChange::None,
                 };
             }
             effects.extend(decided_effects);
@@ -8438,7 +8461,7 @@ impl Deployment {
     pub fn apply_proposal_at(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
         // The check and the apply hold off grant changes together.
         let _access = self.access_guard(mutations);
-        let mutations = self.authorized(mutations)?;
+        let (actor, mutations) = self.authorized(mutations)?;
         if let Some((command, rest)) = crate::engine::operations::unit_command(mutations)? {
             // The decision and the apply hold the issuer's lock together, so
             // the next decision about the operation reads this one's record.
@@ -8454,7 +8477,7 @@ impl Deployment {
                 return Ok(());
             }
             let staged = self.applied_feed.stage(0, commit_ts, &decided.effects);
-            self.apply_proposal_covered(&decided.effects, commit_ts, None)?;
+            self.apply_proposal_covered(&decided.effects, commit_ts, None, actor)?;
             staged.publish();
             return Ok(());
         }
@@ -8462,7 +8485,7 @@ impl Deployment {
         // commit timestamp. Staged before the write lands, so a reader that
         // sees it is told the derived indexes may not hold it yet.
         let staged = self.applied_feed.stage(0, commit_ts, mutations);
-        self.apply_proposal_covered(mutations, commit_ts, None)?;
+        self.apply_proposal_covered(mutations, commit_ts, None, actor)?;
         staged.publish();
         Ok(())
     }
@@ -8506,7 +8529,7 @@ impl Deployment {
         // together; a refused unit journals nothing, so a replay has nothing
         // of it to decide again.
         let _access = self.access_guard(mutations);
-        let mutations = self.authorized(mutations)?;
+        let (actor, mutations) = self.authorized(mutations)?;
         if let Some((command, rest)) = crate::engine::operations::unit_command(mutations)? {
             // The decision, the journal append and the apply hold the
             // issuer's lock together: the journal records each decision's
@@ -8532,7 +8555,7 @@ impl Deployment {
             // lock: the journal then records each decision's effects in the
             // order they were decided, and replay reproduces them exactly.
             let _decisions = self.metadata_exclusive();
-            let (effects, dictionary) = self.decide_commands(mutations, commit_ts)?;
+            let (effects, dictionary) = self.decide_commands(mutations, commit_ts, actor)?;
             // Nothing decided (names already bound, or a refusal) leaves the
             // state as it is, so there is nothing to journal or replay; the
             // bindings it found may still be unsynced. The namespace markers
@@ -8548,30 +8571,41 @@ impl Deployment {
         self.journal_and_apply(mutations, commit_ts, level)
     }
 
-    /// The shared hold on grant changes a unit with an acting principal takes
-    /// for its check and apply; none for a unit without one.
-    pub(crate) fn access_guard(
-        &self,
-        mutations: &[Mutation],
-    ) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
-        coordinode_core::txn::proposal::actor_of(mutations).map(|_| self.access_decisions.read())
+    /// The hold on grant changes a unit takes for its check and apply: the
+    /// exclusive one for a unit that changes the grant catalog or the
+    /// namespaces it grants on, the shared one for a unit acting for a
+    /// principal, none otherwise.
+    pub(crate) fn access_guard(&self, mutations: &[Mutation]) -> AccessHold<'_> {
+        if mutations
+            .iter()
+            .any(|m| matches!(m, Mutation::Command(c) if c.changes_access()))
+        {
+            AccessHold::Exclusive(self.access_decisions.write())
+        } else if coordinode_core::txn::proposal::actor_of(mutations).is_some() {
+            AccessHold::Shared(self.access_decisions.read())
+        } else {
+            AccessHold::None
+        }
     }
 
-    /// `mutations` as they apply once their principal's grants are checked:
-    /// without the principal, or as they are when they name none.
+    /// `mutations` as they apply once their principal's grants are checked,
+    /// with the principal they act for: without it, or as they are when they
+    /// name none.
     ///
     /// # Errors
     ///
     /// [`StorageError::AccessRefused`] when the principal lacks a right the
     /// unit needs; a catalog read failure.
-    fn authorized<'m>(&self, mutations: &'m [Mutation]) -> StorageResult<&'m [Mutation]> {
-        match crate::engine::access::check_unit(self, mutations)? {
-            crate::engine::access::Checked::Unchecked(m)
-            | crate::engine::access::Checked::Granted(m) => Ok(m),
-            crate::engine::access::Checked::Refused(refusal) => {
-                Err(StorageError::AccessRefused(refusal))
-            }
-        }
+    fn authorized<'m>(
+        &self,
+        mutations: &'m [Mutation],
+    ) -> StorageResult<(
+        Option<&'m coordinode_core::access::PrincipalId>,
+        &'m [Mutation],
+    )> {
+        crate::engine::access::check_unit(self, mutations)?
+            .applying()
+            .map_err(StorageError::AccessRefused)
     }
 
     /// Make the journal as durable as `level` promises for a commit that
@@ -8904,11 +8938,14 @@ impl Deployment {
         next
     }
 
+    /// `actor` is the principal the unit acts for, its grants already
+    /// checked: a command it carries is decided on its behalf.
     fn apply_proposal_covered(
         &self,
         mutations: &[Mutation],
         commit_ts: u64,
         cover: Option<coverage::Mark>,
+        actor: Option<&coordinode_core::access::PrincipalId>,
     ) -> StorageResult<()> {
         // DERIVED entries are derived from the unit itself and land in the
         // same batch, under the same coverage marker, as the data they index.
@@ -8917,7 +8954,7 @@ impl Deployment {
         let mutations = mutations.as_ref();
         if mutations.iter().any(|m| matches!(m, Mutation::Command(_))) {
             let _decisions = self.metadata_exclusive();
-            let (effects, dictionary) = self.decide_commands(mutations, commit_ts)?;
+            let (effects, dictionary) = self.decide_commands(mutations, commit_ts, actor)?;
             self.apply_effects_covered(&effects, commit_ts, cover)?;
             self.note_dictionary(dictionary);
             self.note_catalog(&effects);

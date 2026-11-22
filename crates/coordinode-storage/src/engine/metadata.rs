@@ -63,6 +63,7 @@ pub(crate) fn decide(
     scope: Option<&StorageEngine>,
     command: &MetadataCommand,
     commit_ts: u64,
+    actor: Option<&coordinode_core::access::PrincipalId>,
 ) -> StorageResult<Vec<Mutation>> {
     let namespace = || {
         scope.ok_or_else(|| {
@@ -71,6 +72,9 @@ pub(crate) fn decide(
             ))
         })
     };
+    if let Some(effects) = crate::engine::access::decide(deployment, command, commit_ts)? {
+        return Ok(effects);
+    }
     match command {
         MetadataCommand::RegisterFields { names } => decide_registration(namespace()?, names),
         MetadataCommand::AdoptFields { bindings } => decide_adoption(namespace()?, bindings),
@@ -100,12 +104,41 @@ pub(crate) fn decide(
             name,
             token,
             storage,
-        } => decide_namespace_creation(deployment, name, token, *storage),
+        } => {
+            let mut effects = decide_namespace_creation(deployment, name, token, *storage)?;
+            // The creator becomes admin of what it created, in the same
+            // change: no state has the namespace without its admin.
+            if let (Some(creator), Some(id)) = (actor, created_id(&effects)) {
+                effects.push(crate::engine::access::creator_grant(id, creator, commit_ts));
+            }
+            Ok(effects)
+        }
         MetadataCommand::DropNamespace { name } => decide_namespace_drop(deployment, name),
         MetadataCommand::SetNamespaceStorage { name, change } => {
             decide_namespace_storage(deployment, name, *change)
         }
+        // Decided above.
+        MetadataCommand::GrantAccess { .. }
+        | MetadataCommand::RevokeAccess { .. }
+        | MetadataCommand::TransferAccess { .. }
+        | MetadataCommand::SetDeploymentRights { .. }
+        | MetadataCommand::CreateRole { .. }
+        | MetadataCommand::DropRole { .. }
+        | MetadataCommand::SetRoleEligible { .. }
+        | MetadataCommand::GrantRole { .. }
+        | MetadataCommand::RevokeRole { .. }
+        | MetadataCommand::TransferRole { .. } => Err(StorageError::InvalidConfig(format!(
+            "the grant-catalog command {command:?} was not decided"
+        ))),
     }
+}
+
+/// The namespace a creation's effects create, from its record's key.
+fn created_id(effects: &[Mutation]) -> Option<NamespaceId> {
+    effects.iter().find_map(|m| match m {
+        Mutation::Put { key, .. } => decode_namespace_record_key(key),
+        _ => None,
+    })
 }
 
 /// The record of the live namespace `name` with the settings `change`

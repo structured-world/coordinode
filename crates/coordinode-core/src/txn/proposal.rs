@@ -552,6 +552,165 @@ pub enum MetadataCommand {
         /// The settings to change; unset ones are kept.
         change: crate::namespace::NamespaceStorage,
     },
+    /// Give `grantee` the right `role` on the live namespace `namespace`,
+    /// replacing a right it held there. Refused, writing nothing, when the
+    /// namespace or the role named is not live.
+    GrantAccess {
+        /// The namespace's name.
+        namespace: String,
+        /// Who receives the right.
+        grantee: GranteeName,
+        /// The right.
+        role: crate::access::NamespaceRole,
+    },
+    /// Take every right `grantee` holds on each of `namespaces`, as one
+    /// change: no state of the store has it holding some of them and not
+    /// the others. Refused, writing nothing, when a namespace or the role
+    /// named is not live.
+    RevokeAccess {
+        /// The namespaces' names.
+        namespaces: Vec<String>,
+        /// Who loses the rights.
+        grantee: GranteeName,
+    },
+    /// Move the right `role` on `namespace` from `from` to `to`, only while
+    /// `from` holds exactly that right there; refused, writing nothing,
+    /// otherwise.
+    TransferAccess {
+        /// The namespace's name.
+        namespace: String,
+        /// The right moved.
+        role: crate::access::NamespaceRole,
+        /// The principal that holds it now.
+        from: crate::access::PrincipalId,
+        /// The principal that receives it.
+        to: crate::access::PrincipalId,
+    },
+    /// Set the deployment rights `principal` holds: each one named is set,
+    /// the other kept.
+    SetDeploymentRights {
+        /// The principal.
+        principal: crate::access::PrincipalId,
+        /// Whether it may create namespaces.
+        create_namespace: Option<bool>,
+        /// Whether it holds every right on the whole deployment.
+        admin: Option<bool>,
+    },
+    /// Create the role `name` in the live namespace `home`. An exclusive
+    /// role names its eligible principals and the one of them that holds
+    /// it. Refused, writing nothing, when `home` is not live, a role of the
+    /// name exists there, or an exclusive role's holder is not eligible.
+    CreateRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// For an exclusive role, its eligible principals.
+        eligible: Option<Vec<crate::access::PrincipalId>>,
+        /// The principal that holds it from the start.
+        holder: Option<crate::access::PrincipalId>,
+    },
+    /// Drop a role with every grant it holds and everyone holding it.
+    DropRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+    },
+    /// Replace an exclusive role's eligible principals; a holder no longer
+    /// among them loses the role at once.
+    SetRoleEligible {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// The principals that may hold it from here on.
+        eligible: Vec<crate::access::PrincipalId>,
+    },
+    /// Make `to` a holder of a role: of an exclusive one only while nobody
+    /// holds it and `to` is eligible.
+    GrantRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// The principal that receives it.
+        to: crate::access::PrincipalId,
+    },
+    /// Take a role from `from`, every right it carries on every namespace
+    /// at once.
+    RevokeRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// The principal that loses it.
+        from: crate::access::PrincipalId,
+    },
+    /// Move a role from `from` to `to`, only while `from` holds it (and, for
+    /// an exclusive role, `to` is eligible): every right it carries, on
+    /// every namespace, leaves one and reaches the other at once. Refused,
+    /// writing nothing, otherwise; of two concurrent takers exactly one
+    /// succeeds.
+    TransferRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// The principal that holds it now.
+        from: crate::access::PrincipalId,
+        /// The principal that receives it.
+        to: crate::access::PrincipalId,
+    },
+}
+
+impl GranteeName {
+    /// Approximate encoded size.
+    #[must_use]
+    pub fn size_estimate(&self) -> usize {
+        match self {
+            Self::Principal(principal) => principal.len() + 4,
+            Self::Role { home, name } => home.len() + name.len() + 4,
+        }
+    }
+}
+
+/// Who a grant names, as a statement names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GranteeName {
+    /// A principal.
+    Principal(crate::access::PrincipalId),
+    /// A role, by its home namespace's name and its own.
+    Role {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+    },
+}
+
+impl MetadataCommand {
+    /// Whether the command changes the grant catalog or the namespaces it
+    /// grants on: a write acting for a principal must be checked against
+    /// every such change before it and none after it.
+    #[must_use]
+    pub fn changes_access(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateNamespace { .. }
+                | Self::DropNamespace { .. }
+                | Self::GrantAccess { .. }
+                | Self::RevokeAccess { .. }
+                | Self::TransferAccess { .. }
+                | Self::SetDeploymentRights { .. }
+                | Self::CreateRole { .. }
+                | Self::DropRole { .. }
+                | Self::SetRoleEligible { .. }
+                | Self::GrantRole { .. }
+                | Self::RevokeRole { .. }
+                | Self::TransferRole { .. }
+        )
+    }
 }
 
 impl MetadataCommand {
@@ -569,7 +728,17 @@ impl MetadataCommand {
             | Self::RecordDeployment { .. }
             | Self::CreateNamespace { .. }
             | Self::DropNamespace { .. }
-            | Self::SetNamespaceStorage { .. } => PartitionId::Deployment,
+            | Self::SetNamespaceStorage { .. }
+            | Self::GrantAccess { .. }
+            | Self::RevokeAccess { .. }
+            | Self::TransferAccess { .. }
+            | Self::SetDeploymentRights { .. }
+            | Self::CreateRole { .. }
+            | Self::DropRole { .. }
+            | Self::SetRoleEligible { .. }
+            | Self::GrantRole { .. }
+            | Self::RevokeRole { .. }
+            | Self::TransferRole { .. } => PartitionId::Deployment,
             Self::ConditionalRegistryWrite { .. } => PartitionId::Registry,
         }
     }
@@ -596,6 +765,53 @@ impl MetadataCommand {
             Self::CreateNamespace { name, token, .. } => name.len() + token.len() + 16,
             Self::DropNamespace { name } => name.len() + 2,
             Self::SetNamespaceStorage { name, .. } => name.len() + 16,
+            Self::GrantAccess {
+                namespace, grantee, ..
+            } => namespace.len() + grantee.size_estimate() + 4,
+            Self::RevokeAccess {
+                namespaces,
+                grantee,
+            } => namespaces.iter().map(|n| n.len() + 2).sum::<usize>() + grantee.size_estimate(),
+            Self::TransferAccess {
+                namespace,
+                from,
+                to,
+                ..
+            } => namespace.len() + from.len() + to.len() + 12,
+            Self::SetDeploymentRights { principal, .. } => principal.len() + 8,
+            Self::CreateRole {
+                home,
+                name,
+                eligible,
+                holder,
+            } => {
+                home.len()
+                    + name.len()
+                    + eligible
+                        .iter()
+                        .flatten()
+                        .map(|p| p.len() + 4)
+                        .sum::<usize>()
+                    + holder.as_ref().map_or(1, |p| p.len() + 4)
+            }
+            Self::DropRole { home, name } => home.len() + name.len() + 4,
+            Self::SetRoleEligible {
+                home,
+                name,
+                eligible,
+            } => home.len() + name.len() + eligible.iter().map(|p| p.len() + 4).sum::<usize>(),
+            Self::GrantRole { home, name, to }
+            | Self::RevokeRole {
+                home,
+                name,
+                from: to,
+            } => home.len() + name.len() + to.len() + 8,
+            Self::TransferRole {
+                home,
+                name,
+                from,
+                to,
+            } => home.len() + name.len() + from.len() + to.len() + 12,
         }
     }
 }

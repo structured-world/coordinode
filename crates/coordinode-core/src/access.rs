@@ -126,7 +126,9 @@ impl PrincipalId {
 }
 
 /// A right on one namespace. Each includes the ones below it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum NamespaceRole {
     /// Reads its data.
     Reader,
