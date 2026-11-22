@@ -94,8 +94,9 @@ hex = "0.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = { workspace = true }
 # The default features add TLS and SCRAM through aws-lc-rs, which links C;
-# the pg listener serves plaintext with trust auth and needs neither.
-pgwire = { version = "0.42", default-features = false, features = ["server-api", "pg-ext-types"] }
+# the pg listener serves plaintext with trust auth and needs neither. Cells
+# go out as bool, int8, float8 and text, so no extra PG type conversions.
+pgwire = { version = "0.42", default-features = false, features = ["server-api"] }
 async-trait = "0.1.92"
 futures = "0.3.34"
 
