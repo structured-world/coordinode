@@ -282,6 +282,9 @@ impl Database {
         let Some(principal) = principal else {
             return Ok(());
         };
+        // Without `tenancy` no issuer has an owner, and no principal gets
+        // this far.
+        #[cfg(feature = "tenancy")]
         if records::issuer_owner(&self.engine, issuer)?.as_ref() == Some(principal) {
             return Ok(());
         }
@@ -416,6 +419,7 @@ impl Database {
     }
 }
 
-#[cfg(test)]
+// Issuer ownership by principals: only built with `tenancy`.
+#[cfg(all(test, feature = "tenancy"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;

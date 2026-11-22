@@ -381,6 +381,7 @@ fn a_retransmitted_unit_in_the_log_applies_once() {
 /// it, where each unit applies. Another principal's unit naming it applies
 /// nothing and is refused, even one holding every right on the deployment:
 /// ownership is apart from rights. The owner's units apply.
+#[cfg(feature = "tenancy")]
 #[test]
 fn a_foreign_principals_operation_unit_applies_nothing() {
     use coordinode_core::access::PrincipalId;

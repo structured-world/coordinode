@@ -22,6 +22,12 @@ test-format-bump = ["coordinode-core/test-format-bump"]
 # Crash and fault hooks for tests in other crates: where a power cut leaves
 # the journal, and a journal whose syncs fail. Never in a shipped build.
 test-faults = []
+# The grant catalog, the authorization of a principal's unit where it
+# applies, and issuer ownership. Without it a unit naming a principal
+# applies unchecked, as every unit of a store whose access is decided by
+# who can open its files, and grant-catalog commands apply nothing. Off by
+# default; the embedded library's `tenancy` turns it on.
+tenancy = []
 # Native columnar SST block type for the relational TABLE modality
 # (STORAGE COLUMNAR). Enables the lsm-tree columnar batch ingest + projected
 # scan API. A CE capability, on by default; `--no-default-features` drops it.

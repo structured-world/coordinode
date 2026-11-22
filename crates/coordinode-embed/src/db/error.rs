@@ -543,6 +543,13 @@ pub enum DatabaseError {
     #[error("access refused: {0}")]
     AccessRefused(coordinode_core::access::AccessRefusal),
 
+    /// A call named a principal, or asked for the deployment's catalog of
+    /// namespaces or grants, of a library built without `tenancy`: such a
+    /// build is one store whose access is decided by who can open its files,
+    /// and refuses rather than run the call as the trusted host.
+    #[error("this build has no namespaces, principals or access control: {0}")]
+    WithoutTenancy(String),
+
     /// A statement acted for a principal bound to another namespace than the
     /// one this database works in. Nothing ran.
     #[error("the principal is bound to namespace {principal}, this session works in {session}")]

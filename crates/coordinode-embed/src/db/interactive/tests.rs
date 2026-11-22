@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+#[cfg(feature = "tenancy")]
 use coordinode_core::txn::command::Principal;
 use coordinode_core::txn::read_concern::ReadConcernLevel;
 use coordinode_core::txn::write_concern::WriteConcern;
@@ -14,6 +15,7 @@ fn open() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+#[cfg(feature = "tenancy")]
 fn principal(subject: &str) -> ActingContext {
     ActingContext::Principal(Principal {
         subject: Arc::from(subject),
@@ -24,6 +26,7 @@ fn principal(subject: &str) -> ActingContext {
 
 /// Grant `subject` of the `host` scope `role` on the default namespace, as
 /// the store's own work.
+#[cfg(feature = "tenancy")]
 fn grant(db: &Database, subject: &str, role: coordinode_core::access::NamespaceRole) {
     use coordinode_core::access::PrincipalId;
     use coordinode_core::txn::proposal::{GranteeName, MetadataCommand, Mutation};
@@ -1064,7 +1067,8 @@ fn a_member_without_a_tenure_refuses_begin() {
 
 /// A transaction is used only by the caller that began it: another caller,
 /// or the host's trusted access, is told nothing is known of it, which does
-/// not reveal that it exists.
+/// not reveal that it exists. Callers are principals: built with `tenancy`.
+#[cfg(feature = "tenancy")]
 #[test]
 fn another_caller_cannot_use_a_transaction() {
     let (db, _dir) = open();

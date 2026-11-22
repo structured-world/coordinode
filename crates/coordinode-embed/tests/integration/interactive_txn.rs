@@ -547,6 +547,7 @@ fn a_transaction_commits_only_at_the_node_version_it_read() {
 /// there, acting for the caller that holds the transaction: a transaction a
 /// principal began is refused at a moved version and lands at the current
 /// one, with no separate call that would act for anyone else.
+#[cfg(feature = "tenancy")]
 #[test]
 fn a_commit_carries_the_versions_its_caller_built_on() {
     use coordinode_core::graph::node::NodeId;

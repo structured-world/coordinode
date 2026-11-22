@@ -10,15 +10,17 @@
 //! The decision reads nothing but the records earlier decisions wrote, so it
 //! is the same on every member and on every replay.
 
-use coordinode_core::access::{AccessRefusal, MissingRight, PrincipalId};
+use coordinode_core::access::{AccessRefusal, PrincipalId};
 use coordinode_core::txn::operation::{
     BindDecision, INCARNATION_KEY_PREFIX, INTENT_DIGEST_LEN, ISSUER_ID_LEN, IncarnationRecord,
     IntentDigest, IssuerId, LogPosition, OperationCommand, OperationId, OperationOutcome,
     OperationRecord, OperationState, decide_binding, decode_incarnation_key, decode_operation_key,
-    incarnation_key, incarnation_operations_prefix, issuer_incarnations_prefix, issuer_owner_key,
-    operation_key, outcome_of,
+    incarnation_key, incarnation_operations_prefix, issuer_incarnations_prefix, operation_key,
+    outcome_of,
 };
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
+#[cfg(feature = "tenancy")]
+use coordinode_core::{access::MissingRight, txn::operation::issuer_owner_key};
 
 use crate::engine::core::Deployment;
 use crate::engine::partition::Partition;
@@ -70,6 +72,7 @@ pub(crate) struct Decided {
 /// # Errors
 ///
 /// The record cannot be read or does not decode.
+#[cfg(feature = "tenancy")]
 pub fn issuer_owner(engine: &Deployment, issuer: &IssuerId) -> StorageResult<Option<PrincipalId>> {
     engine
         .system_get(Partition::Deployment, &issuer_owner_key(issuer))?
@@ -86,6 +89,7 @@ pub fn issuer_owner(engine: &Deployment, issuer: &IssuerId) -> StorageResult<Opt
 /// isolates no caller from another.
 ///
 /// The owner record a creating enrollment adds, when it adds one.
+#[cfg(feature = "tenancy")]
 fn ownership(
     engine: &Deployment,
     command: &OperationCommand,
@@ -159,6 +163,13 @@ pub(crate) fn decide(
     at: LogPosition,
     actor: Option<&PrincipalId>,
 ) -> StorageResult<Decided> {
+    #[cfg(not(feature = "tenancy"))]
+    let owner_record: Option<Mutation> = {
+        // No principal is checked, so no issuer has an owner to check.
+        let _ = actor;
+        None
+    };
+    #[cfg(feature = "tenancy")]
     let owner_record = match ownership(engine, command, actor)? {
         Ok(record) => record,
         Err(refusal) => {

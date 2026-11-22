@@ -6,9 +6,14 @@
 //! write, so a member of a group changes the catalog through the group's log
 //! and every member applies it in the same order.
 
+#[cfg(feature = "tenancy")]
 use coordinode_core::access::PrincipalId;
-use coordinode_core::namespace::{NamespaceState, NamespaceStorage, validate_namespace_name};
+#[cfg(feature = "tenancy")]
+use coordinode_core::namespace::validate_namespace_name;
+use coordinode_core::namespace::{NamespaceState, NamespaceStorage};
+#[cfg(feature = "tenancy")]
 use coordinode_core::txn::proposal::MetadataCommand;
+#[cfg(feature = "tenancy")]
 use coordinode_query::executor::namespaces::{CatalogFailure, CatalogOutcome, NamespaceEntry};
 use coordinode_storage::engine::metadata;
 
@@ -37,6 +42,7 @@ impl Database {
     /// [`DatabaseError::UnknownNamespace`] when the catalog holds no such
     /// namespace and `create` is off; [`DatabaseError::NamespaceRefused`]
     /// for a name no namespace may have; what opening the store refuses.
+    #[cfg(feature = "tenancy")]
     pub fn open_namespace(
         config: coordinode_storage::engine::config::StorageConfig,
         name: &str,
@@ -84,6 +90,7 @@ impl Database {
     /// [`DatabaseError::NamespaceExists`] when a live namespace holds it,
     /// including one a concurrent creation took first; the write path's
     /// errors (a follower answers [`DatabaseError::NotLeader`]).
+    #[cfg(feature = "tenancy")]
     pub fn create_namespace(&self, name: &str) -> Result<(), DatabaseError> {
         self.create_namespace_with(name, NamespaceStorage::default())
     }
@@ -95,6 +102,7 @@ impl Database {
     /// # Errors
     ///
     /// As [`Self::create_namespace`].
+    #[cfg(feature = "tenancy")]
     pub fn create_namespace_with(
         &self,
         name: &str,
@@ -106,6 +114,7 @@ impl Database {
     /// [`Self::create_namespace_with`] acting for `actor`: a principal
     /// creates only with the right to create namespaces, and becomes admin of
     /// what it created in the same change.
+    #[cfg(feature = "tenancy")]
     pub(super) fn create_namespace_as(
         &self,
         actor: Option<PrincipalId>,
@@ -162,12 +171,14 @@ impl Database {
     /// [`DatabaseError::UnknownNamespace`] when no live namespace has the
     /// name; [`DatabaseError::NamespaceInUse`] for the namespace this handle
     /// works in, which is dropped from another; the write path's errors.
+    #[cfg(feature = "tenancy")]
     pub fn drop_namespace(&self, name: &str) -> Result<(), DatabaseError> {
         self.drop_namespace_as(None, name)
     }
 
     /// [`Self::drop_namespace`] acting for `actor`, which needs admin on the
     /// namespace.
+    #[cfg(feature = "tenancy")]
     pub(super) fn drop_namespace_as(
         &self,
         actor: Option<PrincipalId>,
@@ -203,6 +214,7 @@ impl Database {
     ///
     /// [`DatabaseError::UnknownNamespace`] when no live namespace has the
     /// name; the write path's errors.
+    #[cfg(feature = "tenancy")]
     pub fn set_namespace_storage(
         &self,
         name: &str,
@@ -213,6 +225,7 @@ impl Database {
 
     /// [`Self::set_namespace_storage`] acting for `actor`, which needs admin
     /// on the namespace.
+    #[cfg(feature = "tenancy")]
     fn set_namespace_storage_as(
         &self,
         actor: Option<PrincipalId>,
@@ -237,6 +250,7 @@ impl Database {
     /// there: a principal without admin learns nothing of whether the name
     /// exists, as a missing one is refused like a foreign one. The apply
     /// still decides; this only answers early. The trusted host passes.
+    #[cfg(feature = "tenancy")]
     fn refuse_unless_admin(
         &self,
         actor: Option<&PrincipalId>,
@@ -276,6 +290,7 @@ impl Database {
     /// The deployment's namespaces as `actor` may list them: the trusted
     /// host, a deployment admin, or a holder of the right to create
     /// namespaces; any other principal is refused.
+    #[cfg(feature = "tenancy")]
     pub(super) fn namespaces_as(
         &self,
         actor: Option<&PrincipalId>,
@@ -330,6 +345,7 @@ impl Database {
 
 /// The statements' path to the catalog is the embedded API's: one way a
 /// namespace is created or dropped, whichever surface asks.
+#[cfg(feature = "tenancy")]
 impl coordinode_query::executor::namespaces::NamespaceCatalog for Database {
     fn create_namespace(
         &self,
@@ -381,6 +397,6 @@ impl coordinode_query::executor::namespaces::NamespaceCatalog for Database {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tenancy"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

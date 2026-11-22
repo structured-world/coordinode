@@ -30,9 +30,11 @@ coordinode-storage = "0.9"
   called ready; the workspace itself builds and tests on Linux, macOS and
   Windows with stable Rust. The declared minimum moves up when the code needs
   a newer compiler; older compilers are not tested.
-- **Features.** The default build is a standalone database (see
-  [Build features](#build-features)). `replication` adds membership in a
-  replicated group; the io_uring storage backend is on by default on Linux.
+- **Features.** The default build is a standalone database with namespaces,
+  principals and access control (see [Build features](#build-features)).
+  `replication` adds membership in a replicated group; `tenancy`, on by
+  default, can be left out for a store of one namespace; the io_uring storage
+  backend is on by default on Linux.
 - **What the registry checks run.** A registry release passes when the
   [quickstart example](#quickstart) and a broader consumer build from the
   published packages and run standalone, and the same consumer compiles with
@@ -946,6 +948,23 @@ repair as above.
   snapshot and segment transfer, under mutual TLS node identity), never a
   client protocol. A build with the feature still runs standalone until it is
   given peers.
+- **`tenancy`, on by default.** Namespaces, principals and the per-namespace
+  access control, together (see
+  [Principals and access control](#principals-and-access-control)). A build
+  without it (`default-features = false`) is one store whose access is decided
+  by who can open its files: it compiles no catalog of grants and no
+  authorization step, opens a directory of one namespace and refuses one
+  holding several, naming them. A call acting for a principal, and a
+  statement on the catalog of namespaces or grants (`CREATE NAMESPACE`,
+  `SHOW NAMESPACES`, `GRANT`, ...), are refused with
+  `DatabaseError::WithoutTenancy` rather than run as the trusted host. The
+  directory layout is the same either way, so a directory of one namespace
+  moves between the two builds without conversion.
+
+  ```toml
+  [dependencies]
+  coordinode-embed = { version = "0.9", default-features = false }
+  ```
 - **`io-uring`, on by default.** The storage engine opens on one shared
   io_uring ring instead of synchronous `pread`/`pwrite`, on Linux 5.6 and
   later. Elsewhere it is a no-op; a kernel without io_uring makes the engine

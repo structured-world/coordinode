@@ -43,6 +43,11 @@
 //!   [`replication`]. Without it no consensus, inter-node channel, listener or
 //!   async runtime is compiled; with it the host supplies a multi-threaded
 //!   tokio runtime.
+//! - `tenancy`, on by default: namespaces, principals and the per-namespace
+//!   access control. Without it a database is one store of one namespace,
+//!   with no grant catalog or authorization step compiled; a directory
+//!   holding several namespaces is refused by name, and a principal is
+//!   refused with [`DatabaseError::WithoutTenancy`].
 //! - `io-uring`: the io_uring storage backend on Linux.
 
 pub mod api;
@@ -60,13 +65,15 @@ pub use coordinode_core::txn::transaction::CommitReceipt;
 pub use coordinode_query::executor::runner::CatalogObject;
 pub use db::{
     AccessChange, AccessRefusal, ActingContext, AfterCommitDispatchReport, ConstraintDeclaration,
-    DEFAULT_VECTOR_BUILD_WAIT, Database, DatabaseError, DeploymentAdmin, Disposition,
-    EdgeTypeDeclaration, GrantView, GranteeName, Intent, LabelConstraint, LabelDeclaration,
-    MAX_SCHEMA_PACKAGE_DECLARATIONS, MissingRight, NamespaceRole, PackageConstraint, PeerFailure,
-    Principal, PrincipalId, PublishedObject, ReadFenceFailure, Readiness, ResumedIndexBuilds,
-    RoleView, SchemaPackage, SchemaPublication, SchemaReadiness, StorageFailure, TransactionEnd,
-    TransactionId, TransactionOptions, TriggerDispatchConfig,
+    DEFAULT_VECTOR_BUILD_WAIT, Database, DatabaseError, Disposition, EdgeTypeDeclaration,
+    GranteeName, Intent, LabelConstraint, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,
+    MissingRight, NamespaceRole, PackageConstraint, PeerFailure, Principal, PrincipalId,
+    PublishedObject, ReadFenceFailure, Readiness, ResumedIndexBuilds, SchemaPackage,
+    SchemaPublication, SchemaReadiness, StorageFailure, TransactionEnd, TransactionId,
+    TransactionOptions, TriggerDispatchConfig,
 };
+#[cfg(feature = "tenancy")]
+pub use db::{DeploymentAdmin, GrantView, RoleView};
 pub use repair::RepairReport;
 
 /// What a change-stream consumer registers with
@@ -93,8 +100,8 @@ pub mod changes {
 
 /// Every Rust snippet of the embedded guide, compiled as a doctest against
 /// this crate so the guide cannot advertise code that does not build. The
-/// replicated snippets need the feature; the documentation suite runs with
-/// all features.
-#[cfg(all(doctest, feature = "replication"))]
+/// replicated and the access-control snippets need their features; the
+/// documentation suite runs with all features.
+#[cfg(all(doctest, feature = "replication", feature = "tenancy"))]
 #[doc = include_str!("../../../docs/guide/embedded.md")]
 pub struct EmbeddedGuide;

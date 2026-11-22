@@ -844,13 +844,18 @@ impl Database {
     pub fn open_with_config(config: StorageConfig) -> Result<Self, DatabaseError> {
         let path = config.data_dir().to_path_buf();
         let oracle = Arc::new(TimestampOracle::new());
-        // Its anchor namespace when the store holds several: the others are
-        // reached by name ([`Self::session`]).
-        let engine = coordinode_storage::engine::core::Deployment::open_embedded(
+        let deployment = coordinode_storage::engine::core::Deployment::open_embedded(
             &config,
             Arc::clone(&oracle),
-        )?
-        .anchored_store()?;
+        )?;
+        // Its anchor namespace when the store holds several: the others are
+        // reached by name ([`Self::session`]).
+        #[cfg(feature = "tenancy")]
+        let engine = deployment.anchored_store()?;
+        // A build without namespaces opens a store of one, and refuses by
+        // name one holding several.
+        #[cfg(not(feature = "tenancy"))]
+        let engine = deployment.single_store()?;
         let engine = Arc::new(engine);
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
@@ -1828,6 +1833,18 @@ impl Database {
     /// The principal `actor` names, whichever namespace it is bound to: an
     /// issuer belongs to a stable subject in its trust scope, not to a
     /// namespace, and operation records are the deployment's.
+    /// Refuses a principal in a build without `tenancy`, which checks none:
+    /// running its call as the trusted host would grant it everything.
+    #[allow(clippy::unnecessary_wraps)]
+    fn principals_built() -> Result<(), DatabaseError> {
+        #[cfg(not(feature = "tenancy"))]
+        return Err(DatabaseError::WithoutTenancy(
+            "a call acting for a principal".to_owned(),
+        ));
+        #[cfg(feature = "tenancy")]
+        Ok(())
+    }
+
     fn acting_principal(
         actor: &coordinode_core::txn::command::ActingContext,
     ) -> Result<Option<coordinode_core::access::PrincipalId>, DatabaseError> {
@@ -1835,6 +1852,7 @@ impl Database {
         let ActingContext::Principal(principal) = actor else {
             return Ok(None);
         };
+        Self::principals_built()?;
         coordinode_core::access::PrincipalId::new(&principal.subject, &principal.trust_scope)
             .map(Some)
             .map_err(|e| DatabaseError::SettingsRefused(e.to_string()))
@@ -1848,6 +1866,7 @@ impl Database {
         let Some(ActingContext::Principal(principal)) = actor else {
             return Ok(None);
         };
+        Self::principals_built()?;
         if *principal.namespace != *self.namespace() {
             return Err(DatabaseError::NamespaceMismatch {
                 principal: principal.namespace.to_string(),
@@ -3288,6 +3307,7 @@ impl Database {
             // namespace: its own right decides it, so a principal holding only
             // the right to create namespaces, or only a place in a role's
             // eligible set, reaches what that right allows.
+            #[cfg(feature = "tenancy")]
             if let Some(principal) = actor
                 .as_ref()
                 .filter(|_| !plan.root.is_deployment_catalog_statement())
@@ -3298,6 +3318,14 @@ impl Database {
                     self.engine.namespace(),
                 )?
                 .map_err(DatabaseError::AccessRefused)?;
+            }
+            // A store of one namespace has no catalog of namespaces or grants
+            // to change or list.
+            #[cfg(not(feature = "tenancy"))]
+            if plan.root.is_deployment_catalog_statement() {
+                return Err(DatabaseError::WithoutTenancy(
+                    "a statement on the catalog of namespaces or grants".to_owned(),
+                ));
             }
             // The statement's view of the field dictionary: every binding
             // applied before it started, refreshed here when one has landed
@@ -3348,8 +3376,12 @@ impl Database {
                 }),
                 btree_index_registry: Some(self.index_registry.as_ref()),
                 index_builds: Some(&self.index_builds),
-                // The deployment's catalog, through the embedded API's path.
+                // The deployment's catalog, through the embedded API's path;
+                // a build of one namespace has none.
+                #[cfg(feature = "tenancy")]
                 namespace_catalog: Some(self),
+                #[cfg(not(feature = "tenancy"))]
+                namespace_catalog: None,
                 // Extension-op handlers for this Database (empty by default). An
                 // enterprise layer / integration test populates it via
                 // Database::register_extension so SHARDED-BY-style extension ops
@@ -4559,6 +4591,7 @@ fn query_memory_limit_from_mib(text: &str) -> Result<u64, SessionSettingRefused>
     checked_query_memory_limit(bytes)
 }
 
+#[cfg(feature = "tenancy")]
 mod access;
 mod after_commit;
 mod blob;
@@ -4576,6 +4609,7 @@ mod namespaces;
 mod package;
 mod projection;
 mod state_cut;
+#[cfg(feature = "tenancy")]
 pub use access::{CatalogScope, DeploymentAdmin, GrantView, RoleView};
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use blob::{BlobId, GroupMembers, UploadedBlob};

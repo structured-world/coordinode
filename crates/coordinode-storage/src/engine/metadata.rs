@@ -105,12 +105,16 @@ pub(crate) fn decide(
             token,
             storage,
         } => {
+            #[cfg_attr(not(feature = "tenancy"), allow(unused_mut))]
             let mut effects = decide_namespace_creation(deployment, name, token, *storage)?;
             // The creator becomes admin of what it created, in the same
             // change: no state has the namespace without its admin.
+            #[cfg(feature = "tenancy")]
             if let (Some(creator), Some(id)) = (actor, created_id(&effects)) {
                 effects.push(crate::engine::access::creator_grant(id, creator, commit_ts));
             }
+            #[cfg(not(feature = "tenancy"))]
+            let _ = actor;
             Ok(effects)
         }
         MetadataCommand::DropNamespace { name } => decide_namespace_drop(deployment, name),
@@ -135,6 +139,7 @@ pub(crate) fn decide(
 }
 
 /// The namespace a creation's effects create, from its record's key.
+#[cfg(feature = "tenancy")]
 fn created_id(effects: &[Mutation]) -> Option<NamespaceId> {
     effects.iter().find_map(|m| match m {
         Mutation::Put { key, .. } => decode_namespace_record_key(key),

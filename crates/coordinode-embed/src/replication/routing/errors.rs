@@ -125,6 +125,7 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::NamespaceInUse(_) => "NamespaceInUse",
         E::AccessRefused(_) => "AccessRefused",
         E::NamespaceMismatch { .. } => "NamespaceMismatch",
+        E::WithoutTenancy(_) => "WithoutTenancy",
         E::Mismatched(_) => "Mismatched",
         E::SettingsRefused(_) => "SettingsRefused",
         E::ReadFence { .. } => "ReadFence",
@@ -662,6 +663,7 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
         E::NamespaceMismatch { principal, session } => {
             Kind::NamespaceMismatch(wire::NamespaceMismatch { principal, session })
         }
+        E::WithoutTenancy(what) => Kind::WithoutTenancy(text(what)),
         E::CapacityExhausted {
             endpoint_id,
             used_bytes,
@@ -1077,6 +1079,7 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             principal: m.principal,
             session: m.session,
         },
+        Kind::WithoutTenancy(what) => E::WithoutTenancy(what.message),
         Kind::CapacityExhausted(c) => E::CapacityExhausted {
             endpoint_id: c.endpoint_id,
             used_bytes: c.used_bytes,

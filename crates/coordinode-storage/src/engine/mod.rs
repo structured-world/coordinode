@@ -1,5 +1,11 @@
 //! CoordiNode LSM storage engine — primary KV layer (coordinode-storage).
 
+#[cfg(feature = "tenancy")]
+pub mod access;
+/// Without `tenancy` no grant catalog and no authorization step is
+/// compiled: the two points where a unit applies get their unchecked form.
+#[cfg(not(feature = "tenancy"))]
+#[path = "access_unchecked.rs"]
 pub mod access;
 pub mod applied;
 pub mod batch;

@@ -1443,6 +1443,7 @@ async fn a_schema_package_is_published_through_the_group() {
 /// written in it on the leader, and nothing of the members' own namespace.
 /// A follower refuses the creation, naming the leader; a drop on the leader
 /// takes the namespace from every member.
+#[cfg(feature = "tenancy")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_namespace_created_on_the_leader_serves_on_every_member() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
@@ -1556,6 +1557,7 @@ async fn a_namespace_created_on_the_leader_serves_on_every_member() {
 /// A namespace's storage settings travel through the group's log: set on
 /// the leader at creation and changed there, every member's catalog holds
 /// the merged settings; a follower refuses the change, naming the leader.
+#[cfg(feature = "tenancy")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_namespaces_storage_settings_reach_every_member() {
     use coordinode_core::namespace::{BlockCodec, NamespaceStorage};
@@ -1845,6 +1847,7 @@ async fn open_outside_the_group(dir: &Path) -> Option<DatabaseError> {
 }
 
 /// A served database over a store holding namespaces `default`, `a`, `b`.
+#[cfg(feature = "tenancy")]
 fn served_over_three(dir: &std::path::Path) -> coordinode_embed::replication::ServedDatabase {
     let database = coordinode_embed::Database::open(dir).unwrap();
     database.create_namespace("a").unwrap();
@@ -1862,6 +1865,7 @@ fn served_over_three(dir: &std::path::Path) -> coordinode_embed::replication::Se
 /// the one idle longest: the bound holds, and the closed namespace reopens
 /// on its next command with its data. While every open session is in use,
 /// a session of another namespace is refused as a busy member's command.
+#[cfg(feature = "tenancy")]
 #[test]
 fn the_open_session_bound_closes_the_idlest_and_refuses_when_all_are_in_use() {
     use coordinode_embed::replication::SessionLimits;
@@ -1901,6 +1905,7 @@ fn the_open_session_bound_closes_the_idlest_and_refuses_when_all_are_in_use() {
 /// An open session of a namespace dropped since is not served again: the
 /// next command naming it is refused by name and the session closes, and a
 /// namespace created again under the name gets a session of its own.
+#[cfg(feature = "tenancy")]
 #[test]
 fn a_session_of_a_dropped_namespace_is_not_served() {
     let dir = tempfile::tempdir().unwrap();
@@ -1938,6 +1943,7 @@ fn a_session_of_a_dropped_namespace_is_not_served() {
 
 /// A session no command reached for the idle bound closes; one holding an
 /// open transaction stays open, so its client does not lose it.
+#[cfg(feature = "tenancy")]
 #[test]
 fn an_idle_session_closes_unless_it_holds_a_transaction() {
     use coordinode_embed::replication::SessionLimits;
@@ -1971,6 +1977,7 @@ fn an_idle_session_closes_unless_it_holds_a_transaction() {
 /// database works in the anchor namespace, a session of the other opens by
 /// name, and each holds its own rows. An embedding host's handle reopens the
 /// same store the same way, its other namespace reached by name.
+#[cfg(feature = "tenancy")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_serves_every_namespace_its_store_holds() {
     use coordinode_embed::replication::Member;
@@ -2491,6 +2498,7 @@ async fn a_routed_write_takes_effect_once_across_a_leader_change() {
 /// naming it and the writer role it lacked, and changes nothing on any
 /// member. Once every right is revoked, its read through the follower is
 /// refused too.
+#[cfg(feature = "tenancy")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revocation_refuses_the_next_write_routed_from_a_follower() {
     use coordinode_core::txn::command::Principal;
@@ -2607,6 +2615,7 @@ async fn a_revocation_refuses_the_next_write_routed_from_a_follower() {
 }
 
 /// `subject` of trust scope `idp`, acting in the default namespace.
+#[cfg(feature = "tenancy")]
 fn acting_as(subject: &str) -> ActingContext {
     ActingContext::Principal(coordinode_core::txn::command::Principal {
         subject: subject.into(),
@@ -2619,6 +2628,7 @@ fn acting_as(subject: &str) -> ActingContext {
 /// moves, a principal revoked under the old leader is refused through the
 /// new leader and through its followers, and a principal still granted
 /// writes through them as before.
+#[cfg(feature = "tenancy")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revocation_holds_across_a_leader_change() {
     use coordinode_embed::{AccessChange, GranteeName, NamespaceRole, PrincipalId};
@@ -2694,6 +2704,7 @@ async fn a_revocation_holds_across_a_leader_change() {
 /// through different members of the group: the log orders the two
 /// transfers, exactly one takes effect, the other finds its condition gone
 /// and writes nothing, and every member ends with the same single holder.
+#[cfg(feature = "tenancy")]
 #[tokio::test(flavor = "multi_thread")]
 async fn two_members_race_for_an_exclusive_role_and_one_wins() {
     use coordinode_embed::PrincipalId;
@@ -2774,6 +2785,7 @@ async fn two_members_race_for_an_exclusive_role_and_one_wins() {
 /// namespace under the same ID is refused as if no such transaction were
 /// open, before it reads or writes anything, and the owner's transaction
 /// carries on untouched. Knowing an ID grants nothing.
+#[cfg(feature = "tenancy")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transaction_answers_only_the_caller_that_opened_it() {
     use coordinode_core::txn::command::Principal;

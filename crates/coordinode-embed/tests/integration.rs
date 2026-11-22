@@ -72,4 +72,5 @@ mod integration {
     mod vector_index_build_lifecycle;
     mod vector_index_ddl;
     mod volatile;
+    mod without_tenancy;
 }

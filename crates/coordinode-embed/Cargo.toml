@@ -10,6 +10,14 @@ readme.workspace = true
 documentation = "https://docs.rs/coordinode-embed"
 
 [features]
+default = ["tenancy"]
+# Namespaces, principals and the per-namespace access control, together.
+# Without it a database is one store whose access is decided by who can open
+# its files: it opens a directory of one namespace and refuses by name one
+# holding several, compiles no grant catalog and no authorization step, and
+# refuses a call acting for a principal. The directory layout is the same
+# either way.
+tenancy = ["coordinode-storage/tenancy"]
 # Use the io_uring storage backend on Linux (forwards to
 # coordinode-storage/io-uring). On through coordinode-storage's defaults;
 # no-op on non-Linux targets.
@@ -78,8 +86,9 @@ uuid = { version = "1", features = ["v4"] }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
-# The crate's own tests pause its index workers.
-coordinode-embed = { path = ".", features = ["test-hooks"] }
+# The crate's own tests pause its index workers. Without its default
+# features, so a build without `tenancy` tests without it.
+coordinode-embed = { path = ".", default-features = false, features = ["test-hooks"] }
 # RFC 3339 instants the time-travel tests name.
 time = { workspace = true, features = ["formatting"] }
 # Failure injection into the text indexes this crate's tests drive.

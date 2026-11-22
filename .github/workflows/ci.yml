@@ -391,6 +391,43 @@ jobs:
       - name: Tests without replication (nextest)
         run: cargo nextest run -p coordinode-embed
 
+  embedded-without-tenancy:
+    name: Embedded library without tenancy
+    # The embedded library the way a single-store application takes it: no
+    # namespaces, principals or access control compiled in. It opens a
+    # directory of one namespace, refuses by name one holding several, and
+    # refuses a call acting for a principal; its tests pass without them.
+    runs-on: ubuntu-latest
+    env:
+      # See the `test` job: linked with mold.
+      RUSTFLAGS: "-D warnings -C linker-features=-lld -C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler and mold (skip if present)
+        run: |
+          missing=''
+          command -v protoc >/dev/null 2>&1 || missing="$missing protobuf-compiler libprotobuf-dev"
+          command -v mold >/dev/null 2>&1 || missing="$missing mold"
+          if [ -n "$missing" ]; then
+            sudo apt-get update && sudo apt-get install -y $missing
+          fi
+          echo "protoc: $(protoc --version)"
+          echo "$(mold --version)"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: No access control in the build
+        run: scripts/embedded-without-tenancy.sh
+      - name: Clippy without tenancy
+        run: cargo clippy -p coordinode-embed --no-default-features --all-targets -- -D warnings
+      - name: Clippy without tenancy, with replication
+        run: cargo clippy -p coordinode-embed --no-default-features --features replication --all-targets -- -D warnings
+      - name: Tests without tenancy (nextest)
+        run: cargo nextest run -p coordinode-embed --no-default-features
+
   build:
     name: Build
     # See `test` job: the release build is even larger than debug and
