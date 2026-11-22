@@ -4128,17 +4128,23 @@ async fn publish_existing_state_as_group_base(
 
     // The snapshot is taken at the applied index, so wait for the membership
     // entry this open just proposed to apply; snapshotting before it would
-    // publish a base the group cannot place in its own history.
+    // publish a base the group cannot place in its own history. Waited for
+    // without a clock: a slow disk or a loaded host only takes longer, and
+    // what ends the wait otherwise is the node stopping or a fatal error
+    // (every storage failure in the apply or the snapshot is one).
     let applied = raft
-        .wait(Some(std::time::Duration::from_secs(5)))
-        .metrics(|m| m.last_applied.is_some(), "the membership entry applies")
+        .wait(None)
+        .metrics(
+            |m| m.last_applied.is_some() || m.running_state.is_err(),
+            "the membership entry applies",
+        )
         .await
         .ok()
         .and_then(|m| m.last_applied);
     let Some(applied) = applied else {
         return Err(RaftNodeError::Init(
-            "a group formed around existing data never applied its own membership entry, so \
-             that data could not be published as the group's base state"
+            "a group formed around existing data stopped before it applied its own membership \
+             entry, so that data could not be published as the group's base state"
                 .to_string(),
         ));
     };
@@ -4149,9 +4155,9 @@ async fn publish_existing_state_as_group_base(
         .map_err(|e| RaftNodeError::Init(format!("snapshot of the existing state: {e}")))?;
 
     let snapshot = raft
-        .wait(Some(std::time::Duration::from_secs(10)))
+        .wait(None)
         .metrics(
-            |m| m.snapshot.is_some_and(|s| s.index >= applied.index),
+            |m| m.snapshot.is_some_and(|s| s.index >= applied.index) || m.running_state.is_err(),
             "the snapshot of the existing state completes",
         )
         .await
@@ -4159,8 +4165,8 @@ async fn publish_existing_state_as_group_base(
         .and_then(|m| m.snapshot);
     let Some(snapshot) = snapshot.filter(|s| s.index >= applied.index) else {
         return Err(RaftNodeError::Init(
-            "the snapshot carrying this store's existing data never completed, so the data \
-             could not be published as the group's base state"
+            "the node stopped before the snapshot carrying this store's existing data \
+             completed, so the data could not be published as the group's base state"
                 .to_string(),
         ));
     };

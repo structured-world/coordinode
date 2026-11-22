@@ -192,6 +192,30 @@ async fn a_checkpoint_returns_once_the_snapshot_covers_the_applied_log() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A group formed around a store that already holds data publishes it as the
+/// group's base through a snapshot, however long that snapshot takes to
+/// build: a slow disk or a loaded host makes forming the group slower, never
+/// makes it fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_forms_around_existing_data_however_slow_its_snapshot() {
+    use openraft::async_runtime::watch::WatchReceiver;
+
+    let (_dir, engine) = test_engine();
+    engine
+        .put(Partition::Node, b"node:1:existing", b"v")
+        .expect("existing data");
+    // Longer than any fixed wait the formation could allow itself.
+    crate::storage::BUILD_DELAY_MS.store(11_000, core::sync::atomic::Ordering::Relaxed);
+    let node = RaftNode::single_node(engine)
+        .await
+        .expect("the group forms around the existing data");
+    assert!(
+        node.raft().metrics().borrow_watched().snapshot.is_some(),
+        "the existing data was published as the group's base"
+    );
+    node.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn single_node_bootstrap_becomes_leader() {
     let (_dir, engine) = test_engine();
