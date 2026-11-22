@@ -15,7 +15,6 @@ allow = [
     "BSL-1.0",
     "MPL-2.0",
     "AGPL-3.0-only",
-    "CC0-1.0",
     "CDLA-Permissive-2.0",
     "0BSD",
 ]
@@ -26,14 +25,12 @@ ignore = true
 
 [advisories]
 ignore = [
-    # chrono, chrono-tz and chrono-tz-build are unmaintained, with no fixed
-    # release. The workspace's own code uses jiff; these come in only through
-    # the vendored openraft (itself, and display-more formatting timestamps
-    # with chrono-tz) and pgwire (postgres-types interval and timestamp
-    # conversions). Revisit when openraft and pgwire drop chrono.
+    # chrono is unmaintained, with no fixed release. It comes in only through
+    # pg_interval, which pgwire's server API requires and which depends on
+    # chrono for a chrono::Duration conversion that pgwire does not use.
+    # Drop this once pg_interval puts chrono behind a feature and pgwire
+    # takes it without that feature.
     "RUSTSEC-2026-0543",
-    "RUSTSEC-2026-0555",
-    "RUSTSEC-2026-0559",
     # rsa "Marvin Attack" (timing sidechannel on RSA private-key operations).
     # The maintained TLS provider only verifies RSA peer/certificate signatures
     # with public keys. Its key loader and the wire identity admission refuse
