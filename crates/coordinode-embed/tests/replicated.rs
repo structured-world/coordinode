@@ -227,6 +227,15 @@ async fn a_full_group_refuses_writes_and_keeps_serving_reads() {
             "the refusal is typed, the leader's consensus untouched: {refused:?}"
         );
         assert!(accepted > 0, "the group took writes before it filled");
+        // Every member holds what was accepted before the limit drops: a
+        // follower's log is held to the limit too, so one still behind when
+        // it falls below what it holds stays behind, as a full member should.
+        for member in &members[1..] {
+            wait_until("the follower applied every accepted write", || {
+                label_count(member, "Full") == accepted as u64
+            })
+            .await;
+        }
 
         // Room comes back as the group reclaims its log, so a limit lowered
         // below what every member holds is what keeps the group full: it
