@@ -5746,6 +5746,14 @@ pub fn execute_no_commit(
         };
 
         if let Some(ts) = resolved_ts {
+            // A system time before the epoch names no commit of any store.
+            // Refused before any conversion: read as unsigned it would name a
+            // time past every commit.
+            let Ok(unsigned) = u64::try_from(ts) else {
+                return Err(ExecutionError::Unsupported(format!(
+                    "AS OF TIMESTAMP {ts} is before the Unix epoch: no commit is that old"
+                )));
+            };
             ctx.snapshot_ts = Some(ts);
 
             // Override MVCC and adj snapshots to the requested timestamp.
@@ -5756,10 +5764,29 @@ pub fn execute_no_commit(
             // anchor for its own write. A storage snapshot at seqno S sees
             // versions with seqno STRICTLY below S, and a commit lands at
             // exactly its commit_ts (one seqno per proposal), hence T + 1.
-            #[allow(clippy::cast_sign_loss)]
-            let seqno = (ts as u64).checked_add(1).ok_or_else(|| {
+            let seqno = unsigned.checked_add(1).ok_or_else(|| {
                 ExecutionError::Unsupported("AS OF TIMESTAMP value out of range".into())
             })?;
+            // A time this store's clock has not reached can still be given
+            // to a commit: a read there is not ready, and is not answered
+            // with what is committed now. The next stamp is past both the
+            // last one handed out and the wall clock, so a time below either
+            // is closed to new commits; the ones in flight are waited on
+            // below. A store whose seqnos are not its clock has no time to
+            // compare with.
+            if let Some(oracle) = ctx.engine.oracle() {
+                let handed_out = oracle.current().as_raw();
+                let wall = u64::try_from(wall_clock_us()).unwrap_or(0);
+                if unsigned > handed_out && unsigned >= wall {
+                    return Err(ExecutionError::ReadNotReady {
+                        requested: unsigned,
+                        ready_through: Some(
+                            wall.checked_sub(1)
+                                .map_or(handed_out, |w| handed_out.max(w)),
+                        ),
+                    });
+                }
+            }
             // The named time is kept, never lowered, and answered only once
             // every commit at or below it is applied here: below every
             // commit in flight and, on a replicated member, under its closed

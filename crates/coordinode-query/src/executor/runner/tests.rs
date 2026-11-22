@@ -2520,6 +2520,99 @@ fn as_of_timestamp_string_is_parsed_as_rfc3339() {
     assert_eq!(ctx.snapshot_ts, Some(recent_ts));
 }
 
+/// A plan scanning every `User` as of `ts`.
+fn users_as_of(ts: Value) -> LogicalPlan {
+    LogicalPlan {
+        snapshot_ts: Some(nx(Expr::Literal(ts))),
+        vector_consistency: VectorConsistencyMode::default(),
+        read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
+        root: LogicalOp::Project {
+            input: Box::new(LogicalOp::NodeScan {
+                variable: "n".into(),
+                labels: vec!["User".into()],
+                property_filters: vec![],
+            }),
+            items: vec![crate::planner::logical::ProjectItem {
+                expr: nx(Expr::Star),
+                alias: None,
+            }],
+            distinct: false,
+        },
+    }
+}
+
+/// A system time before the Unix epoch names no commit of any store: it is
+/// refused, in every form a timestamp takes, never answered with the current
+/// data. A negative microsecond count read as unsigned names a time past
+/// every commit, which is how such a read used to see everything.
+#[test]
+fn as_of_before_the_epoch_is_refused() {
+    let (_dir, engine, mut interner) = setup_test_graph();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+    for ts in [
+        Value::Int(-1),
+        Value::Int(-2),
+        Value::Timestamp(-1),
+        Value::Timestamp(-2),
+        Value::String("1900-01-01T00:00:00Z".into()),
+        Value::String("1969-12-31T23:59:59.999999Z".into()),
+    ] {
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        let result = execute(&users_as_of(ts.clone()), &mut ctx);
+        match result {
+            Err(ExecutionError::Unsupported(message)) => {
+                assert!(message.contains("before"), "{ts:?}: {message}");
+            }
+            other => panic!("{ts:?}: expected a refusal, got {other:?}"),
+        }
+        assert!(
+            ctx.snapshot_pin.is_none(),
+            "{ts:?}: a refused read leaves no pin"
+        );
+    }
+}
+
+/// A system time this store has not reached yet can still be given to a
+/// commit: a read there is not ready, and is refused as such rather than
+/// answered with what is committed now.
+#[test]
+fn as_of_in_the_future_is_not_ready() {
+    // A store whose seqnos are its clock: only there does a time compare
+    // with what it has reached.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = StorageEngine::open_with_oracle(
+        &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]),
+        std::sync::Arc::new(TimestampOracle::new()),
+    )
+    .expect("open with oracle");
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+    // 2100-01-01T00:00:00Z.
+    const Y2100_US: i64 = 4_102_444_800_000_000;
+    for ts in [
+        Value::Int(Y2100_US),
+        Value::Timestamp(Y2100_US),
+        Value::String("2100-01-01T00:00:00Z".into()),
+    ] {
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        let result = execute(&users_as_of(ts.clone()), &mut ctx);
+        assert!(
+            matches!(
+                result,
+                Err(ExecutionError::ReadNotReady { requested, .. })
+                    if requested == Y2100_US as u64
+            ),
+            "{ts:?}: expected not ready, got {result:?}"
+        );
+    }
+}
+
 #[test]
 fn no_timestamp_leaves_snapshot_none() {
     let (_dir, engine, mut interner) = setup_test_graph();

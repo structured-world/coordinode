@@ -339,9 +339,9 @@ fn as_of_timestamp_rejects_a_negative_literal() {
 
     let err = db
         .execute_cypher("MATCH (n:Anchor) RETURN n AS OF TIMESTAMP -1")
-        .expect_err("a negative AS OF TIMESTAMP is out of range");
+        .expect_err("a negative AS OF TIMESTAMP is refused");
     assert!(
-        err.to_string().contains("out of range"),
+        err.to_string().contains("before the Unix epoch"),
         "unexpected error: {err}"
     );
     assert_eq!(
