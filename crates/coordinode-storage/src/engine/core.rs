@@ -152,6 +152,13 @@ pub struct Deployment {
     /// `metadata_decisions`: client writes of different issuers decide in
     /// parallel and never hold off dictionary reads.
     operation_decisions: crate::engine::operations::DecisionLocks,
+    /// Held shared while a unit's principal is checked and the unit applied
+    /// (and, on the journalled path, journalled), and exclusively while a
+    /// change to the grant catalog is decided and applied: a write is checked
+    /// against every grant change applied before it and none after, on a
+    /// path whose commits are not ordered by one log. Units with no principal
+    /// do not take it.
+    access_decisions: parking_lot::RwLock<()>,
     /// Counts changes to the field dictionary this process has seen applied
     /// or installed. A view of the dictionary taken at one value covers every
     /// binding applied before it, so a reader compares it once per query.
@@ -2148,6 +2155,7 @@ impl Deployment {
             repairs: parking_lot::Mutex::new(RepairMarks::default()),
             metadata_decisions: parking_lot::Mutex::new(()),
             operation_decisions: crate::engine::operations::DecisionLocks::default(),
+            access_decisions: parking_lot::RwLock::new(()),
             field_dictionary_generation: AtomicU64::new(0),
             field_dictionary_epoch: AtomicU64::new(0),
             pending_commits,
@@ -8428,6 +8436,9 @@ impl Deployment {
     /// canonicalises each key to one final operation, so this marks an
     /// upstream bug rather than silently ordering the pair.
     pub fn apply_proposal_at(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
+        // The check and the apply hold off grant changes together.
+        let _access = self.access_guard(mutations);
+        let mutations = self.authorized(mutations)?;
         if let Some((command, rest)) = crate::engine::operations::unit_command(mutations)? {
             // The decision and the apply hold the issuer's lock together, so
             // the next decision about the operation reads this one's record.
@@ -8491,6 +8502,11 @@ impl Deployment {
         // would fail in; the admission is held until the write is in the
         // journal and the memtables.
         let _admitted = self.admit_write(mutations)?;
+        // The check, the journal append and the apply hold off grant changes
+        // together; a refused unit journals nothing, so a replay has nothing
+        // of it to decide again.
+        let _access = self.access_guard(mutations);
+        let mutations = self.authorized(mutations)?;
         if let Some((command, rest)) = crate::engine::operations::unit_command(mutations)? {
             // The decision, the journal append and the apply hold the
             // issuer's lock together: the journal records each decision's
@@ -8530,6 +8546,32 @@ impl Deployment {
             return Ok(());
         }
         self.journal_and_apply(mutations, commit_ts, level)
+    }
+
+    /// The shared hold on grant changes a unit with an acting principal takes
+    /// for its check and apply; none for a unit without one.
+    pub(crate) fn access_guard(
+        &self,
+        mutations: &[Mutation],
+    ) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        coordinode_core::txn::proposal::actor_of(mutations).map(|_| self.access_decisions.read())
+    }
+
+    /// `mutations` as they apply once their principal's grants are checked:
+    /// without the principal, or as they are when they name none.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::AccessRefused`] when the principal lacks a right the
+    /// unit needs; a catalog read failure.
+    fn authorized<'m>(&self, mutations: &'m [Mutation]) -> StorageResult<&'m [Mutation]> {
+        match crate::engine::access::check_unit(self, mutations)? {
+            crate::engine::access::Checked::Unchecked(m)
+            | crate::engine::access::Checked::Granted(m) => Ok(m),
+            crate::engine::access::Checked::Refused(refusal) => {
+                Err(StorageError::AccessRefused(refusal))
+            }
+        }
     }
 
     /// Make the journal as durable as `level` promises for a commit that

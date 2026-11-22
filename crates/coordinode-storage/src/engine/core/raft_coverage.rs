@@ -320,6 +320,25 @@ impl Deployment {
             index,
             sub,
         };
+        let at = coordinode_core::txn::operation::LogPosition { index, sub };
+        // A unit acting for a principal is checked against the grants the
+        // log has produced up to it, the check and the apply holding off
+        // grant changes together. A refused unit applies only the mark that
+        // tells raw readers of the log, and its proposer, why.
+        let _access = self.access_guard(mutations);
+        let refusal_mark;
+        let mutations = match crate::engine::access::check_unit(self, mutations)? {
+            crate::engine::access::Checked::Unchecked(m)
+            | crate::engine::access::Checked::Granted(m) => m,
+            crate::engine::access::Checked::Refused(refusal) => {
+                refusal_mark = [Mutation::Put {
+                    partition: coordinode_core::txn::proposal::PartitionId::Deployment,
+                    key: crate::engine::operations::skipped_unit_key(at),
+                    value: refusal.encode(),
+                }];
+                &refusal_mark[..]
+            }
+        };
         // A unit bound to a client operation is decided first, holding the
         // issuer's lock through the apply: the next decision about the
         // operation reads this one's record. A unit its binding refuses
@@ -330,7 +349,6 @@ impl Deployment {
             None => mutations,
             Some((command, rest)) => {
                 _decision = Some(self.operation_decisions.lock(&command.issuer()));
-                let at = coordinode_core::txn::operation::LogPosition { index, sub };
                 let outcome =
                     crate::engine::operations::decide(self, command, rest, commit_ts, at)?;
                 decided = if outcome.skipped {

@@ -464,6 +464,11 @@ pub enum StorageError {
     /// of the unit is applied.
     #[error(transparent)]
     Unscoped(#[from] coordinode_core::txn::proposal::Unscoped),
+
+    /// The unit's principal lacked a right at the unit's place in the log:
+    /// it was applied as a refusal and changed nothing.
+    #[error("access refused: {0}")]
+    AccessRefused(coordinode_core::access::AccessRefusal),
 }
 
 /// `key` as text for a message: printable ASCII as it is, every other byte
