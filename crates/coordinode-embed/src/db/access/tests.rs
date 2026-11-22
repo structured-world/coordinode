@@ -562,6 +562,82 @@ fn a_right_holder_reads_whether_a_deployment_admin_is_issued() {
     ));
 }
 
+/// A principal holding only the right to create namespaces, with no session
+/// on any namespace's data, creates one in catalog scope, becomes its admin
+/// at once, lists the deployment's namespaces and drops what it created. It
+/// does not drop a namespace it has no admin on, and a principal without the
+/// right creates nothing and lists nothing; neither learns from the refusal
+/// whether a name is taken.
+#[test]
+fn a_creator_works_in_catalog_scope_without_a_data_session() {
+    use coordinode_storage::engine::access::effective_role;
+    let (db, _dir) = open();
+    db.change_access(
+        &ActingContext::Trusted,
+        AccessChange::DeploymentRights {
+            principal: id("carol"),
+            create_namespace: Some(true),
+            admin: None,
+        },
+    )
+    .expect("grant the right to create namespaces");
+    db.create_namespace("theirs").expect("the host creates one");
+
+    let carol = db.catalog_scope(id("carol"));
+    carol.create_namespace("carols").expect("carol creates");
+    let deployment = db.engine.deployment();
+    let carols = coordinode_storage::engine::metadata::namespace_by_name(deployment, "carols")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        effective_role(deployment, &id("carol"), carols).unwrap(),
+        Some(NamespaceRole::Admin),
+        "the creator is admin of what it created"
+    );
+    let names: Vec<_> = carol
+        .namespaces()
+        .expect("carol lists")
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert!(names.contains(&"carols".to_owned()) && names.contains(&"theirs".to_owned()));
+
+    let theirs = coordinode_storage::engine::metadata::namespace_by_name(deployment, "theirs")
+        .unwrap()
+        .unwrap();
+    refused_for(
+        carol.drop_namespace("theirs"),
+        "carol",
+        MissingRight::Namespace {
+            namespace: theirs,
+            role: NamespaceRole::Admin,
+        },
+    );
+    refused_for(
+        carol.drop_namespace("nowhere"),
+        "carol",
+        MissingRight::DeploymentAdmin,
+    );
+    carol
+        .drop_namespace("carols")
+        .expect("carol drops what it created");
+
+    let eve = db.catalog_scope(id("eve"));
+    // A taken name and a free one are refused alike.
+    for name in ["theirs", "free"] {
+        refused_for(
+            eve.create_namespace(name),
+            "eve",
+            MissingRight::CreateNamespace,
+        );
+    }
+    refused_for(
+        eve.namespaces().map(drop),
+        "eve",
+        MissingRight::CreateNamespace,
+    );
+}
+
 /// A principal bound to another namespace than the handle's changes
 /// nothing through it.
 #[test]

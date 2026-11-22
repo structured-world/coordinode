@@ -4554,7 +4554,7 @@ mod namespaces;
 mod package;
 mod projection;
 mod state_cut;
-pub use access::{DeploymentAdmin, GrantView, RoleView};
+pub use access::{CatalogScope, DeploymentAdmin, GrantView, RoleView};
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use blob::{BlobId, GroupMembers, UploadedBlob};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};

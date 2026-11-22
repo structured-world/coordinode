@@ -49,7 +49,114 @@ pub struct DeploymentAdmin {
     pub changed_ts: u64,
 }
 
+/// The deployment's catalog as one principal reaches it without a session
+/// on any namespace's data: what a principal holding only the right to
+/// create namespaces does before it has one. It runs no statement, reads
+/// and writes no namespace's data and opens no cursor or transaction: it
+/// has no way to.
+pub struct CatalogScope<'d> {
+    db: &'d Database,
+    principal: PrincipalId,
+}
+
+impl core::fmt::Debug for CatalogScope<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CatalogScope")
+            .field("principal", &self.principal)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogScope<'_> {
+    /// The principal this scope acts for.
+    #[must_use]
+    pub fn principal(&self) -> &PrincipalId {
+        &self.principal
+    }
+
+    /// Create the namespace `name`, with the right to create namespaces;
+    /// the principal becomes its admin in the same change.
+    ///
+    /// # Errors
+    ///
+    /// As [`Database::create_namespace`];
+    /// [`DatabaseError::AccessRefused`] without the right.
+    pub fn create_namespace(&self, name: &str) -> Result<(), DatabaseError> {
+        self.create_namespace_with(
+            name,
+            coordinode_core::namespace::NamespaceStorage::default(),
+        )
+    }
+
+    /// [`Self::create_namespace`] with the data-block storage settings
+    /// `storage`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_namespace`].
+    pub fn create_namespace_with(
+        &self,
+        name: &str,
+        storage: coordinode_core::namespace::NamespaceStorage,
+    ) -> Result<(), DatabaseError> {
+        self.db
+            .create_namespace_as(Some(self.principal.clone()), name, storage)
+    }
+
+    /// Drop the namespace `name`, as its admin.
+    ///
+    /// # Errors
+    ///
+    /// As [`Database::drop_namespace`];
+    /// [`DatabaseError::AccessRefused`] without admin on it.
+    pub fn drop_namespace(&self, name: &str) -> Result<(), DatabaseError> {
+        self.db
+            .drop_namespace_as(Some(self.principal.clone()), name)
+    }
+
+    /// The deployment's namespaces, for a principal that may create
+    /// namespaces or holds the deployment admin right.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::AccessRefused`] for any other principal; the
+    /// catalog cannot be read.
+    pub fn namespaces(&self) -> Result<Vec<super::NamespaceInfo>, DatabaseError> {
+        let rights = access::deployment_rights(self.db.engine.deployment(), &self.principal)?;
+        if !(rights.create_namespace || rights.admin) {
+            return Err(DatabaseError::AccessRefused(AccessRefusal {
+                principal: self.principal.clone(),
+                missing: MissingRight::CreateNamespace,
+            }));
+        }
+        self.db.namespaces()
+    }
+
+    /// Commit `change` to the grant catalog, acting for the principal: the
+    /// rights it needs are decided where the change applies, as through
+    /// [`Database::change_access`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Database::change_access`].
+    pub fn change_access(&self, change: AccessChange) -> Result<(), DatabaseError> {
+        self.db
+            .propose_command_as(Some(self.principal.clone()), MetadataCommand::from(change))
+    }
+}
+
 impl Database {
+    /// The deployment's catalog as `principal` reaches it with no session on
+    /// a namespace's data. The host vouches for the principal, as it does
+    /// for a session's.
+    #[must_use]
+    pub fn catalog_scope(&self, principal: PrincipalId) -> CatalogScope<'_> {
+        CatalogScope {
+            db: self,
+            principal,
+        }
+    }
+
     /// The grants on `namespace`, read from the catalog now, for `actor`: a
     /// principal reads them while it holds a right on that namespace.
     ///

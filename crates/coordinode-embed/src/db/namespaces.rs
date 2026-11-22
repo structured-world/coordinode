@@ -106,7 +106,7 @@ impl Database {
     /// [`Self::create_namespace_with`] acting for `actor`: a principal
     /// creates only with the right to create namespaces, and becomes admin of
     /// what it created in the same change.
-    fn create_namespace_as(
+    pub(super) fn create_namespace_as(
         &self,
         actor: Option<PrincipalId>,
         name: &str,
@@ -117,6 +117,21 @@ impl Database {
             reason: e.to_string(),
         })?;
         let deployment = self.engine.deployment();
+        // A principal without the right learns nothing of which names are
+        // taken: refused here as the apply would refuse it. The apply still
+        // decides; this only answers early.
+        if let Some(principal) = &actor {
+            let rights =
+                coordinode_storage::engine::access::deployment_rights(deployment, principal)?;
+            if !(rights.create_namespace || rights.admin) {
+                return Err(DatabaseError::AccessRefused(
+                    coordinode_core::access::AccessRefusal {
+                        principal: principal.clone(),
+                        missing: coordinode_core::access::MissingRight::CreateNamespace,
+                    },
+                ));
+            }
+        }
         if metadata::namespace_by_name(deployment, name)?.is_some() {
             return Err(DatabaseError::NamespaceExists(name.to_owned()));
         }
@@ -153,13 +168,38 @@ impl Database {
 
     /// [`Self::drop_namespace`] acting for `actor`, which needs admin on the
     /// namespace.
-    fn drop_namespace_as(
+    pub(super) fn drop_namespace_as(
         &self,
         actor: Option<PrincipalId>,
         name: &str,
     ) -> Result<(), DatabaseError> {
         let deployment = self.engine.deployment();
-        let Some(id) = metadata::namespace_by_name(deployment, name)? else {
+        let found = metadata::namespace_by_name(deployment, name)?;
+        // A principal without admin on it learns nothing of whether it
+        // exists: refused here as the apply would refuse it.
+        if let Some(principal) = &actor {
+            use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole};
+            use coordinode_storage::engine::access;
+            let missing = match found {
+                None => Some(MissingRight::DeploymentAdmin),
+                Some(namespace) => {
+                    let admin = access::deployment_rights(deployment, principal)?.admin
+                        || access::effective_role(deployment, principal, namespace)?
+                            == Some(NamespaceRole::Admin);
+                    (!admin).then_some(MissingRight::Namespace {
+                        namespace,
+                        role: NamespaceRole::Admin,
+                    })
+                }
+            };
+            if let Some(missing) = missing {
+                return Err(DatabaseError::AccessRefused(AccessRefusal {
+                    principal: principal.clone(),
+                    missing,
+                }));
+            }
+        }
+        let Some(id) = found else {
             return Err(DatabaseError::UnknownNamespace(name.to_owned()));
         };
         // PostgreSQL refuses to drop the database a connection is open on
