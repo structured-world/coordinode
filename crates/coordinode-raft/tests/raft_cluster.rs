@@ -3468,6 +3468,203 @@ async fn a_member_that_lost_committed_entries_votes_again_only_once_caught_up() 
     );
 }
 
+/// A follower that lost the tail of its log comes back while the leader stays
+/// up, behind a purge of the entries it misses. It takes the leader's snapshot
+/// and then every later write from the same leader, with no election: a
+/// stream left on the follower's old position would keep it from getting
+/// anything newer until the leadership changed. The lost tail lies below the
+/// state the follower applied, so it reopens at that state and the leader
+/// serves it as a follower behind the purge. Writes keep arriving throughout,
+/// so the leader's stream to the follower is busy while it catches up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_behind_a_purge_takes_every_write_from_the_same_leader() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+        ];
+        let e1 = open_engine_at(dirs[0].path());
+        let e2 = member_engine_at(dirs[1].path());
+        let e3 = member_engine_at(dirs[2].path());
+
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+            conn(1),
+        )
+        .await
+        .expect("n1");
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n2");
+        let n3 = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+            conn(3),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n3");
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
+            .await
+            .expect("add 2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"), ident(3))
+            .await
+            .expect("add 3");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+
+        let key = |i: u64| format!("node:1:revert-{i}").into_bytes();
+        let put = move |id, i: u64| RaftProposal {
+            id,
+            mutations: unit![Mutation::Put {
+                partition: PartitionId::Node,
+                key: key(i),
+                value: b"v".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(100 + i),
+            start_ts: Timestamp::from_raw(99 + i),
+            bypass_rate_limiter: false,
+        };
+        let id_gen = Arc::new(ProposalIdGenerator::with_base(1u64 << 48));
+        let pipeline = n1.pipeline();
+        for i in 1..=20u64 {
+            pipeline
+                .propose_and_wait(&put(id_gen.next(), i))
+                .expect("propose");
+        }
+        assert!(
+            await_replicated(&e3, &key(20), b"v").await,
+            "n3 has every write"
+        );
+        let term = n1.current_term();
+
+        // Member 3 alone stops; the leader goes on.
+        n3.shutdown().await.expect("stop 3");
+        drop(n3);
+        assert_eq!(
+            Arc::strong_count(&e3),
+            1,
+            "the stopped member still holds its engine: {:?}",
+            coordinode_raft::engine_hold::engine_holders(&e3)
+        );
+        drop(e3);
+
+        // Its disk loses the last third of its newest log segment: entries
+        // the group committed and the leader counted as matched on it.
+        let log_dir = dirs[2].path().join("oplog").join("0");
+        let newest = std::fs::read_dir(&log_dir)
+            .expect("list the log")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+            .max()
+            .expect("a segment");
+        let len = std::fs::metadata(&newest).expect("stat").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&newest)
+            .expect("open segment")
+            .set_len(len - len / 3)
+            .expect("lose the tail");
+
+        // The leader moves on and purges everything member 3 still lacks.
+        for i in 21..=40u64 {
+            pipeline
+                .propose_and_wait(&put(id_gen.next(), i))
+                .expect("propose while 3 is down");
+        }
+        n1.raft().trigger().snapshot().await.expect("snapshot");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let applied = n1.applied_index();
+        n1.raft().trigger().purge_log(applied).await.expect("purge");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Writes keep coming while member 3 reopens and catches up.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            let id_gen = Arc::clone(&id_gen);
+            let pipeline = n1.pipeline();
+            tokio::task::spawn_blocking(move || {
+                let mut i = 1_000u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    pipeline
+                        .propose_and_wait(&put(id_gen.next(), i))
+                        .expect("propose during the catch-up");
+                    i += 1;
+                }
+                i
+            })
+        };
+        let e3 = open_engine_at(dirs[2].path());
+        let n3 = reopen_member(3, &e3, p3).await;
+        assert!(
+            n3.catching_up(),
+            "a member that lost committed entries reopens catching up"
+        );
+        let mut caught_up = false;
+        for _ in 0..300 {
+            if !n3.catching_up() {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(caught_up, "member 3 catches up from the same leader");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let written = writer.await.expect("the writer ends");
+
+        // The next write after the catch-up reaches member 3, and so does
+        // every write made while it caught up.
+        pipeline
+            .propose_and_wait(&put(id_gen.next(), 9_999))
+            .expect("the next write commits");
+        assert!(
+            await_replicated(&e3, &key(9_999), b"v").await,
+            "member 3 applies the next write under the same leader"
+        );
+        for i in (1..=40u64).chain(1_000..written) {
+            assert_eq!(
+                e3.get(Partition::Node, &key(i)).expect("read").as_deref(),
+                Some(b"v".as_slice()),
+                "member 3 holds write {i}"
+            );
+        }
+        assert!(n1.is_leader().await, "member 1 still leads");
+        assert_eq!(n1.current_term(), term, "no election took place");
+
+        drop(pipeline);
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+        n3.shutdown().await.expect("s3");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_follower_behind_a_purge_takes_every_write_from_the_same_leader"
+    );
+}
+
 /// A member whose Raft tree was lost comes back with the vote it had given,
 /// read from the second copy, never the consensus engine's initial one: its
 /// promise does not move back. With every copy of its vote gone it does not
