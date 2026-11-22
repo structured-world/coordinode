@@ -230,8 +230,8 @@ fn unknown_flags_and_tags_are_refused() {
     for tag in [
         // One past the last partition a frame numbers.
         KIND_PUT | ((PARTITIONS.len() as u8) << 3),
-        // The one past the namespace marker.
-        KIND_COMMAND | (2 << 3),
+        // The one past the acting principal.
+        KIND_COMMAND | (3 << 3),
         KIND_DERIVE | (1 << 3),
         KIND_OPERATION | (1 << 3),
         KIND_EFFECTS | (1 << 3),
@@ -1116,5 +1116,105 @@ fn a_field_wise_proposal_is_refused() {
     assert_eq!(
         rmp_serde::from_slice::<RaftProposal>(&framed).expect("a frame"),
         mixed()
+    );
+}
+
+fn actor(subject: &str) -> Mutation {
+    Mutation::Actor(crate::access::PrincipalId::new(subject, "issuer-a").expect("principal"))
+}
+
+/// The principal a unit acts for travels in the frame as its first
+/// operation and comes back unchanged, to a reader of rows too: every member
+/// checks the unit's grants against it when it applies the unit.
+#[test]
+fn the_acting_principal_round_trips_as_the_first_operation() {
+    let mut mutations = vec![actor("alice")];
+    mutations.extend(crate::txn::proposal::in_namespace(
+        NS,
+        [put(PartitionId::Node, b"node:1:42", b"record-bytes")],
+    ));
+    let unit = unnamed(mutations);
+    check_proposal(&unit).expect("checks");
+    let frame = encode_proposal(&unit).expect("encode");
+    assert_eq!(decode(&frame).expect("decode"), unit);
+    let (rows, _) = decode_proposal_rows(&frame, &DecodeLimits::DEFAULT).expect("rows");
+    assert_eq!(rows.mutations, unit.mutations);
+}
+
+/// A unit acts for one principal: a second one, or one after the unit's
+/// first operation, is refused by the encoder before the unit reaches a log
+/// and by the decoder of a frame that carries one anyway. Otherwise the
+/// operations before it, or between the two, would be checked against a
+/// principal they were not issued by.
+#[test]
+fn a_second_or_late_acting_principal_is_refused() {
+    let cases = [
+        vec![actor("alice"), actor("bob"), Mutation::Namespace(NS)],
+        vec![
+            Mutation::Namespace(NS),
+            actor("alice"),
+            put(PartitionId::Node, b"node:1:1", b"r"),
+        ],
+    ];
+    for mutations in cases {
+        let unit = unnamed(mutations.clone());
+        assert!(
+            matches!(encode_proposal(&unit), Err(FrameError::MisplacedActor(_))),
+            "encode {mutations:?}"
+        );
+        assert!(
+            matches!(check_proposal(&unit), Err(FrameError::MisplacedActor(_))),
+            "check {mutations:?}"
+        );
+        assert!(
+            matches!(
+                decode(&unchecked_frame(&mutations)),
+                Err(FrameError::MisplacedActor(_))
+            ),
+            "decode {mutations:?}"
+        );
+    }
+}
+
+/// A principal part the decoder would have to allocate past the bound, an
+/// empty one, or bytes that are not UTF-8 are refused before anything reads
+/// the unit.
+#[test]
+fn a_malformed_acting_principal_is_refused() {
+    // One acting principal: the subject's raw length varint and bytes, then
+    // the trust scope's.
+    let frame = |subject_len: &[u8], subject: &[u8], trust_scope: &[u8]| {
+        let mut body = header(1);
+        body.push(TAG_ACTOR);
+        body.extend_from_slice(subject_len);
+        body.extend_from_slice(subject);
+        body.push(trust_scope.len() as u8);
+        body.extend_from_slice(trust_scope);
+        signed(body)
+    };
+    assert!(
+        matches!(
+            decode(&frame(&[0], b"", b"issuer-a")),
+            Err(FrameError::BadActor(_))
+        ),
+        "an empty subject"
+    );
+    assert!(
+        matches!(
+            decode(&frame(&[3], b"\xff\xfe\xfd", b"issuer-a")),
+            Err(FrameError::BadActor(_))
+        ),
+        "a subject that is not UTF-8"
+    );
+    // 1025 bytes: one past the bound, refused before the bytes are taken.
+    assert!(matches!(
+        decode(&frame(&[0x81, 0x08], b"alice", b"issuer-a")),
+        Err(FrameError::OverLimit { .. })
+    ));
+    assert_eq!(
+        decode(&frame(&[5], b"alice", b"issuer-a"))
+            .expect("the well-formed frame")
+            .mutations,
+        vec![actor("alice")]
     );
 }

@@ -1377,14 +1377,16 @@ impl LogStore {
                     // and an operation record describes the unit's own data,
                     // as an effect context describes its rows.
                     // A namespace marker names where the data after it
-                    // goes and writes nothing itself.
+                    // goes and writes nothing itself, as an acting
+                    // principal names whom it is checked for.
                     Mutation::Delete { .. }
                     | Mutation::RemoveRange { .. }
                     | Mutation::Command(_)
                     | Mutation::Derive(_)
                     | Mutation::Operation(_)
                     | Mutation::Effects(_)
-                    | Mutation::Namespace(_) => false,
+                    | Mutation::Namespace(_)
+                    | Mutation::Actor(_) => false,
                 });
             if writes {
                 return Ok(true);

@@ -56,6 +56,10 @@ const KIND_MASK: u8 = 0b111;
 /// A [`Mutation::Namespace`] marker: the command kind with a partition
 /// number no command carries, the namespace id following as a varint.
 const TAG_NAMESPACE: u8 = KIND_COMMAND | (1 << 3);
+/// A [`Mutation::Actor`]: the command kind with another partition number no
+/// command carries, then the subject and the trust scope, each as a length
+/// and its bytes.
+const TAG_ACTOR: u8 = KIND_COMMAND | (2 << 3);
 
 /// Bytes a decoded label identity holds.
 const LABEL_BYTES: usize = core::mem::size_of::<crate::schema::label_id::LabelId>();
@@ -222,6 +226,12 @@ pub enum FrameError {
     /// An operation on a namespace's data with no namespace named before it.
     #[error(transparent)]
     Unscoped(#[from] super::proposal::Unscoped),
+    /// An acting principal that is not the unit's first operation.
+    #[error(transparent)]
+    MisplacedActor(#[from] super::proposal::MisplacedActor),
+    /// An acting principal whose parts do not decode.
+    #[error("frame acting principal does not decode: {0}")]
+    BadActor(&'static str),
 }
 
 fn put_varint(mut value: u64, out: &mut Vec<u8>) {
@@ -308,6 +318,7 @@ fn encode_within<'a>(
         });
     }
     super::proposal::check_scoped(unit.mutations)?;
+    super::proposal::check_actor(unit.mutations)?;
     let mut out = Vec::with_capacity(64 + unit.mutations.len() * 48);
     out.push(FRAME_VERSION);
     put_varint(unit.id, &mut out);
@@ -439,6 +450,14 @@ impl<'a> Encoder<'a> {
                 out.push(TAG_NAMESPACE);
                 put_varint(namespace.as_raw(), out);
                 self.expanded += NAMESPACE_BYTES;
+            }
+            Mutation::Actor(principal) => {
+                out.push(TAG_ACTOR);
+                for part in [&*principal.subject, &*principal.trust_scope] {
+                    put_varint(part.len() as u64, out);
+                    out.extend_from_slice(part.as_bytes());
+                }
+                self.expanded += principal.len();
             }
         }
         Ok(())
@@ -622,6 +641,7 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
         });
     }
     super::proposal::check_scoped(unit.mutations)?;
+    super::proposal::check_actor(unit.mutations)?;
     // Each addend is the length of a slice held in memory for this unit.
     let mut expanded = 0usize;
     // Lengths and counts an effect context adds per entry, beyond the one
@@ -649,6 +669,7 @@ fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Resu
             }
             Mutation::Operation(command) => command.size_estimate(),
             Mutation::Namespace(_) => NAMESPACE_BYTES,
+            Mutation::Actor(principal) => principal.len(),
             Mutation::Effects(effects) => {
                 check_runs(&effects.runs, &unit.mutations[..at])?;
                 // The slots of each list, as the decoder counts them.
@@ -1023,6 +1044,18 @@ impl<'a> Decoder<'a> {
             self.named = true;
             return Ok(Some(Mutation::Namespace(namespace)));
         }
+        if tag == TAG_ACTOR {
+            // Only the unit's first operation: the operations before it
+            // were not issued by it.
+            if self.at != 0 {
+                return Err(super::proposal::MisplacedActor { at: self.at }.into());
+            }
+            let subject = self.principal_part()?;
+            let trust_scope = self.principal_part()?;
+            let principal = crate::access::PrincipalId::new(subject, trust_scope)
+                .map_err(|_| FrameError::BadActor("an empty principal part"))?;
+            return Ok(Some(Mutation::Actor(principal)));
+        }
         if kind == KIND_COMMAND {
             if tag != KIND_COMMAND {
                 return Err(FrameError::UnknownTag(tag));
@@ -1256,6 +1289,18 @@ impl<'a> Decoder<'a> {
             .ok()
             .and_then(crate::schema::label_id::LabelId::new)
             .ok_or(FrameError::Effects("label id out of range"))
+    }
+
+    /// One part of an acting principal, its length checked against the
+    /// bound before anything is allocated for it.
+    fn principal_part(&mut self) -> Result<&'a str, FrameError> {
+        let len = self.reader.len_at_most(
+            crate::access::MAX_PRINCIPAL_PART_BYTES,
+            "principal part size",
+        )?;
+        let bytes = self.reader.take(len)?;
+        self.spend(len)?;
+        core::str::from_utf8(bytes).map_err(|_| FrameError::BadActor("a part is not UTF-8"))
     }
 
     fn issuer(&mut self) -> Result<IssuerId, FrameError> {

@@ -385,7 +385,8 @@ fn changes_application_data(m: &Mutation) -> bool {
         | Mutation::Derive(_)
         | Mutation::Operation(_)
         | Mutation::Effects(_)
-        | Mutation::Namespace(_) => false,
+        | Mutation::Namespace(_)
+        | Mutation::Actor(_) => false,
     }
 }
 
@@ -920,7 +921,8 @@ impl<'u, 'r, R: Room, F: FnMut(LogicalEvent<'u>, &mut R) -> Take> Projector<'u, 
                 Mutation::Command(_)
                 | Mutation::Derive(_)
                 | Mutation::Operation(_)
-                | Mutation::Namespace(_) => Ok(()),
+                | Mutation::Namespace(_)
+                | Mutation::Actor(_) => Ok(()),
             }
         })
     }

@@ -330,5 +330,6 @@ fn describe(m: &Mutation) -> (String, &[u8], u64) {
         ),
         Mutation::Effects(effects) => ("effects".to_string(), &[], effects.size_estimate() as u64),
         Mutation::Namespace(_) => ("namespace".to_string(), &[], 0),
+        Mutation::Actor(principal) => ("actor".to_string(), &[], principal.len() as u64),
     }
 }

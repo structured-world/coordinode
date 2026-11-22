@@ -60,9 +60,12 @@ pub fn mutation_to_op(m: &Mutation) -> StorageResult<OplogOp> {
             start: start.clone(),
             end: end.clone(),
         },
-        Mutation::Command(_) | Mutation::Operation(_) => {
+        // Authorized as the unit applies: the journal records what applied.
+        Mutation::Command(_) | Mutation::Operation(_) | Mutation::Actor(_) => {
             return Err(StorageError::InvalidConfig(
-                "a metadata or operation command reached the journal undecided".into(),
+                "a metadata command, operation command or acting principal reached the journal \
+                 undecided"
+                    .into(),
             ));
         }
         Mutation::Derive(work) => OplogOp::Derive {
@@ -153,8 +156,9 @@ fn op_to_mutation(op: &OplogOp) -> StorageResult<Mutation> {
     })
 }
 
-/// Whether the unit at a log position was refused by its operation binding,
-/// as the member that applied it recorded.
+/// Whether the unit at a log position was refused by its operation binding
+/// or for its acting principal's grants, as the member that applied it
+/// recorded.
 pub type UnitDecisions<'a> = &'a (dyn Fn(LogPosition) -> StorageResult<bool> + Send + Sync);
 
 /// The ops a journalled entry records, each unit frame expanded into the
@@ -201,14 +205,11 @@ pub fn expand_units_decided<'o>(
             StorageError::Serialization(format!("entry {index} carries over 2^32 units"))
         })?;
         let mutations = decode_unit(frame)?;
-        if mutations
-            .iter()
-            .any(|m| matches!(m, Mutation::Operation(_)))
-        {
+        if coordinode_core::txn::proposal::decided_at_apply(&mutations) {
             let Some(decisions) = decisions else {
                 return Err(StorageError::InvalidConfig(format!(
-                    "unit {index}/{} is bound to a client operation, and no decision source \
-                     says whether it took effect",
+                    "unit {index}/{} is bound to a client operation or acts for a principal, \
+                     and no decision source says whether it took effect",
                     at.sub
                 )));
             };
@@ -219,7 +220,10 @@ pub fn expand_units_decided<'o>(
         for mutation in mutations {
             if !matches!(
                 mutation,
-                Mutation::Command(_) | Mutation::Operation(_) | Mutation::Effects(_)
+                Mutation::Command(_)
+                    | Mutation::Operation(_)
+                    | Mutation::Effects(_)
+                    | Mutation::Actor(_)
             ) {
                 out.push(mutation_to_op(&mutation)?);
             }

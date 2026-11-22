@@ -213,7 +213,8 @@ fn tree_of(m: &Mutation, namespace: Option<NamespaceId>) -> Option<TreeId> {
         Mutation::Derive(_) => Partition::Idx,
         // Writes nothing; it goes with the node rows it describes.
         Mutation::Effects(_) => Partition::Node,
-        Mutation::Namespace(_) => return None,
+        // Authorized and left out before the unit applies.
+        Mutation::Namespace(_) | Mutation::Actor(_) => return None,
     };
     if part.is_deployment() {
         Some(TreeId::system(part))

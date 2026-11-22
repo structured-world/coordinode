@@ -202,6 +202,61 @@ pub enum Mutation {
     /// writes need none. A unit writing several namespaces names each before
     /// its writes, and applies as one.
     Namespace(crate::namespace::NamespaceId),
+    /// The principal the unit acts for: every member checks the unit's
+    /// grants against it, against the catalog state the log has produced up
+    /// to the unit, as one step with applying it. At most one per unit, as
+    /// its first operation; a unit with none is the store's own work or a
+    /// write of an explicitly trusted caller.
+    Actor(crate::access::PrincipalId),
+}
+
+/// An acting principal that is not the unit's first operation, or a second
+/// one, at this position of its unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("operation {at} of the unit names an acting principal; only the first may")]
+pub struct MisplacedActor {
+    /// The operation's position in its unit.
+    pub at: usize,
+}
+
+/// Refuse `mutations` when an acting principal is anything but their first
+/// operation.
+///
+/// # Errors
+///
+/// [`MisplacedActor`] at the first such principal.
+pub fn check_actor(mutations: &[Mutation]) -> Result<(), MisplacedActor> {
+    match mutations
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, m)| matches!(m, Mutation::Actor(_)))
+    {
+        Some((at, _)) => Err(MisplacedActor { at }),
+        None => Ok(()),
+    }
+}
+
+/// Whether applying `mutations` may decide they take no effect: an operation
+/// binding the log already holds refuses a repeat, and an acting principal
+/// that lacks a grant at the unit's place in the log refuses the unit. A
+/// reader of the raw log asks the applied state whether such a unit applied;
+/// any other unit applied as recorded.
+#[must_use]
+pub fn decided_at_apply(mutations: &[Mutation]) -> bool {
+    actor_of(mutations).is_some()
+        || mutations
+            .iter()
+            .any(|m| matches!(m, Mutation::Operation(_)))
+}
+
+/// The principal `mutations` act for, if they name one.
+#[must_use]
+pub fn actor_of(mutations: &[Mutation]) -> Option<&crate::access::PrincipalId> {
+    match mutations.first() {
+        Some(Mutation::Actor(principal)) => Some(principal),
+        _ => None,
+    }
 }
 
 /// An operation on a namespace's data with no namespace named before it, at
@@ -582,6 +637,7 @@ impl Mutation {
             Self::Operation(command) => 1 + command.size_estimate(),
             Self::Effects(effects) => 1 + effects.size_estimate(),
             Self::Namespace(_) => 1 + 8,
+            Self::Actor(principal) => 3 + principal.len(),
         }
     }
 
@@ -599,7 +655,7 @@ impl Mutation {
             | Self::RemoveRange { partition, .. } => !partition.is_deployment(),
             Self::Command(command) => !command.partition().is_deployment(),
             Self::Derive(_) | Self::Effects(_) => true,
-            Self::Operation(_) | Self::Namespace(_) => false,
+            Self::Operation(_) | Self::Namespace(_) | Self::Actor(_) => false,
         }
     }
 }

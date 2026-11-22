@@ -492,6 +492,10 @@ impl AppliedFeed {
                     // Writes nothing: the keys it names are written by the
                     // unit's own row changes, staged above.
                     Mutation::Effects(_) => {}
+                    // Writes nothing. A unit its principal may not write
+                    // applies nothing; a follower that rereads the keys
+                    // staged above finds them unchanged.
+                    Mutation::Actor(_) => {}
                 }
             }
             let seq = if replaced {

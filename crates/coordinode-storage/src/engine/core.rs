@@ -551,7 +551,8 @@ fn mutation_partition(mutation: &Mutation) -> Option<Partition> {
         | Mutation::Derive(_)
         | Mutation::Operation(_)
         | Mutation::Effects(_)
-        | Mutation::Namespace(_) => None,
+        | Mutation::Namespace(_)
+        | Mutation::Actor(_) => None,
     }
 }
 
@@ -5745,11 +5746,7 @@ impl Deployment {
             if !pool.retain(held) {
                 return Err(EntryOutcome::NoRoom);
             }
-            let bound = unit
-                .mutations
-                .iter()
-                .any(|m| matches!(m, Mutation::Operation(_)));
-            let refused = bound
+            let refused = coordinode_core::txn::proposal::decided_at_apply(&unit.mutations)
                 && crate::engine::operations::unit_skipped(self, position)
                     .map_err(EntryOutcome::Failed)?;
             // The unit's namespace, by its marker. A unit naming several
@@ -6349,11 +6346,7 @@ impl Deployment {
                 return Err(EntryOutcome::NoRoom);
             }
             let commit_ts = unit.commit_ts.as_raw();
-            let bound = unit
-                .mutations
-                .iter()
-                .any(|m| matches!(m, Mutation::Operation(_)));
-            let refused = bound
+            let refused = coordinode_core::txn::proposal::decided_at_apply(&unit.mutations)
                 && crate::engine::operations::unit_skipped(self, position)
                     .map_err(EntryOutcome::Failed)?;
             let mut mutations = unit.mutations;
@@ -6453,7 +6446,7 @@ impl Deployment {
                 // Index entries, in the index partition.
                 Mutation::Derive(_) => false,
                 // Decides the unit, already read as `refused`.
-                Mutation::Operation(_) => false,
+                Mutation::Operation(_) | Mutation::Actor(_) => false,
                 // What the rows mean, not a row: a copy of rows applies none.
                 Mutation::Effects(_) => false,
                 // Names the namespace of the rows after it: kept with them.
@@ -8279,8 +8272,9 @@ impl StorageEngine {
                     self.apply_proposal_at(std::slice::from_ref(mutation), 0)
                 }
             }
-            // Write nothing.
-            Mutation::Effects(_) | Mutation::Namespace(_) => Ok(()),
+            // Write nothing; an acting principal alone has no write to
+            // authorize.
+            Mutation::Effects(_) | Mutation::Namespace(_) | Mutation::Actor(_) => Ok(()),
         }
     }
 }
@@ -8951,6 +8945,14 @@ impl Deployment {
                 Mutation::Operation(_) => {
                     return Err(StorageError::InvalidConfig(
                         "an operation command reached the write batch undecided".into(),
+                    ));
+                }
+                // The unit's grants are checked, and the principal left out,
+                // before anything is written: a principal here was never
+                // checked, and its writes are refused rather than written.
+                Mutation::Actor(_) => {
+                    return Err(StorageError::InvalidConfig(
+                        "an acting principal reached the write batch unauthorized".into(),
                     ));
                 }
                 // What the unit's rows mean for the change feed; it writes

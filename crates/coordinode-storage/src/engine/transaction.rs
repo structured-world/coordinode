@@ -523,7 +523,8 @@ fn changes_application_data(mutations: &[Mutation]) -> bool {
         | Mutation::Derive(_)
         | Mutation::Operation(_)
         | Mutation::Effects(_)
-        | Mutation::Namespace(_) => false,
+        | Mutation::Namespace(_)
+        | Mutation::Actor(_) => false,
     })
 }
 
