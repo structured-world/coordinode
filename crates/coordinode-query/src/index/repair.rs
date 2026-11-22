@@ -62,6 +62,9 @@ pub(crate) struct RepairBuild<'a> {
     pub index: &'a IndexDefinition,
     /// The property the build may change.
     pub property: &'a str,
+    /// The principal the build repairs in the name of; `None` for the
+    /// trusted host's build.
+    pub issuer: Option<&'a coordinode_core::access::PrincipalId>,
 }
 
 /// Grants no lease: a repair changes a stored node and creates none, so an
@@ -170,10 +173,15 @@ fn attempt(
     let read_ts = oracle.map_or(coordinode_core::txn::timestamp::Timestamp::ZERO, |o| {
         o.next()
     });
-    let txn = match oracle {
+    let mut txn = match oracle {
         Some(o) => Transaction::begin(engine, Some(o), read_ts),
         None => Transaction::new(engine, None, read_ts, None),
     };
+    // The repair and the build record it moves commit in the issuer's name:
+    // applied only while it holds the rights, so a revocation stops repairs.
+    if let Some(issuer) = build.issuer {
+        txn.act_as(issuer.clone());
+    }
     let log = env.statement_log();
     let mut ctx = ExecutionContext {
         engine,
@@ -222,8 +230,7 @@ fn attempt(
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
         proposal_pipeline: log.map(|(pipeline, _)| pipeline),
-        // The store's own repair of values it already holds.
-        actor: None,
+        actor: build.issuer.cloned(),
         proposal_id_gen: log.map(|(_, ids)| ids),
         read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
         // A build's writes are durable whatever a session writes at.

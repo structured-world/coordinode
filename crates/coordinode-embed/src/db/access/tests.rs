@@ -638,6 +638,77 @@ fn a_creator_works_in_catalog_scope_without_a_data_session() {
     );
 }
 
+/// A unique index built with ON DUPLICATE RENAME by a principal records that
+/// principal on the build, so every repair, here and on a member resuming
+/// the build, runs in its name; a principal without admin is refused before
+/// any build is accepted.
+#[test]
+fn a_repairing_build_records_the_principal_that_asked_for_it() {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let (db, _dir) = open();
+    let ns = default_namespace(&db);
+    db.execute_cypher_shared(
+        "CREATE (:User {email: 'same@x'}), (:User {email: 'same@x'})",
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("the host writes two users of one email");
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "will", NamespaceRole::Writer),
+    )
+    .expect("grant writer");
+    refused_for(
+        run_as(
+            &db,
+            "will",
+            "CREATE UNIQUE INDEX user_email ON :User(email) ON DUPLICATE RENAME email",
+        ),
+        "will",
+        MissingRight::Namespace {
+            namespace: ns,
+            role: NamespaceRole::Admin,
+        },
+    );
+    let store = LocalIndexStore::new(&db.engine);
+    // The store's own builds of its built-in indexes are there from the
+    // start; the refused statement added none.
+    let accepted = store.list_builds().unwrap();
+    assert!(
+        accepted.iter().all(|build| build.on_duplicate.is_none()),
+        "no repairing build was accepted: {accepted:?}"
+    );
+
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "ada", NamespaceRole::Admin),
+    )
+    .expect("grant admin");
+    run_as(
+        &db,
+        "ada",
+        "CREATE UNIQUE INDEX user_email ON :User(email) ON DUPLICATE RENAME email",
+    )
+    .expect("the admin builds, repairing the duplicate");
+    let repairing: Vec<_> = store
+        .list_builds()
+        .unwrap()
+        .into_iter()
+        .filter(|build| build.on_duplicate.is_some())
+        .collect();
+    assert_eq!(repairing.len(), 1, "{repairing:?}");
+    assert_eq!(
+        repairing[0]
+            .on_duplicate
+            .as_ref()
+            .and_then(|repair| repair.issuer.clone()),
+        Some(id("ada"))
+    );
+    assert_eq!(repairing[0].repaired, 1, "the repair ran in ada's name");
+}
+
 /// A principal bound to another namespace than the handle's changes
 /// nothing through it.
 #[test]

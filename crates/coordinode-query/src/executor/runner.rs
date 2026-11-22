@@ -23716,6 +23716,12 @@ fn publish_index_build(
 
     let engine = ctx.engine;
     let mut published = None;
+    // The repairs rewrite user data in the name of the statement asking for
+    // them: its principal goes on the build record with the policy.
+    let repair = repair.map(|repair| crate::index::DuplicateRepair {
+        issuer: ctx.actor.clone(),
+        ..repair
+    });
     // Made durable with the statement's answer, once the build it admits
     // has an outcome or the wait for one ran out ([`await_index_build`]).
     ctx.commit_catalog_change_at(CatalogSync::AtAnswer, |txn| {

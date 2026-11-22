@@ -1389,6 +1389,11 @@ pub struct DuplicateRepair {
     /// appending a random suffix to its value. One of the index's
     /// properties.
     pub property: String,
+    /// The principal whose statement asked for the build: every repair
+    /// rewrites user data in its name and is applied only while it holds the
+    /// rights, so a revocation during the build stops further repairs, also
+    /// of a build resumed elsewhere. `None` for the trusted host's.
+    pub issuer: Option<coordinode_core::access::PrincipalId>,
 }
 
 /// The durable record of one index build: the operation a CREATE or a

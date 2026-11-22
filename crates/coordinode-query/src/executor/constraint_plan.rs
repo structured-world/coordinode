@@ -294,6 +294,8 @@ fn duplicate_repair(
     }
     Ok(Some(DuplicateRepair {
         property: target.to_string(),
+        // Named where the build is published, from the statement's principal.
+        issuer: None,
     }))
 }
 

@@ -1261,6 +1261,7 @@ impl Shared {
             shared: Arc::clone(self),
         };
         let repair_property = taken.repair.as_ref().map(|r| r.property.as_str());
+        let repair_issuer = taken.repair.as_ref().and_then(|r| r.issuer.as_ref());
         let run_repair = |node: NodeId, old: Option<&Value>| {
             super::repair::rename_duplicate(
                 &service,
@@ -1270,6 +1271,7 @@ impl Shared {
                     token: taken.token,
                     index: &taken.def,
                     property: repair_property.unwrap_or_default(),
+                    issuer: repair_issuer,
                 },
                 node,
                 old,

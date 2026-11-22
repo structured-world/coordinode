@@ -1747,6 +1747,7 @@ fn admit_repairing(env: &TestEnv) -> IndexDefinition {
             &IndexBuildRecord::accepted(def.id, def.generation, BuildFailure::Withdraw).repairing(
                 Some(DuplicateRepair {
                     property: "email".into(),
+                    issuer: None,
                 }),
             ),
             None,
@@ -1911,6 +1912,7 @@ fn a_repair_of_a_value_changed_since_overwrites_nothing() {
             token: 0,
             index: &def,
             property: "email",
+            issuer: None,
         },
         NodeId::from_raw(2),
         Some(&Value::String("same@x".into())),
@@ -1958,6 +1960,7 @@ fn repair_node_two(
             token,
             index: def,
             property: "email",
+            issuer: None,
         },
         NodeId::from_raw(2),
         Some(&Value::String("same@x".into())),
@@ -1966,6 +1969,86 @@ fn repair_node_two(
     drop(older);
     builds.wait(def.generation, None).expect("wait");
     repaired
+}
+
+/// A repair rewrites user data in the name of the principal whose statement
+/// asked for the build, applied only while it holds the rights: without
+/// them it renames nothing and records no repair; given them, it repairs;
+/// once they are taken back during the build, the next repair is refused.
+#[test]
+fn a_repair_runs_as_its_builds_issuer() {
+    use coordinode_core::access::PrincipalId;
+    use coordinode_core::txn::proposal::{MetadataCommand, Mutation};
+    let env = env();
+    env.put_user(1, "same@x");
+    env.put_user(2, "same@x");
+    env.put_user(4, "other@x");
+    env.put_user(5, "other@x");
+    let def = admit_repairing(&env);
+    let issuer = PrincipalId::new("builder", "idp").unwrap();
+    let admin = |on: bool| {
+        env.engine
+            .apply_proposal_at(
+                &[Mutation::Command(MetadataCommand::SetDeploymentRights {
+                    principal: issuer.clone(),
+                    create_namespace: None,
+                    admin: Some(on),
+                })],
+                coordinode_core::txn::timestamp::Timestamp::ZERO.as_raw(),
+            )
+            .unwrap();
+    };
+    let builds = service(&env);
+    let older = older_transaction(&env);
+    builds.submit(def.generation).expect("submit");
+    let token = await_running(&env, &def, None);
+    let repair = |node: u64, old: &str| {
+        super::super::repair::rename_duplicate(
+            &builds,
+            env.as_ref(),
+            &super::super::repair::RepairBuild {
+                generation: def.generation,
+                token,
+                index: &def,
+                property: "email",
+                issuer: Some(&issuer),
+            },
+            NodeId::from_raw(node),
+            Some(&Value::String(old.into())),
+            &super::super::repair::suffix,
+        )
+    };
+
+    let refused = repair(2, "same@x");
+    assert!(
+        matches!(&refused, Err(BackfillError::Repair(why)) if why.contains("builder")),
+        "{refused:?}"
+    );
+    assert_eq!(email_of(&env, 2), Some(Value::String("same@x".into())));
+
+    admin(true);
+    assert_eq!(
+        repair(2, "same@x").expect("repair with the rights"),
+        super::super::repair::Repaired::Done
+    );
+    assert_ne!(email_of(&env, 2), Some(Value::String("same@x".into())));
+
+    admin(false);
+    let refused = repair(5, "other@x");
+    assert!(
+        matches!(&refused, Err(BackfillError::Repair(why)) if why.contains("builder")),
+        "{refused:?}"
+    );
+    assert_eq!(email_of(&env, 5), Some(Value::String("other@x".into())));
+    assert_eq!(
+        LocalIndexStore::new(&env.engine)
+            .list_repairs(def.generation)
+            .expect("repairs")
+            .len(),
+        1,
+        "only the repair made with the rights is recorded"
+    );
+    drop(older);
 }
 
 /// A suffix whose result another node already holds is not taken: the
