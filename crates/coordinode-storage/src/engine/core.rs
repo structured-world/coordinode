@@ -8365,6 +8365,7 @@ impl Deployment {
                     | MetadataCommand::SetNamespaceStorage { .. }
                     | MetadataCommand::GrantAccess { .. }
                     | MetadataCommand::RevokeAccess { .. }
+                    | MetadataCommand::RevokeGrant { .. }
                     | MetadataCommand::TransferAccess { .. }
                     | MetadataCommand::SetDeploymentRights { .. }
                     | MetadataCommand::CreateRole { .. }

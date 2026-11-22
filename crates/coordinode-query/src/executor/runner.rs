@@ -7350,6 +7350,12 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::ShowNamespaces => crate::executor::namespaces::show(ctx.namespace_catalog),
 
+        LogicalOp::Access(change) => crate::executor::namespaces::change_access(
+            ctx.namespace_catalog,
+            ctx.actor.as_ref(),
+            change,
+        ),
+
         LogicalOp::CreateVectorIndex {
             name,
             label,

@@ -198,6 +198,9 @@ fn command_needs(
         // it gives no say over who holds the role.
         MetadataCommand::GrantAccess {
             namespace: name, ..
+        }
+        | MetadataCommand::RevokeGrant {
+            namespace: name, ..
         } => vec![admin_of(name)?],
         MetadataCommand::RevokeAccess { namespaces, .. } => namespaces
             .iter()
@@ -488,6 +491,24 @@ pub(crate) fn decide(
                 }
             }
             effects
+        }
+        MetadataCommand::RevokeGrant {
+            namespace,
+            grantee,
+            role,
+        } => {
+            let (Some(namespace), Some(grantee)) =
+                (live(namespace)?, resolve_grantee(engine, grantee)?)
+            else {
+                return Ok(Some(Vec::new()));
+            };
+            // The level named is matched here, where the change applies: a
+            // grant an earlier change already replaced with another level is
+            // not the one this revocation names, and survives it.
+            if !grant(engine, namespace, &grantee)?.is_some_and(|held| held.role == *role) {
+                return Ok(Some(Vec::new()));
+            }
+            vec![delete(grant_key(namespace, &grantee))]
         }
         MetadataCommand::TransferAccess {
             namespace,

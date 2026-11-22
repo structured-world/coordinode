@@ -373,6 +373,48 @@ fn a_revocation_earlier_in_the_log_refuses_every_later_write() {
     assert!(log.write(&bob, a, b"node:1:3"));
 }
 
+/// A revocation of a named level removes the direct grant only while it
+/// still has that level where the revocation applies: a `REVOKE writer`
+/// ordered after the grant became admin leaves the admin grant in place;
+/// one ordered while it is writer removes it.
+#[test]
+fn a_named_revocation_spares_a_grant_replaced_before_it() {
+    let dir = TempDir::new().unwrap();
+    let (engine, oracle) = open(&dir);
+    let mut log = Log {
+        engine: &engine,
+        oracle,
+        index: 0,
+    };
+    let a = create(&mut log, "a");
+    let bob = principal("bob");
+    let grantee = GranteeName::Principal(bob.clone());
+    let revoke_writer = || MetadataCommand::RevokeGrant {
+        namespace: "a".into(),
+        grantee: GranteeName::Principal(principal("bob")),
+        role: NamespaceRole::Writer,
+    };
+
+    log.command(None, grant_cmd("a", grantee.clone(), NamespaceRole::Writer));
+    // An earlier change replaces the writer grant with admin; the revocation
+    // naming writer applies after it.
+    log.command(None, grant_cmd("a", grantee.clone(), NamespaceRole::Admin));
+    log.command(None, revoke_writer());
+    assert_eq!(
+        effective_role(engine.deployment(), &bob, a).unwrap(),
+        Some(NamespaceRole::Admin),
+        "the admin grant the revocation did not name survives"
+    );
+
+    log.command(None, grant_cmd("a", grantee, NamespaceRole::Writer));
+    log.command(None, revoke_writer());
+    assert_eq!(
+        effective_role(engine.deployment(), &bob, a).unwrap(),
+        None,
+        "the writer grant it named is gone"
+    );
+}
+
 /// A principal holding only the right to create namespaces creates one and
 /// becomes its admin in the same change, the grant stamped with the
 /// change's commit timestamp; it has no right on a namespace it did not

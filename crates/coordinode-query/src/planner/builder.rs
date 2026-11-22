@@ -867,6 +867,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             if_exists: c.if_state_holds,
         }),
         Clause::ShowNamespaces => Ok(LogicalOp::ShowNamespaces),
+        Clause::Access(change) => Ok(LogicalOp::Access(change.clone())),
         Clause::CreateVectorIndex(c) => {
             // A trailing extension clause (e.g. an engine-extension's `SHARDED BY
             // ...`) after the known CREATE VECTOR INDEX syntax routes to an

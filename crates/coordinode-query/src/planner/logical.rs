@@ -602,6 +602,10 @@ pub enum LogicalOp {
     /// List the deployment's namespaces.
     ShowNamespaces,
 
+    /// Commit one change to the deployment's grant catalog, acting for the
+    /// statement's principal.
+    Access(coordinode_core::txn::proposal::AccessChange),
+
     /// CREATE VECTOR INDEX: build an HNSW index on a label's vector property.
     ///
     /// Backfills existing nodes; future inserts/updates maintain the index incrementally.
@@ -1119,6 +1123,7 @@ impl LogicalOp {
             Self::DropNamespace { .. } => "DropNamespace",
             Self::SetNamespaceStorage { .. } => "SetNamespaceStorage",
             Self::ShowNamespaces => "ShowNamespaces",
+            Self::Access(_) => "Access",
             Self::CreateVectorIndex { .. } => "CreateVectorIndex",
             Self::DropVectorIndex { .. } => "DropVectorIndex",
             Self::CreateEdgeType { .. } => "CreateEdgeType",
@@ -1233,6 +1238,7 @@ impl LogicalOp {
             | LogicalOp::DropNamespace { .. }
             | LogicalOp::SetNamespaceStorage { .. }
             | LogicalOp::ShowNamespaces
+            | LogicalOp::Access(_)
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
             | LogicalOp::CreateEdgeType { .. }
@@ -1563,6 +1569,7 @@ impl LogicalOp {
             | LogicalOp::DropNamespace { .. }
             | LogicalOp::SetNamespaceStorage { .. }
             | LogicalOp::ShowNamespaces
+            | LogicalOp::Access(_)
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
             | LogicalOp::CreateEdgeType { .. }
@@ -2220,6 +2227,7 @@ fn estimate_op_cost(
         | LogicalOp::DropNamespace { .. }
         | LogicalOp::SetNamespaceStorage { .. }
         | LogicalOp::ShowNamespaces
+        | LogicalOp::Access(_)
         | LogicalOp::CreateVectorIndex { .. }
         | LogicalOp::DropVectorIndex { .. }
         | LogicalOp::CreateEdgeType { .. }
@@ -2999,6 +3007,7 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             output.push_str(&format!("{prefix}SetNamespaceStorage({name})\n"));
         }
         LogicalOp::ShowNamespaces => output.push_str(&format!("{prefix}ShowNamespaces\n")),
+        LogicalOp::Access(_) => output.push_str(&format!("{prefix}Access\n")),
         LogicalOp::CreateVectorIndex {
             name,
             label,

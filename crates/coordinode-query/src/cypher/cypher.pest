@@ -36,6 +36,12 @@ clause = {
   | create_namespace_clause
   | drop_namespace_clause
   | show_namespaces_clause
+  | grant_clause
+  | revoke_clause
+  | transfer_clause
+  | create_role_clause
+  | drop_role_clause
+  | alter_role_clause
   | create_encrypted_index_clause
   | create_text_index_clause
   | create_vector_index_clause
@@ -332,6 +338,46 @@ show_namespaces_clause  = { kw_show ~ kw_namespaces }
 alter_namespace_storage_clause = { kw_alter ~ kw_namespace ~ identifier ~ kw_set ~ kw_storage ~ storage_settings }
 storage_settings = { "(" ~ storage_setting ~ ("," ~ storage_setting)* ~ ")" }
 storage_setting  = { identifier ~ ":" ~ (string_literal | boolean_literal) }
+
+// --- Native ACL ---
+// A principal is PRINCIPAL 'subject' IN 'trust scope', two string literals
+// taken as they decode; a role is ROLE name IN NAMESPACE home, its home
+// named even when it gets rights on another namespace.
+principal_ref  = { kw_principal ~ string_literal ~ kw_in ~ string_literal }
+role_ref       = { kw_role ~ identifier ~ kw_in ~ kw_namespace ~ identifier }
+grantee        = { principal_ref | role_ref }
+namespace_role = { kw_reader | kw_writer | kw_admin }
+principal_list = { "(" ~ (principal_ref ~ ("," ~ principal_ref)*)? ~ ")" }
+
+grant_clause = {
+    kw_grant ~ (
+        kw_admin ~ kw_on ~ kw_deployment ~ kw_to ~ principal_ref
+      | kw_create ~ kw_namespace ~ kw_to ~ principal_ref
+      | namespace_role ~ kw_on ~ kw_namespace ~ identifier ~ kw_to ~ grantee
+      | role_ref ~ kw_to ~ principal_ref ~ grant_role_exclusive?
+    )
+}
+// Refused as written: an exclusive role's eligible set is named when it is
+// created and changed with ALTER ROLE. Parsed only to name the refusal.
+grant_role_exclusive = { kw_exclusive ~ kw_among ~ principal_list }
+revoke_clause = {
+    kw_revoke ~ (
+        kw_admin ~ kw_on ~ kw_deployment ~ kw_from ~ principal_ref
+      | kw_create ~ kw_namespace ~ kw_from ~ principal_ref
+      | kw_all ~ kw_on ~ kw_namespace ~ identifier ~ ("," ~ identifier)* ~ kw_from ~ grantee
+      | namespace_role ~ kw_on ~ kw_namespace ~ identifier ~ kw_from ~ grantee
+      | role_ref ~ kw_from ~ principal_ref
+    )
+}
+transfer_clause = {
+    kw_transfer ~ (namespace_role ~ kw_on ~ kw_namespace ~ identifier | role_ref)
+      ~ kw_from ~ principal_ref ~ kw_to ~ principal_ref
+}
+create_role_clause = {
+    kw_create ~ role_ref ~ (kw_exclusive ~ kw_among ~ principal_list)? ~ (kw_held ~ kw_by ~ principal_ref)?
+}
+drop_role_clause  = { kw_drop ~ role_ref }
+alter_role_clause = { kw_alter ~ role_ref ~ kw_set ~ kw_eligible ~ principal_list }
 
 // --- CREATE EDGE TYPE ---
 
@@ -1105,6 +1151,18 @@ kw_if          = @{ ^"if" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_for         = @{ ^"for" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_typed       = @{ ^"typed" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_rename      = @{ ^"rename" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_grant       = @{ ^"grant" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_revoke      = @{ ^"revoke" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_role        = @{ ^"role" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_principal   = @{ ^"principal" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_reader      = @{ ^"reader" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_writer      = @{ ^"writer" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_admin       = @{ ^"admin" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_exclusive   = @{ ^"exclusive" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_among       = @{ ^"among" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_deployment  = @{ ^"deployment" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_held        = @{ ^"held" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_eligible    = @{ ^"eligible" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 

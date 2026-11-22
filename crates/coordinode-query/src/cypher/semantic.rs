@@ -399,6 +399,7 @@ impl<'a> Analyzer<'a> {
             | Clause::DropNamespace(_)
             | Clause::SetNamespaceStorage(_)
             | Clause::ShowNamespaces
+            | Clause::Access(_)
             | Clause::CreateVectorIndex(_)
             | Clause::DropVectorIndex(_)
             | Clause::CreateEdgeType(_)

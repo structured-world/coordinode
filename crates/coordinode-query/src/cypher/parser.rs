@@ -10,6 +10,7 @@ use pest::iterators::{Pair, Pairs};
 use super::ast::*;
 use super::errors::{ErrorSpan, ParseError};
 
+mod access;
 // Generated from `cypher.pest` ahead of time (tools/pest-codegen), so a build
 // compiles the parser against pest's runtime alone. rustfmt stays out: the
 // generator formats it, and rustfmt takes minutes on its rule chains.
@@ -333,6 +334,12 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             clauses.push(Clause::DropNamespace(namespace_clause(pair, "DROP")?));
         }
         Rule::show_namespaces_clause => clauses.push(Clause::ShowNamespaces),
+        Rule::grant_clause
+        | Rule::revoke_clause
+        | Rule::transfer_clause
+        | Rule::create_role_clause
+        | Rule::drop_role_clause
+        | Rule::alter_role_clause => clauses.push(Clause::Access(access::change(pair)?)),
         Rule::alter_namespace_storage_clause => {
             clauses.push(Clause::SetNamespaceStorage(namespace_storage_clause(pair)?));
         }

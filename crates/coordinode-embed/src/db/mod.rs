@@ -4554,7 +4554,6 @@ mod namespaces;
 mod package;
 mod projection;
 mod state_cut;
-pub use access::AccessChange;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use blob::{BlobId, GroupMembers, UploadedBlob};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
@@ -4563,7 +4562,7 @@ pub use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole, Pr
 pub use coordinode_core::txn::command::{
     ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,
 };
-pub use coordinode_core::txn::proposal::GranteeName;
+pub use coordinode_core::txn::proposal::{AccessChange, GranteeName};
 pub use coordinode_storage::blob::gc::{
     CleanedUpReport, CompactionReport, GcPass, GcPolicy, GcStatus, Reconciliation,
 };

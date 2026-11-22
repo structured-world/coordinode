@@ -2332,6 +2332,196 @@ fn alter_index_and_namespace_maintenance() {
 
 /// The namespace catalog statements: a name, plain or backtick-quoted, and
 /// the existence guard each form takes; a name is required.
+/// The access change an ACL statement parses to.
+fn access(query: &str) -> coordinode_core::txn::proposal::AccessChange {
+    match parse_ok(query).clauses.into_iter().next() {
+        Some(Clause::Access(change)) => change,
+        other => panic!("{query}: expected an access change, got {other:?}"),
+    }
+}
+
+fn principal(subject: &str, scope: &str) -> coordinode_core::access::PrincipalId {
+    coordinode_core::access::PrincipalId::new(subject, scope).unwrap()
+}
+
+/// Every native ACL statement parses to the catalog change it names; a
+/// principal's two literals are taken as they decode, a slash included, and
+/// a role is qualified by its home whatever namespace it gets rights on.
+#[test]
+fn acl_statements_parse_to_their_change() {
+    use coordinode_core::access::NamespaceRole;
+    use coordinode_core::txn::proposal::{AccessChange as C, GranteeName};
+    let editor = |n: &str| principal(&format!("editor/{n}"), "https://id.example/team");
+    let publisher = GranteeName::Role {
+        home: "newsroom".into(),
+        name: "publisher".into(),
+    };
+
+    assert_eq!(
+        access("GRANT writer ON NAMESPACE shared TO ROLE publisher IN NAMESPACE newsroom"),
+        C::Grant {
+            namespace: "shared".into(),
+            grantee: publisher.clone(),
+            role: NamespaceRole::Writer,
+        }
+    );
+    assert_eq!(
+        access("grant READER on namespace a to principal 'editor/1' in 'https://id.example/team'"),
+        C::Grant {
+            namespace: "a".into(),
+            grantee: GranteeName::Principal(editor("1")),
+            role: NamespaceRole::Reader,
+        }
+    );
+    assert_eq!(
+        access("REVOKE writer ON NAMESPACE a FROM ROLE publisher IN NAMESPACE newsroom"),
+        C::RevokeGrant {
+            namespace: "a".into(),
+            grantee: publisher.clone(),
+            role: NamespaceRole::Writer,
+        }
+    );
+    assert_eq!(
+        access(
+            "REVOKE ALL ON NAMESPACE a, b FROM PRINCIPAL 'editor/1' IN 'https://id.example/team'"
+        ),
+        C::Revoke {
+            namespaces: vec!["a".into(), "b".into()],
+            grantee: GranteeName::Principal(editor("1")),
+        }
+    );
+    assert_eq!(
+        access(
+            "TRANSFER ROLE publisher IN NAMESPACE newsroom \
+             FROM PRINCIPAL 'editor/1' IN 'https://id.example/team' \
+             TO PRINCIPAL 'editor/2' IN 'https://id.example/team'"
+        ),
+        C::TransferRole {
+            home: "newsroom".into(),
+            name: "publisher".into(),
+            from: editor("1"),
+            to: editor("2"),
+        }
+    );
+    assert_eq!(
+        access("TRANSFER writer ON NAMESPACE a FROM PRINCIPAL 'p' IN 's' TO PRINCIPAL 'q' IN 's'"),
+        C::Transfer {
+            namespace: "a".into(),
+            role: NamespaceRole::Writer,
+            from: principal("p", "s"),
+            to: principal("q", "s"),
+        }
+    );
+    assert_eq!(
+        access("GRANT ROLE publisher IN NAMESPACE newsroom TO PRINCIPAL 'p' IN 's'"),
+        C::GrantRole {
+            home: "newsroom".into(),
+            name: "publisher".into(),
+            to: principal("p", "s"),
+        }
+    );
+    assert_eq!(
+        access("REVOKE ROLE publisher IN NAMESPACE newsroom FROM PRINCIPAL 'p' IN 's'"),
+        C::RevokeRole {
+            home: "newsroom".into(),
+            name: "publisher".into(),
+            from: principal("p", "s"),
+        }
+    );
+    for (query, create_namespace, admin) in [
+        (
+            "GRANT CREATE NAMESPACE TO PRINCIPAL 'p' IN 's'",
+            Some(true),
+            None,
+        ),
+        (
+            "REVOKE CREATE NAMESPACE FROM PRINCIPAL 'p' IN 's'",
+            Some(false),
+            None,
+        ),
+        (
+            "GRANT admin ON DEPLOYMENT TO PRINCIPAL 'p' IN 's'",
+            None,
+            Some(true),
+        ),
+        (
+            "REVOKE admin ON DEPLOYMENT FROM PRINCIPAL 'p' IN 's'",
+            None,
+            Some(false),
+        ),
+    ] {
+        assert_eq!(
+            access(query),
+            C::DeploymentRights {
+                principal: principal("p", "s"),
+                create_namespace,
+                admin,
+            },
+            "{query}"
+        );
+    }
+    assert_eq!(
+        access(
+            "CREATE ROLE coordinator IN NAMESPACE person \
+             EXCLUSIVE AMONG (PRINCIPAL 'm1' IN 's', PRINCIPAL 'm2' IN 's') \
+             HELD BY PRINCIPAL 'm1' IN 's'"
+        ),
+        C::CreateRole {
+            home: "person".into(),
+            name: "coordinator".into(),
+            eligible: Some(vec![principal("m1", "s"), principal("m2", "s")]),
+            holder: Some(principal("m1", "s")),
+        }
+    );
+    assert_eq!(
+        access("CREATE ROLE readers IN NAMESPACE a"),
+        C::CreateRole {
+            home: "a".into(),
+            name: "readers".into(),
+            eligible: None,
+            holder: None,
+        }
+    );
+    assert_eq!(
+        access("DROP ROLE readers IN NAMESPACE a"),
+        C::DropRole {
+            home: "a".into(),
+            name: "readers".into(),
+        }
+    );
+    assert_eq!(
+        access("ALTER ROLE coordinator IN NAMESPACE person SET ELIGIBLE ()"),
+        C::RoleEligible {
+            home: "person".into(),
+            name: "coordinator".into(),
+            eligible: Vec::new(),
+        }
+    );
+}
+
+/// What the ACL statements refuse: an eligible set given to GRANT ROLE, an
+/// exclusive role created without one holder of its set, a principal part
+/// no principal may have.
+#[test]
+fn acl_statements_refuse_what_the_catalog_cannot_hold() {
+    for query in [
+        "GRANT ROLE r IN NAMESPACE h TO PRINCIPAL 'p' IN 's' EXCLUSIVE AMONG (PRINCIPAL 'p' IN 's')",
+        "CREATE ROLE r IN NAMESPACE h EXCLUSIVE AMONG (PRINCIPAL 'p' IN 's')",
+        "CREATE ROLE r IN NAMESPACE h EXCLUSIVE AMONG (PRINCIPAL 'p' IN 's') HELD BY PRINCIPAL 'q' IN 's'",
+        "CREATE ROLE r IN NAMESPACE h EXCLUSIVE AMONG () HELD BY PRINCIPAL 'q' IN 's'",
+        "GRANT reader ON NAMESPACE a TO PRINCIPAL '' IN 's'",
+    ] {
+        parse_err(query);
+    }
+}
+
+/// The ACL words name nothing reserved: a property or variable called
+/// `role`, `admin` or `grant` reads as before.
+#[test]
+fn acl_words_stay_ordinary_names() {
+    parse_ok("MATCH (role:User) WHERE role.admin = true RETURN role.grant, role.principal");
+}
+
 #[test]
 fn namespace_catalog_statements() {
     for (query, name, guarded) in [

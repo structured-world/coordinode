@@ -410,6 +410,9 @@ fn write_clause(buf: &mut String, clause: &Clause) {
             buf.push_str(" SET STORAGE");
         }
         Clause::ShowNamespaces => buf.push_str("SHOW NAMESPACES"),
+        // The kind of change only: the principals a statement names are
+        // identities, not part of a query's shape.
+        Clause::Access(change) => buf.push_str(access_kind(change)),
         Clause::CreateVectorIndex(c) => {
             buf.push_str("CREATE VECTOR INDEX ");
             buf.push_str(&c.name);
@@ -530,6 +533,19 @@ fn write_clause(buf: &mut String, clause: &Clause) {
             }
             buf.push_str(" }");
         }
+    }
+}
+
+/// The statement an ACL change is written as, without its operands.
+fn access_kind(change: &coordinode_core::txn::proposal::AccessChange) -> &'static str {
+    use coordinode_core::txn::proposal::AccessChange as C;
+    match change {
+        C::Grant { .. } | C::DeploymentRights { .. } | C::GrantRole { .. } => "GRANT",
+        C::Revoke { .. } | C::RevokeGrant { .. } | C::RevokeRole { .. } => "REVOKE",
+        C::Transfer { .. } | C::TransferRole { .. } => "TRANSFER",
+        C::CreateRole { .. } => "CREATE ROLE",
+        C::DropRole { .. } => "DROP ROLE",
+        C::RoleEligible { .. } => "ALTER ROLE",
     }
 }
 

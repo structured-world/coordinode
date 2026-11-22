@@ -283,6 +283,14 @@ impl coordinode_query::executor::namespaces::NamespaceCatalog for Database {
         }
     }
 
+    fn change_access(
+        &self,
+        actor: Option<&PrincipalId>,
+        change: coordinode_core::txn::proposal::AccessChange,
+    ) -> Result<(), CatalogFailure> {
+        Ok(self.propose_command_as(actor.cloned(), MetadataCommand::from(change))?)
+    }
+
     fn namespaces(&self) -> Result<Vec<NamespaceEntry>, CatalogFailure> {
         Ok(Database::namespaces(self)?
             .into_iter()

@@ -107,6 +107,18 @@ pub enum Rule {
     r#alter_namespace_storage_clause,
     r#storage_settings,
     r#storage_setting,
+    r#principal_ref,
+    r#role_ref,
+    r#grantee,
+    r#namespace_role,
+    r#principal_list,
+    r#grant_clause,
+    r#grant_role_exclusive,
+    r#revoke_clause,
+    r#transfer_clause,
+    r#create_role_clause,
+    r#drop_role_clause,
+    r#alter_role_clause,
     r#create_edge_type_clause,
     r#edge_type_properties,
     r#edge_discriminated_by,
@@ -416,6 +428,18 @@ pub enum Rule {
     r#kw_for,
     r#kw_typed,
     r#kw_rename,
+    r#kw_grant,
+    r#kw_revoke,
+    r#kw_role,
+    r#kw_principal,
+    r#kw_reader,
+    r#kw_writer,
+    r#kw_admin,
+    r#kw_exclusive,
+    r#kw_among,
+    r#kw_deployment,
+    r#kw_held,
+    r#kw_eligible,
     r#variable,
     r#identifier,
     r#symbolic_name,
@@ -519,6 +543,18 @@ impl Rule {
             Rule::r#alter_namespace_storage_clause,
             Rule::r#storage_settings,
             Rule::r#storage_setting,
+            Rule::r#principal_ref,
+            Rule::r#role_ref,
+            Rule::r#grantee,
+            Rule::r#namespace_role,
+            Rule::r#principal_list,
+            Rule::r#grant_clause,
+            Rule::r#grant_role_exclusive,
+            Rule::r#revoke_clause,
+            Rule::r#transfer_clause,
+            Rule::r#create_role_clause,
+            Rule::r#drop_role_clause,
+            Rule::r#alter_role_clause,
             Rule::r#create_edge_type_clause,
             Rule::r#edge_type_properties,
             Rule::r#edge_discriminated_by,
@@ -828,6 +864,18 @@ impl Rule {
             Rule::r#kw_for,
             Rule::r#kw_typed,
             Rule::r#kw_rename,
+            Rule::r#kw_grant,
+            Rule::r#kw_revoke,
+            Rule::r#kw_role,
+            Rule::r#kw_principal,
+            Rule::r#kw_reader,
+            Rule::r#kw_writer,
+            Rule::r#kw_admin,
+            Rule::r#kw_exclusive,
+            Rule::r#kw_among,
+            Rule::r#kw_deployment,
+            Rule::r#kw_held,
+            Rule::r#kw_eligible,
             Rule::r#variable,
             Rule::r#identifier,
             Rule::r#symbolic_name,
@@ -1093,6 +1141,12 @@ impl ::pest::Parser<Rule> for CypherParser {
                                     .or_else(|state| { self::r#create_namespace_clause(state) })
                                     .or_else(|state| { self::r#drop_namespace_clause(state) })
                                     .or_else(|state| { self::r#show_namespaces_clause(state) })
+                                    .or_else(|state| { self::r#grant_clause(state) })
+                                    .or_else(|state| { self::r#revoke_clause(state) })
+                                    .or_else(|state| { self::r#transfer_clause(state) })
+                                    .or_else(|state| { self::r#create_role_clause(state) })
+                                    .or_else(|state| { self::r#drop_role_clause(state) })
+                                    .or_else(|state| { self::r#alter_role_clause(state) })
                                     .or_else(|state| {
                                         self::r#create_encrypted_index_clause(state)
                                     })
@@ -4158,6 +4212,507 @@ impl ::pest::Parser<Rule> for CypherParser {
                                                 self::r#string_literal(state)
                                                     .or_else(|state| { self::r#boolean_literal(state) })
                                             })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#principal_ref(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#principal_ref,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_principal(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#string_literal(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_in(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#string_literal(state) })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#role_ref(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#role_ref,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_role(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#identifier(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_in(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_namespace(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#identifier(state) })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#grantee(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#grantee,
+                            |state| {
+                                self::r#principal_ref(state)
+                                    .or_else(|state| { self::r#role_ref(state) })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#namespace_role(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#namespace_role,
+                            |state| {
+                                self::r#kw_reader(state)
+                                    .or_else(|state| { self::r#kw_writer(state) })
+                                    .or_else(|state| { self::r#kw_admin(state) })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#principal_list(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#principal_list,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        state
+                                            .match_string("(")
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state
+                                                    .optional(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#principal_ref(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| {
+                                                                        state
+                                                                            .sequence(|state| {
+                                                                                state
+                                                                                    .optional(|state| {
+                                                                                        state
+                                                                                            .sequence(|state| {
+                                                                                                state
+                                                                                                    .match_string(",")
+                                                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                                                    .and_then(|state| { self::r#principal_ref(state) })
+                                                                                            })
+                                                                                            .and_then(|state| {
+                                                                                                state
+                                                                                                    .repeat(|state| {
+                                                                                                        state
+                                                                                                            .sequence(|state| {
+                                                                                                                super::hidden::skip(state)
+                                                                                                                    .and_then(|state| {
+                                                                                                                        state
+                                                                                                                            .sequence(|state| {
+                                                                                                                                state
+                                                                                                                                    .match_string(",")
+                                                                                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                                                                                    .and_then(|state| { self::r#principal_ref(state) })
+                                                                                                                            })
+                                                                                                                    })
+                                                                                                            })
+                                                                                                    })
+                                                                                            })
+                                                                                    })
+                                                                            })
+                                                                    })
+                                                            })
+                                                    })
+                                            })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { state.match_string(")") })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#grant_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#grant_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_grant(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state
+                                                    .sequence(|state| {
+                                                        self::r#kw_admin(state)
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#kw_on(state) })
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#kw_deployment(state) })
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#kw_to(state) })
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#principal_ref(state) })
+                                                    })
+                                                    .or_else(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#kw_create(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_namespace(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_to(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#principal_ref(state) })
+                                                            })
+                                                    })
+                                                    .or_else(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#namespace_role(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_on(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_namespace(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#identifier(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_to(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#grantee(state) })
+                                                            })
+                                                    })
+                                                    .or_else(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#role_ref(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_to(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#principal_ref(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| {
+                                                                        state
+                                                                            .optional(|state| { self::r#grant_role_exclusive(state) })
+                                                                    })
+                                                            })
+                                                    })
+                                            })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#grant_role_exclusive(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#grant_role_exclusive,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_exclusive(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_among(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#principal_list(state) })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#revoke_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#revoke_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_revoke(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state
+                                                    .sequence(|state| {
+                                                        self::r#kw_admin(state)
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#kw_on(state) })
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#kw_deployment(state) })
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#kw_from(state) })
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#principal_ref(state) })
+                                                    })
+                                                    .or_else(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#kw_create(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_namespace(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_from(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#principal_ref(state) })
+                                                            })
+                                                    })
+                                                    .or_else(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#kw_all(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_on(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_namespace(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#identifier(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| {
+                                                                        state
+                                                                            .sequence(|state| {
+                                                                                state
+                                                                                    .optional(|state| {
+                                                                                        state
+                                                                                            .sequence(|state| {
+                                                                                                state
+                                                                                                    .match_string(",")
+                                                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                                                    .and_then(|state| { self::r#identifier(state) })
+                                                                                            })
+                                                                                            .and_then(|state| {
+                                                                                                state
+                                                                                                    .repeat(|state| {
+                                                                                                        state
+                                                                                                            .sequence(|state| {
+                                                                                                                super::hidden::skip(state)
+                                                                                                                    .and_then(|state| {
+                                                                                                                        state
+                                                                                                                            .sequence(|state| {
+                                                                                                                                state
+                                                                                                                                    .match_string(",")
+                                                                                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                                                                                    .and_then(|state| { self::r#identifier(state) })
+                                                                                                                            })
+                                                                                                                    })
+                                                                                                            })
+                                                                                                    })
+                                                                                            })
+                                                                                    })
+                                                                            })
+                                                                    })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_from(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#grantee(state) })
+                                                            })
+                                                    })
+                                                    .or_else(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#namespace_role(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_on(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_namespace(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#identifier(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_from(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#grantee(state) })
+                                                            })
+                                                    })
+                                                    .or_else(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#role_ref(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_from(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#principal_ref(state) })
+                                                            })
+                                                    })
+                                            })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#transfer_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#transfer_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_transfer(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state
+                                                    .sequence(|state| {
+                                                        self::r#namespace_role(state)
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#kw_on(state) })
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#kw_namespace(state) })
+                                                            .and_then(|state| { super::hidden::skip(state) })
+                                                            .and_then(|state| { self::r#identifier(state) })
+                                                    })
+                                                    .or_else(|state| { self::r#role_ref(state) })
+                                            })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_from(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#principal_ref(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_to(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#principal_ref(state) })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#create_role_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#create_role_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_create(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#role_ref(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state
+                                                    .optional(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#kw_exclusive(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_among(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#principal_list(state) })
+                                                            })
+                                                    })
+                                            })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| {
+                                                state
+                                                    .optional(|state| {
+                                                        state
+                                                            .sequence(|state| {
+                                                                self::r#kw_held(state)
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#kw_by(state) })
+                                                                    .and_then(|state| { super::hidden::skip(state) })
+                                                                    .and_then(|state| { self::r#principal_ref(state) })
+                                                            })
+                                                    })
+                                            })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#drop_role_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#drop_role_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_drop(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#role_ref(state) })
+                                    })
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#alter_role_clause(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#alter_role_clause,
+                            |state| {
+                                state
+                                    .sequence(|state| {
+                                        self::r#kw_alter(state)
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#role_ref(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_set(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#kw_eligible(state) })
+                                            .and_then(|state| { super::hidden::skip(state) })
+                                            .and_then(|state| { self::r#principal_list(state) })
                                     })
                             },
                         )
@@ -14264,6 +14819,426 @@ impl ::pest::Parser<Rule> for CypherParser {
                 }
                 #[inline]
                 #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_grant(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_grant,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("grant")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_revoke(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_revoke,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("revoke")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_role(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_role,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("role")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_principal(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_principal,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("principal")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_reader(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_reader,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("reader")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_writer(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_writer,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("writer")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_admin(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_admin,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("admin")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_exclusive(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_exclusive,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("exclusive")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_among(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_among,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("among")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_deployment(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_deployment,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("deployment")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_held(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_held,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("held")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
+                pub fn r#kw_eligible(
+                    state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                ) -> ::pest::ParseResult<
+                    ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
+                > {
+                    state
+                        .rule(
+                            Rule::r#kw_eligible,
+                            |state| {
+                                state
+                                    .atomic(
+                                        ::pest::Atomicity::Atomic,
+                                        |state| {
+                                            state
+                                                .sequence(|state| {
+                                                    state
+                                                        .match_insensitive("eligible")
+                                                        .and_then(|state| {
+                                                            state
+                                                                .lookahead(
+                                                                    false,
+                                                                    |state| {
+                                                                        self::r#ASCII_ALPHANUMERIC(state)
+                                                                            .or_else(|state| { state.match_string("_") })
+                                                                    },
+                                                                )
+                                                        })
+                                                })
+                                        },
+                                    )
+                            },
+                        )
+                }
+                #[inline]
+                #[allow(non_snake_case, unused_variables)]
                 pub fn r#variable(
                     state: ::std::boxed::Box<::pest::ParserState<'_, Rule>>,
                 ) -> ::pest::ParseResult<
@@ -14688,6 +15663,18 @@ impl ::pest::Parser<Rule> for CypherParser {
                     }
                     Rule::r#storage_settings => rules::r#storage_settings(state),
                     Rule::r#storage_setting => rules::r#storage_setting(state),
+                    Rule::r#principal_ref => rules::r#principal_ref(state),
+                    Rule::r#role_ref => rules::r#role_ref(state),
+                    Rule::r#grantee => rules::r#grantee(state),
+                    Rule::r#namespace_role => rules::r#namespace_role(state),
+                    Rule::r#principal_list => rules::r#principal_list(state),
+                    Rule::r#grant_clause => rules::r#grant_clause(state),
+                    Rule::r#grant_role_exclusive => rules::r#grant_role_exclusive(state),
+                    Rule::r#revoke_clause => rules::r#revoke_clause(state),
+                    Rule::r#transfer_clause => rules::r#transfer_clause(state),
+                    Rule::r#create_role_clause => rules::r#create_role_clause(state),
+                    Rule::r#drop_role_clause => rules::r#drop_role_clause(state),
+                    Rule::r#alter_role_clause => rules::r#alter_role_clause(state),
                     Rule::r#create_edge_type_clause => {
                         rules::r#create_edge_type_clause(state)
                     }
@@ -15067,6 +16054,18 @@ impl ::pest::Parser<Rule> for CypherParser {
                     Rule::r#kw_for => rules::r#kw_for(state),
                     Rule::r#kw_typed => rules::r#kw_typed(state),
                     Rule::r#kw_rename => rules::r#kw_rename(state),
+                    Rule::r#kw_grant => rules::r#kw_grant(state),
+                    Rule::r#kw_revoke => rules::r#kw_revoke(state),
+                    Rule::r#kw_role => rules::r#kw_role(state),
+                    Rule::r#kw_principal => rules::r#kw_principal(state),
+                    Rule::r#kw_reader => rules::r#kw_reader(state),
+                    Rule::r#kw_writer => rules::r#kw_writer(state),
+                    Rule::r#kw_admin => rules::r#kw_admin(state),
+                    Rule::r#kw_exclusive => rules::r#kw_exclusive(state),
+                    Rule::r#kw_among => rules::r#kw_among(state),
+                    Rule::r#kw_deployment => rules::r#kw_deployment(state),
+                    Rule::r#kw_held => rules::r#kw_held(state),
+                    Rule::r#kw_eligible => rules::r#kw_eligible(state),
                     Rule::r#variable => rules::r#variable(state),
                     Rule::r#identifier => rules::r#identifier(state),
                     Rule::r#symbolic_name => rules::r#symbolic_name(state),

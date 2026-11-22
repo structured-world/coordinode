@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use coordinode_core::access::MissingRight;
+use coordinode_core::access::{MissingRight, NamespaceRole};
 use coordinode_core::txn::command::Principal;
+use coordinode_core::txn::proposal::GranteeName;
 
 use super::*;
 use crate::db::StatementOptions;
@@ -334,6 +335,79 @@ fn a_revocation_stops_the_reads_of_an_open_transaction() {
         MissingRight::Namespace {
             namespace: ns,
             role: NamespaceRole::Reader,
+        },
+    );
+}
+
+/// The grant statements name principals and roles exactly: one subject
+/// under two issuers is two principals, a slash in either part is data, and
+/// two roles of one name in two homes are two roles. A right granted on a
+/// third namespace to the role of one home reaches that role's holder and
+/// nobody else.
+#[test]
+fn grant_statements_name_principals_and_roles_exactly() {
+    use coordinode_storage::engine::access::effective_role;
+    let (db, _dir) = open();
+    let host = |query: &str| {
+        db.execute_cypher_shared(query, None, None, None, None)
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+    };
+    for name in ["newsroom", "sports", "shared"] {
+        host(&format!("CREATE NAMESPACE {name}"));
+    }
+    host("CREATE ROLE publisher IN NAMESPACE newsroom");
+    host("CREATE ROLE publisher IN NAMESPACE sports");
+    host("GRANT writer ON NAMESPACE shared TO ROLE publisher IN NAMESPACE newsroom");
+    host(
+        "GRANT ROLE publisher IN NAMESPACE newsroom \
+         TO PRINCIPAL 'editor/1' IN 'https://a.example/team'",
+    );
+    host(
+        "GRANT ROLE publisher IN NAMESPACE sports \
+         TO PRINCIPAL 'editor/1' IN 'https://b.example/team'",
+    );
+
+    let deployment = db.engine.deployment();
+    let shared = coordinode_storage::engine::metadata::namespace_by_name(deployment, "shared")
+        .unwrap()
+        .unwrap();
+    let of_a = PrincipalId::new("editor/1", "https://a.example/team").unwrap();
+    let of_b = PrincipalId::new("editor/1", "https://b.example/team").unwrap();
+    assert_eq!(
+        effective_role(deployment, &of_a, shared).unwrap(),
+        Some(NamespaceRole::Writer),
+        "the holder of newsroom's publisher writes shared"
+    );
+    assert_eq!(
+        effective_role(deployment, &of_b, shared).unwrap(),
+        None,
+        "the same subject of another issuer, holding sports' publisher, has nothing there"
+    );
+
+    // A statement acts for its principal: an admin of the default namespace
+    // grants on it, a principal without admin there is refused.
+    host("GRANT admin ON NAMESPACE default TO PRINCIPAL 'alice' IN 'idp'");
+    run_as(
+        &db,
+        "alice",
+        "GRANT reader ON NAMESPACE default TO PRINCIPAL 'bob' IN 'idp'",
+    )
+    .expect("the admin grants by statement");
+    let ns = default_namespace(&db);
+    assert_eq!(
+        effective_role(deployment, &id("bob"), ns).unwrap(),
+        Some(NamespaceRole::Reader)
+    );
+    refused_for(
+        run_as(
+            &db,
+            "bob",
+            "GRANT writer ON NAMESPACE default TO PRINCIPAL 'bob' IN 'idp'",
+        ),
+        "bob",
+        MissingRight::Namespace {
+            namespace: ns,
+            role: NamespaceRole::Admin,
         },
     );
 }

@@ -75,6 +75,7 @@ impl Query {
                 | Clause::CreateNamespace(_)
                 | Clause::DropNamespace(_)
                 | Clause::SetNamespaceStorage(_)
+                | Clause::Access(_)
                 | Clause::CreateVectorIndex(_)
                 | Clause::DropVectorIndex(_)
                 | Clause::CreateEdgeType(_)
@@ -165,6 +166,9 @@ pub enum Clause {
     SetNamespaceStorage(NamespaceStorageClause),
     /// `SHOW NAMESPACES`: the deployment's namespaces.
     ShowNamespaces,
+    /// `GRANT`, `REVOKE`, `TRANSFER`, `CREATE / DROP / ALTER ROLE`: one
+    /// change to the deployment's grant catalog.
+    Access(coordinode_core::txn::proposal::AccessChange),
     CreateVectorIndex(CreateVectorIndexClause),
     DropVectorIndex(DropVectorIndexClause),
     CreateEdgeType(CreateEdgeTypeClause),

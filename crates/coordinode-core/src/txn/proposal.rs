@@ -584,6 +584,18 @@ pub enum MetadataCommand {
         /// Who loses the rights.
         grantee: GranteeName,
     },
+    /// Take the direct right `grantee` holds on `namespace`, only while its
+    /// stored level is still `role` where the change applies: a grant an
+    /// earlier change replaced with another level survives. Writes nothing
+    /// otherwise.
+    RevokeGrant {
+        /// The namespace's name.
+        namespace: String,
+        /// Who loses the right.
+        grantee: GranteeName,
+        /// The level the right must still have.
+        role: crate::access::NamespaceRole,
+    },
     /// Move the right `role` on `namespace` from `from` to `to`, only while
     /// `from` holds exactly that right there; refused, writing nothing,
     /// otherwise.
@@ -700,6 +712,218 @@ pub enum GranteeName {
     },
 }
 
+/// One change to the grant catalog, as a statement or the embedded API names
+/// it; both commit it as the same catalog command.
+///
+/// A change whose condition does not hold where the log applies it (a
+/// transfer from a principal that no longer holds the right, a grant on a
+/// namespace or role that is not live, a level-specific revocation of a
+/// grant whose level changed) writes nothing; the catalog read afterwards
+/// says what holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessChange {
+    /// Give `grantee` the right `role` on `namespace`, replacing a right it
+    /// held there.
+    Grant {
+        /// The namespace's name.
+        namespace: String,
+        /// Who receives the right.
+        grantee: GranteeName,
+        /// The right.
+        role: crate::access::NamespaceRole,
+    },
+    /// Take every right `grantee` holds on each of `namespaces`, as one
+    /// change: no state of the store has it holding some and not the others.
+    Revoke {
+        /// The namespaces' names.
+        namespaces: Vec<String>,
+        /// Who loses the rights.
+        grantee: GranteeName,
+    },
+    /// Take the direct right `grantee` holds on `namespace`, only while its
+    /// level is still `role` where the change applies: a grant an earlier
+    /// change replaced with another level survives.
+    RevokeGrant {
+        /// The namespace's name.
+        namespace: String,
+        /// Who loses the right.
+        grantee: GranteeName,
+        /// The level the right must still have.
+        role: crate::access::NamespaceRole,
+    },
+    /// Move the right `role` on `namespace` from `from` to `to`, only while
+    /// `from` holds exactly that right there.
+    Transfer {
+        /// The namespace's name.
+        namespace: String,
+        /// The right moved.
+        role: crate::access::NamespaceRole,
+        /// The principal that holds it now.
+        from: crate::access::PrincipalId,
+        /// The principal that receives it.
+        to: crate::access::PrincipalId,
+    },
+    /// Set the deployment rights of `principal`; each one left `None` is
+    /// kept.
+    DeploymentRights {
+        /// The principal.
+        principal: crate::access::PrincipalId,
+        /// Whether it may create namespaces.
+        create_namespace: Option<bool>,
+        /// Whether it holds every right on the whole deployment.
+        admin: Option<bool>,
+    },
+    /// Create the role `name` in the namespace `home`. An exclusive role
+    /// names its eligible principals; `holder`, when named, holds it from
+    /// the start and must be eligible.
+    CreateRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// For an exclusive role, its eligible principals.
+        eligible: Option<Vec<crate::access::PrincipalId>>,
+        /// The principal that holds it from the start.
+        holder: Option<crate::access::PrincipalId>,
+    },
+    /// Drop a role with every grant it holds and everyone holding it.
+    DropRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+    },
+    /// Replace an exclusive role's eligible principals; a holder no longer
+    /// among them loses the role in the same change.
+    RoleEligible {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// The principals that may hold it from here on.
+        eligible: Vec<crate::access::PrincipalId>,
+    },
+    /// Make `to` a holder of a role: of an exclusive one only while nobody
+    /// holds it and `to` is eligible.
+    GrantRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// The principal that receives it.
+        to: crate::access::PrincipalId,
+    },
+    /// Take a role from `from`: every right it carries, on every namespace,
+    /// in one change.
+    RevokeRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// The principal that loses it.
+        from: crate::access::PrincipalId,
+    },
+    /// Move a role from `from` to `to`, only while `from` holds it and, for
+    /// an exclusive role, `to` is eligible. Of two concurrent takers exactly
+    /// one succeeds.
+    TransferRole {
+        /// The home namespace's name.
+        home: String,
+        /// The role's name.
+        name: String,
+        /// The principal that holds it now.
+        from: crate::access::PrincipalId,
+        /// The principal that receives it.
+        to: crate::access::PrincipalId,
+    },
+}
+
+impl From<AccessChange> for MetadataCommand {
+    fn from(change: AccessChange) -> Self {
+        match change {
+            AccessChange::Grant {
+                namespace,
+                grantee,
+                role,
+            } => Self::GrantAccess {
+                namespace,
+                grantee,
+                role,
+            },
+            AccessChange::Revoke {
+                namespaces,
+                grantee,
+            } => Self::RevokeAccess {
+                namespaces,
+                grantee,
+            },
+            AccessChange::RevokeGrant {
+                namespace,
+                grantee,
+                role,
+            } => Self::RevokeGrant {
+                namespace,
+                grantee,
+                role,
+            },
+            AccessChange::Transfer {
+                namespace,
+                role,
+                from,
+                to,
+            } => Self::TransferAccess {
+                namespace,
+                role,
+                from,
+                to,
+            },
+            AccessChange::DeploymentRights {
+                principal,
+                create_namespace,
+                admin,
+            } => Self::SetDeploymentRights {
+                principal,
+                create_namespace,
+                admin,
+            },
+            AccessChange::CreateRole {
+                home,
+                name,
+                eligible,
+                holder,
+            } => Self::CreateRole {
+                home,
+                name,
+                eligible,
+                holder,
+            },
+            AccessChange::DropRole { home, name } => Self::DropRole { home, name },
+            AccessChange::RoleEligible {
+                home,
+                name,
+                eligible,
+            } => Self::SetRoleEligible {
+                home,
+                name,
+                eligible,
+            },
+            AccessChange::GrantRole { home, name, to } => Self::GrantRole { home, name, to },
+            AccessChange::RevokeRole { home, name, from } => Self::RevokeRole { home, name, from },
+            AccessChange::TransferRole {
+                home,
+                name,
+                from,
+                to,
+            } => Self::TransferRole {
+                home,
+                name,
+                from,
+                to,
+            },
+        }
+    }
+}
+
 impl MetadataCommand {
     /// Whether the command changes the grant catalog or the namespaces it
     /// grants on: a write acting for a principal must be checked against
@@ -712,6 +936,7 @@ impl MetadataCommand {
                 | Self::DropNamespace { .. }
                 | Self::GrantAccess { .. }
                 | Self::RevokeAccess { .. }
+                | Self::RevokeGrant { .. }
                 | Self::TransferAccess { .. }
                 | Self::SetDeploymentRights { .. }
                 | Self::CreateRole { .. }
@@ -742,6 +967,7 @@ impl MetadataCommand {
             | Self::SetNamespaceStorage { .. }
             | Self::GrantAccess { .. }
             | Self::RevokeAccess { .. }
+            | Self::RevokeGrant { .. }
             | Self::TransferAccess { .. }
             | Self::SetDeploymentRights { .. }
             | Self::CreateRole { .. }
@@ -777,6 +1003,9 @@ impl MetadataCommand {
             Self::DropNamespace { name } => name.len() + 2,
             Self::SetNamespaceStorage { name, .. } => name.len() + 16,
             Self::GrantAccess {
+                namespace, grantee, ..
+            }
+            | Self::RevokeGrant {
                 namespace, grantee, ..
             } => namespace.len() + grantee.size_estimate() + 4,
             Self::RevokeAccess {

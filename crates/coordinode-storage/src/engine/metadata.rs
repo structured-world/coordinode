@@ -120,6 +120,7 @@ pub(crate) fn decide(
         // Decided above.
         MetadataCommand::GrantAccess { .. }
         | MetadataCommand::RevokeAccess { .. }
+        | MetadataCommand::RevokeGrant { .. }
         | MetadataCommand::TransferAccess { .. }
         | MetadataCommand::SetDeploymentRights { .. }
         | MetadataCommand::CreateRole { .. }
