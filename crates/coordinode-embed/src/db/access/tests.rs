@@ -709,6 +709,96 @@ fn a_repairing_build_records_the_principal_that_asked_for_it() {
     assert_eq!(repairing[0].repaired, 1, "the repair ran in ada's name");
 }
 
+/// A catalog change and a data write in one transaction commit in one log
+/// entry, at one timestamp: removing a principal from a role's eligible set
+/// and deleting what only it could read is one act. When the change is
+/// refused, the data write is refused with it.
+#[test]
+fn a_catalog_change_and_a_data_write_commit_as_one() {
+    use crate::db::TransactionOptions;
+    let (db, _dir) = open();
+    let host = |query: &str| {
+        db.execute_cypher_shared(query, None, None, None, None)
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+    };
+    host(
+        "CREATE ROLE coordinator IN NAMESPACE default \
+         EXCLUSIVE AMONG (PRINCIPAL 'm1' IN 'idp', PRINCIPAL 'm2' IN 'idp') \
+         HELD BY PRINCIPAL 'm2' IN 'idp'",
+    );
+    host("CREATE (:Secret {owner: 'm2'}), (:Kept {owner: 'm2'})");
+
+    let tx = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(
+        tx,
+        "ALTER ROLE coordinator IN NAMESPACE default SET ELIGIBLE (PRINCIPAL 'm1' IN 'idp')",
+        None,
+    )
+    .expect("the change, staged");
+    db.execute_in_transaction(tx, "MATCH (s:Secret) DELETE s", None)
+        .expect("the deletion, staged");
+    let receipt = db.commit_transaction(tx).expect("commit");
+
+    let role = db
+        .role(&ActingContext::Trusted, "default", "coordinator")
+        .expect("read")
+        .expect("the role");
+    assert!(role.holders.is_empty(), "m2 left the set and the role");
+    assert_eq!(role.eligible, Some(vec![id("m1")]));
+    assert_eq!(
+        role.changed_ts,
+        receipt.commit_ts.as_raw(),
+        "the change landed at the transaction's commit"
+    );
+    let secrets = db
+        .execute_cypher_shared("MATCH (s:Secret) RETURN s", None, None, None, None)
+        .unwrap()
+        .rows;
+    assert!(secrets.is_empty(), "the deletion landed with it");
+
+    // A writer without admin: the change is refused, and the deletion with it.
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "eve", NamespaceRole::Writer),
+    )
+    .expect("grant writer");
+    let tx = db
+        .begin_transaction_with(&TransactionOptions {
+            actor: Some(acting("eve")),
+            ..TransactionOptions::trusted()
+        })
+        .expect("begin");
+    let as_eve = StatementOptions {
+        actor: Some(acting("eve")),
+        ..StatementOptions::default()
+    };
+    db.execute_in_transaction_with(
+        tx,
+        "ALTER ROLE coordinator IN NAMESPACE default SET ELIGIBLE ()",
+        None,
+        &as_eve,
+    )
+    .expect("staged");
+    db.execute_in_transaction_with(tx, "MATCH (k:Kept) DELETE k", None, &as_eve)
+        .expect("staged");
+    let refused = db.commit_transaction_with(
+        tx,
+        &crate::db::CommitOptions {
+            actor: Some(&acting("eve")),
+            ..crate::db::CommitOptions::default()
+        },
+    );
+    assert!(
+        matches!(refused, Err(DatabaseError::AccessRefused(_))),
+        "{refused:?}"
+    );
+    let kept = db
+        .execute_cypher_shared("MATCH (k:Kept) RETURN k", None, None, None, None)
+        .unwrap()
+        .rows;
+    assert_eq!(kept.len(), 1, "the refused unit deleted nothing");
+}
+
 /// A principal bound to another namespace than the handle's changes
 /// nothing through it.
 #[test]

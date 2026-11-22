@@ -7350,11 +7350,17 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::ShowNamespaces => crate::executor::namespaces::show(ctx.namespace_catalog),
 
-        LogicalOp::Access(change) => crate::executor::namespaces::change_access(
-            ctx.namespace_catalog,
-            ctx.actor.as_ref(),
-            change,
-        ),
+        // Staged with the statement's own transaction: it commits in one log
+        // entry with whatever else the transaction writes, acting for the
+        // transaction's principal, so a revocation and the deletion of what
+        // only the revoked principal could read are one act.
+        LogicalOp::Access(change) => {
+            ctx.txn
+                .stage_catalog_change(coordinode_core::txn::proposal::MetadataCommand::from(
+                    change.clone(),
+                ));
+            Ok(Vec::new())
+        }
 
         LogicalOp::CreateVectorIndex {
             name,

@@ -405,9 +405,14 @@ REVOKE admin ON DEPLOYMENT FROM PRINCIPAL 'root' IN 's'
 - `CREATE NAMESPACE` right lets its holder create namespaces and list them,
   becoming admin of each it creates; it gives no right on any other
   namespace. `admin ON DEPLOYMENT` reaches every namespace.
+- Inside an explicit transaction these statements commit with its other
+  writes, in one change at one timestamp: removing a principal from a role's
+  eligible set and deleting the data only it could read happen together or
+  not at all.
 - A statement acting for a principal without the right the change needs is
   refused with `ACCESS_REFUSED` naming the principal and the level or
-  deployment right it lacked; nothing changes. The ACL words are not reserved:
+  deployment right it lacked; nothing changes, and in a transaction none of
+  its other writes are applied either. The ACL words are not reserved:
   a property or variable called `role` or `admin` reads as before.
 
 #### CREATE NODE TYPE / CREATE EDGE TYPE ✅ 🔷

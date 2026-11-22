@@ -8,7 +8,6 @@
 
 use coordinode_core::access::PrincipalId;
 use coordinode_core::graph::types::Value;
-use coordinode_core::txn::proposal::AccessChange;
 
 use super::row::Row;
 use super::runner::ExecutionError;
@@ -96,19 +95,6 @@ pub trait NamespaceCatalog: Send + Sync {
     ///
     /// The catalog cannot be read.
     fn namespaces(&self) -> Result<Vec<NamespaceEntry>, CatalogFailure>;
-
-    /// Commit `change` to the deployment's grant catalog, acting for
-    /// `actor`; decided where the change applies, like every catalog change.
-    ///
-    /// # Errors
-    ///
-    /// The host's refusal: a principal without the right the change needs,
-    /// a write it could not commit.
-    fn change_access(
-        &self,
-        actor: Option<&PrincipalId>,
-        change: AccessChange,
-    ) -> Result<(), CatalogFailure>;
 }
 
 /// The catalog a statement reaches, or the refusal of a host that gave none.
@@ -166,20 +152,6 @@ pub(crate) fn set_storage(
         .set_namespace_storage(actor, name, change)
         .map_err(ExecutionError::Catalog)?;
     Ok(vec![changed_row(name, CatalogOutcome::Changed)])
-}
-
-/// `GRANT`, `REVOKE`, `TRANSFER`, `CREATE / DROP / ALTER ROLE`: the change
-/// committed, with no rows. A change whose condition did not hold where it
-/// applied wrote nothing; the catalog says what holds.
-pub(crate) fn change_access(
-    host: Option<&dyn NamespaceCatalog>,
-    actor: Option<&PrincipalId>,
-    change: &AccessChange,
-) -> Result<Vec<Row>, ExecutionError> {
-    catalog(host)?
-        .change_access(actor, change.clone())
-        .map_err(ExecutionError::Catalog)?;
-    Ok(Vec::new())
 }
 
 /// `SHOW NAMESPACES`: a row per namespace, its name, state and the storage

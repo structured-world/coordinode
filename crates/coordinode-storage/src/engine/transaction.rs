@@ -28,7 +28,8 @@ use std::collections::{BTreeMap, HashMap};
 use coordinode_core::graph::edge::PostingList;
 use coordinode_core::txn::invariant::{Claim, ClaimSet};
 use coordinode_core::txn::proposal::{
-    Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
+    MetadataCommand, Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline,
+    RaftProposal,
 };
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::{Journal, WriteConcern};
@@ -460,6 +461,9 @@ pub struct Transaction<'a> {
     /// cannot say it themselves ([`Self::note_node_basis`],
     /// [`Self::note_removed_edge`]). Sealed with the unit.
     effects: EffectContext,
+    /// Catalog changes staged with the attempt ([`Self::stage_catalog_change`]):
+    /// they commit in the unit of its writes, at its commit timestamp.
+    catalog_changes: Vec<MetadataCommand>,
 }
 
 /// The change-feed context an attempt gathers as its writers stage changes:
@@ -592,6 +596,8 @@ pub struct TransactionState {
     effects: EffectContext,
     /// Parked: every statement of the transaction acts for its principal.
     actor: Option<coordinode_core::access::PrincipalId>,
+    /// Parked with the write buffer: they commit in the same unit.
+    catalog_changes: Vec<MetadataCommand>,
 }
 
 /// Bytes the write buffer holds for one staged key beside the key and value
@@ -789,7 +795,17 @@ impl<'a> Transaction<'a> {
             operation: None,
             actor: None,
             effects: EffectContext::default(),
+            catalog_changes: Vec::new(),
         }
+    }
+
+    /// Stage the catalog change `command` with this attempt: it commits in
+    /// the same log entry as the attempt's writes, at one commit timestamp,
+    /// decided where the entry applies, so no state of the store has one
+    /// without the other. A revocation that drops a principal from a role's
+    /// eligible set and deletes what only it could read is one act this way.
+    pub fn stage_catalog_change(&mut self, command: MetadataCommand) {
+        self.catalog_changes.push(command);
     }
 
     /// Act for `principal`: the commit names it, and is applied only if the
@@ -1008,6 +1024,7 @@ impl<'a> Transaction<'a> {
             budget_refusal: self.budget_refusal,
             effects: self.effects,
             actor: self.actor,
+            catalog_changes: self.catalog_changes,
         }
     }
 
@@ -1046,6 +1063,7 @@ impl<'a> Transaction<'a> {
             budget_refusal: self.budget_refusal.take(),
             effects: std::mem::take(&mut self.effects),
             actor: self.actor.clone(),
+            catalog_changes: std::mem::take(&mut self.catalog_changes),
         }
     }
 
@@ -1095,6 +1113,7 @@ impl<'a> Transaction<'a> {
             operation: None,
             actor: state.actor,
             effects: state.effects,
+            catalog_changes: state.catalog_changes,
         }
     }
 
@@ -2406,6 +2425,14 @@ impl<'a> Transaction<'a> {
         if let Some(stop) = self.budget_refusal {
             return Err(CommitError::Budget(stop));
         }
+        // An operation's binding decides its whole unit against the records
+        // of the operation, a catalog change against the catalog: the two are
+        // not decided in one unit.
+        if self.operation.is_some() && !self.catalog_changes.is_empty() {
+            return Err(CommitError::Serialization(
+                "a catalog change does not commit under a client operation".into(),
+            ));
+        }
         // Likewise work every member would refuse to derive.
         self.derived
             .check_fan_out(crate::engine::MAX_DERIVED_EFFECTS)
@@ -2420,6 +2447,7 @@ impl<'a> Transaction<'a> {
         let has_writes = !self.write_buffer.is_empty()
             || !self.range_removals.is_empty()
             || !self.stamped.is_empty()
+            || !self.catalog_changes.is_empty()
             || self.has_pending_merges();
         if has_writes && !self.pressure_exempt {
             match self.engine.write_pressure() {
@@ -2453,6 +2481,13 @@ impl<'a> Transaction<'a> {
                 // Its point writes are already applied, unbound.
                 return Err(CommitError::Serialization(
                     "a client operation binds only a buffered transaction".into(),
+                ));
+            }
+            if !self.catalog_changes.is_empty() {
+                // Its point writes are already applied: nothing is left to
+                // commit the change with in one unit.
+                return Err(CommitError::Serialization(
+                    "a catalog change commits only with a buffered transaction".into(),
                 ));
             }
             // No admission without a clock: the conditions are checked
@@ -2506,6 +2541,7 @@ impl<'a> Transaction<'a> {
         if self.write_buffer.is_empty()
             && self.range_removals.is_empty()
             && self.stamped.is_empty()
+            && self.catalog_changes.is_empty()
             && !has_merge_ops
         {
             // Read-only: nothing to admit or apply, but a condition the
@@ -2809,6 +2845,13 @@ impl<'a> Transaction<'a> {
         } else {
             self.effects = EffectContext::default();
         }
+        // The staged catalog changes, after every position the sealed work
+        // names: decided with the unit's writes where the entry applies.
+        mutations.extend(
+            std::mem::take(&mut self.catalog_changes)
+                .into_iter()
+                .map(Mutation::Command),
+        );
         // The binding goes last, after the sealed DERIVED work whose record
         // sources name positions of the list before it.
         let bind = |mutations: &mut Vec<Mutation>, attempt: u64| {
