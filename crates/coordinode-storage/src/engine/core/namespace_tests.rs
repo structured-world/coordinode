@@ -537,20 +537,30 @@ fn a_namespace_codec_change_applies_to_its_next_tables_only() {
         "the table written before the change stays installed, the same bytes"
     );
     assert_eq!(first_after[1].codec, CompressionType::Zstd(3));
+    let second_after = node_tables(&second);
     assert_eq!(
-        node_tables(&second)
-            .iter()
-            .map(|t| t.codec)
-            .collect::<Vec<_>>(),
+        second_after.iter().map(|t| t.codec).collect::<Vec<_>>(),
         vec![CompressionType::None, CompressionType::None],
         "the other namespace keeps its codec"
+    );
+    assert_eq!(
+        second_after[0], second_before[0],
+        "the other namespace's earlier table stays installed, the same bytes"
     );
     drop((first, second));
     drop(deployment);
 
+    // After a cold reopen each namespace serves the very tables it had
+    // installed (same ids, same bytes, both generations), and every row of
+    // both generations reads back from them.
     let (deployment, _) = open_deployment(&config);
-    for name in ["first", "second"] {
+    for (name, installed) in [("first", &first_after), ("second", &second_after)] {
         let engine = deployment.engine_named(name).expect("reopened");
+        assert_eq!(
+            &node_tables(&engine),
+            installed,
+            "{name}'s installed tables changed across the reopen"
+        );
         assert_rows(&engine, name, 0..1000);
     }
 }
