@@ -4192,6 +4192,51 @@ async fn calls_naming_two_namespaces_work_in_each_alone() {
 /// A namespace created by a statement over gRPC is served to the next call
 /// naming it; a repeated creation is ALREADY_EXISTS naming the namespace,
 /// and once dropped the namespace is NOT_FOUND again.
+/// A refusal for a missing right reaches a client as PERMISSION_DENIED with
+/// reason ACCESS_REFUSED and the principal and right it lacked; a principal
+/// of another namespace than the session's is INVALID_ARGUMENT naming both.
+#[test]
+fn access_refusals_map_to_their_grpc_status() {
+    use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole, PrincipalId};
+    let status = super::db_error_to_status(DatabaseError::AccessRefused(AccessRefusal {
+        principal: PrincipalId::new("alice", "https://id.example").unwrap(),
+        missing: MissingRight::Namespace {
+            namespace: coordinode_core::namespace::NamespaceId::from_raw(7),
+            role: NamespaceRole::Writer,
+        },
+    }));
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    let info = tonic_types::StatusExt::get_details_error_info(&status).expect("error info");
+    assert_eq!(info.reason, "ACCESS_REFUSED");
+    let meta = |key: &str| info.metadata.get(key).map(String::as_str);
+    assert_eq!(meta("subject"), Some("alice"));
+    assert_eq!(meta("trust_scope"), Some("https://id.example"));
+    assert_eq!(meta("missing"), Some("writer"));
+    assert_eq!(meta("namespace_id"), Some("7"));
+
+    let issuer = super::db_error_to_status(DatabaseError::AccessRefused(AccessRefusal {
+        principal: PrincipalId::new("bob", "idp").unwrap(),
+        missing: MissingRight::Issuer(coordinode_core::txn::operation::IssuerId([0xab; 16])),
+    }));
+    let info = tonic_types::StatusExt::get_details_error_info(&issuer).expect("error info");
+    assert_eq!(
+        info.metadata.get("missing").map(String::as_str),
+        Some("issuer")
+    );
+    assert_eq!(
+        info.metadata.get("issuer").map(String::as_str),
+        Some("abababababababababababababababab")
+    );
+
+    let mismatch = super::db_error_to_status(DatabaseError::NamespaceMismatch {
+        principal: "a".into(),
+        session: "b".into(),
+    });
+    assert_eq!(mismatch.code(), tonic::Code::InvalidArgument);
+    let info = tonic_types::StatusExt::get_details_error_info(&mismatch).expect("error info");
+    assert_eq!(info.reason, "NAMESPACE_MISMATCH");
+}
+
 #[tokio::test]
 async fn a_namespace_created_by_a_statement_serves_the_next_call() {
     let (svc, _dir) = test_service();

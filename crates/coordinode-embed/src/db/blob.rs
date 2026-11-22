@@ -204,7 +204,8 @@ impl Database {
         let (id, bound) = match operation {
             Some(descriptor) => {
                 let intent = upload_intent(data);
-                self.admit_operation(descriptor, &intent)?;
+                // The host's own upload: no principal's issuer to check.
+                self.admit_operation(None, descriptor, &intent)?;
                 (
                     BlobId::for_operation(descriptor),
                     Some((descriptor.op, intent)),

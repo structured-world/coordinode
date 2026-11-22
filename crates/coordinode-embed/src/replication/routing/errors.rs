@@ -291,6 +291,7 @@ fn access_refusal_to_wire(refusal: AccessRefusal) -> wire::AccessRefused {
         }),
         MissingRight::CreateNamespace => Missing::CreateNamespace(wire::Empty {}),
         MissingRight::DeploymentAdmin => Missing::DeploymentAdmin(wire::Empty {}),
+        MissingRight::Issuer(issuer) => Missing::Issuer(issuer.0.to_vec()),
     };
     wire::AccessRefused {
         subject: refusal.principal.subject.to_string(),
@@ -322,6 +323,10 @@ fn access_refusal_from_wire(r: wire::AccessRefused) -> Result<AccessRefusal, Str
         },
         Missing::CreateNamespace(_) => MissingRight::CreateNamespace,
         Missing::DeploymentAdmin(_) => MissingRight::DeploymentAdmin,
+        Missing::Issuer(bytes) => MissingRight::Issuer(IssuerId(
+            <[u8; 16]>::try_from(bytes.as_slice())
+                .map_err(|_| "access_refused.issuer: an issuer is 16 bytes")?,
+        )),
     };
     Ok(AccessRefusal { principal, missing })
 }

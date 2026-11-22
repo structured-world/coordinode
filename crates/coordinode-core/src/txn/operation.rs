@@ -303,6 +303,20 @@ pub const OPERATION_KEY_PREFIX: &[u8] = b"op:b:";
 /// Prefix of every incarnation record key.
 pub const INCARNATION_KEY_PREFIX: &[u8] = b"op:i:";
 
+/// Prefix of every issuer-owner record key.
+pub const ISSUER_OWNER_KEY_PREFIX: &[u8] = b"op:o:";
+
+/// The key of the record naming the principal `issuer` belongs to: the one
+/// that enrolled it first. An issuer with no such record was enrolled by the
+/// explicitly trusted host and belongs to no principal.
+#[must_use]
+pub fn issuer_owner_key(issuer: &IssuerId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ISSUER_OWNER_KEY_PREFIX.len() + ISSUER_ID_LEN);
+    key.extend_from_slice(ISSUER_OWNER_KEY_PREFIX);
+    key.extend_from_slice(&issuer.0);
+    key
+}
+
 /// The key of `issuer`'s incarnation records, followed by the incarnation.
 #[must_use]
 pub fn issuer_incarnations_prefix(issuer: &IssuerId) -> Vec<u8> {

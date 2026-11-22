@@ -10,12 +10,13 @@
 //! The decision reads nothing but the records earlier decisions wrote, so it
 //! is the same on every member and on every replay.
 
+use coordinode_core::access::{AccessRefusal, MissingRight, PrincipalId};
 use coordinode_core::txn::operation::{
     BindDecision, INCARNATION_KEY_PREFIX, INTENT_DIGEST_LEN, ISSUER_ID_LEN, IncarnationRecord,
     IntentDigest, IssuerId, LogPosition, OperationCommand, OperationId, OperationOutcome,
     OperationRecord, OperationState, decide_binding, decode_incarnation_key, decode_operation_key,
-    incarnation_key, incarnation_operations_prefix, issuer_incarnations_prefix, operation_key,
-    outcome_of,
+    incarnation_key, incarnation_operations_prefix, issuer_incarnations_prefix, issuer_owner_key,
+    operation_key, outcome_of,
 };
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
 
@@ -58,6 +59,59 @@ pub(crate) struct Decided {
     /// The unit's binding refused it: none of its effects apply. A reader of
     /// the raw log must leave it out too.
     pub(crate) skipped: bool,
+    /// The unit acted for a principal that does not own its issuer: nothing
+    /// of it applies, and its proposer is told why.
+    pub(crate) refused: Option<AccessRefusal>,
+}
+
+/// The principal `issuer` belongs to: the one whose enrollment created it.
+/// `None` for an issuer the explicitly trusted host enrolled, or none.
+///
+/// # Errors
+///
+/// The record cannot be read or does not decode.
+pub fn issuer_owner(engine: &Deployment, issuer: &IssuerId) -> StorageResult<Option<PrincipalId>> {
+    engine
+        .system_get(Partition::Deployment, &issuer_owner_key(issuer))?
+        .map(|bytes| PrincipalId::from_bytes(&bytes).ok_or_else(|| malformed("issuer owner")))
+        .transpose()
+}
+
+/// Whether `actor` may carry out `command`: a principal only on an issuer it
+/// owns, and it owns an issuer its enrollment creates. An issuer of another
+/// principal, one the trusted host enrolled and one that does not exist are
+/// refused alike, so a refusal tells nothing of whose an issuer is; an
+/// ownerless issuer is reached only by the trusted host. With no principal
+/// (the trusted host, the store's own work) nothing is checked: that access
+/// isolates no caller from another.
+///
+/// The owner record a creating enrollment adds, when it adds one.
+fn ownership(
+    engine: &Deployment,
+    command: &OperationCommand,
+    actor: Option<&PrincipalId>,
+) -> StorageResult<Result<Option<Mutation>, AccessRefusal>> {
+    let Some(principal) = actor else {
+        return Ok(Ok(None));
+    };
+    let issuer = command.issuer();
+    let owner = issuer_owner(engine, &issuer)?;
+    if owner.as_ref() == Some(principal) {
+        return Ok(Ok(None));
+    }
+    let creates = matches!(command, OperationCommand::Enroll { .. })
+        && owner.is_none()
+        && incarnations(engine, &issuer)?.is_empty();
+    if creates {
+        return Ok(Ok(Some(record_put(
+            issuer_owner_key(&issuer),
+            principal.to_bytes(),
+        ))));
+    }
+    Ok(Err(AccessRefusal {
+        principal: principal.clone(),
+        missing: MissingRight::Issuer(issuer),
+    }))
 }
 
 /// The operation command `mutations` carries, if any. It is the unit's last
@@ -103,13 +157,25 @@ pub(crate) fn decide(
     rest: &[Mutation],
     commit_ts: u64,
     at: LogPosition,
+    actor: Option<&PrincipalId>,
 ) -> StorageResult<Decided> {
+    let owner_record = match ownership(engine, command, actor)? {
+        Ok(record) => record,
+        Err(refusal) => {
+            return Ok(Decided {
+                effects: Vec::new(),
+                skipped: true,
+                refused: Some(refusal),
+            });
+        }
+    };
     let with = |records: Vec<Mutation>| {
         let mut effects = rest.to_vec();
         effects.extend(records);
         Decided {
             effects,
             skipped: false,
+            refused: None,
         }
     };
     Ok(match command {
@@ -131,6 +197,7 @@ pub(crate) fn decide(
                 BindDecision::Skip => Decided {
                     effects: Vec::new(),
                     skipped: true,
+                    refused: None,
                 },
             }
         }
@@ -138,7 +205,15 @@ pub(crate) fn decide(
             issuer,
             incarnation,
             window,
-        } => with(decide_enrollment(engine, issuer, *incarnation, *window)?),
+        } => {
+            let mut records = decide_enrollment(engine, issuer, *incarnation, *window)?;
+            // The issuer becomes its first enroller's with the enrollment
+            // that creates it, or not at all.
+            if !records.is_empty() {
+                records.extend(owner_record);
+            }
+            with(records)
+        }
         OperationCommand::Exclude(op) => with(decide_exclusion(engine, op)?),
         OperationCommand::Release(op) => with(decide_release(engine, op)?),
         OperationCommand::Retire {
@@ -455,6 +530,7 @@ pub fn unit_decisions(
 pub fn is_operation_record(key: &[u8]) -> bool {
     key.starts_with(coordinode_core::txn::operation::OPERATION_KEY_PREFIX)
         || key.starts_with(INCARNATION_KEY_PREFIX)
+        || key.starts_with(coordinode_core::txn::operation::ISSUER_OWNER_KEY_PREFIX)
 }
 
 #[cfg(test)]

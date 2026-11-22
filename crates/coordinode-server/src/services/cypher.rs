@@ -861,6 +861,49 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [("namespace", name.clone())],
             );
         }
+        // The caller is known and lacks the right: gRPC's own code for it.
+        DatabaseError::AccessRefused(refusal) => {
+            use coordinode_core::access::MissingRight;
+            let mut metadata = vec![
+                ("subject", refusal.principal.subject.to_string()),
+                ("trust_scope", refusal.principal.trust_scope.to_string()),
+            ];
+            match &refusal.missing {
+                MissingRight::Namespace { namespace, role } => {
+                    metadata.push(("missing", role.name().to_owned()));
+                    metadata.push(("namespace_id", namespace.as_raw().to_string()));
+                }
+                MissingRight::CreateNamespace => {
+                    metadata.push(("missing", "create_namespace".to_owned()));
+                }
+                MissingRight::DeploymentAdmin => {
+                    metadata.push(("missing", "deployment_admin".to_owned()));
+                }
+                MissingRight::Issuer(issuer) => {
+                    metadata.push(("missing", "issuer".to_owned()));
+                    metadata.push(("issuer", hex::encode(issuer.0)));
+                }
+            }
+            return status_with_reason(
+                Code::PermissionDenied,
+                rendered,
+                Reason::AccessRefused,
+                metadata,
+            );
+        }
+        // The principal and the session disagree on the namespace: the call
+        // is malformed as sent.
+        DatabaseError::NamespaceMismatch { principal, session } => {
+            return status_with_reason(
+                Code::InvalidArgument,
+                rendered,
+                Reason::NamespaceMismatch,
+                [
+                    ("principal_namespace", principal.clone()),
+                    ("namespace", session.clone()),
+                ],
+            );
+        }
         // A member still catching up with its group: the same call succeeds
         // shortly, or at once at a member that serves.
         DatabaseError::NotServing => {

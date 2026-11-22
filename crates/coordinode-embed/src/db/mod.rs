@@ -1825,6 +1825,21 @@ impl Database {
     /// [`DatabaseError::NamespaceMismatch`] for a principal bound to another
     /// namespace than this database's; [`DatabaseError::SettingsRefused`]
     /// for a principal whose subject or trust scope no grant can name.
+    /// The principal `actor` names, whichever namespace it is bound to: an
+    /// issuer belongs to a stable subject in its trust scope, not to a
+    /// namespace, and operation records are the deployment's.
+    fn acting_principal(
+        actor: &coordinode_core::txn::command::ActingContext,
+    ) -> Result<Option<coordinode_core::access::PrincipalId>, DatabaseError> {
+        use coordinode_core::txn::command::ActingContext;
+        let ActingContext::Principal(principal) = actor else {
+            return Ok(None);
+        };
+        coordinode_core::access::PrincipalId::new(&principal.subject, &principal.trust_scope)
+            .map(Some)
+            .map_err(|e| DatabaseError::SettingsRefused(e.to_string()))
+    }
+
     fn statement_principal(
         &self,
         actor: Option<&coordinode_core::txn::command::ActingContext>,
@@ -2702,7 +2717,7 @@ impl Database {
             let intent = crate::operation::statement_intent(query, params.as_ref());
             // A retry of an operation that took effect runs nothing: its
             // statement may read what it wrote, or choose differently now.
-            self.admit_operation(descriptor, &intent)?;
+            self.admit_operation(session.actor.as_ref(), descriptor, &intent)?;
             session.operation = Some((descriptor.op, intent));
         }
         self.execute_cypher_impl(

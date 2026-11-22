@@ -337,7 +337,8 @@ impl Database {
                 // Before the catalog is read: a retry of a publication that
                 // committed is answered by its outcome, not by the conflict
                 // its own commit now makes for it.
-                self.admit_operation(descriptor, &intent)?;
+                // The host's own publication: no principal's issuer to check.
+                self.admit_operation(None, descriptor, &intent)?;
                 Some((descriptor, intent))
             }
             None => None,

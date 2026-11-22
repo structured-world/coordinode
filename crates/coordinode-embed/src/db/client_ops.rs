@@ -1,7 +1,9 @@
 //! The host's surface of client operation identity: enrollment, lookup,
 //! exclusion and retirement. See [`crate::operation`].
 
+use coordinode_core::access::{AccessRefusal, MissingRight, PrincipalId};
 use coordinode_core::group::DeploymentId;
+use coordinode_core::txn::command::ActingContext;
 use coordinode_core::txn::operation::{
     IntentDigest, IssuerId, OperationCommand, OperationDescriptor, OperationOutcome,
 };
@@ -33,6 +35,24 @@ impl Database {
     /// storage failure), or other enrollments of the same issuer won every
     /// attempt.
     pub fn enroll_issuer(&self, issuer: IssuerId) -> Result<OperationIssuer, DatabaseError> {
+        self.enroll_issuer_as(&ActingContext::Trusted, issuer)
+    }
+
+    /// [`Self::enroll_issuer`] acting for `actor`: a principal's enrollment
+    /// that creates the issuer makes it the principal's, and only its owner
+    /// enrolls it again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::enroll_issuer`]; [`DatabaseError::AccessRefused`] for an
+    /// issuer another principal or the trusted host enrolled, with nothing
+    /// changed and nothing told of whose it is.
+    pub fn enroll_issuer_as(
+        &self,
+        actor: &ActingContext,
+        issuer: IssuerId,
+    ) -> Result<OperationIssuer, DatabaseError> {
+        let principal = Self::acting_principal(actor)?;
         let deployment = self.found_deployment()?;
         for _ in 0..MAX_ENROLL_ATTEMPTS {
             let latest = records::incarnations(&self.engine, &issuer)?
@@ -41,11 +61,14 @@ impl Database {
             let incarnation = latest.checked_add(1).ok_or_else(|| {
                 DatabaseError::Other("the issuer has used every incarnation".into())
             })?;
-            self.propose_operation(OperationCommand::Enroll {
-                issuer,
-                incarnation,
-                window: self.operation_admission_window.get(),
-            })?;
+            self.propose_operation_as(
+                principal.clone(),
+                OperationCommand::Enroll {
+                    issuer,
+                    incarnation,
+                    window: self.operation_admission_window.get(),
+                },
+            )?;
             if let Some(record) = records::incarnation_record(&self.engine, &issuer, incarnation)?
                 && record.open
             {
@@ -77,6 +100,25 @@ impl Database {
         incarnation: u64,
         next_sequence: u64,
     ) -> Result<OperationIssuer, DatabaseError> {
+        self.resume_issuer_as(&ActingContext::Trusted, issuer, incarnation, next_sequence)
+    }
+
+    /// [`Self::resume_issuer`] acting for `actor`, which resumes only an
+    /// issuer it owns.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resume_issuer`]; [`DatabaseError::AccessRefused`] for an
+    /// issuer the principal does not own, whether it exists or not.
+    pub fn resume_issuer_as(
+        &self,
+        actor: &ActingContext,
+        issuer: IssuerId,
+        incarnation: u64,
+        next_sequence: u64,
+    ) -> Result<OperationIssuer, DatabaseError> {
+        let principal = Self::acting_principal(actor)?;
+        self.check_owner(principal.as_ref(), &issuer)?;
         // A database that founded no domain issued no incarnation.
         let Some(deployment) = self.deployment()? else {
             return Err(DatabaseError::Other(format!(
@@ -119,15 +161,35 @@ impl Database {
         descriptor: &OperationDescriptor,
         resolve: Resolve,
     ) -> Result<OperationOutcome, DatabaseError> {
+        self.resolve_operation_as(&ActingContext::Trusted, descriptor, resolve)
+    }
+
+    /// [`Self::resolve_operation`] acting for `actor`, which resolves only
+    /// an operation of an issuer it owns: nothing of another's outcome is
+    /// told, and an exclusion of another's operation changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_operation`]; [`DatabaseError::AccessRefused`] for
+    /// an issuer the principal does not own.
+    pub fn resolve_operation_as(
+        &self,
+        actor: &ActingContext,
+        descriptor: &OperationDescriptor,
+        resolve: Resolve,
+    ) -> Result<OperationOutcome, DatabaseError> {
+        let principal = Self::acting_principal(actor)?;
         self.check_deployment(descriptor)?;
         let op = descriptor.op;
+        // Checked before anything is read out: the outcome is the owner's.
+        self.check_owner(principal.as_ref(), &op.issuer)?;
         let outcome = records::operation_outcome(&self.engine, &op)?;
         if resolve == Resolve::Lookup {
             return Ok(outcome);
         }
         if outcome == OperationOutcome::Unknown {
             // A journaled commit: it syncs every entry before it as well.
-            self.propose_operation(OperationCommand::Exclude(op))?;
+            self.propose_operation_as(principal, OperationCommand::Exclude(op))?;
             return Ok(records::operation_outcome(&self.engine, &op)?);
         }
         // Recorded under a volatile concern, the outcome may not be durable
@@ -146,12 +208,31 @@ impl Database {
     /// The descriptor names another deployment, or the retirement could not
     /// be committed.
     pub fn retire_operations(&self, below: &OperationDescriptor) -> Result<(), DatabaseError> {
+        self.retire_operations_as(&ActingContext::Trusted, below)
+    }
+
+    /// [`Self::retire_operations`] acting for `actor`, which retires only
+    /// operations of an issuer it owns.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::retire_operations`]; [`DatabaseError::AccessRefused`] for
+    /// an issuer the principal does not own, with nothing retired.
+    pub fn retire_operations_as(
+        &self,
+        actor: &ActingContext,
+        below: &OperationDescriptor,
+    ) -> Result<(), DatabaseError> {
+        let principal = Self::acting_principal(actor)?;
         self.check_deployment(below)?;
-        self.propose_operation(OperationCommand::Retire {
-            issuer: below.op.issuer,
-            incarnation: below.op.incarnation,
-            below: below.op.sequence,
-        })
+        self.propose_operation_as(
+            principal,
+            OperationCommand::Retire {
+                issuer: below.op.issuer,
+                incarnation: below.op.incarnation,
+                below: below.op.sequence,
+            },
+        )
     }
 
     /// Release the outcome of the operation `descriptor` names, once the host
@@ -168,20 +249,62 @@ impl Database {
         &self,
         descriptor: &OperationDescriptor,
     ) -> Result<(), DatabaseError> {
+        self.acknowledge_operation_as(&ActingContext::Trusted, descriptor)
+    }
+
+    /// [`Self::acknowledge_operation`] acting for `actor`, which releases
+    /// only an outcome of an issuer it owns.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::acknowledge_operation`]; [`DatabaseError::AccessRefused`]
+    /// for an issuer the principal does not own, with nothing released.
+    pub fn acknowledge_operation_as(
+        &self,
+        actor: &ActingContext,
+        descriptor: &OperationDescriptor,
+    ) -> Result<(), DatabaseError> {
+        let principal = Self::acting_principal(actor)?;
         self.check_deployment(descriptor)?;
-        self.propose_operation(OperationCommand::Release(descriptor.op))
+        self.propose_operation_as(principal, OperationCommand::Release(descriptor.op))
+    }
+
+    /// Refuse a principal that does not own `issuer`: one another principal
+    /// enrolled, one the trusted host enrolled, and one that does not exist
+    /// are refused alike. Nothing is refused to the trusted host. A read
+    /// answers with this before it tells anything; a change is decided again
+    /// where it applies.
+    pub(crate) fn check_owner(
+        &self,
+        principal: Option<&PrincipalId>,
+        issuer: &IssuerId,
+    ) -> Result<(), DatabaseError> {
+        let Some(principal) = principal else {
+            return Ok(());
+        };
+        if records::issuer_owner(&self.engine, issuer)?.as_ref() == Some(principal) {
+            return Ok(());
+        }
+        Err(DatabaseError::AccessRefused(AccessRefusal {
+            principal: principal.clone(),
+            missing: MissingRight::Issuer(*issuer),
+        }))
     }
 
     /// Refuse a write carrying out `descriptor` that should not run: an
     /// attempt of it took effect already, it was excluded or retired, or it
-    /// cannot be admitted now. The binding decides again where the write
-    /// applies; this answers a retry without running it.
+    /// cannot be admitted now, or `principal` does not own its issuer. The
+    /// binding decides again where the write applies; this answers a retry
+    /// without running it.
     pub(crate) fn admit_operation(
         &self,
+        principal: Option<&PrincipalId>,
         descriptor: &OperationDescriptor,
         intent: &IntentDigest,
     ) -> Result<(), DatabaseError> {
         self.check_deployment(descriptor)?;
+        // Before the outcome is told: it is the issuer owner's.
+        self.check_owner(principal, &descriptor.op.issuer)?;
         let op = descriptor.op;
         let incarnation = records::incarnation_record(&self.engine, &op.issuer, op.incarnation)?;
         let record = records::operation_record(&self.engine, &op)?;
@@ -243,9 +366,20 @@ impl Database {
         })
     }
 
-    /// Commit `command` through the write pipeline on its own.
-    fn propose_operation(&self, command: OperationCommand) -> Result<(), DatabaseError> {
-        self.propose_mutation(Mutation::Operation(command))
+    /// Commit `command` through the write pipeline on its own, acting for
+    /// `principal` when one is named: its issuer's ownership is decided where
+    /// it applies.
+    fn propose_operation_as(
+        &self,
+        principal: Option<PrincipalId>,
+        command: OperationCommand,
+    ) -> Result<(), DatabaseError> {
+        let mut mutations = Vec::with_capacity(2);
+        if let Some(principal) = principal {
+            mutations.push(Mutation::Actor(principal));
+        }
+        mutations.push(Mutation::Operation(command));
+        self.propose_mutations(mutations)
     }
 
     /// Commit the command `mutation` through the write pipeline on its own.
@@ -281,3 +415,7 @@ impl Database {
             })
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests;

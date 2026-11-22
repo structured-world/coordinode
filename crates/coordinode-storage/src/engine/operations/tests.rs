@@ -377,6 +377,64 @@ fn a_retransmitted_unit_in_the_log_applies_once() {
     assert!(!unit_skipped(&engine, at(2)).unwrap());
 }
 
+/// An issuer is decided to belong to the principal whose enrollment created
+/// it, where each unit applies. Another principal's unit naming it applies
+/// nothing and is refused, even one holding every right on the deployment:
+/// ownership is apart from rights. The owner's units apply.
+#[test]
+fn a_foreign_principals_operation_unit_applies_nothing() {
+    use coordinode_core::access::PrincipalId;
+    use coordinode_core::txn::proposal::MetadataCommand;
+    let dir = TempDir::new().unwrap();
+    let (engine, oracle) = open(&dir);
+    let alice = PrincipalId::new("alice", "idp").unwrap();
+    let bob = PrincipalId::new("bob", "idp").unwrap();
+    let exclude = |op| Mutation::Operation(OperationCommand::Exclude(op));
+    let apply = |unit: &[Mutation]| engine.apply_proposal_at(unit, oracle.next().as_raw());
+    for principal in [&alice, &bob] {
+        apply(&[Mutation::Command(MetadataCommand::SetDeploymentRights {
+            principal: principal.clone(),
+            create_namespace: None,
+            admin: Some(true),
+        })])
+        .unwrap();
+    }
+    let acting = |principal: &PrincipalId, unit: Vec<Mutation>| {
+        let mut out = vec![Mutation::Actor(principal.clone())];
+        out.extend(unit);
+        out
+    };
+    apply(&acting(&alice, vec![enroll(1)])).expect("alice's enrollment creates the issuer");
+    assert_eq!(issuer_owner(&engine, &ISSUER).unwrap(), Some(alice.clone()));
+
+    let refused = |result: StorageResult<()>| {
+        assert!(
+            matches!(
+                &result,
+                Err(StorageError::AccessRefused(refusal))
+                    if refusal.principal == bob
+                        && refusal.missing == MissingRight::Issuer(ISSUER)
+            ),
+            "expected bob refused for the issuer, got {result:?}"
+        );
+    };
+    refused(apply(&acting(&bob, vec![exclude(op(1, 1))])));
+    refused(apply(&acting(&bob, increment(op(1, 1), 7, 1))));
+    refused(apply(&acting(&bob, vec![enroll(2)])));
+    assert_eq!(outcome(&engine, &op(1, 1)), OperationOutcome::Unknown);
+    assert_eq!(counter(&engine), 0, "bob's bound write applied nothing");
+    assert!(
+        incarnation_record(&engine, &ISSUER, 1)
+            .unwrap()
+            .unwrap()
+            .open,
+        "bob's enrollment closed nothing"
+    );
+
+    apply(&acting(&alice, increment(op(1, 1), 7, 1))).expect("the owner writes");
+    assert_eq!(counter(&engine), 1);
+}
+
 /// An operation command anywhere but last in its unit, or beside another
 /// command, is refused before anything applies.
 #[test]

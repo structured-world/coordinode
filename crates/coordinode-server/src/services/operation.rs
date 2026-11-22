@@ -151,7 +151,13 @@ impl OperationServiceImpl {
     async fn decided(&self, call: RoutedOperationCall) -> Result<RoutedOperationAnswer, Status> {
         // A copy for the leader: the local attempt consumes the call.
         let onward = call.clone();
-        match super::blocking(|| run_operation(&self.executor.database().read(), call)) {
+        match super::blocking(|| {
+            run_operation(
+                &self.executor.database().read(),
+                &ActingContext::Trusted,
+                call,
+            )
+        }) {
             Ok(answer) => Ok(answer),
             Err(e) => match leader_hint(&e) {
                 Some(leader) => {

@@ -964,8 +964,12 @@ impl Database {
             if let Some(descriptor) = options.operation {
                 return Err(DatabaseError::OperationSettled {
                     op: descriptor.op,
-                    outcome: self
-                        .resolve_operation(descriptor, crate::operation::Resolve::Lookup)?,
+                    // The caller's own outcome only: another's is not told.
+                    outcome: self.resolve_operation_as(
+                        &actor,
+                        descriptor,
+                        crate::operation::Resolve::Lookup,
+                    )?,
                     intent_differs: false,
                 });
             }
@@ -1002,7 +1006,8 @@ impl Database {
             state,
         );
         if let Some(descriptor) = operation {
-            self.admit_operation(descriptor, &chain)?;
+            let principal = txn.actor().cloned();
+            self.admit_operation(principal.as_ref(), descriptor, &chain)?;
             txn.bind_operation(descriptor.op, chain);
         }
         // Constraints and vector indexes judge each node as the whole

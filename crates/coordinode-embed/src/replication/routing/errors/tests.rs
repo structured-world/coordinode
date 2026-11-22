@@ -43,9 +43,11 @@ fn an_access_refusal_this_member_cannot_take_is_unreadable() {
     assert!(decode(&refusal("alice", None)).is_err());
     // A principal no member admits: an empty subject, an overlong one.
     let create = Some(Missing::CreateNamespace(wire::Empty {}));
-    assert!(decode(&refusal("", create)).is_err());
+    assert!(decode(&refusal("", create.clone())).is_err());
     let overlong = "a".repeat(coordinode_core::access::MAX_PRINCIPAL_PART_BYTES + 1);
     assert!(decode(&refusal(&overlong, create)).is_err());
+    // An issuer of another length than 16 bytes.
+    assert!(decode(&refusal("alice", Some(Missing::Issuer(vec![1; 15])))).is_err());
 }
 
 /// One error of every variant an executing member can answer with, each with
@@ -384,6 +386,10 @@ fn every_variant() -> Vec<DatabaseError> {
         E::AccessRefused(AccessRefusal {
             principal: alice(),
             missing: MissingRight::DeploymentAdmin,
+        }),
+        E::AccessRefused(AccessRefusal {
+            principal: alice(),
+            missing: MissingRight::Issuer(IssuerId([0x5a; 16])),
         }),
         E::NamespaceMismatch {
             principal: "tenant-a".into(),

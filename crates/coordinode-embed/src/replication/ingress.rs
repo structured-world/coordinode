@@ -454,7 +454,7 @@ impl Ingress {
                 // database decides them, the member's own here.
                 let db = Arc::clone(self.admitter.database()?);
                 (
-                    blocking(move || executor::run_operation(&db.read(), call)).await?,
+                    blocking(move || executor::run_operation(&db.read(), &actor, call)).await?,
                     None,
                 )
             }

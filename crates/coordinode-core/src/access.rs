@@ -98,6 +98,23 @@ fn check_part(part: &'static str, value: &str) -> Result<(), BadPrincipal> {
 }
 
 impl PrincipalId {
+    /// The principal as a record's value: each part as a two-byte length and
+    /// its bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.len());
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// The principal [`Self::to_bytes`] wrote; `None` for any other bytes,
+    /// a principal part no principal may have included.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (principal, rest) = Self::decode_prefix(bytes)?;
+        rest.is_empty().then_some(principal)
+    }
+
     /// The principal's bytes inside a catalog key: each part as a two-byte
     /// big-endian length and its bytes, so one principal's keys never
     /// prefix another's.
@@ -548,6 +565,11 @@ pub enum MissingRight {
     CreateNamespace,
     /// Every right on the whole deployment.
     DeploymentAdmin,
+    /// Ownership of a client-operation issuer: another principal enrolled
+    /// it, or the explicitly trusted host did and it belongs to no
+    /// principal. The same refusal answers an issuer that does not exist, so
+    /// it tells nothing of whose an issuer is.
+    Issuer(crate::txn::operation::IssuerId),
 }
 
 /// Why a unit was applied as a refusal: its principal lacked a right at the
@@ -565,7 +587,7 @@ impl AccessRefusal {
     /// The refusal's bytes: what lacked, then the principal.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(16 + self.principal.len());
+        let mut bytes = Vec::with_capacity(24 + self.principal.len());
         match self.missing {
             MissingRight::Namespace { namespace, role } => {
                 bytes.push(role.tag());
@@ -573,6 +595,10 @@ impl AccessRefusal {
             }
             MissingRight::CreateNamespace => bytes.push(0x10),
             MissingRight::DeploymentAdmin => bytes.push(0x11),
+            MissingRight::Issuer(issuer) => {
+                bytes.push(0x12);
+                bytes.extend_from_slice(&issuer.0);
+            }
         }
         self.principal.encode_into(&mut bytes);
         bytes
@@ -585,6 +611,13 @@ impl AccessRefusal {
         let (missing, rest) = match tag {
             0x10 => (MissingRight::CreateNamespace, rest),
             0x11 => (MissingRight::DeploymentAdmin, rest),
+            0x12 => {
+                let (issuer, rest) = rest.split_first_chunk::<16>()?;
+                (
+                    MissingRight::Issuer(crate::txn::operation::IssuerId(*issuer)),
+                    rest,
+                )
+            }
             tag => {
                 let role = NamespaceRole::from_tag(tag)?;
                 let (namespace, rest) = rest.split_first_chunk::<8>()?;

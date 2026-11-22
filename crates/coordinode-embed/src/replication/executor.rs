@@ -383,8 +383,9 @@ pub fn rollback(db: &Database, rollback: RoutedRollback) -> Result<(), DatabaseE
     )
 }
 
-/// Carry out `call` on `db`'s operation records: what a member does with the
-/// call whether its client reached it or another member passed it here.
+/// Carry out `call` on `db`'s operation records, acting for `actor`: what a
+/// member does with the call whether its client reached it or another member
+/// passed it here. A principal reaches only the issuers it owns.
 ///
 /// # Errors
 ///
@@ -392,11 +393,12 @@ pub fn rollback(db: &Database, rollback: RoutedRollback) -> Result<(), DatabaseE
 /// refuses every call that changes the records.
 pub fn run_operation(
     db: &Database,
+    actor: &ActingContext,
     call: RoutedOperationCall,
 ) -> Result<RoutedOperationAnswer, DatabaseError> {
     Ok(match call {
         RoutedOperationCall::Enroll(issuer) => {
-            let enrolled = db.enroll_issuer(issuer)?;
+            let enrolled = db.enroll_issuer_as(actor, issuer)?;
             RoutedOperationAnswer::Enrolled {
                 incarnation: enrolled.incarnation(),
                 next_sequence: enrolled.next_sequence(),
@@ -404,16 +406,16 @@ pub fn run_operation(
             }
         }
         RoutedOperationCall::Resolve(descriptor, resolve) => {
-            RoutedOperationAnswer::Outcome(db.resolve_operation(&descriptor, resolve)?)
+            RoutedOperationAnswer::Outcome(db.resolve_operation_as(actor, &descriptor, resolve)?)
         }
         RoutedOperationCall::Acknowledge(descriptors) => {
             for descriptor in &descriptors {
-                db.acknowledge_operation(descriptor)?;
+                db.acknowledge_operation_as(actor, descriptor)?;
             }
             RoutedOperationAnswer::Done
         }
         RoutedOperationCall::Retire(below) => {
-            db.retire_operations(&below)?;
+            db.retire_operations_as(actor, &below)?;
             RoutedOperationAnswer::Done
         }
     })
@@ -564,10 +566,10 @@ impl CommandExecutor for MemberCommandExecutor {
 
     fn operation(
         &self,
-        _actor: ActingContext,
+        actor: ActingContext,
         call: RoutedOperationCall,
     ) -> Result<RoutedOperationAnswer, DatabaseError> {
-        run_operation(&self.admitter.database()?.read(), call)
+        run_operation(&self.admitter.database()?.read(), &actor, call)
     }
 
     fn prepare(

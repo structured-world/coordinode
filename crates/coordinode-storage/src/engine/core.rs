@@ -8473,7 +8473,11 @@ impl Deployment {
                 rest,
                 commit_ts,
                 coordinode_core::txn::operation::LogPosition::LOCAL,
+                actor,
             )?;
+            if let Some(refusal) = decided.refused {
+                return Err(StorageError::AccessRefused(refusal));
+            }
             if decided.effects.is_empty() {
                 return Ok(());
             }
@@ -8543,7 +8547,12 @@ impl Deployment {
                 rest,
                 commit_ts,
                 coordinode_core::txn::operation::LogPosition::LOCAL,
+                actor,
             )?;
+            // Refused for its issuer's ownership: nothing is journaled.
+            if let Some(refusal) = decided.refused {
+                return Err(StorageError::AccessRefused(refusal));
+            }
             if decided.effects.is_empty() {
                 // The caller is answered from the record this decision read,
                 // which a volatile write may have left unsynced.

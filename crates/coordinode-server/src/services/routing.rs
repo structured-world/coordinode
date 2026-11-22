@@ -111,10 +111,11 @@ impl CommandExecutor for ServerCommandExecutor {
 
     fn operation(
         &self,
-        _actor: ActingContext,
+        actor: ActingContext,
         call: RoutedOperationCall,
     ) -> Result<RoutedOperationAnswer, DatabaseError> {
-        executor::run_operation(&self.executor.database().read(), call)
+        // The caller the routed call names: it reaches only its own issuers.
+        executor::run_operation(&self.executor.database().read(), &actor, call)
     }
 
     fn rollback(&self, rollback: RoutedRollback) -> Result<(), DatabaseError> {

@@ -76,6 +76,9 @@ pub(crate) fn check_unit<'m>(
             }
             MissingRight::CreateNamespace => rights.create_namespace,
             MissingRight::DeploymentAdmin => false,
+            // Never a namespace need: an issuer's ownership is decided with
+            // the unit's operation command, apart from its rights.
+            MissingRight::Issuer(_) => true,
         };
         if !held {
             return Ok(Checked::Refused(AccessRefusal {

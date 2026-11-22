@@ -237,6 +237,12 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         DatabaseError::NamespaceExists(_) => "42P04",
         DatabaseError::NamespaceRefused { .. } => "42602",
         DatabaseError::NamespaceInUse(_) => "55006",
+        // insufficient_privilege: PostgreSQL's answer to a role without the
+        // privilege a statement needs.
+        DatabaseError::AccessRefused(_) => "42501",
+        // invalid_parameter_value: the principal names another namespace
+        // than the session's.
+        DatabaseError::NamespaceMismatch { .. } => "22023",
         _ => "XX000",
     }
 }

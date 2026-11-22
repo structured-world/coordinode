@@ -350,12 +350,18 @@ impl Deployment {
             Some((command, rest)) => {
                 _decision = Some(self.operation_decisions.lock(&command.issuer()));
                 let outcome =
-                    crate::engine::operations::decide(self, command, rest, commit_ts, at)?;
+                    crate::engine::operations::decide(self, command, rest, commit_ts, at, actor)?;
                 decided = if outcome.skipped {
+                    // A refusal for the issuer's ownership tells its proposer
+                    // why, as a refusal for a missing right does.
                     vec![Mutation::Put {
                         partition: coordinode_core::txn::proposal::PartitionId::Deployment,
                         key: crate::engine::operations::skipped_unit_key(at),
-                        value: Vec::new(),
+                        value: outcome
+                            .refused
+                            .as_ref()
+                            .map(coordinode_core::access::AccessRefusal::encode)
+                            .unwrap_or_default(),
                     }]
                 } else {
                     outcome.effects

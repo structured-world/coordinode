@@ -162,6 +162,16 @@ pub enum Reason {
     /// A session named the namespace it works in for dropping; it is dropped
     /// from a session of another. Metadata carries `namespace`.
     NamespaceInUse,
+    /// The principal the write acted for lacked a right where the write
+    /// applied: nothing changed. Metadata carries `subject`, `trust_scope`
+    /// and `missing` (`reader`, `writer` or `admin` with `namespace_id`;
+    /// `create_namespace`; `deployment_admin`; `issuer` with the issuer in
+    /// hex).
+    AccessRefused,
+    /// The call acted for a principal bound to another namespace than its
+    /// session's. Metadata carries `principal_namespace` and `namespace`.
+    /// Nothing ran.
+    NamespaceMismatch,
     /// The member joined its group and has not caught up yet: it serves no
     /// data. Nothing ran; the call succeeds at a member that serves.
     NotServing,
@@ -362,6 +372,8 @@ impl Reason {
             Reason::NamespaceExists => "NAMESPACE_EXISTS",
             Reason::NamespaceRefused => "NAMESPACE_REFUSED",
             Reason::NamespaceInUse => "NAMESPACE_IN_USE",
+            Reason::AccessRefused => "ACCESS_REFUSED",
+            Reason::NamespaceMismatch => "NAMESPACE_MISMATCH",
             Reason::NotServing => "NOT_SERVING",
             Reason::NotLeader => "NOT_LEADER",
             Reason::MemberReadOnly => "MEMBER_READ_ONLY",
