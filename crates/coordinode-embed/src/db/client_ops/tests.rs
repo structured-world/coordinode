@@ -165,3 +165,81 @@ fn an_ownerless_issuer_is_the_hosts_alone() {
     );
     db.enroll_issuer(issuer).expect("the host enrolls it again");
 }
+
+/// Grants, a role's holder and an issuer's owner are records of the store,
+/// not of the process: after a restart the owner still reaches its issuer,
+/// another principal is still refused it, and the grants and the holder are
+/// what they were.
+#[test]
+fn ownership_and_grants_survive_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let issuer = IssuerId([0x5c; 16]);
+    let written = {
+        let db = Database::open(dir.path()).expect("open");
+        for subject in ["alice", "bob"] {
+            db.change_access(
+                &ActingContext::Trusted,
+                AccessChange::Grant {
+                    namespace: "default".into(),
+                    grantee: GranteeName::Principal(id(subject)),
+                    role: NamespaceRole::Writer,
+                },
+            )
+            .expect("grant writer");
+        }
+        db.execute_cypher_shared(
+            "CREATE ROLE coordinator IN NAMESPACE default \
+             EXCLUSIVE AMONG (PRINCIPAL 'alice' IN 'idp', PRINCIPAL 'bob' IN 'idp') \
+             HELD BY PRINCIPAL 'alice' IN 'idp'",
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("the host creates the role");
+        let enrolled = db
+            .enroll_issuer_as(&acting("alice"), issuer)
+            .expect("alice enrolls");
+        let written = enrolled.next().expect("a descriptor");
+        db.execute_cypher_shared_with(
+            "CREATE (:Owned {k: 1})",
+            None,
+            None,
+            &StatementOptions {
+                actor: Some(acting("alice")),
+                operation: Some(written),
+                ..StatementOptions::default()
+            },
+        )
+        .expect("alice writes under her operation");
+        written
+    };
+
+    let db = Database::open(dir.path()).expect("reopen");
+    assert!(matches!(
+        db.resolve_operation_as(&acting("alice"), &written, Resolve::Lookup)
+            .expect("the owner looks it up"),
+        OperationOutcome::Committed { .. }
+    ));
+    refused(
+        db.resolve_operation_as(&acting("bob"), &written, Resolve::Lookup),
+        "bob",
+        issuer,
+    );
+    let grants = db
+        .namespace_grants(&ActingContext::Trusted, "default")
+        .expect("read grants");
+    for subject in ["alice", "bob"] {
+        assert!(
+            grants.iter().any(|g| {
+                g.grantee == GranteeName::Principal(id(subject)) && g.role == NamespaceRole::Writer
+            }),
+            "{subject}'s grant survived: {grants:?}"
+        );
+    }
+    let role = db
+        .role(&ActingContext::Trusted, "default", "coordinator")
+        .expect("read")
+        .expect("the role");
+    assert_eq!(role.holders, vec![id("alice")]);
+}

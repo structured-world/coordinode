@@ -2606,6 +2606,169 @@ async fn a_revocation_refuses_the_next_write_routed_from_a_follower() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// `subject` of trust scope `idp`, acting in the default namespace.
+fn acting_as(subject: &str) -> ActingContext {
+    ActingContext::Principal(coordinode_core::txn::command::Principal {
+        subject: subject.into(),
+        trust_scope: "idp".into(),
+        namespace: "default".into(),
+    })
+}
+
+/// The grant catalog is the group's, not the leader's: after leadership
+/// moves, a principal revoked under the old leader is refused through the
+/// new leader and through its followers, and a principal still granted
+/// writes through them as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revocation_holds_across_a_leader_change() {
+    use coordinode_embed::{AccessChange, GranteeName, NamespaceRole, PrincipalId};
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        let principal = |s: &str| PrincipalId::new(s, "idp").expect("principal");
+        {
+            let leader = members[0].database().read();
+            for subject in ["bob", "carol"] {
+                leader
+                    .change_access(
+                        &ActingContext::Trusted,
+                        AccessChange::Grant {
+                            namespace: "default".into(),
+                            grantee: GranteeName::Principal(principal(subject)),
+                            role: NamespaceRole::Writer,
+                        },
+                    )
+                    .expect("grant writer");
+            }
+            leader
+                .change_access(
+                    &ActingContext::Trusted,
+                    AccessChange::Revoke {
+                        namespaces: vec!["default".into()],
+                        grantee: GranteeName::Principal(principal("bob")),
+                    },
+                )
+                .expect("revoke bob");
+        }
+
+        members[0].transfer_leadership(2).await.unwrap();
+        assert!(members[1].is_leader().await);
+        for m in [&members[0], &members[2]] {
+            wait_until("the member follows 2", || m.leader() == Some(2)).await;
+        }
+        let write = |subject: &str, n: i64| Statement {
+            actor: acting_as(subject),
+            ..Statement::new(format!("CREATE (:AfterMove {{n: {n}}})"))
+        };
+        for m in [&members[1], &members[2]] {
+            match m.ingress().execute(write("bob", 1)).await {
+                Err(DatabaseError::AccessRefused(refusal)) => {
+                    assert_eq!(refusal.principal, principal("bob"));
+                }
+                other => panic!("expected bob refused after the move, got {other:?}"),
+            }
+        }
+        members[2]
+            .ingress()
+            .execute(write("carol", 2))
+            .await
+            .expect("carol writes through a follower of the new leader");
+
+        for m in &members {
+            wait_until("carol's write, and only it, reaches every member", || {
+                count(m, "AfterMove") == 1
+            })
+            .await;
+        }
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// Two members race to take one exclusive role, each for its own principal,
+/// through different members of the group: the log orders the two
+/// transfers, exactly one takes effect, the other finds its condition gone
+/// and writes nothing, and every member ends with the same single holder.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_members_race_for_an_exclusive_role_and_one_wins() {
+    use coordinode_embed::PrincipalId;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        members[0]
+            .database()
+            .write()
+            .execute_cypher(
+                "CREATE ROLE coordinator IN NAMESPACE default \
+                 EXCLUSIVE AMONG (PRINCIPAL 'm1' IN 'idp', PRINCIPAL 'm2' IN 'idp', \
+                 PRINCIPAL 'm3' IN 'idp') HELD BY PRINCIPAL 'm1' IN 'idp'",
+            )
+            .expect("the host creates the role");
+        let take = |subject: &str| Statement {
+            actor: acting_as(subject),
+            ..Statement::new(format!(
+                "TRANSFER ROLE coordinator IN NAMESPACE default \
+                 FROM PRINCIPAL 'm1' IN 'idp' TO PRINCIPAL '{subject}' IN 'idp'"
+            ))
+        };
+        let (second, third) = tokio::join!(
+            members[1].ingress().execute(take("m2")),
+            members[2].ingress().execute(take("m3")),
+        );
+        second.expect("m2's transfer is answered");
+        third.expect("m3's transfer is answered");
+
+        let holders = |m: &ReplicatedDatabase| {
+            m.database()
+                .read()
+                .role(&ActingContext::Trusted, "default", "coordinator")
+                .ok()
+                .flatten()
+                .map(|role| role.holders)
+        };
+        let winner = holders(&members[0]).expect("the role");
+        assert_eq!(winner.len(), 1, "one holder: {winner:?}");
+        assert!(
+            [
+                PrincipalId::new("m2", "idp").unwrap(),
+                PrincipalId::new("m3", "idp").unwrap()
+            ]
+            .contains(&winner[0]),
+            "a racer won: {winner:?}"
+        );
+        // The loser's transfer names m1 as the source, which no longer holds
+        // the role: run again through its member, it writes nothing.
+        let (loser, through) = if &*winner[0].subject == "m2" {
+            ("m3", &members[2])
+        } else {
+            ("m2", &members[1])
+        };
+        through
+            .ingress()
+            .execute(take(loser))
+            .await
+            .expect("the loser's repeat is answered");
+        for m in &members {
+            wait_until("every member holds the same single holder", || {
+                holders(m).as_ref() == Some(&winner)
+            })
+            .await;
+        }
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A transaction belongs to the caller that opened it, whichever member a
 /// command comes through: a command acting for another subject, issuer or
 /// namespace under the same ID is refused as if no such transaction were
