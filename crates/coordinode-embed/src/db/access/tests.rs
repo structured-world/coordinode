@@ -412,6 +412,156 @@ fn grant_statements_name_principals_and_roles_exactly() {
     );
 }
 
+/// A principal of an exclusive role's eligible set reads the role's holder
+/// and the timestamp it last changed at with no right on any namespace's
+/// data; after a transfer it reads the new holder. A principal neither
+/// eligible, nor holding it, nor its home's admin is refused, and a role
+/// that does not exist is refused the same way.
+#[test]
+fn an_eligible_principal_reads_its_roles_holder_without_data_rights() {
+    let (db, _dir) = open();
+    let ns = default_namespace(&db);
+    db.change_access(
+        &ActingContext::Trusted,
+        AccessChange::CreateRole {
+            home: "default".into(),
+            name: "coordinator".into(),
+            eligible: Some(vec![id("m1"), id("m2")]),
+            holder: Some(id("m1")),
+        },
+    )
+    .expect("create the role");
+
+    let seen = db
+        .role(&acting("m2"), "default", "coordinator")
+        .expect("an eligible principal reads it")
+        .expect("the role exists");
+    assert_eq!(seen.holders, vec![id("m1")]);
+    let before = seen.changed_ts;
+
+    db.change_access(
+        &acting("m2"),
+        AccessChange::TransferRole {
+            home: "default".into(),
+            name: "coordinator".into(),
+            from: id("m1"),
+            to: id("m2"),
+        },
+    )
+    .expect("an eligible principal takes the role over");
+    let after = db
+        .role(&acting("m1"), "default", "coordinator")
+        .expect("the former holder, still eligible, reads it")
+        .expect("the role exists");
+    assert_eq!(after.holders, vec![id("m2")]);
+    assert!(
+        after.changed_ts > before,
+        "the transfer moved its timestamp"
+    );
+
+    for (subject, role) in [("outsider", "coordinator"), ("outsider", "nothing")] {
+        match db.role(&acting(subject), "default", role) {
+            Err(DatabaseError::AccessRefused(refusal)) => assert_eq!(
+                refusal.missing,
+                MissingRight::Namespace {
+                    namespace: ns,
+                    role: NamespaceRole::Admin,
+                },
+                "{role}"
+            ),
+            other => panic!("{subject} on {role}: expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+/// The grants on a namespace are read by a principal holding a right
+/// there, each with the timestamp of the change that made it; a principal
+/// without one is refused, and a namespace that does not exist is refused
+/// to it without saying so.
+#[test]
+fn the_grants_on_a_namespace_are_read_by_its_right_holders() {
+    let (db, _dir) = open();
+    let ns = default_namespace(&db);
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "rita", NamespaceRole::Reader),
+    )
+    .expect("grant reader");
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "will", NamespaceRole::Writer),
+    )
+    .expect("grant writer");
+
+    let grants = db
+        .namespace_grants(&acting("rita"), "default")
+        .expect("a reader reads the grants");
+    let mut seen: Vec<_> = grants.iter().map(|g| (g.grantee.clone(), g.role)).collect();
+    seen.sort_by_key(|(_, role)| *role);
+    assert_eq!(
+        seen,
+        vec![
+            (GranteeName::Principal(id("rita")), NamespaceRole::Reader),
+            (GranteeName::Principal(id("will")), NamespaceRole::Writer),
+        ]
+    );
+    assert!(grants.iter().all(|g| g.changed_ts > 0));
+
+    refused_for(
+        db.namespace_grants(&acting("eve"), "default").map(drop),
+        "eve",
+        MissingRight::Namespace {
+            namespace: ns,
+            role: NamespaceRole::Reader,
+        },
+    );
+    refused_for(
+        db.namespace_grants(&acting("rita"), "nowhere").map(drop),
+        "rita",
+        MissingRight::DeploymentAdmin,
+    );
+}
+
+/// Whether a whole-deployment admin is issued is read by a principal
+/// holding a right on a namespace it reaches: none at first, then the one
+/// granted, with the timestamp of the grant.
+#[test]
+fn a_right_holder_reads_whether_a_deployment_admin_is_issued() {
+    let (db, _dir) = open();
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "rita", NamespaceRole::Reader),
+    )
+    .expect("grant reader");
+    assert!(
+        db.deployment_admins(&acting("rita"), "default")
+            .expect("read")
+            .is_empty(),
+        "no deployment admin is issued"
+    );
+
+    db.change_access(
+        &ActingContext::Trusted,
+        AccessChange::DeploymentRights {
+            principal: id("root"),
+            create_namespace: None,
+            admin: Some(true),
+        },
+    )
+    .expect("issue a deployment admin");
+    let admins = db
+        .deployment_admins(&acting("rita"), "default")
+        .expect("read");
+    assert_eq!(admins.len(), 1);
+    assert_eq!(admins[0].principal, id("root"));
+    assert!(admins[0].changed_ts > 0);
+
+    assert!(matches!(
+        db.deployment_admins(&acting("eve"), "default"),
+        Err(DatabaseError::AccessRefused(_))
+    ));
+}
+
 /// A principal bound to another namespace than the handle's changes
 /// nothing through it.
 #[test]

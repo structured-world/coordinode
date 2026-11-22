@@ -8,10 +8,11 @@
 //! work or a write of an explicitly trusted caller and is not checked here.
 
 use coordinode_core::access::{
-    AccessRefusal, DeploymentRights, GrantRecord, Grantee, MissingRight, NamespaceRole,
-    PrincipalId, ROLE_ALLOCATOR_KEY, ROLE_GRANT_PREFIX, RoleId, RoleRecord, decode_grant_key,
-    decode_held_role_key, decode_role_holder_key, deployment_rights_key, grant_key, held_role_key,
-    held_roles_prefix, role_holder_key, role_holders_prefix, role_name_key, role_record_key,
+    AccessRefusal, DEPLOYMENT_RIGHTS_PREFIX, DeploymentRights, GrantRecord, Grantee, MissingRight,
+    NamespaceRole, PRINCIPAL_GRANT_PREFIX, PrincipalId, ROLE_ALLOCATOR_KEY, ROLE_GRANT_PREFIX,
+    RoleId, RoleRecord, decode_deployment_rights_key, decode_grant_key, decode_held_role_key,
+    decode_role_holder_key, deployment_rights_key, grant_key, held_role_key, held_roles_prefix,
+    namespace_grants_prefix, role_holder_key, role_holders_prefix, role_name_key, role_record_key,
 };
 use coordinode_core::namespace::NamespaceId;
 use coordinode_core::txn::operation::LogPosition;
@@ -336,6 +337,60 @@ pub fn effective_role(
         }
     }
     Ok(best)
+}
+
+/// Every grant on `namespace`: principals' and roles', each with its
+/// record, principals first.
+///
+/// # Errors
+///
+/// A catalog record cannot be read or does not decode.
+pub fn namespace_grants(
+    engine: &Deployment,
+    namespace: NamespaceId,
+) -> StorageResult<Vec<(Grantee, GrantRecord)>> {
+    let mut out = Vec::new();
+    for kind in [PRINCIPAL_GRANT_PREFIX, ROLE_GRANT_PREFIX] {
+        let prefix = namespace_grants_prefix(kind, namespace);
+        for guard in engine.system_prefix_scan(Partition::Deployment, &prefix)? {
+            let (key, value) = guard.into_inner()?;
+            let (_, grantee) = decode_grant_key(&key).ok_or_else(|| {
+                StorageError::Serialization("a grant key of the catalog does not decode".into())
+            })?;
+            let record = GrantRecord::decode(&value).ok_or_else(|| {
+                StorageError::Serialization(format!("the grant of {grantee:?} does not decode"))
+            })?;
+            out.push((grantee, record));
+        }
+    }
+    Ok(out)
+}
+
+/// Every principal holding the whole-deployment admin right, with its
+/// record: empty when none is issued.
+///
+/// # Errors
+///
+/// A catalog record cannot be read or does not decode.
+pub fn deployment_admins(
+    engine: &Deployment,
+) -> StorageResult<Vec<(PrincipalId, DeploymentRights)>> {
+    let mut out = Vec::new();
+    for guard in engine.system_prefix_scan(Partition::Deployment, DEPLOYMENT_RIGHTS_PREFIX)? {
+        let (key, value) = guard.into_inner()?;
+        let principal = decode_deployment_rights_key(&key).ok_or_else(|| {
+            StorageError::Serialization("a deployment-rights key does not decode".into())
+        })?;
+        let rights = DeploymentRights::decode(&value).ok_or_else(|| {
+            StorageError::Serialization(format!(
+                "the deployment rights of {principal:?} do not decode"
+            ))
+        })?;
+        if rights.admin {
+            out.push((principal, rights));
+        }
+    }
+    Ok(out)
 }
 
 /// Whether `principal` may read `namespace` by the catalog `engine` holds

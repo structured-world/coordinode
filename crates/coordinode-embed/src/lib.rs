@@ -60,12 +60,12 @@ pub use coordinode_core::txn::transaction::CommitReceipt;
 pub use coordinode_query::executor::runner::CatalogObject;
 pub use db::{
     AccessChange, AccessRefusal, ActingContext, AfterCommitDispatchReport, ConstraintDeclaration,
-    DEFAULT_VECTOR_BUILD_WAIT, Database, DatabaseError, Disposition, EdgeTypeDeclaration,
-    GranteeName, Intent, LabelConstraint, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,
-    MissingRight, NamespaceRole, PackageConstraint, PeerFailure, Principal, PrincipalId,
-    PublishedObject, ReadFenceFailure, Readiness, ResumedIndexBuilds, SchemaPackage,
-    SchemaPublication, SchemaReadiness, StorageFailure, TransactionEnd, TransactionId,
-    TransactionOptions, TriggerDispatchConfig,
+    DEFAULT_VECTOR_BUILD_WAIT, Database, DatabaseError, DeploymentAdmin, Disposition,
+    EdgeTypeDeclaration, GrantView, GranteeName, Intent, LabelConstraint, LabelDeclaration,
+    MAX_SCHEMA_PACKAGE_DECLARATIONS, MissingRight, NamespaceRole, PackageConstraint, PeerFailure,
+    Principal, PrincipalId, PublishedObject, ReadFenceFailure, Readiness, ResumedIndexBuilds,
+    RoleView, SchemaPackage, SchemaPublication, SchemaReadiness, StorageFailure, TransactionEnd,
+    TransactionId, TransactionOptions, TriggerDispatchConfig,
 };
 pub use repair::RepairReport;
 
