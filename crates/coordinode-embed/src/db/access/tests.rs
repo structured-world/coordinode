@@ -83,12 +83,13 @@ fn only_a_namespace_admin_changes_its_grants() {
             role: NamespaceRole::Admin,
         },
     );
+    // Without any right bob is not admitted to the namespace at all.
     refused_for(
         run_as(&db, "bob", "CREATE (:Doc)"),
         "bob",
         MissingRight::Namespace {
             namespace: ns,
-            role: NamespaceRole::Writer,
+            role: NamespaceRole::Reader,
         },
     );
 
@@ -163,12 +164,13 @@ fn a_revocation_refuses_the_next_write_of_an_open_session() {
         },
     )
     .expect("revoke");
+    // Every right went, so bob is not admitted to the namespace at all.
     refused_for(
         run_as(&db, "bob", "CREATE (:Doc {n: 2})"),
         "bob",
         MissingRight::Namespace {
             namespace: ns,
-            role: NamespaceRole::Writer,
+            role: NamespaceRole::Reader,
         },
     );
     let rows = db
@@ -202,12 +204,13 @@ fn a_transfer_moves_the_right_once() {
         .expect("a repeat is not an error: it writes nothing");
 
     run_as(&db, "q", "CREATE (:Doc)").expect("the new holder writes");
+    // The right left p whole: it holds nothing there any more.
     refused_for(
         run_as(&db, "p", "CREATE (:Doc)"),
         "p",
         MissingRight::Namespace {
             namespace: ns,
-            role: NamespaceRole::Writer,
+            role: NamespaceRole::Reader,
         },
     );
 }
@@ -218,6 +221,16 @@ fn a_transfer_moves_the_right_once() {
 #[test]
 fn a_namespace_statement_acts_for_its_principal() {
     let (db, _dir) = open();
+    // The statements run in a session of the default namespace, which each
+    // principal reads; what is checked is the catalog right the statement
+    // needs beyond that.
+    for subject in ["carol", "dave"] {
+        db.change_access(
+            &ActingContext::Trusted,
+            grant("default", subject, NamespaceRole::Reader),
+        )
+        .expect("grant reader on the session's namespace");
+    }
     refused_for(
         run_as(&db, "carol", "CREATE NAMESPACE carols"),
         "carol",
@@ -260,6 +273,69 @@ fn a_namespace_statement_acts_for_its_principal() {
         },
     );
     run_as(&db, "carol", "DROP NAMESPACE carols").expect("the creator, its admin, drops it");
+}
+
+/// A principal with no right on the namespace reads nothing of it: the read
+/// is refused before it runs, naming the reader role it lacks.
+#[test]
+fn a_principal_without_a_right_reads_nothing() {
+    let (db, _dir) = open();
+    let ns = default_namespace(&db);
+    db.execute_cypher_shared("CREATE (:Secret {v: 1})", None, None, None, None)
+        .expect("the host writes");
+    refused_for(
+        run_as(&db, "eve", "MATCH (s:Secret) RETURN s.v"),
+        "eve",
+        MissingRight::Namespace {
+            namespace: ns,
+            role: NamespaceRole::Reader,
+        },
+    );
+}
+
+/// A revocation stops the reads of a transaction already open: the
+/// statement after it is refused, whatever the transaction read before.
+#[test]
+fn a_revocation_stops_the_reads_of_an_open_transaction() {
+    use crate::db::TransactionOptions;
+    let (db, _dir) = open();
+    let ns = default_namespace(&db);
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "rita", NamespaceRole::Reader),
+    )
+    .expect("grant reader");
+    let rita = acting("rita");
+    let as_rita = StatementOptions {
+        actor: Some(rita.clone()),
+        ..StatementOptions::default()
+    };
+    let tx = db
+        .begin_transaction_with(&TransactionOptions {
+            actor: Some(rita),
+            ..TransactionOptions::trusted()
+        })
+        .expect("begin");
+    db.execute_in_transaction_with(tx, "MATCH (n) RETURN n", None, &as_rita)
+        .expect("the read before the revocation");
+
+    db.change_access(
+        &ActingContext::Trusted,
+        AccessChange::Revoke {
+            namespaces: vec!["default".into()],
+            grantee: GranteeName::Principal(id("rita")),
+        },
+    )
+    .expect("revoke");
+    refused_for(
+        db.execute_in_transaction_with(tx, "MATCH (n) RETURN n", None, &as_rita)
+            .map(drop),
+        "rita",
+        MissingRight::Namespace {
+            namespace: ns,
+            role: NamespaceRole::Reader,
+        },
+    );
 }
 
 /// A principal bound to another namespace than the handle's changes

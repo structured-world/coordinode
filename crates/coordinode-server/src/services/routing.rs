@@ -258,6 +258,7 @@ fn run_fenced(
     answer: &mut AnswerWriter,
 ) -> Result<RoutedStats, DatabaseError> {
     let RoutedStatement {
+        actor,
         query,
         params,
         source,
@@ -270,6 +271,7 @@ fn run_fenced(
     if executor.database().read().keyset_pageable(&query) {
         let stats = executor::write_paged(
             executor.database(),
+            &actor,
             &query,
             params,
             source.as_ref(),
@@ -286,7 +288,7 @@ fn run_fenced(
         );
         return stats;
     }
-    let result = executor.execute(&query, params, source.as_ref(), fenced)?;
+    let result = executor.execute_routed(&actor, &query, params, source.as_ref(), fenced)?;
     executor::write_rows(&result.rows, answer);
     Ok(executor::stats(&result.write_stats, fenced))
 }

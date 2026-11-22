@@ -335,6 +335,32 @@ pub fn effective_role(
     Ok(best)
 }
 
+/// Whether `principal` may read `namespace` by the catalog `engine` holds
+/// now: a deployment admin, or a principal holding at least reader there.
+/// The refusal names the reader role it lacks.
+///
+/// # Errors
+///
+/// A catalog record cannot be read or does not decode.
+pub fn may_read(
+    engine: &Deployment,
+    principal: &PrincipalId,
+    namespace: NamespaceId,
+) -> StorageResult<Result<(), AccessRefusal>> {
+    if deployment_rights(engine, principal)?.admin
+        || effective_role(engine, principal, namespace)?.is_some()
+    {
+        return Ok(Ok(()));
+    }
+    Ok(Err(AccessRefusal {
+        principal: principal.clone(),
+        missing: MissingRight::Namespace {
+            namespace,
+            role: NamespaceRole::Reader,
+        },
+    }))
+}
+
 /// `grantee`'s grant on `namespace`, if it holds one.
 ///
 /// # Errors

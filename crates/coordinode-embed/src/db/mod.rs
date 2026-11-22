@@ -2747,6 +2747,27 @@ impl Database {
         resume: Option<Vec<u8>>,
         limit: usize,
     ) -> Result<PagedCypherResult, DatabaseError> {
+        self.execute_cypher_paged_as(None, query, params, read_ts, resume, limit)
+    }
+
+    /// [`Self::execute_cypher_paged`] acting for `actor`: every page is read
+    /// only while its principal holds a right on the namespace.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::execute_cypher_paged`];
+    /// [`DatabaseError::AccessRefused`] for a principal holding no right on
+    /// the namespace when a page is read.
+    pub fn execute_cypher_paged_as(
+        &self,
+        actor: Option<&coordinode_core::txn::command::ActingContext>,
+        query: &str,
+        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
+        read_ts: Option<u64>,
+        resume: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<PagedCypherResult, DatabaseError> {
+        let actor = self.statement_principal(actor)?;
         // Pin the snapshot once; later pages re-pin to the same timestamp. A
         // new cursor chooses the latest view that is complete and durable
         // rather than naming a fresh timestamp, which a commit in flight or
@@ -2773,7 +2794,7 @@ impl Database {
             after_commit_generation: 0,
             budget: statement_budget(self.query_memory_limit, None, None),
             operation: None,
-            actor: None,
+            actor,
         };
         let params = params.filter(|p| !p.is_empty());
         let mut paging = Some(ScanPaging {
@@ -3244,6 +3265,18 @@ impl Database {
             // Every commit of the statement acts for the transaction's
             // principal, its catalog changes and DDL entries included.
             let actor = txn.actor().cloned();
+            // Every statement of a principal reads its namespace: admitted
+            // only while it holds a right there, read from the catalog now, so
+            // a revocation stops the next statement of a session already open.
+            // Its writes are checked again where the log applies them.
+            if let Some(principal) = &actor {
+                coordinode_storage::engine::access::may_read(
+                    self.engine.deployment(),
+                    principal,
+                    self.engine.namespace(),
+                )?
+                .map_err(DatabaseError::AccessRefused)?;
+            }
             // The statement's view of the field dictionary: every binding
             // applied before it started, refreshed here when one has landed
             // since (a registration, a replica apply, a replay, a snapshot).

@@ -2486,9 +2486,11 @@ async fn a_routed_write_takes_effect_once_across_a_leader_change() {
 }
 
 /// A write routed from a follower is authorized where the leader's log
-/// applies it: once a revocation is in the log, the principal's next write
-/// through the follower is refused with the typed refusal naming it and the
-/// role it lacked, and changes nothing on any member.
+/// applies it: once the principal's right is lowered to reader in the log,
+/// its next write through the follower is refused with the typed refusal
+/// naming it and the writer role it lacked, and changes nothing on any
+/// member. Once every right is revoked, its read through the follower is
+/// refused too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revocation_refuses_the_next_write_routed_from_a_follower() {
     use coordinode_core::txn::command::Principal;
@@ -2527,11 +2529,14 @@ async fn a_revocation_refuses_the_next_write_routed_from_a_follower() {
             .await
             .expect("bob writes through follower 2");
 
-        change(AccessChange::Revoke {
-            namespaces: vec!["default".into()],
+        // Lowered to reader: still admitted, and the write is refused where
+        // the leader applies it.
+        change(AccessChange::Grant {
+            namespace: "default".into(),
             grantee: GranteeName::Principal(bob_id.clone()),
+            role: NamespaceRole::Reader,
         })
-        .expect("revoke bob");
+        .expect("lower bob to reader");
         match members[1].ingress().execute(write(2)).await {
             Err(DatabaseError::AccessRefused(refusal)) => {
                 assert_eq!(refusal.principal, bob_id);
@@ -2546,7 +2551,45 @@ async fn a_revocation_refuses_the_next_write_routed_from_a_follower() {
                     "{refusal:?}"
                 );
             }
-            other => panic!("expected bob refused after the revocation, got {other:?}"),
+            other => panic!("expected bob's write refused as a reader, got {other:?}"),
+        }
+        change(AccessChange::Revoke {
+            namespaces: vec!["default".into()],
+            grantee: GranteeName::Principal(bob_id.clone()),
+        })
+        .expect("revoke bob");
+        // A read through the follower reads nothing either once the
+        // revocation reached it: with every right gone, bob is not admitted
+        // to the namespace at all.
+        let read = Statement {
+            actor: bob.clone(),
+            ..Statement::new("MATCH (r:Routed) RETURN r.n")
+        };
+        // The follower serves the read once the revocation is applied there;
+        // until then it may still answer, which is not what is checked.
+        let mut answer = members[1].ingress().execute(read.clone()).await;
+        for _ in 0..500 {
+            if answer.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            answer = members[1].ingress().execute(read.clone()).await;
+        }
+        match answer {
+            Err(DatabaseError::AccessRefused(refusal)) => {
+                assert_eq!(refusal.principal, bob_id);
+                assert!(
+                    matches!(
+                        refusal.missing,
+                        MissingRight::Namespace {
+                            role: NamespaceRole::Reader,
+                            ..
+                        }
+                    ),
+                    "{refusal:?}"
+                );
+            }
+            other => panic!("expected bob's read refused after the revocation, got {other:?}"),
         }
 
         for m in &members {

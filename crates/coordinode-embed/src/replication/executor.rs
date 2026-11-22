@@ -119,6 +119,7 @@ const ANSWER_PAGE: usize = 1024;
 /// between pages.
 pub fn write_paged(
     database: &RwLock<Database>,
+    actor: &ActingContext,
     query: &str,
     params: Option<HashMap<String, Value>>,
     source: Option<&SourceContext>,
@@ -151,7 +152,8 @@ pub fn write_paged(
         }
         // The paging call takes the parameters by value for every page.
         let started = std::time::Instant::now();
-        let mut page = database.read().execute_cypher_paged(
+        let mut page = database.read().execute_cypher_paged_as(
+            Some(actor),
             query,
             params.clone(),
             read_ts,
@@ -464,7 +466,7 @@ pub fn write_admitted(
 ) -> Result<RoutedStats, DatabaseError> {
     let params = (!params.is_empty()).then_some(params);
     if database.read().keyset_pageable(query) {
-        return write_paged(database, query, params, source, admitted, answer);
+        return write_paged(database, actor, query, params, source, admitted, answer);
     }
     let result = database.read().execute_cypher_shared_with(
         query,

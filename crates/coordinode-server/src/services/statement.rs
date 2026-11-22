@@ -217,11 +217,37 @@ impl StatementExecutor {
         source: Option<&SourceContext>,
         admitted: &Admitted,
     ) -> Result<CypherResult, DatabaseError> {
+        self.execute_with(query, params, source, &admitted.options())
+    }
+
+    /// [`Self::execute`] for a statement another member routed here, acting
+    /// for the caller it names: its commits are applied only where that
+    /// principal holds the rights, as on the member it came through.
+    pub(crate) fn execute_routed(
+        &self,
+        actor: &coordinode_core::txn::command::ActingContext,
+        query: &str,
+        params: Option<HashMap<String, Value>>,
+        source: Option<&SourceContext>,
+        admitted: &Admitted,
+    ) -> Result<CypherResult, DatabaseError> {
+        let options = coordinode_embed::db::StatementOptions {
+            actor: Some(actor.clone()),
+            ..admitted.options()
+        };
+        self.execute_with(query, params, source, &options)
+    }
+
+    fn execute_with(
+        &self,
+        query: &str,
+        params: Option<HashMap<String, Value>>,
+        source: Option<&SourceContext>,
+        options: &coordinode_embed::db::StatementOptions,
+    ) -> Result<CypherResult, DatabaseError> {
         let started = Instant::now();
         metrics::gauge!("coordinode_query_active").increment(1.0);
-        let result = self
-            .writer
-            .execute(query, params, source, &admitted.options());
+        let result = self.writer.execute(query, params, source, options);
         metrics::gauge!("coordinode_query_active").decrement(1.0);
         // A statement that committed writes reports where they landed; one
         // that did not is a read.
