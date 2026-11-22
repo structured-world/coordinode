@@ -753,6 +753,23 @@ impl QuerySession {
     }
 }
 
+/// When a readiness wait of `wait` ends: the wait is first cut at what is
+/// left of an earlier deadline (`left`), then its end taken on the monotonic
+/// clock. Zero ends now.
+///
+/// # Errors
+///
+/// [`DatabaseError::SettingsRefused`] when the clock cannot represent the
+/// end, before anything waits.
+pub(crate) fn wait_end(wait: Duration, left: Option<Duration>) -> Result<Instant, DatabaseError> {
+    let effective = left.map_or(wait, |left| left.min(wait));
+    Instant::now().checked_add(effective).ok_or_else(|| {
+        DatabaseError::SettingsRefused(format!(
+            "a wait of {wait:?} ends past what the clock can represent"
+        ))
+    })
+}
+
 /// The longest a standalone causal wait goes without asking the statement's
 /// budget whether its deadline passed or it was cancelled.
 const BUDGET_CHECK_SLICE: Duration = Duration::from_millis(50);
@@ -2152,7 +2169,8 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// [`DatabaseError::SettingsRefused`] for a position on a standalone store;
+    /// [`DatabaseError::SettingsRefused`] for a position on a standalone store,
+    /// or a wait whose end the clock cannot represent;
     /// [`DatabaseError::ReadNotReady`] after the wait;
     /// [`DatabaseError::Budget`] when the budget ends the wait.
     ///
@@ -2178,8 +2196,12 @@ impl Database {
         if !replicated && let Some(wait) = causal.wait {
             // Waited in slices: a commit finishing wakes the wait, and between
             // slices the budget says whether the statement's deadline passed
-            // or it was cancelled, which nothing else would wake.
-            let until = Instant::now() + wait;
+            // or it was cancelled, which nothing else would wake. The
+            // statement's deadline bounds the wait before its end is taken.
+            let left = budget
+                .and_then(coordinode_core::budget::QueryBudget::time_left_nanos)
+                .map(Duration::from_nanos);
+            let until = wait_end(wait, left)?;
             loop {
                 let slice = until
                     .saturating_duration_since(Instant::now())
@@ -4608,6 +4630,9 @@ mod interactive;
 mod namespaces;
 mod package;
 mod projection;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod readiness_wait_tests;
 mod state_cut;
 #[cfg(feature = "tenancy")]
 pub use access::{CatalogScope, DeploymentAdmin, GrantView, RoleView};

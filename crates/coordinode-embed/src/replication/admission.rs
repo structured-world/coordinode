@@ -364,19 +364,15 @@ impl Admitter {
         checked: Checked,
         already_forwarded: bool,
     ) -> Result<Admission, DatabaseError> {
+        // One end for the read's whole wait, every stage below within it; a
+        // wait whose end the clock cannot represent is refused before any.
+        let waited = WaitEnd::of(checked.read_concern.wait, checked.deadline)?;
         let Some(node) = self.node.as_ref() else {
             // A causal bound a read allows a wait for is waited for here,
             // holding no thread; the store then finds it met.
-            if let (Some(after_ts), Some(wait)) =
-                (checked.read_concern.after_ts, checked.read_concern.wait)
-            {
-                self.await_standalone_bound(
-                    after_ts,
-                    wait,
-                    checked.deadline,
-                    checked.cancel.as_ref(),
-                )
-                .await?;
+            if let (Some(after_ts), Some(waited)) = (checked.read_concern.after_ts, waited) {
+                self.await_standalone_bound(after_ts, waited, checked.cancel.as_ref())
+                    .await?;
             }
             return Ok(Admission::Run(Box::new(self.admit_standalone(checked))));
         };
@@ -394,7 +390,7 @@ impl Admitter {
         // Proving authority for a linearizable read waits on the group: that
         // wait, too, lasts no longer than the operation. The log applied
         // through its read point is waited for only as the read allows.
-        let (apply_wait, cut) = wait_within(checked.read_concern.wait, checked.deadline);
+        let (apply_wait, cut) = (waited.map(WaitEnd::left), waited.is_some_and(|w| w.cut));
         let applied = within_deadline_and_cancel(
             checked.deadline,
             checked.cancel.as_ref(),
@@ -419,12 +415,10 @@ impl Admitter {
             // which the database's view must reach; the position itself is
             // established here.
             let (after_ts, after_position) = (read_concern.after_ts, read_concern.after_position);
-            read_concern.after_ts = within_operation(
-                read_concern.wait,
-                checked.deadline,
-                checked.cancel.as_ref(),
-                |wait| fence.await_causal(after_ts, after_position, wait),
-            )
+            // What the apply stage left of the wait: one budget for both.
+            read_concern.after_ts = within_operation(waited, checked.cancel.as_ref(), |wait| {
+                fence.await_causal(after_ts, after_position, wait)
+            })
             .await?;
         } else if read_concern.level == ReadConcernLevel::Linearizable {
             // The barrier proved authority and applied the log through it;
@@ -478,19 +472,17 @@ impl Admitter {
         let Some(after_ts) = after_ts else {
             return Ok(());
         };
+        let waited = WaitEnd::of(wait, deadline)?;
         let Some(node) = self.node.as_ref() else {
             // Standalone, a start that allows a wait waits for its bound
             // here, as a read does.
-            return match wait {
-                Some(wait) => {
-                    self.await_standalone_bound(after_ts, wait, deadline, cancel)
-                        .await
-                }
+            return match waited {
+                Some(waited) => self.await_standalone_bound(after_ts, waited, cancel).await,
                 None => Ok(()),
             };
         };
         let mut fence = node.read_fence();
-        within_operation(wait, deadline, cancel, |wait| {
+        within_operation(waited, cancel, |wait| {
             fence.await_causal(Some(after_ts), None, wait)
         })
         .await
@@ -498,21 +490,26 @@ impl Admitter {
     }
 
     /// Wait on a standalone store, holding no thread, until no commit at or
-    /// below `after_ts` is in flight: at most `wait`, cut at `deadline` and
-    /// given up once `cancel` is thrown, each ending with its own outcome.
+    /// below `after_ts` is in flight: until `waited` ends, and given up once
+    /// `cancel` is thrown, each ending with its own outcome (a wait the
+    /// operation's deadline cut ends as the deadline does).
     async fn await_standalone_bound(
         &self,
         after_ts: u64,
-        wait: Duration,
-        deadline: Option<Instant>,
+        waited: WaitEnd,
         cancel: Option<&CancelFlag>,
     ) -> Result<(), DatabaseError> {
         let database = self.database()?;
         let met = database.read().causal_bound_met(after_ts);
-        let outcome =
-            within_deadline_and_cancel(deadline, cancel, tokio::time::timeout(wait, met)).await?;
+        let outcome = within_deadline_and_cancel(
+            None,
+            cancel,
+            tokio::time::timeout_at(tokio::time::Instant::from_std(waited.at), met),
+        )
+        .await?;
         match outcome {
             Ok(()) => Ok(()),
+            Err(_elapsed) if waited.cut => Err(DatabaseError::Budget(BudgetStop::Deadline)),
             Err(_elapsed) => Err(DatabaseError::ReadNotReady {
                 requested: after_ts,
                 ready_through: database.read().causal_ready_through(after_ts),
@@ -660,22 +657,21 @@ fn fence_refusal(
 }
 
 /// Wait for a causal bound through `wait_for`, which waits at most the
-/// duration it is handed: the request's own `wait`, cut at the operation's
-/// `deadline`, and given up once `cancel` is thrown. A wait the deadline cut
-/// short ends with the deadline's outcome, as the statement itself would; one
-/// that ran its own course is refused as not ready. Neither is answered below
-/// the bound.
+/// duration it is handed: what is left of the request's wait (`waited`, see
+/// [`WaitEnd`]), and given up once `cancel` is thrown. A wait the deadline
+/// cut short ends with the deadline's outcome, as the statement itself
+/// would; one that ran its own course is refused as not ready. Neither is
+/// answered below the bound.
 async fn within_operation<T, F>(
-    wait: Option<Duration>,
-    deadline: Option<Instant>,
+    waited: Option<WaitEnd>,
     cancel: Option<&CancelFlag>,
     wait_for: impl FnOnce(Option<Duration>) -> F,
 ) -> Result<T, DatabaseError>
 where
     F: std::future::Future<Output = Result<T, ReadFenceError>>,
 {
-    let (wait, cut) = wait_within(wait, deadline);
-    let waited = wait_for(wait);
+    let cut = waited.is_some_and(|w| w.cut);
+    let waited = wait_for(waited.map(WaitEnd::left));
     let outcome = match cancel {
         Some(cancel) => tokio::select! {
             biased;
@@ -692,15 +688,49 @@ where
     }
 }
 
-/// The request's own `wait` cut at the operation's `deadline`, and whether the
-/// deadline cut it: a wait that ends at the deadline answers with the
-/// deadline's outcome, not as not ready.
-fn wait_within(wait: Option<Duration>, deadline: Option<Instant>) -> (Option<Duration>, bool) {
-    // The time left is zero once the deadline has passed: no wait at all.
-    let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-    match (wait, left) {
-        (Some(wait), Some(left)) if left < wait => (Some(left), true),
-        (wait, _) => (wait, false),
+/// When a request's wait ends: fixed once, so every stage of a causal read
+/// waits within the one budget.
+#[derive(Debug, Clone, Copy)]
+struct WaitEnd {
+    at: Instant,
+    /// Whether the operation's deadline cut the wait: a wait that ends at
+    /// the deadline answers with the deadline's outcome, not as not ready.
+    cut: bool,
+}
+
+impl WaitEnd {
+    /// The request's own `wait`, cut first at an earlier operation
+    /// `deadline`; `None` when the request allows no wait. Zero stays zero:
+    /// readiness is checked at once.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError::SettingsRefused`] when the monotonic clock cannot
+    /// represent the wait's end, before anything waits.
+    fn of(
+        wait: Option<Duration>,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Self>, DatabaseError> {
+        let Some(wait) = wait else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        // The time left is zero once the deadline has passed: no wait at all.
+        let (effective, cut) = match deadline.map(|d| d.saturating_duration_since(now)) {
+            Some(left) if left < wait => (left, true),
+            _ => (wait, false),
+        };
+        let at = now.checked_add(effective).ok_or_else(|| {
+            DatabaseError::SettingsRefused(format!(
+                "a wait of {wait:?} ends past what the clock can represent"
+            ))
+        })?;
+        Ok(Some(Self { at, cut }))
+    }
+
+    /// What is left of the wait now.
+    fn left(self) -> Duration {
+        self.at.saturating_duration_since(Instant::now())
     }
 }
 
@@ -747,8 +777,9 @@ fn fence_error(err: ReadFenceError) -> DatabaseError {
         ReadFenceError::NotReady { .. } => fence(ReadFenceFailure::NotReady),
         // The request names a position that cannot be compared here: a
         // refused setting, not a state of this member.
-        foreign @ ReadFenceError::ForeignHistory { .. } => {
-            DatabaseError::SettingsRefused(foreign.to_string())
+        refused @ (ReadFenceError::ForeignHistory { .. }
+        | ReadFenceError::WaitUnrepresentable(_)) => {
+            DatabaseError::SettingsRefused(refused.to_string())
         }
         ReadFenceError::Raft(e) => DatabaseError::Other(format!("Raft error: {e}")),
         // Named like a refused write: the same fields say why this member is

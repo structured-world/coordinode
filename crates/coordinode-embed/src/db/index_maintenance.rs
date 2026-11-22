@@ -107,13 +107,16 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// No index matches; it is not a B-tree index; or the catalog could not
-    /// be written.
+    /// [`DatabaseError::SettingsRefused`] for a wait whose end the clock
+    /// cannot represent, before anything starts; no index matches; it is not
+    /// a B-tree index; or the catalog could not be written.
     pub fn reindex(
         &self,
         index: &IndexSelector,
         wait: Duration,
     ) -> Result<GenerationId, DatabaseError> {
+        // A wait the clock cannot end is refused before the rebuild starts.
+        let deadline = super::wait_end(wait, None)?;
         let def = index
             .resolve(&self.engine)
             .map_err(|e| selector_error(index, e))?;
@@ -126,7 +129,8 @@ impl Database {
             .index_builds
             .rebuild(def)
             .map_err(DatabaseError::Other)?;
-        self.index_builds.wait(def.generation, Some(wait))?;
+        self.index_builds
+            .wait_until(def.generation, Some(deadline))?;
         Ok(def.generation)
     }
 }

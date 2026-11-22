@@ -842,13 +842,36 @@ impl IndexBuildService {
     ///
     /// # Errors
     ///
-    /// The build record could not be read.
+    /// The build record could not be read; a `timeout` whose end the clock
+    /// cannot represent, refused before any wait.
     pub fn wait(
         &self,
         generation: GenerationId,
         timeout: Option<Duration>,
     ) -> Result<Option<IndexBuildOutcome>, StoreError> {
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let deadline = timeout
+            .map(|t| {
+                Instant::now().checked_add(t).ok_or_else(|| {
+                    StoreError::Invariant(format!(
+                        "a wait of {t:?} ends past what the clock can represent"
+                    ))
+                })
+            })
+            .transpose()?;
+        self.wait_until(generation, deadline)
+    }
+
+    /// [`Self::wait`] up to `deadline` (`None`: until it has an outcome), a
+    /// caller's proven end: several waits within one budget share it.
+    ///
+    /// # Errors
+    ///
+    /// The build record could not be read.
+    pub fn wait_until(
+        &self,
+        generation: GenerationId,
+        deadline: Option<Instant>,
+    ) -> Result<Option<IndexBuildOutcome>, StoreError> {
         let mut slots = self.shared.slots.lock();
         loop {
             match slots.get(&generation) {

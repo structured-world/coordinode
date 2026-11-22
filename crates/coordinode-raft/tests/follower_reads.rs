@@ -545,6 +545,24 @@ async fn a_causal_timestamp_past_the_closed_bound_is_not_ready() {
     );
 }
 
+/// A causal wait whose end the clock cannot represent is refused as such
+/// before any wait, whether or not the bound is met.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_causal_wait_the_clock_cannot_end_is_refused() {
+    let (_dir, node) = bootstrap_leader().await;
+    let mut fence = node.read_fence();
+    for after_ts in [Some(u64::MAX), Some(0)] {
+        let err = fence
+            .await_causal(after_ts, None, Some(Duration::MAX))
+            .await
+            .expect_err("an end no clock can represent");
+        assert!(
+            matches!(err, ReadFenceError::WaitUnrepresentable(_)),
+            "refused as an argument, got {err:?}"
+        );
+    }
+}
+
 // ── subscribe_applied ─────────────────────────────────────────────────────────
 
 /// subscribe_applied returns a receiver that sees the current applied value.

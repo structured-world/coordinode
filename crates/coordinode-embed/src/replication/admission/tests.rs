@@ -10,6 +10,47 @@ fn standalone(defaults: AdmissionDefaults) -> (Admitter, tempfile::TempDir) {
     )
 }
 
+/// A read's wait ends once for all its stages: cut first at an earlier
+/// deadline, so even a wait no clock can end is a finite one under it;
+/// without a deadline such a wait is refused as a setting. Zero ends now
+/// and asks no wait; no wait asked stays none.
+#[test]
+fn a_reads_wait_ends_once_within_its_deadline() {
+    let refused = WaitEnd::of(Some(Duration::MAX), None);
+    assert!(
+        matches!(refused, Err(DatabaseError::SettingsRefused(_))),
+        "{refused:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let cut = WaitEnd::of(Some(Duration::MAX), Some(deadline))
+        .expect("finite under the deadline")
+        .expect("a wait");
+    assert!(cut.cut && cut.at <= deadline, "{cut:?}");
+    let own = WaitEnd::of(Some(Duration::from_millis(10)), Some(deadline))
+        .expect("finite")
+        .expect("a wait");
+    assert!(!own.cut && own.at < deadline, "{own:?}");
+    let zero = WaitEnd::of(Some(Duration::ZERO), None)
+        .expect("zero")
+        .expect("a wait");
+    assert_eq!(zero.left(), Duration::ZERO);
+    assert!(WaitEnd::of(None, None).expect("none").is_none());
+}
+
+/// A causal read on a standalone store refuses a wait the clock cannot
+/// end before it waits, through the admitter's async path as well.
+#[tokio::test]
+async fn a_standalone_causal_wait_the_clock_cannot_end_is_refused() {
+    let (admitter, _dir) = standalone(AdmissionDefaults::default());
+    let refused = admitter
+        .await_start_bound(Some(1), Some(Duration::MAX), None, None)
+        .await;
+    assert!(
+        matches!(refused, Err(DatabaseError::SettingsRefused(_))),
+        "{refused:?}"
+    );
+}
+
 /// A fence step that would wait forever ends when its operation does: at its
 /// deadline with the deadline's outcome, at its cancel with the cancel's,
 /// and runs to its end when neither comes first.

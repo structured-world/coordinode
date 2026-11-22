@@ -251,6 +251,11 @@ pub enum ReadFenceError {
         /// This member's history, or what is unknown about it.
         serving: String,
     },
+
+    /// The read's wait ends past what the monotonic clock can represent: a
+    /// refused argument, before any wait.
+    #[error("a wait of {0:?} ends past what the clock can represent")]
+    WaitUnrepresentable(Duration),
 }
 
 /// A history in text: its deployment and group.
@@ -582,7 +587,13 @@ impl ReadFence {
                     .map_or_else(|| "not yet known".to_owned(), history_text),
             });
         }
-        let deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
+        let deadline = wait
+            .map(|wait| {
+                tokio::time::Instant::now()
+                    .checked_add(wait)
+                    .ok_or(ReadFenceError::WaitUnrepresentable(wait))
+            })
+            .transpose()?;
         loop {
             let missing = match self.causal_gap(after_ts, after_position).await? {
                 Ok(bound) => {

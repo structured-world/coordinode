@@ -720,7 +720,7 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// A record could not be read, or the answer could not be made durable.
+    /// As [`Self::await_operations`].
     pub fn await_schema(
         &self,
         publication: &SchemaPublication,
@@ -781,18 +781,20 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// A record could not be read, or the answer could not be made durable.
+    /// [`DatabaseError::SettingsRefused`] for a wait whose end the clock
+    /// cannot represent, before any wait (the operations go on); a record
+    /// could not be read, or the answer could not be made durable.
     pub fn await_operations(
         &self,
         operations: &[GenerationId],
         wait: Duration,
     ) -> Result<Vec<(GenerationId, Readiness)>, DatabaseError> {
-        let deadline = std::time::Instant::now() + wait;
+        // One end for every operation waited for.
+        let deadline = super::wait_end(wait, None)?;
         let mut out = Vec::with_capacity(operations.len());
         let mut any_published = false;
         for &operation in operations {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            let readiness = match self.index_builds.wait(operation, Some(left))? {
+            let readiness = match self.index_builds.wait_until(operation, Some(deadline))? {
                 Some(IndexBuildOutcome::Published { .. }) => {
                     any_published = true;
                     Readiness::Ready
