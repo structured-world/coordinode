@@ -349,6 +349,67 @@ ALTER NAMESPACE archive SET STORAGE (compression: 'zstd:3')   -- changes only wh
 - The SQL frontend takes the same `WITH (...)` and `ALTER NAMESPACE ... SET
   STORAGE (...)`.
 
+<a id="access-control"></a>
+#### GRANT / REVOKE / TRANSFER and roles ✅
+
+Who may read, write and administer each namespace. Each statement is one
+change to the deployment's grant catalog, made for the principal the session
+acts for and decided where the change applies, so a change and the writes
+around it are ordered by the log on every member.
+
+A principal is named by two string literals, its subject and the trust scope
+(issuer) it belongs to; both are taken exactly as they decode, case and
+slashes included. A role is named by its name and its home namespace, which
+qualifies it even when it gets rights on another namespace:
+
+```cypher
+GRANT writer ON NAMESPACE shared TO ROLE publisher IN NAMESPACE newsroom
+GRANT reader ON NAMESPACE reports TO PRINCIPAL 'editor/1' IN 'https://id.example/team'
+REVOKE writer ON NAMESPACE shared FROM ROLE publisher IN NAMESPACE newsroom
+REVOKE ALL ON NAMESPACE a, b FROM PRINCIPAL 'p' IN 'https://id.example'
+TRANSFER writer ON NAMESPACE a FROM PRINCIPAL 'p' IN 's' TO PRINCIPAL 'q' IN 's'
+
+CREATE ROLE readers IN NAMESPACE newsroom [HELD BY PRINCIPAL 'p' IN 's']
+CREATE ROLE coordinator IN NAMESPACE person
+  EXCLUSIVE AMONG (PRINCIPAL 'm1' IN 's', PRINCIPAL 'm2' IN 's') HELD BY PRINCIPAL 'm1' IN 's'
+ALTER ROLE coordinator IN NAMESPACE person SET ELIGIBLE (PRINCIPAL 'm2' IN 's')
+DROP ROLE readers IN NAMESPACE newsroom
+GRANT ROLE readers IN NAMESPACE newsroom TO PRINCIPAL 'p' IN 's'
+REVOKE ROLE readers IN NAMESPACE newsroom FROM PRINCIPAL 'p' IN 's'
+TRANSFER ROLE coordinator IN NAMESPACE person
+  FROM PRINCIPAL 'm1' IN 's' TO PRINCIPAL 'm2' IN 's'
+
+GRANT CREATE NAMESPACE TO PRINCIPAL 'p' IN 's'
+GRANT admin ON DEPLOYMENT TO PRINCIPAL 'root' IN 's'
+REVOKE CREATE NAMESPACE FROM PRINCIPAL 'p' IN 's'
+REVOKE admin ON DEPLOYMENT FROM PRINCIPAL 'root' IN 's'
+```
+
+- Levels: `reader` reads; `writer` also creates, sets and deletes; `admin`
+  also changes the schema and indexes, grants and revokes on the namespace,
+  and drops it. Granting a level replaces the grantee's level there.
+- `REVOKE <level>` removes the direct grant only while its stored level is
+  still the one named where it applies: a grant an earlier change replaced
+  with another level survives. `REVOKE ALL ON NAMESPACE a, b` removes the
+  grantee's direct grants on every namespace named in one change, and needs
+  admin on each of them; without admin on one, none is removed.
+- `TRANSFER` moves a level or a role only while its source holds it there; of
+  two concurrent transfers exactly one wins, and one whose condition no longer
+  holds writes nothing.
+- An exclusive role is held by exactly one principal of its eligible set,
+  named with `HELD BY` when it is created; any principal of the set may
+  transfer the role to itself. `ALTER ROLE ... SET ELIGIBLE` replaces the set
+  (its home's admin only); a holder left out loses the role in the same
+  change, and `SET ELIGIBLE ()` takes it from everyone. `GRANT ROLE` does not
+  take `EXCLUSIVE AMONG`: the set is the role's, named and changed as above.
+- `CREATE NAMESPACE` right lets its holder create namespaces and list them,
+  becoming admin of each it creates; it gives no right on any other
+  namespace. `admin ON DEPLOYMENT` reaches every namespace.
+- A statement acting for a principal without the right the change needs is
+  refused with `ACCESS_REFUSED` naming the principal and the level or
+  deployment right it lacked; nothing changes. The ACL words are not reserved:
+  a property or variable called `role` or `admin` reads as before.
+
 #### CREATE NODE TYPE / CREATE EDGE TYPE ✅ 🔷
 
 CoordiNode extension. Declares a label or edge-type schema upfront so the engine knows the property contract (and, for `TEMPORAL` types, the bitemporal storage layout). Both forms accept an optional `TEMPORAL` modifier and an optional `WITH (...)` property declaration block.

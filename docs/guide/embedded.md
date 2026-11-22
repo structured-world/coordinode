@@ -193,6 +193,122 @@ is `DatabaseError::NamespaceExists`; a name no namespace may have,
 open on. Once a namespace is dropped no session of it opens, and its name is
 free: a namespace created again under it starts empty.
 
+## Principals and access control
+
+A host that has authenticated whoever it acts for (an identity service linked
+into the same process, for one) runs each statement, transaction and catalog
+change **as that principal**: a stable subject in its issuer's trust scope,
+bound to one namespace. Many principals can act through one process at once,
+each checked against its own grants only. The host itself, acting as
+`ActingContext::Trusted`, is checked against nothing.
+
+```rust
+use coordinode_embed::db::StatementOptions;
+use coordinode_embed::{
+    AccessChange, ActingContext, Database, DatabaseError, GranteeName, MissingRight,
+    NamespaceRole, Principal, PrincipalId,
+};
+
+fn alice() -> ActingContext {
+    ActingContext::Principal(Principal {
+        subject: "alice".into(),
+        trust_scope: "https://id.example".into(),
+        namespace: "default".into(),
+    })
+}
+
+fn writes_as_alice(db: &Database) -> Result<(), DatabaseError> {
+    // The host grants; from then on alice writes the namespace.
+    db.change_access(
+        &ActingContext::Trusted,
+        AccessChange::Grant {
+            namespace: "default".into(),
+            grantee: GranteeName::Principal(
+                PrincipalId::new("alice", "https://id.example").expect("a valid principal"),
+            ),
+            role: NamespaceRole::Writer,
+        },
+    )?;
+    let as_alice = StatementOptions {
+        actor: Some(alice()),
+        ..StatementOptions::default()
+    };
+    db.execute_cypher_shared_with("CREATE (:Doc {title: 'mine'})", None, None, &as_alice)?;
+    match db.execute_cypher_shared_with("CREATE INDEX doc_title ON :Doc(title)", None, None, &as_alice) {
+        // A writer does not change the schema: that is an admin's.
+        Err(DatabaseError::AccessRefused(refusal)) => {
+            assert!(matches!(refusal.missing, MissingRight::Namespace { role: NamespaceRole::Admin, .. }));
+            Ok(())
+        }
+        other => other.map(drop),
+    }
+}
+```
+
+The same `actor` goes on `TransactionOptions`, `CommitOptions` and
+`RollbackOptions` for an interactive transaction, and on the `_as` variants of
+the client-operation calls (`enroll_issuer_as`, `resolve_operation_as`, ...).
+
+**Roles.** `reader` reads; `writer` also creates, sets and deletes; `admin`
+also changes the schema and indexes, grants and revokes on the namespace, and
+drops it. Each statement of a principal runs only while it holds a right on
+its namespace, read when the statement starts, so a revocation stops the next
+statement of a session or transaction already open.
+
+**Decided where the write applies.** A principal's write carries the
+principal into the log, and whether it holds the right is decided when the
+entry is applied, against the grants the log has produced up to it,
+identically on every member of a replicated group. A write issued before a
+revocation and ordered after it is refused, whichever member it was sent
+through; a refused write changes nothing and its caller gets
+`DatabaseError::AccessRefused`, naming the principal and the namespace role
+(or deployment right) it lacked. A principal bound to another namespace than
+the handle's is `DatabaseError::NamespaceMismatch` before anything runs.
+
+**Grant changes** are `Database::change_access(actor, AccessChange)` or the
+statements of the [language reference](../cypher/reference#access-control):
+
+| Change | Who may make it |
+|---|---|
+| `Grant` / `RevokeGrant` a level on a namespace | that namespace's admin |
+| `Revoke` every right on several namespaces, as one change | the admin of each |
+| `Transfer` a level from one principal to another, only while the first holds it | that namespace's admin |
+| `CreateRole` / `DropRole` / `RoleEligible` | the role's home namespace's admin |
+| `GrantRole` / `RevokeRole` | the home's admin; a holder gives its role up itself |
+| `TransferRole`, only while `from` holds it | the home's admin, or any principal of an exclusive role's eligible set taking it for itself |
+| `DeploymentRights` (create namespaces, deployment admin) | the deployment admin |
+
+A level-specific `RevokeGrant` removes the grant only while its level is still
+the one named where it applies: a grant an earlier change raised survives it.
+Of two concurrent transfers of a role, exactly one wins; a transfer whose
+condition no longer holds writes nothing, and the catalog read afterwards
+says who holds what. An exclusive role is held by exactly one principal of
+its eligible set: moving it moves every right it carries, on every namespace,
+in one change, so there is no moment where the old holder kept a part of them.
+
+**Reading the grants that bear on you.** `namespace_grants(actor, ns)` lists
+the grants on a namespace, each with the commit timestamp of the change that
+made it, for a principal holding a right there. `role(actor, home, name)`
+gives a role's holders, eligible set and the timestamp it last changed at, to
+its home's admin, to a holder, and to every principal of an exclusive role's
+eligible set even with no right on any data: a taker conditions its transfer
+on the holder it read. `deployment_admins(actor, ns)` says whether a
+whole-deployment admin is issued, to a principal holding a right on a
+namespace it reaches. A principal naming a namespace or role it may not read
+is refused without learning whether it exists.
+
+**Catalog scope.** A principal holding only the right to create namespaces
+has no session on any data yet: `db.catalog_scope(principal)` creates a
+namespace (its creator becomes its admin in the same change), lists the
+deployment's namespaces and drops what it administers. The scope runs no
+statement and opens no transaction or cursor.
+
+**Client-operation issuers** belong to the principal whose enrollment created
+them. Another principal is refused every control action on one (enrollment,
+resume, lookup, exclusion, acknowledgement, retirement, a write carrying one
+of its descriptors), with nothing changed and no outcome told; an issuer the
+trusted host enrolled is reached by the host alone.
+
 ## Transactions and errors
 
 A statement run on its own commits on its own. An interactive transaction
