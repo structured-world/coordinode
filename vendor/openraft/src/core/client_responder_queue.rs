@@ -12,8 +12,7 @@ use std::collections::VecDeque;
 ///
 /// - `push()`: O(1) amortized
 /// - `extend()`: O(k) where k = items added
-/// - `drain_upto()`: O(k) where k = drained count
-/// - `drain_from()`: O(log n + k) where n = total responders, k = drained count
+/// - `drain_upto()`, `drain_from()`: O(log n + k) where n = total responders, k = drained count
 /// - `first_index()`, `len()`, `is_empty()`: O(1)
 pub(crate) struct ClientResponderQueue<T> {
     /// Responders stored as (log_index, responder) pairs in sorted order
@@ -25,13 +24,6 @@ impl<T> ClientResponderQueue<T> {
     pub(crate) fn new() -> Self {
         Self {
             responders: VecDeque::new(),
-        }
-    }
-
-    /// Creates a new empty responder queue with the specified capacity.
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self {
-            responders: VecDeque::with_capacity(capacity),
         }
     }
 
@@ -204,7 +196,9 @@ mod tests {
 
     #[test]
     fn test_grow_and_retain_capacity() {
-        let mut queue = TestQueue::with_capacity(1);
+        let mut queue = TestQueue::new();
+        assert_eq!(0, queue.responders.capacity());
+
         queue.push(10, 100);
         queue.push(20, 200);
         let capacity = queue.responders.capacity();
@@ -249,6 +243,6 @@ mod tests {
             }
         }
         assert_eq!(result, vec![(20, 200)]);
-        assert_eq!(queue.first_index(), Some(10));
+        assert_eq!(queue.drain_upto(u64::MAX), vec![(10, 100)]);
     }
 }

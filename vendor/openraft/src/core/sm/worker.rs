@@ -1,5 +1,6 @@
 use display_more::DisplayOptionExt;
 use futures_util::TryStreamExt;
+use futures_util::future::try_join3;
 use tracing::Instrument;
 
 use crate::RaftLogReader;
@@ -8,34 +9,42 @@ use crate::RaftTypeConfig;
 use crate::StorageError;
 use crate::async_runtime::MpscReceiver;
 use crate::async_runtime::OneshotSender;
-use crate::async_runtime::mpsc::PeekableReceiver;
+use crate::async_runtime::watch::WatchSender;
 use crate::core::ApplyResult;
 use crate::core::notification::Notification;
 use crate::core::sm::Command;
 use crate::core::sm::CommandResult;
 use crate::core::sm::Response;
+use crate::core::sm::apply_batch::ApplyBatch;
 use crate::core::sm::command_receiver::CommandReceiver;
 use crate::core::sm::handle::Handle;
 use crate::entry::RaftEntry;
 use crate::errors::StorageIOResult;
-use crate::raft::responder::core_responder::CoreResponder;
-#[cfg(doc)]
-use crate::storage::RaftLogStorage;
 use crate::storage::RaftStateMachine;
 use crate::storage::v2::entry_responder::EntryResponderBuilder;
 use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::JoinHandleOf;
-use crate::type_config::alias::LogIdOf;
+use crate::type_config::alias::MpscReceiverOf;
 use crate::type_config::alias::MpscSenderOf;
 use crate::type_config::alias::OneshotSenderOf;
 use crate::type_config::alias::SnapshotOf;
+use crate::type_config::alias::WatchSenderOf;
 use crate::type_config::async_runtime::mpsc::MpscSender;
 
-pub(crate) struct Worker<C, SM, LR>
+mod intake;
+mod progress;
+mod reader;
+mod work;
+
+use self::intake::Intake;
+use self::progress::Progress;
+use self::reader::Reader;
+use self::work::Work;
+
+pub(crate) struct Worker<C, SM>
 where
     C: RaftTypeConfig,
     SM: RaftStateMachine<C>,
-    LR: RaftLogReader<C>,
 {
     /// The ID of this Raft node, used to tag worker logs for correlation with core logs.
     id: C::NodeId,
@@ -43,168 +52,121 @@ where
     /// The application state machine implementation.
     state_machine: SM,
 
-    /// Read logs from the [`RaftLogStorage`] implementation to apply them to the state machine.
-    log_reader: LR,
-
-    /// Read command from RaftCore to execute.
-    ///
-    /// Peekable so that merging `Apply` commands can leave a non-mergeable command queued.
-    cmd_rx: PeekableReceiver<CommandReceiver<C, SM>, Command<C, SM>>,
-
     /// Send back the result of the command to RaftCore.
     resp_tx: MpscSenderOf<C, Notification<C>>,
 }
 
-impl<C, SM, LR> Worker<C, SM, LR>
+impl<C, SM> Worker<C, SM>
 where
     C: RaftTypeConfig,
     SM: RaftStateMachine<C>,
-    LR: RaftLogReader<C>,
 {
     /// Spawn a new state machine worker, return a controlling handle.
-    pub(crate) fn spawn(
+    pub(crate) fn spawn<LR>(
         id: C::NodeId,
         state_machine: SM,
         log_reader: LR,
         resp_tx: MpscSenderOf<C, Notification<C>>,
         cmd_channel: (MpscSenderOf<C, Command<C, SM>>, CommandReceiver<C, SM>),
         span: tracing::Span,
-    ) -> Handle<C, SM> {
+    ) -> Handle<C, SM>
+    where
+        LR: RaftLogReader<C>,
+    {
         let (cmd_tx, cmd_rx) = cmd_channel;
 
         let worker = Worker {
             id,
             state_machine,
-            log_reader,
-            cmd_rx: cmd_rx.peekable(),
             resp_tx,
         };
 
-        let join_handle = worker.do_spawn(span);
+        let join_handle = worker.do_spawn(log_reader, cmd_rx, span);
 
         Handle { cmd_tx, join_handle }
     }
 
-    fn do_spawn(mut self, span: tracing::Span) -> JoinHandleOf<C, ()> {
-        let fu = async move {
-            let res = self.worker_loop().await;
-
-            if let Err(err) = res {
-                tracing::error!("{} while execute state machine command", err,);
-
-                self.resp_tx
-                    .send(Notification::StateMachine {
-                        command_result: CommandResult { result: Err(err) },
-                    })
-                    .await
-                    .ok();
+    fn do_spawn<LR>(self, reader: LR, commands: CommandReceiver<C, SM>, span: tracing::Span) -> JoinHandleOf<C, ()>
+    where LR: RaftLogReader<C> {
+        let errors = self.resp_tx.clone();
+        let future = async move {
+            if let Err(error) = self.worker_loop(reader, commands).await {
+                tracing::error!(%error, "state machine worker failed");
+                let result = CommandResult { result: Err(error) };
+                let notification = Notification::StateMachine { command_result: result };
+                errors.send(notification).await.ok();
             }
         };
-        C::spawn(fu.instrument(span))
+        C::spawn(future.instrument(span))
+    }
+
+    /// Drive three owned, channel-connected stages in the existing worker task.
+    #[tracing::instrument(level = "debug", skip_all, fields(id = %self.id))]
+    async fn worker_loop<LR>(self, reader: LR, commands: CommandReceiver<C, SM>) -> Result<(), StorageError<C>>
+    where LR: RaftLogReader<C> {
+        let (read_tx, read_rx) = C::mpsc(STAGE_CHANNEL_SIZE);
+        let (loaded_tx, loaded_rx) = C::mpsc(STAGE_CHANNEL_SIZE);
+        let (progress_tx, progress_rx) = C::watch_channel(Progress::default());
+
+        let intake_stage = Intake::new(commands, read_tx, progress_rx);
+        let read_stage = Reader::new(reader, read_rx, loaded_tx);
+
+        let intake_future = intake_stage.run();
+        let read_future = read_stage.run();
+        let apply_future = self.apply_loop(loaded_rx, progress_tx);
+
+        try_join3(intake_future, read_future, apply_future).await?;
+        Ok(())
+    }
+
+    /// Run a command other than `Apply`.
+    async fn run_command(&mut self, cmd: Command<C, SM>) -> Result<(), StorageError<C>> {
+        match cmd {
+            Command::BuildSnapshot => {
+                tracing::info!("{}: build snapshot", func_name!());
+
+                // It is a read operation and is spawned, and it responds in another task
+                self.build_snapshot(self.resp_tx.clone()).await;
+            }
+            Command::GetSnapshot { tx } => {
+                tracing::info!("{}: get snapshot", func_name!());
+
+                self.get_snapshot(tx).await?;
+                // GetSnapshot does not respond to RaftCore
+            }
+            Command::InstallFullSnapshot {
+                log_io_id: io_id,
+                snapshot,
+            } => {
+                tracing::info!("{}: install complete snapshot", func_name!());
+
+                let meta = snapshot.meta.clone();
+                self.state_machine
+                    .install_snapshot(&meta, snapshot.snapshot)
+                    .await
+                    .sto_write_snapshot(Some(meta.signature()))?;
+
+                tracing::info!("Done install complete snapshot, meta: {}", meta);
+
+                let res = CommandResult::new(Ok(Response::InstallSnapshot((io_id, Some(meta)))));
+                self.resp_tx.send(Notification::sm(res)).await.ok();
+            }
+            Command::Apply { .. } => {
+                unreachable!("Apply is handled by the worker loop");
+            }
+            Command::ExternalFunc { func } => {
+                tracing::debug!("{}: run user defined ExternalFunc", func_name!());
+                func(&mut self.state_machine).await;
+            }
+        }
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn worker_loop(&mut self) -> Result<(), StorageError<C>> {
-        loop {
-            let cmd = match self.cmd_rx.recv().await {
-                None => {
-                    tracing::info!("{}: rx closed, state machine worker quit", func_name!());
-                    return Ok(());
-                }
-                Some(x) => x,
-            };
-
-            tracing::debug!("RAFT_event id={:<2}  input: {:?}", self.id, cmd);
-
-            match cmd {
-                Command::BuildSnapshot => {
-                    tracing::info!("{}: build snapshot", func_name!());
-
-                    // It is a read operation and is spawned, and it responds in another task
-                    self.build_snapshot(self.resp_tx.clone()).await;
-                }
-                Command::GetSnapshot { tx } => {
-                    tracing::info!("{}: get snapshot", func_name!());
-
-                    self.get_snapshot(tx).await?;
-                    // GetSnapshot does not respond to RaftCore
-                }
-                Command::InstallFullSnapshot {
-                    log_io_id: io_id,
-                    snapshot,
-                } => {
-                    tracing::info!("{}: install complete snapshot", func_name!());
-
-                    let meta = snapshot.meta.clone();
-                    self.state_machine
-                        .install_snapshot(&meta, snapshot.snapshot)
-                        .await
-                        .sto_write_snapshot(Some(meta.signature()))?;
-
-                    tracing::info!("Done install complete snapshot, meta: {}", meta);
-
-                    let res = CommandResult::new(Ok(Response::InstallSnapshot((io_id, Some(meta)))));
-                    self.resp_tx.send(Notification::sm(res)).await.ok();
-                }
-                Command::Apply {
-                    first,
-                    last,
-                    client_resp_channels,
-                } => {
-                    let (last, client_resp_channels) = self.merge_queued_applies(last, client_resp_channels);
-                    let resp = self.apply(first, last, client_resp_channels).await?;
-                    let res = CommandResult::new(Ok(Response::Apply(resp)));
-                    self.resp_tx.send(Notification::sm(res)).await.ok();
-                }
-                Command::ExternalFunc { func } => {
-                    tracing::debug!("{}: run user defined ExternalFunc", func_name!());
-                    func(&mut self.state_machine).await;
-                }
-            };
-        }
-    }
-    /// Extend an apply range ending at `last` with the `Apply` commands queued right after it.
-    ///
-    /// RaftCore sends one `Apply` each time the committed index advances, so while the state
-    /// machine is busy, many small `Apply` commands queue up. Applying them as one batch pays the
-    /// per-call cost of `entries_stream()` and `apply()` once instead of once per command.
-    ///
-    /// Only commands that are already queued are taken. The first one that is not an `Apply`
-    /// starting at `last + 1` stays in `cmd_rx` and runs next, so commands still run in the
-    /// order RaftCore sent them.
-    fn merge_queued_applies(
-        &mut self,
-        mut last: LogIdOf<C>,
-        mut client_resp_channels: Vec<(u64, CoreResponder<C>)>,
-    ) -> (LogIdOf<C>, Vec<(u64, CoreResponder<C>)>) {
-        while let Ok(Command::Apply { first, .. }) = self.cmd_rx.try_peek()
-            && first.index() == last.index() + 1
-        {
-            let Ok(Command::Apply {
-                first: next_first,
-                last: next_last,
-                client_resp_channels: next_channels,
-            }) = self.cmd_rx.try_recv()
-            else {
-                unreachable!("the peeked command is an Apply");
-            };
-
-            tracing::debug!("merge queued Apply: [{},{}]", next_first, next_last);
-            last = next_last;
-            client_resp_channels.extend(next_channels);
-        }
-        (last, client_resp_channels)
-    }
-
-    #[tracing::instrument(level = "debug", skip_all)]
-    async fn apply(
-        &mut self,
-        first: LogIdOf<C>,
-        last: LogIdOf<C>,
-        client_resp_channels: Vec<(u64, CoreResponder<C>)>,
-    ) -> Result<ApplyResult<C>, StorageError<C>> {
-        let since = first.index();
-        let end = last.index() + 1;
+    async fn apply(state_machine: &mut SM, batch: ApplyBatch<C>) -> Result<ApplyResult<C>, StorageError<C>> {
+        let since = batch.since();
+        let end = batch.end();
+        let last = batch.last;
 
         #[cfg(debug_assertions)]
         let (got_last_index, last_apply) = {
@@ -212,10 +174,10 @@ where
             (l.clone(), l)
         };
 
-        let strm = self.log_reader.entries_stream(since..end).await;
+        let strm = futures_util::stream::iter(batch.entries);
 
         // Convert Vec to an iterator for efficient matching
-        let mut responder_iter = client_resp_channels.into_iter().peekable();
+        let mut responder_iter = batch.client_resp_channels.into_iter().peekable();
 
         // Prepare entries with responders upfront.
         let strm = strm.map_ok(move |entry| {
@@ -240,7 +202,7 @@ where
             (ent, responder)
         });
 
-        self.state_machine.apply(Box::pin(strm)).await.sto_apply(last.clone())?;
+        state_machine.apply(Box::pin(strm)).await.sto_apply(last.clone())?;
 
         #[cfg(debug_assertions)]
         {
@@ -304,7 +266,51 @@ where
         tx.send(snapshot).ok();
         Ok(())
     }
+
+    /// Publish a completed apply even while the next batch is still being read.
+    async fn apply_and_notify(
+        state_machine: &mut SM,
+        resp_tx: &MpscSenderOf<C, Notification<C>>,
+        batch: ApplyBatch<C>,
+    ) -> Result<(), StorageError<C>> {
+        let applied = Self::apply(state_machine, batch).await?;
+        let res = CommandResult::new(Ok(Response::Apply(applied)));
+        resp_tx.send(Notification::sm(res)).await.ok();
+        Ok(())
+    }
+    async fn apply_loop(
+        mut self,
+        incoming: MpscReceiverOf<C, Work<C, SM>>,
+        progress_tx: WatchSenderOf<C, Progress>,
+    ) -> Result<(), StorageError<C>> {
+        let mut incoming = incoming.peekable();
+        let mut progress = Progress::default();
+        while let Some(mut work) = incoming.recv().await {
+            work.coalesce(&mut incoming);
+            match work {
+                Work::Apply(batch) => {
+                    let entries = batch.entry_count();
+                    progress.started += entries;
+                    progress_tx.send(progress).ok();
+                    Self::apply_and_notify(&mut self.state_machine, &self.resp_tx, batch).await?;
+                    progress.finished += entries;
+                    progress_tx.send(progress).ok();
+                }
+                Work::Barrier { command, finished } => {
+                    self.run_command(command).await?;
+                    finished.send(()).ok();
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+/// Only whole commands that fit this speculative entry budget are read during another apply.
+const MAX_PREFETCH_ENTRIES: u64 = 1024;
+
+/// Entry credits bound one-entry messages across both queues as well as active reads.
+const STAGE_CHANNEL_SIZE: usize = MAX_PREFETCH_ENTRIES as usize;
 
 #[cfg(test)]
 mod worker_test;

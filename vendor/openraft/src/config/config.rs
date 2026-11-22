@@ -1,6 +1,7 @@
 //! Raft runtime configuration.
 
 use std::ops::Deref;
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use backoff_series::BackoffSeries;
@@ -93,8 +94,11 @@ fn default_removed_leader_step_down() -> StepDownPolicy {
 
 /// Log compaction and snapshot policy.
 ///
-/// This governs when periodic snapshots will be taken, as well as the conditions which
-/// would cause a leader to send an `InstallSnapshot` RPC to a follower based on replication lag.
+/// This governs when periodic snapshots will be taken. It does not decide when a leader sends a
+/// follower a snapshot instead of log entries: the leader does that when the entries the follower
+/// needs are already purged. See [snapshot replication].
+///
+/// [snapshot replication]: crate::docs::protocol::replication::snapshot_replication
 ///
 /// Additional policies may become available in the future.
 #[derive(Clone, Debug)]
@@ -103,6 +107,11 @@ fn default_removed_leader_step_down() -> StepDownPolicy {
 pub enum SnapshotPolicy {
     /// A snapshot will be generated once the log has grown the specified number of logs since
     /// the last snapshot.
+    ///
+    /// The threshold must be at least 1, and validation rejects 0. `LogsSinceLast(1)` attempts a
+    /// snapshot once the committed log grows past the last snapshot or attempt; an attempt that
+    /// completes or is refused at a committed position is not repeated there. To turn automatic
+    /// snapshots off, use [`Never`](Self::Never).
     LogsSinceLast(u64),
 
     /// Openraft will never trigger a snapshot building.
@@ -175,6 +184,10 @@ impl SnapshotPolicy {
 /// - [`SnapshotPolicy`] for snapshot triggering strategies
 ///
 /// [`Raft::new`]: crate::Raft::new
+#[since(
+    version = "0.10.1",
+    change = "`enable_tick` no longer stops elections; `enable_elect` controls them"
+)]
 #[since(version = "0.10.1", change = "add opt-in relaxed leader reads")]
 #[since(
     version = "0.10.0",
@@ -207,9 +220,17 @@ pub struct Config {
 
     /// The heartbeat interval in milliseconds at which leaders will send heartbeats to followers
     ///
-    /// A heartbeat is only sent when a tick fires, and the tick loop fires every
-    /// `heartbeat_interval * 13 / 64` milliseconds, so a heartbeat goes out at the first tick at
-    /// or after this interval, up to one tick interval later than it.
+    /// A leader's heartbeat timer fires this interval after the previous round of heartbeats, and
+    /// the next round goes out then. Replication also uses it as the deadline of an RPC.
+    ///
+    /// It must be at least 1, and validation rejects 0, even with heartbeats turned off: a runtime
+    /// switch can turn them on later. To turn automatic heartbeats off, use
+    /// [`enable_heartbeat`](Self::enable_heartbeat) or
+    /// [`RuntimeConfigHandle::heartbeat()`](crate::raft::RuntimeConfigHandle::heartbeat).
+    #[since(
+        version = "0.10.1",
+        change = "heartbeats go out at their deadline, not at the next tick"
+    )]
     #[cfg_attr(feature = "clap", clap(long, default_value_t = DEFAULTS.heartbeat_interval))]
     pub heartbeat_interval: u64,
 
@@ -222,12 +243,13 @@ pub struct Config {
     /// redundant. Under sustained writes this eliminates most heartbeat RPCs; heartbeats resume
     /// automatically once replication idles.
     ///
-    /// A suppressed heartbeat resumes at the first tick at or after its deadline, so it must hold
-    /// that `heartbeat_interval + heartbeat_min_interval` plus one tick interval is smaller than
+    /// A suppressed heartbeat resumes at the first round of heartbeats after the suppression ends,
+    /// so it must hold that `heartbeat_interval + heartbeat_min_interval` is smaller than
     /// `election_timeout_min`, so that suppression can never delay a heartbeat past a follower's
     /// election timeout.
     ///
-    /// Defaults to 0, which disables suppression: every tick sends a heartbeat to every follower.
+    /// Defaults to 0, which disables suppression: every round sends a heartbeat to every follower.
+    #[since(version = "0.10.1", change = "the bound no longer adds a tick interval")]
     #[since(version = "0.10.0")]
     #[cfg_attr(feature = "clap", clap(long, default_value = "0"))]
     pub heartbeat_min_interval: Option<u64>,
@@ -243,11 +265,16 @@ pub struct Config {
     #[cfg_attr(feature = "clap", clap(long, default_value_t = DEFAULTS.max_payload_entries))]
     pub max_payload_entries: u64,
 
-    /// The maximum number of log entries per append I/O operation.
+    /// The maximum number of log entries that merging puts into one append I/O operation.
     ///
-    /// When multiple `AppendEntries` commands are queued, Openraft can merge them into
-    /// a single storage write to improve throughput. This setting limits the batch size
-    /// to prevent excessively large writes that could cause high storage latency.
+    /// When multiple `AppendEntries` commands are queued, Openraft can merge adjacent ones into a
+    /// single storage write to improve throughput. It merges the next command only while the total
+    /// stays within this limit, to prevent excessively large writes that could cause high storage
+    /// latency.
+    ///
+    /// It limits merging, not each storage write: a command that already holds more entries, such
+    /// as a multi-entry client write, is appended whole. With a limit of 1, a two-entry command is
+    /// still one two-entry append.
     ///
     /// This is separate from `max_payload_entries` which controls network replication payload size.
     /// Storage typically has higher throughput than network, so this value can be larger.
@@ -257,13 +284,15 @@ pub struct Config {
     #[cfg_attr(feature = "clap", clap(long, default_value = "4096"))]
     pub max_append_entries: Option<u64>,
 
-    /// The distance behind in log replication a follower must fall before it is considered lagging
+    /// How far behind the leader's last log a new learner may be when a blocking
+    /// [`Raft::add_learner`](crate::Raft::add_learner) returns.
     ///
-    /// - Followers that fall behind this index are replicated with a snapshot.
-    /// - Followers that fall within this index are replicated with log entries.
+    /// With `blocking` set, `add_learner` waits until the learner has replicated the membership log
+    /// that adds it, and is at most this many log entries behind the leader's last log.
     ///
-    /// This value should be greater than snapshot_policy.SnapshotPolicy.LogsSinceLast, otherwise
-    /// transmitting a snapshot may not fix the lagging.
+    /// It does not decide whether a follower gets log entries or a snapshot. The leader sends a
+    /// snapshot when the entries a follower needs are already purged; see
+    /// [snapshot replication](crate::docs::protocol::replication::snapshot_replication).
     #[cfg_attr(feature = "clap", clap(long, default_value_t = DEFAULTS.replication_lag_threshold))]
     pub replication_lag_threshold: u64,
 
@@ -276,6 +305,9 @@ pub struct Config {
     pub snapshot_policy: SnapshotPolicy,
 
     /// The maximum snapshot chunk size allowed when transmitting snapshots (in bytes)
+    ///
+    /// It must be at least 1 and at most `isize::MAX`, the largest byte buffer this target can
+    /// allocate; validation rejects other values. The default is 3 MiB.
     #[cfg_attr(feature = "clap", clap(long, default_value = "3MiB", value_parser=parse_bytes_with_unit))]
     pub snapshot_max_chunk_size: u64,
 
@@ -293,6 +325,12 @@ pub struct Config {
     ///
     /// This controls backpressure for client requests. When the channel is full,
     /// new API calls will block until space becomes available.
+    ///
+    /// The runtime's channels must accept the size, as given by
+    /// [`Mpsc::buffer_size_range()`](crate::async_runtime::Mpsc::buffer_size_range): the
+    /// Tokio-backed runtimes accept 1 to `tokio::sync::Semaphore::MAX_PERMITS`. For a size outside
+    /// it, [`Raft::new`](crate::Raft::new) returns [`ConfigError::ChannelSizeOutOfRange`] instead
+    /// of starting.
     #[since(version = "0.10.0")]
     #[cfg_attr(feature = "clap", clap(long, default_value = "65536"))]
     pub api_channel_size: Option<u64>,
@@ -316,6 +354,12 @@ pub struct Config {
     ///
     /// This channel carries internal notifications like IO completion, replication progress,
     /// and tick events. When full, internal components will block until space is available.
+    ///
+    /// The runtime's channels must accept the size, as given by
+    /// [`Mpsc::buffer_size_range()`](crate::async_runtime::Mpsc::buffer_size_range): the
+    /// Tokio-backed runtimes accept 1 to `tokio::sync::Semaphore::MAX_PERMITS`. For a size outside
+    /// it, [`Raft::new`](crate::Raft::new) returns [`ConfigError::ChannelSizeOutOfRange`] instead
+    /// of starting.
     #[since(version = "0.10.0")]
     #[cfg_attr(feature = "clap", clap(long, default_value = "65536"))]
     pub notification_channel_size: Option<u64>,
@@ -327,6 +371,12 @@ pub struct Config {
     /// notifications. With
     /// [`enable_unbounded_state_machine_buffer`](Self::enable_unbounded_state_machine_buffer),
     /// this setting bounds only the input channel, not the number of pending commands.
+    ///
+    /// The runtime's channels must accept the size, as given by
+    /// [`Mpsc::buffer_size_range()`](crate::async_runtime::Mpsc::buffer_size_range): the
+    /// Tokio-backed runtimes accept 1 to `tokio::sync::Semaphore::MAX_PERMITS`. For a size outside
+    /// it, [`Raft::new`](crate::Raft::new) returns [`ConfigError::ChannelSizeOutOfRange`] instead
+    /// of starting.
     #[since(version = "0.10.0")]
     #[cfg_attr(feature = "clap", clap(long, default_value = "1024"))]
     pub state_machine_channel_size: Option<u64>,
@@ -365,7 +415,8 @@ pub struct Config {
     /// committed, applied) maintains a fixed-capacity ring buffer of this size.
     /// Only used when the `runtime-stats` feature is enabled.
     ///
-    /// Defaults to 1024 if not specified.
+    /// Must be greater than 0, and fit in `usize` on this target; validation rejects other
+    /// values. Defaults to 1024 if not specified.
     #[since(version = "0.10.0")]
     #[cfg_attr(feature = "clap", clap(long))]
     pub log_stage_capacity: Option<u64>,
@@ -384,20 +435,16 @@ pub struct Config {
     ))]
     pub broadcast_submitted_on_append: Option<bool>,
 
-    /// Enable or disable the internal ticker.
+    /// Enable or disable a leader's heartbeat timer.
     ///
-    /// If ticking is disabled, timeout-based events are all disabled:
-    /// a follower won't wake up to enter candidate state,
-    /// and a leader won't send heartbeat.
+    /// If it is disabled, a leader won't send heartbeats on its own.
     ///
-    /// **Critical for elections**: When `false`, followers cannot detect leader failures and will
-    /// never trigger elections, even with `enable_elect = true`, unless the application calls
-    /// [`Trigger::tick`]. The tick mechanism provides the timing infrastructure that allows
-    /// followers to detect when `election_timeout_max` has passed without receiving heartbeats
-    /// from the leader.
+    /// Elections do not depend on this timer: they run on a separate election timer that
+    /// [`enable_elect`](Self::enable_elect) controls. To stop every automatic election, disable
+    /// `enable_elect` as well.
     ///
-    /// This flag is mainly used for testing, to build a consensus system that does not depend on
-    /// wall clock, or to drive many nodes from one application timer through [`Trigger::tick`].
+    /// This flag is mainly used for testing, or to drive the heartbeats of many nodes from one
+    /// application timer through [`Trigger::tick`].
     /// The value of this config is evaluated as follows:
     /// - being absent: true
     /// - `--enable-tick`: true
@@ -407,6 +454,7 @@ pub struct Config {
     /// [`Trigger::tick`]: crate::raft::trigger::Trigger::tick
     // clap 4 requires `num_args = 0..=1`, or it complains about missing arg error
     // https://github.com/clap-rs/clap/discussions/4374
+    #[since(version = "0.10.1", change = "controls the heartbeat timer that replaces the ticker")]
     #[cfg_attr(feature = "clap", clap(long,
            default_value_t = true,
            action = clap::ArgAction::Set,
@@ -437,11 +485,10 @@ pub struct Config {
     /// When disabled (`false`), followers will never initiate elections, even if the leader fails.
     /// This setting is primarily for testing or building custom consensus systems.
     ///
-    /// **Important**: This setting only works when `enable_tick` is also `true`, or when the
-    /// application calls [`Trigger::tick`]. Elections require time-based events to detect leader
-    /// absence.
-    ///
-    /// [`Trigger::tick`]: crate::raft::trigger::Trigger::tick
+    /// Automatic elections run on their own election timer, which this setting controls whatever
+    /// [`enable_tick`](Self::enable_tick) says. It covers a follower's or a learner's election
+    /// after its leader lease expires, a candidate's retry, and the election of a leader whose
+    /// leadership transfer timed out.
     // clap 4 requires `num_args = 0..=1`, or it complains about missing arg error
     // https://github.com/clap-rs/clap/discussions/4374
     #[cfg_attr(feature = "clap", clap(long,
@@ -532,11 +579,14 @@ pub struct Config {
 
     /// The policy for stepping down a Leader that is removed from a committed membership config.
     ///
-    /// - [`After(ms)`](StepDownPolicy::After): when the membership config that removes this Leader
-    ///   is committed and `ms` milliseconds have elapsed, the Leader transfers leadership to the
-    ///   most up-to-date voter, then reverts itself to a learner. During the delay it keeps serving
-    ///   as a Leader, so that in-flight requests and the commit notification of the membership log
-    ///   entry can still reach the followers.
+    /// - [`After(ms)`](StepDownPolicy::After): wait `ms` milliseconds after the membership config
+    ///   that removes this Leader is committed. During that delay, the Leader keeps serving so that
+    ///   in-flight requests and the membership commit notification can still reach the followers.
+    ///   If the node is still a removed Leader after the delay, it attempts to transfer leadership
+    ///   to the most up-to-date voter, if one is available. With or without a target, it waits one
+    ///   more [`heartbeat_interval`](Self::heartbeat_interval) before requesting a fallback role
+    ///   refresh to become a learner. The refresh does nothing if the vote or effective membership
+    ///   has changed since the removal was rechecked. `After(0)` skips only the initial delay.
     /// - [`Never`](StepDownPolicy::Never): the removed Leader keeps leading, until the application
     ///   reverts it manually with [`Trigger::refresh_server_state()`].
     ///
@@ -673,12 +723,15 @@ pub struct Config {
     /// unless you know what you are doing.
     ///
     /// Although log state reversion is typically seen as a bug, enabling it can be
-    /// useful for testing or other special scenarios.
-    /// For instance, in an even number nodes cluster, erasing a node's data and then
-    /// rebooting it(log reverts to empty) will not result in data loss.
+    /// useful for testing or other special scenarios. It only lets the replication progress reset:
+    /// it adds no quorum-safety check and no recovery, so it does not make erasing a node's data
+    /// safe. For the narrow case where erasing one voter cannot lose committed data, see the
+    /// [FAQ][wipe-one-node].
     ///
     /// For one-shot log reversion, use
     /// [`Raft::trigger().allow_next_revert()`](crate::raft::trigger::Trigger::allow_next_revert).
+    ///
+    /// [wipe-one-node]: crate::docs::faq#can-i-wipe-out-the-data-of-one-node-and-wait-for-the-leader-to-replicate-all-data-to-it-again
     #[since(version = "0.10.0")]
     #[cfg_attr(feature = "clap", clap(long,
            action = clap::ArgAction::Set,
@@ -824,7 +877,7 @@ impl Config {
     ///
     /// Defaults to 65536 if not specified.
     pub(crate) fn api_channel_size(&self) -> usize {
-        self.api_channel_size.unwrap_or(65536) as usize
+        saturating_usize(self.api_channel_size.unwrap_or(65536))
     }
 
     /// Get the maximum number of client writes that RaftCore merges into one batch.
@@ -852,14 +905,14 @@ impl Config {
     ///
     /// Defaults to 65536 if not specified.
     pub(crate) fn notification_channel_size(&self) -> usize {
-        self.notification_channel_size.unwrap_or(65536) as usize
+        saturating_usize(self.notification_channel_size.unwrap_or(65536))
     }
 
     /// Get the state machine command channel size for bounded MPSC channel.
     ///
     /// Defaults to 1024 if not specified.
     pub(crate) fn state_machine_channel_size(&self) -> usize {
-        self.state_machine_channel_size.unwrap_or(1024) as usize
+        saturating_usize(self.state_machine_channel_size.unwrap_or(1024))
     }
 
     /// Whether to buffer state-machine commands without a backlog limit; defaults to `false`.
@@ -871,7 +924,7 @@ impl Config {
     ///
     /// Defaults to 1024 if not specified.
     pub(crate) fn log_stage_capacity(&self) -> usize {
-        self.log_stage_capacity.unwrap_or(1024) as usize
+        saturating_usize(self.log_stage_capacity.unwrap_or(1024))
     }
 
     /// Whether to publish submitted logs after each append; defaults to `false`.
@@ -879,7 +932,7 @@ impl Config {
         self.broadcast_submitted_on_append.unwrap_or(false)
     }
 
-    /// Get the maximum number of log entries per append I/O operation.
+    /// Get the maximum number of log entries that merging puts into one append I/O operation.
     ///
     /// Defaults to 4096 if not specified.
     pub(crate) fn max_append_entries(&self) -> u64 {
@@ -891,15 +944,6 @@ impl Config {
     /// Defaults to 0 if not specified, meaning heartbeat suppression is disabled.
     pub(crate) fn heartbeat_min_interval(&self) -> u64 {
         self.heartbeat_min_interval.unwrap_or(0)
-    }
-
-    /// Get the interval in milliseconds at which the tick loop fires.
-    ///
-    /// A heartbeat is only sent when a tick fires, so every heartbeat deadline is rounded up to
-    /// this interval.
-    pub(crate) fn tick_interval(&self) -> u64 {
-        let interval = self.heartbeat_interval * 13 / 64;
-        interval.max(1)
     }
 
     /// Validate the state of this config.
@@ -918,17 +962,24 @@ impl Config {
             });
         }
 
-        // A heartbeat is sent at the first tick at or after its deadline, so heartbeats to a
-        // suppressed follower are up to `heartbeat_min_interval + heartbeat_interval` plus one
-        // tick interval apart.
+        // An interval of 0 would make the heartbeat timer due at once after every round, and give
+        // replication RPCs a deadline of 0.
+        if self.heartbeat_interval == 0 {
+            return Err(ConfigError::HeartbeatIntervalIs0);
+        }
+
+        // A round of heartbeats goes out every `heartbeat_interval`, so heartbeats to a suppressed
+        // follower are up to `heartbeat_min_interval + heartbeat_interval` apart.
         //
         // A `heartbeat_min_interval` of 0 disables suppression and leaves the heartbeat cadence
         // unchanged, so the constraint does not apply to it.
+        //
+        // Widen both operands before addition so the sum cannot overflow.
         let heartbeat_min_interval = self.heartbeat_min_interval();
         let suppression_enabled = heartbeat_min_interval > 0;
-        let max_heartbeat_gap = heartbeat_min_interval + self.heartbeat_interval + self.tick_interval();
+        let max_heartbeat_gap = u128::from(heartbeat_min_interval) + u128::from(self.heartbeat_interval);
 
-        if suppression_enabled && self.election_timeout_min <= max_heartbeat_gap {
+        if suppression_enabled && u128::from(self.election_timeout_min) <= max_heartbeat_gap {
             return Err(ConfigError::HeartbeatMinIntervalTooLarge {
                 election_timeout_min: self.election_timeout_min,
                 heartbeat_interval: self.heartbeat_interval,
@@ -938,6 +989,45 @@ impl Config {
 
         if self.max_payload_entries == 0 {
             return Err(ConfigError::MaxPayloadIs0);
+        }
+
+        // A threshold of 0 would start another build at the same committed position each time the
+        // previous one completes or is refused.
+        if self.snapshot_policy == SnapshotPolicy::LogsSinceLast(0) {
+            return Err(ConfigError::SnapshotLogsSinceLastIs0);
+        }
+
+        // A transport reads each chunk into a byte buffer, whose capacity is at most `isize::MAX`.
+        // A chunk size of 0 would send empty chunks that never finish the snapshot.
+        if self.snapshot_max_chunk_size == 0 {
+            return Err(ConfigError::SnapshotMaxChunkSizeIs0);
+        }
+        let max_chunk_size = u64::try_from(isize::MAX).unwrap_or(u64::MAX);
+        check_fits("snapshot_max_chunk_size", self.snapshot_max_chunk_size, max_chunk_size)?;
+
+        if self.log_stage_capacity == Some(0) {
+            return Err(ConfigError::LogStageCapacityIs0);
+        }
+
+        // A capacity that does not fit `usize` would be truncated, on a 32-bit target possibly to
+        // 0, which the zero check above would then miss.
+        if let Some(capacity) = self.log_stage_capacity {
+            let max_usize = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+            check_fits("log_stage_capacity", capacity, max_usize)?;
+        }
+
+        // A channel size that does not fit `usize` would be truncated, possibly to 0. Whether the
+        // runtime's channels accept a size is checked by `validate_channel_sizes()`, which
+        // `Raft::new` runs before it builds any channel.
+        let max_usize = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+        for (field, size) in [
+            ("api_channel_size", self.api_channel_size),
+            ("notification_channel_size", self.notification_channel_size),
+            ("state_machine_channel_size", self.state_machine_channel_size),
+        ] {
+            if let Some(size) = size {
+                check_fits(field, size, max_usize)?;
+            }
         }
 
         if let Some(probe_interval) = self.quorum_loss_probe_interval {
@@ -960,6 +1050,25 @@ impl Config {
         Ok(self)
     }
 
+    /// Checks that the runtime's channels accept every channel size, given the sizes they
+    /// accept, [`Mpsc::buffer_size_range()`](crate::async_runtime::Mpsc::buffer_size_range).
+    ///
+    /// [`validate()`](Self::validate) cannot check this, because a `Config` does not know the
+    /// runtime. `Raft::new` runs it before it builds any channel, because `channel()` panics on a
+    /// size outside the range.
+    pub(crate) fn validate_channel_sizes(&self, accepted: RangeInclusive<usize>) -> Result<(), ConfigError> {
+        for (field, size) in [
+            ("api_channel_size", self.api_channel_size()),
+            ("notification_channel_size", self.notification_channel_size()),
+            ("state_machine_channel_size", self.state_machine_channel_size()),
+        ] {
+            if !accepted.contains(&size) {
+                return Err(ConfigError::ChannelSizeOutOfRange { field, size, accepted });
+            }
+        }
+        Ok(())
+    }
+
     /// Build a [`Backoff`] iterator from the [`backoff`](Self::backoff) policy string.
     ///
     /// Panics if the policy is invalid — callers should obtain `Config` through [`Config::build`]
@@ -970,4 +1079,22 @@ impl Config {
             BackoffSeries::parse(self.get_backoff()).expect("backoff policy must be validated by Config::validate");
         Backoff::new(series.build())
     }
+}
+
+/// Returns [`ConfigError::TooLarge`] when `value` is greater than `max`, the largest value that
+/// this target accepts for the setting `field`.
+pub(super) fn check_fits(field: &'static str, value: u64, max: u64) -> Result<(), ConfigError> {
+    if value > max {
+        return Err(ConfigError::TooLarge { field, value, max });
+    }
+    Ok(())
+}
+
+/// Converts a size setting to `usize`, saturating at `usize::MAX`.
+///
+/// Validation rejects a size that does not fit. An unvalidated one saturates rather than wraps,
+/// so that a runtime that cannot build a channel that large rejects it, instead of building a
+/// smaller one.
+fn saturating_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }

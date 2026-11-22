@@ -34,6 +34,7 @@ use crate::vote::raft_vote::RaftVoteExt;
 /// - **Log State**: `last_log_index`, `last_applied`, `snapshot`, `purged`
 /// - **Voting State**: `current_term`, `vote`
 /// - **Leader Metrics** (only when leader): `heartbeat`, `replication`, `last_quorum_acked`
+/// - **Follower Metrics**: `last_leader_contact`
 /// - **Cluster Config**: `membership_config`
 ///
 /// # Usage
@@ -173,7 +174,9 @@ pub struct RaftMetrics<C: RaftTypeConfig> {
     ///
     /// Use `last_quorum_acked` instead, which is an absolute timestamp.
     /// This value relates to the time when metrics are reported, which may behind the current time
-    /// by an unknown duration (although it should be very small).
+    /// by an unknown duration. `RaftCore` reports metrics only when it wakes up, so on an idle
+    /// leader with heartbeats off, which nothing wakes, this value stops growing.
+    #[since(version = "0.10.1", change = "stops growing on an idle leader with heartbeats off")]
     #[deprecated(since = "0.10.0", note = "use `last_quorum_acked` instead.")]
     pub millis_since_quorum_ack: Option<u64>,
 
@@ -191,6 +194,15 @@ pub struct RaftMetrics<C: RaftTypeConfig> {
     /// cluster.
     #[since(version = "0.10.0")]
     pub last_quorum_acked: Option<SerdeInstantOf<C>>,
+
+    /// When this node last accepted an `AppendEntries` or full snapshot vote from the remote
+    /// leader identified by its current committed vote. An append with a log conflict still counts.
+    ///
+    /// This timestamp is not persisted. It is `None` after restart or a vote change until this
+    /// node accepts replication from the new leader, and is always `None` on the leader itself.
+    /// Contact does not imply a valid quorum lease or that the local log is caught up.
+    #[since(version = "0.10.1")]
+    pub last_leader_contact: Option<SerdeInstantOf<C>>,
 
     /// The current membership config of the cluster.
     pub membership_config: Arc<StoredMembershipOf<C>>,
@@ -297,6 +309,7 @@ where C: RaftTypeConfig
             current_leader: None,
             millis_since_quorum_ack: None,
             last_quorum_acked: None,
+            last_leader_contact: None,
             membership_config: Arc::new(StoredMembershipOf::<C>::default()),
             committed_membership_config: Arc::new(StoredMembershipOf::<C>::default()),
             replication: None,
@@ -371,6 +384,10 @@ pub struct RaftDataMetrics<C: RaftTypeConfig> {
     /// synchronization with the cluster.
     /// A longer duration without acknowledgment may suggest a higher probability of the leader
     /// being partitioned from the cluster.
+    ///
+    /// `RaftCore` reports metrics only when it wakes up, so on an idle leader with heartbeats off,
+    /// which nothing wakes, this value stops growing. `last_quorum_acked` stays exact.
+    #[since(version = "0.10.1", change = "stops growing on an idle leader with heartbeats off")]
     #[deprecated(since = "0.10.0", note = "use `last_quorum_acked` instead.")]
     pub millis_since_quorum_ack: Option<u64>,
 
@@ -458,6 +475,11 @@ pub struct RaftServerMetrics<C: RaftTypeConfig> {
     /// The ID of the current leader, if known.
     pub current_leader: Option<C::NodeId>,
 
+    /// The timestamp of the last contact with the remote leader.
+    /// See [`RaftMetrics::last_leader_contact`].
+    #[since(version = "0.10.1")]
+    pub last_leader_contact: Option<SerdeInstantOf<C>>,
+
     /// The current membership configuration.
     pub membership_config: Arc<StoredMembershipOf<C>>,
 
@@ -506,6 +528,7 @@ where C: RaftTypeConfig
             vote,
             state: Default::default(),
             current_leader: None,
+            last_leader_contact: None,
             membership_config: Arc::new(Default::default()),
             committed_membership_config: Arc::new(Default::default()),
         }

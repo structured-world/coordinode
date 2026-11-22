@@ -94,14 +94,17 @@ where C: RaftTypeConfig
     /// Result of executing a command sent from a state machine worker.
     StateMachine { command_result: sm::CommandResult<C> },
 
-    /// A tick event to wake up RaftCore to check timeout etc.
+    /// A leader's heartbeat timer reached the next heartbeat, waking RaftCore to send it.
     Tick {
-        /// ith tick
+        /// How many times the heartbeat timer has fired, counting from 1.
         i: u64,
     },
 
     /// The earliest pending linearizable read reached its deadline.
     PendingReadDeadlineReached,
+
+    /// The instant at which this follower's election may be due is reached.
+    ElectionDeadlineReached,
 }
 
 impl<C> Notification<C>
@@ -125,6 +128,7 @@ where C: RaftTypeConfig
             Self::StateMachine { .. } => NotificationName::StateMachine,
             Self::Tick { .. } => NotificationName::Tick,
             Self::PendingReadDeadlineReached => NotificationName::PendingReadDeadlineReached,
+            Self::ElectionDeadlineReached => NotificationName::ElectionDeadlineReached,
         }
     }
 }
@@ -202,6 +206,9 @@ where C: RaftTypeConfig
             }
             Self::PendingReadDeadlineReached => {
                 write!(f, "PendingReadDeadlineReached")
+            }
+            Self::ElectionDeadlineReached => {
+                write!(f, "ElectionDeadlineReached")
             }
         }
     }

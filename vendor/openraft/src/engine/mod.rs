@@ -30,6 +30,7 @@
 mod command_kind;
 mod command_name;
 mod command_scheduler;
+mod election_deadline;
 mod engine_config;
 mod engine_impl;
 mod engine_output;
@@ -48,7 +49,9 @@ pub(crate) mod time_state;
 #[cfg(test)]
 mod tests {
     mod append_entries_test;
+    mod elect_if_due_test;
     mod elect_test;
+    mod election_deadline_test;
     mod handle_pre_vote_req_test;
     mod handle_pre_vote_resp_test;
     mod handle_vote_req_test;
@@ -72,9 +75,9 @@ pub(crate) use command::ValueSender;
 pub(crate) use command_kind::CommandKind;
 pub use command_name::CommandName;
 pub use command_name::SMCommandName;
+pub(crate) use election_deadline::ElectionDeadline;
 pub(crate) use engine_config::EngineConfig;
 pub(crate) use engine_impl::Engine;
 pub(crate) use engine_output::EngineOutput;
-pub(crate) use engine_output::INITIAL_QUEUE_CAPACITY;
 pub use log_id_list::LogIdList;
 pub(crate) use replication_progress::TargetProgress;

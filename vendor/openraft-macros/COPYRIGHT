@@ -2,7 +2,7 @@ openraft-macros
 Copyright the Databend authors and the openraft contributors.
 
 This crate is openraft-macros from https://github.com/databendlabs/openraft,
-commit 8175ca602330a4534a25190d9b64a182859cec9c of its main branch, published
+commit 4251c1c2e673cbbe906910fe9620dff7856293bc of its main branch, published
 under the name coordinode-openraft-macros. Its source is unchanged; only
 Cargo.toml is rewritten for the new package name.
 

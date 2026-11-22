@@ -1,14 +1,15 @@
 use crate::Config;
 use crate::SnapshotPolicy;
 use crate::StepDownPolicy;
+use crate::config::config::check_fits;
 use crate::config::error::ConfigError;
 
 #[test]
 fn test_config_defaults() {
-    let cfg = Config::default();
+    let cfg = Config::default().validate().unwrap();
 
-    assert!(cfg.election_timeout_min >= 150);
-    assert!(cfg.election_timeout_max <= 300);
+    assert_eq!(150, cfg.election_timeout_min);
+    assert_eq!(300, cfg.election_timeout_max);
 
     assert_eq!(50, cfg.heartbeat_interval);
     assert_eq!(300, cfg.max_payload_entries);
@@ -128,6 +129,209 @@ fn test_broadcast_submitted_on_append() {
 }
 
 #[test]
+fn test_log_stage_capacity_configuration() {
+    let config = Config {
+        log_stage_capacity: Some(0),
+        ..Default::default()
+    };
+    let result = config.validate();
+    assert_eq!(ConfigError::LogStageCapacityIs0, result.unwrap_err());
+
+    let config = Config {
+        log_stage_capacity: Some(1),
+        ..Default::default()
+    };
+    let config = config.validate().unwrap();
+    assert_eq!(1, config.log_stage_capacity());
+
+    let config = Config::default().validate().unwrap();
+    assert_eq!(1024, config.log_stage_capacity());
+
+    // On a 32-bit target `usize::MAX` is `u32::MAX`: 2^32 would truncate to 0, so it is rejected.
+    let max_32 = u64::from(u32::MAX);
+    let truncated = check_fits("log_stage_capacity", 1 << 32, max_32);
+    let expected = ConfigError::TooLarge {
+        field: "log_stage_capacity",
+        value: 1 << 32,
+        max: max_32,
+    };
+    assert_eq!(Err(expected), truncated);
+}
+
+/// `log_stage_capacity` must fit `usize`: on a 32-bit target, 2^32 is rejected instead of being
+/// truncated to 0, which would reach `RangeMap::new(0)` when `RuntimeStats` is built.
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn test_log_stage_capacity_must_fit_usize() {
+    let config = Config {
+        log_stage_capacity: Some(1 << 32),
+        ..Default::default()
+    };
+    let error = config.validate().map(|_| ()).unwrap_err();
+    assert!(
+        matches!(error, ConfigError::TooLarge {
+            field: "log_stage_capacity",
+            ..
+        }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn test_heartbeat_interval_must_be_positive() {
+    for enable_heartbeat in [true, false] {
+        let config = Config {
+            heartbeat_interval: 0,
+            enable_heartbeat,
+            ..Default::default()
+        };
+        let result = config.validate().map(|_| ());
+        assert_eq!(
+            Err(ConfigError::HeartbeatIntervalIs0),
+            result,
+            "enable_heartbeat={enable_heartbeat}"
+        );
+    }
+
+    let config = Config {
+        heartbeat_interval: 1,
+        election_timeout_min: 2,
+        election_timeout_max: 3,
+        ..Default::default()
+    };
+    let config = config.validate().unwrap();
+    assert_eq!(1, config.heartbeat_interval);
+
+    // A `heartbeat_min_interval` of 0 still turns heartbeat suppression off.
+    let config = Config {
+        heartbeat_min_interval: Some(0),
+        ..Default::default()
+    };
+    let config = config.validate().unwrap();
+    assert_eq!(0, config.heartbeat_min_interval());
+}
+
+#[test]
+fn test_snapshot_logs_since_last_must_be_positive() {
+    let config = Config {
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(0),
+        ..Default::default()
+    };
+    assert_eq!(
+        Err(ConfigError::SnapshotLogsSinceLastIs0),
+        config.validate().map(|_| ())
+    );
+
+    for policy in [SnapshotPolicy::LogsSinceLast(1), SnapshotPolicy::Never] {
+        let config = Config {
+            snapshot_policy: policy.clone(),
+            ..Default::default()
+        };
+        let config = config.validate().unwrap();
+        assert_eq!(policy, config.snapshot_policy);
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_snapshot_logs_since_last_zero_from_serde_fails_validation() -> anyhow::Result<()> {
+    let mut value = serde_json::to_value(Config::default())?;
+    value["snapshot_policy"] = serde_json::json!({ "LogsSinceLast": 0 });
+    let config: Config = serde_json::from_value(value)?;
+    assert_eq!(SnapshotPolicy::LogsSinceLast(0), config.snapshot_policy);
+    assert_eq!(
+        Err(ConfigError::SnapshotLogsSinceLastIs0),
+        config.validate().map(|_| ())
+    );
+    Ok(())
+}
+
+#[test]
+fn test_snapshot_max_chunk_size_must_form_a_byte_buffer() {
+    let config = Config {
+        snapshot_max_chunk_size: 0,
+        ..Default::default()
+    };
+    assert_eq!(Err(ConfigError::SnapshotMaxChunkSizeIs0), config.validate().map(|_| ()));
+
+    let max = u64::try_from(isize::MAX).unwrap();
+    let config = Config {
+        snapshot_max_chunk_size: max + 1,
+        ..Default::default()
+    };
+    let expected = ConfigError::TooLarge {
+        field: "snapshot_max_chunk_size",
+        value: max + 1,
+        max,
+    };
+    assert_eq!(Err(expected), config.validate().map(|_| ()));
+
+    for size in [1, max, Config::default().snapshot_max_chunk_size] {
+        let config = Config {
+            snapshot_max_chunk_size: size,
+            ..Default::default()
+        };
+        let config = config.validate().unwrap();
+        assert_eq!(size, config.snapshot_max_chunk_size);
+    }
+
+    // On a 32-bit target `isize::MAX` is `i32::MAX`: a chunk size that would truncate to 0 there,
+    // such as 2^32, is rejected.
+    let max_32 = u64::try_from(i32::MAX).unwrap();
+    let truncated = check_fits("snapshot_max_chunk_size", 1 << 32, max_32);
+    assert!(matches!(truncated, Err(ConfigError::TooLarge { .. })), "{truncated:?}");
+}
+
+#[test]
+fn test_channel_sizes_must_fit_usize() {
+    // On a 32-bit target, `usize::MAX` is `u32::MAX`: a larger channel size must be rejected, not
+    // truncated, possibly to 0.
+    let max = u64::from(u32::MAX);
+    assert_eq!(Ok(()), check_fits("api_channel_size", max, max));
+    let too_large = check_fits("api_channel_size", max + 1, max);
+    let expected = ConfigError::TooLarge {
+        field: "api_channel_size",
+        value: max + 1,
+        max,
+    };
+    assert_eq!(Err(expected), too_large);
+
+    // `Config::validate` checks each channel size against `usize::MAX`. On a 64-bit target every
+    // `u64` fits; the runtime check in `Raft::new` rejects what its channels do not accept.
+    #[cfg(target_pointer_width = "64")]
+    {
+        let config = Config {
+            api_channel_size: Some(u64::MAX),
+            ..Default::default()
+        };
+        let config = config.validate().unwrap();
+        assert_eq!(usize::MAX, config.api_channel_size());
+    }
+}
+
+#[test]
+fn test_validate_channel_sizes() {
+    let config = Config {
+        api_channel_size: Some(2),
+        notification_channel_size: Some(3),
+        state_machine_channel_size: Some(4),
+        ..Default::default()
+    };
+    assert_eq!(Ok(()), config.validate_channel_sizes(2..=4));
+
+    // The first size outside the accepted sizes is reported, in field order.
+    for (accepted, field, size) in [
+        (3..=4, "api_channel_size", 2),
+        (2..=2, "notification_channel_size", 3),
+        (2..=3, "state_machine_channel_size", 4),
+    ] {
+        let result = config.validate_channel_sizes(accepted.clone());
+        let expected = ConfigError::ChannelSizeOutOfRange { field, size, accepted };
+        assert_eq!(Err(expected), result);
+    }
+}
+
+#[test]
 fn test_quorum_loss_configuration() {
     let config = Config {
         quorum_loss_probe_interval: Some(599),
@@ -147,8 +351,9 @@ fn test_quorum_loss_configuration() {
         quorum_loss_probe_interval: Some(600),
         ..Default::default()
     };
-    let result = config.validate();
-    assert!(result.is_ok());
+    let config = config.validate().unwrap();
+    assert_eq!(Some(600), config.quorum_loss_probe_interval);
+    assert_eq!(300, config.election_timeout_max);
 
     let config = Config {
         election_timeout_max: u64::MAX,
@@ -259,18 +464,55 @@ fn test_invalid_election_timeout_config_produces_expected_error() {
         election_timeout_min: 1000,
         heartbeat_interval: 1500
     });
+
+    // Equal bounds leave an empty range to sample an election timeout from.
+    let config = Config {
+        election_timeout_min: 1000,
+        election_timeout_max: 1000,
+        ..Default::default()
+    };
+    let err = config.validate().unwrap_err();
+    assert_eq!(err, ConfigError::ElectionTimeout { min: 1000, max: 1000 });
+
+    // A heartbeat interval equal to the election minimum. Suppression is off, so that its own
+    // check cannot reject the setting instead.
+    let config = Config {
+        election_timeout_min: 1000,
+        election_timeout_max: 2000,
+        heartbeat_interval: 1000,
+        heartbeat_min_interval: None,
+        ..Default::default()
+    };
+    let err = config.validate().unwrap_err();
+    assert_eq!(err, ConfigError::ElectionTimeoutLTHeartBeat {
+        election_timeout_min: 1000,
+        heartbeat_interval: 1000
+    });
+
+    // One millisecond inside both bounds is valid.
+    let config = Config {
+        election_timeout_min: 1000,
+        election_timeout_max: 1001,
+        heartbeat_interval: 999,
+        heartbeat_min_interval: None,
+        ..Default::default()
+    };
+    let config = config.validate().unwrap();
+    assert_eq!(1000, config.election_timeout_min);
+    assert_eq!(1001, config.election_timeout_max);
+    assert_eq!(999, config.heartbeat_interval);
 }
 
 #[test]
 fn test_invalid_heartbeat_min_interval_produces_expected_error() {
-    // The tick interval is `heartbeat_interval * 13 / 64` == 101, so the greatest accepted
-    // `heartbeat_min_interval` is `election_timeout_min - heartbeat_interval - 101 - 1` == 398.
+    // The greatest accepted `heartbeat_min_interval` is
+    // `election_timeout_min - heartbeat_interval - 1` == 499.
 
     let config = Config {
         election_timeout_min: 1000,
         election_timeout_max: 2000,
         heartbeat_interval: 500,
-        heartbeat_min_interval: Some(399),
+        heartbeat_min_interval: Some(500),
         ..Default::default()
     };
 
@@ -279,23 +521,49 @@ fn test_invalid_heartbeat_min_interval_produces_expected_error() {
     assert_eq!(err, ConfigError::HeartbeatMinIntervalTooLarge {
         election_timeout_min: 1000,
         heartbeat_interval: 500,
-        heartbeat_min_interval: 399,
+        heartbeat_min_interval: 500,
     });
 
     let config = Config {
         election_timeout_min: 1000,
         election_timeout_max: 2000,
         heartbeat_interval: 500,
-        heartbeat_min_interval: Some(398),
+        heartbeat_min_interval: Some(499),
         ..Default::default()
     };
-    assert!(config.validate().is_ok());
+    let config = config.validate().unwrap();
+    assert_eq!(Some(499), config.heartbeat_min_interval);
+    assert_eq!(499, config.heartbeat_min_interval());
+    assert_eq!(1000, config.election_timeout_min);
+    assert_eq!(2000, config.election_timeout_max);
+    assert_eq!(500, config.heartbeat_interval);
+}
+
+/// The heartbeat gap is computed in `u128`, so a huge `heartbeat_min_interval` is rejected with the
+/// usual error instead of overflowing: a debug build panicked, and a release build wrapped the sum
+/// to 49 and accepted it.
+#[test]
+fn test_heartbeat_min_interval_overflow_returns_an_error() {
+    let config = Config {
+        election_timeout_min: 150,
+        election_timeout_max: 300,
+        heartbeat_interval: 50,
+        heartbeat_min_interval: Some(u64::MAX),
+        ..Default::default()
+    };
+
+    let err = config.validate().unwrap_err();
+    assert_eq!(err, ConfigError::HeartbeatMinIntervalTooLarge {
+        election_timeout_min: 150,
+        heartbeat_interval: 50,
+        heartbeat_min_interval: u64::MAX,
+    });
 }
 
 /// Suppression disabled leaves the heartbeat cadence unchanged, so `election_timeout_min` only has
-/// to exceed `heartbeat_interval`, not the tick interval.
+/// to exceed `heartbeat_interval`.
 #[test]
-fn test_disabled_heartbeat_min_interval_ignores_tick_interval() {
+fn test_disabled_heartbeat_min_interval_only_needs_a_greater_election_timeout() {
     let config = Config {
         election_timeout_min: 101,
         election_timeout_max: 200,
@@ -303,5 +571,10 @@ fn test_disabled_heartbeat_min_interval_ignores_tick_interval() {
         heartbeat_min_interval: None,
         ..Default::default()
     };
-    assert!(config.validate().is_ok());
+    let config = config.validate().unwrap();
+    assert_eq!(None, config.heartbeat_min_interval);
+    assert_eq!(0, config.heartbeat_min_interval());
+    assert_eq!(101, config.election_timeout_min);
+    assert_eq!(200, config.election_timeout_max);
+    assert_eq!(100, config.heartbeat_interval);
 }

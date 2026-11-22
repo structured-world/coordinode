@@ -1,7 +1,6 @@
-# openraft from its upstream main branch, unchanged but for one file taken from
-# a later main commit (see COPYRIGHT), published under this name until an
-# openraft release carries what the workspace needs; then it goes and the
-# workspace depends on openraft again.
+# openraft from its upstream main branch, unchanged (see COPYRIGHT), published
+# under this name until an openraft release carries what the workspace needs;
+# then it goes and the workspace depends on openraft again.
 [package]
 name = "coordinode-openraft"
 description = "openraft (Advanced Raft consensus) from its upstream main branch, as CoordiNode uses it"
@@ -34,7 +33,7 @@ doctest = false
 adapt-network-v1 = []
 bench = ["tokio-rt"]
 bt = ["anyerror/backtrace", "anyhow/backtrace"]
-clap = ["dep:clap", "dep:parse-size"]
+clap = ["dep:clap"]
 compat = ["serde"]
 default = ["tokio-rt", "clap"]
 loosen-follower-log-revert = []
@@ -57,17 +56,15 @@ anyerror = "0.1.10"
 anyhow = { version = "1.0.63", optional = true }
 backoff-series = "0.1.1"
 base2histogram = "0.2.3"
-chrono = "0.4"
 clap = { version = "4.1.11", features = ["derive", "env"], optional = true }
 derive_more = { version = "2.1.1", features = ["std", "from", "try_into", "display"] }
-display-more = "0.2.6"
+display-more = "0.2.7"
 futures-util = "0.3"
 itertools = "0.15"
 maplit = "1.0.2"
 openraft-macros = { package = "coordinode-openraft-macros", version = "0.10.1", path = "../openraft-macros" }
 openraft-rt = { package = "coordinode-openraft-rt", version = "0.10.1", path = "../openraft-rt" }
 openraft-rt-tokio = { package = "coordinode-openraft-rt-tokio", version = "0.10.1", path = "../openraft-rt-tokio", optional = true }
-parse-size = { version = "1.1.0", optional = true }
 peel-off = "0.1.0"
 quorum-set = "0.6.0"
 rand = "0.10"

@@ -6,6 +6,30 @@
 //! Provides [`LocalKey`] and the [`task_local!`](crate::task_local!) macro for declaring
 //! task-scoped variables that are swapped in/out via `scope()` or `sync_scope()`.
 
+/*
+MIT License
+
+Copyright (c) Tokio Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
@@ -28,13 +52,26 @@ use pin_project_lite::pin_project;
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// # mod std {}
+/// # type Option = ();
+/// # #[allow(non_upper_case_globals)]
+/// # const None: ::std::option::Option<u32> = Some(42);
+/// use openraft_rt::task_local;
+///
 /// task_local! {
 ///     pub static ONE: u32;
 ///
 ///     #[allow(unused)]
 ///     static TWO: f32;
 /// }
+///
+/// let before = ONE.try_get();
+/// assert!(before.is_err());
+/// let value = ONE.sync_scope(1, || ONE.get());
+/// assert_eq!(value, 1);
+/// let after = ONE.try_get();
+/// assert!(after.is_err());
 /// ```
 ///
 /// See [`LocalKey`] documentation for more information.
@@ -59,8 +96,10 @@ macro_rules! __task_local_inner {
     ($(#[$attr:meta])* $vis:vis $name:ident, $t:ty) => {
         $(#[$attr])*
         $vis static $name: $crate::task_local::LocalKey<$t> = {
-            std::thread_local! {
-                static __KEY: std::cell::RefCell<Option<$t>> = const { std::cell::RefCell::new(None) };
+            ::std::thread_local! {
+                static __KEY: ::std::cell::RefCell<::std::option::Option<$t>> = const {
+                    ::std::cell::RefCell::new(::std::option::Option::None)
+                };
             }
 
             $crate::task_local::LocalKey { inner: __KEY }
@@ -104,7 +143,9 @@ pub struct LocalKey<T: 'static> {
 impl<T: 'static> LocalKey<T> {
     /// Sets a value `T` as the task-local value for the future `F`.
     ///
-    /// On completion of `scope`, the task-local will be dropped.
+    /// Each poll restores the previous value before returning. The returned future
+    /// keeps the scoped value until it is dropped or the caller takes the value
+    /// with [`TaskLocalFuture::take_value`].
     ///
     /// ### Panics
     ///
@@ -256,8 +297,9 @@ pin_project! {
     /// A future that sets a value `T` of a task local for the future `F` during
     /// its execution.
     ///
-    /// The value of the task-local must be `'static` and will be dropped on the
-    /// completion of the future.
+    /// This future owns the `'static` task-local value even after the inner future
+    /// completes. Dropping this future drops the value unless the caller has
+    /// taken it with [`Self::take_value`].
     ///
     /// Created by the function [`LocalKey::scope`](self::LocalKey::scope).
     pub struct TaskLocalFuture<T, F>
@@ -290,10 +332,33 @@ pin_project! {
 impl<T, F> TaskLocalFuture<T, F>
 where T: 'static
 {
-    /// Returns the value stored in the task local by this `TaskLocalFuture`.
+    /// Takes the task-local value, even after this future has completed.
     ///
-    /// Returns `Some(T)` if the task local value exists, `None` if it has
-    /// already been taken.
+    /// Later calls return `None`. Taking the value before completion leaves
+    /// the key unset during subsequent polls of the inner future.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::pin::pin;
+    /// use openraft_rt::task_local;
+    ///
+    /// task_local! { static MESSAGE: String; }
+    ///
+    /// # futures_util::FutureExt::now_or_never(async {
+    /// let message = String::from("hello");
+    /// let mut scoped = pin!(MESSAGE.scope(message, async {}));
+    /// scoped.as_mut().await;
+    ///
+    /// let outside = MESSAGE.try_get();
+    /// assert!(outside.is_err());
+    /// let value = scoped.as_mut().take_value();
+    /// let text = value.as_deref();
+    /// assert_eq!(text, Some("hello"));
+    /// let taken_again = scoped.as_mut().take_value();
+    /// assert_eq!(taken_again, None);
+    /// # }).unwrap();
+    /// ```
     pub fn take_value(self: Pin<&mut Self>) -> Option<T> {
         let this = self.project();
         this.slot.take()

@@ -164,11 +164,23 @@ where C: RaftTypeConfig
     /// Returns a stream of log entries wrapped in `Result`. I/O errors during reading are
     /// propagated through the stream.
     ///
+    /// # Use by the state-machine worker
+    ///
+    /// The state-machine worker reads every apply batch through this method and collects the
+    /// whole stream into memory before it passes the batch to [`RaftStateMachine::apply()`]. It
+    /// reads the next batch while the state machine applies the current one, so a call may run
+    /// concurrently with `apply()`. Entries committed during that `apply()` are read with one more
+    /// call, of entries just appended, and join the next batch. Streaming entries lazily therefore
+    /// saves neither memory nor latency on this path. Optimize the fixed cost of a call instead,
+    /// such as a seek or a round trip: the worker pays it once or twice per batch, however many
+    /// entries the batch has.
+    ///
     /// # Default Implementation
     ///
     /// The default implementation calls [`Self::try_get_log_entries`] to get all entries and
-    /// converts them to a stream. Applications may implement this for better performance, such as
-    /// streaming entries incrementally.
+    /// converts them to a stream.
+    ///
+    /// [`RaftStateMachine::apply()`]: crate::storage::RaftStateMachine::apply
     #[since(version = "0.10.0")]
     async fn entries_stream<RB>(&mut self, range: RB) -> impl Stream<Item = EntriesStreamResult<C>> + OptionalSend
     where RB: RangeBounds<u64> + Clone + Debug + OptionalSend {

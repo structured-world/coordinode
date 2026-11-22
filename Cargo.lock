@@ -965,7 +965,6 @@ dependencies = [
  "anyerror",
  "backoff-series",
  "base2histogram",
- "chrono",
  "clap",
  "coordinode-openraft-macros",
  "coordinode-openraft-rt",
@@ -975,7 +974,6 @@ dependencies = [
  "futures-util",
  "itertools 0.15.0",
  "maplit",
- "parse-size",
  "peel-off",
  "quorum-set",
  "rand 0.10.4",
@@ -990,7 +988,6 @@ dependencies = [
 name = "coordinode-openraft-macros"
 version = "0.10.1"
 dependencies = [
- "chrono",
  "proc-macro2",
  "quote",
  "semver",
@@ -3796,12 +3793,6 @@ dependencies = [
  "smallvec",
  "windows-link 0.2.1",
 ]
-
-[[package]]
-name = "parse-size"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "487f2ccd1e17ce8c1bfab3a65c89525af41cfad4c8659021a1e9a2aacd73b89b"
 
 [[package]]
 name = "peel-off"

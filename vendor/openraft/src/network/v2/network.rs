@@ -128,16 +128,14 @@ where C: RaftTypeConfig
     /// Return an [`RPCError`] if no reply is received.
     ///
     /// [`AppendResult`] does not implement serde, so the transport sends it in its own wire
-    /// format. To keep sending [`AppendEntriesResponse`], which carries neither log ids nor a
-    /// hint, the follower converts with `AppendEntriesResponse::from(result)` and the leader
-    /// converts back with [`AppendEntriesResponse::into_append_result()`], passing the log ids of
-    /// the request it sent.
+    /// format. A transport that does not carry hints can send [`StreamAppendResult`], a
+    /// serializable format without the hint: both ends convert with `result.map_err(Into::into)`.
+    /// The leader then receives no hint and finds the matching log by binary search.
     ///
     /// [`Raft::append_entries()`]: crate::raft::Raft::append_entries
     /// [`AppendError::Conflict`]: crate::raft::AppendError::Conflict
     /// [`AppendError::HigherVote`]: crate::raft::AppendError::HigherVote
-    /// [`AppendEntriesResponse`]: crate::raft::AppendEntriesResponse
-    /// [`AppendEntriesResponse::into_append_result()`]: crate::raft::AppendEntriesResponse::into_append_result
+    /// [`StreamAppendResult`]: crate::raft::StreamAppendResult
     #[since(version = "0.10.0", change = "returns AppendResult with an optional conflict hint")]
     async fn append_entries(
         &mut self,
@@ -195,8 +193,9 @@ where C: RaftTypeConfig
     ///
     /// The node receiving this message should pass it to [`Raft::pre_vote()`]. Pre-Vote asks the
     /// target whether it *would* grant a vote for `rpc.vote` (a hypothetical `term + 1`) without
-    /// persisting any vote or changing its term. It is only sent when
-    /// [`Config::enable_pre_vote`](crate::Config::enable_pre_vote) is set.
+    /// persisting any vote or changing its term. It is sent when
+    /// [`Config::enable_pre_vote`](crate::Config::enable_pre_vote) is set, and by
+    /// [`Trigger::elect(true)`].
     ///
     /// The default implementation synthesizes a **granting** response, so a network that has not
     /// implemented `pre_vote` makes Pre-Vote a no-op and elections proceed exactly as before (e.g.
@@ -206,7 +205,11 @@ where C: RaftTypeConfig
     /// isolated node would synthesize a quorum of grants and inflate its term, defeating
     /// Pre-Vote.
     ///
+    /// To test an implementation, send a pre-vote from a candidate whose log is behind to a
+    /// leader: the target refuses it, while the default implementation grants it.
+    ///
     /// [`Raft::pre_vote()`]: crate::raft::Raft::pre_vote
+    /// [`Trigger::elect(true)`]: crate::raft::trigger::Trigger::elect
     #[since(version = "0.10.0", change = "added pre_vote RPC for the Pre-Vote feature")]
     async fn pre_vote(&mut self, rpc: VoteRequest<C>, _option: RPCOption) -> Result<VoteResponse<C>, RPCError<C>> {
         // Not implemented: grant unconditionally so Pre-Vote degrades to the normal election path.
@@ -220,7 +223,10 @@ where C: RaftTypeConfig
     /// installed on the target node or rejected because of `vote` being smaller than the
     /// remote one.
     ///
-    /// The default implementation just calls several `install_snapshot` RPCs for each fragment.
+    /// There is no default implementation: `snapshot` holds the whole [`Self::SnapshotData`]
+    /// handle, and the transport decides how to move it. The target calls
+    /// [`Raft::install_full_snapshot()`] only after it holds the complete snapshot; see
+    /// [sending a snapshot](crate::docs::upgrade_guide::upgrade_09_10#sending-a-snapshot).
     ///
     /// The `vote` is the leader vote used to check if the leader is still valid by a
     /// follower.
@@ -266,11 +272,13 @@ where C: RaftTypeConfig
     /// for a while and retries. The duration of the sleep is determined by the backoff
     /// instance.
     ///
-    /// The backoff is an infinite iterator that returns the ith sleep interval before the ith
-    /// retry. The returned instance will be dropped if a successful RPC is made.
+    /// The backoff returns the ith sleep interval before the ith retry. Make it infinite: after
+    /// it ends, Openraft keeps retrying with a fixed delay, as [`Backoff`] describes. The
+    /// returned instance will be dropped if a successful RPC is made.
     ///
     /// Return `None` (the default) to use the backoff configured in
-    /// [`Config::backoff`](crate::Config::backoff).
+    /// [`Config::backoff`](crate::Config::backoff). Only this `None` selects that policy: a
+    /// returned backoff that runs out does not fall back to it.
     #[since(
         version = "0.10.0",
         change = "changed return type to Option<Backoff>; None delegates to Config::backoff"

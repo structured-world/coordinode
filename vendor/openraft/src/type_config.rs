@@ -72,7 +72,9 @@ use crate::vote::raft_vote::RaftVote;
 ///             Self::Payload,
 ///         >,
 ///         Responder<T>     = openraft::impls::OneshotResponder<Self, T>,
+///         Batch<T>         = openraft::impls::InlineBatch<T>,
 ///         AsyncRuntime     = openraft::impls::TokioRuntime,
+///         ErrorSource      = openraft::impls::BoxedErrorSource,
 /// );
 /// ```
 ///
@@ -183,6 +185,7 @@ pub trait RaftTypeConfig:
 
     /// Container for a batch of items that Raft handles together, such as the payloads,
     /// responders and preconditions of consecutive client writes.
+    /// A custom container must follow the [`Batch` sequence contract](Batch#sequence-contract).
     ///
     /// [`declare_raft_types!`](crate::declare_raft_types) defaults it to
     /// [`InlineBatch`](crate::impls::InlineBatch), which stores a single item without heap
@@ -193,7 +196,9 @@ pub trait RaftTypeConfig:
     /// Error wrapper type for storage, network, and membership errors.
     ///
     /// This type is used to wrap underlying errors in storage, network, and membership operations.
-    /// The default implementation uses [`anyerror::AnyError`].
+    /// [`declare_raft_types!`](crate::declare_raft_types) defaults it to
+    /// [`BoxedErrorSource`](crate::impls::BoxedErrorSource), which boxes an
+    /// [`anyerror::AnyError`].
     ///
     /// Custom implementations can provide:
     /// - Enhanced diagnostic capabilities

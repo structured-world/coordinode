@@ -3,15 +3,15 @@
 //! `async` runtime is an abstraction over different asynchronous runtimes, such as `tokio`,
 //! `async-std`, etc.
 
+use std::any::Any;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::future::Future;
-use std::future::poll_fn;
 use std::io;
-use std::pin::pin;
-use std::task::Poll;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use openraft_macros::since;
 
 use crate::CancelHandle;
@@ -26,6 +26,7 @@ use crate::Select3;
 use crate::Select4;
 use crate::TryRecvError;
 use crate::Watch;
+use crate::select2_future::Select2Future;
 
 /// A trait defining interfaces with an asynchronous runtime.
 ///
@@ -65,7 +66,13 @@ pub trait AsyncRuntime: Debug + 'static {
     /// to await the outcome of a [`Future`].
     type Timeout<R, T: Future<Output = R> + OptionalSend>: Future<Output = Result<R, Self::TimeoutError>> + OptionalSend;
 
-    /// Type of thread-local random number generator.
+    /// Type of the random number generator that [`Self::thread_rng`] returns.
+    ///
+    /// Each runtime supplies its own. Tokio, Compio and Monoio return `rand`'s `ThreadRng`, which
+    /// is bound to the calling thread, while
+    /// [`DeterministicRng`](crate::deterministic_rng::DeterministicRng) and the simulator return
+    /// an owned, seeded `SmallRng`. Generic code that moves the generator to another thread needs
+    /// a bound such as `Self::ThreadLocalRng: Send`.
     type ThreadLocalRng: rand::Rng;
 
     /// Spawn a new task.
@@ -75,7 +82,11 @@ pub trait AsyncRuntime: Debug + 'static {
         T: Future + OptionalSend + 'static,
         T::Output: OptionalSend + 'static;
 
-    /// Wait until `duration` has elapsed.
+    /// Wait until `duration` has elapsed since this call.
+    ///
+    /// The deadline is taken when `sleep` is called, as `tokio::time::sleep` does, not when the
+    /// returned future is first polled: a sleep first polled after `duration` has passed is ready
+    /// at once.
     #[track_caller]
     fn sleep(duration: Duration) -> Self::Sleep;
 
@@ -83,11 +94,17 @@ pub trait AsyncRuntime: Debug + 'static {
     #[track_caller]
     fn sleep_until(deadline: Self::Instant) -> Self::Sleep;
 
-    /// Require a [`Future`] to complete before the specified duration has elapsed.
+    /// Require a [`Future`] to complete before `duration` has elapsed since this call.
+    ///
+    /// The deadline is taken when `timeout` is called, as for [`Self::sleep`]. Each poll polls
+    /// `future` before it checks the deadline, as `tokio::time::timeout` does, so a `future` that
+    /// is ready when the deadline has passed still completes with its output.
     #[track_caller]
     fn timeout<R, F: Future<Output = R> + OptionalSend>(duration: Duration, future: F) -> Self::Timeout<R, F>;
 
     /// Require a [`Future`] to complete before the specified instant in time.
+    ///
+    /// As with [`Self::timeout`], each poll polls `future` before it checks `deadline`.
     #[track_caller]
     fn timeout_at<R, F: Future<Output = R> + OptionalSend>(deadline: Self::Instant, future: F) -> Self::Timeout<R, F>;
 
@@ -120,24 +137,7 @@ pub trait AsyncRuntime: Debug + 'static {
         A: Future + OptionalSend,
         B: Future + OptionalSend,
     {
-        async move {
-            let mut a = pin!(a);
-            let mut b = pin!(b);
-            let select = poll_fn(move |cx| {
-                let first = a.as_mut().poll(cx);
-                if let Poll::Ready(value) = first {
-                    let selected = Select2::First(value);
-                    return Poll::Ready(selected);
-                }
-                let second = b.as_mut().poll(cx);
-                if let Poll::Ready(value) = second {
-                    let selected = Select2::Second(value);
-                    return Poll::Ready(selected);
-                }
-                Poll::Pending
-            });
-            select.await
-        }
+        Select2Future::new(a, b)
     }
 
     /// Wait for one of three futures to complete, returning its output.
@@ -155,15 +155,15 @@ pub trait AsyncRuntime: Debug + 'static {
         B: Future + OptionalSend,
         C: Future + OptionalSend,
     {
-        async move {
-            let tail = Self::select2(b, c);
-            let selected = Self::select2(a, tail).await;
-            match selected {
-                Select2::First(value) => Select3::First(value),
-                Select2::Second(Select2::First(value)) => Select3::Second(value),
-                Select2::Second(Select2::Second(value)) => Select3::Third(value),
-            }
-        }
+        // An `async` block would reserve the bytes of `a`, `b` and `c` twice: once for the captured
+        // variables and once in the select future it polls (rust-lang/rust#62958). `map()` stores
+        // them once.
+        let tail = Self::select2(b, c);
+        Self::select2(a, tail).map(|selected| match selected {
+            Select2::First(value) => Select3::First(value),
+            Select2::Second(Select2::First(value)) => Select3::Second(value),
+            Select2::Second(Select2::Second(value)) => Select3::Third(value),
+        })
     }
 
     /// Wait for one of four futures to complete, returning its output.
@@ -183,17 +183,14 @@ pub trait AsyncRuntime: Debug + 'static {
         C: Future + OptionalSend,
         D: Future + OptionalSend,
     {
-        async move {
-            let head = Self::select2(a, b);
-            let tail = Self::select2(c, d);
-            let selected = Self::select2(head, tail).await;
-            match selected {
-                Select2::First(Select2::First(value)) => Select4::First(value),
-                Select2::First(Select2::Second(value)) => Select4::Second(value),
-                Select2::Second(Select2::First(value)) => Select4::Third(value),
-                Select2::Second(Select2::Second(value)) => Select4::Fourth(value),
-            }
-        }
+        let head = Self::select2(a, b);
+        let tail = Self::select2(c, d);
+        Self::select2(head, tail).map(|selected| match selected {
+            Select2::First(Select2::First(value)) => Select4::First(value),
+            Select2::First(Select2::Second(value)) => Select4::Second(value),
+            Select2::Second(Select2::First(value)) => Select4::Third(value),
+            Select2::Second(Select2::Second(value)) => Select4::Fourth(value),
+        })
     }
 
     /// Check if the [`Self::JoinError`] is `panic`.
@@ -204,8 +201,8 @@ pub trait AsyncRuntime: Debug + 'static {
     ///
     /// # Note
     ///
-    /// This is a per-thread instance, which cannot be shared across threads or
-    /// sent to another thread.
+    /// Whether the generator can move to another thread depends on the runtime: see
+    /// [`Self::ThreadLocalRng`].
     #[track_caller]
     fn thread_rng() -> Self::ThreadLocalRng;
 
@@ -259,19 +256,23 @@ pub trait AsyncRuntime: Debug + 'static {
 
     /// Run a blocking function on a separate thread.
     ///
-    /// The default implementation spawns a new OS thread for each call.
+    /// The default implementation spawns a new OS thread for each call. When the thread cannot
+    /// be created, the returned future resolves to the error of the operating system. When `f`
+    /// panics, it resolves to an error that reports the panic and its message.
     /// Runtime implementations may override this with their own thread pool
     /// (e.g., tokio's `spawn_blocking`) for better resource management.
+    #[since(version = "0.10.2", change = "the default returns a thread-creation error")]
+    #[since(version = "0.10.2", change = "the default reports a panic of `f` as an error")]
     fn spawn_blocking<F, T>(f: F) -> impl Future<Output = Result<T, io::Error>> + Send
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
         let (tx, rx) = futures_channel::oneshot::channel();
-        std::thread::spawn(move || {
-            tx.send(f()).ok();
+        let spawned = std::thread::Builder::new().spawn(move || {
+            tx.send(std::panic::catch_unwind(AssertUnwindSafe(f))).ok();
         });
-        async { rx.await.map_err(|_| io::Error::other("spawn_blocking task cancelled")) }
+        blocking_output(spawned.map(drop), rx)
     }
 
     /// Try to poll a value from the channel within the given deadline.
@@ -302,9 +303,12 @@ pub trait AsyncRuntime: Debug + 'static {
     /// Wrap a future with a cancellation handle.
     ///
     /// The returned future yields `Some(output)` when the supplied future completes, or `None`
-    /// when the handle is signalled or dropped. Cancellation is polled first when both are ready.
+    /// when the handle is signalled or dropped. Cancellation is polled first when both are ready,
+    /// and a cancellation that happened before a poll keeps that poll from polling the supplied
+    /// future.
     /// The caller polls or spawns the returned future; borrowed futures are supported.
     /// Use [`Self::cancellable_by`] when a cancellation future is already available.
+    #[since(version = "0.10.2", change = "cancelling before a poll keeps the work unpolled")]
     #[since(version = "0.10.1")]
     fn cancellable<F>(
         future: F,
@@ -316,8 +320,8 @@ pub trait AsyncRuntime: Debug + 'static {
         Self: Sized,
         F: Future + OptionalSend,
     {
-        let (handle, cancelled) = CancelHandle::new();
-        let future = Self::cancellable_by(future, cancelled);
+        let handle = CancelHandle::new();
+        let future = Self::cancellable_by(future, handle.cancelled());
         (handle, future)
     }
 
@@ -331,12 +335,58 @@ pub trait AsyncRuntime: Debug + 'static {
         F: Future + OptionalSend,
         Cancel: Future + OptionalSend,
     {
-        async move {
-            let selected = Self::select2(cancel, future).await;
-            match selected {
-                Select2::First(_) => None,
-                Select2::Second(output) => Some(output),
-            }
-        }
+        Self::select2(cancel, future).map(|selected| match selected {
+            Select2::First(_) => None,
+            Select2::Second(output) => Some(output),
+        })
+    }
+}
+
+/// The output of a blocking worker: the error that kept its thread from starting, or else what
+/// the worker sends through `rx`.
+async fn blocking_output<T>(
+    spawned: io::Result<()>,
+    rx: futures_channel::oneshot::Receiver<std::thread::Result<T>>,
+) -> Result<T, io::Error> {
+    spawned?;
+    match rx.await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(payload)) => Err(io::Error::other(format!(
+            "spawn_blocking worker panicked: {}",
+            panic_message(payload.as_ref())
+        ))),
+        Err(_) => Err(io::Error::other("spawn_blocking worker sent no result")),
+    }
+}
+
+/// The message of a panic payload: the payload of `panic!` is a `&'static str` or a `String`.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    if let Some(msg) = payload.downcast_ref::<&'static str>() {
+        msg
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg
+    } else {
+        "the panic payload is not a string"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use futures_util::FutureExt;
+
+    use super::blocking_output;
+
+    /// A thread-creation error is returned at once, without waiting for a worker result.
+    #[test]
+    fn test_blocking_output_returns_the_spawn_error() {
+        let (_tx, rx) = futures_channel::oneshot::channel::<std::thread::Result<u32>>();
+        let spawned = Err(io::Error::from(io::ErrorKind::WouldBlock));
+
+        let got = blocking_output(spawned, rx).now_or_never();
+
+        let err = got.expect("the spawn error should not wait for the worker").unwrap_err();
+        assert_eq!(io::ErrorKind::WouldBlock, err.kind());
     }
 }

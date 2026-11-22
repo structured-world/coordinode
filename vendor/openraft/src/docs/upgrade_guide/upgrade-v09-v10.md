@@ -5,6 +5,43 @@ changes for each one. The
 [change log](https://github.com/databendlabs/openraft/blob/release-0.10/change-log/v0.10.0.md)
 describes the new features and links each change to its commits.
 
+## Choose a rollout
+
+Decide how the cluster moves to 0.10 before porting the code. Porting the
+source, reopening the data that 0.9 wrote, and running 0.9 and 0.10 nodes
+side by side are separate questions. The application owns the storage
+format, the RPC codec and the message envelope, so Openraft answers only
+part of each one:
+
+| Question | What Openraft provides | What the application checks |
+|---|---|---|
+| Port the source | This guide lists every breaking change. | Its own code that names Openraft types. |
+| Reopen 0.9 data | With the default types, the serialized form of log entries, `Vote`, `StoredMembership`, `SnapshotMeta` and `SnapshotSignature` is unchanged; see [Data and wire compatibility](#data-and-wire-compatibility). | Its storage layout, codec and state-machine format: start the new binary on a copy of real 0.9 data. |
+| Run 0.9 and 0.10 nodes together | No end-to-end test. Some RPC types keep their 0.9 encoding and some do not; see [Data and wire compatibility](#data-and-wire-compatibility). | Every message, response and error body its transport carries, in both directions. |
+| Roll back after 0.10 wrote data | Only `SnapshotMeta` and `SnapshotSignature` are tested in both directions. | Plan the upgrade as forward-only, unless it has tested 0.9 on data that 0.10 wrote. |
+
+A rolling upgrade, one node at a time, needs at least these checks:
+
+1. Encode every RPC, response and error body with one build and decode it
+   with the other, both ways, inside the application's real envelope.
+2. Run a cluster with nodes of both versions in a test: replicate, fail
+   over to a leader of each version, and catch up a lagging node by
+   snapshot.
+3. Leave the features that need new RPCs off until every node runs 0.10:
+   [`Config::enable_pre_vote`][] and [`Trigger::transfer_leader()`][].
+4. Take a backup and verify that it restores.
+
+Without these checks, use a cold restart: stop every node, take and verify
+a backup, upgrade every node, then start them again.
+
+A startup check that refuses to start next to old nodes helps but proves
+little: it sees only the nodes it reaches, and an unreachable node may
+still be running. Carry an explicit protocol version in the transport's
+handshake and reject a peer whose version differs, instead of comparing
+release numbers.
+
+## Port the code
+
 An application that uses [`declare_raft_types!`][], the default types and the
 Tokio runtime typically needs only these steps:
 
@@ -17,10 +54,12 @@ Tokio runtime typically needs only these steps:
    [Type config](#type-config).
 4. Update the log store and the state machine; see
    [Log storage and state machine](#log-storage-and-state-machine).
-5. Implement [`RaftNetworkV2`][], or wrap a v1 network with `openraft-legacy`;
+5. Run the storage test suites against the ported stores before anything
+   else; see [Test suite](#test-suite).
+6. Implement [`RaftNetworkV2`][], or wrap a v1 network with `openraft-legacy`;
    see [Network](#network).
-6. Update the calls into [`Raft`][]; see [Raft API](#raft-api).
-7. Build [`Config`][] with `..Default::default()`; see [Config](#config).
+7. Update the calls into [`Raft`][]; see [Raft API](#raft-api).
+8. Build [`Config`][] with `..Default::default()`; see [Config](#config).
 
 The other sections matter to code that names Openraft types generically,
 implements its own entry, membership, responder or runtime types, or matches
@@ -276,6 +315,43 @@ still needed, `?` converts an `io::Error` into one.
   }
   ```
 
+- The client gets its answer when the responder sends it, not when `apply()`
+  returns. Send a response only once the entry's effects and the applied log
+  id are where [`RaftStateMachine::apply()`][] requires them. A state machine that persists its state must have made them
+  durable; one that commits a transaction per call holds the responses until
+  the commit:
+
+  ```ignore
+  let mut txn = self.db.transaction();
+  let mut responses = Vec::new();
+  while let Some((entry, responder)) = entries.try_next().await? {
+      let response = match entry.payload {
+          EntryPayload::Blank => Response::none(),
+          EntryPayload::Normal(req) => txn.execute(req)?,
+          EntryPayload::Membership(m) => {
+              txn.save_membership(StoredMembership::new(Some(entry.log_id), m))?;
+              Response::none()
+          }
+      };
+      txn.save_applied(entry.log_id)?;
+      responses.push((responder, response));
+  }
+  txn.commit_durably()?;
+  for (responder, response) in responses {
+      if let Some(responder) = responder {
+          responder.send(response);
+      }
+  }
+  ```
+
+  A state machine kept in memory makes each entry visible to readers before
+  it sends the response. After a restart, Openraft installs its last
+  persisted snapshot and replays the logs after it, up to the committed log
+  id that [`RaftLogStorage::save_committed()`][] persisted. The log store
+  must keep those logs and implement `save_committed()`. Blank and membership
+  entries advance the applied log id like any other entry, and a membership
+  entry also replaces the stored membership.
+
 - `try_create_snapshot_builder()` lets a state machine defer a snapshot that
   Openraft requests. `get_snapshot_builder()` is still required; it will be
   replaced by `try_create_snapshot_builder()`.
@@ -361,7 +437,20 @@ Wipe such a node and add it back to the cluster.
   type as its type parameter.
 - New cases check `entries_stream()` and `leader_bounded_stream()`, that a log
   reader sees entries appended after it was created, and the startup checks
-  above.
+  above. The suite also checks the boundaries a port most easily gets wrong:
+  `purge(id)` removes `id` too, `truncate_after(id)` keeps it, and once every
+  entry is purged, `get_log_state()` reports the last purged log id as the last
+  log id.
+- [`ApplicationSuite`][] is new in 0.10.1. It applies the same entries,
+  including blank and membership entries, all together, one at a time and in
+  uneven groups, and compares the responses, the application state and the
+  applied state with the results the application expects. A port that changed
+  how `apply()` groups or acknowledges entries runs it through an
+  [`ApplicationStoreBuilder`][].
+
+Passing both suites does not test the application's restart, crash recovery
+or snapshot transport: those need tests of their own, run against the real
+store and transport.
 
 ## Network
 
@@ -391,6 +480,33 @@ impl RaftNetworkFactory<TypeConfig> for MyFactory {
 tokio's `AsyncRead`, `AsyncWrite` and `AsyncSeek`, as 0.9 required without
 `generic-snapshot-data`. A network that overrode `full_snapshot()` with
 `generic-snapshot-data` implements `RaftNetworkV2::full_snapshot()` instead.
+
+### Sending a snapshot
+
+`RaftNetworkV2::full_snapshot()` receives the whole snapshot as the state
+machine's `SnapshotData` handle, not as one network message. With a v1
+network, Openraft splits a snapshot into `install_snapshot()` chunks; a
+`RaftNetworkV2` transport moves the data itself. For a snapshot in a single
+file, a transfer needs at least these steps:
+
+1. Stage each transfer in a file of its own on the target, created new for
+   that transfer. A fixed scratch name lets a retried or an overlapping
+   transfer append to another transfer's file.
+2. Send chunks of a bounded size, such as `RPCOption::snapshot_chunk_size()`,
+   and stop reading and sending when `cancel` resolves, returning
+   `StreamingError::Closed` with its value.
+3. After the last chunk, flush and sync the file on the target, check it
+   against what the sender declared, such as its length or checksum, and
+   rewind it. Only then call [`Raft::install_full_snapshot()`][] with the
+   vote and the `SnapshotMeta`; its response answers the sender.
+4. Delete the staging file of a transfer that was cancelled or failed.
+
+Test a transfer that disconnects in the middle and is retried, and two
+transfers that overlap. The `raft-kv-rocksdb` example sends a snapshot
+directory this way, as one streamed request per transfer into a new
+directory: see its
+[client](https://github.com/databendlabs/openraft/blob/main/examples/raft-kv-rocksdb/src/network/client.rs)
+and [server](https://github.com/databendlabs/openraft/blob/main/examples/raft-kv-rocksdb/src/network/server.rs).
 
 ### Chunked snapshots
 
@@ -447,7 +563,8 @@ Replace `is_success()` with `is_ok()`, and `is_conflict()` with
 
 A transport that pipelines AppendEntries overrides `stream_append()`, which
 by default sends the requests one by one through `append_entries()`, and the
-follower passes the received stream to [`Raft::stream_append()`][].
+follower passes the received stream to [`Raft::stream_append()`][]. A port can
+keep the default first and add pipelining later, measured on its own.
 
 ### Other network changes
 
@@ -465,10 +582,12 @@ follower passes the received stream to [`Raft::stream_append()`][].
   exhaustive patterns.
 - `NetworkError` and `Unreachable` take the type config, as in
   `NetworkError::<C>::new(&e)` or `Unreachable::<C>::from_string("msg")`.
-- To use Pre-Vote and leadership transfer, implement `RaftNetworkV2::pre_vote()`
-  and `transfer_leader()`, and pass received requests to `Raft::pre_vote()`
-  and `Raft::handle_transfer_leader()`. By default, `pre_vote()` grants the
-  vote and `transfer_leader()` reports the target unreachable.
+- Implement `RaftNetworkV2::pre_vote()` and `transfer_leader()`, and pass
+  received requests to `Raft::pre_vote()` and `Raft::handle_transfer_leader()`.
+  By default, `pre_vote()` grants the vote without contacting the target, so
+  Pre-Vote no longer protects the term, and `transfer_leader()` reports the
+  target unreachable, also when Openraft hands over from a removed leader. See
+  [Pre-Vote and leadership transfer](crate::docs::getting_started#pre-vote-and-leadership-transfer).
 - `RaftNetworkFactory::new_heartbeat_client()` and `new_snapshot_client()`
   can create dedicated heartbeat and snapshot connections, so a transport that
   cannot multiplex one connection avoids head-of-line blocking. By default
@@ -628,6 +747,11 @@ how to select one.
 - Handle `ClientWriteError::LogEntryDiscarded` apart from `ForwardToLeader`:
   the entry was accepted and then discarded, so its commit status is unknown,
   and a retry needs application-level deduplication.
+- Errors and metrics take the type config as a parameter, so an application
+  with several Raft groups has one type per group. Translate them into
+  application types at its API boundary rather than sending them to clients;
+  see [exposing Raft to clients](crate::docs::components::application_api),
+  which also lists how a client retries each rejection.
 
 Public enums gain variants, which exhaustive matches handle:
 
@@ -675,8 +799,11 @@ Public enums gain variants, which exhaustive matches handle:
   `heartbeat_min_interval`:
 
   ```text
-  heartbeat_interval + heartbeat_min_interval + heartbeat_interval * 13 / 64 < election_timeout_min
+  heartbeat_interval + heartbeat_min_interval < election_timeout_min
   ```
+
+  0.10.0 also adds its tick interval, `heartbeat_interval * 13 / 64`, to the
+  left side.
 
 ## Custom async runtimes
 
@@ -747,8 +874,6 @@ These items still compile, with a deprecation warning:
   leading until `Trigger::refresh_server_state()` is called.
 - The log id of the entry that `Raft::initialize()` writes names the
   initializing node instead of node 0.
-- The first tick comes up to one tick interval later than in 0.9, so a test
-  that expects a leader within a tight startup budget may need more time.
 - The API, notification and state-machine channels are bounded, so a burst of
   requests waits for capacity instead of growing memory.
 - Retries to an unreachable node start at 200 ms and double up to 1 s, where
@@ -770,23 +895,31 @@ under named and positional formats such as `bincode` and `postcard` alike.
 The standard `LeaderId` still encodes `voted_for` as an `Option`, and rejects
 a stored `None`.
 
-Between 0.9 and 0.10 peers, snapshot metadata and the v1
-`InstallSnapshotRequest` keep their 0.9 layout in named and positional
-formats alike. With a named-field format such as JSON, a missing
-`VoteRequest::leadership_transfer_from` decodes as `None`, and a missing
-`ForwardToLeader::reason` as `NotLeader`; a positional format such as
-`bincode` cannot decode a `ForwardToLeader` written by 0.9. Error bodies do
-not interoperate, because `StorageError` was an enum in 0.9 and is a struct in
-0.10: treat a serialized error from a peer of another version as diagnostic
-text.
+Between 0.9 and 0.10 peers, `AppendEntriesRequest`, `AppendEntriesResponse`,
+`VoteResponse`, snapshot metadata and the v1 `InstallSnapshotRequest` keep
+their 0.9 layout in named and positional formats alike. `VoteRequest` gained
+`leadership_transfer_from` and `ForwardToLeader` gained `reason`. With a
+named-field format such as JSON, a missing field decodes as `None` and
+`NotLeader`, and a 0.9 node ignores the extra one. A positional format such
+as `bincode` cannot carry either type across versions: a 0.10 node fails to
+decode one written by 0.9, and a 0.9 node decodes one written by 0.10 only
+if it ignores trailing bytes, so it misreads whatever follows the value in
+the application's envelope. 0.9 has no Pre-Vote or TransferLeader RPC.
+`openraft-legacy` keeps the v1 `RaftNetwork` and its chunked snapshot
+messages; it does not change how the application encodes the other RPCs.
+Error bodies do not interoperate, because `StorageError` was an enum in 0.9
+and is a struct in 0.10: treat a serialized error from a peer of another
+version as diagnostic text.
 
 [`Config`]: crate::Config
 [`Config::allow_log_reversion`]: crate::Config::allow_log_reversion
+[`Config::enable_pre_vote`]: crate::Config::enable_pre_vote
 [`Raft`]: crate::Raft
 [`Raft::add_learner()`]: crate::Raft::add_learner
 [`Raft::change_membership()`]: crate::Raft::change_membership
 [`Raft::initialize()`]: crate::Raft::initialize
 [`Raft::stream_append()`]: crate::Raft::stream_append
+[`Raft::install_full_snapshot()`]: crate::Raft::install_full_snapshot
 [`Raft::wait()`]: crate::Raft::wait
 [`RaftTypeConfig`]: crate::RaftTypeConfig
 [`declare_raft_types!`]: crate::declare_raft_types
@@ -798,11 +931,16 @@ text.
 [`SnapshotSignature`]: crate::storage::SnapshotSignature
 [`RaftNetworkV2`]: crate::network::RaftNetworkV2
 [`RaftNetworkFactory`]: crate::network::RaftNetworkFactory
+[`Trigger::transfer_leader()`]: crate::raft::trigger::Trigger::transfer_leader
 [`Wait`]: crate::metrics::Wait
 [`Membership`]: crate::impls::Membership
 [`ChangeMembers`]: crate::impls::ChangeMembers
 [`leader_id_std::LeaderId`]: crate::impls::leader_id_std::LeaderId
 [`openraft::testing::log::Suite`]: crate::testing::log::Suite
+[`ApplicationSuite`]: crate::testing::log::ApplicationSuite
+[`ApplicationStoreBuilder`]: crate::testing::log::ApplicationStoreBuilder
+[`RaftStateMachine::apply()`]: crate::storage::RaftStateMachine::apply
+[`RaftLogStorage::save_committed()`]: crate::storage::RaftLogStorage::save_committed
 [`single-threaded`]: crate::docs::feature_flags#feature-flag-single-threaded
 [`openraft-legacy`]: https://crates.io/crates/openraft-legacy
 [`openraft-membership`]: https://crates.io/crates/openraft-membership

@@ -35,7 +35,7 @@ fn test_build() -> anyhow::Result<()> {
         "--election-timeout-min=10",
         "--election-timeout-max=20",
         "--heartbeat-interval=5",
-        "--install-snapshot-timeout=200",
+        "--install-snapshot-timeout=231",
         "--max-payload-entries=201",
         "--snapshot-policy=since_last:202",
         "--replication-lag-threshold=203",
@@ -51,7 +51,7 @@ fn test_build() -> anyhow::Result<()> {
     assert_eq!(20, config.election_timeout_max);
     assert_eq!(5, config.heartbeat_interval);
 
-    assert_eq!(200, config.install_snapshot_timeout);
+    assert_eq!(231, config.install_snapshot_timeout);
     assert_eq!(201, config.max_payload_entries);
     assert_eq!(SnapshotPolicy::LogsSinceLast(202), config.snapshot_policy);
     assert_eq!(203, config.replication_lag_threshold);
@@ -61,8 +61,11 @@ fn test_build() -> anyhow::Result<()> {
     assert_eq!(Some(208), config.api_channel_size);
     assert_eq!(Some(209), config.notification_channel_size);
 
-    // Test config methods
-    assert_eq!(Duration::from_millis(200), config.install_snapshot_timeout());
+    // Test config methods. 231 differs from the default of 200, so a builder that ignored the
+    // option would fail here.
+    let timeout = config.install_snapshot_timeout();
+    let expected_timeout = Duration::from_millis(231);
+    assert_eq!(expected_timeout, timeout);
     Ok(())
 }
 
@@ -74,8 +77,17 @@ fn test_config_snapshot_policy() -> anyhow::Result<()> {
     let config = Config::build(&["foo", "--snapshot-policy=since_last:3"])?;
     assert_eq!(SnapshotPolicy::LogsSinceLast(3), config.snapshot_policy);
 
-    let res = Config::build(&["foo", "--snapshot-policy=bar:3"]);
-    assert!(res.is_err());
+    let zero = Config::build(&["foo", "--snapshot-policy=since_last:0"]);
+    assert_eq!(Err(ConfigError::SnapshotLogsSinceLastIs0), zero.map(|_| ()));
+
+    let args = ["foo", "--snapshot-policy=bar:3"];
+    let error = Config::build(&args).unwrap_err();
+    let ConfigError::ParseError { source, args: returned } = error else {
+        panic!("expected ConfigError::ParseError, got: {error:?}");
+    };
+    assert_eq!(args, returned.as_slice());
+    let reason = source.to_string();
+    assert!(reason.contains("snapshot policy string is invalid"), "{reason}");
 
     Ok(())
 }
@@ -98,8 +110,14 @@ fn test_config_removed_leader_step_down() -> anyhow::Result<()> {
     let config = Config::build(&["foo", "--removed-leader-step-down=500"])?;
     assert_eq!(StepDownPolicy::After(500), config.removed_leader_step_down);
 
-    let res = Config::build(&["foo", "--removed-leader-step-down=bar"]);
-    assert!(res.is_err());
+    let args = ["foo", "--removed-leader-step-down=bar"];
+    let error = Config::build(&args).unwrap_err();
+    let ConfigError::ParseError { source, args: returned } = error else {
+        panic!("expected ConfigError::ParseError, got: {error:?}");
+    };
+    assert_eq!(args, returned.as_slice());
+    let reason = source.to_string();
+    assert!(reason.contains("invalid digit found in string"), "{reason}");
 
     Ok(())
 }
@@ -411,6 +429,42 @@ fn test_config_lifecycle_latency_capacity() -> anyhow::Result<()> {
     // Method with Some returns the value
     config.log_stage_capacity = Some(2048);
     assert_eq!(2048, config.log_stage_capacity());
+
+    // Zero is rejected
+    let result = Config::build(&["foo", "--log-stage-capacity=0"]);
+    assert_eq!(ConfigError::LogStageCapacityIs0, result.unwrap_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_config_snapshot_max_chunk_size() -> anyhow::Result<()> {
+    let config = Config::build(&["foo", "--snapshot-max-chunk-size=1"])?;
+    assert_eq!(1, config.snapshot_max_chunk_size);
+
+    let zero = Config::build(&["foo", "--snapshot-max-chunk-size=0"]);
+    assert_eq!(Err(ConfigError::SnapshotMaxChunkSizeIs0), zero.map(|_| ()));
+
+    let max = u64::try_from(isize::MAX)?;
+    let too_large = format!("--snapshot-max-chunk-size={}", max + 1);
+    let too_large = Config::build(&["foo", &too_large]);
+    let expected = ConfigError::TooLarge {
+        field: "snapshot_max_chunk_size",
+        value: max + 1,
+        max,
+    };
+    assert_eq!(Err(expected), too_large.map(|_| ()));
+
+    Ok(())
+}
+
+#[test]
+fn test_config_heartbeat_interval() -> anyhow::Result<()> {
+    let config = Config::build(&["foo", "--heartbeat-interval=1"])?;
+    assert_eq!(1, config.heartbeat_interval);
+
+    let zero = Config::build(&["foo", "--heartbeat-interval=0"]);
+    assert_eq!(Err(ConfigError::HeartbeatIntervalIs0), zero.map(|_| ()));
 
     Ok(())
 }

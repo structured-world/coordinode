@@ -10,8 +10,12 @@ use std::pin::Pin;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
 use std::time::Duration;
 
 use openraft_macros::since;
@@ -24,12 +28,14 @@ use crate::OneshotSender;
 use crate::Select2;
 use crate::Select3;
 use crate::Select4;
+use crate::SendError;
 use crate::Watch;
 use crate::mpsc::Mpsc;
 use crate::mpsc::MpscReceiver;
 use crate::mpsc::MpscSender;
 use crate::mpsc::MpscWeakSender;
 use crate::mpsc::TryRecvError;
+use crate::watch::RecvError;
 use crate::watch::WatchReceiver;
 use crate::watch::WatchSender;
 
@@ -102,11 +108,13 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
             Self::test_mpsc_send().await;
             Self::test_mpsc_send_to_closed_channel().await;
             Self::test_mpsc_backpressure().await;
+            Self::test_mpsc_buffer_size_range().await;
             Self::test_buffered_receiver_backlog().await;
             Self::test_buffered_receiver_empty_close().await;
             Self::test_buffered_receiver_drop_idle().await;
             Self::test_buffered_receiver_drop_backlog().await;
             Self::test_buffered_receiver_cancel_receive().await;
+            Self::test_buffered_receiver_keeps_a_pending_receive().await;
             #[cfg(feature = "single-threaded")]
             Self::test_buffered_receiver_non_send().await;
             Self::test_mpsc_try_peek_preserves_order().await;
@@ -118,7 +126,9 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
             #[cfg(feature = "single-threaded")]
             Self::test_mpsc_try_peek_non_send().await;
             Self::test_mpsc_peek_waits_for_item().await;
+            Self::test_mpsc_peek_wakes_on_send().await;
             Self::test_mpsc_peek_closed().await;
+            Self::test_mpsc_peek_wakes_on_close().await;
 
             Self::test_watch_init_value().await;
             Self::test_watch_overwrite_init_value().await;
@@ -129,6 +139,7 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
             Self::test_watch_changed_marks_as_seen().await;
             Self::test_watch_borrow_and_update_marks_seen().await;
             Self::test_watch_changed_returns_immediately_when_unseen().await;
+            Self::test_watch_changed_reports_final_value_before_close().await;
             Self::test_watch_multiple_borrow_then_changed().await;
             Self::test_watch_wait_loop_pattern().await;
             Self::test_watch_multiple_receivers().await;
@@ -177,33 +188,22 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         }
     }
 
-    /// Test `thread_rng()` returns a working random number generator.
+    /// The runtime's RNG can sample values, and `random_range()` stays within its bounds.
+    ///
+    /// This is only a smoke check: the RNG of a runtime is not seeded, so its sequence cannot be
+    /// checked. [`DetsimSuite`] checks the sequence of a seeded RNG.
     pub async fn test_thread_rng() {
         use rand::RngExt;
 
         let mut rng = Rt::thread_rng();
 
-        // Generate some random numbers to verify the RNG works
-        let r1: u32 = rng.random();
-        let r2: u32 = rng.random();
-        let r3: u32 = rng.random();
+        let _: u32 = rng.random();
+        let _: bool = rng.random();
 
-        // While theoretically possible for all to be equal, it's astronomically unlikely
-        // This just verifies the RNG is functioning and producing values
-        let all_same = r1 == r2 && r2 == r3;
-        assert!(
-            !all_same || r1 != 0,
-            "RNG should produce varying values (got {r1}, {r2}, {r3})"
-        );
-
-        // Test range generation
         for _ in 0..100 {
             let value: u32 = rng.random_range(0..100);
             assert!(value < 100, "random_range should respect upper bound");
         }
-
-        // Test bool generation works
-        let _: bool = rng.random();
     }
 
     pub async fn test_sleep() {
@@ -212,10 +212,11 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         let sleep = Rt::sleep(dur_10ms);
         let mut sleep = pin!(sleep);
 
+        // On a loaded host the deadline can pass before the first poll, so either result is valid.
         let poll = futures_util::poll!(sleep.as_mut());
-        assert!(matches!(poll, Poll::Pending));
-
-        sleep.await;
+        if poll.is_pending() {
+            sleep.await;
+        }
         let elapsed = start_time.elapsed();
 
         assert!(elapsed >= dur_10ms);
@@ -261,15 +262,11 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
     pub async fn test_instant_sub_instant() {
         let dur_50ms = Duration::from_millis(50);
 
+        // Both instants come from one sample, so the difference is exact.
         let t1 = Rt::Instant::now();
-        Rt::sleep(dur_50ms).await;
-        let t2 = Rt::Instant::now();
+        let t2 = t1 + dur_50ms;
 
-        // t2 - t1 should be approximately 50ms (at least 50ms)
-        let diff = t2 - t1;
-        assert!(diff >= dur_50ms);
-        // Should be less than 200ms (reasonable upper bound)
-        assert!(diff < Duration::from_millis(200));
+        assert_eq!(t2 - t1, dur_50ms);
     }
 
     /// Test `saturating_duration_since` returns zero when `self` is earlier.
@@ -534,6 +531,19 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
 
         let opt_tx = weak_tx.upgrade();
         assert!(opt_tx.is_none());
+
+        // A live strong sender is enough to upgrade, even after the receiver is dropped; the
+        // upgraded sender then returns the value it could not send.
+        let (tx, rx) = Rt::Mpsc::channel::<u32>(5);
+        let weak_tx = tx.downgrade();
+        drop(rx);
+        let upgraded = weak_tx.upgrade().expect("a strong sender is alive");
+        let sent = upgraded.send(19).await;
+        assert_eq!(Err(SendError(19)), sent);
+
+        drop(upgraded);
+        drop(tx);
+        assert!(weak_tx.upgrade().is_none(), "no strong sender is left");
     }
 
     pub async fn test_mpsc_send() {
@@ -541,28 +551,29 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         let tx = Arc::new(tx);
 
         let n_senders = 10_usize;
-        let recv_expected = (0..n_senders).collect::<Vec<_>>();
 
-        for idx in 0..n_senders {
-            let tx = tx.clone();
-            // no need to wait for senders here, we wait by recv()ing
-            let _handle = Rt::spawn(async move {
-                tx.send(idx).await.unwrap();
-            });
+        let handles = (0..n_senders)
+            .map(|idx| {
+                let tx = tx.clone();
+                Rt::spawn(async move { tx.send(idx).await })
+            })
+            .collect::<Vec<_>>();
+        // Only the spawned tasks hold senders now, so the channel closes once they all end, even
+        // when one fails before it sends.
+        drop(tx);
+
+        let mut received = Vec::with_capacity(n_senders);
+        while let Some(value) = rx.recv().await {
+            received.push(value);
         }
 
-        let mut recv = Vec::with_capacity(n_senders);
-        while let Some(recv_number) = rx.recv().await {
-            recv.push(recv_number);
-
-            if recv.len() == n_senders {
-                break;
-            }
+        for handle in handles {
+            let sent = handle.await.unwrap();
+            sent.unwrap();
         }
 
-        recv.sort();
-
-        assert_eq!(recv_expected, recv);
+        received.sort();
+        assert_eq!((0..n_senders).collect::<Vec<_>>(), received);
     }
 
     /// Test that `send()` returns `SendError` when receiver is dropped.
@@ -576,6 +587,24 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         // Verify the value is returned in the error
         let err = result.unwrap_err();
         assert_eq!(err.0, 42);
+    }
+
+    /// `channel()` builds a channel at both ends of `buffer_size_range()`, which includes 1 on
+    /// every runtime.
+    #[since(version = "0.10.2")]
+    pub async fn test_mpsc_buffer_size_range() {
+        let range = Rt::Mpsc::buffer_size_range();
+        assert!(
+            range.contains(&1),
+            "every runtime accepts a buffer of 1, got: {range:?}"
+        );
+
+        let _channel = Rt::Mpsc::channel::<u32>(*range.start());
+        let _channel = Rt::Mpsc::channel::<u32>(*range.end());
+
+        let (tx, mut rx) = Rt::Mpsc::channel::<u32>(1);
+        tx.send(1).await.unwrap();
+        assert_eq!(Some(1), rx.recv().await);
     }
 
     /// Test bounded channel backpressure: `send()` blocks when buffer is full.
@@ -744,6 +773,29 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         assert_eq!(received, Some(10));
     }
 
+    /// A pending peek is woken by a send, and then returns the sent item.
+    async fn test_mpsc_peek_wakes_on_send() {
+        let (tx, rx) = Rt::Mpsc::channel::<u64>(MPSC_PEEK_CAPACITY);
+        let mut rx = rx.peekable();
+        {
+            let woken = Arc::new(WakeFlag::default());
+            let waker = Waker::from(Arc::clone(&woken));
+            let mut cx = Context::from_waker(&waker);
+            let mut peek = pin!(rx.peek());
+            let polled = peek.as_mut().poll(&mut cx);
+            assert!(polled.is_pending(), "a peek on an empty live channel should be pending");
+            let sent = tx.send(10).await;
+            sent.unwrap();
+            assert!(woken.is_set(), "a send should wake the pending peek");
+            let peeked = Rt::timeout(Duration::from_secs(1), peek).await.unwrap();
+            assert_eq!(peeked, Some(&10));
+        }
+        let received = rx.recv().await;
+        assert_eq!(received, Some(10));
+        let empty = rx.try_recv();
+        assert_eq!(empty, Err(TryRecvError::Empty));
+    }
+
     async fn test_mpsc_peek_closed() {
         let (tx, rx) = Rt::Mpsc::channel::<u64>(MPSC_PEEK_CAPACITY);
         let mut rx = rx.peekable();
@@ -755,6 +807,22 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         let received = rx.recv().await;
         assert_eq!(received, Some(10));
         let closed = rx.peek().await;
+        assert_eq!(closed, None);
+    }
+
+    /// A pending peek is woken when the last sender is dropped, and then returns `None`.
+    async fn test_mpsc_peek_wakes_on_close() {
+        let (tx, rx) = Rt::Mpsc::channel::<u64>(MPSC_PEEK_CAPACITY);
+        let mut rx = rx.peekable();
+        let woken = Arc::new(WakeFlag::default());
+        let waker = Waker::from(Arc::clone(&woken));
+        let mut cx = Context::from_waker(&waker);
+        let mut peek = pin!(rx.peek());
+        let polled = peek.as_mut().poll(&mut cx);
+        assert!(polled.is_pending(), "a peek on an empty live channel should be pending");
+        drop(tx);
+        assert!(woken.is_set(), "dropping the last sender should wake the pending peek");
+        let closed = Rt::timeout(Duration::from_secs(1), peek).await.unwrap();
         assert_eq!(closed, None);
     }
 
@@ -797,10 +865,10 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
     }
 
     pub async fn test_watch_send_error_no_receiver() {
-        let (tx, rx) = Rt::Watch::channel(());
+        let (tx, rx) = Rt::Watch::channel(1_u64);
         drop(rx);
-        let send_result = tx.send(());
-        assert!(send_result.is_err());
+        let sent = tx.send(2);
+        assert_eq!(Err(crate::watch::SendError(2)), sent);
     }
 
     pub async fn test_watch_send_if_modified() {
@@ -917,9 +985,6 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
     /// a subsequent call to `changed()` will properly wait for a new value instead of
     /// returning immediately (which would cause a hot loop / 100% CPU usage).
     pub async fn test_watch_changed_marks_as_seen() {
-        let dur_50ms = Duration::from_millis(50);
-        let dur_40ms = Duration::from_millis(40);
-
         let (tx, mut rx) = Rt::Watch::channel(0i32);
 
         // First, borrow the value (does not mark as seen)
@@ -949,25 +1014,16 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
             assert_eq!(*val, 1);
         }
 
-        // Clone tx for the spawned task
-        let tx_clone = tx.clone();
-        let _handle = Rt::spawn(async move {
-            Rt::sleep(dur_50ms).await;
-            tx_clone.send(2).unwrap();
-        });
-
-        // This changed() should wait for the new value (not return immediately)
-        // If changed() doesn't properly mark as seen, this would return immediately
-        // causing a hot loop
-        let start = Rt::Instant::now();
-        rx.changed().await.unwrap();
-        let elapsed = start.elapsed();
-
-        // Should have waited at least ~40ms for the new value
-        assert!(
-            elapsed >= dur_40ms,
-            "changed() returned too quickly ({elapsed:?}), indicating it didn't wait for new value"
-        );
+        // This changed() must wait for a newer value: if the earlier changed() had not marked 1
+        // as seen, it would return at once.
+        {
+            let mut changed = pin!(rx.changed());
+            let polled = futures_util::poll!(changed.as_mut());
+            assert!(polled.is_pending(), "changed() should wait once the value is seen");
+            tx.send(2).unwrap();
+            let changed = Rt::timeout(Duration::from_secs(1), changed).await.unwrap();
+            changed.unwrap();
+        }
 
         // Verify we got the new value
         {
@@ -1038,14 +1094,59 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         }
     }
 
+    /// Test that `changed()` reports a value sent just before the last sender is dropped, once,
+    /// and then the closure.
+    ///
+    /// As with tokio's watch channel, every receiver sees the final value before `changed()`
+    /// returns [`RecvError`], including a receiver that was already waiting when it was sent.
+    #[since(version = "0.10.2")]
+    pub async fn test_watch_changed_reports_final_value_before_close() {
+        // A waiting `changed()` and an idle receiver each see the final value once.
+        {
+            let (tx, mut rx) = Rt::Watch::channel(0i32);
+            let mut rx2 = rx.clone();
+            {
+                let mut changed = pin!(rx.changed());
+                assert!(poll_in_place(changed.as_mut()).is_pending());
+
+                tx.send(1).unwrap();
+                drop(tx);
+
+                assert_eq!(Ok(()), changed.await);
+            }
+            assert_eq!(1, *rx.borrow_watched());
+            assert_eq!(Err(RecvError(())), rx.changed().await);
+
+            assert_eq!(Ok(()), rx2.changed().await);
+            assert_eq!(1, *rx2.borrow_watched());
+            assert_eq!(Err(RecvError(())), rx2.changed().await);
+        }
+
+        // A waiting `wait_until_ge()` returns the final value.
+        {
+            let (tx, mut rx) = Rt::Watch::channel(0i32);
+            let mut wait = pin!(rx.wait_until_ge(&1));
+            assert!(poll_in_place(wait.as_mut()).is_pending());
+
+            tx.send(1).unwrap();
+            drop(tx);
+
+            assert_eq!(Ok(1), wait.await);
+        }
+
+        // A receiver that has seen every value gets the closure at once.
+        {
+            let (tx, mut rx) = Rt::Watch::channel(0i32);
+            drop(tx);
+            assert_eq!(Err(RecvError(())), rx.changed().await);
+        }
+    }
+
     /// Test that multiple borrow_watched() calls don't affect changed() behavior.
     ///
     /// Since borrow_watched() uses borrow() which doesn't mark as seen,
     /// multiple calls shouldn't cause changed() to misbehave.
     pub async fn test_watch_multiple_borrow_then_changed() {
-        let dur_50ms = Duration::from_millis(50);
-        let dur_40ms = Duration::from_millis(40);
-
         let (tx, mut rx) = Rt::Watch::channel(0i32);
 
         // Multiple borrow_watched calls
@@ -1066,17 +1167,14 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
         }
 
         // Now changed() should wait for the next value
-        let tx_clone = tx.clone();
-        let _handle = Rt::spawn(async move {
-            Rt::sleep(dur_50ms).await;
-            tx_clone.send(2).unwrap();
-        });
-
-        let start = Rt::Instant::now();
-        rx.changed().await.unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(elapsed >= dur_40ms, "changed() returned too quickly ({elapsed:?})");
+        {
+            let mut changed = pin!(rx.changed());
+            let polled = futures_util::poll!(changed.as_mut());
+            assert!(polled.is_pending(), "changed() should wait once the value is seen");
+            tx.send(2).unwrap();
+            let changed = Rt::timeout(Duration::from_secs(1), changed).await.unwrap();
+            changed.unwrap();
+        }
 
         {
             let val = rx.borrow_watched();
@@ -1312,9 +1410,23 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
     }
 
     pub async fn test_oneshot_drop_tx() {
+        // A receiver first polled after the sender is dropped resolves to an error.
         let (tx, rx) = Rt::Oneshot::channel::<()>();
         drop(tx);
         assert!(rx.await.is_err());
+
+        // A waiting receiver is woken by the drop, and then resolves to an error, possibly only
+        // after its task yields.
+        let (tx, mut rx) = Rt::Oneshot::channel::<()>();
+        let woken = Arc::new(WakeFlag::default());
+        let waker = Waker::from(Arc::clone(&woken));
+        let mut cx = Context::from_waker(&waker);
+        let polled = Pin::new(&mut rx).poll(&mut cx);
+        assert!(polled.is_pending(), "a receiver with a live sender should be pending");
+        drop(tx);
+        assert!(woken.is_set(), "dropping the sender should wake the waiting receiver");
+        let received = Rt::timeout(Duration::from_secs(1), rx).await.unwrap();
+        assert!(received.is_err());
     }
 
     pub async fn test_oneshot() {
@@ -1564,6 +1676,26 @@ impl<Rt: AsyncRuntime> Suite<Rt> {
     }
 }
 
+/// A waker that records whether it was woken.
+#[derive(Default)]
+struct WakeFlag(AtomicBool);
+
+impl WakeFlag {
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Polls the future and returns its current state.
 fn poll_in_place<F: Future>(fut: Pin<&mut F>) -> Poll<F::Output> {
     let waker = futures_util::task::noop_waker();
@@ -1602,10 +1734,14 @@ impl<Rt: AsyncRuntime> DetsimSuite<Rt> {
 
     pub fn test_all() {
         Self::test_thread_rng_determinism();
+        Self::test_thread_rng_seeded_sequence();
         Self::test_thread_rng_sequence_advances();
         Self::test_spawn_seed_differs_from_parent();
         Self::test_two_spawned_tasks_differ();
         Self::test_scope();
+        Self::test_block_on_seed_is_only_for_the_root();
+        Self::test_nested_wrapper_uses_its_own_seed();
+        Self::test_seed_continues_across_block_on();
     }
 
     /// Same seed produces the same RNG sequence; different seed differs.
@@ -1623,6 +1759,28 @@ impl<Rt: AsyncRuntime> DetsimSuite<Rt> {
 
         let run3 = collect(456);
         assert_ne!(run1, run3, "different seeds should produce different sequences");
+    }
+
+    /// Under a seed, the first `thread_rng()` of the root draws the sequence of a `SmallRng`
+    /// seeded with that seed.
+    ///
+    /// The control's draws differ from each other, so a generator that repeats its first draw
+    /// fails the comparison.
+    fn test_thread_rng_seeded_sequence() {
+        use rand::RngExt;
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+
+        let mut control = SmallRng::seed_from_u64(42);
+        let expected: [u64; 3] = [control.random(), control.random(), control.random()];
+        assert_ne!(expected[0], expected[1]);
+        assert_ne!(expected[0], expected[2]);
+
+        let drawn: [u64; 3] = Self::new_runtime(42).block_on(async {
+            let mut rng = Det::<Rt>::thread_rng();
+            [rng.random(), rng.random(), rng.random()]
+        });
+        assert_eq!(expected, drawn, "the seeded RNG should draw the control's sequence");
     }
 
     /// Consecutive `thread_rng()` calls produce different values.
@@ -1697,5 +1855,61 @@ impl<Rt: AsyncRuntime> DetsimSuite<Rt> {
             let v3: u64 = Det::<Rt>::scope(100, async { Det::<Rt>::thread_rng().random() }).await;
             assert_ne!(v1, v3, "scope with different seed should produce different value");
         });
+    }
+
+    /// A task spawned through the inner runtime cannot draw from the seed of `block_on`, so the
+    /// root keeps its sequence.
+    fn test_block_on_seed_is_only_for_the_root() {
+        use rand::RngExt;
+
+        let control: u64 = Self::new_runtime(17).block_on(async { Det::<Rt>::thread_rng().random() });
+
+        let (unscoped_drew, root_first) = Self::new_runtime(17).block_on(async {
+            let unscoped = Rt::spawn(async { std::panic::catch_unwind(Det::<Rt>::thread_rng).is_ok() });
+            let unscoped_drew = unscoped.await.unwrap();
+            let root_first: u64 = Det::<Rt>::thread_rng().random();
+            (unscoped_drew, root_first)
+        });
+
+        assert!(
+            !unscoped_drew,
+            "a task spawned through the inner runtime should have no seed"
+        );
+        assert_eq!(control, root_first, "the root should get its first draw");
+    }
+
+    /// A wrapper around another `DeterministicRng` draws from its own seed, not the inner one.
+    fn test_nested_wrapper_uses_its_own_seed() {
+        use rand::RngExt;
+
+        for seed in [17, 87] {
+            let control: u64 = Self::new_runtime(seed).block_on(async { Det::<Rt>::thread_rng().random() });
+
+            let mut nested = Det::<Det<Rt>>::new(1);
+            nested.set_seed(seed);
+            let got: u64 = nested.block_on(async { Det::<Det<Rt>>::thread_rng().random() });
+
+            assert_eq!(control, got, "the nested wrapper should use seed {seed}");
+        }
+    }
+
+    /// The sequence continues across `block_on` calls, with a root future that is not `Send`.
+    fn test_seed_continues_across_block_on() {
+        use rand::RngExt;
+
+        let draw = || async {
+            let not_send = Rc::new(());
+            ready(()).await;
+            let value: u64 = Det::<Rt>::thread_rng().random();
+            drop(not_send);
+            value
+        };
+
+        let uninterrupted: [u64; 2] = Self::new_runtime(17).block_on(async { [draw().await, draw().await] });
+
+        let mut rt = Self::new_runtime(17);
+        let split = [rt.block_on(draw()), rt.block_on(draw())];
+
+        assert_eq!(uninterrupted, split, "a second block_on should continue the sequence");
     }
 }

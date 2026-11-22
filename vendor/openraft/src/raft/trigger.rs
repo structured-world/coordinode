@@ -78,23 +78,26 @@ where C: RaftTypeConfig
 
     /// Queue one timer check and return once it is queued.
     ///
-    /// RaftCore runs the same check that the internal ticker triggers: a node whose election
-    /// timeout has expired starts an election, and a leader whose heartbeat is due sends one
-    /// heartbeat. The check reads the current time when RaftCore handles it. A check before a
-    /// deadline does nothing, and a check after several missed heartbeat intervals sends one
-    /// heartbeat.
+    /// RaftCore runs the heartbeat check that the heartbeat timer triggers, and an election check:
+    /// a leader whose heartbeat is due sends one heartbeat, and a node whose election is due starts
+    /// it. The check reads the current time when RaftCore handles it. A check before a deadline
+    /// does nothing, and a check after several missed heartbeat intervals sends one heartbeat.
     ///
     /// Unlike [`Self::elect`] and [`Self::heartbeat`], the check honors `enable_elect` and
     /// `enable_heartbeat`. It runs whether `enable_tick` is on or off.
     ///
-    /// With [`Config::enable_tick`] set to `false`, an application can drive many nodes from one
-    /// timer of its own. Timeouts are noticed only when a check runs, so the caller's interval
-    /// adds to the election and heartbeat latency. The internal ticker checks about five times per
-    /// [`Config::heartbeat_interval`]. This call waits while the API channel of this node is full.
+    /// With [`Config::enable_tick`] set to `false`, an application can drive the heartbeats of
+    /// many nodes from one timer of its own. A due heartbeat is noticed only when a check runs, so
+    /// the caller's interval adds to the heartbeat latency. Elections do not need this call: they
+    /// run on their own election timer, controlled by [`Config::enable_elect`], whether
+    /// `enable_tick` is on or off, and the election check is kept for backward compatibility. The
+    /// heartbeat timer of a leader fires once per [`Config::heartbeat_interval`]. This call waits
+    /// while the API channel of this node is full.
     ///
     /// Returns error when RaftCore has [`Fatal`] error, e.g., shut down or having storage error.
     ///
     /// [`Config::enable_tick`]: crate::Config::enable_tick
+    /// [`Config::enable_elect`]: crate::Config::enable_elect
     /// [`Config::heartbeat_interval`]: crate::Config::heartbeat_interval
     #[since(version = "0.10.1")]
     pub async fn tick(&self) -> Result<(), Fatal<C>> {
@@ -135,6 +138,10 @@ where C: RaftTypeConfig
     /// While the transfer is in progress, this node forwards client requests to `to`. If `to` has
     /// not taken over within an election timeout, this node steps down and starts an election,
     /// which it may win again.
+    ///
+    /// It returns once the request is queued, not when `to` has taken over. To learn the outcome,
+    /// wait on the metrics; see
+    /// [handing over leadership](crate::docs::cluster_control::leadership#handing-over-leadership).
     ///
     /// If this node is not a Leader, it is just ignored.
     ///

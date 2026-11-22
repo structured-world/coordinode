@@ -25,16 +25,17 @@ use crate::async_runtime::Select2;
 use crate::async_runtime::Select3;
 use crate::async_runtime::Select4;
 use crate::async_runtime::TryRecvError;
+use crate::async_runtime::watch::WatchReceiver;
 use crate::async_runtime::watch::WatchSender;
 use crate::batch::Batch;
 use crate::config::Config;
 use crate::config::RuntimeConfig;
 use crate::core::ClientResponderQueue;
+use crate::core::DeadlineNotifier;
 use crate::core::IoBroadcast;
 use crate::core::LeaseReadStatePublisher;
 use crate::core::MetricsChannels;
 use crate::core::PendingRead;
-use crate::core::PendingReadDeadlineNotifier;
 use crate::core::PendingReadQueue;
 use crate::core::ServerState;
 use crate::core::SharedReplicateBatch;
@@ -140,7 +141,6 @@ use crate::type_config::alias::MembershipStateOf;
 use crate::type_config::alias::MpscReceiverOf;
 use crate::type_config::alias::MpscSenderOf;
 use crate::type_config::alias::MutexOf;
-use crate::type_config::alias::OneshotReceiverOf;
 use crate::type_config::alias::PayloadOf;
 use crate::type_config::alias::VoteOf;
 use crate::type_config::alias::WatchReceiverOf;
@@ -207,7 +207,7 @@ where
     /// This node's runtime config.
     pub(crate) config: Arc<Config>,
 
-    pub(crate) runtime_config: Arc<RuntimeConfig<C>>,
+    pub(crate) runtime_config: Arc<RuntimeConfig>,
 
     /// Additional state that does not directly affect the consensus.
     pub(crate) core_state: CoreState<C>,
@@ -235,7 +235,19 @@ where
     pub(crate) pending_reads: PendingReadQueue<C>,
 
     /// Wakes this core when a pending linearizable read reaches its deadline.
-    pub(crate) pending_read_deadline_notifier: PendingReadDeadlineNotifier<C>,
+    pub(crate) pending_read_deadline_notifier: DeadlineNotifier<C>,
+
+    /// Wakes this core when its election may be due.
+    ///
+    /// Only [`Self::refresh_election_deadline`] sets its deadline, and only a campaigner with
+    /// `enable_elect` on gets one.
+    pub(crate) election_deadline_notifier: DeadlineNotifier<C>,
+
+    /// Wakes this core with a [`Notification::Tick`] when a leader's next heartbeat is due.
+    ///
+    /// Only [`Self::refresh_heartbeat_deadline`] sets its deadline, and only a leader with
+    /// `enable_tick` and `enable_heartbeat` on gets one.
+    pub(crate) heartbeat_deadline_notifier: DeadlineNotifier<C>,
 
     /// A mapping of node IDs the replication state of the target node.
     pub(crate) replications: BTreeMap<C::NodeId, ReplicationHandle<C>>,
@@ -249,7 +261,7 @@ where
     /// A self-held keepalive sender for the dedicated install-snapshot channel.
     ///
     /// Mirrors [`Self::tx_api`]: it keeps `rx_install_snapshot` open after the application drops
-    /// its last `Raft` handle, so the core shuts down only via `rx_shutdown` instead of
+    /// its last `Raft` handle, so the core shuts down only via `rx_control` instead of
     /// truncating an in-flight `stream_append`.
     #[allow(dead_code)]
     pub(crate) tx_install_snapshot: MpscSenderOf<C, InstallFullSnapshotRequest<C, SM>>,
@@ -260,7 +272,14 @@ where
     /// `rx_api`, which is independent of the state machine type.
     pub(crate) rx_install_snapshot: MpscReceiverOf<C, InstallFullSnapshotRequest<C, SM>>,
 
-    pub(crate) rx_shutdown: OneshotReceiverOf<C, ()>,
+    /// The control channel from the `Raft` handles.
+    ///
+    /// A send only wakes this core up, so that it reads the switches in [`Self::runtime_config`]
+    /// again; unseen sends merge into one, and none of them carries data that could be lost.
+    /// Closing the channel, by [`Raft::shutdown`] or by dropping every `Raft` handle, stops it.
+    ///
+    /// [`Raft::shutdown`]: crate::Raft::shutdown
+    pub(crate) rx_control: WatchReceiverOf<C, ()>,
 
     /// Shared notification channel and buffered self-notifications.
     pub(crate) notifications: NotificationChannel<C>,
@@ -311,6 +330,14 @@ impl VoteRequestKind {
         match self {
             VoteRequestKind::Vote => "vote",
             VoteRequestKind::PreVote => "pre-vote",
+        }
+    }
+
+    /// The RPC that a [`Timeout`] of this request names.
+    fn rpc_type(self) -> RPCTypes {
+        match self {
+            VoteRequestKind::Vote => RPCTypes::Vote,
+            VoteRequestKind::PreVote => RPCTypes::PreVote,
         }
     }
 }
@@ -515,6 +542,7 @@ where
         self.write_entries(
             Batch::of([payload]),
             Batch::of([Some(CoreResponder::Progress(tx))]),
+            None,
             #[cfg(feature = "runtime-stats")]
             C::now(),
         );
@@ -572,6 +600,7 @@ where
         self.write_entries(
             Batch::of([payload]),
             Batch::of([Some(CoreResponder::Progress(tx))]),
+            None,
             #[cfg(feature = "runtime-stats")]
             C::now(),
         );
@@ -685,6 +714,10 @@ where
     /// I.e.: append the log entries to local store, forward them to a quorum(including the
     /// leader), waiting for them to be committed and applied.
     ///
+    /// `precondition` is checked against the leader's state right before the entries are
+    /// appended, after this node is known to accept writes. If it does not hold, every responder
+    /// receives [`ClientWriteError::PreconditionFailed`] and nothing is appended.
+    ///
     /// Returns the log IDs assigned to the entries, or `None` if the entries could not be
     /// written (e.g., this node is not the leader).
     ///
@@ -700,6 +733,7 @@ where
         &mut self,
         payloads: BatchOf<C, PayloadOf<C>>,
         responders: BatchOf<C, Option<CoreResponder<C>>>,
+        precondition: Option<Precondition<C>>,
         #[cfg(feature = "runtime-stats")] proposed_at: InstantOf<C>,
     ) -> Option<LeaderLogIds<CommittedLeaderIdOf<C>>> {
         debug_assert_eq!(
@@ -720,6 +754,16 @@ where
                 return None;
             }
         };
+
+        if let Some(precondition) = precondition
+            && let Err(e) = precondition.ensure_satisfied(lh.state)
+        {
+            let err = ClientWriteError::PreconditionFailed(e);
+            for tx in responders.into_iter().flatten() {
+                tx.on_complete(Err(err.clone()))
+            }
+            return None;
+        }
 
         let entry_count = payloads.len() as u64;
         let log_ids = lh.leader_append_entries(payloads)?;
@@ -858,6 +902,7 @@ where
             vote,
             state: st.server_state,
             current_leader: self.current_leader(),
+            last_leader_contact: st.last_leader_contact().map(SerdeInstant::new),
             membership_config: st.membership_state.effective().clone(),
             committed_membership_config: st.membership_state.committed().clone(),
         };
@@ -889,6 +934,7 @@ where
             current_leader: server_metrics.current_leader.clone(),
             millis_since_quorum_ack: data_metrics.millis_since_quorum_ack,
             last_quorum_acked: data_metrics.last_quorum_acked,
+            last_leader_contact: server_metrics.last_leader_contact,
             membership_config: server_metrics.membership_config.clone(),
             committed_membership_config: server_metrics.committed_membership_config.clone(),
             heartbeat: data_metrics.heartbeat.clone(),
@@ -907,23 +953,30 @@ where
         // but not `RaftDataMetrics` and `RaftServerMetrics`.
         // Thus if `RaftMetrics` change is perceived, the other two should have been updated.
 
-        self.metrics.data.send_if_modified(|metrics| {
+        let data_sent = self.metrics.data.send_if_modified(|metrics| {
             if data_metrics.ne(metrics) {
                 *metrics = data_metrics.clone();
                 return true;
             }
             false
         });
+        if data_sent {
+            self.runtime_stats.data_metrics_sends += 1;
+        }
 
-        self.metrics.server.send_if_modified(|metrics| {
+        let server_sent = self.metrics.server.send_if_modified(|metrics| {
             if server_metrics.ne(metrics) {
                 *metrics = server_metrics.clone();
                 return true;
             }
             false
         });
+        if server_sent {
+            self.runtime_stats.server_metrics_sends += 1;
+        }
 
         tracing::debug!("report metrics: {}", m);
+        self.runtime_stats.metrics_sends += 1;
         let res = self.metrics.all.send(m);
 
         if let Err(err) = res {
@@ -1085,9 +1138,12 @@ where
         self.reschedule_pending_read_check();
     }
 
-    fn reschedule_pending_read_check(&self) {
+    fn reschedule_pending_read_check(&mut self) {
         let deadline = self.pending_reads.earliest_deadline();
-        self.pending_read_deadline_notifier.set_deadline(deadline);
+        let update = self.pending_read_deadline_notifier.set_deadline(deadline);
+        if update.woke {
+            self.runtime_stats.pending_read_rearm_wakes += 1;
+        }
     }
 
     /// Return the current leader node ID based on the committed vote.
@@ -1160,14 +1216,6 @@ where
 
         // Drain responders up to last.index
         let mut responders = self.client_responders.drain_upto(last.index());
-
-        let entry_count = last.index() + 1 - first.index();
-        self.runtime_stats.apply_batch.record(entry_count);
-
-        // Record to external metrics recorder
-        if let Some(r) = &self.metrics_recorder {
-            r.record_apply_batch(entry_count);
-        }
 
         // Call on_commit on each responder
         for (index, responder) in responders.iter_mut() {
@@ -1387,13 +1435,20 @@ where
         loop {
             self.flush_metrics();
 
+            // Set the election and heartbeat deadlines once per round, before the wait below, which
+            // is the only one that can last indefinitely. A command send that blocks inside a round
+            // only delays the wake-up, and an election started meanwhile runs its commands after
+            // that send.
+            self.refresh_election_deadline();
+            self.refresh_heartbeat_deadline();
+
             tracing::debug!(
                 "RAFT_stats id={:<2} log_io: {}",
                 self.id,
                 self.engine.state.log_progress()
             );
 
-            // In each loop, it does not have to check rx_shutdown and flush metrics for every RaftMsg
+            // In each loop, it does not have to check rx_control and flush metrics for every RaftMsg
             // processed.
             // In each loop, the first step is blocking waiting for any message from any channel.
             // Then if there is any message, process as many as possible to maximize throughput.
@@ -1401,7 +1456,7 @@ where
             // Check shutdown first so that a message flood in `tx_api` won't block shutting down.
             self.runtime_stats.end_core_busy(busy_since);
             let selected = C::select4(
-                &mut self.rx_shutdown,
+                self.rx_control.changed(),
                 self.notifications.recv(),
                 self.rx_install_snapshot.recv(),
                 self.rx_api.ensure_buffered(),
@@ -1409,8 +1464,13 @@ where
             .await;
             busy_since = self.runtime_stats.begin_core_busy();
             match selected {
-                Select4::First(_) => {
-                    tracing::info!("recv from rx_shutdown");
+                Select4::First(Ok(())) => {
+                    // A wake-up: the top of the loop reads the runtime switches again.
+                    tracing::debug!("woken up through rx_control");
+                }
+
+                Select4::First(Err(_)) => {
+                    tracing::info!("rx_control is closed, shut down");
                     return Err(Fatal::Stopped);
                 }
 
@@ -1637,7 +1697,7 @@ where
 
                     Err(_timeout) => {
                         let timeout_err = Timeout::<C> {
-                            action: RPCTypes::Vote,
+                            action: kind.rpc_type(),
                             id,
                             target: target.clone(),
                             timeout: ttl,
@@ -1871,9 +1931,14 @@ where
                     }
                 }
                 self.runtime_stats.write_batch.record(payloads.len() as u64);
+
+                let precondition = write_option.expected_last_log_id.map(|last_log_id| Precondition::LastLogId {
+                    last_log_id: Some(last_log_id),
+                });
                 self.write_entries(
                     payloads,
                     responders,
+                    precondition,
                     #[cfg(feature = "runtime-stats")]
                     proposed_at,
                 );
@@ -2047,7 +2112,16 @@ where
                     );
                 }
             }
-            ExternalCommand::Tick => self.handle_tick("external-tick"),
+            ExternalCommand::Tick => {
+                self.handle_tick("external-tick");
+
+                // Elections have their own deadline notifier, so a manual tick need not check
+                // them. The check is kept for backward compatibility: `Trigger::tick()` has always
+                // started a due election, within the same call.
+                // TODO: remove this call in a later release and leave elections to the deadline
+                // notifier.
+                self.elect_if_due();
+            }
         }
     }
 
@@ -2166,21 +2240,20 @@ where
 
             Notification::StateMachine { command_result } => self.handle_state_machine_result(command_result)?,
             Notification::PendingReadDeadlineReached => self.process_pending_reads(),
+            Notification::ElectionDeadlineReached => self.elect_if_due(),
         };
         Ok(())
     }
 
-    /// Handle [`Notification::Tick`] and [`ExternalCommand::Tick`]: check the election timer and,
-    /// if leading, the heartbeat timer.
+    /// Handle [`Notification::Tick`] and [`ExternalCommand::Tick`]: send a heartbeat if this node
+    /// is leading and one is due.
     ///
-    /// `emitter` names the tick source in log messages.
+    /// [`Self::heartbeat_deadline_notifier`] sends [`Notification::Tick`] when the next heartbeat
+    /// is due, and [`Self::election_deadline_notifier`] wakes the core when an election may be
+    /// due. `emitter` names the tick source in log messages.
     fn handle_tick(&mut self, emitter: impl fmt::Display) {
-        // check every timer
-
         let now = C::now();
         tracing::debug!("received {}, now: {}", emitter, now.display());
-
-        self.handle_tick_election();
 
         // Leader send heartbeat
         let heartbeat_at = self.engine.leader_ref().map(|l| l.next_heartbeat);
@@ -2196,6 +2269,88 @@ where
                 l.next_heartbeat = C::now() + Duration::from_millis(self.config.heartbeat_interval);
             }
         }
+    }
+
+    /// Set the heartbeat deadline to the instant at which this leader's next heartbeat is due.
+    ///
+    /// [`Self::handle_tick`] moves `next_heartbeat` later whenever it handles a due heartbeat, so
+    /// the deadline changes and the notifier re-arms for the next one.
+    fn refresh_heartbeat_deadline(&mut self) {
+        let wake_at = self.heartbeat_wake_at();
+        let update = self.heartbeat_deadline_notifier.set_deadline(wake_at);
+        if update.woke {
+            self.runtime_stats.heartbeat_rearm_wakes += 1;
+        }
+        if update.changed {
+            tracing::debug!(
+                "heartbeat deadline: {}",
+                wake_at.as_ref().map(|t| t.display()).display()
+            );
+        }
+    }
+
+    /// Return when this node's next heartbeat is due, or `None` if it sends none on its own.
+    ///
+    /// Only a leader with `enable_tick` and `enable_heartbeat` on sends automatic heartbeats. An
+    /// idle leader without them is not woken at all. Turning either switch back on wakes the core
+    /// through [`Self::rx_control`], and the deadline returns at that round.
+    fn heartbeat_wake_at(&self) -> Option<InstantOf<C>> {
+        if !self.runtime_config.enable_tick.load(Ordering::Relaxed) {
+            return None;
+        }
+        if !self.runtime_config.enable_heartbeat.load(Ordering::Relaxed) {
+            return None;
+        }
+        let leader = self.engine.leader_ref()?;
+        Some(leader.next_heartbeat)
+    }
+
+    /// Set the election deadline to the instant at which this node's election may be due.
+    ///
+    /// A heartbeat that extends the lease moves the deadline later before it is reached, so no
+    /// [`Notification::ElectionDeadlineReached`] is sent while the leader is alive.
+    fn refresh_election_deadline(&mut self) {
+        let wake_at = self.election_wake_at();
+        let update = self.election_deadline_notifier.set_deadline(wake_at);
+        if update.woke {
+            self.runtime_stats.election_rearm_wakes += 1;
+        }
+        if update.changed {
+            tracing::debug!("election deadline: {}", wake_at.as_ref().map(|t| t.display()).display());
+        }
+    }
+
+    /// Return when this node's election may be due, or `None` if it has none to wait for.
+    ///
+    /// It covers every election that [`Self::elect_if_due`] may start: a follower's or a learner's
+    /// after its leader lease expires, a candidate's retry, and the election of a leader whose
+    /// leadership transfer timed out. Only a campaigner with `enable_elect` on has one. A leader
+    /// without a transfer in progress, and a single campaigner whose election is already in
+    /// progress, have none.
+    ///
+    /// Turning `enable_elect` back on wakes the core through [`Self::rx_control`], and the
+    /// deadline returns at that round.
+    fn election_wake_at(&self) -> Option<InstantOf<C>> {
+        if !self.runtime_config.enable_elect.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        if !self.engine.state.membership_state.is_campaigner_in_effective_or_committed(&self.id) {
+            return None;
+        }
+
+        // A leader campaigns only once its leadership transfer has timed out.
+        let transfer_deadline = match self.engine.leader_ref() {
+            Some(leader) => Some(leader.transfer_deadline()?),
+            None => None,
+        };
+
+        let is_single_campaigner = self.engine.is_single_campaigner();
+        let pre_vote = self.runtime_config.enable_pre_vote.load(Ordering::Relaxed) && !is_single_campaigner;
+        let deadline = self.engine.election_deadline(pre_vote)?;
+
+        let wake_at = deadline.earliest_due_at().max(transfer_deadline).unwrap_or_else(C::now);
+        Some(wake_at)
     }
 
     /// Handle [`Notification::LocalIO`]: a local log or vote write reached the disk.
@@ -2260,6 +2415,14 @@ where
                 }
             }
             sm::Response::Apply(res) => {
+                // The worker merges queued `Apply` commands, so one result covers one `apply()`
+                // call, which may span several commands.
+                let entry_count = res.end - res.since;
+                self.runtime_stats.apply_batch.record(entry_count);
+                if let Some(r) = &self.metrics_recorder {
+                    r.record_apply_batch(entry_count);
+                }
+
                 self.runtime_stats.record_log_stage_now(Stage::Applied, res.last_applied.index() + 1);
                 self.engine.state.apply_progress_mut().try_flush(res.last_applied);
                 self.broadcast_applied_bound();
@@ -2286,93 +2449,16 @@ where
         self.engine.output.push_command(Command::ReplicateCommitted { committed });
     }
 
-    #[tracing::instrument(level = "debug", skip_all)]
-    fn handle_tick_election(&mut self) {
-        let now = C::now();
-
-        tracing::debug!("try to trigger election, now: {}", now.display());
-
-        if self.engine.state.server_state == ServerState::Leader {
-            let transfer_expired = self.engine.leader_ref().is_some_and(|leader| leader.is_transfer_expired());
-            if !transfer_expired {
-                tracing::debug!("skip election, already a leader");
-                return;
-            }
-            tracing::info!("leadership transfer has not completed in time, start an election");
-        }
-
-        if !self.engine.state.membership_state.is_campaigner_in_effective_or_committed(&self.id) {
-            tracing::debug!("skip election, not a campaigner in effective or committed membership");
-            return;
-        }
-
-        if !self.runtime_config.enable_elect.load(Ordering::Relaxed) {
-            tracing::debug!("skip election, election disabled");
-            return;
-        }
-
-        let mut election_timeout = self.engine.config.timer_config.election_timeout;
-        if self.engine.is_there_greater_log() {
-            election_timeout += self.engine.config.timer_config.smaller_log_timeout;
-        }
-
-        let effective = self.engine.state.membership_state.effective();
-        // A sole voter may elect immediately only while holding its own vote. It must honor a
-        // vote granted to a campaigner outside the voter sets.
-        let is_sole_voter = effective.voter_ids().eq([self.id.clone()]);
-        let vote = self.engine.state.vote_ref();
-        let votes_for_self = vote.leader_node_id() == &self.id;
-        let may_campaign = effective.is_campaigner(&self.id);
-        let is_single_campaigner = may_campaign && is_sole_voter && votes_for_self;
-
-        if is_single_campaigner {
-            // When a node restart, it may stay in any state but the in progress election(engine.candidate) is
-            // empty.
-            if self.engine.candidate_ref().is_some() {
-                tracing::debug!("skip election, single voter already has an active election in progress");
-                return;
-            }
-            tracing::debug!("single voter, elect immediately");
-        } else {
-            tracing::debug!("check election timeout");
-
-            let local_vote = &self.engine.state.vote;
-            tracing::debug!("local vote: {}, election_timeout: {:?}", local_vote, election_timeout,);
-
-            if local_vote.is_expired(now, election_timeout) {
-                tracing::info!("election timeout expired, triggering election");
-            } else {
-                tracing::debug!("election timeout not yet expired");
-                return;
-            }
-        }
-
-        // Only the sole effective voter holding its own vote can skip Pre-Vote. A removed
-        // committed voter still needs a remote quorum, even if there is only one effective voter.
-        let pre_vote = self.runtime_config.enable_pre_vote.load(Ordering::Relaxed) && !is_single_campaigner;
-
-        if pre_vote {
-            // A Pre-Vote does not advance `vote.last_update_time`, so without this guard a node
-            // would re-issue a Pre-Vote on every tick. Skip while a fresh round is still in flight;
-            // restart once it has been pending longer than `election_timeout`.
-            if let Some(started) = self.engine.pre_candidate_ref().map(|pc| pc.starting_time())
-                && now < started + election_timeout
-            {
-                tracing::debug!("skip pre-vote, a pre-vote round is already in flight");
-                return;
-            }
-        }
-
-        // Every time elect, reset this flag.
-        self.engine.reset_greater_log();
-
-        if pre_vote {
-            tracing::info!("trigger pre-vote");
-            self.engine.pre_elect();
-        } else {
-            tracing::info!("trigger election");
-            self.engine.elect();
-        }
+    /// Start a Pre-Vote or a real election if this node may campaign and its election is due.
+    ///
+    /// It handles [`Notification::ElectionDeadlineReached`], and runs for
+    /// [`ExternalCommand::Tick`]. The notification may have been sent for a deadline that has
+    /// since moved, or before this node changed role or elections were disabled, so
+    /// [`Engine::elect_if_due`] checks every condition again.
+    fn elect_if_due(&mut self) {
+        let enable_elect = self.runtime_config.enable_elect.load(Ordering::Relaxed);
+        let enable_pre_vote = self.runtime_config.enable_pre_vote.load(Ordering::Relaxed);
+        self.engine.elect_if_due(C::now(), enable_elect, enable_pre_vote);
     }
 
     /// If a message is sent under a vote that this node no longer holds, it is a stale message
@@ -2814,9 +2900,11 @@ where
         let send = self.sm_handle.send(command);
         let mut send = std::pin::pin!(send);
         loop {
-            let selected = C::select3(&mut self.rx_shutdown, send.as_mut(), self.notifications.recv()).await;
+            let selected = C::select3(self.rx_control.changed(), send.as_mut(), self.notifications.recv()).await;
             match selected {
-                Select3::First(_) | Select3::Third(None) => return Err(Fatal::Stopped),
+                // A wake-up: the top of the main loop, reached after this round, reads the switches.
+                Select3::First(Ok(())) => {}
+                Select3::First(Err(_)) | Select3::Third(None) => return Err(Fatal::Stopped),
                 Select3::Second(Ok(())) => return Ok(()),
                 Select3::Second(Err(_)) => {
                     let source = C::err_from_string("cannot send to sm::Worker");
@@ -2917,15 +3005,18 @@ where
 mod tests {
     use std::fmt;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use maplit::btreemap;
     use maplit::btreeset;
     use openraft_rt_tokio::TokioRuntime;
 
+    use super::VoteRequestKind;
     use super::apply_membership_to_payload;
     use crate::Membership;
     use crate::core::raft_msg::membership_payloads::MembershipPayloads;
     use crate::entry::RaftPayload;
+    use crate::errors::Timeout;
     use crate::impls::ChangeMembers;
     use crate::type_config::TypeConfigExt;
     use crate::type_config::alias::MembershipStateOf;
@@ -3088,5 +3179,22 @@ mod tests {
 
         let returned = unused_rx.try_recv().unwrap();
         assert_eq!(None, returned);
+    }
+
+    /// A timed-out Vote or Pre-Vote request names its own RPC.
+    #[test]
+    fn vote_request_timeout_names_its_rpc() {
+        let timeout = |kind: VoteRequestKind| {
+            let err = Timeout::<TestConfig> {
+                action: kind.rpc_type(),
+                id: 1,
+                target: 2,
+                timeout: Duration::from_millis(5),
+            };
+            err.to_string()
+        };
+
+        assert_eq!(timeout(VoteRequestKind::Vote), "timeout after 5ms when Vote 1->2");
+        assert_eq!(timeout(VoteRequestKind::PreVote), "timeout after 5ms when PreVote 1->2");
     }
 }

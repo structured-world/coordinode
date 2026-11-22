@@ -903,12 +903,15 @@ impl RaftNode {
 
         let network = StubNetworkFactory;
 
+        // A configuration the engine refuses is an init failure too.
         let raft: RaftInstance =
             openraft::Raft::new(node_id, config, network, log_store, state_machine)
                 .await
-                .map_err(|e: openraft::error::Fatal<TypeConfig>| {
-                    RaftNodeError::Init(e.to_string())
-                })?;
+                .map_err(
+                    |e: openraft::error::RaftError<TypeConfig, openraft::ConfigError>| {
+                        RaftNodeError::Init(e.to_string())
+                    },
+                )?;
 
         // Try to initialize as single-node cluster.
         // On fresh start: succeeds, node becomes leader.
@@ -1233,12 +1236,15 @@ impl RaftNode {
         #[cfg(feature = "test-faults")]
         let apply_pause = state_machine.apply_pause();
 
+        // A configuration the engine refuses is an init failure too.
         let raft: RaftInstance =
             openraft::Raft::new(node_id, config, network, log_store, state_machine)
                 .await
-                .map_err(|e: openraft::error::Fatal<TypeConfig>| {
-                    RaftNodeError::Init(e.to_string())
-                })?;
+                .map_err(
+                    |e: openraft::error::RaftError<TypeConfig, openraft::ConfigError>| {
+                        RaftNodeError::Init(e.to_string())
+                    },
+                )?;
 
         let raft = Arc::new(raft);
         let commands = Commands::new(Arc::clone(&raft), Arc::clone(&engine), engine.oracle());

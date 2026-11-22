@@ -34,7 +34,6 @@ single-threaded = []
 singlethreaded = []
 
 [dependencies]
-chrono = "0.4"
 proc-macro2 = "1.0"
 quote = "1.0"
 semver = "1.0.14"

@@ -82,27 +82,27 @@ use crate::RaftState;
 pub use crate::RaftTypeConfig;
 use crate::StorageError;
 use crate::StorageHelper;
+use crate::async_runtime::Mpsc;
 use crate::async_runtime::MpscWeakSender;
 use crate::async_runtime::OneshotSender;
 use crate::async_runtime::Select2;
 use crate::async_runtime::mpsc::MpscSender;
 use crate::async_runtime::watch::WatchReceiver;
-use crate::async_runtime::watch::WatchSender;
 use crate::base::BoxFuture;
 use crate::base::BoxOnce;
 use crate::base::BoxStream;
 use crate::config::Config;
+use crate::config::ConfigError;
 use crate::config::RuntimeConfig;
 use crate::core::ClientResponderQueue;
+use crate::core::DeadlineNotifier;
 use crate::core::IoBroadcast;
 use crate::core::LeaseReadStatePublisher;
 use crate::core::MetricsChannels;
-use crate::core::PendingReadDeadlineNotifier;
 use crate::core::PendingReadQueue;
 use crate::core::RaftCore;
 use crate::core::SharedReplicateBatch;
 use crate::core::StepDownWatcher;
-use crate::core::Tick;
 use crate::core::heartbeat::handle::HeartbeatWorkersHandle;
 use crate::core::io_flush_tracking::AppliedProgress;
 use crate::core::io_flush_tracking::CommitProgress;
@@ -122,7 +122,6 @@ use crate::core::sm;
 use crate::core::sm::worker;
 use crate::engine::Engine;
 use crate::engine::EngineConfig;
-use crate::engine::INITIAL_QUEUE_CAPACITY;
 use crate::entry::RaftPayload;
 use crate::errors::ClientWriteError;
 use crate::errors::Fatal;
@@ -151,6 +150,7 @@ use crate::storage::RaftStateMachine;
 use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::JoinErrorOf;
 use crate::type_config::alias::LogIdOf;
+use crate::type_config::alias::MpscOf;
 use crate::type_config::alias::MpscSenderOf;
 use crate::type_config::alias::MpscWeakSenderOf;
 use crate::type_config::alias::NodeIdOf;
@@ -195,20 +195,26 @@ use crate::vote::raft_vote::RaftVoteExt;
 /// );
 /// ```
 ///
+/// A generic associated type, `Responder<T>` or `Batch<T>`, is written with its type parameter, as
+/// in the example above. The macro adds the `where T: OptionalSend + 'static` bound that
+/// [`RaftTypeConfig`] declares for it, so an entry does not write its own `where` clause.
+///
 /// Types can be omitted, and the following default type will be used:
-/// - `D`:            `String`
-/// - `R`:            `String`
-/// - `NodeId`:       `u64`
-/// - `Node`:         `::openraft::impls::BasicNode`
-/// - `Term`:         `u64`
-/// - `LeaderId`:     `::openraft::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId>`
+/// - `D`:              `String`
+/// - `R`:              `String`
+/// - `NodeId`:         `u64`
+/// - `Node`:           `::openraft::impls::BasicNode`
+/// - `Term`:           `u64`
+/// - `LeaderId`:       `::openraft::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId>`
 /// - `Vote`:           `::openraft::impls::Vote<Self::LeaderId>`
 /// - `Membership`:     `::openraft::impls::Membership<Self::NodeId, Self::Node>`
+/// - `MembershipEdit`: `::openraft::impls::ChangeMembers<Self::NodeId, Self::Node>`
 /// - `Payload`:        `::openraft::impls::EntryPayload<Self::D, Self::Membership>`
-/// - `Entry`:          `::openraft::impls::Entry<CommittedLeaderId, Self::Payload>`
-/// - `Responder<T>`:   `::openraft::impls::OneshotResponder<Self, T>`
+/// - `Entry`:          `::openraft::alias::DefaultEntryOf<Self>`
+/// - `Responder<T>`:   `::openraft::impls::ProgressResponder<Self, T>`
+/// - `Batch<T>`:       `::openraft::impls::InlineBatch<T>`
 /// - `AsyncRuntime`:   `::openraft::impls::TokioRuntime`
-/// - `ErrorSource`:    `::anyerror::AnyError`
+/// - `ErrorSource`:    `::openraft::impls::BoxedErrorSource`
 ///
 /// For example, to declare with only `D` and `R` types:
 /// ```ignore
@@ -232,36 +238,37 @@ macro_rules! declare_raft_types {
     };
 
     // The main entry of this macro
-    ($(#[$outer:meta])* $visibility:vis $id:ident: $($(#[$inner:meta])* $type_id:ident = $type:ty),* $(,)? ) => {
+    ($(#[$outer:meta])* $visibility:vis $id:ident: $($(#[$inner:meta])* $type_id:ident $(<$type_param:ident>)? = $type:ty),* $(,)? ) => {
         $(#[$outer])*
         #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd)]
         $visibility struct $id {}
 
         impl $crate::RaftTypeConfig for $id {
-            // `expand!(KEYED, ...)` ignores the duplicates.
+            // `expand!(KEYED, ...)` ignores the duplicates of a type name.
             // Thus by appending default types after user defined types,
             // the absent user defined types are filled with default types.
+            // A generic type gets the bound that `RaftTypeConfig` declares for it.
             $crate::macros::expand!(
                 KEYED,
-                (T, ATTR, V) => {ATTR type T = V;},
-                $(($type_id, $(#[$inner])*, $type),)*
+                (N, P, ATTR, V) => {ATTR type N P = V;},
+                $(($type_id, $(<$type_param>)?, $(#[$inner])*, $type $(where $type_param: $crate::OptionalSend + 'static)?),)*
 
                 // Default types:
-                (D            , , String                                       ),
-                (R            , , String                                       ),
-                (NodeId       , , u64                                          ),
-                (Node         , , $crate::impls::BasicNode                     ),
-                (Term         , , u64                                          ),
-                (LeaderId     , , $crate::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId> ),
-                (Vote           , , $crate::impls::Vote<Self::LeaderId>            ),
-                (Membership     , , $crate::impls::Membership<Self::NodeId, Self::Node> ),
-                (MembershipEdit , , $crate::impls::ChangeMembers<Self::NodeId, Self::Node> ),
-                (Payload        , , $crate::impls::EntryPayload<Self::D, Self::Membership> ),
-                (Entry          , , $crate::impls::Entry<<Self::LeaderId as $crate::vote::RaftLeaderId>::Committed, Self::Payload> ),
-                (Responder<T>   , , $crate::impls::ProgressResponder<Self, T> where T: $crate::OptionalSend + 'static     ),
-                (Batch<T>       , , $crate::impls::InlineBatch<T> where T: $crate::OptionalSend + 'static     ),
-                (AsyncRuntime   , , $crate::impls::TokioRuntime                  ),
-                (ErrorSource    , , $crate::impls::BoxedErrorSource               ),
+                (D              , , , String                                       ),
+                (R              , , , String                                       ),
+                (NodeId         , , , u64                                          ),
+                (Node           , , , $crate::impls::BasicNode                     ),
+                (Term           , , , u64                                          ),
+                (LeaderId       , , , $crate::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId> ),
+                (Vote           , , , $crate::impls::Vote<Self::LeaderId>            ),
+                (Membership     , , , $crate::impls::Membership<Self::NodeId, Self::Node> ),
+                (MembershipEdit , , , $crate::impls::ChangeMembers<Self::NodeId, Self::Node> ),
+                (Payload        , , , $crate::impls::EntryPayload<Self::D, Self::Membership> ),
+                (Entry          , , , $crate::impls::Entry<<Self::LeaderId as $crate::vote::RaftLeaderId>::Committed, Self::Payload> ),
+                (Responder      , <T>, , $crate::impls::ProgressResponder<Self, T> where T: $crate::OptionalSend + 'static ),
+                (Batch          , <T>, , $crate::impls::InlineBatch<T> where T: $crate::OptionalSend + 'static ),
+                (AsyncRuntime   , , , $crate::impls::TokioRuntime                  ),
+                (ErrorSource    , , , $crate::impls::BoxedErrorSource               ),
             );
 
         }
@@ -470,7 +477,10 @@ where
     /// state machine. This ensures that restarts of the node will yield the same ID every time.
     ///
     /// ### `config`
-    /// Raft's runtime config. See the docs on the `Config` object for more details.
+    /// Raft's runtime config. See the docs on the `Config` object for more details. A channel
+    /// size that the runtime's channels do not accept makes this return [`RaftError::APIError`]
+    /// with [`ConfigError::ChannelSizeOutOfRange`], naming the field, before any task starts. A
+    /// storage error while it recovers the initial state is a [`RaftError::Fatal`].
     ///
     /// ### `network`
     /// An implementation of the [`RaftNetworkFactory`] trait which will be used by Raft for
@@ -493,6 +503,10 @@ where
     /// // The state machine has recovered at least its pre-restart committed state.
     /// ```
     #[since(
+        version = "0.10.2",
+        change = "return `RaftError<C, ConfigError>`, with a `ConfigError` for a channel size the runtime does not accept"
+    )]
+    #[since(
         version = "0.10.0",
         change = "require N::Network: NetSnapshot<SnapshotData = SM::SnapshotData>"
     )]
@@ -503,7 +517,7 @@ where
         network: N,
         log_store: LS,
         state_machine: SM,
-    ) -> Result<Self, Fatal<C>>
+    ) -> Result<Self, RaftError<C, ConfigError>>
     where
         N: RaftNetworkFactory<C>,
         N::Network: NetSnapshot<C, SnapshotData = SM::SnapshotData>,
@@ -521,7 +535,8 @@ where
     /// Call [`run`](Self::run) after those components are ready.
     ///
     /// Storage is inspected and the initial Raft state is recovered during this call, but
-    /// No Raft background task starts until [`run`](Self::run) is called.
+    /// No Raft background task starts until [`run`](Self::run) is called. It returns the same
+    /// errors as `new`.
     ///
     /// ```ignore
     /// let raft = Raft::build(id, config, network, log_store, sm).await?;
@@ -529,6 +544,10 @@ where
     /// raft.run();
     /// server.serve().await?;
     /// ```
+    #[since(
+        version = "0.10.2",
+        change = "return `RaftError<C, ConfigError>`, with a `ConfigError` for a channel size the runtime does not accept"
+    )]
     #[since(version = "0.10.0")]
     #[tracing::instrument(level="debug", skip_all, fields(cluster=%config.cluster_name))]
     pub async fn build<LS, N>(
@@ -537,12 +556,16 @@ where
         network: N,
         mut log_store: LS,
         mut state_machine: SM,
-    ) -> Result<Self, Fatal<C>>
+    ) -> Result<Self, RaftError<C, ConfigError>>
     where
         N: RaftNetworkFactory<C>,
         N::Network: NetSnapshot<C, SnapshotData = SM::SnapshotData>,
         LS: RaftLogStorage<C>,
     {
+        // Check the channel sizes before building any channel: a runtime panics on a size that
+        // its channels do not accept.
+        config.validate_channel_sizes(MpscOf::<C>::buffer_size_range()).map_err(RaftError::APIError)?;
+
         let api_channel_size = config.api_channel_size();
         let notification_channel_size = config.notification_channel_size();
 
@@ -565,7 +588,7 @@ where
         let weak_tx_notify = tx_notify.downgrade();
 
         let (tx_progress, progress_watcher) = IoProgressWatcher::new();
-        let (tx_shutdown, rx_shutdown) = C::oneshot();
+        let (tx_control, rx_control) = C::watch_channel(());
 
         let runtime_config = Arc::new(RuntimeConfig::new(&config));
 
@@ -581,7 +604,7 @@ where
 
         let state = {
             let mut helper = StorageHelper::new(&mut log_store, &mut state_machine).with_id(id.clone());
-            helper.get_initial_state().await?
+            helper.get_initial_state().await.map_err(Fatal::from)?
         };
 
         let engine = Engine::new(state, eng_config);
@@ -609,8 +632,7 @@ where
             let rx_metrics = rx_metrics.clone();
             let rx_server_metrics = rx_server_metrics.clone();
 
-            Box::new(move |inner: &RaftInner<C>| {
-                let tick_tx = tx_notify.clone();
+            Box::new(move |_inner: &RaftInner<C>| {
                 let buffered = config.enable_unbounded_state_machine_buffer();
                 let sm_cmd_rx = sm::command_receiver::CommandReceiver::new(sm_cmd_rx, buffered);
                 let sm_handle = worker::Worker::spawn(
@@ -621,6 +643,10 @@ where
                     (sm_cmd_tx, sm_cmd_rx),
                     sm_span,
                 );
+                let election_deadline_notifier =
+                    DeadlineNotifier::spawn(tx_notify.clone(), |_| Notification::ElectionDeadlineReached);
+                let heartbeat_deadline_notifier =
+                    DeadlineNotifier::spawn(tx_notify.clone(), |i| Notification::Tick { i });
 
                 let core: RaftCore<C, N, LS, SM> = RaftCore {
                     id: id.clone(),
@@ -634,12 +660,16 @@ where
                     engine,
                     lease_read_state_publisher,
 
-                    // Start small like the engine queues; the queue grows on demand
-                    // and keeps its capacity after draining.
-                    client_responders: ClientResponderQueue::with_capacity(INITIAL_QUEUE_CAPACITY),
+                    // Allocates on the first client write, like the engine queues, and keeps
+                    // its capacity after draining.
+                    client_responders: ClientResponderQueue::new(),
 
                     pending_reads: PendingReadQueue::default(),
-                    pending_read_deadline_notifier: PendingReadDeadlineNotifier::spawn(tx_notify.clone()),
+                    pending_read_deadline_notifier: DeadlineNotifier::spawn(tx_notify.clone(), |_| {
+                        Notification::PendingReadDeadlineReached
+                    }),
+                    election_deadline_notifier,
+                    heartbeat_deadline_notifier,
                     replications: Default::default(),
 
                     heartbeat_handle: HeartbeatWorkersHandle::new(id.clone(), config.clone()),
@@ -651,7 +681,7 @@ where
                     ),
                     tx_install_snapshot: tx_install_snapshot.clone(),
                     rx_install_snapshot,
-                    rx_shutdown,
+                    rx_control,
 
                     notifications: NotificationChannel::new(tx_notify, rx_notify),
 
@@ -690,16 +720,7 @@ where
 
                 let core = Box::new(core);
                 let core_fut = core.main().instrument(trace_span!("spawn").or_current());
-                let join_handle = C::spawn(core_fut);
-
-                let tick_period = Duration::from_millis(config.tick_interval());
-                let enabled = {
-                    let enable_tick = inner.runtime_config.enable_tick.lock().unwrap();
-                    enable_tick.subscribe()
-                };
-                let tick_handle = Tick::spawn(tick_period, tick_tx, enabled);
-                *inner.tick_handle.lock().unwrap() = Some(tick_handle);
-                join_handle
+                C::spawn(core_fut)
             })
         };
 
@@ -707,14 +728,13 @@ where
             id,
             config,
             runtime_config,
-            tick_handle: Mutex::new(None),
             tx_api,
             rx_lease_read_state,
             rx_metrics,
             rx_data_metrics,
             rx_server_metrics,
             progress_watcher,
-            tx_shutdown: Mutex::new(Some(tx_shutdown)),
+            tx_control: Mutex::new(Some(tx_control)),
             core_state: Mutex::new(CoreState::Unstarted(Some(start))),
             extensions: Extensions::default(),
         };
@@ -1025,8 +1045,8 @@ where
     /// truncated the conflicting entries.
     ///
     /// [`AppendResult`] does not implement serde, so convert it to the transport's own response
-    /// type. `AppendEntriesResponse::from(result)` keeps the existing format, but drops the log id
-    /// and the hint.
+    /// type. Converting it to [`StreamAppendResult`] with `result.map_err(Into::into)` gives a
+    /// serializable format that keeps the log id but drops the hint.
     #[since(version = "0.10.0", change = "returns AppendResult with an optional conflict hint")]
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn append_entries(&self, rpc: AppendEntriesRequest<C>) -> Result<AppendResult<C>, RaftError<C>> {
@@ -1444,9 +1464,10 @@ where
     /// multiple times as it sends all payloads in a single message to the Raft core.
     ///
     /// `write_option` controls how RaftCore admits the batch: pass `WriteOption::default()` for an
-    /// unconditional write, or [`WriteOption::expect_leader()`] to admit the batch only while a
-    /// given leader is established. To attach your own responders instead of reading a stream,
-    /// use [`Self::write_many()`].
+    /// unconditional write, [`WriteOption::expect_leader()`] to admit the batch only while a
+    /// given leader is established, or [`WriteOption::expect_last_log_id()`] to admit it only on
+    /// top of a given log entry. To attach your own responders instead of reading a stream, use
+    /// [`Self::write_many()`].
     ///
     /// `Err(Fatal)` from this method means the batch was not submitted. If RaftCore stops later,
     /// the stream yields `Err(Fatal::Stopped)` and ends.
@@ -1460,6 +1481,8 @@ where
     /// - If this node may not accept writes, for example because it is not the leader, its leader
     ///   lease has expired, or it is transferring leadership, every entry yields
     ///   [`ClientWriteError::ForwardToLeader`] and nothing is appended.
+    /// - If the expected last log id is not the leader's last log id, every entry yields
+    ///   [`ClientWriteError::PreconditionFailed`] and nothing is appended.
     /// - Otherwise every entry is appended to the leader's log in order, at consecutive log
     ///   indexes.
     ///
@@ -1492,6 +1515,7 @@ where
     ///
     /// [`ClientWriteError::ForwardToLeader`]: crate::errors::ClientWriteError::ForwardToLeader
     /// [`ClientWriteError::LogEntryDiscarded`]: crate::errors::ClientWriteError::LogEntryDiscarded
+    /// [`ClientWriteError::PreconditionFailed`]: crate::errors::ClientWriteError::PreconditionFailed
     #[since(version = "0.10.1", change = "add write_option argument")]
     #[since(version = "0.10.0")]
     #[tracing::instrument(level = "debug", skip_all)]
@@ -1561,12 +1585,16 @@ where
     /// - If this node may not accept writes, for example because it is not the leader, its leader
     ///   lease has expired, or it is transferring leadership, every write fails with
     ///   [`ClientWriteError::ForwardToLeader`] and nothing is appended.
+    /// - If the last log id expected by [`WriteOption::with_last_log_id()`] is not the leader's
+    ///   last log id, every write fails with [`ClientWriteError::PreconditionFailed`] and nothing
+    ///   is appended.
     /// - Otherwise every write is appended to the leader's log in order, at consecutive log
     ///   indexes.
     ///
     /// RaftCore may append the batch together with other queued writes, but it never splits the
-    /// batch. Since admission is all or nothing, a responder on any one write tells whether the
-    /// whole batch was admitted. An empty batch appends nothing.
+    /// batch. A batch that expects a last log id is appended alone. Since admission is all or
+    /// nothing, a responder on any one write tells whether the whole batch was admitted. An empty
+    /// batch appends nothing.
     ///
     /// # Commit
     ///
@@ -1602,6 +1630,7 @@ where
     /// [`.with_option()`]: WriteManyRequest::with_option
     /// [`ClientWriteError::ForwardToLeader`]: crate::errors::ClientWriteError::ForwardToLeader
     /// [`ClientWriteError::LogEntryDiscarded`]: crate::errors::ClientWriteError::LogEntryDiscarded
+    /// [`ClientWriteError::PreconditionFailed`]: crate::errors::ClientWriteError::PreconditionFailed
     #[since(version = "0.10.1")]
     pub fn write_many(
         &self,
@@ -2232,7 +2261,7 @@ where
     ///
     /// It sends a shutdown signal and waits until `RaftCore` returns. If this future is cancelled
     /// while joining the core, a later call resumes that join and waits for the core to exit.
-    /// Use [`Self::try_shutdown`] to check for core or tick task join failures.
+    /// Use [`Self::try_shutdown`] to check for a core task join failure.
     ///
     /// # Examples
     ///
@@ -2245,33 +2274,26 @@ where
         Ok(())
     }
 
-    /// Shut down this node and return an error if either core or tick task failed to join.
+    /// Shut down this node and return an error if the core task failed to join.
     ///
-    /// Both joins finish before this returns, and results are retained across calls to this method
-    /// and [`Self::shutdown`]. Concurrent callers and retries after cancellation share the joins.
+    /// The join finishes before this returns, and its result is retained across calls to this
+    /// method and [`Self::shutdown`]. Concurrent callers and retries after cancellation share the
+    /// join.
     ///
-    /// Success describes the runtime joins of started core and tick tasks, independently of their
-    /// return values and other background task lifetimes. A node stopped before [`Self::run`]
-    /// succeeds.
+    /// Success describes the runtime join of a started core task, independently of its return
+    /// value and other background task lifetimes. A node stopped before [`Self::run`] succeeds.
+    #[since(version = "0.10.1", change = "joins only the core task: the tick task is retired")]
     #[since(version = "0.10.0")]
     pub async fn try_shutdown(&self) -> Result<(), ShutdownError> {
-        if let Some(tx) = self.inner.tx_shutdown.lock().unwrap().take() {
-            let send_res = tx.send(());
-            tracing::info!("sending shutdown signal to RaftCore, sending res: {:?}", send_res);
+        // Dropping the sender closes the control channel, which stops RaftCore.
+        let tx_control = self.inner.tx_control.lock().unwrap().take();
+        if tx_control.is_some() {
+            tracing::info!("closing the control channel to stop RaftCore");
         }
+        drop(tx_control);
 
         let (_, core_failed) = self.inner.join_core_task().await;
-        let core_result = if core_failed { Err(ShutdownError) } else { Ok(()) };
-        let tick_join = {
-            let mut tick_handle = self.inner.tick_handle.lock().unwrap();
-            let Some(handle) = tick_handle.as_mut() else {
-                return core_result;
-            };
-            handle.shutdown()
-        };
-        let tick_result = tick_join.await;
-        tick_result?;
-        core_result
+        if core_failed { Err(ShutdownError) } else { Ok(()) }
     }
 
     /// Provides mutable access to [`RaftStateMachine`] through a user-provided function.

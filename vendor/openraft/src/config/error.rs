@@ -1,3 +1,5 @@
+use std::ops::RangeInclusive;
+
 use backoff_series::ParseError as BackoffParseError;
 use openraft_macros::since;
 
@@ -5,6 +7,15 @@ use crate::impls::BoxedErrorSource;
 
 /// Error variants related to configuration.
 #[since]
+#[since(version = "0.10.2", change = "added zero heartbeat interval error")]
+#[since(version = "0.10.2", change = "added zero snapshot log threshold error")]
+#[since(version = "0.10.2", change = "added zero snapshot chunk size error")]
+#[since(
+    version = "0.10.2",
+    change = "added an error for a channel size the runtime does not accept"
+)]
+#[since(version = "0.10.2", change = "added an error for a value too large for the target")]
+#[since(version = "0.10.2", change = "added zero log-stage capacity error")]
 #[since(version = "0.10.0", change = "added quorum-loss inactivity validation error")]
 #[derive(Debug, thiserror::Error)]
 #[derive(PartialEq, Eq)]
@@ -32,6 +43,48 @@ pub enum ConfigError {
     #[error("max_payload_entries must be > 0")]
     MaxPayloadIs0,
 
+    /// The threshold of [`SnapshotPolicy::LogsSinceLast`](crate::SnapshotPolicy::LogsSinceLast)
+    /// must be greater than 0.
+    #[since(version = "0.10.2")]
+    #[error("snapshot_policy LogsSinceLast threshold must be > 0; use Never to disable automatic snapshots")]
+    SnapshotLogsSinceLastIs0,
+
+    /// The `snapshot_max_chunk_size` configuration must be greater than 0.
+    #[since(version = "0.10.2")]
+    #[error("snapshot_max_chunk_size must be > 0")]
+    SnapshotMaxChunkSizeIs0,
+
+    /// The `log_stage_capacity` configuration must be greater than 0.
+    #[since(version = "0.10.2")]
+    #[error("log_stage_capacity must be > 0")]
+    LogStageCapacityIs0,
+
+    /// A setting is larger than this target can hold, such as a size that does not fit in
+    /// `usize` on a 32-bit target.
+    #[since(version = "0.10.2")]
+    #[error("{field}({value}) must be <= {max} on this target")]
+    TooLarge {
+        /// The name of the setting.
+        field: &'static str,
+        /// The configured value.
+        value: u64,
+        /// The largest value this target accepts for the setting.
+        max: u64,
+    },
+
+    /// A channel size is outside the sizes that the runtime's channels accept, as given by
+    /// [`Mpsc::buffer_size_range()`](crate::async_runtime::Mpsc::buffer_size_range).
+    #[since(version = "0.10.2")]
+    #[error("{field}({size}) must be in {accepted:?}, the sizes the runtime's channels accept")]
+    ChannelSizeOutOfRange {
+        /// The name of the channel size setting.
+        field: &'static str,
+        /// The channel size that the runtime would build.
+        size: usize,
+        /// The sizes that the runtime's channels accept.
+        accepted: RangeInclusive<usize>,
+    },
+
     /// Election timeout must be greater than heartbeat interval.
     #[error("election_timeout_min({election_timeout_min}) must be > heartbeat_interval({heartbeat_interval})")]
     ElectionTimeoutLTHeartBeat {
@@ -41,10 +94,16 @@ pub enum ConfigError {
         heartbeat_interval: u64,
     },
 
+    /// The `heartbeat_interval` configuration must be greater than 0.
+    #[since(version = "0.10.2")]
+    #[error("heartbeat_interval must be > 0; use enable_heartbeat to turn heartbeats off")]
+    HeartbeatIntervalIs0,
+
     /// Heartbeat suppression must not delay a heartbeat past a follower's election timeout.
+    #[since(version = "0.10.1", change = "the bound no longer adds a tick interval")]
     #[since(version = "0.10.0")]
     #[error(
-        "heartbeat_interval({heartbeat_interval}) + heartbeat_min_interval({heartbeat_min_interval}) + tick interval(heartbeat_interval * 13 / 64) must be < election_timeout_min({election_timeout_min})"
+        "heartbeat_interval({heartbeat_interval}) + heartbeat_min_interval({heartbeat_min_interval}) must be < election_timeout_min({election_timeout_min})"
     )]
     HeartbeatMinIntervalTooLarge {
         /// Minimum election timeout value.

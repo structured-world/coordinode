@@ -233,12 +233,66 @@ Most of the APIs are quite straightforward, except two indirect APIs:
 
 ### Ensure the storage implementation is correct
 
-There is a [Test suite for RaftLogStorage and RaftStateMachine][`LogSuite`] available in Openraft.
-If your implementation passes the tests, Openraft should work well with it.
-To test your implementation, run `Suite::test_all()` with a [`StoreBuilder`] implementation,
-as shown in the [`sm-rocks` test](https://github.com/databendlabs/openraft/blob/main/examples/sm-rocks/src/test.rs).
+Run the [storage conformance suite][`LogSuite`] against the log store and state
+machine used in production. Implement [`StoreBuilder`] to create a fresh pair
+for each test. Return a guard that keeps their files alive until the test ends,
+as the [`sm-rocks` adapter](https://github.com/databendlabs/openraft/blob/main/examples/sm-rocks/src/test.rs) does.
 
-Once all tests pass, you can ensure that your custom storage implementation can work correctly in a distributed system.
+Use this test template with your own store types and constructor:
+
+```ignore
+use std::io;
+
+use openraft::StorageError;
+use openraft::testing::log::{StoreBuilder, Suite};
+use openraft::type_config::TypeConfigExt;
+use tempfile::TempDir;
+
+use crate::{LogStore, StateMachine, TypeConfig};
+
+struct ProductionStoreBuilder;
+
+fn storage_error(error: io::Error) -> StorageError<TypeConfig> {
+    let source = TypeConfig::err_from_error(&error);
+    StorageError::read(source)
+}
+
+impl StoreBuilder<TypeConfig, LogStore, StateMachine, TempDir> for ProductionStoreBuilder {
+    async fn build(&self) -> Result<(TempDir, LogStore, StateMachine), StorageError<TypeConfig>> {
+        // Open the production stores under a new temporary directory.
+        let directory = TempDir::new().map_err(storage_error)?;
+        let logs = LogStore::open(directory.path().join("log")).map_err(storage_error)?;
+        let state_machine = StateMachine::open(directory.path().join("sm")).map_err(storage_error)?;
+        Ok((directory, logs, state_machine))
+    }
+}
+
+#[test]
+fn production_storage_contracts() {
+    TypeConfig::run(async {
+        Suite::test_all(ProductionStoreBuilder).await.unwrap();
+    });
+}
+```
+
+The suite checks basic storage contracts, including these boundaries:
+
+- `truncate_after(Some(id))` preserves the entry at `id`; `truncate_after(None)` clears the log.
+- `purge(id)` removes entries through `id`, inclusive.
+- Applied membership retains the log ID of the membership entry.
+
+Passing the suite verifies those contracts. It does not test application commands,
+your snapshot transport, or recovery after a crash. Add tests that compare complete
+application state after transfer and restart, reject incomplete snapshots, and
+exercise failures during data and metadata publication. See the
+[production checklist](#7-production-checklist) for the remaining requirements.
+
+Implement [`ApplicationStoreBuilder`](crate::testing::log::ApplicationStoreBuilder)
+and run [`ApplicationSuite::test_all()`](crate::testing::log::ApplicationSuite::test_all)
+to compare complete application state, apply progress, membership, and every command
+response when the same entries arrive together, individually, and in uneven groups.
+The adapter supplies independent expected results. Transport and crash tests stay with
+the application because they require its real receiver and process lifecycle.
 
 
 ### An implementation has to guarantee data durability.
@@ -292,13 +346,12 @@ Here is the list of methods that need to be implemented for the [`RaftNetworkV2`
 accepted, or the [`AppendError`] that explains why it rejected the request. A
 conflict carries a hint that helps the leader find the matching log with fewer
 probes. [`AppendResult`] does not implement serde, so the transport converts it
-to and from its own wire type, such as `network-v2-http`'s
-[`AppendReply`](https://github.com/databendlabs/openraft/blob/main/examples/network-v2-http/src/append_reply.rs).
-To keep the [`AppendEntriesResponse`] wire format instead, the follower sends
-`AppendEntriesResponse::from(result)` and the leader rebuilds the result with
-[`AppendEntriesResponse::into_append_result()`], passing the log ids of the
-request it sent. That format carries no hint, and the leader then uses binary
-search.
+to and from its own wire type, such as the examples'
+[`AppendReply`](https://github.com/databendlabs/openraft/blob/main/examples/utils/append_reply.rs).
+A transport that does not carry hints can send [`StreamAppendResult`], a
+serializable format without the hint: both ends convert with
+`result.map_err(Into::into)`. The leader then receives no hint and finds the
+matching log by binary search.
 
 ### Optional: `stream_append()` for pipelined replication
 
@@ -316,6 +369,30 @@ one per request the follower answered.
 | [`RaftNetworkV2`] method | forward request            | to target                                     |
 |--------------------------|----------------------------|-----------------------------------------------|
 | [`stream_append()`]      | [`AppendEntriesRequest`] stream | remote node [`Raft::stream_append()`]    |
+
+### Pre-Vote and leadership transfer
+
+Two more methods have default implementations, so a transport that leaves them
+out compiles, but the features they carry then do nothing:
+
+| [`RaftNetworkV2`] method | forward request             | to target                                      | default implementation |
+|--------------------------|-----------------------------|------------------------------------------------|------------------------|
+| [`pre_vote()`]           | [`VoteRequest`]             | remote node [`Raft::pre_vote()`]               | grants without contacting the target |
+| [`transfer_leader()`]    | [`TransferLeaderRequest`]   | remote node [`Raft::handle_transfer_leader()`] | reports the target [`Unreachable`]   |
+
+Openraft sends a pre-vote when [`Config::enable_pre_vote`] is set, and on
+`Trigger::elect(true)`. With the default [`pre_vote()`], every peer grants it,
+so a candidate that cannot win still increases its term. Openraft transfers
+leadership on [`Trigger::transfer_leader()`], and on its own when a committed
+membership removes the leader. With the default [`transfer_leader()`], the
+target never hears of the transfer, and an ordinary election follows after an
+election timeout.
+
+To check that a transport carries Pre-Vote, send a pre-vote from a candidate
+whose log is behind to a leader and expect a refusal, which the default would
+not give. The `network-v2-http`
+[pre-vote test](https://github.com/databendlabs/openraft/blob/main/examples/network-v2-http/tests/pre_vote.rs)
+does this.
 
 The canonical example gets both sides from the [`network-v2-http`](https://github.com/databendlabs/openraft/tree/main/examples/network-v2-http)
 crate. Its [client](https://github.com/databendlabs/openraft/blob/main/examples/network-v2-http/src/client.rs)
@@ -561,6 +638,11 @@ and links the trait, protocol page, or test suite that defines it.
   reach as [`Unreachable`] so Openraft backs off instead of retrying
   immediately.
 
+- **Pre-Vote and leadership transfer.** Implement [`pre_vote()`] and
+  [`transfer_leader()`]: their defaults grant every pre-vote without asking
+  the peer and report every transfer target unreachable. See
+  [Pre-Vote and leadership transfer](#pre-vote-and-leadership-transfer).
+
 - **Cluster initialization and membership changes.** Call [`Raft::initialize()`]
   once, on one pristine node
   ([cluster formation][`docs::cluster-formation`]). A new voter then joins in two
@@ -581,6 +663,11 @@ and links the trait, protocol page, or test suite that defines it.
   drift. See [read operations][`docs::read`]; the canonical example serves all
   three modes as `/read`, `/linearizable_read` and `/follower_read` in
   [http_api.rs](https://github.com/databendlabs/openraft/blob/main/examples/raft-kv-memstore/src/http_api.rs).
+  Pair each advertised guarantee with a test of its endpoint. The example's
+  [read-guarantee tests](https://github.com/databendlabs/openraft/blob/main/examples/raft-kv-memstore/src/read_guarantees_test.rs)
+  exercise a former leader with stale data and a committed write whose apply is
+  paused. The local endpoint can return the old value; the linearizable endpoint
+  must reject old leadership or wait for the committed effects to become visible.
 
 - **Metrics, fatal errors and shutdown.** Watch [`Raft::metrics()`] for
   leadership, replication lag and membership
@@ -595,6 +682,38 @@ and links the trait, protocol page, or test suite that defines it.
   the target version means the stored format changed and a migration is
   required.
 
+Application commands and snapshots have their own persisted schemas, independently
+of Openraft's metadata. Preserve old-data fixtures for the production encoding;
+see [deterministic commands and durable schemas](crate::docs::components::state_machine).
+
+### Adopter CI
+
+Run the basic suite against the production store, then application scenarios
+through the production endpoints and snapshot transport. This example job adds
+schema fixtures, endpoint reads, storage conformance, and process-interruption
+recovery to the workspace checks:
+
+```yaml
+name: adopter-contracts
+on: [push, pull_request]
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - run: make verify docs-check
+      - run: make verify-example-types-kv verify-example-raft-kv-memstore
+      - run: make verify-example-sm-rocks
+```
+
+For an adopter repository, replace the example targets with its own store,
+schema-fixture, endpoint, snapshot-transfer, and crash-recovery tests. Keep the
+crash tests separate from orderly restart tests: stopping a child at a named
+publication boundary exercises recovery without destructors. Passing Openraft's
+library suite does not verify application storage or network adapters.
+
 
 [`declare_raft_types!`]:                `crate::declare_raft_types`
 [`Raft`]:                               `crate::Raft`
@@ -608,14 +727,18 @@ and links the trait, protocol page, or test suite that defines it.
 [`Raft::append_entries()`]:             `crate::Raft::append_entries`
 [`Raft::stream_append()`]:              `crate::Raft::stream_append`
 [`Raft::vote()`]:                       `crate::Raft::vote`
+[`Raft::pre_vote()`]:                   `crate::Raft::pre_vote`
+[`Raft::handle_transfer_leader()`]:     `crate::Raft::handle_transfer_leader`
 [`Raft::install_full_snapshot()`]:      `crate::Raft::install_full_snapshot`
 
 [`AppendEntriesRequest`]:               `crate::raft::AppendEntriesRequest`
 [`AppendError`]:                        `crate::raft::AppendError`
 [`AppendResult`]:                       `crate::raft::AppendResult`
-[`AppendEntriesResponse`]:              `crate::raft::AppendEntriesResponse`
-[`AppendEntriesResponse::into_append_result()`]: `crate::raft::AppendEntriesResponse::into_append_result`
+[`StreamAppendResult`]:                 `crate::raft::StreamAppendResult`
 [`VoteRequest`]:                        `crate::raft::VoteRequest`
+[`TransferLeaderRequest`]:              `crate::raft::TransferLeaderRequest`
+[`Config::enable_pre_vote`]:            `crate::Config::enable_pre_vote`
+[`Trigger::transfer_leader()`]:         `crate::raft::trigger::Trigger::transfer_leader`
 
 [`RaftTypeConfig`]:                     `crate::RaftTypeConfig`
 [`AsyncRuntime`]:                       `crate::AsyncRuntime`
@@ -678,6 +801,8 @@ and links the trait, protocol page, or test suite that defines it.
 [`stream_append()`]:                    `crate::network::RaftNetworkV2::stream_append`
 [`vote()`]:                             `crate::network::RaftNetworkV2::vote`
 [`full_snapshot()`]:                    `crate::network::RaftNetworkV2::full_snapshot`
+[`pre_vote()`]:                         `crate::network::RaftNetworkV2::pre_vote`
+[`transfer_leader()`]:                  `crate::network::RaftNetworkV2::transfer_leader`
 [`RPCOption`]:                          `crate::network::RPCOption`
 
 

@@ -1,12 +1,9 @@
-use std::str::FromStr;
-
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
+use syn::parse::ParseStream;
 use syn::parse::Parser;
 use syn::spanned::Spanned;
-
-use crate::utils;
 
 pub struct Since {
     pub(crate) version: Option<String>,
@@ -59,10 +56,10 @@ impl Since {
                             since.set_change(namevalue.value.clone(), Spanned::span(&namevalue.value))?;
                         }
 
-                        name => {
+                        _ => {
                             let msg = format!(
-                                "Unknown attribute {} is specified; expected one of: `version`, `date`",
-                                name,
+                                "Unknown attribute `{}`; expected one of: `version`, `date`, `change`",
+                                q,
                             );
                             return Err(syn::Error::new_spanned(namevalue, msg));
                         }
@@ -81,56 +78,19 @@ impl Since {
         Ok(since)
     }
     /// Append a `since` doc such as `Since: 1.0.0` to the bottom of the doc section.
+    ///
+    /// Only the outer attributes of `item` are parsed; the tokens after them are kept unchanged.
     pub(crate) fn append_since_doc(self, item: TokenStream) -> Result<TokenStream, syn::Error> {
-        let item = proc_macro2::TokenStream::from(item);
-
-        // Present docs to skip, in order to append `since` at bottom of doc section.
-        let mut present_docs = vec![];
-
-        // Tokens left after present docs.
-        let mut last_non_doc = vec![];
-
-        let mut it = item.clone().into_iter();
-        loop {
-            let Some(curr) = it.next() else {
-                break;
-            };
-            let Some(next) = it.next() else {
-                last_non_doc.push(curr);
-                break;
-            };
-
-            if utils::is_doc(&curr, &next) {
-                present_docs.push(curr);
-                present_docs.push(next);
-            } else {
-                last_non_doc.push(curr);
-                last_non_doc.push(next);
-                break;
-            }
-        }
-
-        let since_docs_str = if present_docs.is_empty() {
-            format!(r#"#[doc = " {}"]"#, self.to_doc_string())
-        } else {
-            // If there are already docs, insert a blank line.
-            format!(r#"#[doc = ""] #[doc = " {}"]"#, self.to_doc_string())
+        let split_outer_attrs = |input: ParseStream| {
+            let attrs = input.call(syn::Attribute::parse_outer)?;
+            let rest: proc_macro2::TokenStream = input.parse()?;
+            Ok((attrs, rest))
         };
-        let since_docs = proc_macro2::TokenStream::from_str(&since_docs_str).unwrap();
+        let (mut attrs, rest) = split_outer_attrs.parse(item)?;
 
-        let present_docs: proc_macro2::TokenStream = present_docs.into_iter().collect();
-        let last_non_docs: proc_macro2::TokenStream = last_non_doc.into_iter().collect();
+        self.append_since_doc_attrs(&mut attrs);
 
-        // Other non doc tokens.
-        let other: proc_macro2::TokenStream = it.collect();
-
-        let tokens = quote! {
-            #present_docs
-            #since_docs
-            #last_non_docs
-            #other
-        };
-        Ok(tokens.into())
+        Ok(quote!(#(#attrs)* #rest).into())
     }
 
     /// Build a `Since` from a `#[since(...)]` attribute marker.
@@ -138,22 +98,26 @@ impl Since {
         Self::from_tokens(attr.meta.require_list()?.tokens.clone())
     }
 
-    /// Insert the `Since:` doc line(s) into an attribute list, after any leading doc attrs.
+    /// Insert the `Since:` doc line(s) into an attribute list, after the last doc attr, or first
+    /// when there is none.
     ///
-    /// The attribute-list counterpart of [`Self::append_since_doc`], used by the syn-based
-    /// struct / enum field path.
+    /// Inserting after the last doc attr keeps the line at the bottom of the docs even when a
+    /// non-doc attribute, such as `#[allow(...)]`, comes before or between the doc comments.
+    ///
+    /// Used for an item-level `#[since(...)]` and for `#[since(...)]` markers on struct fields and
+    /// enum variants.
     fn append_since_doc_attrs(&self, attrs: &mut Vec<syn::Attribute>) {
-        let lead_docs = attrs.iter().take_while(|a| a.path().is_ident("doc")).count();
+        let end_of_docs = attrs.iter().rposition(|a| a.path().is_ident("doc")).map_or(0, |i| i + 1);
 
         // If there are already docs, insert a blank line before the `Since:` line.
-        let blank = if lead_docs > 0 { quote!(#[doc = ""]) } else { quote!() };
+        let blank = if end_of_docs > 0 { quote!(#[doc = ""]) } else { quote!() };
         let line = format!(" {}", self.to_doc_string());
         let new_docs = syn::Attribute::parse_outer
             .parse2(quote!(#blank #[doc = #line]))
             .expect("since doc attributes are well-formed");
 
         for (offset, attr) in new_docs.into_iter().enumerate() {
-            attrs.insert(lead_docs + offset, attr);
+            attrs.insert(end_of_docs + offset, attr);
         }
     }
 
@@ -197,15 +161,15 @@ impl Since {
 
         let date_str = Self::parse_str(date_lit, "date", span)?;
 
-        chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|_e| {
-            syn::Error::new(
+        if !is_valid_date(&date_str) {
+            return Err(syn::Error::new(
                 span,
                 format!(
                     "`date`(`{}`) is not valid date string. Expected format: yyyy-mm-dd",
                     date_str
                 ),
-            )
-        })?;
+            ));
+        }
 
         self.date = Some(date_str);
 
@@ -275,27 +239,49 @@ pub(crate) fn try_expand_container(args: TokenStream, item: TokenStream) -> Resu
 /// Returns whether any marker was found.
 fn rewrite_field_since(input: &mut syn::DeriveInput) -> Result<bool, syn::Error> {
     let mut found = false;
-    match &mut input.data {
-        syn::Data::Struct(data) => {
-            for field in &mut data.fields {
-                found |= rewrite_attrs_since(&mut field.attrs)?;
-            }
-        }
-        syn::Data::Enum(data) => {
-            for variant in &mut data.variants {
-                found |= rewrite_attrs_since(&mut variant.attrs)?;
-                for field in &mut variant.fields {
-                    found |= rewrite_attrs_since(&mut field.attrs)?;
-                }
-            }
-        }
-        syn::Data::Union(data) => {
-            for field in &mut data.fields.named {
-                found |= rewrite_attrs_since(&mut field.attrs)?;
-            }
-        }
+    for attrs in marker_sites(input) {
+        found |= rewrite_attrs_since(attrs)?;
     }
     Ok(found)
+}
+
+/// Remove every `#[since(...)]` marker from the fields / variants of `item`.
+///
+/// When a container fails to expand, the caller re-emits the item with the error; without this,
+/// rustc would also reject each marker left on a field. An item without markers, including one
+/// that is not a struct, enum or union, is returned unchanged.
+pub(crate) fn strip_field_markers(item: TokenStream) -> TokenStream {
+    let Ok(mut input) = syn::parse2::<syn::DeriveInput>(item.clone().into()) else {
+        return item;
+    };
+
+    let mut removed = false;
+    for attrs in marker_sites(&mut input) {
+        let before = attrs.len();
+        attrs.retain(|a| !is_since(a));
+        removed |= attrs.len() != before;
+    }
+
+    if !removed {
+        return item;
+    }
+    quote!(#input).into()
+}
+
+/// The attribute lists of every field and variant of `input`, where `#[since(...)]` markers sit,
+/// in source order.
+fn marker_sites(input: &mut syn::DeriveInput) -> Vec<&mut Vec<syn::Attribute>> {
+    match &mut input.data {
+        syn::Data::Struct(data) => data.fields.iter_mut().map(|field| &mut field.attrs).collect(),
+        syn::Data::Enum(data) => data
+            .variants
+            .iter_mut()
+            .flat_map(|variant| {
+                std::iter::once(&mut variant.attrs).chain(variant.fields.iter_mut().map(|field| &mut field.attrs))
+            })
+            .collect(),
+        syn::Data::Union(data) => data.fields.named.iter_mut().map(|field| &mut field.attrs).collect(),
+    }
 }
 
 /// Replace each `#[since(...)]` attribute in `attrs` with its `Since:` doc, preserving order.
@@ -314,7 +300,113 @@ fn rewrite_attrs_since(attrs: &mut Vec<syn::Attribute>) -> Result<bool, syn::Err
     Ok(true)
 }
 
-/// Whether `attr` is a `#[since(...)]` marker, matching both `since` and `openraft_macros::since`.
+/// The paths a `#[since(...)]` marker on a field or variant may use: the bare name, this crate,
+/// and its re-exports in `openraft`.
+const MARKER_PATHS: [&[&str]; 4] = [
+    &["since"],
+    &["openraft_macros", "since"],
+    &["openraft", "macros", "since"],
+    &["openraft", "openraft_macros", "since"],
+];
+
+/// Whether `attr` is a `#[since(...)]` marker: its path is exactly one of [`MARKER_PATHS`].
+///
+/// Any other attribute stays on the field for rustc, so another tool's `#[clippy::since]` is kept
+/// and a misspelled path still fails to resolve.
 fn is_since(attr: &syn::Attribute) -> bool {
-    attr.path().segments.last().is_some_and(|s| s.ident == "since")
+    let path = attr.path();
+    path.leading_colon.is_none()
+        && MARKER_PATHS.iter().any(|names| {
+            names.len() == path.segments.len()
+                && names.iter().zip(&path.segments).all(|(name, segment)| segment.ident == *name)
+        })
+}
+
+/// Whether `s` is an existing calendar date written as `yyyy-mm-dd`.
+fn is_valid_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+
+    let (Some(year), Some(month), Some(day)) =
+        (parse_digits(&b[0..4]), parse_digits(&b[5..7]), parse_digits(&b[8..10]))
+    else {
+        return false;
+    };
+
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+
+    (1..=days_in_month).contains(&day)
+}
+
+/// Parse a string of ASCII digits as a decimal number; `None` if any byte is not a digit.
+fn parse_digits(b: &[u8]) -> Option<u32> {
+    b.iter().try_fold(0u32, |acc, c| {
+        c.is_ascii_digit().then(|| acc * 10 + u32::from(c - b'0'))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+    use syn::parse_quote;
+
+    use super::is_since;
+    use super::is_valid_date;
+
+    #[test]
+    fn test_is_since() {
+        let markers: [syn::Attribute; 4] = [
+            parse_quote!(#[since(version = "1.0.0")]),
+            parse_quote!(#[openraft_macros::since(version = "1.0.0")]),
+            parse_quote!(#[openraft::macros::since(version = "1.0.0")]),
+            parse_quote!(#[openraft::openraft_macros::since(version = "1.0.0")]),
+        ];
+        for attr in &markers {
+            assert!(is_since(attr), "{}", quote!(#attr));
+        }
+
+        // Another tool's attribute, a misspelled path and other spellings are left for rustc.
+        let others: [syn::Attribute; 6] = [
+            parse_quote!(#[clippy::since]),
+            parse_quote!(#[openraft_macro::since(version = "1.0.0")]),
+            parse_quote!(#[macros::since(version = "1.0.0")]),
+            parse_quote!(#[::openraft_macros::since(version = "1.0.0")]),
+            parse_quote!(#[since::since(version = "1.0.0")]),
+            parse_quote!(#[doc = "since"]),
+        ];
+        for attr in &others {
+            assert!(!is_since(attr), "{}", quote!(#attr));
+        }
+    }
+
+    #[test]
+    fn test_is_valid_date() {
+        assert!(is_valid_date("2021-01-01"));
+        assert!(is_valid_date("2021-12-31"));
+        assert!(is_valid_date("2024-02-29"));
+        assert!(is_valid_date("2000-02-29"));
+
+        assert!(!is_valid_date("2021-01--"));
+        assert!(!is_valid_date("2021-1-01"));
+        assert!(!is_valid_date("2021-01-1"));
+        assert!(!is_valid_date("2021/01/01"));
+        assert!(!is_valid_date("2021-00-01"));
+        assert!(!is_valid_date("2021-13-01"));
+        assert!(!is_valid_date("2021-01-00"));
+        assert!(!is_valid_date("2021-04-31"));
+        assert!(!is_valid_date("2023-02-29"));
+        assert!(!is_valid_date("1900-02-29"));
+        assert!(!is_valid_date("+021-01-01"));
+        assert!(!is_valid_date("2021-01-01 "));
+        assert!(!is_valid_date(""));
+    }
 }

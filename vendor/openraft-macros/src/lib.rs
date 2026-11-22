@@ -13,9 +13,11 @@ pub(crate) mod utils;
 mod variant_name;
 
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::quote;
 use since::Since;
 use syn::Item;
+use syn::ItemTrait;
 use syn::ReturnType;
 use syn::TraitItem;
 use syn::Type;
@@ -24,10 +26,12 @@ use syn::parse_str;
 use syn::parse2;
 use syn::token::RArrow;
 
-/// This proc macro attribute optionally adds `Send` bounds to a trait.
+/// This proc macro attribute optionally adds `Send` bounds to the async methods of a trait.
 ///
-/// By default, `Send` bounds will be added to the trait and to the return bounds of any async
-/// functions defined within the trait.
+/// By default, each `async fn` in the trait becomes a `fn` returning
+/// `impl Future<Output = T> + Send`, and a default method body runs in an `async move` block.
+/// Other items stay unchanged, and the trait itself gets no `Send` bound: implementors and callers
+/// state their own bounds, for example with Openraft's `OptionalSend`.
 ///
 /// If the `single-threaded` feature is enabled, the trait definition remains the same without any
 /// added `Send` bounds.
@@ -51,66 +55,65 @@ use syn::token::RArrow;
 /// }
 /// ```
 ///
-/// Note: This proc macro can only be used with traits.
-///
-/// # Panics
-///
-/// This proc macro will panic if used on anything other than trait definitions.
+/// Note: This proc macro can only be used with traits. Applying it to any other item is a compile
+/// error, with or without `single-threaded`.
 #[proc_macro_attribute]
 pub fn add_async_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = match syn::parse::<Item>(item.clone()) {
+        Ok(Item::Trait(input)) => input,
+        Ok(_) => {
+            let e = syn::Error::new(Span::call_site(), "add_async_trait can only be used with traits");
+            return utils::token_stream_with_error(item, e);
+        }
+        Err(e) => return utils::token_stream_with_error(item, e),
+    };
+
     if cfg!(feature = "single-threaded") {
-        allow_non_send_bounds(item)
+        allow_non_send_bounds(input)
     } else {
-        add_send_bounds(item)
+        add_send_bounds(input)
     }
 }
 
-fn allow_non_send_bounds(item: TokenStream) -> TokenStream {
+fn allow_non_send_bounds(input: ItemTrait) -> TokenStream {
     // `async_fn_in_trait` requires the user to explicitly specify the `Send` bound for public
     // trait methods, however the `single-threaded` feature renders the requirement irrelevant.
-    let item: proc_macro2::TokenStream = item.into();
     quote! {
         #[allow(async_fn_in_trait)]
-        #item
+        #input
     }
     .into()
 }
 
-fn add_send_bounds(item: TokenStream) -> TokenStream {
+fn add_send_bounds(mut input: ItemTrait) -> TokenStream {
     let default_return_type: Box<Type> = parse_str("impl std::future::Future<Output = ()> + Send").unwrap();
 
-    match parse_macro_input!(item) {
-        Item::Trait(mut input) => {
-            for item in input.items.iter_mut() {
-                // for each async function definition
-                let TraitItem::Fn(function) = item else { continue };
-                if function.sig.asyncness.is_none() {
-                    continue;
-                };
+    for item in input.items.iter_mut() {
+        // for each async function definition
+        let TraitItem::Fn(function) = item else { continue };
+        if function.sig.asyncness.is_none() {
+            continue;
+        };
 
-                // remove async from signature
-                function.sig.asyncness = None;
+        // remove async from signature
+        function.sig.asyncness = None;
 
-                // wrap the return type in a `Future`
-                function.sig.output = match &function.sig.output {
-                    ReturnType::Default => ReturnType::Type(RArrow::default(), default_return_type.clone()),
-                    ReturnType::Type(arrow, t) => {
-                        let tokens = quote!(impl std::future::Future<Output = #t> + Send);
-                        ReturnType::Type(*arrow, parse2(tokens).unwrap())
-                    }
-                };
-
-                // if a body is defined, wrap it in an async block
-                let Some(body) = &function.default else { continue };
-                let body = parse2(quote!({ async move #body })).unwrap();
-                function.default = Some(body);
+        // wrap the return type in a `Future`
+        function.sig.output = match &function.sig.output {
+            ReturnType::Default => ReturnType::Type(RArrow::default(), default_return_type.clone()),
+            ReturnType::Type(arrow, t) => {
+                let tokens = quote!(impl std::future::Future<Output = #t> + Send);
+                ReturnType::Type(*arrow, parse2(tokens).unwrap())
             }
+        };
 
-            quote!(#input).into()
-        }
-
-        _ => panic!("add_async_trait can only be used with traits"),
+        // if a body is defined, wrap it in an async block
+        let Some(body) = &function.default else { continue };
+        let body = parse2(quote!({ async move #body })).unwrap();
+        function.default = Some(body);
     }
+
+    quote!(#input).into()
 }
 
 /// Add a `Since` line of doc, such as `/// Since: 1.0.0`.
@@ -127,6 +130,14 @@ fn add_send_bounds(item: TokenStream) -> TokenStream {
 ///
 /// - The `version` must be a valid semver string.
 /// - The `date` must be a valid date string in the format `yyyy-mm-dd`.
+/// - The optional `change` argument can appear more than once. The macro adds a colon after the
+///   version and optional date, then joins the change messages with `; `.
+///
+/// `#[since(version = "1.0.0", date = "2021-01-01", change = "add Foo", change = "add Bar")]`
+/// generates `Since: 1.0.0, Date(2021-01-01): add Foo; add Bar`.
+///
+/// Stacked `#[since]` attributes generate lines in the order they appear. Put the newest version
+/// first to show the newest change at the top.
 ///
 /// ### Example
 ///
@@ -163,12 +174,17 @@ fn add_send_bounds(item: TokenStream) -> TokenStream {
 ///     capacity: u64,
 /// }
 /// ```
+///
+/// A marker is written as `#[since(...)]`, `#[openraft_macros::since(...)]`,
+/// `#[openraft::macros::since(...)]` or `#[openraft::openraft_macros::since(...)]`. Every other
+/// attribute is left on the field or variant for rustc, so another tool's attribute such as
+/// `#[clippy::since]` is kept, and a misspelled path fails to resolve.
 #[proc_macro_attribute]
 pub fn since(args: TokenStream, item: TokenStream) -> TokenStream {
     let tokens = do_since(args, item.clone());
     match tokens {
         Ok(x) => x,
-        Err(e) => utils::token_stream_with_error(item, e),
+        Err(e) => utils::token_stream_with_error(since::strip_field_markers(item), e),
     }
 }
 
@@ -187,12 +203,21 @@ fn do_since(args: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Er
 /// Render a template with arguments multiple times.
 ///
 /// The template to expand is defined as `(K,V) => { ... }`, where `K` and `V` are template
-/// variables.
+/// variables. Each tuple of arguments after the template renders the body once, with every
+/// occurrence of a variable replaced by the corresponding argument, including occurrences inside
+/// `()`, `[]` and `{}`.
 ///
-/// - The template must contain at least 1 variable.
-/// - If the first macro argument is `KEYED`, the first variable serve as the key for deduplication.
-///   Otherwise, the first macro argument should be `!KEYED`, and no deduplication will be
+/// - The template must contain at least 1 variable. A template with one variable keeps the trailing
+///   comma of a one-element tuple: `(K,)`.
+/// - If the first macro argument is `KEYED`, the first variable serves as the key for
+///   deduplication: among tuples whose first arguments have the same tokens, only the first one is
+///   rendered. Otherwise, the first macro argument should be `!KEYED`, and no deduplication will be
 ///   performed.
+/// - Each tuple has one argument per variable. An argument may be empty, like the second argument
+///   of `(a,,1)`.
+/// - Arguments are separated by commas outside `<...>`, `()`, `[]` and `{}`, so `HashMap<K, V>` is
+///   one argument. A `<` used as an operator, as in `a < b`, also opens `<...>`; wrap such an
+///   argument in parentheses.
 ///
 /// # Example: `KEYED` for deduplication
 ///
@@ -245,8 +270,8 @@ fn do_since(args: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Er
 /// ```
 #[proc_macro]
 pub fn expand(item: TokenStream) -> TokenStream {
-    let repeat = parse_macro_input!(item as expand::Expand);
-    repeat.render().into()
+    let input = parse_macro_input!(item as expand::Expand);
+    input.render().into()
 }
 
 /// Derive `COUNT`, `ALL`, `index()`, `as_str()` and `Display` for an enum that names the
