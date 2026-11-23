@@ -59,12 +59,49 @@
 //! statement. Where a proxy cannot carry a bidirectional stream, choose one
 //! unary call per statement with [`Transport::Unary`].
 //!
+//! ## Nearest reads
+//!
+//! A client given several members of a group
+//! ([`CoordinodeClientBuilder::endpoints`]) measures how fast each answers
+//! when it is built and sends a read a follower may serve to the fastest. A
+//! member there whose view does not meet the read's causal bound passes it
+//! once to a member that can, within the read's one wait, so the caller
+//! makes one call either way:
+//!
+//! ```no_run
+//! # tokio_test::block_on(async {
+//! use std::collections::HashMap;
+//! use coordinode_client::{CausalToken, CoordinodeClient, ReadPreference};
+//!
+//! let mut client = CoordinodeClient::builder("http://node1:7080")
+//!     .namespace("default")
+//!     .endpoints(["http://node2:7080", "http://node3:7080"])
+//!     .causal_wait(std::time::Duration::from_millis(500))
+//!     .build()
+//!     .await
+//!     .unwrap();
+//! // Refresh a key after a change event committed at `seen`.
+//! let seen = CausalToken::from(0);
+//! let (rows, _) = client
+//!     .execute_causal_read_with_preference(
+//!         "MATCH (d:Doc {id: 1}) RETURN d",
+//!         HashMap::new(),
+//!         seen,
+//!         ReadPreference::Nearest,
+//!     )
+//!     .await
+//!     .unwrap();
+//! # let _ = rows;
+//! # })
+//! ```
+//!
 //! Source tracking relies on Rust's built-in `#[track_caller]` attribute.
 //! No macros are needed — simply call the normal client methods and the
 //! driver infers the caller's `file:line` automatically.
 
 pub mod config;
 pub mod error;
+mod routing;
 mod session;
 mod source;
 pub mod subscription;
@@ -202,6 +239,9 @@ pub struct CoordinodeClient {
     cypher: CypherServiceClient<tonic::transport::Channel>,
     /// The persistent session subscriptions ride, opened on first use.
     session: Option<Arc<session::SessionLink>>,
+    /// The endpoints of the group this client reaches, fastest first, when
+    /// it was given more than one.
+    routes: Option<routing::Routes>,
 }
 
 impl CoordinodeClient {
@@ -227,12 +267,26 @@ impl CoordinodeClient {
             .await?;
 
         let cypher = CypherServiceClient::new(channel.clone());
+        let routes = routing::Routes::probe(&config).await;
 
         Ok(Self {
             config,
             channel,
             cypher,
             session: None,
+            routes,
+        })
+    }
+
+    /// The endpoints this client reaches, fastest first, as it measured them
+    /// when it was built; empty when it was given only the one endpoint.
+    pub fn endpoints_by_latency(&self) -> Vec<String> {
+        self.routes.as_ref().map_or_else(Vec::new, |routes| {
+            routes
+                .members()
+                .iter()
+                .map(|route| route.endpoint.clone())
+                .collect()
         })
     }
 
@@ -370,14 +424,7 @@ impl CoordinodeClient {
         let query = query.into();
         async move {
             let (rows, _applied_index) = self
-                .execute_request(
-                    query,
-                    params,
-                    read_preference.to_proto(),
-                    None,
-                    None,
-                    location,
-                )
+                .execute_request(query, params, Some(read_preference), None, None, location)
                 .await?;
             Ok(rows)
         }
@@ -458,7 +505,7 @@ impl CoordinodeClient {
         } else {
             None
         };
-        self.execute_causal_read_inner(query.into(), HashMap::new(), after, location)
+        self.execute_causal_read_inner(query.into(), HashMap::new(), after, None, location)
     }
 
     /// Execute a causal read with named parameters.
@@ -478,7 +525,37 @@ impl CoordinodeClient {
         } else {
             None
         };
-        self.execute_causal_read_inner(query.into(), params, after, location)
+        self.execute_causal_read_inner(query.into(), params, after, None, location)
+    }
+
+    /// A causal read that names its [`ReadPreference`]: a refresh after a
+    /// change event, for example, read where `preference` permits at or
+    /// after `after`. A preference that lets a follower serve it goes to the
+    /// fastest endpoint this client reaches
+    /// ([`CoordinodeClientBuilder::endpoints`]); a member there that is
+    /// behind `after` passes it once to a member that can serve it, within
+    /// the one wait the client allows, so the caller makes one call either
+    /// way. Any later update or deletion is what such a read sees.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::execute_causal_read`].
+    ///
+    /// [`CoordinodeClientBuilder::endpoints`]: config::CoordinodeClientBuilder::endpoints
+    #[track_caller]
+    pub fn execute_causal_read_with_preference(
+        &mut self,
+        query: impl Into<String>,
+        params: HashMap<String, Value>,
+        after: CausalToken,
+        preference: ReadPreference,
+    ) -> impl Future<Output = Result<(Vec<Row>, CausalToken), ClientError>> + '_ {
+        let location = if self.config.debug_source_tracking {
+            Some(Location::caller())
+        } else {
+            None
+        };
+        self.execute_causal_read_inner(query.into(), params, after, Some(preference), location)
     }
 
     // ── Config access ─────────────────────────────────────────────────────────
@@ -498,7 +575,7 @@ impl CoordinodeClient {
     ) -> Result<Vec<Row>, ClientError> {
         // Settings left unset: the server applies its configured defaults.
         let (rows, _applied_index) = self
-            .execute_request(query, params, 0, None, None, location)
+            .execute_request(query, params, None, None, None, location)
             .await?;
         Ok(rows)
     }
@@ -519,7 +596,7 @@ impl CoordinodeClient {
             timeout_ms: 0,
         });
         let (rows, operation_time) = self
-            .execute_request(query, params, 0, None, write_concern, location)
+            .execute_request(query, params, None, None, write_concern, location)
             .await?;
         Ok((rows, CausalToken(operation_time)))
     }
@@ -529,6 +606,7 @@ impl CoordinodeClient {
         query: String,
         params: HashMap<String, Value>,
         after: CausalToken,
+        preference: Option<ReadPreference>,
         location: Option<&'static Location<'static>>,
     ) -> Result<(Vec<Row>, CausalToken), ClientError> {
         let read_concern = Some(ReadConcern {
@@ -542,7 +620,7 @@ impl CoordinodeClient {
             at_timestamp: 0,
         });
         let (rows, operation_time) = self
-            .execute_request(query, params, 0, read_concern, None, location)
+            .execute_request(query, params, preference, read_concern, None, location)
             .await?;
         Ok((rows, after.max(CausalToken(operation_time))))
     }
@@ -550,22 +628,69 @@ impl CoordinodeClient {
     /// Low-level request executor shared by all public methods.
     ///
     /// Returns the decoded rows **and** the receipt's operation time from
-    /// `QueryStats` so causal methods can wrap it in a [`CausalToken`]. A
-    /// `read_preference` of zero and an absent concern leave the setting to
-    /// the server.
+    /// `QueryStats` so causal methods can wrap it in a [`CausalToken`]. An
+    /// absent `preference` and concern leave the setting to the server. A
+    /// read whose preference lets this client choose where it goes, when the
+    /// client reaches several endpoints, goes as one unary call there; the
+    /// rest take the client's transport.
     async fn execute_request(
         &mut self,
         query: String,
         params: HashMap<String, Value>,
-        read_preference: i32,
+        preference: Option<ReadPreference>,
         read_concern: Option<ReadConcern>,
         write_concern: Option<WriteConcern>,
         location: Option<&'static Location<'static>>,
     ) -> Result<(Vec<Row>, u64), ClientError> {
-        let proto_params = params
+        let proto_params: HashMap<_, _> = params
             .into_iter()
             .map(|(k, v)| (k, value::to_proto(v)))
             .collect();
+        let read_preference = preference.map_or(0, ReadPreference::to_proto);
+
+        let routed = preference.and_then(|preference| {
+            self.routes
+                .as_ref()
+                .and_then(|routes| routes.for_read(preference))
+        });
+        if let Some((route, direct)) = routed {
+            let request = ExecuteCypherRequest {
+                query: query.clone(),
+                parameters: proto_params.clone(),
+                read_preference,
+                read_concern: read_concern.clone(),
+                write_concern,
+                ..Default::default()
+            };
+            let mut cypher = route.cypher;
+            match self.unary(&mut cypher, request, location).await {
+                // A leader named on a forwarded answer that no longer
+                // carries the read: it goes on as if none had been named, to
+                // the fastest endpoint or the one the client was built for.
+                Err(ClientError::Grpc(status))
+                    if direct && status.code() == tonic::Code::Unavailable =>
+                {
+                    if let Some(routes) = self.routes.as_mut() {
+                        routes.forget_direct();
+                    }
+                    return Box::pin(
+                        self.execute_request(
+                            query,
+                            proto_params
+                                .into_iter()
+                                .map(|(k, v)| (k, value::from_proto(v)))
+                                .collect(),
+                            preference,
+                            read_concern,
+                            write_concern,
+                            location,
+                        ),
+                    )
+                    .await;
+                }
+                answered => return answered,
+            }
+        }
 
         if self.config.transport == Transport::Session {
             let link = self.session().await?;
@@ -587,7 +712,7 @@ impl CoordinodeClient {
             .await;
         }
 
-        let mut request = tonic::Request::new(ExecuteCypherRequest {
+        let request = ExecuteCypherRequest {
             query,
             parameters: proto_params,
             read_preference,
@@ -602,14 +727,29 @@ impl CoordinodeClient {
             query_memory_limit_mb: None,
             // The driver does not number its writes yet.
             operation: None,
-        });
+        };
+        let mut cypher = self.cypher.clone();
+        self.unary(&mut cypher, request, location).await
+    }
 
+    /// Send `request` as one unary call through `cypher`, take the routing
+    /// hints its response carries, and decode its rows and operation time.
+    async fn unary(
+        &mut self,
+        cypher: &mut CypherServiceClient<tonic::transport::Channel>,
+        request: ExecuteCypherRequest,
+        location: Option<&'static Location<'static>>,
+    ) -> Result<(Vec<Row>, u64), ClientError> {
+        let mut request = tonic::Request::new(request);
         self.config.name_namespace(request.metadata_mut());
         if let Some(loc) = location {
             source::inject_grpc_metadata(request.metadata_mut(), loc, &self.config);
         }
 
-        let response = self.cypher.execute_cypher(request).await?;
+        let response = cypher.execute_cypher(request).await?;
+        if let Some(routes) = self.routes.as_mut() {
+            routes.observe(response.metadata());
+        }
         let body = response.into_inner();
 
         let operation_time = operation_time(body.stats.as_ref());

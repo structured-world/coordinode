@@ -34,6 +34,8 @@ pub struct Node {
     pub raft: Arc<RaftNode>,
     /// What the member's own clients' statements run through.
     pub executor: StatementExecutor,
+    /// The change-stream consumers' registry runs while the member does.
+    _registry: coordinode_replicate::RegistryBackground,
     _dir: tempfile::TempDir,
 }
 
@@ -118,6 +120,41 @@ pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -
 
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(RaftProposalPipeline::new(Arc::clone(raft.raft())));
+    // Change streams over the member's log, with their consumers' registry,
+    // as a deployed member serves them.
+    let (cdc, registry) = {
+        let applied = Arc::clone(&raft);
+        let source = Arc::new(coordinode_replicate::LogRetentionSource::new(
+            Arc::clone(&engine),
+            coordinode_raft::storage::raft_oplog_dirs(&engine, 0)
+                .unwrap()
+                .all,
+            raft.retained_floor(),
+            Arc::new(move || applied.applied_through()),
+        ));
+        let registry = coordinode_replicate::ShardConsumerRegistry::new(
+            Arc::clone(&engine),
+            Arc::clone(&pipeline),
+            Arc::new(
+                coordinode_core::txn::proposal::ProposalIdGenerator::with_base(
+                    coordinode_core::txn::proposal::fresh_proposal_id_base(),
+                ),
+            ),
+            Arc::new(coordinode_replicate::SystemClock),
+            source,
+        )
+        .unwrap();
+        let background = registry
+            .start_background(coordinode_replicate::BackgroundConfig::default())
+            .unwrap();
+        let cdc = coordinode_server::services::cdc::ChangeEventServiceImpl::for_raft_node(
+            &engine,
+            Arc::clone(&raft),
+            registry,
+        )
+        .unwrap();
+        (Arc::new(cdc), background)
+    };
     let db = Arc::new(RwLock::new(
         Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap(),
     ));
@@ -126,7 +163,8 @@ pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -
     let cypher = CypherServiceImpl::from_executor(executor.clone());
     let operations = OperationServiceImpl::new(executor.clone());
     let sessions = SessionSvc::new(executor.clone(), Arc::new(SessionRegistry::new()))
-        .with_cluster(Arc::clone(&raft));
+        .with_cluster(Arc::clone(&raft))
+        .with_change_streams(cdc);
     // What a member passes its clients' commands to the leader through.
     let routing =
         CommandRoutingHandler::new(Arc::new(ServerCommandExecutor::new(executor.clone())))
@@ -153,8 +191,21 @@ pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -
         db,
         raft,
         executor,
+        _registry: registry,
         _dir: dir,
     }
+}
+
+/// A flat group of three: member 1 leads, members 2 and 3 follow. Returns
+/// them with the ports they serve on.
+pub async fn three_members() -> Vec<(Node, u16)> {
+    let ports = [alloc_port(), alloc_port(), alloc_port()];
+    let n1 = open_node(1, ports[0], None).await;
+    let n2 = open_node(2, ports[1], Some((&n1, ports[0]))).await;
+    let n3 = open_node(3, ports[2], Some((&n1, ports[0]))).await;
+    n1.raft.change_membership(vec![1, 2, 3]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    vec![(n1, ports[0]), (n2, ports[1]), (n3, ports[2])]
 }
 
 /// A group of two: member 1 leads, member 2 follows. Returns both with the

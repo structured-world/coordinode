@@ -13,6 +13,7 @@ fn builder_defaults() {
         transport: builder.transport,
         causal_wait: builder.causal_wait,
         namespace: None,
+        endpoints: builder.endpoints.clone(),
     };
     assert_eq!(
         config.causal_wait, None,
@@ -66,6 +67,7 @@ fn source_tracking_flag_reflects_config() {
         transport: Transport::default(),
         causal_wait: None,
         namespace: None,
+        endpoints: Vec::new(),
     };
     let config_off = ClientConfig {
         debug_source_tracking: false,

@@ -10,6 +10,7 @@ fn make_config(tracking: bool) -> ClientConfig {
         transport: crate::Transport::default(),
         causal_wait: None,
         namespace: None,
+        endpoints: Vec::new(),
     }
 }
 
@@ -46,6 +47,7 @@ fn skips_empty_app_fields() {
         transport: crate::Transport::default(),
         causal_wait: None,
         namespace: None,
+        endpoints: Vec::new(),
     };
 
     inject_grpc_metadata(&mut meta, loc, &config);

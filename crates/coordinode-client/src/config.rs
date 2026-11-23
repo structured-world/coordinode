@@ -32,6 +32,11 @@ pub struct ClientConfig {
     /// value naming it; a server refuses tenant data to a client that names
     /// none.
     pub(crate) namespace: Option<tonic::metadata::AsciiMetadataValue>,
+
+    /// Further endpoints of the same group this client may reach, beside
+    /// `endpoint`; a read that may be served away from the leader goes to
+    /// the one that answers this client fastest.
+    pub(crate) endpoints: Vec<String>,
 }
 
 /// The metadata key a call names its namespace under.
@@ -92,6 +97,7 @@ pub struct CoordinodeClientBuilder {
     pub(crate) transport: Transport,
     pub(crate) causal_wait: Option<std::time::Duration>,
     pub(crate) namespace: Option<String>,
+    pub(crate) endpoints: Vec<String>,
 }
 
 impl CoordinodeClientBuilder {
@@ -105,7 +111,26 @@ impl CoordinodeClientBuilder {
             transport: Transport::default(),
             causal_wait: None,
             namespace: None,
+            endpoints: Vec::new(),
         }
+    }
+
+    /// Also reach the group through `endpoints`, members this client is
+    /// permitted to use beside the one it was built for. When the client is
+    /// built it measures how fast each answers; a read that may be served
+    /// away from the leader ([`crate::ReadPreference::Nearest`] and the
+    /// other non-primary preferences) then goes to the fastest one that
+    /// answered. That member serves it if its view meets the read, and
+    /// otherwise passes it once to a member that can. Endpoints that do not
+    /// answer are left out; with none named, every call goes to the
+    /// endpoint the client was built for.
+    pub fn endpoints<I, S>(mut self, endpoints: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.endpoints = endpoints.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Work in the namespace named `name`: every call names it, and the
@@ -179,6 +204,7 @@ impl CoordinodeClientBuilder {
             transport: self.transport,
             causal_wait: self.causal_wait,
             namespace,
+            endpoints: self.endpoints,
         };
         super::CoordinodeClient::connect_with_config(config).await
     }
