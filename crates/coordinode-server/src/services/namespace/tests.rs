@@ -93,15 +93,30 @@ async fn typed_reads_see_their_own_namespace_alone() {
                     },
                 ))
             };
-            let own = hits(word).await.expect("text search").into_inner().results;
+            // A reader not caught up with the index's last commit refuses
+            // with a typed retryable reason: not indexed yet, like no hits.
+            let not_ready = |status: &tonic::Status| {
+                use tonic_types::StatusExt as _;
+                status.code() == tonic::Code::Unavailable
+                    && status
+                        .get_details_error_info()
+                        .is_some_and(|info| info.reason == "TEXT_INDEX_NOT_READY")
+            };
+            let own = match hits(word).await {
+                Ok(answer) => answer.into_inner().results,
+                Err(status) if not_ready(&status) => Vec::new(),
+                Err(status) => panic!("text search: {status:?}"),
+            };
             if own.len() == 2 {
-                let foreign = hits(other_word)
-                    .await
-                    .expect("text search")
-                    .into_inner()
-                    .results;
-                assert!(foreign.is_empty(), "{namespace} finds another's words");
-                break;
+                match hits(other_word).await {
+                    Ok(answer) => {
+                        let foreign = answer.into_inner().results;
+                        assert!(foreign.is_empty(), "{namespace} finds another's words");
+                        break;
+                    }
+                    Err(status) if not_ready(&status) => {}
+                    Err(status) => panic!("text search: {status:?}"),
+                }
             }
             assert!(std::time::Instant::now() < deadline, "never indexed");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

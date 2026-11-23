@@ -530,23 +530,47 @@ fn a_namespace_codec_change_applies_to_its_next_tables_only() {
 
     write_rows(&first, &oracle, "first", 500..1000);
     write_rows(&second, &oracle, "second", 500..1000);
+    // Each namespace's tables after the next flush: one written before the
+    // change and still installed is the very one (same bytes); every table
+    // written since, by the flush or by the engine's own compaction of the
+    // two, carries that namespace's current codec, never the other's. Whether
+    // a compaction ran by now is the machine's timing, not something the
+    // codec change decides.
     let first_after = node_tables(&first);
-    assert_eq!(first_after.len(), 2, "{first_after:?}");
-    assert_eq!(
-        first_after[0], first_before[0],
-        "the table written before the change stays installed, the same bytes"
-    );
-    assert_eq!(first_after[1].codec, CompressionType::Zstd(3));
     let second_after = node_tables(&second);
-    assert_eq!(
-        second_after.iter().map(|t| t.codec).collect::<Vec<_>>(),
-        vec![CompressionType::None, CompressionType::None],
-        "the other namespace keeps its codec"
-    );
-    assert_eq!(
-        second_after[0], second_before[0],
-        "the other namespace's earlier table stays installed, the same bytes"
-    );
+    for (name, before, after, codec) in [
+        (
+            "first",
+            &first_before,
+            &first_after,
+            CompressionType::Zstd(3),
+        ),
+        (
+            "second",
+            &second_before,
+            &second_after,
+            CompressionType::None,
+        ),
+    ] {
+        for table in after {
+            match before.iter().find(|t| t.id == table.id) {
+                Some(earlier) => assert_eq!(
+                    table, earlier,
+                    "{name}'s table {} written before the change stays the same bytes",
+                    table.id
+                ),
+                None => assert_eq!(
+                    table.codec, codec,
+                    "{name}'s table {} written since carries its own codec",
+                    table.id
+                ),
+            }
+        }
+        assert!(
+            after.iter().any(|t| before.iter().all(|b| b.id != t.id)),
+            "{name}'s next flush wrote a table: {after:?}"
+        );
+    }
     drop((first, second));
     drop(deployment);
 
