@@ -77,6 +77,8 @@ Thumbs.db
 data/
 # openraft's documentation module of that name, in the vendored source
 !vendor/openraft/src/docs/data/
+# data directories a released engine wrote, kept as migration fixtures
+!crates/coordinode-migrate/tests/fixtures/*/data/
 
 # Node.js / VitePress docs
 node_modules/
