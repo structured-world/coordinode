@@ -3105,6 +3105,74 @@ fn removed_ids_are_never_results() {
     }
 }
 
+/// A node linked beside neighbours retired together stays reachable: a, b,
+/// far; then, at once, a removed, c inserted on a's vector (where a hides b
+/// and far under the pruning rule) and b moved far away. The repair of a
+/// retired node must bridge through the other one retired with it and leave
+/// c an incoming edge, and a relinked c must not plan itself as its own
+/// nearest neighbour. Either way wrong, c is a live result no search reaches,
+/// as a current read after a deletion, an insert and an update committed in a
+/// row found it.
+#[test]
+fn a_node_beside_a_removed_one_survives_its_neighbours_update() {
+    for round in 0..50_000 {
+        let index = HnswIndex::new(HnswConfig {
+            metric: VectorMetric::L2,
+            max_elements: 64,
+            ..Default::default()
+        });
+        index.insert_shared(1, &[1.0, 0.0]);
+        index.insert_shared(2, &[0.8, 0.0]);
+        index.insert_shared(3, &[-5.0, 0.0]);
+        let gate = std::sync::Barrier::new(3);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                gate.wait();
+                index.remove(1);
+            });
+            s.spawn(|| {
+                gate.wait();
+                index.insert_shared(4, &[1.0, 0.0]);
+            });
+            s.spawn(|| {
+                gate.wait();
+                if round % 2 == 0 {
+                    index.insert_shared(2, &[-9.0, 0.0]);
+                }
+            });
+        });
+        if round % 2 == 1 {
+            index.insert_shared(2, &[-9.0, 0.0]);
+        }
+        let hits: Vec<u64> = index.search(&[1.0, 0.0], 2).iter().map(|h| h.id).collect();
+        // The graph as it was left, for a failure to show where c lost its
+        // way in.
+        let graph = || {
+            let store = index.nodes();
+            (0..index.node_len())
+                .map(|i| {
+                    let lists: Vec<Vec<u64>> = (0..index.node_levels(i))
+                        .map(|l| index.layer_snapshot(i, l))
+                        .collect();
+                    format!(
+                        "slot {i} id {} {:?} lists {lists:?}",
+                        index.node_id(i),
+                        store.state(i)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            hits,
+            [4, 3],
+            "round {round}; entry {:?}\n{}",
+            index.entry_point.for_search(),
+            graph()
+        );
+    }
+}
+
 /// Removing the entry point hands it to a node that serves, so every other
 /// id stays reachable; removing every node empties the index, which then
 /// takes inserts again.
@@ -3156,7 +3224,9 @@ fn a_neighbour_retired_while_linking_does_not_orphan_the_new_node() {
     let a = index.idx_for_id_for_test(1).expect("a is indexed");
     let c = [0.0, 0.0];
     let idx = index.allocate_node(4, 0, &c).expect("a slot");
-    let plan = index.plan_links(&c, 0).expect("a graph to plan against");
+    let plan = index
+        .plan_links((idx, 4), &c, 0)
+        .expect("a graph to plan against");
     let level0: Vec<usize> = plan
         .iter()
         .find(|p| p.level == 0)

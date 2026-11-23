@@ -1470,7 +1470,12 @@ impl HnswIndex {
     /// `new_level` down: the greedy descent and ef-search from the current
     /// entry point, against the live graph. `None` while the index has no
     /// entry point, i.e. no node to link to.
-    fn plan_links(&self, vector: &[f32], new_level: usize) -> Option<Vec<LayerPlan>> {
+    fn plan_links(
+        &self,
+        (own, id): (usize, u64),
+        vector: &[f32],
+        new_level: usize,
+    ) -> Option<Vec<LayerPlan>> {
         // The single-load snapshot gives `(start_idx, top_level)` from ONE
         // atomic read.
         let (start_idx, top_level) = self.entry_point.for_search()?;
@@ -1506,8 +1511,15 @@ impl HnswIndex {
             // but a retired node is never a new link: left among the
             // candidates it would hide live ones under the pruning rule and
             // then be dropped, leaving the list short of what it hid.
+            // The node being linked, reachable already when an earlier attempt
+            // left a back-edge, is its own nearest candidate and would hide
+            // every other under the same rule; so would an older node of its
+            // id. Neither is a link.
             let store = self.nodes();
-            candidates.retain(|c| store.state(c.idx as usize).is_linkable());
+            candidates.retain(|c| {
+                let c = c.idx as usize;
+                c != own && store.state(c).is_linkable() && self.node_id(c) != id
+            });
 
             let max_conn = if level == 0 {
                 self.config.m_max0
@@ -1958,7 +1970,13 @@ impl HnswIndex {
             .filter_map(|(id, vector)| {
                 let level = self.random_level();
                 let idx = self.allocate_node(*id, level, vector)?;
-                Some((idx, *id, level, vector, self.plan_links(vector, level)))
+                Some((
+                    idx,
+                    *id,
+                    level,
+                    vector,
+                    self.plan_links((idx, *id), vector, level),
+                ))
             })
             .collect();
         for (idx, id, level, vector, plan) in planned {
@@ -2111,7 +2129,7 @@ impl HnswIndex {
     /// The node is then linked again against the graph that is left.
     fn link_node(&self, idx: usize, id: u64, new_level: usize, vector: &[f32]) {
         loop {
-            let Some(plan) = self.plan_links(vector, new_level) else {
+            let Some(plan) = self.plan_links((idx, id), vector, new_level) else {
                 if self.entry_point.try_seed(new_level as u8, idx as u64) {
                     return;
                 }
@@ -2281,7 +2299,7 @@ impl HnswIndex {
             let Some(vector) = self.read_node_f32(u) else {
                 continue;
             };
-            let Some(plan) = self.plan_links(vector, 0) else {
+            let Some(plan) = self.plan_links((u, self.node_id(u)), vector, 0) else {
                 return unreached;
             };
             let candidates: Vec<usize> = plan
@@ -2346,15 +2364,11 @@ impl HnswIndex {
         // back-edge this snapshot misses sees the retirement and links again.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         let n = self.node_len();
-        let dead = |id: u64| id == old as u64;
         for level in 0..self.node_levels(old) {
-            let bridge = self.layer_snapshot(old, level);
-            for &nb in &bridge {
+            for nb in self.layer_snapshot(old, level) {
                 let nb = nb as usize;
                 if nb < n && store.state(nb).is_linkable() && level < self.node_levels(nb) {
-                    self.layer_update(nb, level, |current| {
-                        self.repaired_list(nb, level, current, &dead, &bridge)
-                    });
+                    self.repair_list(nb, level);
                 }
             }
         }
@@ -2365,6 +2379,99 @@ impl HnswIndex {
         if self.reclaim.unlinkable_len() >= (n / 16).max(SWEEP_MIN_SLOTS) {
             self.sweep_unlinkable(guard);
         }
+    }
+
+    /// Repair the list of the linkable node `nb` at `level` after a neighbour
+    /// of it was retired: every neighbour that can no longer be linked goes,
+    /// the gap is bridged from what those neighbours reach that still can be
+    /// (see [`Self::live_bridge`]), and each node the repair newly links
+    /// gets an edge back to `nb`.
+    ///
+    /// Neighbours retired together (a removal beside an update, or two
+    /// removals) are each other's bridge: bridging only through what is
+    /// linkable leaves a node whose links went through both with no list and
+    /// no incoming edge, a live result no search reaches. The back-edges keep
+    /// `nb` reachable once the edge from the retired node is gone. A node so
+    /// linked that is retired meanwhile is caught by the same fence pairing as
+    /// an insert's back-edges, and repaired around once more.
+    fn repair_list(&self, nb: usize, level: usize) {
+        const ATTEMPTS: usize = 4;
+        let max_conn = if level == 0 {
+            self.config.m_max0
+        } else {
+            self.config.m
+        };
+        let store = self.nodes();
+        // A slot past the count read here was allocated since, by an insert
+        // still linking it: it can be linked.
+        let linkable = |x: u64| {
+            let x = x as usize;
+            x >= self.node_len() || store.state(x).is_linkable()
+        };
+        let mut added: Vec<u64> = Vec::new();
+        for _ in 0..ATTEMPTS {
+            self.layer_update(nb, level, |current| {
+                added.clear();
+                let dead: Vec<u64> = current.iter().copied().filter(|&x| !linkable(x)).collect();
+                if dead.is_empty() {
+                    return None;
+                }
+                let bridge = self.live_bridge(&dead, level, nb);
+                let next =
+                    self.repaired_list(nb, level, current, &|x| dead.contains(&x), &bridge)?;
+                added.extend(next.iter().copied().filter(|x| !current.contains(x)));
+                Some(next)
+            });
+            for &x in &added {
+                if level < self.node_levels(x as usize) {
+                    self.add_neighbour_to(x as usize, level, nb as u64, max_conn);
+                }
+            }
+            // Pairs with the fence in `retire_node`, as in
+            // `publish_back_edges`.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            if added.iter().all(|&x| linkable(x)) {
+                return;
+            }
+        }
+    }
+
+    /// What the `dead` neighbours of `nb` at `level` lead to that can still be
+    /// linked: their own neighbours there, with a retired one replaced in turn
+    /// by its neighbours. A retired node's lists stay readable until its slot
+    /// is free, and a free slot is in no list a sweep has repaired.
+    fn live_bridge(&self, dead: &[u64], level: usize, nb: usize) -> Vec<u64> {
+        let store = self.nodes();
+        let n = self.node_len();
+        let mut seen: rustc_hash::FxHashSet<u64> = dead.iter().copied().collect();
+        seen.insert(nb as u64);
+        let mut frontier: Vec<u64> = Vec::new();
+        let mut list = Vec::new();
+        let mut expand = |x: usize, frontier: &mut Vec<u64>| {
+            if x < n
+                && store.state(x) == data_level0::NodeState::Retired
+                && level < self.node_levels(x)
+            {
+                self.layer_snapshot_into(x, level, &mut list);
+                frontier.extend_from_slice(&list);
+            }
+        };
+        for &d in dead {
+            expand(d as usize, &mut frontier);
+        }
+        let mut bridge = Vec::new();
+        while let Some(x) = frontier.pop() {
+            if !seen.insert(x) || x as usize >= n {
+                continue;
+            }
+            match store.state(x as usize) {
+                state if state.is_linkable() => bridge.push(x),
+                data_level0::NodeState::Retired => expand(x as usize, &mut frontier),
+                // A free slot is about to hold another node.
+                _ => {}
+            }
+        }
+        bridge
     }
 
     /// `current`, the list of `idx` at `level`, without the slots `dead`
