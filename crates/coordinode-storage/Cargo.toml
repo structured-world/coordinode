@@ -114,6 +114,8 @@ serde_json = { workspace = true }
 nanoid = "0.5"
 test-log = "0.2.21"
 rand = "0.10"
+# Counts what a change-stream page allocates (tests/tail_read_cost.rs).
+tracking-allocator = { version = "0.4", default-features = false }
 
 [[bench]]
 name = "merge_stress"

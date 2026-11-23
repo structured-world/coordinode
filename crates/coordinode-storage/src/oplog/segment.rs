@@ -388,6 +388,19 @@ impl FrameCursor {
     /// The file cannot be opened, or its header is not a segment header of
     /// this format.
     pub(crate) fn open(path: &Path) -> StorageResult<Self> {
+        Self::open_at(path, HEADER_SIZE)
+    }
+
+    /// A cursor on the frame starting at byte `offset` of the segment at
+    /// `path` (at least [`HEADER_SIZE`], the first frame), for a reader that
+    /// resumes where it stopped. The header is checked when it reads from
+    /// the first frame; a later offset was reached through a checked one.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be opened, or (from the first frame) its header is not
+    /// a segment header of this format.
+    pub(crate) fn open_at(path: &Path, offset: u64) -> StorageResult<Self> {
         let file = std::fs::File::open(path)
             .map_err(|e| StorageError::Io(format!("open segment {path:?}: {e}")))?;
         let len = file
@@ -395,17 +408,26 @@ impl FrameCursor {
             .map_err(|e| StorageError::Io(format!("stat segment {path:?}: {e}")))?
             .len();
         let mut file = io::BufReader::with_capacity(FRAME_CURSOR_BUFFER, file);
-        let mut header = [0u8; HEADER_SIZE as usize];
-        file.read_exact(&mut header)
-            .map_err(|e| StorageError::Io(format!("read segment header {path:?}: {e}")))?;
-        check_header(&header, path)?;
+        let offset = offset.max(HEADER_SIZE);
+        if offset == HEADER_SIZE {
+            let mut header = [0u8; HEADER_SIZE as usize];
+            file.read_exact(&mut header)
+                .map_err(|e| StorageError::Io(format!("read segment header {path:?}: {e}")))?;
+            check_header(&header, path)?;
+        }
         Ok(Self {
             file,
             path: path.to_path_buf(),
             len,
-            at: HEADER_SIZE,
+            at: offset,
             peeked: None,
         })
+    }
+
+    /// Where the frame at the cursor starts: just past the last frame
+    /// skipped or read.
+    pub(crate) fn at(&self) -> u64 {
+        self.at
     }
 
     /// The frame at the cursor: its payload's length and its entry's log

@@ -63,7 +63,7 @@ use std::path::PathBuf;
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::convert::expand_units_decided;
 use crate::oplog::entry::{OplogEntry, OplogOp, ShardId};
-use crate::oplog::segment::{HEADER_SIZE, read_frames_from};
+use crate::oplog::segment::{FrameCursor, HEADER_SIZE, Peeked};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -251,9 +251,11 @@ impl OplogTailer {
             let Some(cursor) = self.cursor.as_mut() else {
                 break;
             };
-            // Only the bytes past the cursor: a segment being written is read
-            // up to its last complete frame, the crc framing makes that safe.
-            let frames = match read_frames_from(&cursor.path, cursor.offset) {
+            // Frame by frame from the cursor, up to the page's last entry: a
+            // page costs its entries, not the rest of the segment. A segment
+            // being written is read up to its last complete frame, the crc
+            // framing makes that safe.
+            let mut frames = match FrameCursor::open_at(&cursor.path, cursor.offset) {
                 Ok(frames) => frames,
                 Err(e) => {
                     // Rewritten by a truncation, or purged, since the cursor
@@ -273,22 +275,57 @@ impl OplogTailer {
             let mut reached = false;
             let mut stale = false;
             let mut full = false;
-            for (mut entry, end) in frames {
-                if entry.index < self.next {
-                    cursor.offset = end;
+            let mut unreadable = false;
+            loop {
+                let index = match frames.peek() {
+                    Ok(Peeked::Frame { index, .. }) => index,
+                    // The end of the complete frames.
+                    Ok(Peeked::End) => break,
+                    Err(e) => {
+                        tracing::debug!(
+                            segment = %cursor.path.display(),
+                            error = %e,
+                            "segment not readable; the read resumes here"
+                        );
+                        unreadable = true;
+                        break;
+                    }
+                };
+                if index < self.next {
+                    // Read before: passed without its payload.
+                    frames.skip();
+                    cursor.offset = frames.at();
                     continue;
                 }
-                if entry.index > self.next {
+                if index > self.next {
                     // The segment does not continue where the cursor expects:
                     // it was rewritten.
                     stale = true;
                     break;
                 }
-                if entry.index >= until || result.len() >= max_entries {
+                if index >= until || result.len() >= max_entries {
                     full = true;
                     break;
                 }
-                cursor.offset = end;
+                let payload = match frames.read_payload() {
+                    Ok(Some(payload)) => payload,
+                    // A checksum that fails ends the complete frames.
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::debug!(
+                            segment = %cursor.path.display(),
+                            error = %e,
+                            "segment not readable; the read resumes here"
+                        );
+                        unreadable = true;
+                        break;
+                    }
+                };
+                // A frame that does not decode ends the complete frames.
+                let Ok(mut entry) = OplogEntry::decode(&payload) else {
+                    break;
+                };
+                cursor.offset = frames.at();
                 self.next = entry.index + 1;
                 self.held = true;
                 reached = true;
@@ -309,6 +346,17 @@ impl OplogTailer {
                     };
                     result.push((OplogEntry { ops, ..entry }, token));
                 }
+            }
+            if unreadable {
+                // Rewritten by a truncation, or purged, while it was read:
+                // resolve the position again rather than skip, once a call.
+                self.cursor = None;
+                if reached {
+                    located = false;
+                } else if located {
+                    break;
+                }
+                continue;
             }
             if full {
                 break;
