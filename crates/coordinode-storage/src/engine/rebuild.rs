@@ -240,6 +240,36 @@ pub struct StoredVersion<'a> {
     pub operand: bool,
 }
 
+/// The keys the tree of partition `part` at the directory `from` under the
+/// endpoints of `config` holds under `prefix`, as it stands: what a caller
+/// rewriting the tree reads of it first. The tree is closed to everything
+/// else.
+///
+/// # Errors
+///
+/// The tree cannot be opened or read.
+pub fn tree_keys_under(
+    config: &crate::engine::config::StorageConfig,
+    part: crate::engine::partition::Partition,
+    from: &Path,
+    prefix: &[u8],
+) -> StorageResult<Vec<Vec<u8>>> {
+    use lsm_tree::{AbstractTree as _, Guard as _};
+    let tree = config
+        .tree_config_at(
+            part,
+            from,
+            lsm_tree::SharedSequenceNumberGenerator::from(
+                lsm_tree::SequenceNumberCounter::default(),
+            ),
+            None,
+        )
+        .open()?;
+    tree.prefix(prefix, lsm_tree::SeqNo::MAX, None)
+        .map(|guard| Ok(guard.key()?.to_vec()))
+        .collect()
+}
+
 /// The memtable size past which [`rewrite_tree_values`] writes what it
 /// holds to a table, so a large tree is not held in memory whole.
 const REWRITE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;

@@ -24,7 +24,10 @@ fn split(stored: &[u8]) -> (&[u8], u64) {
 #[test]
 fn a_version_keeps_only_the_commit_the_journal_proves() {
     let mut known = Writes::new();
-    known.insert((Partition::Node, b"node:1".to_vec(), 70), b"v".to_vec());
+    known.insert(
+        (Partition::Node, b"node:1".to_vec(), 70, Written::Value),
+        b"v".to_vec(),
+    );
 
     let proved = stamped(Partition::Node, version(b"node:1", b"v", 70), &known);
     assert_eq!(split(&proved), (&b"v"[..], 70));
@@ -43,7 +46,10 @@ fn a_version_keeps_only_the_commit_the_journal_proves() {
 
     // A settled row: no commit is ever at zero.
     let mut settled = Writes::new();
-    settled.insert((Partition::Node, b"node:2".to_vec(), 0), b"v".to_vec());
+    settled.insert(
+        (Partition::Node, b"node:2".to_vec(), 0, Written::Value),
+        b"v".to_vec(),
+    );
     let stored = stamped(Partition::Node, version(b"node:2", b"v", 0), &settled);
     assert_eq!(split(&stored), (&b"v"[..], UNKNOWN));
 }
@@ -221,7 +227,9 @@ fn each_write_is_known_at_its_own_units_commit() {
     );
 
     let writes = journal_writes(store).expect("read the journal");
-    let at = |key: &[u8], commit: u64| writes.get(&(Partition::Node, key.to_vec(), commit));
+    let at = |key: &[u8], commit: u64| {
+        writes.get(&(Partition::Node, key.to_vec(), commit, Written::Value))
+    };
     assert_eq!(at(b"node:a", 500), Some(&b"x".to_vec()));
     assert_eq!(at(b"node:a", 600), None, "not at the entry's timestamp");
     assert_eq!(at(b"node:b", 600), Some(&b"y".to_vec()));
@@ -229,6 +237,161 @@ fn each_write_is_known_at_its_own_units_commit() {
         writes.len(),
         2,
         "the delete and the checkpoint's journal prove nothing"
+    );
+}
+
+/// A unit carrying `mutations` and, last, the binding of a client operation,
+/// whose outcome the apply decides, at `commit`.
+fn bound_unit(mutations: Vec<coordinode_core::txn::proposal::Mutation>, commit: u64) -> Vec<u8> {
+    use coordinode_core::txn::operation::{IssuerId, OperationCommand, OperationId};
+    use coordinode_core::txn::proposal::Mutation;
+    let mut all = mutations;
+    all.push(Mutation::Operation(OperationCommand::Exclude(
+        OperationId {
+            issuer: IssuerId([1; 16]),
+            incarnation: 1,
+            sequence: 1,
+        },
+    )));
+    coordinode_core::txn::frame::encode_unit(
+        &coordinode_core::txn::proposal::in_namespace(crate::test_support::NAMESPACE, all),
+        coordinode_core::txn::timestamp::Timestamp::from_raw(commit),
+    )
+    .expect("encode")
+}
+
+fn node_put(key: &[u8], value: &[u8]) -> coordinode_core::txn::proposal::Mutation {
+    coordinode_core::txn::proposal::Mutation::Put {
+        partition: coordinode_core::txn::proposal::PartitionId::Node,
+        key: key.to_vec(),
+        value: value.to_vec(),
+    }
+}
+
+/// The mark 0.10.1 applied for the unit `sub` of log entry `index` whose
+/// binding refused it, in the store's Schema tree.
+fn mark_refused(store: &Path, index: u64, sub: u32) {
+    use lsm_tree::AbstractTree as _;
+    let tree = config(store)
+        .tree_config_at(
+            Partition::Schema,
+            Path::new("schema"),
+            lsm_tree::SharedSequenceNumberGenerator::from(lsm_tree::SequenceNumberCounter::new(
+                100,
+            )),
+            None,
+        )
+        .open()
+        .expect("open");
+    let mut key = b"raft:skip:".to_vec();
+    key.extend_from_slice(&index.to_be_bytes());
+    key.extend_from_slice(&sub.to_be_bytes());
+    tree.insert(key, "", 900);
+    let lock = tree.get_flush_lock();
+    tree.rotate_memtable();
+    tree.flush(&lock, 0).expect("flush");
+}
+
+/// A unit whose binding the apply refused wrote nothing, whatever its frame
+/// carries: a version with its key and bytes at its commit is not its write,
+/// and keeps no commit. A bound unit the apply took proves its writes as any.
+#[test]
+fn a_unit_its_binding_refused_proves_nothing() {
+    use coordinode_storage::oplog::{OplogEntry, OplogOp};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path();
+    let entry = OplogEntry {
+        ts: 900,
+        term: 1,
+        index: 4,
+        shard: 0,
+        ops: vec![
+            OplogOp::Unit {
+                frame: bound_unit(vec![node_put(b"node:r", b"x")], 800),
+            },
+            OplogOp::Unit {
+                frame: bound_unit(vec![node_put(b"node:t", b"y")], 900),
+            },
+        ],
+        is_migration: false,
+        pre_images: None,
+    };
+    crate::test_support::write_segment(
+        &store.join("oplog/0/oplog-00000000000000000004.bin"),
+        &[entry],
+        true,
+    );
+    mark_refused(store, 4, 0);
+
+    let known = journal_writes(store).expect("read the journal");
+    let refused = stamped(Partition::Node, version(b"node:r", b"x", 800), &known);
+    assert_eq!(split(&refused), (&b"x"[..], UNKNOWN));
+    let taken = stamped(Partition::Node, version(b"node:t", b"y", 900), &known);
+    assert_eq!(split(&taken), (&b"y"[..], 900));
+}
+
+/// A put proves a value and a merge proves an operand, never the other: a
+/// unit writing a key both ways proves each of its two versions, and an
+/// operand with the bytes of a put is not that put.
+#[test]
+fn a_write_proves_only_a_version_of_its_own_kind() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_storage::oplog::{OplogEntry, OplogOp};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path();
+    let both = coordinode_core::txn::frame::encode_unit(
+        &coordinode_core::txn::proposal::in_namespace(
+            crate::test_support::NAMESPACE,
+            [
+                node_put(b"node:k", b"value"),
+                Mutation::Merge {
+                    partition: PartitionId::Node,
+                    key: b"node:k".to_vec(),
+                    operand: b"operand".to_vec(),
+                },
+            ],
+        ),
+        coordinode_core::txn::timestamp::Timestamp::from_raw(500),
+    )
+    .expect("encode");
+    let entry = OplogEntry {
+        ts: 500,
+        term: 1,
+        index: 1,
+        shard: 0,
+        ops: vec![
+            OplogOp::Unit { frame: both },
+            OplogOp::Unit {
+                frame: unit(b"node:p", b"bytes", 600),
+            },
+        ],
+        is_migration: false,
+        pre_images: None,
+    };
+    crate::test_support::write_segment(
+        &store.join("oplog/0/oplog-00000000000000000001.bin"),
+        &[entry],
+        true,
+    );
+
+    let known = journal_writes(store).expect("read the journal");
+    let value = stamped(Partition::Node, version(b"node:k", b"value", 500), &known);
+    assert_eq!(split(&value), (&b"value"[..], 500));
+    let operand = StoredVersion {
+        operand: true,
+        ..version(b"node:k", b"operand", 500)
+    };
+    assert_eq!(
+        split(&stamped(Partition::Node, operand, &known)),
+        (&b"operand"[..], 500)
+    );
+    let not_the_put = StoredVersion {
+        operand: true,
+        ..version(b"node:p", b"bytes", 600)
+    };
+    assert_eq!(
+        split(&stamped(Partition::Node, not_the_put, &known)),
+        (&b"bytes"[..], UNKNOWN)
     );
 }
 

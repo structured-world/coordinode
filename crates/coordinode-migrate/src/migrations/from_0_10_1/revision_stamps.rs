@@ -10,9 +10,10 @@
 //! So each tree is written anew from its whole history, every version and
 //! merge operand at its own sequence number, with the commit it is known to
 //! carry or, where that is not known, the unknown revision. A version is
-//! known only when the journal holds the write itself: an entry at that
-//! timestamp writing that key with those bytes, which a 0.10.1 commit applied
-//! at its own timestamp. A record of unknown revision reads as before; a
+//! known only when the journal holds the write itself: a unit the apply took
+//! at that timestamp, writing that key with those bytes as a value or an
+//! operand as stored, which a 0.10.1 commit applied at its own timestamp. A
+//! record of unknown revision reads as before; a
 //! write conditioned on its revision is refused until a write replaces it.
 //!
 //! This runs on the trees at the top of a 0.10.1 store, before they move
@@ -114,13 +115,7 @@ fn survey(data: &Path) -> anyhow::Result<Vec<Finding>> {
 fn apply(finding: &Finding, backup: &Backup) -> anyhow::Result<()> {
     let store = &finding.path;
     let known = journal_writes(store)?;
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        store,
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
+    let config = store_config(store);
     for part in pending(store)? {
         stamp_tree(store, &config, part, &known, backup)
             .with_context(|| format!("the {} tree of {}", part.name(), store.display()))?;
@@ -138,19 +133,53 @@ fn apply(finding: &Finding, backup: &Backup) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The writes the journal of `store` holds, by partition, key and commit
-/// timestamp, with the bytes each wrote: what proves a version's commit.
-type Writes = HashMap<(Partition, Vec<u8>, u64), Vec<u8>>;
+/// The endpoints a store's trees are read and written under.
+fn store_config(store: &Path) -> StorageConfig {
+    StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        store,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )])
+}
 
-/// The writes the units of `store`'s own journal carry, each at the commit
+/// What a write leaves in a tree: a version of the key, or a merge operand
+/// of it. A write proves only a stored version of its own kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Written {
+    Value,
+    Operand,
+}
+
+/// The writes the journal of `store` holds, by partition, key, commit
+/// timestamp and kind, with the bytes each wrote: what proves a version's
+/// commit.
+type Writes = HashMap<(Partition, Vec<u8>, u64, Written), Vec<u8>>;
+
+/// The prefix of the mark 0.10.1 applied, in the Schema tree, for a log unit
+/// its operation binding refused: the entry's index and the unit's place
+/// among the entry's units follow, both big-endian.
+const REFUSED_UNIT_PREFIX: &[u8] = b"raft:skip:";
+
+/// The writes the units of `store`'s own journal applied, each at the commit
 /// timestamp its unit names. Only a put or a merge the unit states proves
-/// anything: a command decided when it was applied names no write here, and
-/// the journal of a checkpoint inside the store is that checkpoint's, not
-/// this history's. A unit that does not read stops the run.
+/// anything: a command decided when it was applied names no write here. A
+/// unit whose outcome the apply decides, by the binding of a client
+/// operation, proves its writes only when the store holds no mark of its
+/// refusal; a refused one wrote none of them. The journal of a checkpoint
+/// inside the store is that checkpoint's, not this history's. A unit that
+/// does not read stops the run.
+///
+/// A unit not applied yet, or applied by a copy installed from another
+/// member, proves nothing it could be mistaken for: 0.10.1 wrote every
+/// version at the commit timestamp of the unit applying it, unique to that
+/// commit, and an installed copy at zero, which no commit is.
 fn journal_writes(store: &Path) -> anyhow::Result<Writes> {
     use coordinode_core::txn::frame::{DecodeLimits, decode_proposal};
-    use coordinode_core::txn::proposal::Mutation;
+    use coordinode_core::txn::proposal::{Mutation, decided_at_apply};
     use coordinode_storage::oplog::OplogOp;
+    let refused = refused_units(store)?;
     let mut writes = Writes::new();
     for path in oplog::segment_files(store)? {
         if in_other_store(store, &path) {
@@ -158,34 +187,82 @@ fn journal_writes(store: &Path) -> anyhow::Result<Writes> {
         }
         let segment = oplog::read(&path)?;
         for entry in &segment.entries {
+            // The unit's place among the entry's units, as its refusal is
+            // marked.
+            let mut sub = 0u32;
             for op in &entry.ops {
                 let OplogOp::Unit { frame } = op else {
                     continue;
                 };
+                let place = sub;
+                sub = sub.checked_add(1).with_context(|| {
+                    format!("log entry {} carries over 2^32 units", entry.index)
+                })?;
                 let unit = decode_proposal(frame, &DecodeLimits::DEFAULT).with_context(|| {
                     format!("a unit of log entry {} in {}", entry.index, path.display())
                 })?;
+                if decided_at_apply(&unit.mutations)
+                    && refused.contains(&refused_unit_key(entry.index, place))
+                {
+                    continue;
+                }
                 let at = unit.commit_ts.as_raw();
                 for mutation in unit.mutations {
-                    let (partition, key, bytes) = match mutation {
+                    let (partition, key, bytes, kind) = match mutation {
                         Mutation::Put {
                             partition,
                             key,
                             value,
-                        } => (partition, key, value),
+                        } => (partition, key, value, Written::Value),
                         Mutation::Merge {
                             partition,
                             key,
                             operand,
-                        } => (partition, key, operand),
+                        } => (partition, key, operand, Written::Operand),
                         _ => continue,
                     };
-                    writes.insert((Partition::from(partition), key, at), bytes);
+                    writes.insert((Partition::from(partition), key, at, kind), bytes);
                 }
             }
         }
     }
     Ok(writes)
+}
+
+fn refused_unit_key(index: u64, sub: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(REFUSED_UNIT_PREFIX.len() + 12);
+    key.extend_from_slice(REFUSED_UNIT_PREFIX);
+    key.extend_from_slice(&index.to_be_bytes());
+    key.extend_from_slice(&sub.to_be_bytes());
+    key
+}
+
+/// The marks of refused units `store`'s Schema tree holds, read from the
+/// tree wherever a run left it: in place, or written beside the old one.
+fn refused_units(store: &Path) -> anyhow::Result<HashSet<Vec<u8>>> {
+    let top = store.join(Partition::Schema.name());
+    let Some(tree) = [
+        top.clone(),
+        with_suffix(&top, STAGED_SUFFIX),
+        with_suffix(&top, REPLACED_SUFFIX),
+    ]
+    .into_iter()
+    .find(|dir| dir.is_dir()) else {
+        return Ok(HashSet::new());
+    };
+    let relative = tree
+        .strip_prefix(store)
+        .context("a tree of the store")?
+        .to_path_buf();
+    Ok(coordinode_storage::engine::rebuild::tree_keys_under(
+        &store_config(store),
+        Partition::Schema,
+        &relative,
+        REFUSED_UNIT_PREFIX,
+    )
+    .with_context(|| format!("read the refused units of {}", store.display()))?
+    .into_iter()
+    .collect())
 }
 
 /// Whether `path`, below `store`, belongs to another store inside it: a
@@ -298,8 +375,13 @@ fn stamped(part: Partition, version: StoredVersion<'_>, known: &Writes) -> Vec<u
     if version.key.first() == Some(&0x00) {
         return version.value.to_vec();
     }
+    let kind = if version.operand {
+        Written::Operand
+    } else {
+        Written::Value
+    };
     let proved = known
-        .get(&(part, version.key.to_vec(), version.seqno))
+        .get(&(part, version.key.to_vec(), version.seqno, kind))
         .is_some_and(|bytes| bytes.as_slice() == version.value);
     let revision = if proved && version.seqno != UNKNOWN {
         version.seqno
