@@ -168,6 +168,10 @@ impl MergeOperator for PostingListMerge {
 /// Pre-merged NodeRecords (from previous compaction) may appear as operands —
 /// the merge function detects them by the `0x00` prefix and uses the latest
 /// one as the new base, discarding older bases.
+///
+/// The base and every operand end in the revision stamp of the write that
+/// made them ([`crate::engine::revision`]); the merged record carries the
+/// stamp of the last one applied, the record's latest write.
 pub struct DocumentMerge;
 
 impl MergeOperator for DocumentMerge {
@@ -177,6 +181,37 @@ impl MergeOperator for DocumentMerge {
         base_value: Option<&[u8]>,
         operands: &[&[u8]],
     ) -> Result<UserValue, LsmError> {
+        fn unstamp(value: &[u8]) -> Result<(&[u8], u64), LsmError> {
+            crate::engine::revision::split(value).ok_or(LsmError::MergeOperator)
+        }
+        let base = base_value.map(unstamp).transpose()?;
+        // Records take a handful of operands between compactions.
+        let mut payloads: smallvec::SmallVec<[&[u8]; 8]> =
+            smallvec::SmallVec::with_capacity(operands.len());
+        let mut revision = base.map_or(crate::engine::revision::UNKNOWN, |(_, at)| at);
+        for operand in operands {
+            let (payload, at) = unstamp(operand)?;
+            payloads.push(payload);
+            revision = at;
+        }
+        let mut merged = self.fold(base.map(|(payload, _)| payload), &payloads)?;
+        crate::engine::revision::append_stamp(&mut merged, revision);
+        Ok(merged.into())
+    }
+}
+
+impl DocumentMerge {
+    /// The record `operands` make of `base_value`, payloads without their
+    /// revision stamps, encoded with the `0x00` prefix.
+    ///
+    /// # Errors
+    ///
+    /// An operand or the base does not decode.
+    pub(crate) fn fold(
+        &self,
+        base_value: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> Result<Vec<u8>, LsmError> {
         // Decode the base NodeRecord (from a PUT), or start with None.
         let mut record = match base_value {
             Some(data) if !data.is_empty() => Some(decode_node_record(data)?),
@@ -259,12 +294,13 @@ pub(crate) fn decode_node_record(data: &[u8]) -> Result<NodeRecord, LsmError> {
 }
 
 /// Encode a NodeRecord with the 0x00 prefix byte.
-fn encode_node_record(rec: &NodeRecord) -> Result<UserValue, LsmError> {
+fn encode_node_record(rec: &NodeRecord) -> Result<Vec<u8>, LsmError> {
     let msgpack = rec.to_msgpack().map_err(|_| LsmError::MergeOperator)?;
-    let mut buf = Vec::with_capacity(1 + msgpack.len());
+    // Room for the revision stamp the merge operator appends.
+    let mut buf = Vec::with_capacity(1 + msgpack.len() + crate::engine::revision::STAMP_LEN);
     buf.push(PREFIX_NODE_RECORD);
     buf.extend_from_slice(&msgpack);
-    Ok(buf.into())
+    Ok(buf)
 }
 
 /// Apply a DocDelta to a NodeRecord, accumulating Extra-targeting deltas into

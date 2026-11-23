@@ -362,6 +362,16 @@ pub enum StorageError {
     #[error("a write keyed by its commit needs a transaction that commits at a timestamp")]
     NoCommitTimestamp,
 
+    /// A live record of `partition` whose original commit timestamp is not
+    /// known, so its revision cannot be named: it came from a store that did
+    /// not keep it. Its value still reads; a write conditioned on its
+    /// revision is refused, nothing written, until a write replaces it.
+    #[error(
+        "the revision of a record of the {partition} partition is not known; \
+         its value reads, but a write cannot be conditioned on its revision"
+    )]
+    RevisionUnavailable { partition: &'static str },
+
     /// The store holds history but no binding of the domain it belongs to:
     /// the binding was lost or removed, and founding a new domain now would
     /// claim that history for another. Refused; the binding is recovered

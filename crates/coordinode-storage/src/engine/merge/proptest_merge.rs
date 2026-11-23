@@ -221,14 +221,19 @@ proptest! {
     ///
     /// The comparison is of the bytes, which is what the engine asks for:
     /// repeated merging must produce identical bytes, or two replicas that
-    /// compacted differently could not be compared by checksum.
+    /// compacted differently could not be compared by checksum. The operands
+    /// are as stored, each stamped with its own write's revision, so the
+    /// revision the folded record carries must agree too.
     #[test]
     fn fuzz_document_partial_fold_matches_full(deltas in doc_deltas_strategy()) {
         let merger = DocumentMerge;
 
         let operands: Vec<Vec<u8>> = deltas
             .iter()
-            .map(|d| d.encode().expect("encode delta"))
+            .zip(1u64..)
+            .map(|(d, revision)| {
+                crate::engine::revision::stamp(&d.encode().expect("encode delta"), revision)
+            })
             .collect();
         let operand_refs: Vec<&[u8]> = operands.iter().map(|v| v.as_slice()).collect();
 

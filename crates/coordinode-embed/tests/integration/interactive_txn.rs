@@ -680,6 +680,100 @@ fn an_auto_commit_statement_reports_the_version_it_wrote() {
         .expect("the reported version is the one that is there");
 }
 
+/// A node's version survives compaction past the retention horizon and a
+/// reopen as the commit timestamp that wrote it. A version saved before a
+/// later write cannot authorize a fresh transaction after that write is
+/// compacted too: the commit is refused with the current version and applies
+/// nothing, and the current version is accepted.
+#[test]
+fn a_saved_version_stays_stale_through_compaction_and_reopen() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_embed::DatabaseError;
+    use coordinode_storage::engine::partition::Partition;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let compact = |db: &mut Database| {
+        db.engine()
+            .persist_partition(Partition::Node)
+            .expect("flush");
+        db.execute_cypher("CREATE (:Traffic)").expect("traffic");
+        db.engine()
+            .persist_partition(Partition::Node)
+            .expect("flush");
+        db.engine()
+            .force_compaction(Partition::Node)
+            .expect("compact");
+    };
+    let balance = |db: &mut Database| {
+        db.execute_cypher("MATCH (n:Probe) RETURN n.val AS v")
+            .expect("read")[0]
+            .get("v")
+            .and_then(|v| v.as_int())
+    };
+    let probe = NodeId::from_raw(1);
+
+    let mut db = Database::open(dir.path()).expect("open");
+    db.set_retention_window(Duration::ZERO);
+    let c1 = db
+        .execute_cypher_full("CREATE (n:Probe {val: 1})", None, None, None, None)
+        .expect("create")
+        .commit_ts()
+        .expect("committed");
+    compact(&mut db);
+    let saved = db.node_version(probe).expect("version");
+    assert_eq!(saved, Some(c1), "compaction keeps the commit timestamp");
+    drop(db);
+
+    let mut db = Database::open(dir.path()).expect("reopen");
+    db.set_retention_window(Duration::ZERO);
+    assert_eq!(db.node_version(probe).expect("version"), Some(c1));
+    let c2 = db
+        .execute_cypher_full("MATCH (n:Probe) SET n.val = 2", None, None, None, None)
+        .expect("replace")
+        .commit_ts()
+        .expect("committed");
+    compact(&mut db);
+    drop(db);
+
+    let mut db = Database::open(dir.path()).expect("reopen");
+    assert_eq!(db.node_version(probe).expect("version"), Some(c2));
+    let stale = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(stale, "MATCH (n:Probe) SET n.val = 3", None)
+        .expect("statement");
+    db.execute_in_transaction(stale, "CREATE (:Effect)", None)
+        .expect("statement");
+    db.expect_node_version(stale, probe, saved)
+        .expect("state the condition");
+    match db.commit_transaction(stale) {
+        Err(DatabaseError::RevisionMismatch {
+            expected, current, ..
+        }) => {
+            assert_eq!(expected, saved);
+            assert_eq!(current, Some(c2));
+        }
+        other => panic!("expected a version mismatch, got {other:?}"),
+    }
+    assert_eq!(
+        balance(&mut db),
+        Some(2),
+        "the refused commit applied nothing"
+    );
+    assert!(
+        db.execute_cypher("MATCH (n:Effect) RETURN n")
+            .expect("read")
+            .is_empty(),
+        "no other effect of the refused commit exists"
+    );
+
+    let fresh = db.begin_transaction().expect("begin");
+    db.execute_in_transaction(fresh, "MATCH (n:Probe) SET n.val = 3", None)
+        .expect("statement");
+    db.expect_node_version(fresh, probe, Some(c2))
+        .expect("state the condition");
+    db.commit_transaction(fresh).expect("the current version");
+    assert_eq!(balance(&mut db), Some(3));
+}
+
 /// Two claimers of one record on the embedded surface: exactly one takes it,
 /// and the other is told which version is there.
 ///

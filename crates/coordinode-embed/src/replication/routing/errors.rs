@@ -111,6 +111,7 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::TransactionConflict { .. } => "TransactionConflict",
         E::InvariantRefused { .. } => "InvariantRefused",
         E::RevisionMismatch { .. } => "RevisionMismatch",
+        E::RevisionUnavailable { .. } => "RevisionUnavailable",
         E::TransactionTooLarge { .. } => "TransactionTooLarge",
         E::WriteBackpressure => "WriteBackpressure",
         E::MemberBusy => "MemberBusy",
@@ -639,6 +640,9 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             expected,
             current,
         }),
+        E::RevisionUnavailable { partition } => {
+            Kind::RevisionUnavailable(text(partition.to_owned()))
+        }
         E::TransactionTooLarge {
             id,
             buffered,
@@ -768,6 +772,15 @@ fn optional_transaction_from(field: &str, bytes: &[u8]) -> Result<Option<Transac
         return Ok(None);
     }
     transaction_from(field, bytes).map(Some)
+}
+
+/// The partition a routed error names, by the name this member gives it.
+fn partition_named(name: &str) -> Result<&'static str, String> {
+    coordinode_storage::engine::partition::Partition::all()
+        .iter()
+        .map(|part| part.name())
+        .find(|known| *known == name)
+        .ok_or_else(|| format!("a partition {name:?} this member does not know"))
 }
 
 fn catalog_object(object: i32) -> Result<CatalogObject, String> {
@@ -1057,6 +1070,9 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             transaction: optional_transaction_from("revision_mismatch", &t.transaction_id)?,
             expected: t.expected,
             current: t.current,
+        },
+        Kind::RevisionUnavailable(t) => E::RevisionUnavailable {
+            partition: partition_named(&t.message)?,
         },
         Kind::TransactionTooLarge(t) => E::TransactionTooLarge {
             id: transaction_from("transaction_too_large", &t.transaction_id)?,

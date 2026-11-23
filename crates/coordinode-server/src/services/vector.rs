@@ -45,8 +45,8 @@ fn metric_cypher(metric: i32) -> (&'static str, &'static str) {
 /// Returns `None` if the row lacks the required `n` (node_id) or `_dist` columns.
 fn row_to_vector_result(
     row: std::collections::BTreeMap<String, Value>,
-    version_of: impl Fn(u64) -> u64,
-) -> Option<query::VectorResult> {
+    versions: &std::collections::HashMap<u64, u64>,
+) -> Option<Result<query::VectorResult, Status>> {
     let node_id = match row.get("n")? {
         Value::Int(id) => *id as u64,
         _ => return None,
@@ -73,16 +73,18 @@ fn row_to_vector_result(
             properties.insert(prop_name.to_string(), value_to_proto_pub(v));
         }
     }
-    Some(query::VectorResult {
-        node: Some(graph::Node {
-            node_id,
-            labels,
-            properties,
-            element_id: NodeId::from_raw(node_id).to_element_id(),
-            version: version_of(node_id),
+    Some(
+        super::graph::version_of(versions, node_id).map(|version| query::VectorResult {
+            node: Some(graph::Node {
+                node_id,
+                labels,
+                properties,
+                element_id: NodeId::from_raw(node_id).to_element_id(),
+                version,
+            }),
+            distance,
         }),
-        distance,
-    })
+    )
 }
 
 /// Map the engine-side vector index health snapshot to its wire form. The
@@ -210,34 +212,30 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         // index's health under the same lock so the watermark reported is
         // consistent with the snapshot the query ran against. The registry
         // keys on the raw (unescaped) label/property.
-        let (rows, index_health) = super::blocking(|| {
+        let (rows, versions, index_health) = super::blocking(|| {
             let db = database.read();
             // A statement's failure: a query vector the metric cannot
             // evaluate is the caller's, answered INVALID_ARGUMENT.
-            let rows = db
+            let result = db
                 .execute_cypher_shared(&cypher, Some(params), None, None, None)
-                .map_err(db_error_to_status)?
-                .rows;
+                .map_err(db_error_to_status)?;
+            // Each node's version as the search saw it.
+            let versions = super::graph::versions_at(
+                &db,
+                result.write_stats.read_ts,
+                result.rows.iter().filter_map(super::graph::node_of),
+            )?;
             let health = db
                 .vector_index_registry()
                 .health_snapshot(&req.label, &req.property)
                 .map(index_health_to_proto);
-            Ok::<_, Status>((rows, health))
+            Ok::<_, Status>((result.rows, versions, health))
         })?;
 
-        let results: Vec<query::VectorResult> = super::blocking(|| {
-            let db = database.read();
-            rows.into_iter()
-                .filter_map(|row| {
-                    row_to_vector_result(row, |id| {
-                        db.node_version(NodeId::from_raw(id))
-                            .ok()
-                            .flatten()
-                            .unwrap_or(0)
-                    })
-                })
-                .collect()
-        });
+        let results: Vec<query::VectorResult> = rows
+            .into_iter()
+            .filter_map(|row| row_to_vector_result(row, &versions))
+            .collect::<Result<_, _>>()?;
 
         let mut response = Response::new(query::VectorSearchResponse {
             results,
@@ -293,28 +291,25 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         params.insert("qv".to_string(), Value::Vector(query_vector.values.clone()));
 
         // Hybrid search is read-only — take the shared read lock so
-        // concurrent search requests run in parallel.
-        let rows = super::blocking(|| {
-            database
-                .read()
-                .execute_cypher_shared(&cypher, Some(params), None, None, None)
-        })
-        .map_err(db_error_to_status)?
-        .rows;
-
-        let results: Vec<query::VectorResult> = super::blocking(|| {
+        // concurrent search requests run in parallel. Each node's version is
+        // the one the search saw.
+        let (rows, versions) = super::blocking(|| {
             let db = database.read();
-            rows.into_iter()
-                .filter_map(|row| {
-                    row_to_vector_result(row, |id| {
-                        db.node_version(NodeId::from_raw(id))
-                            .ok()
-                            .flatten()
-                            .unwrap_or(0)
-                    })
-                })
-                .collect()
-        });
+            let result = db
+                .execute_cypher_shared(&cypher, Some(params), None, None, None)
+                .map_err(db_error_to_status)?;
+            let versions = super::graph::versions_at(
+                &db,
+                result.write_stats.read_ts,
+                result.rows.iter().filter_map(super::graph::node_of),
+            )?;
+            Ok::<_, Status>((result.rows, versions))
+        })?;
+
+        let results: Vec<query::VectorResult> = rows
+            .into_iter()
+            .filter_map(|row| row_to_vector_result(row, &versions))
+            .collect::<Result<_, _>>()?;
 
         // The hybrid request carries no label, so the vector phase can span
         // several labels' indexes — there is no single index whose health to

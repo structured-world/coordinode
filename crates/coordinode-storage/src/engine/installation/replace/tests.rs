@@ -547,7 +547,13 @@ fn a_snapshot_installed_during_preparation_drops_the_replacement() {
     engine
         .install_raft_image(
             &[Partition::Idx],
-            |_| Ok(vec![(entry(b"s"), b"s1".to_vec())]),
+            // A copied row as stored: its payload and its write's revision.
+            |_| {
+                Ok(vec![(
+                    entry(b"s"),
+                    crate::engine::revision::stamp(b"s1", 5),
+                )])
+            },
             10,
             b"payload",
             &[],
@@ -788,11 +794,18 @@ fn the_history_of_both_stretches_comes_out_once_in_seqno_order() {
         ],
         "one logical range per stretch"
     );
+    // Each version as stored: its payload, and the revision of the write
+    // that made it, which a copy of the history keeps.
     let puts: Vec<&[u8]> = history
         .entries
         .iter()
         .filter_map(|e| match e {
-            HistoryEntry::Put { value, .. } => Some(value.as_slice()),
+            HistoryEntry::Put { value, seqno, .. } => {
+                let (payload, revision) =
+                    crate::engine::revision::split(value).expect("a stamped version");
+                assert_eq!(revision, *seqno, "the version carries its write's revision");
+                Some(payload)
+            }
             _ => None,
         })
         .collect();

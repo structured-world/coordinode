@@ -124,6 +124,11 @@ pub enum Reason {
     /// this: it named a version, and what it needs back is which version is
     /// there, not that something contended.
     RevisionMismatch,
+    /// The version of a record is not known: the record came from a store
+    /// that did not keep it. Its value reads; a write conditioned on its
+    /// version is refused, nothing applied, until a write replaces the
+    /// record. Metadata carries `partition`.
+    RevisionUnavailable,
     /// A transaction buffered more uncommitted data than it may. Splitting the
     /// work into smaller transactions is the fix; retrying as-is will not help.
     TransactionTooLarge,
@@ -361,6 +366,7 @@ impl Reason {
             Reason::TransactionConflict => "TRANSACTION_CONFLICT",
             Reason::InvariantRefused => "INVARIANT_REFUSED",
             Reason::RevisionMismatch => "REVISION_MISMATCH",
+            Reason::RevisionUnavailable => "REVISION_UNAVAILABLE",
             Reason::TransactionTooLarge => "TRANSACTION_TOO_LARGE",
             Reason::CapacityExhausted => "CAPACITY_EXHAUSTED",
             Reason::StorageFull => "STORAGE_FULL",

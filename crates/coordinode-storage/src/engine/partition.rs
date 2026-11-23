@@ -153,6 +153,13 @@ impl Partition {
         matches!(self, Self::Adj | Self::Counter)
     }
 
+    /// Whether a record of this partition carries its revision: the commit
+    /// timestamp of the write that produced its value. Every partition whose
+    /// records are replaced rather than folded from operands does.
+    pub const fn carries_revision(self) -> bool {
+        !matches!(self, Self::Adj | Self::Counter)
+    }
+
     /// Whether this partition holds the deployment's own state (the consumer
     /// registry, this node's consensus state) rather than data. Its records
     /// are read only as they stand now, so the time-travel window keeps no

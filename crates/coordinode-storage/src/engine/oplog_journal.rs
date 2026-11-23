@@ -735,8 +735,10 @@ pub(crate) fn op_partition(op: &OplogOp) -> Option<Partition> {
 /// marker as ONE tree batch, so a persisted marker implies every effect of
 /// the entry in this tree is persisted. Non-data ops are no-ops.
 /// `installations` is the index tree's catalog when `tree` is the index
-/// tree.
+/// tree. Values are stamped with the commit timestamp `seqno`, as the commit
+/// path stamps them.
 pub(crate) fn apply_oplog_ops_at(
+    part: Partition,
     tree: &AnyTree,
     installations: Option<&crate::engine::installation::Installations>,
     ops: &[&OplogOp],
@@ -751,9 +753,10 @@ pub(crate) fn apply_oplog_ops_at(
             // A replacement being prepared receives the same write in the
             // same batch, as on the live apply path.
             OplogOp::Insert { key, value, .. } => {
-                batch.insert(addressing.point(key)?, value.as_slice());
+                let value = crate::engine::revision::stored(part, key, value, seqno);
+                batch.insert(addressing.point(key)?, value.as_ref());
                 if let Some(staging) = addressing.staging_point(key) {
-                    batch.insert(staging, value.as_slice());
+                    batch.insert(staging, value.as_ref());
                 }
             }
             OplogOp::Delete { key, .. } => {
@@ -763,9 +766,10 @@ pub(crate) fn apply_oplog_ops_at(
                 }
             }
             OplogOp::Merge { key, operand, .. } => {
-                batch.merge(addressing.point(key)?, operand.as_slice());
+                let operand = crate::engine::revision::stored(part, key, operand, seqno);
+                batch.merge(addressing.point(key)?, operand.as_ref());
                 if let Some(staging) = addressing.staging_point(key) {
-                    batch.merge(staging, operand.as_slice());
+                    batch.merge(staging, operand.as_ref());
                 }
             }
             OplogOp::RemoveRange { start, end, .. } => {

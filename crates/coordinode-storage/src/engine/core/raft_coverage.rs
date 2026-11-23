@@ -517,7 +517,8 @@ impl StorageEngine {
     /// node-local ones ([`is_node_local`]), and, of the reserved records,
     /// only the deployment tree's closure ledger, read at the same cut: the
     /// position authority a copy of the same history carries. Coverage and
-    /// installation records keep their own rules.
+    /// installation records keep their own rules. Each value is as stored,
+    /// its revision stamp included, so a copy keeps every record's revision.
     ///
     /// # Errors
     ///
@@ -525,10 +526,9 @@ impl StorageEngine {
     pub fn replicated_rows(&self, partition: Partition) -> StorageResult<Rows> {
         let snapshot = self.snapshot();
         let mut rows: Rows = self
-            .snapshot_prefix_scan(&snapshot, partition, &[])?
+            .snapshot_prefix_scan_stored(&snapshot, partition, &[])?
             .into_iter()
             .filter(|(key, _)| !is_node_local(partition, key))
-            .map(|(key, value)| (key, value.to_vec()))
             .collect();
         if partition == Partition::Deployment {
             rows.extend(self.closure_rows_at(snapshot)?);
@@ -598,13 +598,10 @@ impl StorageEngine {
         // is corrupt would otherwise fail on that table before the repair
         // could drop it.
         let snapshot = self.snapshot();
+        // As stored, revisions included: written back as they were.
         let mut keep: Rows = Vec::new();
         for prefix in node_local_prefixes(partition) {
-            keep.extend(
-                self.snapshot_prefix_scan(&snapshot, partition, prefix)?
-                    .into_iter()
-                    .map(|(key, value)| (key, value.to_vec())),
-            );
+            keep.extend(self.snapshot_prefix_scan_stored(&snapshot, partition, prefix)?);
         }
         // Durable with the intent, before the clear: a crash after it leaves
         // them in the intent, not only in a memtable.
@@ -616,7 +613,7 @@ impl StorageEngine {
         }
         self.clear_partition_tree(partition, self.tree(partition)?)?;
         for (key, value) in &keep {
-            self.put(partition, key, value)?;
+            self.put_stored(partition, key, value)?;
         }
         // The rows are addressed as the application addresses them; in the
         // index tree each generation's rows go to this member's installation.
@@ -819,8 +816,9 @@ impl StorageEngine {
                 return self
                     .finish_rebuild_with(repair, || self.establish_replaced(partition, None));
             }
+            // The rows as the peer stores them: each keeps its revision.
             for (key, value) in &copy.rows {
-                self.put(partition, key, value)?;
+                self.put_stored(partition, key, value)?;
             }
             return Ok(());
         };

@@ -14,22 +14,68 @@ use crate::proto::{common, graph};
 use crate::services::cypher::{proto_to_value_pub, value_to_proto_pub};
 use crate::services::db_err_to_status;
 
-/// Backtick-escape a Cypher identifier (label, relationship type, or property key).
-/// The version to report for a node on the wire: the timestamp of the commit
-/// that last wrote it.
+/// The version of each node a read returned, as that read saw it: the commit
+/// that wrote the state the read returned, read at the read's own timestamp
+/// (`read_ts`, inclusive), so a node and its version are of one write
+/// whatever landed since. A node the read returned is there at its
+/// timestamp, so each has a version.
 ///
-/// Zero when the database cannot name one, which the field documents as "no
-/// version resolved" rather than as version zero. That is the honest answer
-/// for a node that is gone by the time the reply is built, and it keeps a
-/// failed lookup from being read as a real version a client could then write
-/// against.
-fn node_version(db: &Database, node_id: u64) -> u64 {
-    db.node_version(NodeId::from_raw(node_id))
-        .ok()
-        .flatten()
-        .unwrap_or(0)
+/// # Errors
+///
+/// The read's timestamp is no longer retained, or a node's original commit
+/// is not known; the call fails rather than report a version it cannot name.
+pub(crate) fn versions_at(
+    db: &Database,
+    read_ts: Option<u64>,
+    nodes: impl IntoIterator<Item = u64>,
+) -> Result<std::collections::HashMap<u64, u64>, Status> {
+    let mut versions = std::collections::HashMap::new();
+    for node_id in nodes {
+        // Only an empty view has no timestamp, and it returns no node.
+        let read_ts = read_ts.ok_or_else(|| {
+            Status::internal("a read returned a node but named no timestamp it read at")
+        })?;
+        let version = db
+            .node_version_at(NodeId::from_raw(node_id), read_ts)
+            .map_err(|e| db_err_to_status("node version", e))?
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "node {node_id} returned by a read is absent at the read's timestamp"
+                ))
+            })?;
+        versions.insert(node_id, version);
+    }
+    Ok(versions)
 }
 
+/// The node a row of `RETURN *` over a node variable `n` holds.
+pub(crate) fn node_of(row: &coordinode_query::executor::Row) -> Option<u64> {
+    match row.get("n")? {
+        Value::Int(id) => Some(*id as u64),
+        _ => None,
+    }
+}
+
+/// The version [`versions_at`] found for `node_id`.
+pub(crate) fn version_of(
+    versions: &std::collections::HashMap<u64, u64>,
+    node_id: u64,
+) -> Result<u64, Status> {
+    versions
+        .get(&node_id)
+        .copied()
+        .ok_or_else(|| Status::internal(format!("no version was read for node {node_id}")))
+}
+
+/// The timestamp a statement that wrote committed at: the version of every
+/// record it wrote.
+fn written_at(result: &coordinode_embed::db::CypherResult, call: &str) -> Result<u64, Status> {
+    result
+        .commit_ts()
+        .ok_or_else(|| Status::internal(format!("{call}: the write reported no commit timestamp")))
+}
+
+/// Backtick-escape a Cypher identifier (label, relationship type, or property key).
 fn cypher_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
@@ -59,21 +105,18 @@ impl GraphServiceImpl {
         cypher: &str,
         params: std::collections::HashMap<String, Value>,
         operation: Option<coordinode_embed::operation::OperationDescriptor>,
-    ) -> Result<Vec<coordinode_query::executor::row::Row>, coordinode_embed::DatabaseError> {
+    ) -> Result<coordinode_embed::db::CypherResult, coordinode_embed::DatabaseError> {
         let options = coordinode_embed::db::StatementOptions {
             operation,
             ..Default::default()
         };
         super::blocking(|| {
-            database
-                .read()
-                .execute_cypher_shared_with(
-                    cypher,
-                    (!params.is_empty()).then_some(params),
-                    None,
-                    &options,
-                )
-                .map(|result| result.rows)
+            database.read().execute_cypher_shared_with(
+                cypher,
+                (!params.is_empty()).then_some(params),
+                None,
+                &options,
+            )
         })
     }
 }
@@ -115,10 +158,13 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
 
         let cypher = format!("CREATE (n{label_part}{props_part}) RETURN n");
 
-        let rows = Self::write(&database, &cypher, params, operation)
+        let result = Self::write(&database, &cypher, params, operation)
             .map_err(|e| db_err_to_status("create_node", e))?;
+        // The version the node was created at, so a caller that means to
+        // write it again conditionally already has what to state.
+        let version = written_at(&result, "create_node")?;
 
-        let node_id = match rows.first().and_then(|r| r.get("n")) {
+        let node_id = match result.rows.first().and_then(|r| r.get("n")) {
             Some(Value::Int(id)) => *id as u64,
             _ => {
                 return Err(Status::internal(
@@ -132,9 +178,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             labels: req.labels,
             properties: req.properties,
             element_id: NodeId::from_raw(node_id).to_element_id(),
-            // The version the node was created at, so a caller that means to
-            // write it again conditionally already has what to state.
-            version: super::blocking(|| node_version(&database.read(), node_id)),
+            version,
         }))
     }
 
@@ -200,8 +244,11 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         params.insert("rows".to_string(), Value::Array(rows));
 
-        let result_rows = Self::write(&database, &cypher, params, operation)
+        let result = Self::write(&database, &cypher, params, operation)
             .map_err(|e| db_err_to_status("create_nodes_batch", e))?;
+        // One statement, one commit: the version of every node it created.
+        let version = written_at(&result, "create_nodes_batch")?;
+        let result_rows = result.rows;
 
         if result_rows.len() != req.nodes.len() {
             return Err(Status::internal(format!(
@@ -211,30 +258,27 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             )));
         }
 
-        let nodes: Result<Vec<graph::Node>, Status> = super::blocking(|| {
-            let db = database.read();
-            result_rows
-                .iter()
-                .enumerate()
-                .map(|(i, row)| {
-                    let node_id = match row.get("m") {
-                        Some(Value::Int(id)) => *id as u64,
-                        _ => {
-                            return Err(Status::internal(format!(
-                                "create_nodes_batch: row[{i}] missing node id"
-                            )));
-                        }
-                    };
-                    Ok(graph::Node {
-                        node_id,
-                        labels: labels.clone(),
-                        properties: req.nodes[i].properties.clone(),
-                        element_id: NodeId::from_raw(node_id).to_element_id(),
-                        version: node_version(&db, node_id),
-                    })
+        let nodes: Result<Vec<graph::Node>, Status> = result_rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let node_id = match row.get("m") {
+                    Some(Value::Int(id)) => *id as u64,
+                    _ => {
+                        return Err(Status::internal(format!(
+                            "create_nodes_batch: row[{i}] missing node id"
+                        )));
+                    }
+                };
+                Ok(graph::Node {
+                    node_id,
+                    labels: labels.clone(),
+                    properties: req.nodes[i].properties.clone(),
+                    element_id: NodeId::from_raw(node_id).to_element_id(),
+                    version,
                 })
-                .collect()
-        });
+            })
+            .collect();
 
         Ok(Response::new(graph::CreateNodesBatchResponse {
             nodes: nodes?,
@@ -256,27 +300,33 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         // `RETURN *` copies ALL columns from NodeScan: `n`, `n.__label__`, `n.<prop>`.
         // An explicit `RETURN n, n.__label__` would strip `n.*` properties in the Project step.
         // get_node is read-only — shared lock lets parallel reads
-        // proceed without blocking on each other.
-        let rows = super::blocking(|| {
-            database.read().execute_cypher_shared(
-                "MATCH (n) WHERE n = $id RETURN *",
-                Some(params),
-                None,
-                None,
-                None,
-            )
-        })
-        .map_err(|e| db_err_to_status("get_node", e))?
-        .rows;
+        // proceed without blocking on each other. The version is the one the
+        // read saw, read at its timestamp under the same lock.
+        let (rows, versions) = super::blocking(|| {
+            let db = database.read();
+            let result = db
+                .execute_cypher_shared(
+                    "MATCH (n) WHERE n = $id RETURN *",
+                    Some(params),
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(|e| db_err_to_status("get_node", e))?;
+            let versions = versions_at(
+                &db,
+                result.write_stats.read_ts,
+                result.rows.iter().filter_map(node_of),
+            )?;
+            Ok::<_, Status>((result.rows, versions))
+        })?;
 
         let row = rows
             .first()
             .ok_or_else(|| Status::not_found(format!("node {} not found", req.node_id)))?;
 
-        let node_id = match row.get("n") {
-            Some(Value::Int(id)) => *id as u64,
-            _ => return Err(Status::not_found(format!("node {} not found", req.node_id))),
-        };
+        let node_id = node_of(row)
+            .ok_or_else(|| Status::not_found(format!("node {} not found", req.node_id)))?;
 
         // Primary label stored by NodeScan as `n.__label__`.
         let label = match row.get("n.__label__") {
@@ -307,8 +357,8 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             properties,
             element_id: NodeId::from_raw(node_id).to_element_id(),
             // What a reader needs to write this node back conditionally: the
-            // version it is at, read in the same call as its contents.
-            version: super::blocking(|| node_version(&database.read(), node_id)),
+            // version of the very state returned.
+            version: version_of(&versions, node_id)?,
         }))
     }
 
@@ -350,7 +400,8 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         );
 
         let rows = Self::write(&database, &cypher, params, operation)
-            .map_err(|e| db_err_to_status("create_edge", e))?;
+            .map_err(|e| db_err_to_status("create_edge", e))?
+            .rows;
 
         let row = rows
             .first()
@@ -439,19 +490,20 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             )
         };
 
-        // Traversal is read-only — shared lock for parallel reads.
-        let rows = super::blocking(|| {
-            database
-                .read()
+        // Traversal is read-only: shared lock for parallel reads. Every node
+        // reports the version the traversal saw, read at its timestamp.
+        let nodes = super::blocking(|| {
+            let db = database.read();
+            let result = db
                 .execute_cypher_shared(&cypher, Some(params), None, None, None)
-        })
-        .map_err(|e| db_err_to_status("traverse", e))?
-        .rows;
-
-        // Held across the mapping so every node in one traversal reports its
-        // version against one view, rather than each taking its own lock and
-        // its own moment.
-        let nodes = super::blocking(|| traversed_nodes(&database.read(), &rows));
+                .map_err(|e| db_err_to_status("traverse", e))?;
+            let versions = versions_at(
+                &db,
+                result.write_stats.read_ts,
+                result.rows.iter().filter_map(node_of),
+            )?;
+            traversed_nodes(&result.rows, &versions)
+        })?;
 
         Ok(Response::new(graph::TraverseResponse {
             nodes,
@@ -461,16 +513,17 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
     }
 }
 
-/// The nodes a traversal returned, each with the version `db` holds.
-fn traversed_nodes(db: &Database, rows: &[coordinode_query::executor::Row]) -> Vec<graph::Node> {
+/// The nodes a traversal returned, each with the version the traversal saw
+/// ([`versions_at`]).
+fn traversed_nodes(
+    rows: &[coordinode_query::executor::Row],
+    versions: &std::collections::HashMap<u64, u64>,
+) -> Result<Vec<graph::Node>, Status> {
     rows.iter()
         .filter_map(|row| {
             // `RETURN *` copies all columns from the Traverse operator row:
             // `n` = node_id, `n.__label__` = primary label, `n.<prop>` = properties.
-            let node_id = match row.get("n")? {
-                Value::Int(id) => *id as u64,
-                _ => return None,
-            };
+            let node_id = node_of(row)?;
 
             // Primary label stored by the Traverse operator as `n.__label__`.
             let label = match row.get("n.__label__") {
@@ -494,13 +547,13 @@ fn traversed_nodes(db: &Database, rows: &[coordinode_query::executor::Row]) -> V
                 }
             }
 
-            Some(graph::Node {
+            Some(version_of(versions, node_id).map(|version| graph::Node {
                 node_id,
                 labels,
                 properties,
                 element_id: NodeId::from_raw(node_id).to_element_id(),
-                version: node_version(db, node_id),
-            })
+                version,
+            }))
         })
         .collect()
 }

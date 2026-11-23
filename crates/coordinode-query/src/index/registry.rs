@@ -1373,7 +1373,7 @@ impl IndexRegistry {
             let Some(scope) = entry_scope(&index, node.carried) else {
                 continue;
             };
-            self.bind(engine, txn, &index, version)?;
+            Self::bind(txn, &index, version)?;
             let staging = Staging {
                 engine,
                 shard_id,
@@ -1426,7 +1426,7 @@ impl IndexRegistry {
             let Some(scope) = entry_scope(&index, change.carried) else {
                 continue;
             };
-            self.bind(engine, txn, &index, version)?;
+            Self::bind(txn, &index, version)?;
             let owner = EntryOwner {
                 node_id: change.node_id.as_raw(),
                 valid_from: change.valid_from,
@@ -1486,7 +1486,7 @@ impl IndexRegistry {
             let Some(scope) = entry_scope(&index, node.carried) else {
                 continue;
             };
-            self.bind(engine, txn, &index, version)?;
+            Self::bind(txn, &index, version)?;
             let staging = Staging {
                 engine,
                 shard_id,
@@ -1528,7 +1528,7 @@ impl IndexRegistry {
         } in self.btree_for_label(node.label)
         {
             if let Some(values) = entry_values(&index, node.value_of) {
-                self.bind(engine, txn, &index, version)?;
+                Self::bind(txn, &index, version)?;
                 // The entry may stand in any scope of the label while a
                 // change moves its carriers; a unique entry is released only
                 // where the node holds it.
@@ -1596,7 +1596,7 @@ impl IndexRegistry {
         if matches!(def.state, super::IndexState::Failed { .. }) {
             return Ok(());
         }
-        self.bind(engine, txn, def, version)?;
+        Self::bind(txn, def, version)?;
         LocalIndexStore::new(engine).stage_label_postings_txn(txn, def, shard, node, before, after)
     }
 
@@ -1620,25 +1620,16 @@ impl IndexRegistry {
         if matches!(def.state, super::IndexState::Failed { .. }) {
             return Ok(());
         }
-        self.bind(engine, txn, def, version)?;
+        Self::bind(txn, def, version)?;
         LocalIndexStore::new(engine).stage_label_presence_txn(txn, def, shard, node, held)
     }
 
     /// Bind the writing transaction's effects in `index` to the definition
     /// record this member read, when it read one: a transition, drop or
     /// rebuild of the index before the commit refuses the write, to be
-    /// retried under the binding in force.
-    ///
-    /// The version is the record's sequence number, which compaction
-    /// settles to zero once the record is below the retention horizon,
-    /// without any write. A version the horizon has passed is checked
-    /// against the record: still the definition registered, now at version
-    /// zero, it is the same write settled, and the binding moves to zero.
-    /// Any change to the definition is a later write, with its own nonzero
-    /// version until it settles too, and its content differs.
+    /// retried under the binding in force. The version is the commit that
+    /// wrote the record, which it keeps for as long as it stands.
     fn bind(
-        &self,
-        engine: &StorageEngine,
         txn: &mut Transaction,
         index: &IndexDefinition,
         version: Option<u64>,
@@ -1646,48 +1637,8 @@ impl IndexRegistry {
         let Some(read) = version else {
             return Ok(());
         };
-        let version = if read != 0 && read < engine.gc_watermark() {
-            self.settled_version(engine, index, read)?
-        } else {
-            read
-        };
-        txn.bind_index_definition(&index.schema_key(), Some(version))?;
+        txn.bind_index_definition(&index.schema_key(), Some(read))?;
         Ok(())
-    }
-
-    /// The version to bind `index` to when it was registered at `read`, a
-    /// version below the retention horizon: zero when compaction settled
-    /// the very record registered, `read` otherwise, which the commit then
-    /// refuses as a change.
-    fn settled_version(
-        &self,
-        engine: &StorageEngine,
-        index: &IndexDefinition,
-        read: u64,
-    ) -> Result<u64, StoreError> {
-        let key = index.schema_key();
-        let version_now = || {
-            engine.record_version(
-                coordinode_storage::engine::partition::Partition::Schema,
-                &key,
-            )
-        };
-        if version_now()? != Some(0) {
-            return Ok(read);
-        }
-        let stored = LocalIndexStore::new(engine).load_definition(index.id)?;
-        // A write between the two reads of the version would have given it
-        // a nonzero one: the content read is the settled record's.
-        if stored.as_ref() != Some(index) || version_now()? != Some(0) {
-            return Ok(read);
-        }
-        let mut indexes = self.indexes.write();
-        if let Some(registered) = indexes.by_id.get_mut(&index.id)
-            && registered.version == Some(read)
-        {
-            registered.version = Some(0);
-        }
-        Ok(0)
     }
 }
 

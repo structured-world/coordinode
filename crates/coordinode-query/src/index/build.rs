@@ -484,8 +484,9 @@ impl<'a> Backfill<'a> {
     ) -> Result<Page, BackfillError> {
         let nodes = LocalNodeStore;
         if self.bind_definition {
-            // Read for each page: a version held across the build could stop
-            // matching a record storage renumbered without a write.
+            // Read for each page: a definition rewritten to the value the
+            // build holds (a withdrawn change folded away) has a later
+            // version, and the build goes on under it.
             let Some(version) = coordinode_modality::LocalIndexStore::new(self.engine)
                 .definition_version_as(index)?
             else {

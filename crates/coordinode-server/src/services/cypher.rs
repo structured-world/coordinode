@@ -714,6 +714,16 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
             }
             return status_with_reason(Code::Aborted, rendered, Reason::RevisionMismatch, metadata);
         }
+        // Not retryable as is: the record has no version to state until a
+        // write replaces it.
+        DatabaseError::RevisionUnavailable { partition } => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::RevisionUnavailable,
+                [("partition", partition.to_string())],
+            );
+        }
         DatabaseError::TransactionTooLarge {
             id,
             buffered,

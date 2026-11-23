@@ -34,6 +34,7 @@ use coordinode_core::index::encoding::{GENERATION_PREFIX_LEN, GENERATION_TAGS};
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 use rustc_hash::FxHashMap;
 
+use crate::engine::partition::Partition;
 use crate::engine::{StorageGuard, StorageIter};
 use crate::error::{StorageError, StorageResult};
 
@@ -131,10 +132,11 @@ pub(crate) fn put_generation(key: &mut [u8], generation: u64) {
     }
 }
 
-/// Scan the logical range `(lo, hi)` of the index tree at `seqno`: each
-/// piece from its own physical range, in logical order, every key given
-/// back in logical form.
+/// Scan the logical range `(lo, hi)` of `part`'s tree at `seqno`: each piece
+/// from its own physical range, in logical order, every key given back in
+/// logical form.
 pub(crate) fn scan(
+    part: Partition,
     tree: &AnyTree,
     bindings: &Bindings,
     lo: Bound<&[u8]>,
@@ -148,23 +150,25 @@ pub(crate) fn scan(
             .into_iter()
             .flat_map(move |piece| -> StorageIter {
                 match piece {
-                    Piece::Raw { lo, hi } => {
-                        Box::new(tree.range((lo, hi), seqno, None).map(StorageGuard::raw))
-                    }
+                    Piece::Raw { lo, hi } => Box::new(
+                        tree.range((lo, hi), seqno, None)
+                            .map(move |guard| StorageGuard::raw(part, guard)),
+                    ),
                     Piece::Domain { generation, lo, hi } => Box::new(
                         tree.range((lo, hi), seqno, None)
-                            .map(move |guard| StorageGuard::of_generation(guard, generation)),
+                            .map(move |guard| StorageGuard::of_generation(part, guard, generation)),
                     ),
                 }
             }),
     )
 }
 
-/// Scan the keys of the index tree starting with the logical `prefix` at
+/// Scan the keys of `part`'s tree starting with the logical `prefix` at
 /// `seqno`. A prefix inside one generation is one physical prefix scan (its
 /// prefix filter applies); a shorter generation prefix, or the empty prefix
 /// (the whole user keyspace), comes apart per generation.
 pub(crate) fn scan_prefix(
+    part: Partition,
     tree: &AnyTree,
     bindings: &Bindings,
     prefix: &[u8],
@@ -172,6 +176,7 @@ pub(crate) fn scan_prefix(
 ) -> StorageIter {
     match prefix.first() {
         None => scan(
+            part,
             tree,
             bindings,
             Bound::Included(crate::engine::coverage::USER_KEYSPACE_START),
@@ -180,16 +185,17 @@ pub(crate) fn scan_prefix(
         ),
         // The reserved namespace is never part of a user scan.
         Some(0x00) => Box::new(std::iter::empty()),
-        Some(_) if domain_tag(prefix).is_none() => {
-            Box::new(tree.prefix(prefix, seqno, None).map(StorageGuard::raw))
-        }
+        Some(_) if domain_tag(prefix).is_none() => Box::new(
+            tree.prefix(prefix, seqno, None)
+                .map(move |guard| StorageGuard::raw(part, guard)),
+        ),
         Some(_) if prefix.len() >= GENERATION_PREFIX_LEN => {
             let mut buf = Vec::with_capacity(prefix.len());
             let generation = slot(prefix);
             match (bindings.locate(prefix, &mut buf), generation) {
                 (Located::Bound(physical), Some(generation)) => Box::new(
                     tree.prefix(physical, seqno, None)
-                        .map(move |guard| StorageGuard::of_generation(guard, generation)),
+                        .map(move |guard| StorageGuard::of_generation(part, guard, generation)),
                 ),
                 _ => Box::new(std::iter::empty()),
             }
@@ -197,6 +203,7 @@ pub(crate) fn scan_prefix(
         Some(_) => {
             let end = successor(prefix);
             scan(
+                part,
                 tree,
                 bindings,
                 Bound::Included(prefix),
@@ -991,6 +998,7 @@ struct SeekPiece {
 /// the pieces it passes over, so every key is read once whichever way the
 /// scan moves.
 pub(crate) struct Seekable {
+    part: Partition,
     tree: AnyTree,
     seqno: SeqNo,
     pieces: Vec<SeekPiece>,
@@ -1001,9 +1009,10 @@ pub(crate) struct Seekable {
 }
 
 impl Seekable {
-    /// A seekable scan of the logical range `(lo, hi)` of `tree` at
+    /// A seekable scan of the logical range `(lo, hi)` of `part`'s `tree` at
     /// `seqno`; `bindings` translates when `tree` is the index tree.
     pub(crate) fn open(
+        part: Partition,
         tree: &AnyTree,
         bindings: Option<&Bindings>,
         lo: Bound<&[u8]>,
@@ -1039,6 +1048,7 @@ impl Seekable {
             })
             .collect();
         Self {
+            part,
             tree: tree.clone(),
             seqno,
             back: pieces.len(),
@@ -1055,10 +1065,10 @@ impl Seekable {
         }
     }
 
-    fn wrap(piece: &SeekPiece, guard: lsm_tree::IterGuardImpl) -> StorageGuard {
+    fn wrap(part: Partition, piece: &SeekPiece, guard: lsm_tree::IterGuardImpl) -> StorageGuard {
         match piece.domain {
-            Some((generation, _)) => StorageGuard::of_generation(guard, generation),
-            None => StorageGuard::raw(guard),
+            Some((generation, _)) => StorageGuard::of_generation(part, guard, generation),
+            None => StorageGuard::raw(part, guard),
         }
     }
 
@@ -1154,7 +1164,7 @@ impl Iterator for Seekable {
         while self.front < self.back {
             let piece = &mut self.pieces[self.front];
             if let Some(guard) = piece.inner.next() {
-                return Some(Self::wrap(piece, guard));
+                return Some(Self::wrap(self.part, piece, guard));
             }
             self.front += 1;
         }
@@ -1167,7 +1177,7 @@ impl DoubleEndedIterator for Seekable {
         while self.back > self.front {
             let piece = &mut self.pieces[self.back - 1];
             if let Some(guard) = piece.inner.next_back() {
-                return Some(Self::wrap(piece, guard));
+                return Some(Self::wrap(self.part, piece, guard));
             }
             self.back -= 1;
         }

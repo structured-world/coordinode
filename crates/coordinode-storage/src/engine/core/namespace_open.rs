@@ -247,7 +247,8 @@ pub(crate) fn catalog_at(
             StorageError::Serialization("a namespace record of the catalog does not decode".into())
         };
         let id = decode_namespace_record_key(&key).ok_or_else(malformed)?;
-        out.push((id, NamespaceRecord::decode(&value).ok_or_else(malformed)?));
+        let value = crate::engine::revision::payload_of(&value)?;
+        out.push((id, NamespaceRecord::decode(value).ok_or_else(malformed)?));
     }
     Ok(out)
 }
@@ -266,7 +267,7 @@ pub(crate) fn storage_at(
     let key = coordinode_core::namespace::namespace_record_key(id);
     match records.get(&key, lsm_tree::SeqNo::MAX)? {
         None => Ok(coordinode_core::namespace::NamespaceStorage::default()),
-        Some(bytes) => NamespaceRecord::decode(&bytes)
+        Some(bytes) => NamespaceRecord::decode(crate::engine::revision::payload_of(&bytes)?)
             .map(|record| record.storage)
             .ok_or_else(|| {
                 StorageError::Serialization(format!("the catalog record of {id} does not decode"))
@@ -288,7 +289,7 @@ pub(crate) fn live_at(
     let key = coordinode_core::namespace::namespace_record_key(id);
     match records.get(&key, seqno)? {
         None => Ok(false),
-        Some(bytes) => NamespaceRecord::decode(&bytes)
+        Some(bytes) => NamespaceRecord::decode(crate::engine::revision::payload_of(&bytes)?)
             .map(|record| record.state == NamespaceState::Live)
             .ok_or_else(|| {
                 StorageError::Serialization(format!("the catalog record of {id} does not decode"))

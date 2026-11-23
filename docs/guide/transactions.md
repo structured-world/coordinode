@@ -170,7 +170,7 @@ Posting-list operations (adding/removing edges on a node) use **merge operators*
 
 A record's **version** is the timestamp of the commit that last wrote it. It comes back three ways, all the same number:
 
-- with the node you read (`Node.version` over gRPC, `Database::node_version` embedded), so a read gives you the value and the version together;
+- with the node you read (`Node.version` over gRPC, `Database::node_version` embedded), so a read gives you the value and the version together. Over gRPC every node a read returns (`GetNode`, `Traverse`, vector and hybrid search) carries the version of the very state returned, read at the read's own timestamp; embedded, `Database::node_version_at` gives a node's version at a statement's `read_ts`;
 - from the write that produced it (`QueryStats.commit_ts` on a statement that commits on its own, `CypherResult::commit_ts()` embedded), so after writing you already hold the version to condition your next write on, with no read in between;
 - from the commit of an interactive transaction (`Committed.commit_ts` on the session), which is the timestamp every statement in it landed at. A statement *inside* such a transaction reports no timestamp of its own, because it has not committed yet; a read reports none either, having committed nothing.
 
@@ -185,6 +185,8 @@ Two uses follow from the same primitive.
 **A fenced claim.** A lease or a claim is a record; holding it means having written it. A write done under the claim does two things: it states the claim record's version, and it writes the claim record too. The version catches a takeover that has already committed; writing the record puts the claim in the transaction's write set, so a takeover racing that very commit loses to first-writer-wins instead of interleaving with it. Either way the previous holder's write is refused on the claim rather than on the data, so the work it would have done never reaches the records the claim protects.
 
 **Retrying after an outcome you never heard.** If a commit's reply is lost, retry the same work against the version you originally read. If the first attempt landed, the version moved and the retry is refused, which is how you learn it succeeded; if it did not, the version is unchanged and the retry does the work. The blind retry, which applies the write twice, is what this avoids.
+
+A version stays the commit that wrote the record for as long as the record is there: compaction past the retention window, a reopen, and a copy of the data installed on another member (a Raft snapshot, a repair from another copy) all keep it. Writing the same value again is another write with its own version, so a version read before it no longer matches. A record whose original commit is not known (it came from a store that did not keep it) still reads, but its version cannot be named: asking for it, or committing on the condition of one, is refused with `FAILED_PRECONDITION` and `reason = REVISION_UNAVAILABLE`, nothing applied, until a write replaces the record. No version is ever reported as zero.
 
 Adjacency and counters carry no version. Their rows are folded from operands rather than replaced, so no single commit last wrote one, and a conditional write over them would be a condition on nothing. Asking for their version is refused rather than answered with "nothing is there", and so is conditioning a write on one. Edges added and removed, and counters incremented, are ordered by their merge operator and need no version to be safe under concurrency.
 

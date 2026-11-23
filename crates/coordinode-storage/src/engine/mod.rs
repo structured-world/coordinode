@@ -41,6 +41,7 @@ pub mod pending;
 pub mod promise;
 pub mod rebuild;
 pub mod retention_stats;
+pub(crate) mod revision;
 pub mod routing;
 pub mod scope;
 pub mod space;
@@ -77,29 +78,52 @@ pub type StorageIter = Box<dyn DoubleEndedIterator<Item = StorageGuard> + Send +
 /// One key-value pair of a scan. A key of an index generation is read from
 /// this member's installation of it and given back with the generation in
 /// its place (see [`installation`]); every other key is given back as stored.
+/// A value is given back without the revision its record carries
+/// ([`revision`]).
 pub struct StorageGuard {
     inner: lsm_tree::IterGuardImpl,
     /// The generation whose installation the key was read from.
     generation: Option<u64>,
+    /// Whether the value ends in a revision stamp: a user key of a partition
+    /// whose records carry one. A scan of the user keyspace yields no
+    /// reserved key, so this is decided once per scan.
+    stamped: bool,
 }
 
 impl StorageGuard {
-    /// A pair stored as it is addressed.
+    /// A pair of `part`'s user keyspace stored as it is addressed.
     #[inline]
-    pub(crate) fn raw(inner: lsm_tree::IterGuardImpl) -> Self {
+    pub(crate) fn raw(part: partition::Partition, inner: lsm_tree::IterGuardImpl) -> Self {
         Self {
             inner,
             generation: None,
+            stamped: part.carries_revision(),
         }
     }
 
-    /// A pair of `generation`, read from its installation.
+    /// A pair of `generation` of `part`, read from its installation.
     #[inline]
-    pub(crate) fn of_generation(inner: lsm_tree::IterGuardImpl, generation: u64) -> Self {
+    pub(crate) fn of_generation(
+        part: partition::Partition,
+        inner: lsm_tree::IterGuardImpl,
+        generation: u64,
+    ) -> Self {
         Self {
             inner,
             generation: Some(generation),
+            stamped: part.carries_revision(),
         }
+    }
+
+    /// `value` without its stamp when `stamped`: a view, no copy.
+    #[inline]
+    fn payload(stamped: bool, value: lsm_tree::UserValue) -> lsm_tree::Result<Payload> {
+        let len = if stamped {
+            revision::payload_of(&value)?.len()
+        } else {
+            value.len()
+        };
+        Ok(Payload { value, len })
     }
 
     /// The key and value.
@@ -107,13 +131,30 @@ impl StorageGuard {
     /// # Errors
     ///
     /// A read failure.
-    pub fn into_inner(self) -> lsm_tree::Result<(lsm_tree::UserKey, lsm_tree::UserValue)> {
+    pub fn into_inner(self) -> lsm_tree::Result<(lsm_tree::UserKey, Payload)> {
+        use lsm_tree::Guard as _;
+        let translation = Translation {
+            generation: self.generation,
+        };
+        let stamped = self.stamped;
+        let (key, value) = self.inner.into_inner()?;
+        Ok((translation.logical_key(key), Self::payload(stamped, value)?))
+    }
+
+    /// The key, copied into an owned buffer, and the value as stored: its
+    /// revision stamp included. What a copy of the row to another tree takes,
+    /// so the copy keeps the revision.
+    ///
+    /// # Errors
+    ///
+    /// A read failure.
+    pub(crate) fn into_stored(self) -> lsm_tree::Result<(Vec<u8>, lsm_tree::UserValue)> {
         use lsm_tree::Guard as _;
         let translation = Translation {
             generation: self.generation,
         };
         let (key, value) = self.inner.into_inner()?;
-        Ok((translation.logical_key(key), value))
+        Ok((translation.logical_vec(&key), value))
     }
 
     /// The key and value, with the key copied into an owned buffer: what a
@@ -123,13 +164,17 @@ impl StorageGuard {
     /// # Errors
     ///
     /// A read failure.
-    pub fn into_owned(self) -> lsm_tree::Result<(Vec<u8>, lsm_tree::UserValue)> {
+    pub fn into_owned(self) -> lsm_tree::Result<(Vec<u8>, Payload)> {
         use lsm_tree::Guard as _;
         let translation = Translation {
             generation: self.generation,
         };
+        let stamped = self.stamped;
         let (key, value) = self.inner.into_inner()?;
-        Ok((translation.logical_vec(&key), value))
+        Ok((
+            translation.logical_vec(&key),
+            Self::payload(stamped, value)?,
+        ))
     }
 
     /// The key, and the value only when `pred` accepts the key (a separated
@@ -141,10 +186,15 @@ impl StorageGuard {
     pub fn into_inner_if(
         self,
         pred: impl Fn(&lsm_tree::UserKey) -> bool,
-    ) -> lsm_tree::Result<(lsm_tree::UserKey, Option<lsm_tree::UserValue>)> {
+    ) -> lsm_tree::Result<(lsm_tree::UserKey, Option<Payload>)> {
         use lsm_tree::Guard as _;
+        let stamped = self.stamped;
+        let unstamp = |value: Option<lsm_tree::UserValue>| {
+            value.map(|value| Self::payload(stamped, value)).transpose()
+        };
         if self.generation.is_none() {
-            return self.inner.into_inner_if(pred);
+            let (key, value) = self.inner.into_inner_if(pred)?;
+            return Ok((key, unstamp(value)?));
         }
         let translation = Translation {
             generation: self.generation,
@@ -157,7 +207,7 @@ impl StorageGuard {
         let key = logical.into_inner().ok_or_else(|| {
             lsm_tree::Error::InvalidHeader("a scan pair was read without its key")
         })?;
-        Ok((key, value))
+        Ok((key, unstamp(value)?))
     }
 
     /// The key.
@@ -181,7 +231,15 @@ impl StorageGuard {
     /// A read failure.
     pub fn size(self) -> lsm_tree::Result<u32> {
         use lsm_tree::Guard as _;
-        self.inner.size()
+        let size = self.inner.size()?;
+        if !self.stamped {
+            return Ok(size);
+        }
+        // `STAMP_LEN` is 8 and fits a `u32`.
+        size.checked_sub(revision::STAMP_LEN as u32)
+            .ok_or(lsm_tree::Error::InvalidHeader(
+                "a stored record is shorter than its revision stamp",
+            ))
     }
 
     /// The value.
@@ -189,9 +247,72 @@ impl StorageGuard {
     /// # Errors
     ///
     /// A read failure.
-    pub fn value(self) -> lsm_tree::Result<lsm_tree::UserValue> {
+    pub fn value(self) -> lsm_tree::Result<Payload> {
         use lsm_tree::Guard as _;
-        self.inner.value()
+        let stamped = self.stamped;
+        Self::payload(stamped, self.inner.value()?)
+    }
+}
+
+/// The value of a record as a scan hands it out: its payload, a view into
+/// the bytes the tree read, without the revision stamp stored after it.
+/// Reads as `&[u8]`; what a caller keeps of it, it copies.
+#[derive(Clone)]
+pub struct Payload {
+    value: lsm_tree::UserValue,
+    /// The payload's length: the value's, less a stamp it carries.
+    len: usize,
+}
+
+impl Payload {
+    /// The payload's bytes.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        // `len` is at most the value's length, by construction.
+        &self.value[..self.len]
+    }
+
+    /// The payload copied into an owned buffer.
+    #[inline]
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_slice().to_vec()
+    }
+}
+
+impl ::core::ops::Deref for Payload {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for Payload {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl ::core::borrow::Borrow<[u8]> for Payload {
+    #[inline]
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl ::core::fmt::Debug for Payload {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_tuple("Payload").field(&self.as_slice()).finish()
+    }
+}
+
+impl Eq for Payload {}
+
+impl<T: AsRef<[u8]> + ?Sized> PartialEq<T> for Payload {
+    fn eq(&self, other: &T) -> bool {
+        self.as_slice() == other.as_ref()
     }
 }
 

@@ -428,6 +428,19 @@ pub enum DatabaseError {
         current: Option<u64>,
     },
 
+    /// A write was conditioned on the version of a record, or a version was
+    /// read, whose original commit is not known: the record came from a
+    /// store that did not keep it. Its value still reads; a conditioned write
+    /// is refused, nothing applied, until a write replaces the record.
+    #[error(
+        "the version of a record of the {partition} partition is not known; \
+         its value reads, but a write cannot be conditioned on its version"
+    )]
+    RevisionUnavailable {
+        /// The partition of the record.
+        partition: &'static str,
+    },
+
     /// A transaction buffered more uncommitted data than it is allowed to, and
     /// was discarded. Splitting the work into smaller transactions is the fix.
     #[error("transaction {id} exceeded its buffer limit ({buffered} > {limit} bytes)")]
@@ -854,6 +867,9 @@ impl From<StorageError> for DatabaseError {
             },
             StorageError::IndexEntry(entry) => Self::IndexEntry(entry),
             StorageError::AccessRefused(refusal) => Self::AccessRefused(refusal),
+            StorageError::RevisionUnavailable { partition } => {
+                Self::RevisionUnavailable { partition }
+            }
             // A read stopped by its memory budget, as one through a store is.
             StorageError::Budget(stop) => Self::Budget(stop),
             other => Self::Storage(StorageFailure {

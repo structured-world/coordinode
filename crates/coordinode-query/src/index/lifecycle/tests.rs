@@ -856,26 +856,34 @@ fn a_check_followed_at_once_by_another_reports_its_own_outcome() {
     assert_eq!(env.holders(&def, "b@x"), vec![2], "repaired");
 }
 
-/// Settle the catalog's versions as a bottommost compaction does to records
-/// it keeps no older version of: renumbered to zero, unwritten. Returns the
-/// version `def`'s record is left at.
-fn settle_catalog(env: &TestEnv, def: &IndexDefinition) -> Option<u64> {
+/// Compact the catalog as a bottommost compaction does to records it keeps
+/// no older version of, and check `def`'s record keeps its version: a
+/// rewrite by storage is not a write.
+fn settle_catalog(env: &TestEnv, def: &IndexDefinition) {
     use coordinode_storage::engine::partition::Partition::Schema;
+    let version = || {
+        LocalIndexStore::new(&env.engine)
+            .definition_version(def.id)
+            .expect("version")
+    };
+    let before = version();
+    assert!(before.is_some_and(|v| v > 0), "the definition was written");
     env.engine.persist().expect("persist");
     // No time-travel window: only live snapshots hold versions back.
     env.engine.set_retention_window(Duration::ZERO);
     env.engine
         .major_compact(Schema)
         .expect("compact the catalog");
-    LocalIndexStore::new(&env.engine)
-        .definition_version(def.id)
-        .expect("version")
+    assert_eq!(
+        version(),
+        before,
+        "compaction keeps the definition's version"
+    );
 }
 
-/// A check binds each repair to its index's definition as stored when the
-/// repair commits, not to a version read when the check was taken: storage
-/// renumbering the unchanged definition meanwhile costs neither the repair
-/// nor the check.
+/// A check whose index's catalog is compacted while it runs repairs and
+/// concludes: the unchanged definition keeps its version, so neither the
+/// repair nor the check is refused.
 #[test]
 fn a_check_repairs_across_a_settled_definition_version() {
     let (env, builds, def) = member_with_users();
@@ -883,11 +891,7 @@ fn a_check_repairs_across_a_settled_definition_version() {
     env.hold_pages_after(0);
     let operation = builds.request_check(def.id).expect("check");
     env.await_held_page();
-    assert_eq!(
-        settle_catalog(&env, &def),
-        Some(0),
-        "precondition: the definition's version settled without a write"
-    );
+    settle_catalog(&env, &def);
     env.release_pages();
     let outcome = builds
         .wait_check(operation, Some(Duration::from_secs(30)))
@@ -899,9 +903,9 @@ fn a_check_repairs_across_a_settled_definition_version() {
     assert_eq!(env.holders(&def, "b@x"), vec![2], "repaired");
 }
 
-/// A build binds each page and its publication to its definition as stored
-/// at that commit: storage renumbering the unchanged definition during the
-/// build neither supersedes the build nor refuses its publication.
+/// A build whose index's catalog is compacted while it runs publishes: the
+/// unchanged definition keeps its version, so the build is neither
+/// superseded nor refused its publication.
 #[test]
 fn a_build_publishes_across_a_settled_definition_version() {
     let env = env();
@@ -915,11 +919,7 @@ fn a_build_publishes_across_a_settled_definition_version() {
     let builds = service(&env);
     builds.submit(def.generation).expect("submit");
     env.await_held_page();
-    assert_eq!(
-        settle_catalog(&env, &def),
-        Some(0),
-        "precondition: the definition's version settled without a write"
-    );
+    settle_catalog(&env, &def);
     env.release_pages();
     assert!(
         matches!(

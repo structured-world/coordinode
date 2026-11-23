@@ -503,10 +503,11 @@ fn a_rebuild_the_journal_cannot_cover_is_refused() {
     let kept = read_kept_rows(&store.primary(), TreeId::system(Partition::Deployment))
         .expect("read the intent")
         .expect("the rebuild keeps its records");
+    // Kept as stored: the routes' payload, with its write's revision.
     assert!(
         kept.iter().any(
             |(key, value)| key.as_slice() == routing_key(Partition::Node).as_slice()
-                && value == &store.routes
+                && crate::engine::revision::payload_of(value).ok() == Some(&store.routes[..])
         ),
         "the routes are no longer kept"
     );

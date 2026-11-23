@@ -649,6 +649,56 @@ fn a_versioned_read_of_a_record_older_than_the_horizon_answers() {
     );
 }
 
+/// A record's version is the commit timestamp of the write that produced it,
+/// through compaction past the retention horizon and through a reopen: a
+/// compaction that settles the row keeps it. The same value written again
+/// later is another write with its own version, which the version a reader
+/// saved before can never match.
+#[test]
+fn a_record_keeps_its_commit_timestamp_through_compaction() {
+    let base = future_base();
+    let (engine, oracle, _dir) = oracle_engine(base);
+    engine.set_retention_window(Duration::from_secs(1));
+    let key = b"node:00:00000001";
+    let other = b"node:00:00000002";
+    let settle = |at: u64| {
+        put_at(&engine, other, b"tick", at);
+        flush(&engine);
+        oracle.advance_to(Timestamp::from_raw(at + 60_000_000));
+        engine.advance_gc_watermark();
+        engine.force_compaction(Partition::Node).expect("compact");
+    };
+    let c1 = base + 1_000;
+    put_at(&engine, key, b"same", c1);
+    flush(&engine);
+    settle(base + 60_000_000);
+    let saved = engine
+        .record_version(Partition::Node, key)
+        .expect("version");
+    assert_eq!(
+        saved,
+        Some(c1),
+        "settled, the record keeps its commit timestamp"
+    );
+
+    let c2 = base + 200_000_000;
+    put_at(&engine, key, b"same", c2);
+    flush(&engine);
+    settle(base + 260_000_000);
+    let now = engine
+        .record_version(Partition::Node, key)
+        .expect("version");
+    assert_eq!(
+        now,
+        Some(c2),
+        "the same value written again is another write"
+    );
+    assert_ne!(
+        now, saved,
+        "a version saved before the rewrite matches nothing"
+    );
+}
+
 /// The window's disk cost is observable per partition, and it is paid in key
 /// versions, not in tables: inside the window the compaction output carries
 /// both versions of the key (so it is larger than one version) and nothing

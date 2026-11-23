@@ -167,7 +167,7 @@ fn a_patch_folded_without_its_base_would_replace_the_record() {
 
     // Against its real base the patch adds a field and keeps the rest.
     let honest = merger
-        .merge(b"node:00:01", Some(&base), &[&operand])
+        .fold(Some(&base), &[&operand])
         .expect("apply to the real base");
     let honest = decode_node_record(&honest).expect("decode");
     assert!(
@@ -177,11 +177,9 @@ fn a_patch_folded_without_its_base_would_replace_the_record() {
 
     // Folded without a base it becomes a record of its own, and that record
     // supersedes the real one when they meet.
-    let composed = merger
-        .merge(b"node:00:01", None, &[&operand])
-        .expect("fold with no base");
+    let composed = merger.fold(None, &[&operand]).expect("fold with no base");
     let replaced = merger
-        .merge(b"node:00:01", Some(&base), &[&composed])
+        .fold(Some(&base), &[&composed])
         .expect("apply the composite to the base");
     let replaced = decode_node_record(&replaced).expect("decode");
 

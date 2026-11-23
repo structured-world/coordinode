@@ -597,13 +597,11 @@ pub trait IndexStore {
     /// The version of the stored definition of `def.id` while it is still
     /// exactly `def`, read with it in one step; `None` when it moved or is
     /// gone. What an executor holding a definition across many commits binds
-    /// each of them to: storage may renumber a record it keeps no older
-    /// version of without writing it, so a version read once can stop
-    /// matching a definition that never changed. The binding is by value:
-    /// a definition that returns to an earlier value (a withdrawn selection
-    /// change folded away) serves exactly that interpretation again, over
-    /// entries the fold brought back into its one scope, so effects derived
-    /// from it hold.
+    /// each of them to. The binding is by value: a definition that returns
+    /// to an earlier value (a withdrawn selection change folded away) is a
+    /// later write with its own version, yet serves exactly that
+    /// interpretation again, over entries the fold brought back into its one
+    /// scope, so effects derived from it hold.
     ///
     /// # Errors
     ///

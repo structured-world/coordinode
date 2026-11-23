@@ -341,8 +341,8 @@ fn writes_bind_an_index_whose_definition_has_settled() {
     );
 }
 
-/// A definition that changed and then settled is not the one registered:
-/// version zero on both does not make them one, and a write bound to the
+/// A definition that changed and then settled is not the one registered: the
+/// change keeps its own version through compaction, and a write bound to the
 /// registered definition is refused as a conflict with that change, every
 /// time it runs again while the registry still holds the old one.
 #[test]
@@ -352,6 +352,13 @@ fn a_settled_change_of_the_definition_refuses_the_writes_bound_before_it() {
     db.execute_cypher("CREATE UNIQUE INDEX agent_session ON :Agent(session_id)")
         .expect("CREATE INDEX");
     let registered = super::helpers::index_named(db.engine(), "agent_session").expect("index");
+    let version = |db: &coordinode_embed::Database| {
+        db.engine()
+            .record_version(Partition::Schema, &registered.schema_key())
+            .expect("version")
+            .expect("the definition is stored")
+    };
+    let registered_at = version(&db);
     // The record changes behind the registry: another generation.
     let mut changed = registered.clone();
     changed.generation =
@@ -363,6 +370,11 @@ fn a_settled_change_of_the_definition_refuses_the_writes_bound_before_it() {
             &rmp_serde::to_vec(&changed).expect("encode"),
         )
         .expect("rewrite the definition");
+    let changed_at = version(&db);
+    assert_ne!(
+        changed_at, registered_at,
+        "the change is a write of its own"
+    );
     db.set_retention_window(std::time::Duration::from_millis(200));
     std::thread::sleep(std::time::Duration::from_millis(500));
     db.execute_cypher("CREATE (:Other {n: 1})")
@@ -372,11 +384,9 @@ fn a_settled_change_of_the_definition_refuses_the_writes_bound_before_it() {
         db.engine().force_compaction(*part).expect("compact");
     }
     assert_eq!(
-        db.engine()
-            .record_version(Partition::Schema, &registered.schema_key())
-            .expect("version"),
-        Some(0),
-        "the change settled"
+        version(&db),
+        changed_at,
+        "the settled change keeps its version"
     );
 
     let refused = db.execute_cypher("CREATE (:Agent {session_id: 's1'})");

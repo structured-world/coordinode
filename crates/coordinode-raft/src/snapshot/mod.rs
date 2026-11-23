@@ -1564,9 +1564,12 @@ pub fn install_received(
         let source = source_deployment
             .engine(*id)
             .map_err(|e| storage("open a namespace of the snapshot", e))?;
-        let schema = source
-            .replicated_rows(Partition::Schema)
-            .map_err(|e| storage(&format!("read the schema of namespace {name}"), e))?;
+        let schema: Vec<(Vec<u8>, Vec<u8>)> = source
+            .snapshot_prefix_scan(&source.snapshot(), Partition::Schema, &[])
+            .map_err(|e| storage(&format!("read the schema of namespace {name}"), e))?
+            .into_iter()
+            .map(|(key, value)| (key, value.to_vec()))
+            .collect();
         verify_field_dictionary(&schema)?;
         sources.push(source);
     }

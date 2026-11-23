@@ -1700,6 +1700,7 @@ impl Deployment {
                                 || covered.get(id).is_some_and(|c| c.contains(entry.index, 0));
                             if !skip {
                                 apply_oplog_ops_at(
+                                    id.part,
                                     tree,
                                     installations,
                                     ops,
@@ -3603,9 +3604,9 @@ impl StorageEngine {
             Partition::Idx => {
                 let bindings = self.installations()?.current();
                 bindings.check_prefix_history(prefix, seqno)?;
-                crate::engine::installation::scan_prefix(tree, &bindings, prefix, seqno)
+                crate::engine::installation::scan_prefix(part, tree, &bindings, prefix, seqno)
             }
-            _ => coverage::user_prefix(tree, prefix, seqno),
+            _ => coverage::user_prefix(part, tree, prefix, seqno),
         })
     }
 
@@ -3632,7 +3633,7 @@ impl StorageEngine {
             Partition::Idx => {
                 let bindings = self.installations()?.current();
                 bindings.check_history(lo, hi, seqno)?;
-                crate::engine::installation::scan(tree, &bindings, lo, hi, seqno)
+                crate::engine::installation::scan(part, tree, &bindings, lo, hi, seqno)
             }
             _ => {
                 let owned = |b: Bound<&[u8]>| match b {
@@ -3642,17 +3643,18 @@ impl StorageEngine {
                 };
                 Box::new(
                     tree.range((owned(lo), owned(hi)), seqno, None)
-                        .map(crate::engine::StorageGuard::raw),
+                        .map(move |inner| crate::engine::StorageGuard::raw(part, inner)),
                 )
             }
         })
     }
 
     /// Point lookups of the logical `keys` of `part` at `seqno` through one
-    /// tree descent, one result per key. Index generation keys are
-    /// translated into one shared buffer; a key of a generation with no
-    /// installation here finds nothing.
-    fn stored_multi_get(
+    /// tree descent, one result per key, each value as stored: its revision
+    /// stamp included. Index generation keys are translated into one shared
+    /// buffer; a key of a generation with no installation here finds
+    /// nothing.
+    fn stored_multi_get_stamped(
         &self,
         part: Partition,
         keys: &[&[u8]],
@@ -4155,7 +4157,7 @@ impl StorageEngine {
         drop(source);
         drop(ckpt);
         for (key, value) in &local {
-            self.put(partition, key, value)?;
+            self.put_stored(partition, key, value)?;
         }
 
         // 3. Replay the journal entries the copy lacks for this partition at
@@ -4178,6 +4180,7 @@ impl StorageEngine {
                 continue;
             }
             apply_oplog_ops_at(
+                partition,
                 tree,
                 installations,
                 &ops,
@@ -4506,7 +4509,8 @@ impl StorageEngine {
     }
 
     /// This node's own records in `partition` (see
-    /// [`raft_coverage::is_node_local`]), read from the live tree.
+    /// [`raft_coverage::is_node_local`]), read from the live tree as stored,
+    /// revisions included: what [`Self::put_stored`] writes back.
     fn node_local_rows(&self, partition: Partition) -> StorageResult<Rows> {
         let prefixes: &[&[u8]] = match partition {
             Partition::Raft => &[b""],
@@ -4515,7 +4519,7 @@ impl StorageEngine {
         let mut rows = Rows::new();
         for prefix in prefixes {
             for guard in self.prefix_scan(partition, prefix)? {
-                let (key, value) = guard.into_owned()?;
+                let (key, value) = guard.into_stored()?;
                 rows.push((key, value.to_vec()));
             }
         }
@@ -7502,7 +7506,7 @@ impl Deployment {
         let value = self
             .system_tree(part)?
             .get(key, self.coordinator.current_seqno())?;
-        Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
+        Ok(crate::engine::revision::user_bytes(part, key, value)?)
     }
 
     /// Write `key` of the system set's `part` directly, at the next seqno,
@@ -7513,9 +7517,14 @@ impl Deployment {
     /// `part` has no tree in the system set, the write is not admitted, or
     /// the tree refuses it.
     pub fn system_put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
-        let mut batch = lsm_tree::WriteBatch::with_capacity(1);
-        batch.insert(key, value);
-        self.system_write(part, key, (key.len() + value.len()) as u64, batch)
+        self.system_write(part, key, (key.len() + value.len()) as u64, |seqno| {
+            let mut batch = lsm_tree::WriteBatch::with_capacity(1);
+            batch.insert(
+                key,
+                crate::engine::revision::stored(part, key, value, seqno).as_ref(),
+            );
+            batch
+        })
     }
 
     /// Delete `key` of the system set's `part` directly, as
@@ -7525,19 +7534,21 @@ impl Deployment {
     ///
     /// As [`Self::system_put`].
     pub fn system_delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {
-        let mut batch = lsm_tree::WriteBatch::with_capacity(1);
-        batch.remove(key);
-        self.system_write(part, key, key.len() as u64, batch)
+        self.system_write(part, key, key.len() as u64, |_| {
+            let mut batch = lsm_tree::WriteBatch::with_capacity(1);
+            batch.remove(key);
+            batch
+        })
     }
 
-    /// Apply `batch`, one direct write of `key` carrying `bytes`, to the
-    /// system set's `part`.
+    /// Apply the batch `build` makes for the seqno the write lands at, one
+    /// direct write of `key` carrying `bytes`, to the system set's `part`.
     fn system_write(
         &self,
         part: Partition,
         key: &[u8],
         bytes: u64,
-        batch: lsm_tree::WriteBatch,
+        build: impl FnOnce(lsm_tree::SeqNo) -> lsm_tree::WriteBatch,
     ) -> StorageResult<()> {
         let tree = self.system_tree(part)?;
         let _admitted =
@@ -7545,7 +7556,7 @@ impl Deployment {
         // Held until the data is in: no complete snapshot may cover its seqno
         // before.
         let (seqno, _landing) = self.pending_commits.admit_direct(|| self.next_seqno());
-        let (added, memtable) = tree.apply_batch(batch, seqno)?;
+        let (added, memtable) = tree.apply_batch(build(seqno), seqno)?;
         self.coordinator
             .flush_trigger()
             .wrote(part, added, memtable);
@@ -8065,7 +8076,7 @@ impl Deployment {
         key: &[u8],
     ) -> StorageResult<Option<bytes::Bytes>> {
         let value = self.system_tree(part)?.get(key, *snapshot)?;
-        Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
+        Ok(crate::engine::revision::user_bytes(part, key, value)?)
     }
 
     /// The records of the system set's `part` under `prefix` now, in key
@@ -8076,6 +8087,7 @@ impl Deployment {
     /// `part` has no tree in the system set.
     pub fn system_prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
         Ok(coverage::user_prefix(
+            part,
             self.system_tree(part)?,
             prefix,
             self.coordinator.current_seqno(),
@@ -8094,6 +8106,7 @@ impl Deployment {
     ) -> StorageResult<StorageIter> {
         Ok(Box::new(
             coverage::user_prefix(
+                part,
                 self.system_tree(part)?,
                 prefix,
                 self.coordinator.current_seqno(),
@@ -8158,9 +8171,8 @@ impl StorageEngine {
         };
         let value = tree.get(stored, self.coordinator.current_seqno())?;
 
-        match value {
-            Some(v) => {
-                let bytes = bytes::Bytes::copy_from_slice(&v);
+        match crate::engine::revision::user_bytes(part, key, value)? {
+            Some(bytes) => {
                 if let (Some(cache), Some(ticket)) = (&self.tiered_cache, ticket) {
                     let weight = self.resolve_cache_weight(cache, part, &bytes);
                     cache.fill(id, key, &bytes, weight, ticket);
@@ -8250,22 +8262,29 @@ impl StorageEngine {
             return Ok(());
         }
 
-        let values = self.stored_multi_get(part, &miss_keys, self.coordinator.current_seqno())?;
+        let values =
+            self.stored_multi_get_stamped(part, &miss_keys, self.coordinator.current_seqno())?;
 
         for (n, (slot, value)) in miss_idx.into_iter().zip(values).enumerate() {
-            let Some(v) = value else {
+            let Some(stored) = value else {
                 each(slot, None)?;
                 continue;
+            };
+            // A view of the payload inside the tree's buffer: no copy.
+            let v = if crate::engine::revision::stamped(part, keys[slot]) {
+                crate::engine::revision::payload_of(&stored).map_err(StorageError::from)?
+            } else {
+                &stored
             };
             self.access_tracker.record(id, keys[slot]);
             match (&self.tiered_cache, tickets.get(n)) {
                 (Some(cache), Some(ticket)) => {
-                    let bytes = bytes::Bytes::copy_from_slice(&v);
+                    let bytes = bytes::Bytes::copy_from_slice(v);
                     let weight = self.resolve_cache_weight(cache, part, &bytes);
                     cache.fill(id, keys[slot], &bytes, weight, *ticket);
                     each(slot, Some(StoredValue::Cached(&bytes)))?;
                 }
-                _ => each(slot, Some(StoredValue::Tree(&v)))?,
+                _ => each(slot, Some(StoredValue::Tree(v)))?,
             }
         }
         Ok(())
@@ -8283,12 +8302,17 @@ impl StorageEngine {
             crate::engine::footprint::footprint_of((key.len() + value.len()) as u64, 1),
         )?;
         let mut addressing = self.addressing(part)?;
-        let mut batch = lsm_tree::WriteBatch::with_capacity(3);
-        batch.insert(addressing.point(key)?, value);
-        if let Some(staging) = addressing.staging_point(key) {
-            batch.insert(staging, value);
-        }
-        self.apply_single(part, batch)?;
+        let point = addressing.point(key)?.to_vec();
+        let staging = addressing.staging_point(key).map(<[u8]>::to_vec);
+        self.apply_single(part, |seqno| {
+            let value = crate::engine::revision::stored(part, key, value, seqno);
+            let mut batch = lsm_tree::WriteBatch::with_capacity(3);
+            batch.insert(point.as_slice(), value.as_ref());
+            if let Some(staging) = &staging {
+                batch.insert(staging.as_slice(), value.as_ref());
+            }
+            batch
+        })?;
         let id = self.tree_id(part);
         self.write_taps.wrote(id, [key]);
         if let Some(cache) = &self.tiered_cache {
@@ -8297,14 +8321,45 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Apply one direct write's `batch` (its key and a replacement's copy)
-    /// at the next seqno.
-    fn apply_single(&self, part: Partition, batch: lsm_tree::WriteBatch) -> StorageResult<()> {
+    /// Write back a row read as stored ([`Self::snapshot_prefix_scan_stored`]):
+    /// its value already carries its revision, which the write keeps.
+    pub(crate) fn put_stored(
+        &self,
+        part: Partition,
+        key: &[u8],
+        stored: &[u8],
+    ) -> StorageResult<()> {
+        let _admitted = self.admit_partition_write(
+            [part],
+            crate::engine::footprint::footprint_of((key.len() + stored.len()) as u64, 1),
+        )?;
+        let mut addressing = self.addressing(part)?;
+        let mut batch = lsm_tree::WriteBatch::with_capacity(3);
+        batch.insert(addressing.point(key)?, stored);
+        if let Some(staging) = addressing.staging_point(key) {
+            batch.insert(staging, stored);
+        }
+        self.apply_single(part, |_| batch)?;
+        let id = self.tree_id(part);
+        self.write_taps.wrote(id, [key]);
+        if let Some(cache) = &self.tiered_cache {
+            cache.remove(id, key);
+        }
+        Ok(())
+    }
+
+    /// Apply one direct write, the batch `build` makes for the seqno it
+    /// lands at (its key and a replacement's copy), at the next seqno.
+    fn apply_single(
+        &self,
+        part: Partition,
+        build: impl FnOnce(lsm_tree::SeqNo) -> lsm_tree::WriteBatch,
+    ) -> StorageResult<()> {
         let tree = self.tree(part)?;
         // Held until the data is in: no complete snapshot may cover its
         // seqno before.
         let (seqno, _landing) = self.pending_commits.admit_direct(|| self.next_seqno());
-        let (added, memtable) = tree.apply_batch(batch, seqno)?;
+        let (added, memtable) = tree.apply_batch(build(seqno), seqno)?;
         self.coordinator
             .flush_trigger()
             .wrote(part, added, memtable);
@@ -8329,7 +8384,7 @@ impl StorageEngine {
             if let Some(staging) = addressing.staging_point(key) {
                 batch.remove(staging);
             }
-            self.apply_single(part, batch)?;
+            self.apply_single(part, |_| batch)?;
         }
         let id = self.tree_id(part);
         self.write_taps.wrote(id, [key]);
@@ -8389,12 +8444,17 @@ impl StorageEngine {
             crate::engine::footprint::footprint_of((key.len() + operand.len()) as u64, 1),
         )?;
         let mut addressing = self.addressing(part)?;
-        let mut batch = lsm_tree::WriteBatch::with_capacity(3);
-        batch.merge(addressing.point(key)?, operand);
-        if let Some(staging) = addressing.staging_point(key) {
-            batch.merge(staging, operand);
-        }
-        self.apply_single(part, batch)?;
+        let point = addressing.point(key)?.to_vec();
+        let staging = addressing.staging_point(key).map(<[u8]>::to_vec);
+        self.apply_single(part, |seqno| {
+            let operand = crate::engine::revision::stored(part, key, operand, seqno);
+            let mut batch = lsm_tree::WriteBatch::with_capacity(3);
+            batch.merge(point.as_slice(), operand.as_ref());
+            if let Some(staging) = &staging {
+                batch.merge(staging.as_slice(), operand.as_ref());
+            }
+            batch
+        })?;
         let id = self.tree_id(part);
         self.write_taps.wrote(id, [key]);
         if let Some(cache) = &self.tiered_cache {
@@ -9320,7 +9380,7 @@ impl StorageEngine {
         self.clear_partition_tree(part, tree)?;
         cleared()?;
         for (key, value) in &kept {
-            self.put(part, key, value)?;
+            self.put_stored(part, key, value)?;
         }
         self.finish_rebuild(repair)
     }
@@ -10111,6 +10171,7 @@ impl StorageEngine {
             )?;
         }
         Ok(Box::new(crate::engine::installation::Seekable::open(
+            part,
             tree,
             bindings.as_deref(),
             Bound::Included(coverage::clamp_user_start(start)),
@@ -10787,7 +10848,14 @@ impl StorageEngine {
             return Ok(inspect(None));
         };
         let value = self.tree(part)?.get(stored, *snapshot)?;
-        Ok(inspect(value.as_deref()))
+        let payload = match &value {
+            Some(stored) if crate::engine::revision::stamped(part, key) => {
+                Some(crate::engine::revision::payload_of(stored)?)
+            }
+            Some(stored) => Some(&stored[..]),
+            None => None,
+        };
+        Ok(inspect(payload))
     }
 
     /// Refuse a read of the index generation `key` belongs to at a snapshot
@@ -10835,7 +10903,7 @@ impl StorageEngine {
             return Ok(None);
         };
         let value = tree.get(stored, *snapshot)?;
-        Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
+        Ok(crate::engine::revision::user_bytes(part, key, value)?)
     }
 
     /// Batch point lookup through a previously taken snapshot — the
@@ -10881,9 +10949,19 @@ impl StorageEngine {
         for key in keys {
             self.check_history_of(part, key, *snapshot)?;
         }
-        let values = self.stored_multi_get(part, keys, *snapshot)?;
-        for (slot, value) in values.iter().enumerate() {
-            each(slot, value.as_ref().map(StoredValue::Tree))?;
+        let values = self.stored_multi_get_stamped(part, keys, *snapshot)?;
+        for (slot, (key, value)) in keys.iter().zip(&values).enumerate() {
+            let Some(stored) = value else {
+                each(slot, None)?;
+                continue;
+            };
+            // A view of the payload inside the tree's buffer: no copy.
+            let payload = if crate::engine::revision::stamped(part, key) {
+                crate::engine::revision::payload_of(stored).map_err(StorageError::from)?
+            } else {
+                stored
+            };
+            each(slot, Some(StoredValue::Tree(payload)))?;
         }
         Ok(())
     }
@@ -10901,6 +10979,23 @@ impl StorageEngine {
         for guard in self.snapshot_prefix_iter(snapshot, part, prefix)? {
             let (key, value) = guard.into_owned()?;
             results.push((key, bytes::Bytes::copy_from_slice(&value)));
+        }
+        Ok(results)
+    }
+
+    /// [`Self::snapshot_prefix_scan`] with each value as stored, its revision
+    /// stamp included: the rows a copy of the partition carries, so the copy
+    /// keeps every record's revision.
+    pub(crate) fn snapshot_prefix_scan_stored(
+        &self,
+        snapshot: &lsm_tree::SeqNo,
+        part: Partition,
+        prefix: &[u8],
+    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut results = Vec::new();
+        for guard in self.snapshot_prefix_iter(snapshot, part, prefix)? {
+            let (key, value) = guard.into_stored()?;
+            results.push((key, value.to_vec()));
         }
         Ok(results)
     }
@@ -10927,36 +11022,61 @@ impl StorageEngine {
     /// what a conditional write is asking about, and inventing a second
     /// number would mean keeping two things in step for no gain.
     ///
+    /// The revision is the one the record's value carries
+    /// ([`crate::engine::revision`]), so it survives every rewrite of the
+    /// record by storage: compaction, a copy of the partition installed
+    /// elsewhere, a reopen.
+    ///
     /// A commutative partition has no version to give: adjacency and counter
     /// rows are folded from operands rather than replaced, so there is no
     /// single commit that last wrote one. Asking is a caller error rather
     /// than an answer of `None`, which would read as "nothing is there".
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::RevisionUnavailable`] for a live record whose original
+    /// commit timestamp is not known; [`StorageError::InvalidConfig`] for a
+    /// commutative partition; a read failure.
     pub fn record_version(
         &self,
         part: Partition,
         key: &[u8],
     ) -> StorageResult<Option<lsm_tree::SeqNo>> {
-        if part.is_commutative() {
-            return Err(StorageError::InvalidConfig(format!(
-                "the {part:?} partition is merge-composed: its rows are folded from \
-                 operands, so no single commit is their version"
-            )));
-        }
-        let tree = self.tree(part)?;
+        let Some(value) = self.get_versioned_at_rest(part, key)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::revision_of(part, &value)?.1))
+    }
+
+    /// The version of a record as a read at `snapshot` saw it: the revision
+    /// of the value visible there, so a value read at `snapshot` and this
+    /// version are of one write. `None` when no live row is visible there.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::record_version`]; the snapshot is no longer retained.
+    pub fn record_version_at(
+        &self,
+        snapshot: &lsm_tree::SeqNo,
+        part: Partition,
+        key: &[u8],
+    ) -> StorageResult<Option<lsm_tree::SeqNo>> {
+        Self::check_versioned(part, key)?;
+        self.check_snapshot_retained(part, *snapshot)?;
+        self.check_history_of(part, key, *snapshot)?;
         let mut buf = Vec::new();
         let Some(stored) = self.stored_key(part, key, &mut buf) else {
             return Ok(None);
         };
-        Ok(tree
-            .get_internal_entry(stored, lsm_tree::SeqNo::MAX)?
-            .map(|e| e.key.seqno))
+        let Some(value) = self.tree(part)?.get(stored, *snapshot)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::revision_of(part, &value)?.1))
     }
 
     /// A record's latest value together with its [`Self::record_version`],
-    /// both of one write: what a read-modify-write states as its condition.
-    /// Reading the value and the version separately could pair a version
-    /// with an older value when a commit lands between the two reads, and a
-    /// write conditioned on that version would then pass on stale data.
+    /// both read from one stored value, so both are of one write: what a
+    /// read-modify-write states as its condition.
     ///
     /// # Errors
     ///
@@ -10966,27 +11086,63 @@ impl StorageEngine {
         part: Partition,
         key: &[u8],
     ) -> StorageResult<Option<(bytes::Bytes, lsm_tree::SeqNo)>> {
-        // The latest value, read between two reads of the version: equal
-        // versions mean no write landed between, so the value is that
-        // write's. The value is read at the present, never at the version
-        // itself: a record last written before the retention horizon is still
-        // the latest state, and compaction may have settled its version to
-        // zero, so a read at the version would be a refused read in the past.
+        let Some(value) = self.get_versioned_at_rest(part, key)? else {
+            return Ok(None);
+        };
+        let (payload, revision) = Self::revision_of(part, &value)?;
+        Ok(Some((bytes::Bytes::copy_from_slice(payload), revision)))
+    }
+
+    /// The latest stored value of a record, its revision stamp included. It
+    /// is read at the present, never at the revision: a record last written
+    /// before the retention horizon is still the latest state.
+    fn get_versioned_at_rest(
+        &self,
+        part: Partition,
+        key: &[u8],
+    ) -> StorageResult<Option<lsm_tree::UserValue>> {
+        Self::check_versioned(part, key)?;
         let tree = self.tree(part)?;
         let mut buf = Vec::new();
         let Some(stored) = self.stored_key(part, key, &mut buf) else {
             return Ok(None);
         };
-        loop {
-            let Some(version) = self.record_version(part, key)? else {
-                return Ok(None);
-            };
-            let value = tree.get(stored, lsm_tree::SeqNo::MAX)?;
-            if self.record_version(part, key)? != Some(version) {
-                continue;
-            }
-            return Ok(value.map(|value| (bytes::Bytes::copy_from_slice(&value), version)));
+        Ok(tree.get(stored, lsm_tree::SeqNo::MAX)?)
+    }
+
+    /// Refuse a version asked of a record that carries none: a row of a
+    /// commutative partition, or a key of the engine's own.
+    fn check_versioned(part: Partition, key: &[u8]) -> StorageResult<()> {
+        if !part.carries_revision() {
+            return Err(StorageError::InvalidConfig(format!(
+                "the {part:?} partition is merge-composed: its rows are folded from \
+                 operands, so no single commit is their version"
+            )));
         }
+        if !crate::engine::revision::stamped(part, key) {
+            return Err(StorageError::InvalidConfig(
+                "a key of the engine's reserved namespace has no version".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A stored record's payload and its known revision.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::RevisionUnavailable`] when the record's original
+    /// commit timestamp is not known; the value holds no stamp.
+    fn revision_of(part: Partition, value: &[u8]) -> StorageResult<(&[u8], lsm_tree::SeqNo)> {
+        let (payload, revision) = crate::engine::revision::split(value).ok_or(
+            lsm_tree::Error::InvalidHeader("a stored record is shorter than its revision stamp"),
+        )?;
+        if revision == crate::engine::revision::UNKNOWN {
+            return Err(StorageError::RevisionUnavailable {
+                partition: part.name(),
+            });
+        }
+        Ok((payload, revision))
     }
 
     /// Whether `key` was written by anything this snapshot does not already
@@ -11122,7 +11278,8 @@ fn run_cascade_evict(
             Some(b) => b,
             None => continue,
         };
-        let routing: crate::engine::routing::PartitionRouting = rmp_serde::from_slice(&bytes)
+        let bytes = crate::engine::revision::payload_of(&bytes)?;
+        let routing: crate::engine::routing::PartitionRouting = rmp_serde::from_slice(bytes)
             .map_err(|e| StorageError::Io(format!("decode routing for {}: {e}", part.name())))?;
         if !routing.endpoints_used().iter().any(|id| *id == endpoint_id) {
             continue;
@@ -11535,7 +11692,7 @@ pub enum StoredValue<'a> {
     /// Held by the tiered cache.
     Cached(&'a bytes::Bytes),
     /// A view into the block the tree read it from.
-    Tree(&'a lsm_tree::UserValue),
+    Tree(&'a [u8]),
 }
 
 impl<'a> StoredValue<'a> {
@@ -11618,7 +11775,8 @@ fn load_or_init_partition_routing(
         Some(bytes) => {
             // Existing routing — decode and validate against current
             // endpoint set.
-            let routing: PartitionRouting = rmp_serde::from_slice(&bytes).map_err(|e| {
+            let bytes = crate::engine::revision::payload_of(&bytes)?;
+            let routing: PartitionRouting = rmp_serde::from_slice(bytes).map_err(|e| {
                 StorageError::Io(format!(
                     "decode persisted routing for {}: {e}",
                     partition.name()
@@ -11641,7 +11799,11 @@ fn load_or_init_partition_routing(
             })?;
             let write_seqno = seqno.next();
             let mut batch = lsm_tree::WriteBatch::with_capacity(1);
-            batch.insert(key.as_slice(), encoded.as_slice());
+            batch.insert(
+                key.as_slice(),
+                crate::engine::revision::stored(Partition::Deployment, &key, &encoded, write_seqno)
+                    .as_ref(),
+            );
             records.apply_batch(batch, write_seqno).map_err(|e| {
                 StorageError::Io(format!("persist routing for {}: {e}", partition.name()))
             })?;

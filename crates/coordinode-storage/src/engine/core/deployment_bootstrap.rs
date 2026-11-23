@@ -316,7 +316,15 @@ impl DeploymentRebuild {
             if ops.is_empty() {
                 continue;
             }
-            apply_oplog_ops_at(records, None, &ops, entry.ts, entry.index, Domain::Journal)?;
+            apply_oplog_ops_at(
+                Partition::Deployment,
+                records,
+                None,
+                &ops,
+                entry.ts,
+                entry.index,
+                Domain::Journal,
+            )?;
             replayed += 1;
         }
         records.insert(
@@ -354,12 +362,18 @@ impl DeploymentRebuild {
         let Some(theirs) = source.get(DEPLOYMENT_KEY, lsm_tree::SeqNo::MAX)? else {
             return Ok(None);
         };
-        let ours = self
+        // Both rows are as stored; the deployment they name is the payload.
+        let payload = crate::engine::revision::payload_of;
+        let theirs = payload(&theirs)?;
+        let ours = match self
             .kept
             .iter()
             .find(|(key, _)| key.as_slice() == DEPLOYMENT_KEY)
-            .map(|(_, value)| value.as_slice());
-        Ok((ours != Some(theirs.as_ref())).then_some(RebuildRefusal::OtherDeployment))
+        {
+            Some((_, value)) => Some(payload(value)?),
+            None => None,
+        };
+        Ok((ours != Some(theirs)).then_some(RebuildRefusal::OtherDeployment))
     }
 }
 

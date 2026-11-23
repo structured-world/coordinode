@@ -1113,7 +1113,7 @@ impl MultiModalCoordinator for ScopedCoordinator<'_> {
     fn get(&self, part: Partition, key: &[u8]) -> StorageResult<Option<bytes::Bytes>> {
         let tree = self.tree(part)?;
         let value = tree.get(key, self.inner.seqno.get())?;
-        Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
+        Ok(crate::engine::revision::user_bytes(part, key, value)?)
     }
 
     fn snapshot_get(
@@ -1124,7 +1124,7 @@ impl MultiModalCoordinator for ScopedCoordinator<'_> {
     ) -> StorageResult<Option<bytes::Bytes>> {
         let tree = self.tree(part)?;
         let value = tree.get(key, *snapshot)?;
-        Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
+        Ok(crate::engine::revision::user_bytes(part, key, value)?)
     }
 
     fn contains_key(&self, part: Partition, key: &[u8]) -> StorageResult<bool> {
@@ -1136,7 +1136,7 @@ impl MultiModalCoordinator for ScopedCoordinator<'_> {
     fn prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
         let seqno = self.inner.seqno.get();
-        Ok(coverage::user_prefix(tree, prefix, seqno))
+        Ok(coverage::user_prefix(part, tree, prefix, seqno))
     }
 
     fn prefix_scan_at(
@@ -1146,7 +1146,7 @@ impl MultiModalCoordinator for ScopedCoordinator<'_> {
         snapshot: lsm_tree::SeqNo,
     ) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
-        Ok(coverage::user_prefix(tree, prefix, snapshot))
+        Ok(coverage::user_prefix(part, tree, prefix, snapshot))
     }
 
     fn range_scan(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<StorageIter> {
@@ -1159,10 +1159,9 @@ impl MultiModalCoordinator for ScopedCoordinator<'_> {
             std::ops::Bound::Included(coverage::clamp_user_start(start).to_vec()),
             std::ops::Bound::Included(end.to_vec()),
         );
-        Ok(Box::new(
-            tree.range(range, seqno, None)
-                .map(crate::engine::StorageGuard::raw),
-        ))
+        Ok(Box::new(tree.range(range, seqno, None).map(move |inner| {
+            crate::engine::StorageGuard::raw(part, inner)
+        })))
     }
 
     fn range_seekable(
@@ -1190,7 +1189,7 @@ impl MultiModalCoordinator for ScopedCoordinator<'_> {
     ) -> StorageResult<Vec<(Vec<u8>, bytes::Bytes)>> {
         let tree = self.tree(part)?;
         let mut results = Vec::new();
-        for guard in coverage::user_prefix(tree, prefix, *snapshot) {
+        for guard in coverage::user_prefix(part, tree, prefix, *snapshot) {
             let (key, value) = guard.into_inner()?;
             results.push((key.to_vec(), bytes::Bytes::copy_from_slice(&value)));
         }

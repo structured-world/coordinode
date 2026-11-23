@@ -511,12 +511,15 @@ fn apply_group(
     let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 1);
     // A replacement being prepared for a generation receives the same write
     // in the same batch, so the batch's coverage marker covers it too.
+    // Every value is stamped with `seqno`: the commit timestamp of the write
+    // that produces it.
     for mutation in group {
         match mutation {
             Mutation::Put { key, value, .. } => {
-                batch.insert(addressing.point(key)?, value.as_slice());
+                let value = crate::engine::revision::stored(part, key, value, seqno);
+                batch.insert(addressing.point(key)?, value.as_ref());
                 if let Some(staging) = addressing.staging_point(key) {
-                    batch.insert(staging, value.as_slice());
+                    batch.insert(staging, value.as_ref());
                 }
             }
             Mutation::Delete { key, .. } => {
@@ -526,9 +529,10 @@ fn apply_group(
                 }
             }
             Mutation::Merge { key, operand, .. } => {
-                batch.merge(addressing.point(key)?, operand.as_slice());
+                let operand = crate::engine::revision::stored(part, key, operand, seqno);
+                batch.merge(addressing.point(key)?, operand.as_ref());
                 if let Some(staging) = addressing.staging_point(key) {
-                    batch.merge(staging, operand.as_slice());
+                    batch.merge(staging, operand.as_ref());
                 }
             }
             Mutation::RemoveRange { start, end, .. } => {

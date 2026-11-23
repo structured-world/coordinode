@@ -614,6 +614,93 @@ fn a_conditional_write_lands_only_at_the_version_it_named() {
     }
 }
 
+/// A copy of a partition installed on another member keeps every record's
+/// revision, though the install writes all its rows at one physical sequence
+/// number: two records written by different commits read back their own
+/// commits there. A later commit applied on top moves only the record it
+/// writes, and a version read before it is refused afterwards.
+#[test]
+fn an_installed_copy_keeps_each_records_revision() {
+    const KEY: &[u8] = b"node:00:00000001";
+    const OTHER: &[u8] = b"node:00:00000002";
+    let wc = WriteConcern::default();
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    let (source, source_oracle, _s) = test_engine();
+    let write = |key: &[u8], value: &[u8]| {
+        let mut txn = mvcc_txn(&source, &source_oracle);
+        txn.put(Partition::Node, key, value).expect("stage");
+        txn.commit(&ctx()).expect("commit");
+        source
+            .record_version(Partition::Node, key)
+            .expect("version")
+            .expect("written")
+    };
+    let c1 = write(KEY, b"first");
+    let c2 = write(OTHER, b"other");
+    assert_ne!(c1, c2);
+
+    let (engine, oracle, _d) = test_engine();
+    engine
+        .install_raft_image(
+            &[Partition::Node],
+            |part| source.replicated_rows(part),
+            1,
+            b"payload",
+            &[],
+            None,
+        )
+        .expect("install the copy");
+    let version = |key: &[u8]| {
+        engine
+            .record_version(Partition::Node, key)
+            .expect("version")
+            .expect("installed")
+    };
+    assert_eq!(version(KEY), c1, "the copy keeps the first record's commit");
+    assert_eq!(version(OTHER), c2, "and the second's");
+    assert_eq!(
+        engine.get(Partition::Node, KEY).unwrap().as_deref(),
+        Some(&b"first"[..])
+    );
+
+    // The tail: an ordinary commit on the copy replaces one record.
+    let mut tail = mvcc_txn(&engine, &oracle);
+    tail.put(Partition::Node, KEY, b"second").expect("stage");
+    tail.expect_version(Partition::Node, KEY, Some(c1))
+        .expect("state the condition");
+    tail.commit(&ctx())
+        .expect("the installed revision is the current one");
+    let c3 = version(KEY);
+    assert!(c3 > c1, "the replacement carries its own commit");
+    assert_eq!(
+        version(OTHER),
+        c2,
+        "the record it did not write keeps its own"
+    );
+
+    let mut stale = mvcc_txn(&engine, &oracle);
+    stale.put(Partition::Node, KEY, b"third").expect("stage");
+    stale
+        .expect_version(Partition::Node, KEY, Some(c1))
+        .expect("state the condition");
+    match stale.commit(&ctx()) {
+        Err(CommitError::RevisionMismatch { expected, current }) => {
+            assert_eq!(expected, Some(c1));
+            assert_eq!(current, Some(c3));
+        }
+        other => panic!("expected a version mismatch, got {other:?}"),
+    }
+    assert_eq!(
+        engine.get(Partition::Node, KEY).unwrap().as_deref(),
+        Some(&b"second"[..]),
+        "the refused commit applied nothing"
+    );
+}
+
 /// Two claimers race for one record and exactly one wins. The loser is told
 /// which version is there, which is what makes its next attempt a decision
 /// rather than another guess.

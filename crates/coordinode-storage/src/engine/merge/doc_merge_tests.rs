@@ -51,7 +51,7 @@ fn doc_merge_set_path_on_empty_base() {
     };
     let operand = delta.encode().expect("encode delta");
 
-    let result = op.merge(b"node:0:1", None, &[&operand]).expect("merge");
+    let result = op.fold(None, &[&operand]).expect("merge");
     let rec = decode_node_record(&result).expect("decode result");
 
     // The extra map should contain config.ssid = "home".
@@ -79,9 +79,7 @@ fn doc_merge_set_path_on_existing_record() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     let doc_val = merged.get_extra("config").expect("config key");
@@ -110,7 +108,7 @@ fn doc_merge_multiple_deltas_different_paths() {
     let op1 = delta1.encode().expect("encode");
     let op2 = delta2.encode().expect("encode");
 
-    let result = op.merge(b"node:0:1", None, &[&op1, &op2]).expect("merge");
+    let result = op.fold(None, &[&op1, &op2]).expect("merge");
     let rec = decode_node_record(&result).expect("decode");
 
     let a = rec.get_extra("a").expect("key a");
@@ -134,9 +132,7 @@ fn doc_merge_increment() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     let val = merged.get_extra("counter").expect("counter key");
@@ -158,9 +154,7 @@ fn doc_merge_array_push() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     let val = merged.get_extra("tags").expect("tags key");
@@ -195,9 +189,7 @@ fn doc_merge_add_to_set_dedup() {
     let op1 = delta1.encode().expect("encode");
     let op2 = delta2.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&op1, &op2])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&op1, &op2]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     let val = merged.get_extra("tags").expect("tags key");
@@ -228,9 +220,7 @@ fn doc_merge_delete_path() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     assert!(merged.get_extra("keep").is_some());
@@ -249,12 +239,8 @@ fn doc_merge_re_merge_stability() {
     };
     let operand = delta.encode().expect("encode");
 
-    let first = op
-        .merge(b"node:0:1", None, &[&operand])
-        .expect("first merge");
-    let second = op
-        .merge(b"node:0:1", Some(&first), &[])
-        .expect("second merge");
+    let first = op.fold(None, &[&operand]).expect("first merge");
+    let second = op.fold(Some(&first), &[]).expect("second merge");
 
     // Both should decode to equivalent NodeRecords.
     let rec1 = decode_node_record(&first).expect("decode 1");
@@ -277,7 +263,7 @@ fn doc_merge_pre_merged_record_as_operand() {
     let op1 = delta1.encode().expect("encode");
 
     // First merge produces a NodeRecord.
-    let partial = op.merge(b"node:0:1", None, &[&op1]).expect("partial merge");
+    let partial = op.fold(None, &[&op1]).expect("partial merge");
 
     // Subsequent compaction: partial result as operand + new delta.
     let delta2 = DocDelta::SetPath {
@@ -287,9 +273,7 @@ fn doc_merge_pre_merged_record_as_operand() {
     };
     let op2 = delta2.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", None, &[&partial, &op2])
-        .expect("re-merge");
+    let result = op.fold(None, &[&partial, &op2]).expect("re-merge");
     let rec = decode_node_record(&result).expect("decode");
 
     assert_eq!(rec.get_extra("a"), Some(&Value::Int(1)));
@@ -314,9 +298,7 @@ fn doc_merge_preserves_labels_and_props() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     // Labels preserved.
@@ -337,7 +319,57 @@ fn doc_merge_preserves_labels_and_props() {
 fn doc_merge_empty_operand_returns_error() {
     let op = DocumentMerge;
     let empty: &[u8] = &[];
-    assert!(op.merge(b"node:0:1", None, &[empty]).is_err());
+    assert!(op.fold(None, &[empty]).is_err());
+    // As stored: a stamp on an empty operand.
+    let stamped = crate::engine::revision::stamp(empty, 7);
+    assert!(op.merge(b"node:0:1", None, &[&stamped]).is_err());
+}
+
+/// The merged record carries the revision of the last write applied: the
+/// last operand's, or the base's when there is none.
+#[test]
+fn doc_merge_carries_the_last_writes_revision() {
+    use crate::engine::revision::{split, stamp};
+    let op = DocumentMerge;
+    let base = stamp(&encode_rec(&NodeRecord::new(TYPE)), 10);
+    let set = |value: i64| {
+        DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["x".into()],
+            value: rmpv::Value::Integer(value.into()),
+        }
+        .encode()
+        .expect("encode")
+    };
+    let first = stamp(&set(1), 20);
+    let second = stamp(&set(2), 30);
+
+    let merged = op
+        .merge(b"node:0:1", Some(&base), &[&first, &second])
+        .expect("merge");
+    let (payload, revision) = split(&merged).expect("stamped");
+    assert_eq!(revision, 30, "the last operand's write");
+    let rec = decode_node_record(payload).expect("decode");
+    assert_eq!(rec.get_extra("x"), Some(&Value::Int(2)));
+
+    let alone = op.merge(b"node:0:1", Some(&base), &[]).expect("merge");
+    assert_eq!(
+        split(&alone).map(|(_, at)| at),
+        Some(10),
+        "the base's write"
+    );
+
+    // A fold of operands only (a partial compaction) keeps the last one's,
+    // and folding it again with a later operand moves on to that one's.
+    let partial = op.merge(b"node:0:1", None, &[&first]).expect("partial");
+    assert_eq!(split(&partial).map(|(_, at)| at), Some(20));
+    let again = op
+        .merge(b"node:0:1", Some(&partial), &[&second])
+        .expect("again");
+    assert_eq!(split(&again).map(|(_, at)| at), Some(30));
+
+    // A value without a stamp is not one this engine wrote.
+    assert!(op.merge(b"node:0:1", Some(b"1234567"), &[]).is_err());
 }
 
 // --- PropField tests ---
@@ -357,9 +389,7 @@ fn doc_merge_prop_field_set_path() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base_bytes), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base_bytes), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     if let Some(Value::Document(doc)) = merged.props.get(&42) {
@@ -382,7 +412,7 @@ fn doc_merge_prop_field_creates_doc_from_nothing() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op.merge(b"node:0:1", None, &[&operand]).expect("merge");
+    let result = op.fold(None, &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     if let Some(Value::Document(doc)) = merged.props.get(&10) {
@@ -411,9 +441,7 @@ fn doc_merge_prop_field_delete_path() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base_bytes), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base_bytes), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     if let Some(Value::Document(doc)) = merged.props.get(&7) {
@@ -446,9 +474,7 @@ fn doc_merge_prop_field_increment() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base_bytes), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base_bytes), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     if let Some(Value::Document(doc)) = merged.props.get(&5) {
@@ -478,9 +504,7 @@ fn doc_merge_prop_field_preserves_extra_and_other_props() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base_bytes), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base_bytes), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     // Other prop untouched.
@@ -519,9 +543,7 @@ fn doc_merge_mixed_extra_and_prop_field() {
     let op1 = d1.encode().expect("encode");
     let op2 = d2.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base_bytes), &[&op1, &op2])
-        .expect("merge");
+    let result = op.fold(Some(&base_bytes), &[&op1, &op2]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     assert_eq!(
@@ -554,7 +576,7 @@ fn doc_merge_legacy_bare_record_as_base() {
     let operand = delta.encode().expect("encode");
 
     let result = op
-        .merge(b"node:0:1", Some(&bare_msgpack), &[&operand])
+        .fold(Some(&bare_msgpack), &[&operand])
         .expect("merge with legacy base");
     let merged = decode_node_record(&result).expect("decode");
 
@@ -579,9 +601,7 @@ fn doc_merge_remove_property_prop_field() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base_bytes), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base_bytes), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     assert!(!merged.props.contains_key(&3), "field 3 should be removed");
@@ -607,9 +627,7 @@ fn doc_merge_remove_property_extra_key() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base_bytes), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base_bytes), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     assert!(
@@ -637,9 +655,7 @@ fn doc_merge_remove_property_idempotent() {
     };
     let operand = delta.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base_bytes), &[&operand])
-        .expect("merge");
+    let result = op.fold(Some(&base_bytes), &[&operand]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     assert_eq!(merged.props.get(&1), Some(&Value::Int(100)));
@@ -679,9 +695,7 @@ fn doc_merge_multiple_extra_deltas_batched_same_result() {
     let op2 = d2.encode().expect("encode d2");
     let op3 = d3.encode().expect("encode d3");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&op1, &op2, &op3])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&op1, &op2, &op3]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     let doc_val = merged.get_extra("counters").expect("counters key");
@@ -744,9 +758,7 @@ fn doc_merge_mixed_extra_and_propfield_deltas() {
     let op2 = d_prop.encode().expect("encode d_prop");
     let op3 = d_extra2.encode().expect("encode d_extra2");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&op1, &op2, &op3])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&op1, &op2, &op3]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     // PropField 7's "inner" key should be updated to 99.
@@ -807,9 +819,7 @@ fn doc_merge_setpath_then_remove_property_extra() {
     let op1 = d_set.encode().expect("encode d_set");
     let op2 = d_remove.encode().expect("encode d_remove");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&op1, &op2])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&op1, &op2]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     // "drop" was a top-level extra key and should be gone.
@@ -869,9 +879,7 @@ fn doc_merge_set_property_keeps_the_value_type() {
         .collect();
     let refs: Vec<&[u8]> = ops.iter().map(Vec::as_slice).collect();
 
-    let result = op
-        .merge(b"node:0:1", Some(&base_bytes), &refs)
-        .expect("merge");
+    let result = op.fold(Some(&base_bytes), &refs).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     assert_eq!(merged.props.get(&1), Some(&Value::Timestamp(200)));
@@ -903,9 +911,7 @@ fn doc_merge_set_property_after_an_extra_path_set() {
     let op1 = path.encode().expect("encode");
     let op2 = set.encode().expect("encode");
 
-    let result = op
-        .merge(b"node:0:1", Some(&base), &[&op1, &op2])
-        .expect("merge");
+    let result = op.fold(Some(&base), &[&op1, &op2]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     assert_eq!(merged.get_extra("seen"), Some(&Value::Timestamp(9)));
@@ -954,9 +960,7 @@ fn doc_merge_base_reset_flushes_extra_doc() {
     let op2 = d2.encode().expect("encode d2");
 
     // Operands: delta1, then a full NodeRecord (base reset), then delta2.
-    let result = op
-        .merge(b"node:0:1", Some(&base1), &[&op1, &base2, &op2])
-        .expect("merge");
+    let result = op.fold(Some(&base1), &[&op1, &base2, &op2]).expect("merge");
     let merged = decode_node_record(&result).expect("decode");
 
     // Final state should be base2 + d2 applied (base2's label, flag=true, note="after reset").

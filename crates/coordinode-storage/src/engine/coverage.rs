@@ -151,16 +151,19 @@ pub(crate) fn clamp_user_start(start: &[u8]) -> &[u8] {
     }
 }
 
-/// Scan `prefix` of `tree` at `seqno`, never yielding a reserved key. An
-/// empty prefix means the user keyspace, not the whole tree.
-pub(crate) fn user_prefix(tree: &AnyTree, prefix: &[u8], seqno: SeqNo) -> StorageIter {
+/// Scan `prefix` of `part`'s `tree` at `seqno`, never yielding a reserved
+/// key. An empty prefix means the user keyspace, not the whole tree.
+pub(crate) fn user_prefix(
+    part: crate::engine::partition::Partition,
+    tree: &AnyTree,
+    prefix: &[u8],
+    seqno: SeqNo,
+) -> StorageIter {
+    let guard = move |inner| StorageGuard::raw(part, inner);
     match prefix.first() {
-        None => Box::new(
-            tree.range(USER_KEYSPACE_START.., seqno, None)
-                .map(StorageGuard::raw),
-        ),
+        None => Box::new(tree.range(USER_KEYSPACE_START.., seqno, None).map(guard)),
         Some(0x00) => Box::new(std::iter::empty()),
-        Some(_) => Box::new(tree.prefix(prefix, seqno, None).map(StorageGuard::raw)),
+        Some(_) => Box::new(tree.prefix(prefix, seqno, None).map(guard)),
     }
 }
 

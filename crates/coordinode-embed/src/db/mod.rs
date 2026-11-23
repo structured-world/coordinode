@@ -2340,6 +2340,32 @@ impl Database {
             .record_version(coordinode_storage::engine::partition::Partition::Node, &key)?)
     }
 
+    /// The version of a node as a read at `read_ts` (inclusive, a statement's
+    /// [`WriteStats::read_ts`]) saw it: the commit that wrote the node state
+    /// that read returned, or `None` when the node was not there. A value and
+    /// a version read this way are of one write, whatever landed since.
+    ///
+    /// # Errors
+    ///
+    /// The read is no longer retained, or the node's original commit is not
+    /// known ([`DatabaseError::RevisionUnavailable`]).
+    pub fn node_version_at(
+        &self,
+        node_id: coordinode_core::graph::node::NodeId,
+        read_ts: u64,
+    ) -> Result<Option<u64>, DatabaseError> {
+        let key = coordinode_core::graph::node::encode_node_key(self.shard_id, node_id);
+        // A storage snapshot at S sees seqnos strictly below S. Saturating by
+        // design: at u64::MAX nothing is above to include, so the top
+        // snapshot is the bound.
+        let snapshot = read_ts.saturating_add(1);
+        Ok(self.engine.record_version_at(
+            &snapshot,
+            coordinode_storage::engine::partition::Partition::Node,
+            &key,
+        )?)
+    }
+
     /// Run one pass of the COMPUTED TTL reaper now, as the background reaper
     /// runs it: expired records are deleted by committed transactions, which
     /// replicate and reach every follower of the applied commits (the vector

@@ -342,6 +342,10 @@ fn every_variant() -> Vec<DatabaseError> {
             expected: None,
             current: Some(5),
         },
+        E::RevisionUnavailable { partition: "node" },
+        E::RevisionUnavailable {
+            partition: "schema",
+        },
         E::TransactionTooLarge {
             id: txid(),
             buffered: 300,
