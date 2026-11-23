@@ -394,6 +394,67 @@ struct Waited {
     ran_ns: u64,
     queued_ns: u64,
     blocked_ns: u64,
+    /// Bytes the process caused to be written to storage so far.
+    written: u64,
+}
+
+/// Bytes process `pid` caused to be written to storage so far (its
+/// `/proc/<pid>/io` `write_bytes`); `None` where the kernel keeps no such
+/// count.
+#[cfg(target_os = "linux")]
+fn written_of(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("write_bytes:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn written_of(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Bytes the processes on `port` caused to be written to storage during
+/// `from..to` (from `started`): a member restarted in it counts both of its
+/// processes, the new one from its start (its count starts at zero), the
+/// old one up to its last sample. `None` without samples in or around it.
+fn written_during(
+    samples: &[Waited],
+    port: u16,
+    started: Instant,
+    (from, to): (Duration, Duration),
+) -> Option<u64> {
+    let at = |sample: &Waited| sample.at.saturating_duration_since(started);
+    let mut pids: Vec<u32> = samples
+        .iter()
+        .filter(|s| s.port == port)
+        .map(|s| s.pid)
+        .collect();
+    pids.dedup();
+    let mut total = None;
+    for pid in pids {
+        let of = |s: &&Waited| s.port == port && s.pid == pid;
+        let before = samples.iter().filter(of).rev().find(|s| at(s) <= from);
+        let after = samples
+            .iter()
+            .filter(of)
+            .find(|s| at(s) >= to)
+            .or_else(|| samples.iter().rfind(of));
+        let (Some(after), first) = (after, samples.iter().find(of)) else {
+            continue;
+        };
+        // A process sampled first after the span, or gone before it, wrote
+        // nothing in it.
+        if first.is_some_and(|s| at(s) > to) || at(after) < from {
+            continue;
+        }
+        let start = before.map_or(0, |s| s.written);
+        *total.get_or_insert(0) += after.written.saturating_sub(start);
+    }
+    total
 }
 
 /// What process `pid` has run and waited so far, summed over its threads, as
@@ -532,6 +593,9 @@ struct PauseWaits {
     host_cpu: Option<(f64, f64)>,
     /// How many CPUs each member's process kept busy during it.
     members_cores: Vec<(u16, Option<f64>)>,
+    /// Bytes each member's process caused to be written to storage during
+    /// it: which of them loaded the disk the group shares.
+    members_written: Vec<(u16, Option<u64>)>,
 }
 
 impl std::fmt::Debug for PauseWaits {
@@ -539,8 +603,13 @@ impl std::fmt::Debug for PauseWaits {
         write!(
             f,
             "led by {:?}: leader waited {:?}, group I/O {:?}, host CPUs busy (all, outside \
-             the group) {:?}, cores used by member {:?}",
-            self.leader, self.leader_waited, self.group_io, self.host_cpu, self.members_cores
+             the group) {:?}, cores used by member {:?}, bytes written by member {:?}",
+            self.leader,
+            self.leader_waited,
+            self.group_io,
+            self.host_cpu,
+            self.members_cores,
+            self.members_written
         )
     }
 }
@@ -885,6 +954,7 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Attempted {
                             ran_ns,
                             queued_ns,
                             blocked_ns,
+                            written: written_of(pid).unwrap_or(0),
                         });
                     }
                 }
@@ -1126,6 +1196,15 @@ async fn move_under_workload(kill_completing: bool, stall: Stall) -> Attempted {
                 members_cores: ports
                     .iter()
                     .map(|port| (*port, cores_used(&observed.waits, *port, started, *pause)))
+                    .collect(),
+                members_written: ports
+                    .iter()
+                    .map(|port| {
+                        (
+                            *port,
+                            written_during(&observed.waits, *port, started, *pause),
+                        )
+                    })
                     .collect(),
             }
         })
@@ -1373,6 +1452,37 @@ fn only_the_pauses_over_the_injected_span_judge_it() {
 /// The CPU check's controls: a host whose CPUs the group itself keeps busy
 /// did not stall the group; one other work keeps busy did, and the group's
 /// share is taken out of the host's busy time before comparing.
+/// What a member wrote during a pause counts both processes of a member
+/// restarted in it: the old one up to its last sample, the new one from its
+/// start, its count starting at zero.
+#[test]
+fn bytes_written_in_a_pause_count_a_restarted_member_whole() {
+    let t0 = Instant::now();
+    let sample = |pid: u32, ms: u64, written: u64| Waited {
+        port: 1,
+        pid,
+        at: t0 + Duration::from_millis(ms),
+        ran_ns: 0,
+        queued_ns: 0,
+        blocked_ns: 0,
+        written,
+    };
+    let samples = [
+        sample(10, 0, 100),
+        sample(10, 1_000, 150),
+        sample(10, 1_500, 200),
+        sample(11, 1_800, 500),
+        sample(11, 2_500, 600),
+    ];
+    let pause = (Duration::from_millis(1_000), Duration::from_millis(2_000));
+    assert_eq!(written_during(&samples, 1, t0, pause), Some(50 + 600));
+    assert_eq!(
+        written_during(&samples, 2, t0, pause),
+        None,
+        "no samples of it"
+    );
+}
+
 #[test]
 fn only_other_work_on_the_host_counts_as_its_stall() {
     let t0 = Instant::now();
@@ -1389,6 +1499,7 @@ fn only_other_work_on_the_host_counts_as_its_stall() {
         group_io: Some(0.0),
         host_cpu: cpu_shares(samples, t0, pause),
         members_cores: Vec::new(),
+        members_written: Vec::new(),
     };
 
     // Every CPU busy for the whole second, all of it the group's.
