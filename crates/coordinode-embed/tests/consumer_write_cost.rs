@@ -61,11 +61,17 @@ fn cost_of_writes(ordinary: u32, strict: u32) -> u64 {
     let mut least = u64::MAX;
     for round in 0..ROUNDS {
         // Every store starts the measured writes on empty memtables. A
-        // memtable takes a new arena segment (1.5 MiB) when one fills, on the
-        // write that crosses it; where that falls depends on the bytes written
-        // before and on whether a background flush has rotated the memtable
-        // yet, not on the write measured.
+        // memtable takes an arena segment (1.5 MiB) when it starts and when
+        // one fills, on the write that gets there; where that falls depends
+        // on the bytes written before and on the store's background work, not
+        // on the write measured.
         db.persist().unwrap();
+        // The fresh memtables' first arena segments go to whichever thread
+        // writes into them first: this write, unmeasured, or background work
+        // of the store. Taken here, no measured write pays for one, whatever
+        // the threads' timing on a loaded host.
+        db.execute_cypher(&format!("CREATE (:User {{round: {round}, n: -1}})"))
+            .unwrap();
         let ((), _) = alloc_peak::peak_of(|| {
             for i in 0..WRITES {
                 db.execute_cypher(&format!("CREATE (:User {{round: {round}, n: {i}}})"))
