@@ -255,6 +255,59 @@ fn a_first_statement_waiting_for_its_start_holds_no_thread(on_follower: bool) {
     });
 }
 
+/// A read its member is behind for goes to the leader and waits there; a
+/// Cancel naming it on the member it was sent to ends it as cancelled, and
+/// the wait at the leader holds no thread meanwhile.
+#[test]
+fn a_forwarded_read_waiting_at_the_leader_ends_with_its_cancel() {
+    use coordinode_server::proto::replication::ReadPreference;
+    on_one_blocking_thread(|_leader, follower| async move {
+        let mut waiting = Session::open(follower).await;
+        let mut other = Session::open(follower).await;
+        let client_frame::Op::Configure(mut configure) = unreachable_bound() else {
+            unreachable!("a configure frame");
+        };
+        configure.read_preference = Some(ReadPreference::Nearest as i32);
+        waiting
+            .send(1, client_frame::Op::Configure(configure))
+            .await;
+        waiting
+            .answer(1, Duration::from_secs(10))
+            .await
+            .expect("configured");
+        waiting
+            .send(2, statement("RETURN 1 AS one", Vec::new()))
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        other
+            .send(1, statement("RETURN 1 AS one", Vec::new()))
+            .await;
+        let answered = other.answer(1, Duration::from_secs(20)).await;
+        assert!(
+            matches!(answered, Some(Event::CursorOpen(_))),
+            "another session's statement is held behind the forwarded read: {answered:?}"
+        );
+
+        waiting
+            .send(
+                3,
+                client_frame::Op::Cancel(Cancel {
+                    target_request_id: 2,
+                }),
+            )
+            .await;
+        match waiting.answer(2, Duration::from_secs(20)).await {
+            Some(Event::Error(error)) => assert_eq!(
+                error.code,
+                tonic::Code::Cancelled as u32,
+                "the cancel ends the forwarded read: {error:?}"
+            ),
+            other => panic!("the cancel ends the forwarded read, got {other:?}"),
+        }
+    });
+}
+
 #[test]
 fn a_first_statement_on_the_leader_waits_for_its_start_without_a_thread() {
     a_first_statement_waiting_for_its_start_holds_no_thread(false);

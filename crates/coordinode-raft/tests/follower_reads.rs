@@ -605,6 +605,80 @@ async fn a_linearizable_bound_is_its_barriers_prefix_not_what_applied_since() {
     );
 }
 
+/// A linearizable read's log-apply stage waits only for what is left of the
+/// read's one wait: an apply released within it is met, and one released
+/// after it is refused as not ready when the wait ends, not after a budget
+/// renewed once authority was proved (the authority timeout here is far
+/// longer than the wait).
+#[cfg(feature = "test-faults")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linearizable_reads_apply_wait_is_what_is_left_of_its_one_wait() {
+    let (_dir, node) = bootstrap_leader().await;
+    let node = Arc::new(node);
+    let id_gen = Arc::new(ProposalIdGenerator::new());
+    let put = |ts: u64, key: &'static [u8]| RaftProposal {
+        id: id_gen.next(),
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts - 1),
+        bypass_rate_limiter: false,
+        mutations: unit![Mutation::Put {
+            partition: PartitionId::Node,
+            key: key.to_vec(),
+            value: b"v".to_vec(),
+        }],
+    };
+    node.pipeline()
+        .propose_and_wait(&put(100, b"wait:first"))
+        .expect("propose");
+
+    // Each round holds the apply of the next entry and releases it after
+    // `release`; the read allows a wait of `wait` and a 30 s authority bound.
+    for (round, (release, wait, served)) in [
+        (Duration::from_millis(100), Duration::from_secs(5), true),
+        (Duration::from_secs(2), Duration::from_millis(300), false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let next = node.read_fence().applied_index() + 1;
+        let (reached, go) = node.pause_apply_at(next);
+        let proposal = put(1_000 * (round as u64 + 2), b"wait:held");
+        let pipeline = node.pipeline();
+        let writer = tokio::spawn(async move { pipeline.propose_and_wait(&proposal) });
+        reached.await.expect("the apply stops at the held entry");
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(release).await;
+            let _ = go.send(());
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = node
+            .read_fence()
+            .apply(
+                ReadPreference::Primary,
+                ReadConcern::Linearizable,
+                Duration::from_secs(30),
+                Some(started + wait),
+            )
+            .await;
+        let took = started.elapsed();
+        if served {
+            outcome.expect("the apply released within the wait is met");
+        } else {
+            assert!(
+                matches!(outcome, Err(ReadFenceError::NotReady { waited: true, .. })),
+                "{outcome:?}"
+            );
+            assert!(
+                took < release,
+                "refused when its wait ended, not after a renewed budget: {took:?}"
+            );
+        }
+        releaser.await.expect("release");
+        writer.await.expect("writer").expect("the held write lands");
+    }
+}
+
 /// A causal wait whose end the clock cannot represent is refused as such
 /// before any wait, whether or not the bound is met.
 #[tokio::test(flavor = "multi_thread")]
