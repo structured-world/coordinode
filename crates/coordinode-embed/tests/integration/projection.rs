@@ -68,7 +68,7 @@ fn seen(db: &mut Database) -> usize {
 /// as its own memory to hand over more than once.
 fn read(db: &Database, cursor: &ChangeCursor) -> ChangeBatch {
     let budget = QueryBudget::new(1 << 24);
-    db.read_changes(cursor, 64, &budget)
+    db.read_changes(cursor, 64, &budget, None)
         .expect("read")
         .batch()
         .clone()
@@ -138,12 +138,26 @@ fn effects_and_progress_commit_together_and_once() {
 /// The fragments of one source transaction, read as the stream service
 /// reads them: from the source's journal, within the smallest budget a read
 /// from `cursor` keeps an event in, so the large transaction's events do not
-/// fit one read. Each with the cursor it was read from.
+/// fit one read. Each with the cursor it was read from. Read as a follower
+/// of the cursor's interest, as a stream reads, each fragment the one a
+/// read alone gets.
 fn fragments(src: &Database, cursor: &ChangeCursor) -> Vec<(ChangeCursor, ChangeBatch)> {
+    let follower = src.follow_changes(cursor).expect("follow");
     let read = |at: &ChangeCursor, bytes: u64| {
-        src.engine()
-            .read_changes(at, 1_000, &QueryBudget::new(bytes))
-            .map(|(batch, _charge)| batch)
+        let followed = src
+            .engine()
+            .read_changes(at, 1_000, &QueryBudget::new(bytes), Some(&follower))
+            .map(|(batch, _charge)| batch);
+        let alone = src
+            .engine()
+            .read_changes(at, 1_000, &QueryBudget::new(bytes), None)
+            .map(|(batch, _charge)| batch);
+        assert_eq!(
+            followed.as_ref().ok(),
+            alone.as_ref().ok(),
+            "a follower's fragment is the one read alone"
+        );
+        followed
     };
     let budget_bytes = (1..)
         .map(|step| step * 500)

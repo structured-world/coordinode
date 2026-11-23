@@ -123,7 +123,8 @@ fn holds_within(
     for limit in limits {
         engine.set_change_feed_cache_bytes(0);
         let budget = QueryBudget::new(limit);
-        let (_, peak) = alloc_peak::peak_of(|| engine.read_changes(start, 16, &budget).map(|_| ()));
+        let (_, peak) =
+            alloc_peak::peak_of(|| engine.read_changes(start, 16, &budget, None).map(|_| ()));
         assert!(
             peak as u64 <= limit,
             "held {peak} bytes at once within a {limit}-byte budget"
@@ -132,12 +133,30 @@ fn holds_within(
         let shared = usize::try_from(limit).expect("a test budget");
         engine.set_change_feed_cache_bytes(shared);
         let budget = QueryBudget::new(limit);
-        let (_, peak) = alloc_peak::peak_of(|| engine.read_changes(start, 16, &budget).map(|_| ()));
+        let (_, peak) =
+            alloc_peak::peak_of(|| engine.read_changes(start, 16, &budget, None).map(|_| ()));
         assert!(
             peak as u64 <= 2 * limit,
             "held {peak} bytes at once within a {limit}-byte budget and a {shared}-byte one \
              for later readers"
         );
+        // A follower's read also keeps the interest's selection of each
+        // unit for later readers, within the same store budget.
+        engine.set_change_feed_cache_bytes(0);
+        engine.set_change_feed_cache_bytes(shared);
+        let follower = engine.follow_changes(start.interest()).expect("follow");
+        let budget = QueryBudget::new(limit);
+        let (_, peak) = alloc_peak::peak_of(|| {
+            engine
+                .read_changes(start, 16, &budget, Some(&follower))
+                .map(|_| ())
+        });
+        assert!(
+            peak as u64 <= 2 * limit,
+            "a follower held {peak} bytes at once within a {limit}-byte budget and a \
+             {shared}-byte one for later readers"
+        );
+        drop(follower);
         // Nothing held for the next limit's reads.
         engine.set_change_feed_cache_bytes(0);
     }
@@ -194,10 +213,12 @@ fn a_read_stopping_inside_a_large_unit_holds_its_budget() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, start) = large_unit(dir.path());
     let read = |budget: &QueryBudget| {
-        engine.read_changes(&start, 16, budget).map(|(batch, _)| {
-            let unit = &batch.units[0];
-            (unit.events.len(), unit.projected)
-        })
+        engine
+            .read_changes(&start, 16, budget, None)
+            .map(|(batch, _)| {
+                let unit = &batch.units[0];
+                (unit.events.len(), unit.projected)
+            })
     };
     // A first read sets up what the process keeps for every later one (its
     // log statements' registrations): not memory any read holds.

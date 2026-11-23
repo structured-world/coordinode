@@ -46,15 +46,29 @@ fn interest(labels: Option<&[&str]>, edge_types: Option<&[&str]>) -> ChangeInter
 /// written in the background below the test's commits may still be applying
 /// when they return, so an empty page is no end. The end is where a cursor
 /// opened now starts: it waits for every entry applied before it.
+///
+/// It reads as a follower of its interest, every page selected once for
+/// the interest, and checks each page against the same read made alone.
 fn read_all(db: &Database, cursor: &mut ChangeCursor) -> Vec<UnitChanges> {
     let end = db
         .change_cursor(&ChangeInterest::default())
         .expect("end cursor")
         .position();
     let budget = QueryBudget::new(1 << 24);
+    let follower = db.follow_changes(cursor).expect("follow");
     let mut units = Vec::new();
     while cursor.position() < end {
-        let page = db.read_changes(cursor, 8, &budget).expect("read");
+        let page = db
+            .read_changes(cursor, 8, &budget, Some(&follower))
+            .expect("read");
+        let alone = db
+            .read_changes(cursor, 8, &budget, None)
+            .expect("read alone");
+        assert_eq!(
+            page.batch(),
+            alone.batch(),
+            "a follower's page is the page read alone"
+        );
         units.extend(page.batch().units.iter().cloned());
         *cursor = page.batch().cursor.clone();
     }
@@ -770,7 +784,7 @@ fn a_read_too_small_for_one_event_refuses() {
     db.change_cursor(&ChangeInterest::default())
         .expect("settled");
     let budget = QueryBudget::new(64);
-    match db.read_changes(&start, 8, &budget) {
+    match db.read_changes(&start, 8, &budget, None) {
         Err(coordinode_embed::DatabaseError::Budget(_)) => {}
         Err(other) => panic!("refused otherwise: {other}"),
         Ok(page) => panic!("read within 64 bytes: {:?}", page.batch()),

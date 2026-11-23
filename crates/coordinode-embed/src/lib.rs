@@ -91,7 +91,9 @@ pub mod consumer {
 /// Committed changes as logical events ([`Database::read_changes`]): the
 /// cursor a reader keeps, the units and events it receives.
 pub mod changes {
-    pub use crate::db::{ChangeInterest, ChangePage, ProjectionProgress, ProjectionTransaction};
+    pub use crate::db::{
+        ChangeFollower, ChangeInterest, ChangePage, ProjectionProgress, ProjectionTransaction,
+    };
     pub use coordinode_storage::engine::change_feed::{
         Action, ChangeBatch, ChangeCursor, ChangeEvent, CursorError, Delivery, EventId,
         OwnedTarget, UnitChanges,

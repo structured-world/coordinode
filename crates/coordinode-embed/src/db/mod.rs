@@ -4639,7 +4639,7 @@ pub use access::{CatalogScope, DeploymentAdmin, GrantView, RoleView};
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use blob::{BlobId, GroupMembers, UploadedBlob};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
-pub use changes::{ChangeInterest, ChangePage};
+pub use changes::{ChangeFollower, ChangeInterest, ChangePage};
 pub use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole, PrincipalId};
 pub use coordinode_core::txn::command::{
     ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,

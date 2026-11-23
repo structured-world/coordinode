@@ -526,12 +526,14 @@ impl ChangeEventServiceImpl {
         };
 
         let incarnation = handle.incarnation();
+        let follower = engine.follow_changes_log(&self.oplog_dirs, cursor.interest());
         tokio::spawn(stream_consumer(StreamState {
             engine,
             watch: registry.watch(&handle),
             registry,
             handle,
             cursor,
+            follower,
             oplog_dirs: Arc::from(self.oplog_dirs.as_slice()),
             slot: Arc::new(Semaphore::new(1)),
             delivery,
@@ -622,6 +624,9 @@ struct StreamState {
     watch: RegistrationWatch,
     /// Where the stream reads next.
     cursor: ChangeCursor,
+    /// The stream follows its cursor's interest while it runs: the streams
+    /// of one interest select each unit once between them.
+    follower: coordinode_storage::engine::decoded_log::ChangeFollower,
     /// The directories of the log the stream reads, through the entries the
     /// store decodes once for every stream of it.
     oplog_dirs: Arc<[PathBuf]>,
@@ -698,6 +703,7 @@ async fn stream_consumer(mut s: StreamState) {
             let engine = Arc::clone(&s.engine);
             let dirs = Arc::clone(&s.oplog_dirs);
             let cursor = s.cursor.clone();
+            let follower = s.follower.clone();
             let read_bytes = s.tuning.buffer_bytes as u64;
             tokio::task::spawn_blocking(move || {
                 // What one read holds, its batch, the label names it needs
@@ -707,8 +713,15 @@ async fn stream_consumer(mut s: StreamState) {
                 let budget = QueryBudget::new(read_bytes);
                 let mut names = ReadNames::default();
                 let mut form = ProtoForm::new(&engine, &mut names, &cursor);
-                let read = engine
-                    .read_changes_log_encoded(&cursor, &dirs, until, room, &budget, &mut form);
+                let read = engine.read_changes_log_encoded(
+                    &cursor,
+                    &dirs,
+                    until,
+                    room,
+                    &budget,
+                    &mut form,
+                    Some(&follower),
+                );
                 // A name that could not be read stopped the read: its cause
                 // is the read's, whatever the read made of the stop.
                 if let Some(failed) = form.failed.take() {

@@ -15,6 +15,13 @@
 //! room is needed the oldest segments, in the log's own order, stop being
 //! held, and an entry that cannot be held is still shared while some reader
 //! holds it.
+//!
+//! Readers that keep reading one interest follow it ([`ChangeFollower`]):
+//! what the interest selects of each unit, the events it takes and how each
+//! reaches it, is made once for all of them and held beside the entry's
+//! segment, within the same budget and let go with the segment. It lives
+//! while some follower of the interest does; each reader delivers from it at
+//! its own place and within its own budget.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -107,6 +114,9 @@ pub struct DecodedEntry {
     units: Vec<ChangeUnit>,
     /// Where the next frame of its segment starts.
     end: u64,
+    /// The segment it was decoded from: its first index, its file
+    /// ([`path_id`]) and the log's cut count then.
+    segment: (u64, u64, u64),
     /// Its charge to the store's budget; `None` for an entry decoded within
     /// a reader's own budget, which that reader's charge holds.
     _charge: Option<Charge>,
@@ -193,6 +203,15 @@ fn path_id(path: &Path) -> u64 {
     hasher.finish()
 }
 
+/// What one followed interest selected of a segment's entries.
+#[derive(Debug, Default)]
+struct Selections {
+    /// By entry index.
+    entries: BTreeMap<u64, Arc<EntrySelection>>,
+    /// A fill of this interest's selections of the segment is running.
+    filling: bool,
+}
+
 /// What is decoded of one segment.
 #[derive(Debug)]
 struct Segment {
@@ -203,6 +222,9 @@ struct Segment {
     slots: BTreeMap<u64, Slot>,
     /// A fill of this segment is running; readers needing it wait for it.
     filling: bool,
+    /// What each followed interest selected of its entries, by the
+    /// interest's [`Variant`] id.
+    selections: rustc_hash::FxHashMap<u64, Selections>,
 }
 
 impl Segment {
@@ -212,7 +234,18 @@ impl Segment {
             cuts,
             slots: BTreeMap::new(),
             filling: false,
+            selections: rustc_hash::FxHashMap::default(),
         }
+    }
+
+    /// Whether a fill of the segment or of a selection of it runs.
+    fn busy(&self) -> bool {
+        self.filling || self.selections.values().any(|s| s.filling)
+    }
+
+    /// Whether anything is left to look up in it.
+    fn kept(&self) -> bool {
+        self.busy() || !self.slots.is_empty() || !self.selections.is_empty()
     }
 
     /// Where the frame of entry `index` starts, when the entry before it is
@@ -226,7 +259,8 @@ impl Segment {
             .map_or(HEADER_SIZE, |entry| entry.end)
     }
 
-    /// Stop holding its entries: what readers still hold stays shared.
+    /// Stop holding its entries and the selections of them: what readers
+    /// still hold stays shared, and charged until they let go.
     fn lend(&mut self) {
         for slot in self.slots.values_mut() {
             if let Slot::Held(entry) = slot {
@@ -234,12 +268,160 @@ impl Segment {
             }
         }
         self.slots.retain(|_, slot| slot.get().is_some());
+        for selections in self.selections.values_mut() {
+            selections.entries.clear();
+        }
+        self.selections.retain(|_, s| s.filling);
     }
 
     fn holds_any(&self) -> bool {
         self.slots
             .values()
             .any(|slot| matches!(slot, Slot::Held(_)))
+            || self.selections.values().any(|s| !s.entries.is_empty())
+    }
+}
+
+/// What one followed interest selected of one entry's units, made once for
+/// every reader of the interest, charged to the store's budget until the
+/// last of them lets go of it.
+#[derive(Debug)]
+pub(crate) struct EntrySelection {
+    units: Vec<crate::engine::change_feed::UnitSelection>,
+    _charge: Charge,
+}
+
+impl EntrySelection {
+    /// The selection of each unit of the entry, in the entry's order.
+    pub(crate) fn units(&self) -> &[crate::engine::change_feed::UnitSelection] {
+        &self.units
+    }
+}
+
+/// One interest followed on one log: the readers of it share what it
+/// selects of each unit. Lives while some [`ChangeFollower`] of it does.
+#[derive(Debug)]
+struct Variant {
+    /// Its key in every segment's selections; never given to another.
+    id: u64,
+    interest: crate::engine::change_feed::Interest,
+    log: Weak<DecodedLog>,
+}
+
+impl Drop for Variant {
+    /// The last follower left: nothing of what the interest selected stays
+    /// to be looked up. A fill finishing later cannot keep it, as a fill
+    /// runs for a follower that keeps the variant alive until it is done.
+    fn drop(&mut self) {
+        if let Some(log) = self.log.upgrade() {
+            log.retire(self.id, &self.interest);
+        }
+    }
+}
+
+/// A reader following one interest of one log. While a follower of an
+/// interest lives, its reads share each unit's selection with every other
+/// follower of the same interest: the units are selected once, and each
+/// reader delivers from them at its own place, within its own budget.
+/// Dropping the last follower of an interest drops what it selected.
+#[derive(Debug, Clone)]
+pub struct ChangeFollower {
+    log: Arc<DecodedLog>,
+    variant: Arc<Variant>,
+}
+
+impl ChangeFollower {
+    /// The interest it follows.
+    pub fn interest(&self) -> &crate::engine::change_feed::Interest {
+        &self.variant.interest
+    }
+
+    /// Whether it follows `log`.
+    pub(crate) fn follows_log(&self, log: &Arc<DecodedLog>) -> bool {
+        Arc::ptr_eq(&self.log, log)
+    }
+}
+
+/// A reader's claim on the fill of a segment, or of one interest's
+/// selections of it. The fill ends it with [`Self::done`] before publishing;
+/// a fill that unwinds lets it go here, so the readers waiting on it look
+/// again rather than wait for good.
+struct Claim<'l> {
+    log: &'l DecodedLog,
+    first: u64,
+    cuts: u64,
+    /// The variant whose selections are filled; `None` for the entries.
+    variant: Option<u64>,
+    armed: bool,
+}
+
+impl<'l> Claim<'l> {
+    fn new(log: &'l DecodedLog, first: u64, cuts: u64, variant: Option<u64>) -> Self {
+        Self {
+            log,
+            first,
+            cuts,
+            variant,
+            armed: true,
+        }
+    }
+
+    /// The fill ran to its end; its publish lets the claim go.
+    fn done(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self.log.state.lock();
+        if let Some(segment) = state.segments.get_mut(&self.first)
+            && segment.cuts == self.cuts
+        {
+            match self.variant {
+                None => segment.filling = false,
+                Some(id) => {
+                    if let Some(selections) = segment.selections.get_mut(&id) {
+                        selections.filling = false;
+                    }
+                }
+            }
+        }
+        drop(state);
+        self.log.filled.notify_all();
+    }
+}
+
+/// The store's budget as a projection's room: what it takes counts as held
+/// at once, the oldest segments let go first when it is short.
+struct SharedRoom<'l> {
+    log: &'l DecodedLog,
+    /// The segment being selected, which stays.
+    keep: u64,
+    taken: u64,
+}
+
+impl crate::engine::change_feed::Room for SharedRoom<'_> {
+    fn take(&mut self, bytes: u64) -> bool {
+        let Ok(wanted) = usize::try_from(bytes) else {
+            return false;
+        };
+        self.log.make_room(wanted, self.keep);
+        if self.log.memory.room() < wanted {
+            return false;
+        }
+        self.log.memory.take(wanted);
+        self.taken += bytes;
+        true
+    }
+
+    fn give(&mut self, bytes: u64) {
+        // At most what was taken: the projection gives back its own.
+        self.log.memory.give(bytes as usize);
+        self.taken -= bytes;
     }
 }
 
@@ -260,9 +442,36 @@ pub struct DecodedLog {
     memory: Arc<DecodedMemory>,
     state: Mutex<State>,
     filled: Condvar,
+    /// The interests some reader follows, each with its live variant.
+    variants: Mutex<rustc_hash::FxHashMap<crate::engine::change_feed::Interest, Weak<Variant>>>,
+    /// The id the next variant takes.
+    next_variant: core::sync::atomic::AtomicU64,
     /// Frames decoded, for tests counting the work readers share.
     #[cfg(any(test, feature = "test-faults"))]
     decodes: AtomicUsize,
+    /// Units selected for a followed interest, for the same tests.
+    #[cfg(any(test, feature = "test-faults"))]
+    selects: AtomicUsize,
+    /// The next fill of entries, or of a selection, panics: a reader that
+    /// fails while it fills.
+    #[cfg(test)]
+    panic_next: Mutex<Option<bool>>,
+    /// Run once a fill of entries ended and before it publishes: what
+    /// happens to the log while a fill is late.
+    #[cfg(test)]
+    before_publish: LateHook,
+}
+
+/// What a test runs while a fill is late.
+#[cfg(test)]
+#[derive(Default)]
+struct LateHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(test)]
+impl core::fmt::Debug for LateHook {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("LateHook")
+    }
 }
 
 impl DecodedLog {
@@ -277,8 +486,41 @@ impl DecodedLog {
             memory,
             state: Mutex::new(State::default()),
             filled: Condvar::new(),
+            variants: Mutex::new(rustc_hash::FxHashMap::default()),
+            next_variant: core::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-faults"))]
             decodes: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-faults"))]
+            selects: AtomicUsize::new(0),
+            #[cfg(test)]
+            panic_next: Mutex::new(None),
+            #[cfg(test)]
+            before_publish: LateHook::default(),
+        }
+    }
+
+    /// Run `late` once the next fill of entries ended, before it publishes.
+    #[cfg(test)]
+    fn before_next_publish(&self, late: impl FnOnce() + Send + 'static) {
+        *self.before_publish.0.lock() = Some(Box::new(late));
+    }
+
+    /// Make the next fill panic: of a selection when `selection`, of
+    /// entries otherwise.
+    #[cfg(test)]
+    fn panic_next_fill(&self, selection: bool) {
+        *self.panic_next.lock() = Some(selection);
+    }
+
+    /// Panic here when the next fill of this kind is to.
+    #[cfg(test)]
+    #[expect(clippy::panic, reason = "a test makes a reader fail inside a fill")]
+    fn maybe_panic(&self, selection: bool) {
+        let mut next = self.panic_next.lock();
+        if *next == Some(selection) {
+            *next = None;
+            drop(next);
+            panic!("a reader fails while it fills");
         }
     }
 
@@ -286,6 +528,233 @@ impl DecodedLog {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn decodes(&self) -> usize {
         self.decodes.load(Ordering::Acquire)
+    }
+
+    /// Units selected for a followed interest so far.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn selects(&self) -> usize {
+        self.selects.load(Ordering::Acquire)
+    }
+
+    /// How many interests have something selected held for them.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn held_selections(&self) -> usize {
+        let state = self.state.lock();
+        let mut ids: Vec<u64> = state
+            .segments
+            .values()
+            .flat_map(|segment| {
+                segment
+                    .selections
+                    .iter()
+                    .filter(|(_, s)| !s.entries.is_empty())
+                    .map(|(id, _)| *id)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    }
+
+    /// A follower of `interest` on this log: the variant other followers of
+    /// the same interest share, or a new one.
+    pub(crate) fn follow(
+        self: &Arc<Self>,
+        interest: &crate::engine::change_feed::Interest,
+    ) -> ChangeFollower {
+        let mut variants = self.variants.lock();
+        if let Some(variant) = variants.get(interest).and_then(Weak::upgrade) {
+            return ChangeFollower {
+                log: Arc::clone(self),
+                variant,
+            };
+        }
+        let variant = Arc::new(Variant {
+            id: self.next_variant.fetch_add(1, Ordering::AcqRel),
+            interest: interest.clone(),
+            log: Arc::downgrade(self),
+        });
+        variants.insert(interest.clone(), Arc::downgrade(&variant));
+        ChangeFollower {
+            log: Arc::clone(self),
+            variant,
+        }
+    }
+
+    /// The variant `id` of `interest` lost its last follower: forget it and
+    /// what it selected. What readers still hold of it stays charged until
+    /// they let go.
+    fn retire(&self, id: u64, interest: &crate::engine::change_feed::Interest) {
+        {
+            let mut variants = self.variants.lock();
+            // A follower may have made a new variant of the interest since.
+            if variants
+                .get(interest)
+                .is_some_and(|v| v.strong_count() == 0)
+            {
+                variants.remove(interest);
+            }
+        }
+        let mut state = self.state.lock();
+        for segment in state.segments.values_mut() {
+            segment.selections.remove(&id);
+        }
+        state.segments.retain(|_, segment| segment.kept());
+    }
+
+    /// The selection `follower`'s interest makes of each of `entries`, made
+    /// once for every follower of it: held for later readers while the
+    /// store's budget has room, beside the entry's segment, and lent while
+    /// some reader holds it otherwise. `None` for an entry whose selection
+    /// does not fit the store's budget: its reader selects it within its
+    /// own. Readers of the same entry wait for one selection of it.
+    ///
+    /// # Errors
+    ///
+    /// A unit that does not project.
+    pub(crate) fn select(
+        &self,
+        follower: &ChangeFollower,
+        entries: &[Arc<DecodedEntry>],
+        reader: &mut Reader<'_, '_>,
+    ) -> StorageResult<Vec<Option<Arc<EntrySelection>>>> {
+        let variant = &follower.variant;
+        let mut out: Vec<Option<Arc<EntrySelection>>> = Vec::new();
+        if !reader.reserve(&mut out, entries.len()) {
+            return Err(StorageError::Budget(
+                coordinode_core::budget::BudgetStop::Memory {
+                    requested: (entries.len() * core::mem::size_of::<Option<Arc<EntrySelection>>>())
+                        as u64,
+                    used: reader.budget.memory_used(),
+                    limit: reader.budget.memory_limit(),
+                },
+            ));
+        }
+        let mut n = 0;
+        while n < entries.len() {
+            let entry = &entries[n];
+            let (first, file, cuts) = entry.segment;
+            {
+                let mut state = self.state.lock();
+                // An entry decoded before a cut is of a segment the cut may
+                // have replaced: selected for this read only, nothing kept.
+                if self.cuts() != cuts {
+                    drop(state);
+                    out.push(
+                        self.select_entry(entry, &variant.interest, first)?
+                            .map(Arc::new),
+                    );
+                    n += 1;
+                    continue;
+                }
+                let segment = state
+                    .segments
+                    .entry(first)
+                    .or_insert_with(|| Segment::new(file, cuts));
+                if segment.cuts != cuts || segment.file != file {
+                    *segment = Segment::new(file, cuts);
+                }
+                let selections = segment.selections.entry(variant.id).or_default();
+                if let Some(selection) = selections.entries.get(&entry.index) {
+                    out.push(Some(Arc::clone(selection)));
+                    n += 1;
+                    continue;
+                }
+                if selections.filling {
+                    // One selection of the segment at a time: wait for it,
+                    // then look again.
+                    self.filled.wait(&mut state);
+                    continue;
+                }
+                selections.filling = true;
+            }
+            let claim = Claim::new(self, first, cuts, Some(variant.id));
+            let selected = self.select_entry(entry, &variant.interest, first);
+            let selected = match selected {
+                Ok(selection) => Ok(selection.map(Arc::new)),
+                Err(e) => Err(e),
+            };
+            claim.done();
+            {
+                let mut state = self.state.lock();
+                let current = self.cuts() == cuts;
+                if let Some(segment) = state
+                    .segments
+                    .get_mut(&first)
+                    .filter(|s| s.cuts == cuts && s.file == file)
+                    && let Some(selections) = segment.selections.get_mut(&variant.id)
+                {
+                    selections.filling = false;
+                    // Kept for later readers unless the log was cut back
+                    // meanwhile; a failed selection keeps nothing and the
+                    // next reader selects again.
+                    if current && let Ok(Some(selection)) = &selected {
+                        selections
+                            .entries
+                            .insert(entry.index, Arc::clone(selection));
+                    }
+                }
+            }
+            self.filled.notify_all();
+            out.push(selected?);
+            n += 1;
+        }
+        Ok(out)
+    }
+
+    /// What `interest` selects of `entry`'s units, taken from the store's
+    /// budget before it is allocated, the oldest segments but `keep` let go
+    /// first when the budget is short. `None` when it does not fit.
+    ///
+    /// # Errors
+    ///
+    /// A unit that does not project.
+    fn select_entry(
+        &self,
+        entry: &DecodedEntry,
+        interest: &crate::engine::change_feed::Interest,
+        keep: u64,
+    ) -> StorageResult<Option<EntrySelection>> {
+        use crate::engine::change_feed::Room as _;
+        #[cfg(test)]
+        self.maybe_panic(true);
+        let mut room = SharedRoom {
+            log: self,
+            keep,
+            taken: 0,
+        };
+        let own = (core::mem::size_of::<EntrySelection>()
+            + 2 * core::mem::size_of::<usize>()
+            + entry.units.len() * core::mem::size_of::<crate::engine::change_feed::UnitSelection>())
+            as u64;
+        if !room.take(own) {
+            return Ok(None);
+        }
+        let mut units = Vec::with_capacity(entry.units.len());
+        for unit in &entry.units {
+            #[cfg(any(test, feature = "test-faults"))]
+            self.selects.fetch_add(1, Ordering::AcqRel);
+            match crate::engine::change_feed::select_unit(unit, interest, &mut room) {
+                Ok(Some(selection)) => units.push(selection),
+                Ok(None) => {
+                    drop(units);
+                    self.memory.give(room.taken as usize);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    drop(units);
+                    self.memory.give(room.taken as usize);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Some(EntrySelection {
+            units,
+            _charge: Charge {
+                bytes: room.taken as usize,
+                memory: Arc::clone(&self.memory),
+            },
+        }))
     }
 
     /// The first index of every segment some entry of which is held.
@@ -365,9 +834,23 @@ impl DecodedLog {
             else {
                 continue;
             };
+            let claim = Claim::new(self, first, cuts, None);
             // A cap: past the address space it bounds nothing.
             let want = (room - out.len()).saturating_add(READ_AHEAD);
-            let filled = self.fill(engine, &path, start, next, until, want, reader);
+            let filled = self.fill(
+                engine,
+                (first, &path, cuts),
+                start,
+                next,
+                until,
+                want,
+                reader,
+            );
+            #[cfg(test)]
+            if let Some(late) = self.before_publish.0.lock().take() {
+                late();
+            }
+            claim.done();
             let Some(decoded) = self.publish(first, cuts, filled)? else {
                 // Read across a cut of the log: what it decoded may be of the
                 // segment the cut replaced. Read again.
@@ -487,24 +970,21 @@ impl DecodedLog {
 
     /// Let go of the oldest segments, in the log's order, until `needed`
     /// bytes fit under the target or no other segment is held. The segment
-    /// `filling` is the one being read and stays.
-    fn make_room(&self, needed: usize, filling: &Path) {
+    /// `keep`, by its first index, is the one being read and stays.
+    fn make_room(&self, needed: usize, keep: u64) {
         if self.memory.room() >= needed {
             return;
         }
-        let filling = path_id(filling);
         let mut state = self.state.lock();
-        for segment in state.segments.values_mut() {
+        for (first, segment) in &mut state.segments {
             if self.memory.room() >= needed {
                 break;
             }
-            if segment.file != filling && segment.holds_any() {
+            if *first != keep && segment.holds_any() {
                 segment.lend();
             }
         }
-        state
-            .segments
-            .retain(|_, segment| segment.filling || !segment.slots.is_empty());
+        state.segments.retain(|_, segment| segment.kept());
     }
 
     /// Let go of segments until what is held fits the target: a shrunk target
@@ -517,9 +997,7 @@ impl DecodedLog {
             }
             segment.lend();
         }
-        state
-            .segments
-            .retain(|_, segment| segment.filling || !segment.slots.is_empty());
+        state.segments.retain(|_, segment| segment.kept());
     }
 
     /// Decode up to `want` entries of the segment at `path` from `next`, its
@@ -532,13 +1010,15 @@ impl DecodedLog {
     fn fill(
         &self,
         engine: &Deployment,
-        path: &Path,
+        (first, path, cuts): (u64, &Path, u64),
         start: u64,
         next: u64,
         until: u64,
         want: usize,
         reader: &mut Reader<'_, '_>,
     ) -> StorageResult<Vec<(Arc<DecodedEntry>, bool)>> {
+        #[cfg(test)]
+        self.maybe_panic(false);
         let mut frames = match FrameCursor::open_at(path, start) {
             Ok(frames) => frames,
             // Purged since it was found: the caller reads the log again.
@@ -574,7 +1054,8 @@ impl DecodedLog {
             else {
                 break;
             };
-            self.make_room(envelope, path);
+            self.make_room(envelope, first);
+            let segment = (first, path_id(path), cuts);
             let shared = self.memory.room();
             if envelope > shared && !decoded.is_empty() {
                 // Past the store's budget: only the first entry of a fill
@@ -607,7 +1088,10 @@ impl DecodedLog {
                     Ok((units, kept)) => {
                         let bytes = kept + ENTRY_BYTES;
                         self.memory.take(bytes);
-                        decoded.push((self.entry(index, units, frames.at(), Some(bytes)), true));
+                        decoded.push((
+                            self.entry(index, units, frames.at(), segment, Some(bytes)),
+                            true,
+                        ));
                         expect = index + 1;
                         continue;
                     }
@@ -649,7 +1133,7 @@ impl DecodedLog {
                     let bytes = (kept + ENTRY_BYTES) as u64;
                     // What the entry does not keep returns to the reader.
                     reader.charge.shrink(room - bytes.min(room));
-                    decoded.push((self.entry(index, units, frames.at(), None), false));
+                    decoded.push((self.entry(index, units, frames.at(), segment, None), false));
                 }
                 Err(failed) => {
                     reader.charge.shrink(room);
@@ -681,6 +1165,7 @@ impl DecodedLog {
         index: u64,
         units: Vec<ChangeUnit>,
         end: u64,
+        segment: (u64, u64, u64),
         held: Option<usize>,
     ) -> Arc<DecodedEntry> {
         #[cfg(any(test, feature = "test-faults"))]
@@ -689,6 +1174,7 @@ impl DecodedLog {
             index,
             units,
             end,
+            segment,
             _charge: held.map(|bytes| Charge {
                 bytes,
                 memory: Arc::clone(&self.memory),

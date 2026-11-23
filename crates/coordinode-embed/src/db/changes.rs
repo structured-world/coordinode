@@ -12,6 +12,7 @@
 use coordinode_core::budget::{MemoryCharge, QueryBudget};
 use coordinode_modality::change_interest::{InterestRefusal, resolve_change_interest};
 use coordinode_storage::engine::change_feed::{ChangeBatch, ChangeCursor, Interest};
+pub use coordinode_storage::engine::decoded_log::ChangeFollower;
 
 use super::{Database, DatabaseError};
 
@@ -116,21 +117,74 @@ impl Database {
     /// position, `ChangeCursor` for a cursor of another history or
     /// interpretation, `ChangeFeedUnsupported` for a unit the feed cannot
     /// read. On each of them the cursor stays valid.
+    ///
+    /// A reader that keeps reading passes the `follower` it holds for its
+    /// cursor ([`Self::follow_changes`]): readers following the same
+    /// interest then share what it selects of each unit.
     pub fn read_changes<'b>(
         &self,
         cursor: &ChangeCursor,
         max_entries: usize,
         budget: &'b QueryBudget,
+        follower: Option<&ChangeFollower>,
     ) -> Result<ChangePage<'b>, DatabaseError> {
         let (batch, charge) = if self.engine.has_journal() {
-            self.engine.read_changes(cursor, max_entries, budget)?
+            self.engine
+                .read_changes(cursor, max_entries, budget, follower)?
         } else {
-            self.group_read_changes(cursor, max_entries, budget)?
+            self.group_read_changes(cursor, max_entries, budget, follower)?
         };
         Ok(ChangePage {
             batch,
             _charge: charge,
         })
+    }
+
+    /// A follower of `cursor`'s interest on this database's log, for a
+    /// reader that keeps reading from cursors of it: while some follower of
+    /// an interest lives, the readers of it select each unit once between
+    /// them. Drop it when the reader stops reading.
+    ///
+    /// # Errors
+    ///
+    /// The database's log cannot be found.
+    pub fn follow_changes(&self, cursor: &ChangeCursor) -> Result<ChangeFollower, DatabaseError> {
+        if self.engine.has_journal() {
+            return Ok(self.engine.follow_changes(cursor.interest())?);
+        }
+        self.group_follow_changes(cursor)
+    }
+
+    /// [`Self::follow_changes`] on the log of the group this database
+    /// applies.
+    #[cfg(feature = "replication")]
+    fn group_follow_changes(&self, cursor: &ChangeCursor) -> Result<ChangeFollower, DatabaseError> {
+        Ok(self
+            .engine
+            .follow_changes_log(&self.group_log_dirs()?, cursor.interest()))
+    }
+
+    /// Without replication a database follows no group's log.
+    #[cfg(not(feature = "replication"))]
+    fn group_follow_changes(
+        &self,
+        _cursor: &ChangeCursor,
+    ) -> Result<ChangeFollower, DatabaseError> {
+        Err(DatabaseError::Unsupported(
+            "reading a group's log needs the replication feature".into(),
+        ))
+    }
+
+    /// The directories of the log of the group this database applies.
+    #[cfg(feature = "replication")]
+    fn group_log_dirs(&self) -> Result<Vec<std::path::PathBuf>, DatabaseError> {
+        // The log of the group this database is a member of: its shard.
+        const GROUP_LOG_SHARD: u32 = 0;
+        Ok(
+            coordinode_raft::storage::raft_oplog_dirs(&self.engine, GROUP_LOG_SHARD)
+                .map_err(|e| DatabaseError::Other(format!("the group's log: {e}")))?
+                .all,
+        )
     }
 
     /// The end of what this database applied of its group's log.
@@ -159,16 +213,13 @@ impl Database {
         cursor: &ChangeCursor,
         max_entries: usize,
         budget: &'b QueryBudget,
+        follower: Option<&ChangeFollower>,
     ) -> Result<(ChangeBatch, MemoryCharge<'b>), DatabaseError> {
-        // The log of the group this database is a member of: its shard.
-        const GROUP_LOG_SHARD: u32 = 0;
-        let dirs = coordinode_raft::storage::raft_oplog_dirs(&self.engine, GROUP_LOG_SHARD)
-            .map_err(|e| DatabaseError::Other(format!("the group's log: {e}")))?
-            .all;
+        let dirs = self.group_log_dirs()?;
         let until = self.group_log_end()?;
         Ok(self
             .engine
-            .read_changes_log(cursor, &dirs, until, max_entries, budget)?)
+            .read_changes_log(cursor, &dirs, until, max_entries, budget, follower)?)
     }
 
     /// Without replication a database applies no group's log.
@@ -178,6 +229,7 @@ impl Database {
         _cursor: &ChangeCursor,
         _max_entries: usize,
         _budget: &'b QueryBudget,
+        _follower: Option<&ChangeFollower>,
     ) -> Result<(ChangeBatch, MemoryCharge<'b>), DatabaseError> {
         Err(DatabaseError::Unsupported(
             "reading a group's log needs the replication feature".into(),

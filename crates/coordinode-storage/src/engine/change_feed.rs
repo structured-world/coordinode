@@ -278,12 +278,31 @@ pub struct ChangeRead {
     /// The position after the last entry read; where the read started when
     /// the journal held nothing more yet.
     pub next: u64,
+    /// For a read some follower of its interest made, the selection that
+    /// interest made of each entry, beside it; `None` for an entry the store
+    /// had no room to hold one of. Empty for any other read.
+    pub(crate) selections: Vec<Option<std::sync::Arc<crate::engine::decoded_log::EntrySelection>>>,
 }
 
 impl ChangeRead {
     /// The units of the entries read, in log order.
     pub fn units(&self) -> impl Iterator<Item = &ChangeUnit> {
         self.entries.iter().flat_map(|entry| entry.units())
+    }
+
+    /// The units of the entries read, each with the selection the read's
+    /// interest made of it when there is one.
+    pub(crate) fn selected_units(
+        &self,
+    ) -> impl Iterator<Item = (&ChangeUnit, Option<&UnitSelection>)> {
+        self.entries.iter().enumerate().flat_map(|(n, entry)| {
+            let selection = self.selections.get(n).and_then(Option::as_deref);
+            entry
+                .units()
+                .iter()
+                .enumerate()
+                .map(move |(u, unit)| (unit, selection.and_then(|s| s.units().get(u))))
+        })
     }
 }
 
@@ -1680,8 +1699,10 @@ fn for_each_run_key(
 
 /// What a reader of the feed is interested in: nodes routed by some labels,
 /// relationships of some types, and whether blob objects. `None` takes every
-/// one of that kind; an empty list takes none.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// one of that kind; an empty list takes none. Its selectors are kept sorted
+/// and without repeats, so interests spelled differently that take the same
+/// events are equal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Interest {
     labels: Option<Vec<LabelId>>,
     edge_types: Option<Vec<Vec<u8>>>,
@@ -2300,6 +2321,109 @@ impl ChangeBatch {
     }
 }
 
+impl ChangeEvent {
+    /// The event as the unit's projection handed it, its bytes borrowed
+    /// from here: what a reader's form is built from.
+    fn view(&self) -> LogicalEvent<'_> {
+        let target = match &self.target {
+            OwnedTarget::Node(key) => Target::Node(Cow::Borrowed(key)),
+            OwnedTarget::Relationship {
+                edge_type,
+                source,
+                target,
+            } => Target::Relationship {
+                edge_type,
+                source: *source,
+                target: *target,
+            },
+            OwnedTarget::RelationshipProperties(key) => {
+                Target::RelationshipProperties(Cow::Borrowed(key))
+            }
+            OwnedTarget::RelationshipInstance(key) => {
+                Target::RelationshipInstance(Cow::Borrowed(key))
+            }
+            OwnedTarget::Scope { label, activation } => Target::Scope {
+                label: *label,
+                activation: *activation,
+            },
+            OwnedTarget::BlobOwner(key) => Target::BlobOwner(Cow::Borrowed(key)),
+            OwnedTarget::Label(label) => Target::Label(*label),
+        };
+        LogicalEvent {
+            ordinal: self.id.ordinal,
+            action: self.action,
+            target,
+            payload: self.payload.as_deref(),
+            routing: self.labels.as_ref().map(|(before, after)| Routing {
+                before: Cow::Borrowed(before),
+                after: Cow::Borrowed(after),
+            }),
+        }
+    }
+}
+
+/// What the readers of one interest take of a unit: whether they follow it,
+/// how many events its projection holds, and the events they take, as each
+/// of them receives them. Made once and handed to every one of them; each
+/// delivers from it at its own place, within its own budget.
+#[derive(Debug)]
+pub(crate) struct UnitSelection {
+    pub(crate) follows: bool,
+    pub(crate) projected: u32,
+    pub(crate) events: Vec<ChangeEvent>,
+}
+
+/// The selection `interest` makes of `unit`, the whole unit examined, what
+/// it keeps taken from `room` before it is allocated. `None` when the room
+/// refuses it: the caller gives back what `room` took for it.
+///
+/// # Errors
+///
+/// As [`unit_changes_from`], for a unit that does not project.
+pub(crate) fn select_unit(
+    unit: &ChangeUnit,
+    interest: &Interest,
+    room: &mut impl Room,
+) -> Result<Option<UnitSelection>, crate::error::StorageError> {
+    if !interest.follows(unit) {
+        return Ok(Some(UnitSelection {
+            follows: false,
+            projected: 0,
+            events: Vec::new(),
+        }));
+    }
+    let mut events: Vec<ChangeEvent> = Vec::new();
+    let mut refused = false;
+    let projected = unit.project_with(0, room, |event, room| {
+        if let Some(delivery) = interest.delivery(&event) {
+            if !grow_within(&mut events, room) || !room.take(event_heap_bytes(&event)) {
+                refused = true;
+                return Take::Enough;
+            }
+            events.push(owned_event(unit.position, &event, delivery));
+        }
+        Take::More
+    });
+    match projected {
+        Ok(projected) if !refused => Ok(Some(UnitSelection {
+            follows: true,
+            projected,
+            events,
+        })),
+        Ok(_) | Err(ProjectStop::NoRoom) => Ok(None),
+        Err(ProjectStop::Projection(e)) => Err(projection_error(e)),
+    }
+}
+
+/// The storage error a unit that does not project reads as.
+fn projection_error(e: ProjectionError) -> crate::error::StorageError {
+    use crate::error::StorageError;
+    match e {
+        ProjectionError::Unsupported(reason) => StorageError::ChangeFeedUnsupported { reason },
+        ProjectionError::Malformed(reason) => StorageError::Serialization(reason),
+    }
+}
+
 /// `event` of the unit at `position` as a reader receives it, reaching it
 /// as `delivery`.
 pub(crate) fn owned_event(
@@ -2441,6 +2565,24 @@ impl Room for BlockCharge<'_, '_> {
     }
 }
 
+/// [`unit_changes_from`] with no unit selected beforehand.
+#[cfg(test)]
+pub(crate) fn unit_changes<'u>(
+    units: impl IntoIterator<Item = &'u ChangeUnit>,
+    interest: &Interest,
+    from: ReadPlace,
+    charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+    encoding: &mut impl ChangeEncoding,
+) -> Result<(Vec<UnitChanges>, Option<ReadPlace>), crate::error::StorageError> {
+    unit_changes_from(
+        units.into_iter().map(|unit| (unit, None)),
+        interest,
+        from,
+        charge,
+        encoding,
+    )
+}
+
 /// The changes a reader at `from` receives of `units`, the units of the
 /// entries read from its entry on: units before `from` inside its entry are
 /// passed over, and the unit it stopped in continues at its ordinal. The
@@ -2451,23 +2593,23 @@ impl Room for BlockCharge<'_, '_> {
 /// What `encoding` says the reader's form of each unit and event takes is
 /// charged with it.
 ///
+/// A unit may come with the selection its interest made of it for every
+/// reader of that interest: the reader then delivers the selected events
+/// from its place without projecting the unit itself.
+///
 /// # Errors
 ///
 /// [`StorageError::ChangeFeedUnsupported`] for a unit the feed cannot
 /// project, [`StorageError::Serialization`] for a malformed one, and
 /// [`StorageError::Budget`] as above.
-pub(crate) fn unit_changes<'u>(
-    units: impl IntoIterator<Item = &'u ChangeUnit>,
+pub(crate) fn unit_changes_from<'u>(
+    units: impl IntoIterator<Item = (&'u ChangeUnit, Option<&'u UnitSelection>)>,
     interest: &Interest,
     from: ReadPlace,
     charge: &mut coordinode_core::budget::MemoryCharge<'_>,
     encoding: &mut impl ChangeEncoding,
 ) -> Result<(Vec<UnitChanges>, Option<ReadPlace>), crate::error::StorageError> {
     use crate::error::StorageError;
-    let projection = |e: ProjectionError| match e {
-        ProjectionError::Unsupported(reason) => StorageError::ChangeFeedUnsupported { reason },
-        ProjectionError::Malformed(reason) => StorageError::Serialization(reason),
-    };
     let ReadPlace {
         entry: from_entry,
         within: from_within,
@@ -2491,10 +2633,11 @@ pub(crate) fn unit_changes<'u>(
         }
         Ok((out, Some(place)))
     };
-    for unit in units {
+    for (unit, selection) in units {
         // A unit of another namespace is no part of this reader's feed: it
         // learns neither its events nor that it exists.
-        if !interest.follows(unit) {
+        let follows = selection.map_or_else(|| interest.follows(unit), |s| s.follows);
+        if !follows {
             continue;
         }
         let first = if unit.position.index == from_entry {
@@ -2522,9 +2665,50 @@ pub(crate) fn unit_changes<'u>(
         if !grow_within(&mut out, &mut room) || !room.take(unit_form) {
             return stop(&mut room, out, stopped(first));
         }
+        let mut taken: Vec<ChangeEvent> = Vec::new();
+        if let Some(selection) = selection {
+            // The interest's selection of the whole unit, made once: this
+            // reader delivers its events from `first` on, each charged to
+            // its own budget as it is kept.
+            let mut through = selection.projected;
+            for event in selection.events.iter().filter(|e| e.id.ordinal >= first) {
+                let view = event.view();
+                let Some(form) = encoding.event(&view, &mut |bytes| room.take(bytes)) else {
+                    through = event.id.ordinal;
+                    break;
+                };
+                let kept = event_heap_bytes(&view) + form;
+                if !grow_within(&mut taken, &mut room) || !room.take(kept) {
+                    through = event.id.ordinal;
+                    break;
+                }
+                taken.push(event.clone());
+            }
+            if through < selection.projected {
+                if through > first {
+                    out.push(UnitChanges {
+                        position: unit.position,
+                        commit_ts: unit.commit_ts,
+                        events: taken,
+                        projected: selection.projected,
+                        first,
+                        through,
+                    });
+                }
+                return stop(&mut room, out, stopped(through));
+            }
+            out.push(UnitChanges {
+                position: unit.position,
+                commit_ts: unit.commit_ts,
+                events: taken,
+                projected: selection.projected,
+                first,
+                through,
+            });
+            continue;
+        }
         // Events are handed over one at a time from `first` on; those after
         // the one the budget refuses are only counted.
-        let mut taken: Vec<ChangeEvent> = Vec::new();
         let mut through = first;
         let mut refused = false;
         let projected = unit.project_with(first, &mut room, |event, room| {
@@ -2551,7 +2735,7 @@ pub(crate) fn unit_changes<'u>(
                 drop(taken);
                 return stop(&mut room, out, stopped(first));
             }
-            Err(ProjectStop::Projection(e)) => return Err(projection(e)),
+            Err(ProjectStop::Projection(e)) => return Err(projection_error(e)),
         };
         // A projection that stopped handing events over before the unit's
         // end: the read stops inside it.

@@ -814,6 +814,8 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
     let start =
         coordinode_storage::engine::change_feed::ChangeCursor::from_bytes(&start).expect("cursor");
     let dirs = [oplog_dir.path().to_path_buf()];
+    // As a stream reads: following its cursor's interest.
+    let follower = f.engine.follow_changes_log(&dirs, start.interest());
     let buffer_bytes = (1..)
         .map(|step| step * 250)
         .find(|&bytes| {
@@ -826,10 +828,12 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
                     1,
                     &QueryBudget::new(bytes as u64),
                     &mut super::ProtoForm::new(&f.engine, &mut names, &start),
+                    Some(&follower),
                 )
                 .is_ok()
         })
         .expect("a read the entry decodes within");
+    drop(follower);
     f.service = f.service.with_tuning(super::CdcStreamTuning {
         buffer_bytes,
         ..super::CdcStreamTuning::default()

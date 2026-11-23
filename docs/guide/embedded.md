@@ -589,9 +589,12 @@ let interest = ChangeInterest {
     blobs: false,
 };
 let mut cursor = db.change_cursor(&interest)?;
+// Held while the reader keeps reading: readers of the same interest select
+// each transaction's events once between them.
+let follower = db.follow_changes(&cursor)?;
 let budget = QueryBudget::new(64 << 20);
 loop {
-    let page = db.read_changes(&cursor, 256, &budget)?;
+    let page = db.read_changes(&cursor, 256, &budget, Some(&follower))?;
     for unit in &page.batch().units {
         for event in &unit.events {
             // ...apply `event` to the projection.
@@ -627,6 +630,16 @@ is another stream; one carried to a database of another namespace reads
 nothing of it. A transaction writes one namespace; a log unit spanning
 several, which no transaction produces, is `ChangeFeedUnsupported`.
 
+A reader that keeps reading holds a `ChangeFollower` for its cursor
+(`follow_changes`) and passes it to each read. While some follower of an
+interest is held, what the interest selects of each transaction is made
+once and shared by every reader of it, within the `cdc_buffer_bytes`
+memory; each reader still delivers at its own place and within its own
+budget, and a page reads the same with or without it. Interests that list
+the same labels and types in another order are one interest. Dropping the
+last follower of an interest drops what it selected. A one-off read passes
+`None`.
+
 A transaction with more events than one read holds is delivered in
 fragments: each `UnitChanges` covers the ordinals `first..through` of its
 transaction, `completes_unit()` tells the last one, and the cursor continues
@@ -654,7 +667,7 @@ let projection = Database::open("/var/lib/myapp/projection")?;
 let start = source.change_cursor(&ChangeInterest::default())?;
 let progress = projection.start_projection("people", &start)?;
 let budget = QueryBudget::new(64 << 20);
-let page = source.read_changes(&progress.received, 256, &budget)?;
+let page = source.read_changes(&progress.received, 256, &budget, None)?;
 let progress = projection.apply_changes("people", page.batch(), |tx, unit| {
     for event in &unit.events {
         if let OwnedTarget::Node(_) = &event.target {

@@ -5412,6 +5412,21 @@ impl Deployment {
         crate::engine::change_feed::ChangeRead,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
+        self.journal_change_read(from, max_entries, budget, None)
+    }
+
+    /// [`Self::change_read`] with the selections `follower`'s interest made
+    /// of the entries read, when a follower is given.
+    fn journal_change_read<'b>(
+        &self,
+        from: u64,
+        max_entries: usize,
+        budget: &'b coordinode_core::budget::QueryBudget,
+        follower: Option<&crate::engine::decoded_log::ChangeFollower>,
+    ) -> StorageResult<(
+        crate::engine::change_feed::ChangeRead,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
         let (Some(oplog), Some(coverage)) = (&self.oplog, &self.coverage) else {
             return Err(StorageError::InvalidConfig(
                 "the store keeps no journal".into(),
@@ -5436,7 +5451,7 @@ impl Deployment {
             );
             (hold, log, until)
         };
-        self.change_read_of(&log, from, until, max_entries, budget)
+        self.change_read_of(&log, from, until, max_entries, budget, follower)
     }
 
     /// The decoded entries of the log in `dirs`, shared by every change-feed
@@ -5500,18 +5515,25 @@ impl Deployment {
     /// `budget` but those the store cannot hold, which the read decodes
     /// within what `budget` has left and keeps charged through the returned
     /// charge.
-    fn change_read_of<'b>(
+    pub(crate) fn change_read_of<'b>(
         &self,
-        log: &crate::engine::decoded_log::DecodedLog,
+        log: &Arc<crate::engine::decoded_log::DecodedLog>,
         from: u64,
         until: u64,
         max_entries: usize,
         budget: &'b coordinode_core::budget::QueryBudget,
+        follower: Option<&crate::engine::decoded_log::ChangeFollower>,
     ) -> StorageResult<(
         crate::engine::change_feed::ChangeRead,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
+        if follower.is_some_and(|f| !f.follows_log(log)) {
+            return Err(StorageError::InvalidConfig(
+                "the change follower follows another log than the read's".into(),
+            ));
+        }
         let mut charge = budget.empty_charge();
+        let mut selections = Vec::new();
         let (entries, next) = if from < until && max_entries > 0 {
             // What the read itself holds while it runs, as a read of the log
             // always did: a segment's read buffer, the one path it holds, and
@@ -5529,25 +5551,66 @@ impl Deployment {
                 + fixed
                 + per_record_byte * marker;
             charge.grow(working).map_err(StorageError::Budget)?;
-            let read = log.read(
-                self,
-                from,
-                until,
-                max_entries,
-                &mut crate::engine::decoded_log::Reader {
-                    budget,
-                    charge: &mut charge,
-                },
-            );
+            let mut reader = crate::engine::decoded_log::Reader {
+                budget,
+                charge: &mut charge,
+            };
+            let read = log.read(self, from, until, max_entries, &mut reader);
+            // The selection a followed interest made of each entry, made once
+            // for all its followers.
+            let read = read.and_then(|(entries, next)| {
+                if let Some(follower) = follower {
+                    selections = log.select(follower, &entries, &mut reader)?;
+                }
+                Ok((entries, next))
+            });
             charge.shrink(working);
             read?
         } else {
             (Vec::new(), from)
         };
         Ok((
-            crate::engine::change_feed::ChangeRead { entries, next },
+            crate::engine::change_feed::ChangeRead {
+                entries,
+                next,
+                selections,
+            },
             charge,
         ))
+    }
+
+    /// A follower of `interest` on this store's journal: while some
+    /// follower of an interest lives, reads of it given the follower select
+    /// each unit once for all of them. Drop it when the reader leaves.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a store without a journal.
+    pub fn follow_changes(
+        &self,
+        interest: &crate::engine::change_feed::Interest,
+    ) -> StorageResult<crate::engine::decoded_log::ChangeFollower> {
+        let oplog = self
+            .oplog
+            .as_ref()
+            .ok_or_else(|| StorageError::InvalidConfig("the store keeps no journal".into()))?;
+        let (dir, floor) = {
+            let journal = oplog
+                .lock()
+                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+            (journal.dir().to_path_buf(), journal.retained_floor())
+        };
+        Ok(self.decoded_log(&[dir], Some(floor)).follow(interest))
+    }
+
+    /// [`Self::follow_changes`] on the log segments in `dirs`: the consensus
+    /// log of the group this store applies.
+    pub fn follow_changes_log(
+        &self,
+        dirs: &[PathBuf],
+        interest: &crate::engine::change_feed::Interest,
+    ) -> crate::engine::decoded_log::ChangeFollower {
+        self.decoded_log(dirs, None).follow(interest)
     }
 
     /// [`Self::change_read`] over the log segments in `dirs`, from `from` up
@@ -5570,7 +5633,7 @@ impl Deployment {
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
         let log = self.decoded_log(dirs, None);
-        self.change_read_of(&log, from, until, max_entries, budget)
+        self.change_read_of(&log, from, until, max_entries, budget, None)
     }
 
     /// A change cursor at `position` of this store's journal, for
@@ -5644,17 +5707,26 @@ impl Deployment {
     /// cursor's position; [`StorageError::ChangeFeedUnsupported`] for a unit
     /// the feed cannot project; see [`Self::change_read`]. On any of them
     /// nothing is handed over and the cursor stays valid.
+    ///
+    /// A reader that reads again and again passes the `follower` it holds
+    /// for the cursor's interest ([`Self::follow_changes`]): every follower
+    /// of the interest then shares what it selects of each unit.
+    /// [`StorageError::InvalidConfig`] for a follower of another interest
+    /// or log.
     pub fn read_changes<'b>(
         &self,
         cursor: &crate::engine::change_feed::ChangeCursor,
         max_entries: usize,
         budget: &'b coordinode_core::budget::QueryBudget,
+        follower: Option<&crate::engine::decoded_log::ChangeFollower>,
     ) -> StorageResult<(
         crate::engine::change_feed::ChangeBatch,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
         self.check_cursor_history(cursor)?;
-        let (read, mut charge) = self.change_read(cursor.position(), max_entries, budget)?;
+        Self::check_follower(cursor, follower)?;
+        let (read, mut charge) =
+            self.journal_change_read(cursor.position(), max_entries, budget, follower)?;
         let batch = Self::batch_of(
             cursor,
             &read,
@@ -5678,20 +5750,20 @@ impl Deployment {
         until: u64,
         max_entries: usize,
         budget: &'b coordinode_core::budget::QueryBudget,
+        follower: Option<&crate::engine::decoded_log::ChangeFollower>,
     ) -> StorageResult<(
         crate::engine::change_feed::ChangeBatch,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
-        self.check_cursor_history(cursor)?;
-        let (read, mut charge) =
-            self.change_read_log(dirs, cursor.position(), until, max_entries, budget)?;
-        let batch = Self::batch_of(
+        self.read_changes_log_encoded(
             cursor,
-            &read,
-            &mut charge,
+            dirs,
+            until,
+            max_entries,
+            budget,
             &mut crate::engine::change_feed::Unencoded,
-        )?;
-        Ok((batch, charge))
+            follower,
+        )
     }
 
     /// [`Self::read_changes_log`] for a reader that holds its own form of
@@ -5713,15 +5785,37 @@ impl Deployment {
         max_entries: usize,
         budget: &'b coordinode_core::budget::QueryBudget,
         encoding: &mut impl crate::engine::change_feed::ChangeEncoding,
+        follower: Option<&crate::engine::decoded_log::ChangeFollower>,
     ) -> StorageResult<(
         crate::engine::change_feed::ChangeBatch,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
         self.check_cursor_history(cursor)?;
-        let (read, mut charge) =
-            self.change_read_log(dirs, cursor.position(), until, max_entries, budget)?;
+        Self::check_follower(cursor, follower)?;
+        let log = self.decoded_log(dirs, None);
+        let (read, mut charge) = self.change_read_of(
+            &log,
+            cursor.position(),
+            until,
+            max_entries,
+            budget,
+            follower,
+        )?;
         let batch = Self::batch_of(cursor, &read, &mut charge, encoding)?;
         Ok((batch, charge))
+    }
+
+    /// Refuse a follower of another interest than the cursor's.
+    fn check_follower(
+        cursor: &crate::engine::change_feed::ChangeCursor,
+        follower: Option<&crate::engine::decoded_log::ChangeFollower>,
+    ) -> StorageResult<()> {
+        if follower.is_some_and(|f| f.interest() != cursor.interest()) {
+            return Err(StorageError::InvalidConfig(
+                "the change follower follows another interest than the cursor".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Refuse a cursor whose positions count another log than this store's.
@@ -5744,9 +5838,9 @@ impl Deployment {
         charge: &mut coordinode_core::budget::MemoryCharge<'_>,
         encoding: &mut impl crate::engine::change_feed::ChangeEncoding,
     ) -> StorageResult<crate::engine::change_feed::ChangeBatch> {
-        use crate::engine::change_feed::{ChangeBatch, ChangeCursor, ReadPlace, unit_changes};
-        let (units, stopped) = unit_changes(
-            read.units(),
+        use crate::engine::change_feed::{ChangeBatch, ChangeCursor, ReadPlace, unit_changes_from};
+        let (units, stopped) = unit_changes_from(
+            read.selected_units(),
             cursor.interest(),
             ReadPlace {
                 entry: cursor.position(),
