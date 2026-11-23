@@ -265,6 +265,77 @@ fn read_range_spans_sealed_and_active_segments() {
     assert!(mgr.read_range(30, 40).expect("past the end").is_empty());
 }
 
+/// Thirty entries in three segments of ten, the newest active.
+fn three_segments(dir: &Path) -> OplogManager {
+    let mut mgr = test_manager(dir);
+    for i in 0..30u64 {
+        mgr.append(&make_entry(i, 3000 + i)).expect("append");
+        if i % 10 == 9 && i < 29 {
+            mgr.rotate().expect("rotate");
+        }
+    }
+    mgr
+}
+
+fn indexes_read(read: StorageResult<Option<Vec<OplogEntry>>>) -> Vec<u64> {
+    read.expect("read")
+        .expect("no cut")
+        .iter()
+        .map(|e| e.index)
+        .collect()
+}
+
+/// A planned read is carried out without the manager, which meanwhile goes
+/// on appending and seals the segment the plan read frames of: the read
+/// returns what was planned, the frames still where the plan found them.
+#[test]
+fn a_planned_read_returns_what_was_planned_while_the_log_grows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = three_segments(dir.path());
+    let plan = mgr.plan_read(5, 28).expect("plan");
+    for i in 30..35u64 {
+        mgr.append(&make_entry(i, 3000 + i)).expect("append");
+    }
+    mgr.rotate()
+        .expect("seal the segment the plan reads frames of");
+    assert_eq!(indexes_read(plan.read_std()), (5..28).collect::<Vec<_>>());
+}
+
+/// A read planned before the log was cut back is not trusted: the files may
+/// hold other entries under the same names since, so the reader plans again.
+#[test]
+fn a_read_planned_before_a_cut_is_planned_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = three_segments(dir.path());
+    let plan = mgr.plan_read(0, u64::MAX).expect("plan");
+    mgr.truncate_from(15).expect("cut");
+    assert!(plan.read_std().expect("read").is_none());
+    assert_eq!(
+        indexes_read(mgr.plan_read(0, u64::MAX).expect("plan again").read_std()),
+        (0..15).collect::<Vec<_>>()
+    );
+}
+
+/// A segment a purge removed after the read was planned held only entries
+/// below the purge point, which the reader keeps to: the read passes over
+/// it. A segment gone without a purge is a hole, and the read fails.
+#[test]
+fn only_a_purge_lets_a_planned_segment_go_missing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = three_segments(dir.path());
+    let plan = mgr.plan_read(0, u64::MAX).expect("plan");
+    assert_eq!(mgr.purge_before(10).expect("purge"), 1);
+    assert_eq!(indexes_read(plan.read_std()), (10..30).collect::<Vec<_>>());
+
+    let plan = mgr.plan_read(0, u64::MAX).expect("plan");
+    let (_, sealed) = mgr.sealed.first().expect("a sealed segment").clone();
+    std::fs::remove_file(&sealed).expect("remove a segment behind the log");
+    assert!(
+        plan.read_std().is_err(),
+        "a hole in the log is not passed over"
+    );
+}
+
 /// A read of the active segment's entries opens no sealed segment: the last
 /// sealed one ends where the active one begins. Its file is removed here, so
 /// a read that opened it fails.

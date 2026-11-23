@@ -587,11 +587,25 @@ pub(crate) fn frame_ends(data: &[u8]) -> Vec<u64> {
     ends
 }
 
+/// Whole frames of an open segment, as [`SegmentWriter::span_of`] names
+/// them: `count` frames filling `[start, end)` of the file at `path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrameSpan {
+    pub(crate) path: PathBuf,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) count: usize,
+}
+
 /// Decode `count` consecutive frames filling `data` exactly.
 ///
 /// Unlike [`read_frame_prefix`], any bad frame is an error: the caller asks
 /// for frames it knows were written whole.
-fn decode_frames(data: &[u8], count: usize, path: &Path) -> StorageResult<Vec<OplogEntry>> {
+pub(crate) fn decode_frames(
+    data: &[u8],
+    count: usize,
+    path: &Path,
+) -> StorageResult<Vec<OplogEntry>> {
     let mut cursor = Cursor::new(data);
     let mut entries = Vec::with_capacity(count);
     for entry_idx in 0..count {
@@ -677,9 +691,6 @@ pub struct SegmentWriter {
     /// `(index, file offset of its frame)` of every entry, ascending by
     /// index: a read of the live tail seeks straight to what it asks for.
     frames: Vec<(u64, u64)>,
-    /// Read handle of this file, opened on the first read. A handle of its
-    /// own keeps its file position apart from the writer's.
-    reader: Option<std::fs::File>,
     /// How an append is made durable.
     sync: SyncMethod,
     /// Handed out by [`Self::flush_to_os`]; the file is duplicated once per
@@ -875,7 +886,6 @@ impl SegmentWriter {
             last_ts: 0,
             total_bytes: 0,
             frames: Vec::new(),
-            reader: None,
             sync,
             sync_handle: None,
             charge: None,
@@ -1189,48 +1199,47 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// Entries with `index ∈ [from_index, to_index)`, read back from this
-    /// still-open segment.
+    /// Where the frames of entries with `index ∈ [from_index, to_index)` lie
+    /// in this still-open segment, every one of them with the kernel, so
+    /// another handle of the file reads them while the writer goes on
+    /// appending; `None` when the segment holds none of them.
     ///
-    /// Reads only the frames in range, so reading the live tail costs what
-    /// it returns, not the size of the segment.
+    /// Only the frames in range are named, so reading the live tail costs
+    /// what it returns, not the size of the segment. A span reaching into the
+    /// writer's buffer flushes it; one below it costs no call.
     ///
     /// # Errors
     ///
-    /// I/O failures, and a frame in range that fails its checksum or does not
-    /// decode (this process wrote it, so that is corruption, not a torn write).
-    pub fn read_range(&mut self, from_index: u64, to_index: u64) -> StorageResult<Vec<OplogEntry>> {
+    /// The writer's buffer cannot be flushed; the segment is broken then.
+    pub(crate) fn span_of(
+        &mut self,
+        from_index: u64,
+        to_index: u64,
+    ) -> StorageResult<Option<FrameSpan>> {
         let first = self
             .frames
             .partition_point(|&(index, _)| index < from_index);
         let last = self.frames.partition_point(|&(index, _)| index < to_index);
         if first >= last {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let start = self.frames[first].1;
         let end = self
             .frames
             .get(last)
             .map_or(HEADER_SIZE + self.total_bytes, |&(_, offset)| offset);
-
-        // What the reader sees must include every frame appended so far.
-        self.file
-            .flush()
-            .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
-        let reader = match &mut self.reader {
-            Some(reader) => reader,
-            slot => slot.insert(std::fs::File::open(&self.path).map_err(|e| {
-                StorageError::Io(format!("open segment {:?} for reading: {e}", self.path))
-            })?),
-        };
-        // Offsets are within a file this process wrote; they fit in memory.
-        let len = usize::try_from(end - start).map_err(io_err)?;
-        let mut data = vec![0u8; len];
-        reader.seek(SeekFrom::Start(start)).map_err(io_err)?;
-        reader.read_exact(&mut data).map_err(|e| {
-            StorageError::Io(format!("read segment {:?} at {start}: {e}", self.path))
-        })?;
-        decode_frames(&data, last - first, &self.path)
+        // The buffer holds the newest bytes written; the rest is with the
+        // kernel already.
+        let with_kernel = HEADER_SIZE + self.total_bytes - self.file.buffer().len() as u64;
+        if end > with_kernel {
+            self.flush_buffer()?;
+        }
+        Ok(Some(FrameSpan {
+            path: self.path.clone(),
+            start,
+            end,
+            count: last - first,
+        }))
     }
 
     /// Index of the first entry written here, if any.
@@ -1401,7 +1410,12 @@ impl SegmentReader {
     pub fn open(path: &Path) -> StorageResult<Self> {
         let data = std::fs::read(path)
             .map_err(|e| StorageError::Io(format!("read segment {:?}: {e}", path)))?;
+        Self::from_bytes(&data, path)
+    }
 
+    /// Validate and load all entries from `data`, the whole of the sealed
+    /// segment at `path` as read.
+    pub(crate) fn from_bytes(data: &[u8], path: &Path) -> StorageResult<Self> {
         let total_len = data.len() as u64;
         let min_len = HEADER_SIZE + FOOTER_SIZE;
         if total_len < min_len {
@@ -1411,7 +1425,7 @@ impl SegmentReader {
             )));
         }
 
-        let mut cursor = Cursor::new(&data);
+        let mut cursor = Cursor::new(data);
 
         // Validate header
         let header = read_header(&mut cursor)?;

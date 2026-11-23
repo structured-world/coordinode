@@ -855,7 +855,9 @@ pub struct RaftLogHandle {
 }
 
 impl RaftLogHandle {
-    /// The log's entries in `[from, to)` that it holds, once written.
+    /// The log's entries in `[from, to)` that it holds, once written. The
+    /// log's manager is held only to name what to read, so its writer goes
+    /// on appending while the segments are read. Waits on the disk.
     ///
     /// # Errors
     ///
@@ -866,10 +868,17 @@ impl RaftLogHandle {
         {
             sync.wait_written(to - 1);
         }
-        self.oplog
-            .lock()
-            .map_err(|_| StorageError::Io("raft log mutex poisoned".into()))?
-            .read_range(from, to)
+        loop {
+            let plan = self
+                .oplog
+                .lock()
+                .map_err(|_| StorageError::Io("raft log mutex poisoned".into()))?
+                .plan_read(from, to)?;
+            // A read the log was cut back under is planned again.
+            if let Some(entries) = plan.read_std()? {
+                return Ok(entries);
+            }
+        }
     }
 
     /// The segment manager itself, for what reads its state rather than its
@@ -1275,6 +1284,56 @@ impl LogStore {
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
+    /// Another handle of this store, sharing its log, caches and writer,
+    /// holding the engine as `name`. Cheap: every field is shared.
+    fn another(&self, name: &'static str) -> LogStore {
+        LogStore {
+            engine: self.engine.share(name),
+            oplog: Arc::clone(&self.oplog),
+            last_log_id: Arc::clone(&self.last_log_id),
+            last_purged: Arc::clone(&self.last_purged),
+            append_notifier: Arc::clone(&self.append_notifier),
+            sync: Arc::clone(&self.sync),
+            tail: Arc::clone(&self.tail),
+            hold: self.hold.another(),
+            incarnation: self.incarnation,
+            saved_vote: Arc::clone(&self.saved_vote),
+            member: Arc::clone(&self.member),
+        }
+    }
+
+    /// The first index not purged: everything below it may be gone.
+    fn min_valid_index(&self) -> Result<u64, io::Error> {
+        Ok(self
+            .last_purged
+            .lock()
+            .map_err(|_| io::Error::other("last_purged mutex poisoned"))?
+            .map_or(0, |id| id.index + 1))
+    }
+
+    /// The entries of `[start, end)` the segments hold, decoded. The log's
+    /// manager is held only to name what to read: its writer goes on
+    /// appending while the segments are read, through the engine's file
+    /// system, and decoded. A read the log was cut back under is planned
+    /// again. Waits on the disk.
+    fn read_segments(&self, start: u64, end: u64) -> Result<Vec<Entry>, io::Error> {
+        loop {
+            let plan = self
+                .oplog
+                .lock()
+                .map_err(|_| io::Error::other("oplog mutex poisoned"))?
+                .plan_read(start, end)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            if let Some(read) = self
+                .engine
+                .read_journal(plan)
+                .map_err(|e| io::Error::other(e.to_string()))?
+            {
+                return read.into_iter().map(Self::oplog_to_entry).collect();
+            }
+        }
+    }
+
     /// Encode a Raft Entry as an OplogEntry.
     ///
     /// The first op is the entry's envelope; a Normal entry's proposals follow
@@ -1374,14 +1433,7 @@ impl LogStore {
     pub fn writes_user_data_from(&self, from: u64) -> Result<bool, io::Error> {
         // Every entry taken is in the segments before they are read.
         self.sync.wait_idle();
-        let entries = self
-            .oplog
-            .lock()
-            .map_err(|_| io::Error::other("raft log mutex poisoned"))?
-            .read_range(from, u64::MAX)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        for oplog_entry in entries {
-            let entry = Self::oplog_to_entry(oplog_entry)?;
+        for entry in self.read_segments(from, u64::MAX)? {
             let openraft::entry::EntryPayload::Normal(request) = &entry.payload else {
                 continue;
             };
@@ -1428,14 +1480,7 @@ impl LogStore {
     /// member of a group whose membership was not applied yet.
     pub fn names_member_from(&self, from: u64, node_id: u64) -> Result<bool, io::Error> {
         use openraft::entry::RaftEntry as _;
-        let entries = self
-            .oplog
-            .lock()
-            .map_err(|_| io::Error::other("raft log mutex poisoned"))?
-            .read_range(from, u64::MAX)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        for oplog_entry in entries {
-            let entry = Self::oplog_to_entry(oplog_entry)?;
+        for entry in self.read_segments(from, u64::MAX)? {
             if entry
                 .get_membership()
                 .is_some_and(|m| names_beside_another(&m, node_id))
@@ -1480,16 +1525,6 @@ impl RaftLogReader<TypeConfig> for LogStore {
             return Ok(Vec::new());
         }
 
-        // First valid index: everything strictly below this has been purged.
-        // When last_purged is None (no purge happened yet), min_valid_index = 0,
-        // so no entries are skipped — including the Bootstrap entry at index 0.
-        let min_valid_index: u64 = self
-            .last_purged
-            .lock()
-            .map_err(|_| io::Error::other("last_purged mutex poisoned"))?
-            .map(|id| id.index + 1)
-            .unwrap_or(0);
-
         // The end of the log comes from the tail, which holds every entry
         // not yet written; below the tail every entry is in the segments.
         let (cached, tail_first) = {
@@ -1497,25 +1532,24 @@ impl RaftLogReader<TypeConfig> for LogStore {
             (tail.range(start, end_exclusive), tail.first())
         };
         let file_end = tail_first.map_or(end_exclusive, |first| first.min(end_exclusive));
-        let oplog_entries = if start < file_end {
-            self.oplog
-                .lock()
-                .map_err(|_| io::Error::other("oplog mutex poisoned"))?
-                .read_range(start, file_end)
-                .map_err(|e| io::Error::other(e.to_string()))?
+        let mut entries = if start < file_end {
+            // Off the runtime's threads, and with the log's writer let go
+            // while the segments are read: a catch-up read of whole sealed
+            // segments holds neither a worker nor the leader's appends.
+            let store = self.another("raft log segment read");
+            blocking(move || store.read_segments(start, file_end)).await?
         } else {
             Vec::new()
         };
 
-        let mut entries = Vec::with_capacity(oplog_entries.len() + cached.len());
-        for oe in oplog_entries {
-            // Skip entries that fall within the purged range (segment granularity
-            // means a segment may still contain some pre-purge-boundary entries).
-            if oe.index < min_valid_index {
-                continue;
-            }
-            entries.push(Self::oplog_to_entry(oe)?);
-        }
+        // Read after the segments: a purge records its point before it
+        // removes any of them, so every entry a removed segment held lies
+        // below this. When no purge happened yet this is 0 and nothing is
+        // skipped, the Bootstrap entry at index 0 included.
+        let min_valid_index = self.min_valid_index()?;
+        // Segment granularity keeps entries below the purge point in a
+        // segment that straddles it.
+        entries.retain(|e| e.log_id.index >= min_valid_index);
         entries.extend(
             cached
                 .iter()
@@ -1527,15 +1561,35 @@ impl RaftLogReader<TypeConfig> for LogStore {
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote>, io::Error> {
-        match self.get(KEY_VOTE)? {
-            Some(bytes) => {
-                let vote: Vote =
-                    rmp_serde::from_slice(&bytes).map_err(|e| io::Error::other(e.to_string()))?;
-                Ok(Some(vote))
-            }
-            None => Ok(None),
-        }
+        let store = self.another("raft vote read");
+        let bytes = blocking(move || store.get(KEY_VOTE)).await?;
+        bytes
+            .map(|bytes| rmp_serde::from_slice(&bytes).map_err(|e| io::Error::other(e.to_string())))
+            .transpose()
     }
+}
+
+/// Run `work`, which reads or writes the stores and may wait on the disk,
+/// here on a worker that first hands its other tasks to the rest of the
+/// runtime, for work that borrows its caller's state. A single-threaded
+/// runtime has no other worker to hand them to, and runs it as it is.
+fn in_place<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+/// Run `work`, which waits on the disk, on the runtime's blocking threads,
+/// so no worker of the runtime waits with it.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, io::Error> + Send + 'static,
+) -> Result<T, io::Error> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| io::Error::other(format!("raft storage work stopped: {e}")))?
 }
 
 impl RaftLogStorage<TypeConfig> for LogStore {
@@ -1565,23 +1619,86 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
-        // Cheap clone: all fields are Arc-wrapped.
-        LogStore {
-            engine: self.engine.share("raft log reader"),
-            oplog: Arc::clone(&self.oplog),
-            last_log_id: Arc::clone(&self.last_log_id),
-            last_purged: Arc::clone(&self.last_purged),
-            append_notifier: Arc::clone(&self.append_notifier),
-            sync: Arc::clone(&self.sync),
-            tail: Arc::clone(&self.tail),
-            hold: self.hold.another(),
-            incarnation: self.incarnation,
-            saved_vote: Arc::clone(&self.saved_vote),
-            member: Arc::clone(&self.member),
-        }
+        self.another("raft log reader")
     }
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
+        // Both copies already hold it durably: no sync, no blocking thread.
+        if self
+            .saved_vote
+            .lock()
+            .map_err(|_| io::Error::other("saved vote mutex poisoned"))?
+            .as_ref()
+            == Some(vote)
+        {
+            return Ok(());
+        }
+        let (store, vote) = (self.another("raft vote write"), *vote);
+        blocking(move || store.save_vote_now(&vote)).await
+    }
+
+    async fn save_committed(
+        &mut self,
+        committed: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
+    ) -> Result<(), io::Error> {
+        // Recorded by the log's writer thread, as the next sync covers it
+        // either way: the Raft core calls this on every commit and must not
+        // wait on the journal it lands in.
+        let record = match committed {
+            Some(log_id) => LocalWrite::Put {
+                partition: Partition::Raft,
+                key: KEY_COMMITTED.to_vec(),
+                value: rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?,
+            },
+            None => LocalWrite::Delete {
+                partition: Partition::Raft,
+                key: KEY_COMMITTED.to_vec(),
+            },
+        };
+        self.sync.save_record(record);
+        Ok(())
+    }
+
+    async fn read_committed(
+        &mut self,
+    ) -> Result<Option<openraft::type_config::alias::LogIdOf<TypeConfig>>, io::Error> {
+        let store = self.another("raft committed read");
+        blocking(move || store.read_committed_now()).await
+    }
+
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: IOFlushed<TypeConfig>,
+    ) -> Result<(), io::Error>
+    where
+        I: IntoIterator<Item = Entry> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        self.append_now(entries, callback)
+    }
+
+    async fn truncate_after(
+        &mut self,
+        last_log_id: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
+    ) -> Result<(), io::Error> {
+        let store = self.another("raft log truncation");
+        blocking(move || store.truncate_after_now(last_log_id)).await
+    }
+
+    async fn purge(
+        &mut self,
+        log_id: openraft::type_config::alias::LogIdOf<TypeConfig>,
+    ) -> Result<(), io::Error> {
+        let store = self.another("raft log purge");
+        blocking(move || store.purge_now(log_id)).await
+    }
+}
+
+/// The work of the [`RaftLogStorage`] calls that waits on the disk, run on a
+/// blocking thread.
+impl LogStore {
+    fn save_vote_now(&self, vote: &Vote) -> Result<(), io::Error> {
         let mut saved = self
             .saved_vote
             .lock()
@@ -1612,30 +1729,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         Ok(())
     }
 
-    async fn save_committed(
-        &mut self,
-        committed: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
-    ) -> Result<(), io::Error> {
-        // Recorded by the log's writer thread, as the next sync covers it
-        // either way: the Raft core calls this on every commit and must not
-        // wait on the journal it lands in.
-        let record = match committed {
-            Some(log_id) => LocalWrite::Put {
-                partition: Partition::Raft,
-                key: KEY_COMMITTED.to_vec(),
-                value: rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?,
-            },
-            None => LocalWrite::Delete {
-                partition: Partition::Raft,
-                key: KEY_COMMITTED.to_vec(),
-            },
-        };
-        self.sync.save_record(record);
-        Ok(())
-    }
-
-    async fn read_committed(
-        &mut self,
+    fn read_committed_now(
+        &self,
     ) -> Result<Option<openraft::type_config::alias::LogIdOf<TypeConfig>>, io::Error> {
         // A record still queued for the writer thread lands first, so the
         // committed index read is the one last saved.
@@ -1650,14 +1745,11 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         }
     }
 
-    async fn append<I>(
-        &mut self,
-        entries: I,
-        callback: IOFlushed<TypeConfig>,
-    ) -> Result<(), io::Error>
+    /// Hand `entries` to the log's writer thread; no file I/O here, so the
+    /// Raft core calls it in place.
+    fn append_now<I>(&self, entries: I, callback: IOFlushed<TypeConfig>) -> Result<(), io::Error>
     where
-        I: IntoIterator<Item = Entry> + OptionalSend,
-        I::IntoIter: OptionalSend,
+        I: IntoIterator<Item = Entry>,
     {
         // (proposal id, log index) of every proposal in this batch, told to
         // the waiting writers once the batch is written and durable.
@@ -1692,8 +1784,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         Ok(())
     }
 
-    async fn truncate_after(
-        &mut self,
+    fn truncate_after_now(
+        &self,
         last_log_id: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
     ) -> Result<(), io::Error> {
         let keep_exclusive = last_log_id.map_or(0, |id| id.index + 1);
@@ -1725,8 +1817,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         Ok(())
     }
 
-    async fn purge(
-        &mut self,
+    fn purge_now(
+        &self,
         log_id: openraft::type_config::alias::LogIdOf<TypeConfig>,
     ) -> Result<(), io::Error> {
         // openraft may forget an entry once applied, but the entry is the
@@ -1752,16 +1844,12 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         let purged_to = if below == log_id.index + 1 {
             log_id
         } else {
-            // The id of the last entry actually dropped, read before it goes.
-            let last = self
-                .oplog
-                .lock()
-                .map_err(|_| io::Error::other("oplog mutex poisoned"))?
-                .read_range(below - 1, below)
-                .map_err(|e| io::Error::other(e.to_string()))?
+            // The id of the last entry actually dropped, read before it goes,
+            // with the log's writer let go meanwhile.
+            self.read_segments(below - 1, below)?
                 .pop()
-                .ok_or_else(|| io::Error::other(format!("raft log entry {} missing", below - 1)))?;
-            Self::oplog_to_entry(last)?.log_id
+                .ok_or_else(|| io::Error::other(format!("raft log entry {} missing", below - 1)))?
+                .log_id
         };
 
         // Recorded durably before any segment goes: a crash between the two
@@ -2673,26 +2761,28 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             // Membership changes are applied before normal entries (pure metadata,
             // no tree mutations, no crash-consistency concern with ordering).
             if let Some(ref membership) = entry.get_membership() {
-                let stored: StoredMembership =
-                    openraft::StoredMembership::new(Some(entry.log_id), membership.clone());
-                let previous = self
-                    .last_membership
-                    .lock()
-                    .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))?
-                    .clone();
-                // Before the membership itself: one partition's writes land
-                // in order, so a membership that survives a crash has its
-                // retirements beside it.
-                self.retire_removed(
-                    previous.membership().nodes().map(|(_, node)| node),
-                    membership.nodes().map(|(_, node)| node),
-                )?;
-                *self
-                    .last_membership
-                    .lock()
-                    .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))? =
-                    stored.clone();
-                self.save_membership(&stored)?;
+                in_place(|| -> Result<(), io::Error> {
+                    let stored: StoredMembership =
+                        openraft::StoredMembership::new(Some(entry.log_id), membership.clone());
+                    let previous = self
+                        .last_membership
+                        .lock()
+                        .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))?
+                        .clone();
+                    // Before the membership itself: one partition's writes
+                    // land in order, so a membership that survives a crash
+                    // has its retirements beside it.
+                    self.retire_removed(
+                        previous.membership().nodes().map(|(_, node)| node),
+                        membership.nodes().map(|(_, node)| node),
+                    )?;
+                    *self
+                        .last_membership
+                        .lock()
+                        .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))? =
+                        stored.clone();
+                    self.save_membership(&stored)
+                })?;
             }
 
             // Each proposal lands with its coverage marker in every tree it
@@ -2703,40 +2793,48 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             let index = entry.log_id.index;
             let response = match &entry.payload {
                 openraft::entry::EntryPayload::Normal(request) => {
-                    let mut total = 0;
-                    let mut refused = Vec::new();
-                    let mut records_pair = false;
-                    let mut records_deployment = false;
-                    for (sub, proposal) in request.proposals.iter().enumerate() {
-                        let sub = u32::try_from(sub).map_err(|_| {
-                            io::Error::other(format!("entry {index} carries over 2^32 proposals"))
-                        })?;
-                        let r = self.apply_proposal_under(proposal, index, sub, &gate.applies)?;
-                        total += r.mutations_applied;
-                        refused.extend(r.refused);
-                        self.applied_commit_ts.fetch_max(
-                            proposal.commit_ts.as_raw(),
-                            core::sync::atomic::Ordering::Release,
-                        );
-                        records_pair |= proposal.mutations.iter().any(|m| {
-                            matches!(
-                                m,
-                                Mutation::Command(MetadataCommand::RecordGroupPair { .. })
-                            )
-                        });
-                        records_deployment |= proposal.mutations.iter().any(|m| {
-                            matches!(
-                                m,
-                                Mutation::Command(MetadataCommand::RecordDeployment { .. })
-                            )
-                        });
-                    }
-                    if records_pair {
-                        self.refresh_group_pair()?;
-                    }
-                    if records_deployment {
-                        self.refresh_deployment()?;
-                    }
+                    // The proposals read the trees they check (unique values,
+                    // derived index entries) and write them.
+                    let (total, refused) = in_place(|| -> Result<_, io::Error> {
+                        let mut total = 0;
+                        let mut refused = Vec::new();
+                        let mut records_pair = false;
+                        let mut records_deployment = false;
+                        for (sub, proposal) in request.proposals.iter().enumerate() {
+                            let sub = u32::try_from(sub).map_err(|_| {
+                                io::Error::other(format!(
+                                    "entry {index} carries over 2^32 proposals"
+                                ))
+                            })?;
+                            let r =
+                                self.apply_proposal_under(proposal, index, sub, &gate.applies)?;
+                            total += r.mutations_applied;
+                            refused.extend(r.refused);
+                            self.applied_commit_ts.fetch_max(
+                                proposal.commit_ts.as_raw(),
+                                core::sync::atomic::Ordering::Release,
+                            );
+                            records_pair |= proposal.mutations.iter().any(|m| {
+                                matches!(
+                                    m,
+                                    Mutation::Command(MetadataCommand::RecordGroupPair { .. })
+                                )
+                            });
+                            records_deployment |= proposal.mutations.iter().any(|m| {
+                                matches!(
+                                    m,
+                                    Mutation::Command(MetadataCommand::RecordDeployment { .. })
+                                )
+                            });
+                        }
+                        if records_pair {
+                            self.refresh_group_pair()?;
+                        }
+                        if records_deployment {
+                            self.refresh_deployment()?;
+                        }
+                        Ok((total, refused))
+                    })?;
                     let sub = closure_position(request).ok_or_else(|| {
                         io::Error::other(format!("entry {index} carries over 2^32 proposals"))
                     })?;
@@ -2746,7 +2844,9 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                     }
                     #[cfg(feature = "test-faults")]
                     self.apply_pause.stop_at(index).await;
-                    self.apply_closure(request.closed_below, index, sub, &gate.applies)?;
+                    in_place(|| {
+                        self.apply_closure(request.closed_below, index, sub, &gate.applies)
+                    })?;
                     Response {
                         mutations_applied: total,
                         refused,
@@ -2771,10 +2871,12 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                 let payload = rmp_serde::to_vec(&entry.log_id)
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 let applies = &gate.applies;
-                self.engine
-                    .fold_raft_coverage(self.folded, next, &payload, |part| {
-                        applies.floor(part) >= next
-                    });
+                in_place(|| {
+                    self.engine
+                        .fold_raft_coverage(self.folded, next, &payload, |part| {
+                            applies.floor(part) >= next
+                        });
+                });
                 self.folded = next;
             }
 

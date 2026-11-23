@@ -3930,6 +3930,21 @@ impl Deployment {
         &self.fs
     }
 
+    /// Carry out `read` through the file system the trees read through:
+    /// `io_uring` where the build and the kernel have it, so the segments are
+    /// read in one submission. The calling thread waits for it; see
+    /// [`PlannedRead::read`](crate::oplog::PlannedRead::read).
+    ///
+    /// # Errors
+    ///
+    /// As [`PlannedRead::read`](crate::oplog::PlannedRead::read).
+    pub fn read_journal(
+        &self,
+        read: crate::oplog::PlannedRead,
+    ) -> StorageResult<Option<Vec<crate::oplog::OplogEntry>>> {
+        read.read(self.fs.as_ref())
+    }
+
     /// How the trees sync their files.
     pub(crate) fn tree_sync(&self) -> lsm_tree::fs::SyncMode {
         self.tree_sync

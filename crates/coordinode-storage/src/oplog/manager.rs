@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::engine::config::SyncMethod;
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, ShardId};
+use crate::oplog::planned_read::{Part, PlannedRead};
 use crate::oplog::segment::{
     SegmentFooter, SegmentReader, SegmentWriter, TailState, is_sealed, sealed_footer,
 };
@@ -221,6 +222,7 @@ pub struct RetainedFloor(Arc<FloorState>);
 struct FloorState {
     first: AtomicU64,
     cuts: AtomicU64,
+    purges: AtomicU64,
 }
 
 impl RetainedFloor {
@@ -228,7 +230,19 @@ impl RetainedFloor {
         Self(Arc::new(FloorState {
             first: AtomicU64::new(first.unwrap_or(NO_SEGMENT)),
             cuts: AtomicU64::new(0),
+            purges: AtomicU64::new(0),
         }))
+    }
+
+    /// How many purges began so far. A reader that finds a segment gone
+    /// and this moved since it named the segment lost it to a purge.
+    pub(crate) fn purges(&self) -> u64 {
+        self.0.purges.load(Ordering::Acquire)
+    }
+
+    /// Record a purge, before it removes any segment.
+    fn purging(&self) {
+        self.0.purges.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The first index the log holds; `None` when it holds no segment.
@@ -725,13 +739,35 @@ impl Drop for OplogManager {
 }
 
 impl OplogManager {
-    /// Return all entries with `index ∈ [from_index, to_index)`, ascending.
+    /// Return all entries with `index ∈ [from_index, to_index)`, ascending,
+    /// read through the standard file system while this manager is held.
+    /// A reader that must not hold it takes [`Self::plan_read`] instead.
     ///
-    /// Only the segments that can hold the range are read, and the active
-    /// segment is read in place: a read of the tail costs what it returns,
-    /// however long the log is.
+    /// # Errors
+    ///
+    /// As [`Self::plan_read`] and [`PlannedRead::read`].
     pub fn read_range(&mut self, from_index: u64, to_index: u64) -> StorageResult<Vec<OplogEntry>> {
-        let mut result = Vec::new();
+        // Nothing cuts the log back while this manager is held.
+        self.plan_read(from_index, to_index)?
+            .read_std()?
+            .ok_or_else(|| StorageError::Io("the journal was cut back under its manager".into()))
+    }
+
+    /// What a read of the entries with `index ∈ [from_index, to_index)`
+    /// takes, named without reading any of it: the reader carries it out
+    /// with [`PlannedRead::read`] once it let go of this manager, which
+    /// meanwhile goes on appending.
+    ///
+    /// Only the segments that can hold the range are named, and of the
+    /// active segment only the frames in range: a read of the tail costs
+    /// what it returns, however long the log is.
+    ///
+    /// # Errors
+    ///
+    /// The active segment's buffer cannot be handed to the kernel; the log
+    /// stops then.
+    pub fn plan_read(&mut self, from_index: u64, to_index: u64) -> StorageResult<PlannedRead> {
+        let mut parts = Vec::new();
 
         // Segments are ordered by first index and each holds the indexes up
         // to the next one's first, so the range starts in the last segment
@@ -760,26 +796,25 @@ impl OplogManager {
             if next_first.is_some_and(|end| end <= from_index) {
                 continue;
             }
-
-            let reader = SegmentReader::open(path)?;
-
-            // Skip segments belonging to a different shard (defensive).
-            if reader.header.shard_id != self.shard_id {
-                continue;
-            }
-
-            result.extend(
-                reader
-                    .into_entries()
-                    .into_iter()
-                    .filter(|entry| entry.index >= from_index && entry.index < to_index),
-            );
+            parts.push(Part::Sealed { path: path.clone() });
         }
 
         if let Some(writer) = &mut self.current {
-            result.extend(writer.read_range(from_index, to_index)?);
+            let span = writer.span_of(from_index, to_index);
+            let broken = writer.is_broken();
+            if let Some(span) = self.stop_on(span, broken)? {
+                parts.push(Part::Active(span));
+            }
         }
-        Ok(result)
+        Ok(PlannedRead {
+            shard_id: self.shard_id,
+            from: from_index,
+            to: to_index,
+            parts,
+            floor: self.floor.clone(),
+            cuts: self.floor.cuts(),
+            purges: self.floor.purges(),
+        })
     }
 
     /// Delete segments that are outside the time window, fully below the
@@ -850,16 +885,18 @@ impl OplogManager {
                 && reader.entries().iter().any(|e| !is_durable(e));
             if within_window || needed_by_consumer || holds_non_durable {
                 remaining.push((first_idx, path));
-            } else if let Err(e) = self.remove_segment(&path) {
+                continue;
+            }
+            self.floor.purging();
+            if let Err(e) = self.remove_segment(&path) {
                 failed = Some(StorageError::Io(format!(
                     "remove expired segment {:?}: {e}",
                     path
                 )));
                 remaining.push((first_idx, path));
                 break;
-            } else {
-                purged += 1;
             }
+            purged += 1;
         }
 
         // A failure keeps every segment not yet removed, so the list still
@@ -965,6 +1002,9 @@ impl OplogManager {
             purgeable += 1;
         }
 
+        if purgeable > 0 {
+            self.floor.purging();
+        }
         for removed in 0..purgeable {
             let path = &self.sealed[removed].1;
             if let Err(e) = self.remove_segment(path) {

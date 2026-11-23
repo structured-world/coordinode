@@ -72,6 +72,8 @@ fn received(engine: &StorageEngine, bytes: &[u8]) -> SnapshotData {
 
 // -- LogStore --
 
+mod segment_reads;
+
 #[tokio::test]
 async fn log_store_save_and_read_vote() {
     let (_dir, engine) = test_engine();
