@@ -14,12 +14,18 @@ use crate::{BACKUP_DIR, apply, survey};
 /// A store as 0.10.1 laid its trees out under `dir`: its marker and a tree
 /// of every partition, and the tables, at the top, each holding one file.
 /// It has a Deployment tree already, so the step that moves the
-/// deployment's records into one, which opens the store, passes it over:
-/// these trees are not ones an engine opens. That step runs on a store
-/// 0.10.1 wrote, in `tests/from_0_10_1.rs`.
+/// deployment's records into one, which opens the store, passes it over,
+/// and its trees are marked written with revisions, so the step that
+/// rewrites them does too: these trees are not ones an engine opens. Those
+/// steps run on a store 0.10.1 wrote, in `tests/from_0_10_1.rs`.
 fn flat_store(dir: &Path) {
     std::fs::create_dir_all(dir.join("system/deployment")).expect("dir");
     std::fs::write(dir.join(MARKER_FILE), b"5").expect("marker");
+    let stamped: String = Partition::all()
+        .iter()
+        .map(|part| format!("{}\n", part.name()))
+        .collect();
+    std::fs::write(dir.join("REVISION_STAMPS"), stamped).expect("stamped");
     for name in Partition::all()
         .iter()
         .filter(|part| part.name() != "deployment")

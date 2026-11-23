@@ -75,18 +75,29 @@ cargo run --release -p coordinode-migrate -- --data /var/lib/coordinode --apply 
 Only the step from the release just before this one ships: a directory of an
 older release goes through each release in turn. From 0.10.1 the step:
 
-- moves each tree from the top of a store into the system set (`system/`) or
-  the store's namespace set (`ns/0000000000000001/`), checkpoints included;
 - puts the namespace marker in front of every unit of the journal and of the
   group's Raft log;
+- writes every tree anew with each record's version: the commit that wrote
+  it where the journal still holds that write, and an unknown version
+  otherwise. A record of unknown version reads as before; a write
+  conditioned on its version is refused with `REVISION_UNAVAILABLE`, nothing
+  written, until a write replaces the record. The old trees' files are kept
+  in the backup;
+- moves each tree from the top of a store into the system set (`system/`) or
+  the store's namespace set (`ns/0000000000000001/`), checkpoints included;
 - moves the deployment's own records (its identity, node identifier leases,
   level routing, version pairs, operation incarnations, the Raft state
   machine's position, membership and snapshot) from the Schema tree to the
   Deployment tree.
 
-A report changes nothing. Every journal segment `--apply` rewrites is kept as
-a hard link under `<dir>/migrate-backup/<run>/`; a moved tree is moved back by
-renaming its directory. A second run finds nothing to do.
+A report changes nothing. Every journal segment and tree file `--apply`
+rewrites is kept as a hard link under `<dir>/migrate-backup/<run>/`; a moved
+tree is moved back by renaming its directory. A second run finds nothing to
+do.
+
+On its first open after the step, a store the server alone writes gives each
+index definition of unknown version a version of its own, by writing the
+definition again as it stands, before it admits any write.
 
 ## Watching a move
 

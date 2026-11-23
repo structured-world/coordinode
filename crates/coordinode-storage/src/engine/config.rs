@@ -1389,8 +1389,21 @@ impl StorageConfig {
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         routing: Option<&crate::engine::routing::PartitionRouting>,
     ) -> lsm_tree::Config {
-        let part = tree.part;
-        let mut config = self.base_tree_config(part, &tree.dir(), seqno, routing);
+        self.tree_config_at(tree.part, &tree.dir(), seqno, routing)
+    }
+
+    /// The tree configuration of partition `part` with its tree at the
+    /// directory `dir` under every endpoint, which need not be the one this
+    /// build places it at: what an offline rewrite of a tree reads and writes
+    /// with ([`crate::engine::rebuild::rewrite_tree_values`]).
+    pub fn tree_config_at(
+        &self,
+        part: Partition,
+        dir: &Path,
+        seqno: lsm_tree::SharedSequenceNumberGenerator,
+        routing: Option<&crate::engine::routing::PartitionRouting>,
+    ) -> lsm_tree::Config {
+        let mut config = self.base_tree_config(part, dir, seqno, routing);
 
         // Merge operators, per partition:
         //

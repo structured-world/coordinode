@@ -12,17 +12,23 @@
 
 mod deployment_records;
 mod layout;
+mod revision_stamps;
 mod unit_namespace;
 
 use coordinode_storage::engine::scope::NamespaceId;
 
 use super::ReleaseStep;
 
+/// In order: the journal first, read by this build's decoder from then on;
+/// the trees, written with revisions while still at the top of the store,
+/// which this build refuses to open; only then the move into the sets that
+/// makes the store open, and the records moved by an open.
 pub(super) const STEP: ReleaseStep = ReleaseStep {
     from: "0.10.1",
     migrations: &[
-        layout::MIGRATION,
         unit_namespace::MIGRATION,
+        revision_stamps::MIGRATION,
+        layout::MIGRATION,
         deployment_records::MIGRATION,
     ],
 };

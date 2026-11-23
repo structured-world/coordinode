@@ -91,23 +91,21 @@ fn apply(finding: &Finding, _backup: &Backup) -> anyhow::Result<()> {
             .prefix_scan(Partition::Schema, record)
             .with_context(|| format!("scan {}", finding.path.display()))?
         {
-            let (key, value) = guard
-                .into_inner()
+            let key = guard
+                .key()
                 .with_context(|| format!("scan {}", finding.path.display()))?;
             if exact && key.as_ref() != record {
                 continue;
             }
-            moved.push((key.to_vec(), value.to_vec()));
+            moved.push(key.to_vec());
         }
     }
-    for (key, value) in &moved {
+    // Each record moves as stored: the revision it carries goes with it.
+    for key in &moved {
         let printable = coordinode_storage::error::printable_key(key);
         engine
-            .put(Partition::Deployment, key, value)
-            .with_context(|| format!("write {printable} in {}", finding.path.display()))?;
-        engine
-            .delete(Partition::Schema, key)
-            .with_context(|| format!("remove {printable} in {}", finding.path.display()))?;
+            .move_record(Partition::Schema, Partition::Deployment, key)
+            .with_context(|| format!("move {printable} in {}", finding.path.display()))?;
     }
     engine
         .persist()

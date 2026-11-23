@@ -161,6 +161,10 @@ pub struct LocalCopyStatus {
 /// they would have started from this member's marks.
 const MAX_PENDING_REPORTS: usize = 1024;
 
+/// The version a definition of unknown commit is registered at: no commit
+/// is at zero, so a write bound to it matches no record and is refused.
+const UNKNOWN_REVISION: u64 = 0;
+
 /// The most bytes the queue of reports waiting to be recorded holds, as
 /// allocated: its slots and the buffers of the reports' tuples. A tuple can
 /// be as long as an index key, so the count alone does not bound them. Past
@@ -1198,14 +1202,57 @@ impl IndexRegistry {
         self.found_unfit_here(&store.list_unfit_here().map_err(storage)?);
         let mut loaded = Catalog::default();
         for def in defs {
-            let version = engine.record_version(
+            let version = match engine.record_version(
                 coordinode_storage::engine::partition::Partition::Schema,
                 &def.schema_key(),
-            )?;
+            ) {
+                Ok(version) => version,
+                // A definition whose commit is not known binds its writers
+                // to no version a record can be at: each is refused, nothing
+                // written, until the definition is written again.
+                Err(StorageError::RevisionUnavailable { .. }) => Some(UNKNOWN_REVISION),
+                Err(e) => return Err(e),
+            };
             loaded.insert(self.registered(def, version));
         }
         *self.indexes.write() = loaded;
         Ok(())
+    }
+
+    /// Write again, as it stands, every stored index definition whose commit
+    /// is not known (a store brought from a release that kept none), so it
+    /// has a version its writers bind to: the write is a commit of its own.
+    /// For a store this process alone writes, before it admits any write; a
+    /// replicated store's definitions are written by its group. Returns how
+    /// many were written.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    pub fn reinstall_unknown_definitions(
+        &self,
+        engine: &StorageEngine,
+    ) -> Result<usize, StorageError> {
+        use coordinode_storage::engine::partition::Partition::Schema;
+        let mut written = 0;
+        for def in super::ops::list_index_definitions(engine)? {
+            let key = def.schema_key();
+            match engine.record_version(Schema, &key) {
+                Err(StorageError::RevisionUnavailable { .. }) => {}
+                other => {
+                    other?;
+                    continue;
+                }
+            }
+            if let Some(stored) = engine.get(Schema, &key)? {
+                engine.put(Schema, &key, &stored)?;
+                written += 1;
+            }
+        }
+        if written > 0 {
+            engine.persist()?;
+        }
+        Ok(written)
     }
 
     /// The labels of the B-tree indexes with parts kept apart: a node being

@@ -1183,6 +1183,11 @@ impl Database {
         // unfit until checked, from before the registry serves anything.
         let index_registry = Arc::new(coordinode_query::index::IndexRegistry::new());
         index_registry.recover_local_guards(&engine)?;
+        // A store only this process writes gives a definition of unknown
+        // commit one, before it admits a write bound to it.
+        if opens_deployment && engine.has_journal() {
+            index_registry.reinstall_unknown_definitions(&engine)?;
+        }
         index_registry.load_all(&engine)?;
         // A capture of the store says what this member proved of its index
         // copies, and a transfer received says what the sender proved.

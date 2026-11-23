@@ -8321,6 +8321,29 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Move the record at `key` from partition `from` to partition `to` as
+    /// it is stored, its revision included: the same write, kept, now read
+    /// from `to`. Returns whether there was a record to move.
+    ///
+    /// # Errors
+    ///
+    /// A partition has no tree here, or a read or write fails.
+    pub fn move_record(&self, from: Partition, to: Partition, key: &[u8]) -> StorageResult<bool> {
+        let mut buf = Vec::new();
+        let Some(stored) = self.stored_key(from, key, &mut buf) else {
+            return Ok(false);
+        };
+        let Some(value) = self
+            .tree(from)?
+            .get(stored, self.coordinator.current_seqno())?
+        else {
+            return Ok(false);
+        };
+        self.put_stored(to, key, &value)?;
+        self.delete(from, key)?;
+        Ok(true)
+    }
+
     /// Write back a row read as stored ([`Self::snapshot_prefix_scan_stored`]):
     /// its value already carries its revision, which the write keeps.
     pub(crate) fn put_stored(

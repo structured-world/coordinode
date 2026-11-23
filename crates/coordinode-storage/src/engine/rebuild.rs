@@ -226,6 +226,120 @@ pub(crate) fn tree_history(
     })
 }
 
+/// One version of a key, or one merge operand of it, a tree holds: what
+/// [`rewrite_tree_values`] hands its caller.
+#[derive(Debug, Clone, Copy)]
+pub struct StoredVersion<'a> {
+    /// The key as stored.
+    pub key: &'a [u8],
+    /// The value or operand as stored.
+    pub value: &'a [u8],
+    /// The sequence number the tree holds it at.
+    pub seqno: lsm_tree::SeqNo,
+    /// Whether it is a merge operand rather than a value.
+    pub operand: bool,
+}
+
+/// The memtable size past which [`rewrite_tree_values`] writes what it
+/// holds to a table, so a large tree is not held in memory whole.
+const REWRITE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Write the tree of partition `part` at the directory `from` under the
+/// endpoints of `config` anew at `to`: every version, merge operand and
+/// deletion it holds, each at its own sequence number, every value and
+/// operand through `rewrite`, and its retention floor. Both trees are closed
+/// to everything else; `to` must not hold a tree. The new tree is durable
+/// when this returns; putting it in place of the old one is the caller's.
+/// Returns the number of values and operands rewritten.
+///
+/// # Errors
+///
+/// A tree cannot be opened, read or written, or `rewrite` refuses a value.
+pub fn rewrite_tree_values(
+    config: &crate::engine::config::StorageConfig,
+    part: crate::engine::partition::Partition,
+    (from, to): (&Path, &Path),
+    routing: Option<&crate::engine::routing::PartitionRouting>,
+    rewrite: &mut dyn FnMut(StoredVersion<'_>) -> StorageResult<Vec<u8>>,
+) -> StorageResult<u64> {
+    use lsm_tree::AbstractTree as _;
+    let counter = || {
+        lsm_tree::SharedSequenceNumberGenerator::from(lsm_tree::SequenceNumberCounter::default())
+    };
+    let source = config
+        .tree_config_at(part, from, counter(), routing)
+        .open()?;
+    if let Some(taken) = config
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.path.join(to))
+        .find(|path| path.exists())
+    {
+        return Err(StorageError::TargetExists {
+            path: taken.display().to_string(),
+        });
+    }
+    let target = config.tree_config_at(part, to, counter(), routing).open()?;
+    let flush = |tree: &AnyTree| -> StorageResult<()> {
+        let lock = tree.get_flush_lock();
+        tree.rotate_memtable();
+        // Nothing below a watermark of zero is collected: every version
+        // the source holds is written as it is.
+        tree.flush(&lock, 0)?;
+        tree.persist_flushes()?;
+        Ok(())
+    };
+    let mut rewritten = 0u64;
+    for event in tree_history(&source)? {
+        let (_, memtable) = match event {
+            ScanSinceEvent::Insert { key, value, seqno } => {
+                let value = rewrite(StoredVersion {
+                    key: &key,
+                    value: &value,
+                    seqno,
+                    operand: false,
+                })?;
+                rewritten += 1;
+                target.insert(key, value, seqno)
+            }
+            ScanSinceEvent::MergeOperand {
+                key,
+                operand,
+                seqno,
+            } => {
+                let operand = rewrite(StoredVersion {
+                    key: &key,
+                    value: &operand,
+                    seqno,
+                    operand: true,
+                })?;
+                rewritten += 1;
+                target.merge(key, operand, seqno)
+            }
+            ScanSinceEvent::PointTombstone { key, seqno } => target.remove(key, seqno),
+            ScanSinceEvent::WeakTombstone { key, seqno } => target.remove_weak(key, seqno),
+            ScanSinceEvent::RangeTombstone {
+                start_key,
+                end_key,
+                seqno,
+            } => {
+                target.remove_range(start_key, end_key, seqno);
+                (0, target.active_memtable().size())
+            }
+        };
+        if memtable > REWRITE_FLUSH_BYTES {
+            flush(&target)?;
+        }
+    }
+    flush(&target)?;
+    target.sync_devices()?;
+    let floor = source.retention_floor();
+    if floor < target.retention_floor() {
+        target.lower_retention_floor(floor)?;
+    }
+    Ok(rewritten)
+}
+
 /// Write one event of a tree's history into `tree` at its original seqno.
 /// Returns the bytes the write added and the memtable's size after it.
 #[cfg(feature = "columnar")]
