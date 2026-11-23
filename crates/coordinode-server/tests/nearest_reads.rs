@@ -277,6 +277,16 @@ async fn a_refresh_then_acknowledge_consumer_publishes_before_it_acknowledges() 
         published.insert(int(&row["id"]), int(&row["v"]));
     }
     assert_eq!(published.get(&1), Some(&2), "the later update");
+    // A deletion's refresh finds the key gone.
+    let (_, gone) = writer
+        .execute_causal_write("MATCH (d:Doc {id: 1}) DELETE d")
+        .await
+        .unwrap();
+    let rows = refresh(&mut refresher, gone.as_u64()).await.unwrap();
+    assert!(
+        rows.iter().all(|row| int(&row["id"]) != 1),
+        "the deletion is what the refresh sees"
+    );
     // Published: now the cursor covering it is acknowledged.
     subscription.acknowledge(&batch.cursor).await.unwrap();
 
@@ -444,6 +454,32 @@ async fn a_refresh_reaching_a_member_behind_it_is_served_in_one_call() {
         refused.message()
     );
     assert_eq!(hops(refused.metadata()).as_deref(), Some("1"));
+
+    // The call's deadline goes with the read: earlier than its wait, it ends
+    // the forwarded read as a deadline, not after the whole wait.
+    let mut timed = coordinode_test_fixtures::client::named(fresh_read(
+        u64::MAX,
+        replication::ReadPreference::Secondary,
+        30_000,
+    ));
+    timed.set_timeout(Duration::from_millis(500));
+    let started = Instant::now();
+    let ended = near
+        .execute_cypher(timed)
+        .await
+        .expect_err("the deadline ends it");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "ended by its deadline, not its wait: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            ended.code(),
+            tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
+        ),
+        "{ended:?}"
+    );
 
     // A member whose view meets the bound serves it where it arrives.
     let mut ready = client(members[1].1).await;
