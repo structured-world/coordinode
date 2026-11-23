@@ -372,6 +372,15 @@ pub enum StorageError {
     )]
     RevisionUnavailable { partition: &'static str },
 
+    /// A directory of this engine format whose records were written by a
+    /// build that kept no record revisions. Nothing in it was read or
+    /// changed; a store of the release before this one is brought here by
+    /// the offline migration, any other is not opened.
+    #[error(
+        "{path} holds records written without their revisions by a build this one does not open"
+    )]
+    RevisionsMissing { path: String },
+
     /// The store holds history but no binding of the domain it belongs to:
     /// the binding was lost or removed, and founding a new domain now would
     /// claim that history for another. Refused; the binding is recovered

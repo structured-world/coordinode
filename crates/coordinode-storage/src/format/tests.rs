@@ -309,6 +309,31 @@ fn a_new_directory_is_marked_with_the_current_format() {
     );
 }
 
+/// A directory of the current format written by a build that kept no
+/// record revisions is refused before anything in it is read, its marker as
+/// it was; a new directory records that its records carry them.
+#[test]
+fn a_directory_whose_records_carry_no_revisions_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("data");
+    prepare_dir(&dir, 5, STEPS).expect("prepare");
+    assert!(marker_has_revisions(&dir).expect("read"));
+
+    let older = tempfile::tempdir().expect("tempdir");
+    std::fs::write(older.path().join(MARKER_FILE), b"5\n").expect("marker");
+    touch(older.path(), "system");
+    let err = prepare_dir(older.path(), 5, STEPS).expect_err("refused");
+    assert!(
+        matches!(err, StorageError::RevisionsMissing { .. }),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read(older.path().join(MARKER_FILE)).expect("read"),
+        b"5\n",
+        "nothing changed"
+    );
+}
+
 /// A directory with data and no marker predates the marker: format 0,
 /// migrated by a release of format 1 and refused by any later one.
 #[test]

@@ -380,6 +380,14 @@ pub fn prepare_dir(dir: &Path, runs: u32, steps: &[MigrationStep]) -> StorageRes
         None => 0,
     };
     if found == runs {
+        // A directory of this format whose records were written without
+        // their revisions: its values would be read with a stamp they do
+        // not carry, so it is refused before anything is read.
+        if !marker_has_revisions(dir)? {
+            return Err(StorageError::RevisionsMissing {
+                path: dir.display().to_string(),
+            });
+        }
         return Ok(FormatOpen::Current);
     }
     let refuse = || StorageError::UnsupportedFormat {
@@ -401,32 +409,60 @@ pub fn prepare_dir(dir: &Path, runs: u32, steps: &[MigrationStep]) -> StorageRes
     })
 }
 
+/// The line of the format marker saying every record of the directory
+/// carries its revision: what a directory this build writes, or one brought
+/// to it, records beside its format.
+pub const REVISIONS_LINE: &str = "record-revisions";
+
+/// The marker's text, `None` without a marker.
+fn marker_text(dir: &Path) -> StorageResult<Option<String>> {
+    let path = dir.join(MARKER_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_at("read", &path, e)),
+    }
+}
+
 /// The format a directory's marker names, `None` without a marker.
 pub fn read_marker(dir: &Path) -> StorageResult<Option<u32>> {
-    let path = dir.join(MARKER_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io_at("read", &path, e)),
+    let Some(text) = marker_text(dir)? else {
+        return Ok(None);
     };
-    text.trim().parse().map(Some).map_err(|_| {
+    let format = text.lines().next().unwrap_or_default();
+    format.trim().parse().map(Some).map_err(|_| {
         StorageError::Io(format!(
             "{} does not name an engine format: {text:?}",
-            path.display()
+            dir.join(MARKER_FILE).display()
         ))
     })
 }
 
-/// Record `format` as the directory's format: written aside, made durable,
-/// then renamed over the marker, so a crash leaves the old marker or the new
-/// one and never a torn one. The marker is charged to `footprints` before it
-/// is written.
+/// Whether the directory's marker says its records carry their revisions
+/// ([`REVISIONS_LINE`]).
+///
+/// # Errors
+///
+/// The marker cannot be read.
+pub fn marker_has_revisions(dir: &Path) -> StorageResult<bool> {
+    Ok(marker_text(dir)?.is_some_and(|text| text.lines().skip(1).any(|l| l == REVISIONS_LINE)))
+}
+
+/// Record `format` as the directory's format, its records carrying their
+/// revisions: written aside, made durable, then renamed over the marker, so
+/// a crash leaves the old marker or the new one and never a torn one. The
+/// marker is charged to `footprints` before it is written.
 pub fn write_marker(
     dir: &Path,
     format: u32,
     footprints: &crate::engine::footprint::Footprints,
 ) -> StorageResult<()> {
-    write_atomically(dir, MARKER_FILE, &format!("{format}\n"), footprints)
+    write_atomically(
+        dir,
+        MARKER_FILE,
+        &format!("{format}\n{REVISIONS_LINE}\n"),
+        footprints,
+    )
 }
 
 /// Name of the file each claimed endpoint directory holds while a restore

@@ -29,6 +29,8 @@ coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-h
 coordinode-raft = { workspace = true }
 # A store 0.10.1 wrote, migrated, is opened as an application opens it.
 coordinode-embed = { workspace = true }
+# A tree as 0.10.1 left it, written and read back raw.
+lsm-tree = { workspace = true }
 openraft = { workspace = true }
 tempfile = { workspace = true }
 

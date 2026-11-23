@@ -1,15 +1,22 @@
 //! A store released 0.10.1 wrote is brought to this build and opens as an
 //! application opens it, with every record it held.
 //!
-//! The fixture is the directory the 0.10.1 embedded quickstart left after
-//! one run: an account with a unique email and its wallet, written in one
-//! transaction, and a run counter node.
+//! The fixtures are directories the released 0.10.1 engine wrote:
+//! `embedded-0.10.1`, the embedded quickstart after one run (an account with
+//! a unique email and its wallet, written in one transaction, and a run
+//! counter node); `embedded-0.10.1-receipts`, a unique account, two probe
+//! nodes committed one after the other and a refused write, the journal
+//! holding every write; `embedded-0.10.1-settled`, the same compacted with
+//! no retention window, every version settled, the journal still whole. The
+//! last two carry a file `receipts`: each probe's key, node id and the
+//! commit its write returned.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_embed::{Database, DatabaseError};
 
@@ -27,12 +34,53 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
 fn int(db: &mut Database, query: &str) -> i64 {
     let rows = db.execute_cypher(query).expect("query");
     match rows.first().and_then(|row| row.values().next()) {
         Some(Value::Int(n)) => *n,
         other => panic!("{query}: {other:?}"),
     }
+}
+
+/// A fixture with receipts migrated into a fresh directory: the data
+/// directory and each probe's node and commit, by key.
+fn migrated(name: &str, dir: &Path) -> (PathBuf, HashMap<String, (NodeId, u64)>) {
+    let data = dir.join("data");
+    copy_dir(&fixture(name).join("data"), &data);
+    let receipts = std::fs::read_to_string(fixture(name).join("receipts")).expect("receipts");
+    let receipts = receipts
+        .lines()
+        .map(|line| {
+            let mut fields = line.split(' ');
+            let key = fields.next().expect("key").to_owned();
+            let id: u64 = fields.next().expect("id").parse().expect("id");
+            let commit: u64 = fields.next().expect("commit").parse().expect("commit");
+            (key, (NodeId::from_raw(id), commit))
+        })
+        .collect();
+    coordinode_migrate::apply(&data, "run1").expect("migrate");
+    (data, receipts)
+}
+
+/// The unique email of the fixtures holds: a held value is refused, a new
+/// one taken.
+fn unique_holds(db: &mut Database, held: &str, new: &str) {
+    let mut params = HashMap::new();
+    params.insert("email".to_string(), Value::String(held.into()));
+    assert!(matches!(
+        db.execute_cypher_with_params("CREATE (:Account {email: $email})", params),
+        Err(DatabaseError::UniqueViolation { .. })
+    ));
+    let mut params = HashMap::new();
+    params.insert("email".to_string(), Value::String(new.into()));
+    db.execute_cypher_with_params("CREATE (:Account {email: $email})", params)
+        .expect("a new value");
 }
 
 /// Migrated, the 0.10.1 store opens with its run, its account and wallet,
@@ -43,10 +91,7 @@ fn int(db: &mut Database, query: &str) -> i64 {
 fn a_store_0_10_1_wrote_opens_whole() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data = dir.path().join("data");
-    copy_dir(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/embedded-0.10.1"),
-        &data,
-    );
+    copy_dir(&fixture("embedded-0.10.1"), &data);
     assert!(
         Database::open(&data).is_err(),
         "this build refuses the store as 0.10.1 left it"
@@ -103,112 +148,96 @@ fn a_store_0_10_1_wrote_opens_whole() {
     assert!(again.iter().all(|(_, f)| f.is_empty()));
 }
 
-/// The commit of every version the journal still holds is kept: the node
-/// 0.10.1 wrote keeps the version of its write, and a conditional write on
-/// it lands.
+/// Every version the journal proves keeps exactly the commit its write
+/// returned: two probes written one after the other read back their own
+/// receipts. A conditional write on one lands; the new write has its own
+/// version, which stands after a reopen, where the old one is stale.
 #[test]
-fn a_version_the_journal_proves_is_kept() {
+fn a_version_the_journal_proves_keeps_its_receipt() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join("data");
-    copy_dir(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/embedded-0.10.1"),
-        &data,
-    );
-    coordinode_migrate::apply(&data, "run1").expect("migrate");
-    let mut db = Database::open(&data).expect("open the migrated store");
-    let id = int(&mut db, "MATCH (r:QuickstartRun) RETURN id(r) AS n");
-    let node = coordinode_core::graph::node::NodeId::from_raw(id as u64);
-    let version = db
-        .node_version(node)
-        .expect("the journal proves the node's write")
-        .expect("the node is there");
-    assert!(version > 0);
+    let (data, receipts) = migrated("embedded-0.10.1-receipts", dir.path());
+    let (a, c1) = receipts["a"];
+    let (b, c2) = receipts["b"];
+    assert!(c1 < c2);
+
+    let db = Database::open(&data).expect("open the migrated store");
+    assert_eq!(db.node_version(a).expect("version"), Some(c1));
+    assert_eq!(db.node_version(b).expect("version"), Some(c2));
     let tx = db.begin_transaction().expect("begin");
-    db.execute_in_transaction(tx, "MATCH (r:QuickstartRun) SET r.again = true", None)
+    db.execute_in_transaction(tx, "MATCH (p:Probe {k: 'a'}) SET p.v = 10", None)
         .expect("statement");
-    db.expect_node_version(tx, node, Some(version))
+    db.expect_node_version(tx, a, Some(c1))
         .expect("state the condition");
     db.commit_transaction(tx)
         .expect("the kept version is current");
-    let written = db.node_version(node).expect("version").expect("there");
-    assert!(written > version, "the new write has its own version");
+    let written = db.node_version(a).expect("version").expect("there");
+    assert!(written > c2, "the new write has its own version");
+    assert_eq!(db.node_version(b).expect("version"), Some(c2));
     drop(db);
 
-    // Reopened: the version stands, the old one is stale, the index serves.
     let mut db = Database::open(&data).expect("reopen");
-    assert_eq!(db.node_version(node).expect("version"), Some(written));
+    assert_eq!(db.node_version(a).expect("version"), Some(written));
     let tx = db.begin_transaction().expect("begin");
-    db.execute_in_transaction(tx, "MATCH (r:QuickstartRun) SET r.stale = true", None)
+    db.execute_in_transaction(tx, "MATCH (p:Probe {k: 'a'}) SET p.v = 11", None)
         .expect("statement");
-    db.expect_node_version(tx, node, Some(version))
+    db.expect_node_version(tx, a, Some(c1))
         .expect("state the condition");
     assert!(matches!(
         db.commit_transaction(tx),
         Err(DatabaseError::RevisionMismatch { current, .. }) if current == Some(written)
     ));
-    db.execute_cypher("CREATE (:Account {email: 'bob@example.com'})")
-        .expect("a new value");
-    assert_eq!(int(&mut db, "MATCH (a:Account) RETURN count(a) AS n"), 2);
+    unique_holds(&mut db, "alice@example.com", "bob@example.com");
 }
 
-/// With the journal past what wrote them, no version 0.10.1 wrote is known:
-/// the store still opens and reads every record as it was, a conditional
-/// write on a record of unknown version is refused without writing, and a
-/// write replacing it gives it a version of its own.
+/// A store whose every version a compaction settled, its journal still
+/// whole, proves no commit: each record reads as it was, a conditional write
+/// on one is refused with nothing of its transaction applied, a write
+/// replacing it gives it a version of its own, and the unique index serves
+/// writes, before and after a reopen.
 #[test]
-fn a_version_nothing_proves_is_unknown() {
+fn a_settled_version_is_unknown() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join("data");
-    copy_dir(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/embedded-0.10.1"),
-        &data,
-    );
-    std::fs::remove_dir_all(data.join("oplog")).expect("lose the journal");
-    coordinode_migrate::apply(&data, "run1").expect("migrate");
+    let (data, receipts) = migrated("embedded-0.10.1-settled", dir.path());
+    let (a, _) = receipts["a"];
+    let (b, _) = receipts["b"];
+
     let mut db = Database::open(&data).expect("open the migrated store");
     assert_eq!(
-        int(
-            &mut db,
-            "MATCH (a:Account {email: 'alice-1@example.com'})-[:OWNS]->(w:Wallet) \
-             RETURN w.balance AS b"
-        ),
-        100
+        int(&mut db, "MATCH (p:Probe {k: 'b'}) RETURN p.v AS v"),
+        2,
+        "the record reads as it was"
     );
-    let id = int(&mut db, "MATCH (r:QuickstartRun) RETURN id(r) AS n");
-    let node = coordinode_core::graph::node::NodeId::from_raw(id as u64);
-    assert!(matches!(
-        db.node_version(node),
-        Err(DatabaseError::RevisionUnavailable { .. })
-    ));
+    for node in [a, b] {
+        assert!(matches!(
+            db.node_version(node),
+            Err(DatabaseError::RevisionUnavailable { .. })
+        ));
+    }
     let tx = db.begin_transaction().expect("begin");
-    db.execute_in_transaction(tx, "MATCH (r:QuickstartRun) SET r.refused = true", None)
+    db.execute_in_transaction(tx, "MATCH (p:Probe {k: 'a'}) SET p.v = 10", None)
         .expect("statement");
     db.execute_in_transaction(tx, "CREATE (:SideEffect)", None)
         .expect("statement");
-    db.expect_node_version(tx, node, Some(1))
+    db.expect_node_version(tx, a, Some(1))
         .expect("state the condition");
     assert!(matches!(
         db.commit_transaction(tx),
         Err(DatabaseError::RevisionUnavailable { .. })
     ));
     assert_eq!(int(&mut db, "MATCH (s:SideEffect) RETURN count(s) AS n"), 0);
+    assert_eq!(int(&mut db, "MATCH (p:Probe {k: 'a'}) RETURN p.v AS v"), 1);
 
-    db.execute_cypher("MATCH (r:QuickstartRun) SET r.replaced = true")
+    db.execute_cypher("MATCH (p:Probe {k: 'a'}) SET p.v = 12")
         .expect("a write replaces the record");
-    assert!(db.node_version(node).expect("version").is_some());
+    let written = db.node_version(a).expect("version").expect("there");
+    unique_holds(&mut db, "alice@example.com", "bob@example.com");
+    drop(db);
 
-    // The unique index whose definition the open wrote again serves
-    // writes: a new value is taken, a held one refused.
-    db.execute_cypher("CREATE (:Account {email: 'bob@example.com'})")
-        .expect("a new value");
-    let mut params = HashMap::new();
-    params.insert(
-        "email".to_string(),
-        Value::String("alice-1@example.com".into()),
-    );
+    let mut db = Database::open(&data).expect("reopen");
+    assert_eq!(db.node_version(a).expect("version"), Some(written));
     assert!(matches!(
-        db.execute_cypher_with_params("CREATE (:Account {email: $email})", params),
-        Err(DatabaseError::UniqueViolation { .. })
+        db.node_version(b),
+        Err(DatabaseError::RevisionUnavailable { .. })
     ));
-    assert_eq!(int(&mut db, "MATCH (a:Account) RETURN count(a) AS n"), 2);
+    unique_holds(&mut db, "bob@example.com", "carol@example.com");
 }

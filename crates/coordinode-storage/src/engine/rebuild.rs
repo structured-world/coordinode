@@ -279,7 +279,25 @@ pub fn rewrite_tree_values(
             path: taken.display().to_string(),
         });
     }
-    let target = config.tree_config_at(part, to, counter(), routing).open()?;
+    // The new tree starts past every seqno the source holds, and its clear
+    // refuses every snapshot below that until the history is in and its
+    // floor lowered to the source's: no read of it, now or after a crash
+    // mid-way, is answered from history the source did not serve.
+    let past = source
+        .get_highest_seqno()
+        .map_or(0, |highest| highest + 1)
+        .max(source.retention_floor() + 1);
+    let target = config
+        .tree_config_at(
+            part,
+            to,
+            lsm_tree::SharedSequenceNumberGenerator::from(lsm_tree::SequenceNumberCounter::new(
+                past,
+            )),
+            routing,
+        )
+        .open()?;
+    target.clear()?;
     let flush = |tree: &AnyTree| -> StorageResult<()> {
         let lock = tree.get_flush_lock();
         tree.rotate_memtable();
@@ -333,12 +351,15 @@ pub fn rewrite_tree_values(
     }
     flush(&target)?;
     target.sync_devices()?;
-    let floor = source.retention_floor();
-    if floor < target.retention_floor() {
-        target.lower_retention_floor(floor)?;
-    }
+    // The clear left the floor at `past`, at or above the source's: lowered
+    // to exactly the source's, whichever the source's is.
+    target.lower_retention_floor(source.retention_floor())?;
     Ok(rewritten)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests;
 
 /// Write one event of a tree's history into `tree` at its original seqno.
 /// Returns the bytes the write added and the memtable's size after it.
