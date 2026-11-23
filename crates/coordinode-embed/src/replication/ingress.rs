@@ -168,9 +168,10 @@ impl Ingress {
             Admission::Forward(leader) => return self.route(leader, statement).await,
             Admission::ForwardRead(forward) => {
                 match self.forward_read(forward, statement.clone()).await {
-                    // Proven not sent: the read is served here after all,
-                    // waiting what is left of its budget, never routed on.
-                    Err(DatabaseError::PeerUnreachable { .. }) => {
+                    // Proven not run there (unreachable, or no room for it):
+                    // the read is served here after all, waiting what is left
+                    // of its budget, never routed on.
+                    Err(DatabaseError::PeerUnreachable { .. } | DatabaseError::MemberBusy) => {
                         self.admitter
                             .admit_unsent(&statement.query, &statement.requested, &forward)
                             .await?

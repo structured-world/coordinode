@@ -47,6 +47,37 @@ fn fresh_read(
     }
 }
 
+/// A target with no room for the read did not run it, as one the member could
+/// not reach did not: the member it arrived at waits for it there with what
+/// is left of its wait, and answers as that wait ends, not with the target's
+/// busy refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_its_target_has_no_room_for_waits_where_it_arrived() {
+    use coordinode_embed::replication::routing::{CommandSlots, SlotCount};
+    let one = SlotCount::new(1).unwrap();
+    let slots = CommandSlots::new(one, one);
+    let members = members::three_members_with_leader_slots(Some(slots.clone())).await;
+    // The leader's one place is taken.
+    let _held = slots.take().expect("the leader's one place");
+
+    let mut near = client(members[2].1).await;
+    let started = Instant::now();
+    let refused = near
+        .execute_cypher(coordinode_test_fixtures::client::named(fresh_read(
+            u64::MAX / 2,
+            replication::ReadPreference::Nearest,
+            700,
+        )))
+        .await
+        .expect_err("no member meets the bound");
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(600),
+        "waited out here: {:?}",
+        started.elapsed()
+    );
+}
+
 /// A TCP relay in front of `upstream` that holds every chunk it carries,
 /// either way, for `delay`: an endpoint the fixture makes far away. Returns
 /// the port it listens on.

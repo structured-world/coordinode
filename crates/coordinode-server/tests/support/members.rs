@@ -43,6 +43,18 @@ pub struct Node {
 /// listens on the port given with it and adds it as a learner; without one
 /// it founds a group.
 pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -> Node {
+    open_node_limited(node_id, port, founder, None).await
+}
+
+/// [`open_node`] whose clients' commands and the commands other members
+/// route to it share `slots`, as a deployed member's `commands_max` makes
+/// them; unbounded without.
+pub async fn open_node_limited(
+    node_id: u64,
+    port: u16,
+    founder: Option<(&Node, u16)>,
+    slots: Option<coordinode_embed::replication::routing::CommandSlots>,
+) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -159,16 +171,23 @@ pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -
         Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap(),
     ));
 
-    let executor = StatementExecutor::new(Arc::clone(&db)).with_raft_node(Arc::clone(&raft));
+    let mut executor = StatementExecutor::new(Arc::clone(&db)).with_raft_node(Arc::clone(&raft));
+    if let Some(slots) = slots.clone() {
+        executor = executor.with_command_slots(slots);
+    }
     let cypher = CypherServiceImpl::from_executor(executor.clone());
     let operations = OperationServiceImpl::new(executor.clone());
     let sessions = SessionSvc::new(executor.clone(), Arc::new(SessionRegistry::new()))
         .with_cluster(Arc::clone(&raft))
         .with_change_streams(cdc);
     // What a member passes its clients' commands to the leader through.
-    let routing =
-        CommandRoutingHandler::new(Arc::new(ServerCommandExecutor::new(executor.clone())))
-            .into_service(MAX_ROUTED_MESSAGE);
+    let handler =
+        CommandRoutingHandler::new(Arc::new(ServerCommandExecutor::new(executor.clone())));
+    let routing = match slots {
+        Some(slots) => handler.sharing(slots),
+        None => handler,
+    }
+    .into_service(MAX_ROUTED_MESSAGE);
 
     let context = Arc::clone(raft.connections().unwrap().context());
     serve_member_listener(
@@ -199,8 +218,16 @@ pub async fn open_node(node_id: u64, port: u16, founder: Option<(&Node, u16)>) -
 /// A flat group of three: member 1 leads, members 2 and 3 follow. Returns
 /// them with the ports they serve on.
 pub async fn three_members() -> Vec<(Node, u16)> {
+    three_members_with_leader_slots(None).await
+}
+
+/// [`three_members`] whose leader runs its commands, its clients' and the
+/// routed ones, in `slots`.
+pub async fn three_members_with_leader_slots(
+    slots: Option<coordinode_embed::replication::routing::CommandSlots>,
+) -> Vec<(Node, u16)> {
     let ports = [alloc_port(), alloc_port(), alloc_port()];
-    let n1 = open_node(1, ports[0], None).await;
+    let n1 = open_node_limited(1, ports[0], None, slots).await;
     let n2 = open_node(2, ports[1], Some((&n1, ports[0]))).await;
     let n3 = open_node(3, ports[2], Some((&n1, ports[0]))).await;
     n1.raft.change_membership(vec![1, 2, 3]).await.unwrap();

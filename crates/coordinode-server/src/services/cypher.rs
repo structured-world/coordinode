@@ -1446,9 +1446,10 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                     .await
                 {
                     Ok(answer) => return Ok(routed_response(answer, start, executor.history())),
-                    // Proven not sent: served here after all, with what is
-                    // left of its wait, and never routed on.
-                    Err(DatabaseError::PeerUnreachable { .. }) => {
+                    // Proven not run there (unreachable, or no room for it):
+                    // served here after all, with what is left of its wait,
+                    // and never routed on.
+                    Err(DatabaseError::PeerUnreachable { .. } | DatabaseError::MemberBusy) => {
                         let admitted = executor
                             .admit_unsent(&req.query, &requested, &forward)
                             .await

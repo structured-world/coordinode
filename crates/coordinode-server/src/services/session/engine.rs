@@ -449,7 +449,9 @@ impl CursorEngine for DatabaseCursorEngine {
                             })))
                                 as Box<dyn PreparedStatement>);
                         }
-                        Err(DatabaseError::PeerUnreachable { .. }) => {
+                        // Proven not run there (unreachable, or no room for
+                        // it): served here with what is left of its wait.
+                        Err(DatabaseError::PeerUnreachable { .. } | DatabaseError::MemberBusy) => {
                             let admitted = engine
                                 .executor
                                 .admit_unsent(&call.query, &requested, &forward)
@@ -681,9 +683,12 @@ impl DatabaseCursorEngine {
                             history: self.executor.history(),
                         }));
                     }
-                    Err(DatabaseError::PeerUnreachable { .. }) => runtime
-                        .block_on(self.executor.admit_unsent(query, requested, &forward))
-                        .map_err(engine_error)?,
+                    // As above: not run there, served here.
+                    Err(DatabaseError::PeerUnreachable { .. } | DatabaseError::MemberBusy) => {
+                        runtime
+                            .block_on(self.executor.admit_unsent(query, requested, &forward))
+                            .map_err(engine_error)?
+                    }
                     Err(e) => return Err(engine_error(e)),
                 }
             }
