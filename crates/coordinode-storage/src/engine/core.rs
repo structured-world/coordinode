@@ -415,6 +415,18 @@ pub struct Deployment {
     /// Journal indices held while a consumer registering at them publishes
     /// the floor that keeps them.
     journal_holds: crate::engine::oplog_journal::JournalHolds,
+    /// The decoded entries of each log the store's change feeds read, by the
+    /// log's directories: one per log, shared by its readers.
+    // no-std: spin::Mutex; taken once per read to find the log.
+    decoded_logs: parking_lot::Mutex<
+        rustc_hash::FxHashMap<Vec<PathBuf>, Arc<crate::engine::decoded_log::DecodedLog>>,
+    >,
+    /// Where each log a writer opened over this store starts, and its cut
+    /// count, as the writer publishes them, by directory.
+    // no-std: spin::Mutex; taken when a log opens and a feed first reads it.
+    log_floors: parking_lot::Mutex<rustc_hash::FxHashMap<PathBuf, crate::oplog::RetainedFloor>>,
+    /// The memory budget of every log's decoded entries.
+    decoded_memory: Arc<crate::engine::decoded_log::DecodedMemory>,
     /// Whether the store holds a consensus group's history (its log is bound
     /// to a group, or its trees hold entries of one), as found at open.
     group_history: bool,
@@ -2247,6 +2259,11 @@ impl Deployment {
             consumer_journal_floor: AtomicU64::new(if protections_pending { 0 } else { u64::MAX }),
             protections_pending: std::sync::atomic::AtomicBool::new(protections_pending),
             journal_holds: Default::default(),
+            decoded_logs: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
+            log_floors: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
+            decoded_memory: crate::engine::decoded_log::DecodedMemory::new(
+                crate::engine::decoded_log::DEFAULT_DECODED_BYTES,
+            ),
             group_history,
             me: std::sync::OnceLock::new(),
             opener,
@@ -5385,7 +5402,7 @@ impl Deployment {
                 "the store keeps no journal".into(),
             ));
         };
-        let (_hold, dir, until) = {
+        let (_hold, log, until) = {
             let journal = oplog
                 .lock()
                 .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
@@ -5398,9 +5415,124 @@ impl Deployment {
             }
             let hold = crate::engine::oplog_journal::JournalHold::take(&self.journal_holds, from);
             let until = journal.durable_below().min(coverage.applied_prefix());
-            (hold, journal.dir().to_path_buf(), until)
+            let log = self.decoded_log(
+                &[journal.dir().to_path_buf()],
+                Some(journal.retained_floor()),
+            );
+            (hold, log, until)
         };
-        self.change_read_log(&[dir], from, until, max_entries, budget)
+        self.change_read_of(&log, from, until, max_entries, budget)
+    }
+
+    /// The decoded entries of the log in `dirs`, shared by every change-feed
+    /// reader of it: made on first use, with `floor` when its writer is this
+    /// store's own journal, or with what the log's writer registered
+    /// ([`Self::register_log`]).
+    pub(crate) fn decoded_log(
+        &self,
+        dirs: &[PathBuf],
+        floor: Option<crate::oplog::RetainedFloor>,
+    ) -> Arc<crate::engine::decoded_log::DecodedLog> {
+        let mut key = dirs.to_vec();
+        key.sort();
+        let mut logs = self.decoded_logs.lock();
+        if let Some(log) = logs.get(&key) {
+            return Arc::clone(log);
+        }
+        let floor = floor.or_else(|| {
+            let floors = self.log_floors.lock();
+            dirs.iter().find_map(|dir| floors.get(dir).cloned())
+        });
+        let log = Arc::new(crate::engine::decoded_log::DecodedLog::new(
+            key.clone(),
+            floor,
+            Arc::clone(&self.decoded_memory),
+        ));
+        logs.insert(key, Arc::clone(&log));
+        log
+    }
+
+    /// Record that a writer of this store keeps a log in `dirs` and publishes
+    /// `floor` for it: where the log starts and how often it was cut back.
+    /// Change feeds reading the log then know a segment rewritten by a cut
+    /// from the one it replaced. Call it before any feed reads the log.
+    pub fn register_log(&self, dirs: &[PathBuf], floor: crate::oplog::RetainedFloor) {
+        let mut floors = self.log_floors.lock();
+        for dir in dirs {
+            floors.insert(dir.clone(), floor.clone());
+        }
+    }
+
+    /// Set how many bytes of decoded log entries the store holds for its
+    /// change feeds, across its logs (`cdc_buffer_bytes`). A lower target
+    /// lets go of the oldest held entries now; entries readers still hold
+    /// stay charged until they let go.
+    pub fn set_change_feed_cache_bytes(&self, bytes: usize) {
+        self.decoded_memory.set_target(bytes);
+        for log in self.decoded_logs.lock().values() {
+            log.trim();
+        }
+    }
+
+    /// The target of the decoded entries held for change feeds, and what
+    /// they take now, those only readers still hold included.
+    pub fn change_feed_cache_bytes(&self) -> (usize, usize) {
+        (self.decoded_memory.target(), self.decoded_memory.held())
+    }
+
+    /// The decoded entries of `log` from `from` below `until`, at most
+    /// `max_entries`: shared with every reader of the log, none charged to
+    /// `budget` but those the store cannot hold, which the read decodes
+    /// within what `budget` has left and keeps charged through the returned
+    /// charge.
+    fn change_read_of<'b>(
+        &self,
+        log: &crate::engine::decoded_log::DecodedLog,
+        from: u64,
+        until: u64,
+        max_entries: usize,
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> StorageResult<(
+        crate::engine::change_feed::ChangeRead,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
+        let mut charge = budget.empty_charge();
+        let (entries, next) = if from < until && max_entries > 0 {
+            // What the read itself holds while it runs, as a read of the log
+            // always did: a segment's read buffer, the one path it holds, and
+            // a point read of the deployment's records deciding a unit's
+            // operation binding (a marker of an empty value under a short key).
+            let marker = crate::engine::operations::skipped_unit_key(
+                coordinode_core::txn::operation::LogPosition { index: 0, sub: 0 },
+            )
+            .len() as u64;
+            let (fixed, per_record_byte) =
+                scan_hold_terms(self.system_tree(Partition::Deployment)?);
+            // Runs are bounded by the tree's levels: far below u64::MAX.
+            let working = crate::oplog::segment::FRAME_CURSOR_BUFFER as u64
+                + READER_PATH_ROOM
+                + fixed
+                + per_record_byte * marker;
+            charge.grow(working).map_err(StorageError::Budget)?;
+            let read = log.read(
+                self,
+                from,
+                until,
+                max_entries,
+                &mut crate::engine::decoded_log::Reader {
+                    budget,
+                    charge: &mut charge,
+                },
+            );
+            charge.shrink(working);
+            read?
+        } else {
+            (Vec::new(), from)
+        };
+        Ok((
+            crate::engine::change_feed::ChangeRead { entries, next },
+            charge,
+        ))
     }
 
     /// [`Self::change_read`] over the log segments in `dirs`, from `from` up
@@ -5422,20 +5554,8 @@ impl Deployment {
         crate::engine::change_feed::ChangeRead,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
-        let mut units = Vec::new();
-        let (next, charge) = self.read_log_units(
-            dirs,
-            from,
-            until,
-            max_entries,
-            budget,
-            &mut units,
-            |entry, pool, units| self.change_units_of_entry(entry, pool, units),
-        )?;
-        Ok((
-            crate::engine::change_feed::ChangeRead { units, next },
-            charge,
-        ))
+        let log = self.decoded_log(dirs, None);
+        self.change_read_of(&log, from, until, max_entries, budget)
     }
 
     /// A change cursor at `position` of this store's journal, for
@@ -5559,50 +5679,23 @@ impl Deployment {
         Ok((batch, charge))
     }
 
-    /// The batch a reader at `cursor` receives for `entries`, the log
-    /// entries from its position on as stored (unit frames whole, see
-    /// [`crate::oplog::tailer::OplogTailer::keeping_frames`]), read once for
-    /// every reader, with `next` the position after the last of them. The
-    /// entries are projected here for this reader's interest; a unit refused
-    /// by its operation binding has no events. The events are charged to
-    /// `budget`, the batch stopping inside a unit when it is spent, and keep
-    /// their memory charged through the returned charge.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::read_changes`], for the units the entries carry.
-    pub fn changes_of_entries<'e, 'b>(
-        &self,
-        cursor: &crate::engine::change_feed::ChangeCursor,
-        entries: impl IntoIterator<Item = &'e crate::oplog::entry::OplogEntry>,
-        next: u64,
-        budget: &'b coordinode_core::budget::QueryBudget,
-    ) -> StorageResult<(
-        crate::engine::change_feed::ChangeBatch,
-        coordinode_core::budget::MemoryCharge<'b>,
-    )> {
-        self.changes_of_entries_encoded(
-            cursor,
-            entries,
-            next,
-            budget,
-            &mut crate::engine::change_feed::Unencoded,
-        )
-    }
-
-    /// [`Self::changes_of_entries`] for a reader that holds its own form of
+    /// [`Self::read_changes_log`] for a reader that holds its own form of
     /// the batch with it, as `encoding` says what each unit and event of
     /// that form takes: the batch stops where the events and their form no
     /// longer fit the budget together, and the returned charge holds both.
+    /// The entries are decoded once for every reader of the log and shared;
+    /// only this reader's events and their form are charged to `budget`.
     ///
     /// # Errors
     ///
-    /// As [`Self::changes_of_entries`].
-    pub fn changes_of_entries_encoded<'e, 'b>(
+    /// As [`Self::read_changes_log`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_changes_log_encoded<'b>(
         &self,
         cursor: &crate::engine::change_feed::ChangeCursor,
-        entries: impl IntoIterator<Item = &'e crate::oplog::entry::OplogEntry>,
-        next: u64,
+        dirs: &[std::path::PathBuf],
+        until: u64,
+        max_entries: usize,
         budget: &'b coordinode_core::budget::QueryBudget,
         encoding: &mut impl crate::engine::change_feed::ChangeEncoding,
     ) -> StorageResult<(
@@ -5610,57 +5703,9 @@ impl Deployment {
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
         self.check_cursor_history(cursor)?;
-        // The entries are decoded within what the budget has left, the
-        // decoded units charged to it while the batch is projected from
-        // them: a read decodes no more than it can hold, and stops before an
-        // entry that does not fit, which the next read takes.
-        let mut charge = budget.empty_charge();
-        debug_assert!(budget.memory_used() <= budget.memory_limit());
-        // A budget refuses every reservation past its limit.
-        let room = budget.memory_limit() - budget.memory_used();
-        // The decoding's working memory is held before anything is decoded,
-        // and what the decoded units do not keep returns after.
-        charge.grow(room).map_err(StorageError::Budget)?;
-        let mut pool = crate::engine::fixed_cut::EntryPool::new(room);
-        let mut units = Vec::new();
-        let mut read_to = next;
-        for entry in entries {
-            let before = units.len();
-            match self.change_units_of_entry(&entry.borrowed(), &mut pool, &mut units) {
-                Ok(()) => {}
-                Err(EntryOutcome::NoRoom) if entry.index > cursor.position() => {
-                    units.truncate(before);
-                    read_to = entry.index;
-                    break;
-                }
-                Err(EntryOutcome::NoRoom) => {
-                    return Err(StorageError::Budget(
-                        coordinode_core::budget::BudgetStop::Memory {
-                            requested: 0,
-                            used: budget.memory_used(),
-                            limit: budget.memory_limit(),
-                        },
-                    ));
-                }
-                Err(EntryOutcome::Failed(e)) => return Err(e),
-                Err(EntryOutcome::Unreadable) => {
-                    return Err(StorageError::Serialization(format!(
-                        "entry {} cannot be read",
-                        entry.index
-                    )));
-                }
-            }
-        }
-        let decoded = pool.kept();
-        charge.shrink(room - decoded);
-        let read = crate::engine::change_feed::ChangeRead {
-            units,
-            next: read_to,
-        };
+        let (read, mut charge) =
+            self.change_read_log(dirs, cursor.position(), until, max_entries, budget)?;
         let batch = Self::batch_of(cursor, &read, &mut charge, encoding)?;
-        // The decoded units go with the read; the batch keeps its events.
-        drop(read);
-        charge.shrink(decoded);
         Ok((batch, charge))
     }
 
@@ -5686,7 +5731,7 @@ impl Deployment {
     ) -> StorageResult<crate::engine::change_feed::ChangeBatch> {
         use crate::engine::change_feed::{ChangeBatch, ChangeCursor, ReadPlace, unit_changes};
         let (units, stopped) = unit_changes(
-            &read.units,
+            read.units(),
             cursor.interest(),
             ReadPlace {
                 entry: cursor.position(),
@@ -5711,7 +5756,7 @@ impl Deployment {
     /// to `units`, each decoded within what is left of `pool`. A data change
     /// recorded outside a unit carries no effect context and cannot be
     /// projected, so it fails the read rather than vanish from the feed.
-    fn change_units_of_entry(
+    pub(crate) fn change_units_of_entry(
         &self,
         entry: &crate::oplog::OplogEntryRef<'_>,
         pool: &mut crate::engine::fixed_cut::EntryPool,
@@ -11543,7 +11588,7 @@ struct RepairMarks {
 }
 
 /// Why one log entry of a cut's continuation was not taken.
-enum EntryOutcome {
+pub(crate) enum EntryOutcome {
     /// It does not fit what is left of the read's budget.
     NoRoom,
     /// Its frame does not hold together: a purge or a rewrite raced the read,

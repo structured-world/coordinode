@@ -268,15 +268,23 @@ pub(crate) fn grow_within<T>(v: &mut Vec<T>, room: &mut impl Room) -> bool {
     true
 }
 
-/// A read of the journal for a change feed: its units in log order, and the
-/// position the next read starts at.
-#[derive(Debug, Clone, PartialEq)]
+/// A read of the journal for a change feed: its entries, decoded once for
+/// every reader of the log and shared, in log order, and the position the
+/// next read starts at.
+#[derive(Debug, Clone)]
 pub struct ChangeRead {
-    /// The units of the entries read, in log order.
-    pub units: Vec<ChangeUnit>,
+    /// The entries read, in log order.
+    pub entries: Vec<std::sync::Arc<crate::engine::decoded_log::DecodedEntry>>,
     /// The position after the last entry read; where the read started when
     /// the journal held nothing more yet.
     pub next: u64,
+}
+
+impl ChangeRead {
+    /// The units of the entries read, in log order.
+    pub fn units(&self) -> impl Iterator<Item = &ChangeUnit> {
+        self.entries.iter().flat_map(|entry| entry.units())
+    }
 }
 
 /// Most keys one run of point deletes may stand for: no unit holds more
@@ -2448,8 +2456,8 @@ impl Room for BlockCharge<'_, '_> {
 /// [`StorageError::ChangeFeedUnsupported`] for a unit the feed cannot
 /// project, [`StorageError::Serialization`] for a malformed one, and
 /// [`StorageError::Budget`] as above.
-pub(crate) fn unit_changes(
-    units: &[ChangeUnit],
+pub(crate) fn unit_changes<'u>(
+    units: impl IntoIterator<Item = &'u ChangeUnit>,
     interest: &Interest,
     from: ReadPlace,
     charge: &mut coordinode_core::budget::MemoryCharge<'_>,

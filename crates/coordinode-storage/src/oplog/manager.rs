@@ -209,24 +209,53 @@ const NO_SEGMENT: u64 = u64::MAX;
 /// A segment is published once its file exists and unpublished once it is
 /// removed, so between the two a reader can see a floor lower than the disk
 /// holds, never a higher one.
+///
+/// It also publishes how many times the log was cut back: a cut removes
+/// entries whose indices, and the very segment names that held them, a later
+/// append takes again with other contents, so what a reader learned of a
+/// segment before a cut does not describe the one under that name after it.
 #[derive(Clone, Debug)]
-pub struct RetainedFloor(Arc<AtomicU64>);
+pub struct RetainedFloor(Arc<FloorState>);
+
+#[derive(Debug)]
+struct FloorState {
+    first: AtomicU64,
+    cuts: AtomicU64,
+}
 
 impl RetainedFloor {
     fn new(first: Option<u64>) -> Self {
-        Self(Arc::new(AtomicU64::new(first.unwrap_or(NO_SEGMENT))))
+        Self(Arc::new(FloorState {
+            first: AtomicU64::new(first.unwrap_or(NO_SEGMENT)),
+            cuts: AtomicU64::new(0),
+        }))
     }
 
     /// The first index the log holds; `None` when it holds no segment.
     pub fn get(&self) -> Option<u64> {
-        match self.0.load(Ordering::Acquire) {
+        match self.0.first.load(Ordering::Acquire) {
             NO_SEGMENT => None,
             first => Some(first),
         }
     }
 
     fn set(&self, first: Option<u64>) {
-        self.0.store(first.unwrap_or(NO_SEGMENT), Ordering::Release);
+        self.0
+            .first
+            .store(first.unwrap_or(NO_SEGMENT), Ordering::Release);
+    }
+
+    /// How many times the log was cut back so far. A reader that took this
+    /// before reading a segment and finds it unchanged after read the
+    /// segment as no cut has rewritten it.
+    pub fn cuts(&self) -> u64 {
+        self.0.cuts.load(Ordering::Acquire)
+    }
+
+    /// Record a cut, before its first change to the segments: a reader whose
+    /// read overlaps it sees the count move.
+    fn cut(&self) {
+        self.0.cuts.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -960,6 +989,7 @@ impl OplogManager {
     /// Used when the whole log is retired; a log that keeps a prefix is cut
     /// with [`Self::truncate_from`] instead.
     pub fn truncate_all(&mut self) -> StorageResult<()> {
+        self.floor.cut();
         if self.current.is_some() {
             self.rotate()?;
         }
@@ -992,6 +1022,7 @@ impl OplogManager {
     /// Reading, cutting or removing a segment fails, or a directory cannot be
     /// synced.
     pub fn truncate_from(&mut self, from: u64) -> StorageResult<()> {
+        self.floor.cut();
         self.rotate()?;
         let mut touched_dirs: Vec<PathBuf> = Vec::new();
         let mut note_dir = |path: &Path| {

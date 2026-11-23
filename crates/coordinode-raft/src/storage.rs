@@ -1155,6 +1155,9 @@ impl LogStore {
         .with_sync_method(settings.sync_method)
         .with_footprints(footprints)
         .map_err(|e| io::Error::other(e.to_string()))?;
+        // The store's change feeds read this log: they learn where it starts
+        // and when a cut rewrites its segments from the log itself.
+        engine.register_log(&recovery_dirs, oplog.retained_floor());
 
         let last_purged = promises.purged;
         // The last entry in the segments; its recovery reads the last segment

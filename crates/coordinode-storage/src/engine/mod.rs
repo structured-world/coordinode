@@ -19,6 +19,7 @@ pub mod config;
 pub mod coordinator;
 pub mod core;
 pub(crate) mod coverage;
+pub mod decoded_log;
 pub mod fixed_cut;
 pub(crate) mod flush;
 pub mod footprint;

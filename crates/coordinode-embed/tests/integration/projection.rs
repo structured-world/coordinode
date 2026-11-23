@@ -13,7 +13,6 @@ use coordinode_embed::changes::{
     ChangeBatch, ChangeCursor, ChangeInterest, OwnedTarget, ProjectionTransaction, UnitChanges,
 };
 use coordinode_embed::{Database, DatabaseError};
-use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
 
 fn run(db: &mut Database, query: &str) {
     db.execute_cypher(query)
@@ -137,64 +136,30 @@ fn effects_and_progress_commit_together_and_once() {
 }
 
 /// The fragments of one source transaction, read as the stream service
-/// reads them: from the source's journal as stored, within `budget_bytes`
-/// of events a read, starting at `cursor`. Each with the cursor it was read
-/// from.
-fn fragments(
-    src: &Database,
-    src_dir: &std::path::Path,
-    cursor: &ChangeCursor,
-) -> Vec<(ChangeCursor, ChangeBatch)> {
-    let mut tailer = OplogTailer::new(
-        &[src_dir.join("oplog").join("0")],
-        ResumeToken::from_start(0),
-    )
-    .expect("tailer")
-    .keeping_frames();
-    let entries: Vec<_> = tailer
-        .read_next(1_000, &CdcFilters::default(), u64::MAX)
-        .expect("entries")
-        .into_iter()
-        .map(|(entry, _)| entry)
-        .filter(|entry| entry.index >= cursor.position())
-        .collect();
-    let next = entries.last().expect("an entry").index + 1;
-    // The smallest budget every entry decodes within: what is left of it
-    // after the decoding does not hold the large transaction's events.
+/// reads them: from the source's journal, within the smallest budget a read
+/// from `cursor` keeps an event in, so the large transaction's events do not
+/// fit one read. Each with the cursor it was read from.
+fn fragments(src: &Database, cursor: &ChangeCursor) -> Vec<(ChangeCursor, ChangeBatch)> {
+    let read = |at: &ChangeCursor, bytes: u64| {
+        src.engine()
+            .read_changes(at, 1_000, &QueryBudget::new(bytes))
+            .map(|(batch, _charge)| batch)
+    };
     let budget_bytes = (1..)
         .map(|step| step * 500)
-        .find(|&bytes| {
-            entries.iter().all(|entry| {
-                src.engine()
-                    .changes_of_entries(
-                        &src.engine()
-                            .change_cursor_at(entry.index, cursor.interest().clone())
-                            .expect("cursor"),
-                        [entry],
-                        entry.index + 1,
-                        &QueryBudget::new(bytes),
-                    )
-                    .is_ok()
-            })
-        })
-        .expect("a budget the entries decode within");
+        .find(|&bytes| read(cursor, bytes).is_ok())
+        .expect("a budget a read keeps an event in");
     let mut out = Vec::new();
     let mut at = cursor.clone();
     loop {
-        let budget = QueryBudget::new(budget_bytes);
-        let (batch, _charge) = src
-            .engine()
-            .changes_of_entries(
-                &at,
-                entries.iter().filter(|e| e.index >= at.position()),
-                next,
-                &budget,
-            )
-            .expect("read");
+        let batch = read(&at, budget_bytes).expect("read");
         let moved = batch.cursor != at;
         let from = std::mem::replace(&mut at, batch.cursor.clone());
+        if batch.units.is_empty() {
+            return out;
+        }
         out.push((from, batch));
-        if !moved || at.position() >= next {
+        if !moved {
             return out;
         }
     }
@@ -210,7 +175,7 @@ fn a_transaction_in_fragments_takes_effect_whole() {
     let dst_dir = tempfile::tempdir().expect("tempdir");
     let mut src = source(src_dir.path());
     let start = linked_hub(&mut src);
-    let pieces = fragments(&src, src_dir.path(), &start);
+    let pieces = fragments(&src, &start);
     let staged_pieces = pieces
         .iter()
         .filter(|(_, batch)| batch.units.iter().any(|u| !u.completes_unit()))
@@ -372,7 +337,7 @@ fn a_fragment_after_a_skipped_one_is_refused() {
     let mut src = source(src_dir.path());
     let dst = Database::open(dst_dir.path()).expect("open destination");
     let start = linked_hub(&mut src);
-    let pieces = fragments(&src, src_dir.path(), &start);
+    let pieces = fragments(&src, &start);
     assert!(pieces.len() >= 3, "{} pieces", pieces.len());
     assert!(
         !pieces[0].1.units.iter().all(UnitChanges::completes_unit),

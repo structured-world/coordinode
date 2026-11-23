@@ -47,7 +47,6 @@ use coordinode_storage::engine::change_feed::{
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::error::StorageError;
-use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer};
 
 use super::error_details::{Reason, status_with_reason};
 use crate::proto::replication::cdc::{
@@ -86,32 +85,9 @@ pub struct ChangeEventServiceImpl {
     applied_changes: AppliedSignal,
     /// Read pacing of every stream.
     tuning: CdcStreamTuning,
-    /// The log reader every stream shares, made on the first subscription.
-    // no-std: spin::Mutex; taken once per subscription.
-    hub: parking_lot::Mutex<Option<Arc<CdcHub>>>,
 }
 
 impl ChangeEventServiceImpl {
-    /// The shard's shared log reader, made at the applied position on the
-    /// first call.
-    fn hub(&self) -> Result<Arc<CdcHub>, Status> {
-        let mut slot = self.hub.lock();
-        if let Some(hub) = slot.as_ref() {
-            return Ok(Arc::clone(hub));
-        }
-        let hub = Arc::new(
-            CdcHub::new(
-                &self.oplog_dirs,
-                self.shard_id,
-                (self.applied)(),
-                self.tuning.buffer_bytes,
-            )
-            .map_err(|e| Status::internal(format!("change stream reader: {e}")))?,
-        );
-        *slot = Some(Arc::clone(&hub));
-        Ok(hub)
-    }
-
     /// A service streaming shard `shard_id`'s Raft log, applied by `engine`,
     /// from `oplog_dirs` (see `coordinode_raft::storage::raft_oplog_dirs`),
     /// up to `applied`, which `applied_changes` signals moving.
@@ -131,14 +107,14 @@ impl ChangeEventServiceImpl {
             applied,
             applied_changes,
             tuning: CdcStreamTuning::default(),
-            hub: parking_lot::Mutex::new(None),
         }
     }
 
-    /// The same service pacing its streams by `tuning`.
-    pub fn with_tuning(mut self, tuning: CdcStreamTuning) -> Self {
-        self.tuning = tuning;
-        self
+    /// The same service pacing its streams by `tuning`; the store holds
+    /// `tuning.buffer_bytes` of decoded log entries for its streams.
+    pub fn with_tuning(self, tuning: CdcStreamTuning) -> Self {
+        self.engine.set_change_feed_cache_bytes(tuning.buffer_bytes);
+        Self { tuning, ..self }
     }
 
     /// A service streaming shard 0's Raft log of `node`, whose store is
@@ -549,8 +525,6 @@ impl ChangeEventServiceImpl {
             }
         };
 
-        let hub = self.hub()?;
-        let reader = hub.reader(cursor.position());
         let incarnation = handle.incarnation();
         tokio::spawn(stream_consumer(StreamState {
             engine,
@@ -558,9 +532,7 @@ impl ChangeEventServiceImpl {
             registry,
             handle,
             cursor,
-            hub,
-            reader: Some(reader),
-            own_tailer: None,
+            oplog_dirs: Arc::from(self.oplog_dirs.as_slice()),
             slot: Arc::new(Semaphore::new(1)),
             delivery,
             applied: Arc::clone(&self.applied),
@@ -650,13 +622,9 @@ struct StreamState {
     watch: RegistrationWatch,
     /// Where the stream reads next.
     cursor: ChangeCursor,
-    /// The shard's shared reader of the log.
-    hub: Arc<CdcHub>,
-    /// The stream's registration with the hub; out of the state only while a
-    /// read holds it.
-    reader: Option<HubReader>,
-    /// Reads the log while the stream is behind what the hub holds.
-    own_tailer: Option<OplogTailer>,
+    /// The directories of the log the stream reads, through the entries the
+    /// store decodes once for every stream of it.
+    oplog_dirs: Arc<[PathBuf]>,
     /// The one batch of the stream on its way: taken before a read, held by
     /// the batch until the transport takes it. A stream holds one read's
     /// memory at a time, the batch it builds or the one it sent.
@@ -726,57 +694,38 @@ async fn stream_consumer(mut s: StreamState) {
 
         let read_from = s.cursor.position();
         let until = (s.applied)();
-        let Some(reader) = s.reader.take() else {
-            break;
-        };
         let read = {
             let engine = Arc::clone(&s.engine);
-            let hub = Arc::clone(&s.hub);
+            let dirs = Arc::clone(&s.oplog_dirs);
             let cursor = s.cursor.clone();
-            let mut tailer = s.own_tailer.take();
             let read_bytes = s.tuning.buffer_bytes as u64;
             tokio::task::spawn_blocking(move || {
-                let read = read_entries(&hub, &reader, &mut tailer, read_from, room, until)
-                    .and_then(|(entries, next)| {
-                        // What one read holds, its batch, the label names it
-                        // needs and the batch's wire form together: a unit
-                        // larger than this goes out in fragments, the cursor
-                        // continuing inside it.
-                        let budget = QueryBudget::new(read_bytes);
-                        let mut names = ReadNames::default();
-                        let mut form = ProtoForm::new(&engine, &mut names, &cursor);
-                        let read = engine.changes_of_entries_encoded(
-                            &cursor,
-                            entries.iter().map(|e| &**e),
-                            next,
-                            &budget,
-                            &mut form,
-                        );
-                        // A name that could not be read stopped the read: its
-                        // cause is the read's, whatever the read made of the
-                        // stop.
-                        if let Some(failed) = form.failed.take() {
-                            return Err(failed);
-                        }
-                        let (batch, charge) = read?;
-                        hub.passed(&reader, batch.cursor.position());
-                        let proto = batch_to_proto(&batch, &names)?;
-                        // The wire form goes on alone, in the stream's slot.
-                        let cursor = batch.cursor.clone();
-                        drop((batch, names));
-                        drop(charge);
-                        Ok((proto, cursor))
-                    });
-                (read, reader, tailer)
+                // What one read holds, its batch, the label names it needs
+                // and the batch's wire form together: a unit larger than this
+                // goes out in fragments, the cursor continuing inside it. The
+                // log's entries are decoded once for every stream and shared.
+                let budget = QueryBudget::new(read_bytes);
+                let mut names = ReadNames::default();
+                let mut form = ProtoForm::new(&engine, &mut names, &cursor);
+                let read = engine
+                    .read_changes_log_encoded(&cursor, &dirs, until, room, &budget, &mut form);
+                // A name that could not be read stopped the read: its cause
+                // is the read's, whatever the read made of the stop.
+                if let Some(failed) = form.failed.take() {
+                    return Err(failed);
+                }
+                let (batch, charge) = read?;
+                let proto = batch_to_proto(&batch, &names)?;
+                // The wire form goes on alone, in the stream's slot.
+                let cursor = batch.cursor.clone();
+                drop((batch, names));
+                drop(charge);
+                Ok((proto, cursor))
             })
             .await
         };
         let read = match read {
-            Ok((read, reader, tailer)) => {
-                s.reader = Some(reader);
-                s.own_tailer = tailer;
-                read
-            }
+            Ok(read) => read,
             Err(e) => {
                 s.delivery
                     .fail(Status::internal(format!("change stream read: {e}")))
@@ -838,39 +787,6 @@ async fn stream_consumer(mut s: StreamState) {
                     () = heartbeat => {}
                 },
             }
-        }
-    }
-}
-
-/// The next entries from `position` below `until`, at most `max`, as stored:
-/// from the shard's hub, or from the log itself while the stream is behind
-/// what the hub holds. Returns them and the position after the last one.
-fn read_entries(
-    hub: &CdcHub,
-    reader: &HubReader,
-    own_tailer: &mut Option<OplogTailer>,
-    position: u64,
-    max: usize,
-    until: u64,
-) -> Result<(Vec<SharedEntry>, u64), StorageError> {
-    match hub.read(reader, position, max, until)? {
-        HubRead::Entries { entries, next } => {
-            *own_tailer = None;
-            Ok((entries, next))
-        }
-        HubRead::Behind(base) => {
-            // A tailer that has passed `position` is not reused: a read that
-            // stopped inside an entry reads that entry again.
-            let tailer = match own_tailer {
-                Some(tailer) if tailer.next_index() == position => tailer,
-                _ => own_tailer.insert(hub.tailer_at(position)?),
-            };
-            let entries = tailer.read_next(max, &CdcFilters::default(), until.min(base))?;
-            let next = tailer.next_index();
-            Ok((
-                entries.into_iter().map(|(e, _)| Arc::new(e)).collect(),
-                next,
-            ))
         }
     }
 }
@@ -1177,9 +1093,7 @@ fn event_to_proto(
 }
 
 mod delivery;
-mod hub;
 pub(crate) use delivery::{Credit, Delivery, Outgoing, session_error};
-use hub::{CdcHub, HubRead, HubReader, SharedEntry};
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]

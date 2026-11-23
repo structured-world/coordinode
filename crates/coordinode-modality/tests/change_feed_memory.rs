@@ -111,19 +111,35 @@ fn journal_with(dir: &std::path::Path, unit: &[Mutation]) -> (StorageEngine, Cha
 }
 
 /// Read from `start` within each of `limits`, refused or not, and assert
-/// the read held no more than its budget at any moment.
+/// the read held no more than its budget at any moment when the store holds
+/// nothing for later readers, every entry then decoded within the read's own
+/// budget; and no more than its budget and the store's own when the store
+/// holds decoded entries for later readers within a budget of that size.
 fn holds_within(
     engine: &StorageEngine,
     start: &ChangeCursor,
     limits: impl IntoIterator<Item = u64>,
 ) {
     for limit in limits {
+        engine.set_change_feed_cache_bytes(0);
         let budget = QueryBudget::new(limit);
         let (_, peak) = alloc_peak::peak_of(|| engine.read_changes(start, 16, &budget).map(|_| ()));
         assert!(
             peak as u64 <= limit,
             "held {peak} bytes at once within a {limit}-byte budget"
         );
+
+        let shared = usize::try_from(limit).expect("a test budget");
+        engine.set_change_feed_cache_bytes(shared);
+        let budget = QueryBudget::new(limit);
+        let (_, peak) = alloc_peak::peak_of(|| engine.read_changes(start, 16, &budget).map(|_| ()));
+        assert!(
+            peak as u64 <= 2 * limit,
+            "held {peak} bytes at once within a {limit}-byte budget and a {shared}-byte one \
+             for later readers"
+        );
+        // Nothing held for the next limit's reads.
+        engine.set_change_feed_cache_bytes(0);
     }
 }
 
@@ -203,26 +219,30 @@ fn a_read_stopping_inside_a_large_unit_holds_its_budget() {
     );
 }
 
-/// The units a read decodes keep charged at least the memory they hold:
+/// The units a read decodes keep charged at least the memory they hold, to
+/// the store's budget of decoded entries every reader of the log shares:
 /// every list of their effect context, its slots and what each slot owns.
 #[test]
 fn decoded_units_are_charged_what_they_hold() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, start) = large_unit(dir.path());
     let budget = QueryBudget::new(64 << 20);
-    let (read, charge) = engine.change_read(start.position(), 16, &budget).unwrap();
-    assert_eq!(read.units.len(), 1);
-    let held = held_by(&read.units);
+    let (read, _charge) = engine.change_read(start.position(), 16, &budget).unwrap();
+    let units: Vec<_> = read.units().collect();
+    assert_eq!(units.len(), 1);
+    let held = held_by(units.iter().copied());
+    let (_, charged) = engine.change_feed_cache_bytes();
     assert!(
-        held <= charge.bytes(),
-        "the units hold {held} bytes, charged {}",
-        charge.bytes()
+        held <= charged as u64,
+        "the units hold {held} bytes, charged {charged}"
     );
 }
 
 /// The heap a read's units hold: their list, each unit's operations, and
 /// what each operation and its effect context own, by capacity.
-fn held_by(units: &[coordinode_storage::engine::change_feed::ChangeUnit]) -> u64 {
+fn held_by<'u>(
+    units: impl IntoIterator<Item = &'u coordinode_storage::engine::change_feed::ChangeUnit>,
+) -> u64 {
     let labels = |l: &Vec<LabelId>| l.capacity() * std::mem::size_of::<LabelId>();
     let owned = |m: &Mutation| match m {
         Mutation::Put { key, value, .. } => key.capacity() + value.capacity(),
@@ -245,13 +265,13 @@ fn held_by(units: &[coordinode_storage::engine::change_feed::ChangeUnit]) -> u64
         Mutation::Namespace(_) => 0,
         other => panic!("the test writes no {other:?}"),
     };
-    let bytes = std::mem::size_of_val(units)
-        + units
-            .iter()
-            .map(|u| {
-                u.mutations.capacity() * std::mem::size_of::<Mutation>()
-                    + u.mutations.iter().map(owned).sum::<usize>()
-            })
-            .sum::<usize>();
+    let bytes = units
+        .into_iter()
+        .map(|u| {
+            std::mem::size_of_val(u)
+                + u.mutations.capacity() * std::mem::size_of::<Mutation>()
+                + u.mutations.iter().map(owned).sum::<usize>()
+        })
+        .sum::<usize>();
     bytes as u64
 }

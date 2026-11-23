@@ -813,14 +813,16 @@ async fn a_large_transaction_goes_out_in_fragments_that_resume_inside_it() {
     let start = f.cursor_at(0);
     let start =
         coordinode_storage::engine::change_feed::ChangeCursor::from_bytes(&start).expect("cursor");
+    let dirs = [oplog_dir.path().to_path_buf()];
     let buffer_bytes = (1..)
         .map(|step| step * 250)
         .find(|&bytes| {
             let mut names = super::ReadNames::default();
             f.engine
-                .changes_of_entries_encoded(
+                .read_changes_log_encoded(
                     &start,
-                    [&entry],
+                    &dirs,
+                    1,
                     1,
                     &QueryBudget::new(bytes as u64),
                     &mut super::ProtoForm::new(&f.engine, &mut names, &start),
@@ -1443,11 +1445,13 @@ async fn labels_are_named_on_every_batch_by_its_own_read() {
     })
     .expect("append");
     mgr.flush().expect("flush");
-    // Room for the unit's rows and some tens of its events and names a read.
+    // Room for some tens of the unit's events and names a read; its rows are
+    // decoded once into what the store holds for its streams.
     f.service = f.service.with_tuning(super::CdcStreamTuning {
-        buffer_bytes: 256 << 10,
+        buffer_bytes: 64 << 10,
         ..super::CdcStreamTuning::default()
     });
+    f.engine.set_change_feed_cache_bytes(1 << 20);
     let mut stream = f
         .service
         .subscribe(named(register("named", strict())))
