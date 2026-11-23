@@ -763,6 +763,102 @@ fn a_creator_works_in_catalog_scope_without_a_data_session() {
     );
 }
 
+/// A repairing build that loses its issuer's rights before it finishes makes
+/// no further repair: the build is left as an interrupted statement leaves it,
+/// the issuer's admin is revoked, and the build resumed on the next process
+/// renames no node, since every repair is applied in the issuer's name.
+#[test]
+fn a_repairing_build_whose_issuer_lost_the_grant_repairs_nothing() {
+    use coordinode_modality::{
+        BuildFailure, DuplicateRepair, IndexBuildRecord, IndexDescriptor, IndexState,
+        IndexStore as _, LocalIndexStore,
+    };
+    let (db, _dir) = open();
+    db.execute_cypher_shared(
+        "CREATE (:User {email: 'same@x'}), (:User {email: 'same@x'})",
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("the host writes two users of one email");
+    db.change_access(
+        &ActingContext::Trusted,
+        grant("default", "ada", NamespaceRole::Admin),
+    )
+    .expect("grant admin");
+
+    // ada's build, admitted and not yet run, as a statement cut off by a
+    // stop leaves it.
+    let store = LocalIndexStore::new(&db.engine);
+    let mut descriptor =
+        IndexDescriptor::compound("user_email", "User", vec!["email".into()]).unique();
+    descriptor.state = IndexState::Building {
+        written: 0,
+        estimated_total: 0,
+    };
+    let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+        &db.engine,
+        None,
+        coordinode_core::txn::timestamp::Timestamp::ZERO,
+        None,
+    );
+    let def = store
+        .publish_definition_txn(&mut txn, descriptor)
+        .expect("publish index");
+    store
+        .put_build_txn(
+            &mut txn,
+            &IndexBuildRecord::accepted(def.id, def.generation, BuildFailure::Withdraw).repairing(
+                Some(DuplicateRepair {
+                    property: "email".into(),
+                    issuer: Some(id("ada")),
+                }),
+            ),
+            None,
+        )
+        .expect("admit build");
+    drop(txn);
+
+    db.change_access(
+        &ActingContext::Trusted,
+        AccessChange::Revoke {
+            namespaces: vec!["default".into()],
+            grantee: GranteeName::Principal(id("ada")),
+        },
+    )
+    .expect("revoke");
+    // The build ends however its repair is refused; what matters is that
+    // nothing was renamed in ada's name.
+    let _ = db.resume_interrupted_index_builds();
+
+    let emails: Vec<_> = db
+        .execute_cypher_shared("MATCH (u:User) RETURN u.email AS e", None, None, None, None)
+        .expect("read as the host")
+        .rows
+        .into_iter()
+        .map(|row| row.get("e").cloned())
+        .collect();
+    assert_eq!(
+        emails,
+        vec![
+            Some(coordinode_core::graph::types::Value::String(
+                "same@x".into()
+            ));
+            2
+        ],
+        "no repair was applied after the revocation"
+    );
+    let repaired: u64 = store
+        .list_builds()
+        .unwrap()
+        .into_iter()
+        .filter(|build| build.generation == def.generation)
+        .map(|build| build.repaired)
+        .sum();
+    assert_eq!(repaired, 0);
+}
+
 /// A unique index built with ON DUPLICATE RENAME by a principal records that
 /// principal on the build, so every repair, here and on a member resuming
 /// the build, runs in its name; a principal without admin is refused before
