@@ -1909,7 +1909,7 @@ impl Shared {
                         continue;
                     }
                     LocalNodeStore
-                        .expect_row_txn(&mut txn, shard_id, owner, Some(row_version))
+                        .expect_row_condition_txn(&mut txn, shard_id, owner, Some(row_version))
                         .map_err(text)?;
                     store
                         .repair_entry_txn(

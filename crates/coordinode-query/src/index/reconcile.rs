@@ -196,7 +196,7 @@ impl Reconcile<'_> {
                     moved = true;
                     break;
                 };
-                txn.bind_index_definition(&def.schema_key(), Some(version))
+                txn.bind_index_condition(&def.schema_key(), Some(version))
                     .map_err(StoreError::from)?;
                 placing.push(Placing { def, label });
             }
@@ -470,7 +470,7 @@ impl Fold<'_> {
                 Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
                 None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
             };
-            txn.bind_index_definition(&def.schema_key(), Some(version))
+            txn.bind_index_condition(&def.schema_key(), Some(version))
                 .map_err(StoreError::from)?;
             // What the step stages is charged to the same bytes, each write
             // before it is buffered.

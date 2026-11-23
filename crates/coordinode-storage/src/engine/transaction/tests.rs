@@ -813,10 +813,14 @@ fn a_record_of_unknown_commit_is_given_one_version() {
 /// A caller's version condition on a record of unknown commit is refused
 /// whatever it names, zero and absence included, and nothing is written:
 /// the state the engine's own rewrite is conditioned on is not a version a
-/// caller can hold, so naming zero cannot write past a lost revision.
+/// caller can hold, so naming zero cannot write past a lost revision. Every
+/// public form taking a caller's number holds to it: a plain condition, a
+/// write built on as written at a version, and an index definition binding.
 #[test]
 fn a_callers_condition_on_a_record_of_unknown_commit_is_refused() {
     const KEY: &[u8] = b"node:00:00000001";
+    const DEFINITION: &[u8] = b"idx:def:by_name";
+    const SIDE: &[u8] = b"node:00:00000002";
     let (engine, oracle, _d) = test_engine();
     let wc = WriteConcern::default();
     let ctx = || CommitContext {
@@ -828,20 +832,43 @@ fn a_callers_condition_on_a_record_of_unknown_commit_is_refused() {
     create
         .put(Partition::Node, KEY, b"as it stands")
         .expect("stage");
+    create
+        .put(Partition::Schema, DEFINITION, b"as it stands")
+        .expect("stage");
     create.commit(&ctx()).expect("create");
     assert!(
         engine
             .forget_revision(Partition::Node, KEY)
             .expect("forget")
     );
+    assert!(
+        engine
+            .forget_revision(Partition::Schema, DEFINITION)
+            .expect("forget")
+    );
 
-    for expected in [Some(0), None] {
+    type State = fn(&mut Transaction) -> StorageResult<()>;
+    let forms: [(&str, State); 5] = [
+        ("expect_version Some(0)", |txn| {
+            txn.expect_version(Partition::Node, KEY, Some(0))
+        }),
+        ("expect_version None", |txn| {
+            txn.expect_version(Partition::Node, KEY, None)
+        }),
+        ("accept_written_at 0", |txn| {
+            txn.accept_written_at(Partition::Node, KEY, 0)
+        }),
+        ("bind_index_definition Some(0)", |txn| {
+            txn.bind_index_definition(DEFINITION, Some(0))
+        }),
+        ("bind_index_definition None", |txn| {
+            txn.bind_index_definition(DEFINITION, None)
+        }),
+    ];
+    for (form, state) in forms {
         let mut txn = mvcc_txn(&engine, &oracle);
-        txn.expect_version(Partition::Node, KEY, expected)
-            .expect("state the condition");
-        txn.put(Partition::Node, KEY, b"past the lost revision")
-            .expect("stage");
-        txn.put(Partition::Node, b"node:00:00000002", b"side effect")
+        state(&mut txn).expect("state the condition");
+        txn.put(Partition::Node, SIDE, b"side effect")
             .expect("stage");
         assert!(
             matches!(
@@ -850,7 +877,7 @@ fn a_callers_condition_on_a_record_of_unknown_commit_is_refused() {
                     StorageError::RevisionUnavailable { .. }
                 ))
             ),
-            "{expected:?} is refused"
+            "{form} is refused"
         );
     }
     assert_eq!(
@@ -858,12 +885,16 @@ fn a_callers_condition_on_a_record_of_unknown_commit_is_refused() {
         Some(&b"as it stands"[..])
     );
     assert_eq!(
-        engine.get(Partition::Node, b"node:00:00000002").unwrap(),
+        engine.get(Partition::Node, SIDE).unwrap(),
         None,
         "no side effect"
     );
     assert!(matches!(
         engine.record_version(Partition::Node, KEY),
+        Err(StorageError::RevisionUnavailable { .. })
+    ));
+    assert!(matches!(
+        engine.record_version(Partition::Schema, DEFINITION),
         Err(StorageError::RevisionUnavailable { .. })
     ));
 }

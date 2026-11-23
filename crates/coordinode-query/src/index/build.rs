@@ -493,7 +493,7 @@ impl<'a> Backfill<'a> {
             else {
                 return Err(BackfillError::Superseded);
             };
-            txn.bind_index_definition(&index.schema_key(), Some(version))
+            txn.bind_index_condition(&index.schema_key(), Some(version))
                 .map_err(StoreError::from)?;
         }
         let page = nodes.prefix_scan_paged_tracked(txn, prefix, start_after, size)?;

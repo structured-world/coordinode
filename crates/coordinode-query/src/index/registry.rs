@@ -1672,7 +1672,7 @@ impl IndexRegistry {
         let Some(read) = version else {
             return Ok(());
         };
-        txn.bind_index_definition(&index.schema_key(), Some(read))?;
+        txn.bind_index_condition(&index.schema_key(), Some(read))?;
         Ok(())
     }
 }

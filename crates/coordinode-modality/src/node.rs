@@ -487,6 +487,22 @@ pub trait NodeStore {
         owner: EntryOwner,
         version: Option<u64>,
     ) -> StoreResult<()>;
+
+    /// [`Self::expect_row_txn`] at the condition [`Self::latest_row`] read,
+    /// in the engine's form (`Transaction::expect_condition`): a row whose
+    /// commit is not known is written only while nothing has written it.
+    /// Never for a version a caller supplies.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn expect_row_condition_txn(
+        &self,
+        txn: &mut Transaction,
+        shard_id: u16,
+        owner: EntryOwner,
+        condition: Option<u64>,
+    ) -> StoreResult<()>;
 }
 
 /// One page of a shard's rows ([`NodeStore::rows_page`]).
@@ -1541,7 +1557,17 @@ impl NodeStore for LocalNodeStore {
         owner: EntryOwner,
         version: Option<u64>,
     ) -> StoreResult<()> {
-        Ok(txn.expect_condition(Partition::Node, &row_key(shard_id, owner), version)?)
+        Ok(txn.expect_version(Partition::Node, &row_key(shard_id, owner), version)?)
+    }
+
+    fn expect_row_condition_txn(
+        &self,
+        txn: &mut Transaction,
+        shard_id: u16,
+        owner: EntryOwner,
+        condition: Option<u64>,
+    ) -> StoreResult<()> {
+        Ok(txn.expect_condition(Partition::Node, &row_key(shard_id, owner), condition)?)
     }
 }
 

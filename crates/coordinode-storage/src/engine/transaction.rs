@@ -2170,7 +2170,33 @@ impl<'a> Transaction<'a> {
         key: &[u8],
         version: u64,
     ) -> StorageResult<()> {
-        self.expect_condition(part, key, Some(version))?;
+        self.accept(part, key, version, ConditionOf::Caller)
+    }
+
+    /// [`Self::accept_written_at`] at the condition
+    /// [`StorageEngine::record_condition`] read, in the engine's form
+    /// ([`Self::expect_condition`]). Never for a version a caller supplies.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::expect_version`].
+    pub fn accept_condition_written_at(
+        &mut self,
+        part: Partition,
+        key: &[u8],
+        condition: u64,
+    ) -> StorageResult<()> {
+        self.accept(part, key, condition, ConditionOf::Engine)
+    }
+
+    fn accept(
+        &mut self,
+        part: Partition,
+        key: &[u8],
+        version: u64,
+        of: ConditionOf,
+    ) -> StorageResult<()> {
+        self.expect(part, key, Some(version), of)?;
         self.accepted_writes.push((part, key.to_vec()));
         Ok(())
     }
@@ -2184,8 +2210,32 @@ impl<'a> Transaction<'a> {
     ///
     /// The errors of [`Self::expect_version`].
     pub fn bind_index_definition(&mut self, key: &[u8], version: Option<u64>) -> StorageResult<()> {
+        self.bind_definition(key, version, ConditionOf::Caller)
+    }
+
+    /// [`Self::bind_index_definition`] at the condition the engine read of
+    /// the definition, in the engine's form ([`Self::expect_condition`]).
+    /// Never for a version a caller supplies.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::expect_version`].
+    pub fn bind_index_condition(
+        &mut self,
+        key: &[u8],
+        condition: Option<u64>,
+    ) -> StorageResult<()> {
+        self.bind_definition(key, condition, ConditionOf::Engine)
+    }
+
+    fn bind_definition(
+        &mut self,
+        key: &[u8],
+        version: Option<u64>,
+        of: ConditionOf,
+    ) -> StorageResult<()> {
         if self.derived.bind(key) {
-            self.expect_condition(Partition::Schema, key, version)?;
+            self.expect(Partition::Schema, key, version, of)?;
         }
         Ok(())
     }

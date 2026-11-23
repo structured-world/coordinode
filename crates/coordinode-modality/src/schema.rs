@@ -1172,7 +1172,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
             .is_some_and(|binding| binding.state == BindingState::Implicit);
         match version {
             Some(version) if implicit => {
-                txn.accept_written_at(Partition::Schema, &pointer_key, version)?;
+                txn.accept_condition_written_at(Partition::Schema, &pointer_key, version)?;
             }
             _ => txn.expect_condition(Partition::Schema, &pointer_key, version)?,
         }
