@@ -550,17 +550,32 @@ fn a_namespace_codec_change_applies_to_its_next_tables_only() {
     drop((first, second));
     drop(deployment);
 
-    // After a cold reopen each namespace serves the very tables it had
-    // installed (same ids, same bytes, both generations), and every row of
-    // both generations reads back from them.
+    // After a cold reopen each namespace serves what it had installed: a
+    // table still installed is the very one (same bytes), and one the
+    // engine's own compaction wrote since carries the namespace's current
+    // codec, never the other's; every row of both generations reads back.
+    // Whether a compaction ran by the time of the check is the machine's
+    // timing, not something the codec change decides.
     let (deployment, _) = open_deployment(&config);
-    for (name, installed) in [("first", &first_after), ("second", &second_after)] {
+    for (name, installed, codec) in [
+        ("first", &first_after, CompressionType::Zstd(3)),
+        ("second", &second_after, CompressionType::None),
+    ] {
         let engine = deployment.engine_named(name).expect("reopened");
-        assert_eq!(
-            &node_tables(&engine),
-            installed,
-            "{name}'s installed tables changed across the reopen"
-        );
+        for table in node_tables(&engine) {
+            match installed.iter().find(|t| t.id == table.id) {
+                Some(before) => assert_eq!(
+                    &table, before,
+                    "{name}'s table {} changed across the reopen",
+                    table.id
+                ),
+                None => assert_eq!(
+                    table.codec, codec,
+                    "{name}'s compacted table {} carries its own codec",
+                    table.id
+                ),
+            }
+        }
         assert_rows(&engine, name, 0..1000);
     }
 }
