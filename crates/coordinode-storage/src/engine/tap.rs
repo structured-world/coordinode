@@ -54,7 +54,7 @@ pub enum Tapped {
     Keys(Vec<Vec<u8>>),
     /// The partition was replaced wholesale: the keys it lost are not
     /// known, so the consumer starts over from a fresh snapshot
-    /// ([`StorageEngine::rebase_tap`](crate::engine::core::StorageEngine::rebase_tap)).
+    /// ([`Deployment::rebase_tap`](crate::engine::core::Deployment::rebase_tap)).
     Replaced,
 }
 

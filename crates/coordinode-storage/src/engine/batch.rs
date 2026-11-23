@@ -210,7 +210,7 @@ impl Mutation {
 ///
 /// A batch built from a [`StorageEngine`] writes its namespace; one the
 /// deployment builds to apply a logged unit writes the namespace each part
-/// of the unit names ([`Self::write_to`]), every part at the one seqno.
+/// of the unit names, every part at the one seqno.
 pub struct WriteBatch<'a> {
     engine: &'a Deployment,
     /// The sets the mutations write, by the place a mutation names.

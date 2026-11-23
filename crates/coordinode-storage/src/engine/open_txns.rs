@@ -4,9 +4,9 @@
 //! maintained by the transactions that see its definition, and a transaction
 //! that decided what to maintain before the definition existed goes on
 //! without it until it ends. Whoever makes such a change takes a
-//! [`StorageEngine::snapshot_boundary`](crate::engine::core::StorageEngine::snapshot_boundary)
+//! [`Deployment::snapshot_boundary`](crate::engine::core::Deployment::snapshot_boundary)
 //! after it and waits for the transactions opened at or before it to end
-//! ([`StorageEngine::await_transactions_through`](crate::engine::core::StorageEngine::await_transactions_through)),
+//! ([`Deployment::await_transactions_through`](crate::engine::core::Deployment::await_transactions_through)),
 //! the way PostgreSQL's concurrent index build waits for older snapshots.
 //!
 //! A snapshot pin does not mark a transaction's life: a statement repins at

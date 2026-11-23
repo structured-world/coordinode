@@ -10,7 +10,8 @@
 //!
 //! [`receive_store`] reads such a stream into a directory, rebuilds each tree
 //! there from its files and its memtable contents, and leaves a directory that
-//! opens with [`StorageEngine::open_checkpoint`]. Installing it into a live
+//! opens with [`StorageEngine::open_checkpoint`](crate::engine::core::StorageEngine::open_checkpoint).
+//! Installing it into a live
 //! store is the receiver's business; the engine's own install reads it as rows.
 //!
 //! The stream, all integers little-endian:
@@ -699,7 +700,8 @@ impl Deployment {
 
     /// Refuse a capture whose table trees disagree with the tables the
     /// catalog declares, when the catalog is named
-    /// ([`StorageEngine::set_catalog_inventory`]). Read with the set of trees
+    /// ([`Deployment::set_catalog_inventory`](crate::engine::core::Deployment::set_catalog_inventory)).
+    /// Read with the set of trees
     /// held, so no creation or drop is under way: a disagreement is one a
     /// failed creation or drop left in the store, and a copy of it would open
     /// as a table without its rows or rows without their table.
@@ -841,7 +843,8 @@ impl Deployment {
 }
 
 /// A store received with [`receive_store`]: a directory that opens with
-/// [`StorageEngine::open_checkpoint`], removed when this drops.
+/// [`StorageEngine::open_checkpoint`](crate::engine::core::StorageEngine::open_checkpoint),
+/// removed when this drops.
 #[derive(Debug)]
 pub struct ReceivedStore {
     dir: PathBuf,

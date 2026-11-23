@@ -563,7 +563,7 @@ impl StorageEngine {
     /// Replace `partition`'s replicated rows with `rows`, keeping its
     /// node-local ones, under a rebuild intent. On a Raft store the tree
     /// carries no Raft record until [`Self::finish_raft_rebuild`]; entries
-    /// applied in between (with [`Self::apply_raft_proposal`]) record their
+    /// applied in between (with [`Deployment::apply_raft_proposal`]) record their
     /// markers. Call with the applies paused.
     ///
     /// The rows land at seqno `INSTALLED_ROW_SEQNO` (0), below every commit
@@ -654,7 +654,7 @@ impl StorageEngine {
     /// # Errors
     ///
     /// The errors of `rows_of`, [`Self::begin_partition_rebuild`] and
-    /// [`Self::reset_raft_coverage`], a flush failure, or an intent removal
+    /// [`Deployment::reset_raft_coverage`], a flush failure, or an intent removal
     /// failure.
     pub fn install_raft_image(
         &self,

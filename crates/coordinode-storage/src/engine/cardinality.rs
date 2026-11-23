@@ -779,7 +779,8 @@ pub struct Rebuilt {
 ///
 /// Precondition: the descriptor is committed, and every transaction open
 /// when it landed has finished
-/// ([`StorageEngine::await_transactions_through`]). A commit that read the
+/// ([`Deployment::await_transactions_through`](crate::engine::core::Deployment::await_transactions_through)).
+/// A commit that read the
 /// profile before the descriptor existed stages no change; one that lands
 /// after the snapshot without its change would be missed by the
 /// correction.

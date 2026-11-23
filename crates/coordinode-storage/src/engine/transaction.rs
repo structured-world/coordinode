@@ -728,7 +728,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Open a transaction at the latest complete state, its snapshot pinned
-    /// in the same step it is taken. See [`StorageEngine::pin_latest_snapshot`]
+    /// in the same step it is taken. See [`Deployment::pin_latest_snapshot`](crate::engine::core::Deployment::pin_latest_snapshot)
     /// for why the two cannot be separate calls.
     #[cfg_attr(feature = "stage-timing", track_caller)]
     pub fn begin(
@@ -741,7 +741,8 @@ impl<'a> Transaction<'a> {
     }
 
     /// [`Self::begin`] reading a view that holds only durable effects
-    /// ([`StorageEngine::durable_view`]), for a transaction under a read
+    /// ([`Deployment::durable_view`](crate::engine::core::Deployment::durable_view)),
+    /// for a transaction under a read
     /// concern that must not see a write a crash can still take back.
     #[cfg_attr(feature = "stage-timing", track_caller)]
     pub fn begin_durable(
@@ -1684,7 +1685,8 @@ impl<'a> Transaction<'a> {
     }
 
     /// Take a snapshot whose pin the caller already holds, from
-    /// [`StorageEngine::pin_new_snapshot`], rather than pinning it here after
+    /// [`Deployment::pin_new_snapshot`](crate::engine::core::Deployment::pin_new_snapshot),
+    /// rather than pinning it here after
     /// the fact.
     pub fn adopt_snapshot(&mut self, snapshot: StorageSnapshot, pin: Option<SnapshotPin>) {
         self.snapshot = Some(snapshot);
@@ -2309,7 +2311,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Leave the open transactions a schema change waits for
-    /// ([`StorageEngine::await_transactions_through`](crate::engine::core::StorageEngine::await_transactions_through)),
+    /// ([`Deployment::await_transactions_through`](crate::engine::core::Deployment::await_transactions_through)),
     /// when this transaction has staged nothing: a statement that waits for
     /// the index build it started would otherwise wait for itself. A
     /// transaction holding staged writes stays, since an index built past it

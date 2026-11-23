@@ -303,7 +303,8 @@ pub trait SchemaStore {
 
 /// The catalog's list of `STORAGE COLUMNAR` tables, as the engine checks a
 /// capture's table trees against it
-/// ([`StorageEngine::set_catalog_inventory`]): every declared label whose
+/// ([`Deployment::set_catalog_inventory`](coordinode_storage::engine::core::Deployment::set_catalog_inventory)):
+/// every declared label whose
 /// schema is a columnar table, read from the store's current catalog.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CatalogTables;

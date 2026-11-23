@@ -150,7 +150,7 @@ pub(crate) type JournalHolds = Arc<parking_lot::Mutex<std::collections::BTreeMap
 
 /// Keeps the journal from one index on until dropped, whatever purges or
 /// reclamation run meanwhile. Taken by
-/// [`StorageEngine::hold_journal_from`](crate::engine::core::StorageEngine::hold_journal_from)
+/// [`Deployment::hold_journal_from`](crate::engine::core::Deployment::hold_journal_from)
 /// while a consumer registering at that index publishes the floor that keeps
 /// it from then on.
 #[derive(Debug)]

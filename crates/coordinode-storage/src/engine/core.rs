@@ -624,7 +624,7 @@ enum EntryScope {
     NodeLocal,
 }
 
-/// How a crash test ends a store: see [`StorageEngine::journal_crash_point`].
+/// How a crash test ends a store: see [`Deployment::journal_crash_point`].
 #[cfg(any(test, feature = "test-faults"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashKind {
@@ -634,7 +634,7 @@ pub enum CrashKind {
     Kill,
 }
 
-/// A journal stopped by [`StorageEngine::hold_journal`]; it answers again
+/// A journal stopped by [`Deployment::hold_journal`]; it answers again
 /// once this is dropped.
 #[cfg(any(test, feature = "test-faults"))]
 #[must_use = "the journal answers again once this is dropped"]
@@ -956,7 +956,7 @@ impl Deployment {
     /// journalled to a retained oplog (at the oplog-eligible endpoint), so the
     /// engine survives a crash by replaying the un-flushed tail and can repair
     /// a corrupt partition from a checkpoint plus oplog replay
-    /// ([`Self::repair_partition_from_checkpoint`]).
+    /// ([`StorageEngine::repair_partition_from_checkpoint`]).
     ///
     /// In-memory configs (every endpoint `Volatile`) get no journal — there is
     /// no durable place to keep it; durability there is best-effort by design.
@@ -9544,7 +9544,7 @@ impl Deployment {
     }
 
     /// Run `hook` once a drop within an operation
-    /// ([`Self::drop_columnar_table_held`]) has removed a table's tree. For
+    /// ([`StorageEngine::drop_columnar_table_held`]) has removed a table's tree. For
     /// tests of what a capture sees of a drop under way.
     #[cfg(any(test, feature = "test-faults"))]
     pub fn set_table_dropped_hook(&self, hook: Option<Box<dyn FnMut() + Send>>) {
@@ -9559,7 +9559,7 @@ impl Deployment {
     }
 
     /// Run `hook` once a creation within an operation
-    /// ([`Self::create_columnar_table_held`]) has its tree and stamp, before
+    /// ([`StorageEngine::create_columnar_table_held`]) has its tree and stamp, before
     /// the operation records them. For tests of a table dropped and created
     /// again in between.
     #[cfg(any(test, feature = "test-faults"))]
@@ -9602,7 +9602,7 @@ impl Deployment {
     /// seqno at or below it, and every later write a higher one.
     ///
     /// Read it before starting work that must later fold in "everything since",
-    /// then feed it to [`Self::changed_keys_since`]. Saves callers from
+    /// then feed it to [`StorageEngine::changed_keys_since`]. Saves callers from
     /// importing the Layer-3 coordinator trait to reach the same value.
     pub fn current_seqno(&self) -> lsm_tree::SeqNo {
         self.coordinator.current_seqno()
@@ -9889,7 +9889,8 @@ impl StorageEngine {
 
     /// Inclusive-bounded range scan: yields entries with keys `K` such
     /// that `start ≤ K ≤ end`. Convenience wrapper over
-    /// [`MultiModalCoordinator::range_scan`]; used by callers that have
+    /// [`MultiModalCoordinator::range_scan`](crate::engine::coordinator::MultiModalCoordinator::range_scan);
+    /// used by callers that have
     /// decomposed a query into disjoint key intervals (e.g. spatial
     /// Z-curve subrange decomposition).
     pub fn range_scan(
@@ -10434,7 +10435,7 @@ impl StorageEngine {
     /// which can be above this node's clock until the apply advances it, so
     /// the snapshot is read while no entry applies.
     ///
-    /// Pin the snapshot (with [`Self::pin_snapshot_at`]) before reading at
+    /// Pin the snapshot (with [`Deployment::pin_snapshot_at`]) before reading at
     /// it. Blocks on a Raft store; call it off the async runtime.
     ///
     /// # Errors
@@ -10513,7 +10514,7 @@ impl Deployment {
     /// Start `tap` over after it reported
     /// [`Tapped::Replaced`](crate::engine::tap::Tapped::Replaced): discard
     /// what it holds and return a fresh snapshot with the guarantee of
-    /// [`Self::tap_writes`].
+    /// [`StorageEngine::tap_writes`].
     ///
     /// # Errors
     ///
@@ -11602,7 +11603,7 @@ impl Drop for Deployment {
     }
 }
 
-/// Outcome of [`StorageEngine::create_checkpoint`].
+/// Outcome of [`Deployment::create_checkpoint`].
 #[derive(Debug, Default, Clone)]
 pub struct CheckpointSummary {
     /// Number of partition trees checkpointed.
@@ -11883,7 +11884,7 @@ const REBUILD_INTENT_DIR: &str = "rebuild";
 
 /// The ledger a rebuild replays closure records against: the one its source
 /// cut installed, advanced entry by entry; see
-/// [`StorageEngine::replay_closure_record`].
+/// [`Deployment::replay_closure_record`].
 pub struct ClosureReplay(crate::engine::closure_ledger::ClosureLedger);
 
 /// The writes to the deployment's records `plan` makes against `ledger`, with the timestamp to
@@ -12064,13 +12065,13 @@ pub mod breakpoint_read_gate {
 
 pub use crate::engine::closure_ledger::StoredCeiling;
 
-/// A log position's commit ceiling, as [`StorageEngine::commit_ceiling_at`]
+/// A log position's commit ceiling, as [`Deployment::commit_ceiling_at`]
 /// answers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitCeiling {
     /// Answered from memory.
     Known(u64),
-    /// To read from the stored records ([`StorageEngine::read_stored_ceiling`]).
+    /// To read from the stored records ([`Deployment::read_stored_ceiling`]).
     Stored(StoredCeiling),
 }
 
