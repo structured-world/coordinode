@@ -545,6 +545,66 @@ async fn a_causal_timestamp_past_the_closed_bound_is_not_ready() {
     );
 }
 
+/// A linearizable read's bound is the commits of the prefix its authority
+/// barrier proved, not of what applied after: a later commit, readable yet
+/// or not, does not hold the read back, so a view covering the barrier
+/// suffices.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linearizable_bound_is_its_barriers_prefix_not_what_applied_since() {
+    let (_dir, node) = bootstrap_leader().await;
+    let id_gen = ProposalIdGenerator::new();
+    let put = |ts: u64, key: &[u8]| RaftProposal {
+        id: id_gen.next(),
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts - 1),
+        bypass_rate_limiter: false,
+        mutations: unit![Mutation::Put {
+            partition: PartitionId::Node,
+            key: key.to_vec(),
+            value: b"v".to_vec(),
+        }],
+    };
+    node.pipeline()
+        .propose_and_wait(&put(100, b"barrier:before"))
+        .expect("propose");
+
+    let mut fence = node.read_fence();
+    fence
+        .apply(
+            ReadPreference::Primary,
+            ReadConcern::Linearizable,
+            coordinode_raft::read_fence::READ_FENCE_TIMEOUT,
+            Some(std::time::Instant::now() + Duration::from_secs(5)),
+        )
+        .await
+        .expect("the barrier passes on the leader");
+    let at_barrier = fence.barrier_bound().await.expect("the bound");
+    let before = fence.applied_index();
+
+    // A later commit, past every commit of the barrier's prefix.
+    let later = at_barrier.unwrap_or(0) + 1_000_000;
+    node.pipeline()
+        .propose_and_wait(&put(later, b"barrier:after"))
+        .expect("propose");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while node.read_fence().applied_index() <= before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the later write applies"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fence.barrier_bound().await.expect("the bound"),
+        at_barrier,
+        "the barrier's prefix, whatever applied after it"
+    );
+    assert!(
+        at_barrier.is_some_and(|bound| bound < later),
+        "{at_barrier:?}"
+    );
+}
+
 /// A causal wait whose end the clock cannot represent is refused as such
 /// before any wait, whether or not the bound is met.
 #[tokio::test(flavor = "multi_thread")]

@@ -198,7 +198,11 @@ fn leading(admission: Admission) -> Result<Box<Admitted>, DatabaseError> {
     match admission {
         Admission::Run(fenced) => Ok(fenced),
         // An admission that may not route on never asks to.
-        Admission::Forward(leader) => Err(DatabaseError::NotLeader {
+        Admission::Forward(leader)
+        | Admission::ForwardRead(coordinode_embed::replication::admission::ReadForward {
+            to: leader,
+            ..
+        }) => Err(DatabaseError::NotLeader {
             leader_id: Some(leader),
         }),
     }

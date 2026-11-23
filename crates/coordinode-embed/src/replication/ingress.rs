@@ -20,7 +20,7 @@ use coordinode_query::advisor::source::SourceContext;
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
 
-use super::admission::{Admission, Admitter, Requested, leader_hint};
+use super::admission::{Admission, Admitter, ReadForward, Requested, leader_hint};
 use super::executor;
 use super::routing::{
     CommandRouter, RoutedAnswer, RoutedBegin, RoutedCommit, RoutedOperationAnswer,
@@ -166,6 +166,18 @@ impl Ingress {
         let admitted = match self.admitter.fence(checked, false).await? {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader) => return self.route(leader, statement).await,
+            Admission::ForwardRead(forward) => {
+                match self.forward_read(forward, statement.clone()).await {
+                    // Proven not sent: the read is served here after all,
+                    // waiting what is left of its budget, never routed on.
+                    Err(DatabaseError::PeerUnreachable { .. }) => {
+                        self.admitter
+                            .admit_unsent(&statement.query, &statement.requested, &forward)
+                            .await?
+                    }
+                    other => return other,
+                }
+            }
         };
         // A write that reaches a follower is refused by consensus before
         // anything is applied, and goes to the leader as if it had been
@@ -247,6 +259,44 @@ impl Ingress {
             })
             .await?;
         Ok(self.answered(answer, Some(ran_at)))
+    }
+
+    /// Send a read this member is behind for to `forward.to`, once: with its
+    /// preference, which the target checks against its own role, and what
+    /// is left of its wait and deadline. Never sent to another member
+    /// instead, so a strict follower read never reaches the leader and a
+    /// stale route cannot loop; the target never routes it on.
+    async fn forward_read(
+        &self,
+        forward: ReadForward,
+        statement: Statement,
+    ) -> Result<Routed<RoutedAnswer>, DatabaseError> {
+        let Statement {
+            namespace,
+            query,
+            params,
+            requested,
+            actor,
+            source,
+            ..
+        } = statement;
+        let routed = RoutedStatement {
+            namespace: self.namespace_of(namespace.as_deref())?,
+            actor,
+            query,
+            params,
+            settings: executor::forwarded_read_settings(&requested, &forward),
+            transaction: None,
+            operation: requested.operation,
+            deadline: time_left(requested.deadline)?,
+            source,
+            start: None,
+        };
+        let router = self.admitter.router(forward.to)?;
+        let admitted = AdmissionSignal::new(|| {});
+        let answer =
+            cancellable(requested.cancel.as_ref(), router.execute(routed, &admitted)).await?;
+        Ok(self.answered(answer, Some(forward.to)))
     }
 
     /// Run `call` at `leader`. A call proven not sent there

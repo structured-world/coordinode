@@ -303,6 +303,9 @@ pub struct ReadFence {
     /// The history this member's log belongs to; `None` before its
     /// deployment is known.
     history: Option<coordinode_core::txn::read_concern::HistoryId>,
+    /// The read point a linearizable read's authority barrier proved, set by
+    /// [`Self::apply`]: the prefix its view must hold, whatever applies after.
+    barrier: Option<u64>,
 }
 
 impl ReadFence {
@@ -322,6 +325,7 @@ impl ReadFence {
             engine: None,
             stored_ceilings: None,
             history: None,
+            barrier: None,
         }
     }
 
@@ -427,15 +431,17 @@ impl ReadFence {
     /// A linearizable read proves authority (the leader's lease, or a quorum
     /// round within `timeout`) and then needs the log applied through the
     /// read point. That is ready or not ready: it is waited for only when the
-    /// read asked for a wait (`apply_wait`), and for at most that long; with
-    /// none it is refused at once as [`ReadFenceError::NotReady`].
+    /// read asked for a wait, until `apply_until`, the end of the read's
+    /// wait fixed by its caller, so proving authority spends from the same
+    /// budget; with none it is refused at once as
+    /// [`ReadFenceError::NotReady`].
     pub async fn apply(
         &mut self,
         preference: ReadPreference,
         concern: ReadConcern,
         // Bound on proving authority for a linearizable read.
         timeout: Duration,
-        apply_wait: Option<Duration>,
+        apply_until: Option<std::time::Instant>,
     ) -> Result<(), ReadFenceError> {
         // A read-only member's consensus is a frozen view: what it believes
         // about leadership and lag says nothing current. It serves what it
@@ -518,11 +524,18 @@ impl ReadFence {
                     timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
                 })?
                 .map_err(|e| ReadFenceError::Raft(e.to_string()))?;
-                // A zero wait only checks what is applied already.
+                // What proving authority left of the wait, taken now: a zero
+                // wait, or one already spent, only checks what is applied.
+                let left = apply_until.map_or(Duration::ZERO, |until| {
+                    until.saturating_duration_since(std::time::Instant::now())
+                });
                 let ready = linearizer
-                    .try_await_ready(&self.raft, Some(apply_wait.unwrap_or(Duration::ZERO)))
+                    .try_await_ready(&self.raft, Some(left))
                     .await
                     .map_err(|e| ReadFenceError::Raft(e.to_string()))?;
+                if let Ok(state) = &ready {
+                    self.barrier = Some(state.read_log_id().index());
+                }
                 if let Err(state) = ready {
                     return Err(ReadFenceError::NotReady {
                         missing: format!(
@@ -530,7 +543,7 @@ impl ReadFence {
                             state.applied().map(|id| id.index),
                             state.read_log_id().index()
                         ),
-                        waited: apply_wait.is_some(),
+                        waited: apply_until.is_some(),
                     });
                 }
             }
@@ -721,8 +734,11 @@ impl ReadFence {
     ///
     /// The store could not read the log's commit ceilings.
     pub async fn barrier_bound(&self) -> Result<Option<u64>, ReadFenceError> {
-        let applied = *self.applied_rx.borrow();
-        self.prefix_ceiling(applied).await
+        // The proved read point, not what has applied since: a view holding
+        // the barrier's prefix suffices, and a later commit still unreadable
+        // must not hold the read back. Without a barrier, what is applied.
+        let point = self.barrier.unwrap_or_else(|| *self.applied_rx.borrow());
+        self.prefix_ceiling(point).await
     }
 
     /// Return the current applied log index on this node, a position in

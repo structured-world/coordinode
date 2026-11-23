@@ -257,7 +257,9 @@ async fn a_standalone_member_runs_everything_here() {
             assert_eq!(admitted.history, None, "a standalone member has no log");
             assert!(!admitted.served_by_leader);
         }
-        Admission::Forward(leader) => panic!("a standalone member forwarded to {leader}"),
+        Admission::Forward(to) | Admission::ForwardRead(ReadForward { to, .. }) => {
+            panic!("a standalone member forwarded to {to}")
+        }
     }
     assert_eq!(admitter.transaction_leader().expect("no election"), None);
     assert!(matches!(

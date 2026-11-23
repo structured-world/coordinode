@@ -16,7 +16,7 @@ use coordinode_core::graph::types::Value;
 use coordinode_core::txn::command::AdmissionSignal;
 use coordinode_embed::db::CypherResult;
 pub(crate) use coordinode_embed::replication::admission::{
-    Admission, Admitted, Checked, Requested, leader_hint,
+    Admission, Admitted, Checked, ReadForward, Requested, leader_hint,
 };
 use coordinode_embed::replication::admission::{AdmissionDefaults, Admitter};
 pub(crate) use coordinode_embed::replication::executor::columns_and_values;
@@ -206,6 +206,17 @@ impl StatementExecutor {
         self.admitter
             .admit(query, requested, already_forwarded)
             .await
+    }
+
+    /// Admit here a read whose forward was proven not sent, waiting what is
+    /// left of its budget; never routed on.
+    pub(crate) async fn admit_unsent(
+        &self,
+        query: &str,
+        requested: &Requested,
+        forward: &ReadForward,
+    ) -> Result<Box<Admitted>, DatabaseError> {
+        self.admitter.admit_unsent(query, requested, forward).await
     }
 
     /// Run an admitted statement to completion. Blocking: a write commits

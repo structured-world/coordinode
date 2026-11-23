@@ -144,6 +144,21 @@ pub enum Admission {
     Run(Box<Admitted>),
     /// It needs the leader, which is another member: route it there.
     Forward(u64),
+    /// A read this member is behind for: route it once, before anything of
+    /// it runs, to a member its preference permits.
+    ForwardRead(ReadForward),
+}
+
+/// Where a read this member is behind for goes, and what it takes there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadForward {
+    /// The member it goes to.
+    pub to: u64,
+    /// The members it may be served by, which the target checks against its
+    /// own role.
+    pub preference: ReadPreference,
+    /// What is left of the read's wait: one budget through the hop.
+    pub wait: Option<Duration>,
 }
 
 /// Resolves, checks and fences statements on one member.
@@ -390,7 +405,9 @@ impl Admitter {
         // Proving authority for a linearizable read waits on the group: that
         // wait, too, lasts no longer than the operation. The log applied
         // through its read point is waited for only as the read allows.
-        let (apply_wait, cut) = (waited.map(WaitEnd::left), waited.is_some_and(|w| w.cut));
+        // The fixed end, not a duration: what proving authority spends comes
+        // out of the same budget.
+        let (apply_until, cut) = (waited.map(|w| w.at), waited.is_some_and(|w| w.cut));
         let applied = within_deadline_and_cancel(
             checked.deadline,
             checked.cancel.as_ref(),
@@ -398,7 +415,7 @@ impl Admitter {
                 checked.read_preference,
                 fence_concern(checked.read_concern.level),
                 coordinode_raft::read_fence::READ_FENCE_TIMEOUT,
-                apply_wait,
+                apply_until,
             ),
         )
         .await?;
@@ -415,11 +432,32 @@ impl Admitter {
             // which the database's view must reach; the position itself is
             // established here.
             let (after_ts, after_position) = (read_concern.after_ts, read_concern.after_position);
-            // What the apply stage left of the wait: one budget for both.
-            read_concern.after_ts = within_operation(waited, checked.cancel.as_ref(), |wait| {
-                fence.await_causal(after_ts, after_position, wait)
-            })
-            .await?;
+            // A member behind the bound with somewhere to send the read sends
+            // it, once and before anything of it runs, rather than wait out
+            // the budget here; a zero wait still goes. With nowhere to send
+            // it, or once routed, the wait is spent here.
+            let route = (!already_forwarded && !checked.writes)
+                .then(|| behind_route(node, checked.read_preference))
+                .flatten();
+            if let Some(to) = route {
+                match fence.await_causal(after_ts, after_position, None).await {
+                    Ok(bound) => read_concern.after_ts = bound,
+                    Err(ReadFenceError::NotReady { .. }) => {
+                        return Ok(Admission::ForwardRead(ReadForward {
+                            to,
+                            preference: checked.read_preference,
+                            wait: waited.map(WaitEnd::left),
+                        }));
+                    }
+                    Err(e) => return Err(fence_error(e)),
+                }
+            } else {
+                // What the apply stage left of the wait: one budget for both.
+                read_concern.after_ts = within_operation(waited, checked.cancel.as_ref(), |wait| {
+                    fence.await_causal(after_ts, after_position, wait)
+                })
+                .await?;
+            }
         } else if read_concern.level == ReadConcernLevel::Linearizable {
             // The barrier proved authority and applied the log through it;
             // what is left is a view holding that prefix, the same bound a
@@ -450,6 +488,31 @@ impl Admitter {
             served_by_leader,
             read_as_of_ts: fence.as_of().unwrap_or(0),
         })))
+    }
+
+    /// Admit here a read whose forward ([`Admission::ForwardRead`]) was
+    /// proven not sent: it waits what is left of its budget for its bound
+    /// on this member and is never routed on.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit`]; a read still not ready is refused as such.
+    pub async fn admit_unsent(
+        &self,
+        query: &str,
+        requested: &Requested,
+        forward: &ReadForward,
+    ) -> Result<Box<Admitted>, DatabaseError> {
+        let mut requested = requested.clone();
+        requested.causal_wait = forward.wait;
+        match self.admit(query, &requested, true).await? {
+            Admission::Run(admitted) => Ok(admitted),
+            Admission::Forward(to) | Admission::ForwardRead(ReadForward { to, .. }) => {
+                Err(DatabaseError::NotLeader {
+                    leader_id: Some(to),
+                })
+            }
+        }
     }
 
     /// Establish a transaction start's causal bound on this member's log, as
@@ -685,6 +748,29 @@ where
             Err(DatabaseError::Budget(BudgetStop::Deadline))
         }
         outcome => outcome.map_err(fence_error),
+    }
+}
+
+/// The member a read this member is behind for goes to, from what the group
+/// already knows, without probing anyone: the leader when the preference
+/// permits it and this member knows it; for a read only a follower may
+/// serve, another member it does not know to lead. A member cut off from its
+/// group may know no leader: another voter then, which checks its own role
+/// and view and never sends the read on. `None` when no other voter is known.
+fn behind_route(node: &RaftNode, preference: ReadPreference) -> Option<u64> {
+    let me = node.node_id();
+    let leader = node.current_leader().filter(|&leader| leader != me);
+    let other = |skip: Option<u64>| {
+        node.voter_ids()
+            .into_iter()
+            .find(|&id| id != me && Some(id) != skip)
+    };
+    match preference {
+        ReadPreference::Secondary => other(leader),
+        ReadPreference::Primary
+        | ReadPreference::PrimaryPreferred
+        | ReadPreference::SecondaryPreferred
+        | ReadPreference::Nearest => leader.or_else(|| other(None)),
     }
 }
 

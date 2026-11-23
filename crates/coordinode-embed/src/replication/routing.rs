@@ -35,6 +35,7 @@ use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 use coordinode_query::advisor::source::SourceContext;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proto::internode::routing as wire;
+use coordinode_raft::read_fence::ReadPreference;
 pub use coordinode_session::{CommandSlot, CommandSlots, SessionSlots, SlotCount};
 use coordinode_wire::peer::PeerConnectInfo;
 use tonic::metadata::MetadataValue;
@@ -229,6 +230,9 @@ pub struct RoutedSettings {
     pub vector_build_wait: Option<Duration>,
     /// Memory limit of the statement in bytes.
     pub query_memory_limit: Option<u64>,
+    /// The members the read may be served by, for a read forwarded because
+    /// its ingress was behind its bound; `None` reads at the leader.
+    pub read_preference: Option<ReadPreference>,
 }
 
 /// One statement to run at the member that executes it.
@@ -332,6 +336,8 @@ pub struct RoutedStats {
     pub read_as_of_ts: u64,
     /// The timestamp it read at; zero for none.
     pub read_ts: u64,
+    /// Whether the executing member led its group when it served it.
+    pub served_by_leader: bool,
 }
 
 /// A statement's answer: its columns, its rows in column order and its
@@ -2367,6 +2373,13 @@ fn settings_to_wire(settings: RoutedSettings) -> wire::RoutedSettings {
             .vector_build_wait
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
         query_memory_limit: settings.query_memory_limit,
+        read_preference: settings.read_preference.map_or(0, |p| match p {
+            ReadPreference::Primary => 1,
+            ReadPreference::PrimaryPreferred => 2,
+            ReadPreference::Secondary => 3,
+            ReadPreference::SecondaryPreferred => 4,
+            ReadPreference::Nearest => 5,
+        }),
     }
 }
 
@@ -2402,6 +2415,19 @@ fn settings_from_wire(settings: Option<wire::RoutedSettings>) -> Result<RoutedSe
         vector_consistency: vector_consistency_from_wire(settings.vector_consistency)?,
         vector_build_wait: settings.vector_build_wait_ms.map(Duration::from_millis),
         query_memory_limit: settings.query_memory_limit,
+        read_preference: match settings.read_preference {
+            0 => None,
+            1 => Some(ReadPreference::Primary),
+            2 => Some(ReadPreference::PrimaryPreferred),
+            3 => Some(ReadPreference::Secondary),
+            4 => Some(ReadPreference::SecondaryPreferred),
+            5 => Some(ReadPreference::Nearest),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "read preference {other} is not one this member knows"
+                )));
+            }
+        },
     })
 }
 
@@ -2538,6 +2564,7 @@ fn stats_to_wire(stats: RoutedStats) -> wire::RoutedStats {
         read_index: stats.read_index,
         read_as_of_ts: stats.read_as_of_ts,
         read_ts: stats.read_ts,
+        served_by_leader: stats.served_by_leader,
     }
 }
 
@@ -2553,6 +2580,7 @@ fn stats_from_wire(stats: wire::RoutedStats) -> RoutedStats {
         read_index: stats.read_index,
         read_as_of_ts: stats.read_as_of_ts,
         read_ts: stats.read_ts,
+        served_by_leader: stats.served_by_leader,
     }
 }
 

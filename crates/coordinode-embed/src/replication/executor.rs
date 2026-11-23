@@ -19,7 +19,7 @@ use coordinode_query::executor::runner::WriteStats;
 use coordinode_raft::read_fence::ReadPreference;
 use parking_lot::RwLock;
 
-use super::admission::{Admission, Admitted, Admitter, Requested};
+use super::admission::{Admission, Admitted, Admitter, ReadForward, Requested};
 use super::routing::{
     AnswerWriter, CommandExecutor, PreparedRouted, RoutedAnswer, RoutedBegin, RoutedCommit,
     RoutedOperationAnswer, RoutedOperationCall, RoutedPreparing, RoutedRollback, RoutedSettings,
@@ -89,6 +89,7 @@ pub fn stats(ws: &WriteStats, admitted: &Admitted) -> RoutedStats {
         read_index: admitted.applied_index,
         read_as_of_ts: admitted.read_as_of_ts,
         read_ts: ws.read_ts.unwrap_or(0),
+        served_by_leader: admitted.served_by_leader,
     }
 }
 
@@ -211,12 +212,26 @@ pub fn routed_settings(requested: &Requested) -> RoutedSettings {
         vector_consistency: requested.vector_consistency,
         vector_build_wait: requested.vector_build_wait,
         query_memory_limit: requested.query_memory_limit,
+        // Routed for leadership: read at the leader.
+        read_preference: None,
+    }
+}
+
+/// The settings a read forwarded because this member is behind its bound
+/// runs under at `forward.to`: what it named, its preference, and what is
+/// left of its wait, one budget through the hop.
+pub fn forwarded_read_settings(requested: &Requested, forward: &ReadForward) -> RoutedSettings {
+    RoutedSettings {
+        causal_wait: forward.wait,
+        read_preference: Some(forward.preference),
+        ..routed_settings(requested)
     }
 }
 
 /// The settings an autonomous statement routed here is admitted with: the
-/// ones its ingress resolved, read from the leader, which this member must
-/// be. Never routed on.
+/// ones its ingress resolved, read from the leader unless it was forwarded
+/// as a read its ingress was behind for, then where its preference permits.
+/// Never routed on.
 pub fn routed_requested(statement: &RoutedStatement, cancel: &CancelFlag) -> Requested {
     let settings = &statement.settings;
     Requested {
@@ -225,7 +240,7 @@ pub fn routed_requested(statement: &RoutedStatement, cancel: &CancelFlag) -> Req
         after_position: settings.after_position,
         causal_wait: settings.causal_wait,
         at_timestamp: settings.at_timestamp.unwrap_or(0),
-        read_preference: Some(ReadPreference::Primary),
+        read_preference: Some(settings.read_preference.unwrap_or(ReadPreference::Primary)),
         write_concern: settings.write_concern,
         vector_consistency: settings.vector_consistency,
         vector_build_wait: settings.vector_build_wait,
@@ -529,7 +544,8 @@ impl CommandExecutor for MemberCommandExecutor {
             {
                 Admission::Run(fenced) => fenced,
                 // An admission that may not route on never asks to.
-                Admission::Forward(leader) => {
+                Admission::Forward(leader)
+                | Admission::ForwardRead(ReadForward { to: leader, .. }) => {
                     return Err(DatabaseError::NotLeader {
                         leader_id: Some(leader),
                     });
@@ -616,7 +632,8 @@ impl CommandExecutor for MemberCommandExecutor {
             let requested = routed_requested(&statement, &cancel);
             let fenced = match admitter.admit(&statement.query, &requested, true).await? {
                 Admission::Run(fenced) => fenced,
-                Admission::Forward(leader) => {
+                Admission::Forward(leader)
+                | Admission::ForwardRead(ReadForward { to: leader, .. }) => {
                     return Err(DatabaseError::NotLeader {
                         leader_id: Some(leader),
                     });

@@ -122,7 +122,7 @@ async fn a_linearizable_read_waits_for_apply_only_as_it_asks() {
             ReadPreference::Nearest,
             ReadConcern::Linearizable,
             Duration::from_secs(5),
-            Some(Duration::from_millis(100)),
+            Some(std::time::Instant::now() + Duration::from_millis(100)),
         ),
     )
     .await;
@@ -147,7 +147,7 @@ async fn a_linearizable_read_waits_for_apply_only_as_it_asks() {
                 ReadPreference::Nearest,
                 ReadConcern::Linearizable,
                 Duration::from_secs(5),
-                Some(Duration::from_secs(20)),
+                Some(std::time::Instant::now() + Duration::from_secs(20)),
             )
             .await
     });
@@ -463,7 +463,9 @@ async fn the_fence_applies_the_resolved_preference() {
             assert!(admitted.served_by_leader);
             assert!(admitted.applied_index > 0, "the group applied its election");
         }
-        Admission::Forward(leader) => panic!("the leader forwarded to {leader}"),
+        Admission::Forward(to) | Admission::ForwardRead(ReadForward { to, .. }) => {
+            panic!("the leader forwarded to {to}")
+        }
     }
 
     node.shutdown().await.expect("shutdown");

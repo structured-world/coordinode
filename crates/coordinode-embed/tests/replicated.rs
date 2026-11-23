@@ -2859,6 +2859,86 @@ async fn a_role_taken_by_another_machine_holds_across_a_leader_change() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A causal read reaching a member held below its bound is sent once,
+/// before it runs, to a member its preference permits, and served there in
+/// one call: to the leader for a read anyone may serve, with no wait at all;
+/// to the other follower for a read only a follower may serve, never to the
+/// leader. The target never sends it on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_behind_its_bound_goes_once_to_a_member_that_can_serve_it() {
+    use coordinode_core::txn::read_concern::ReadConcernLevel;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, _ports) = group(&dirs, None).await;
+        followers_reach_the_leader(&members).await;
+        // Member 3 hears nothing of consensus from here on; the members'
+        // command channel still reaches it.
+        nemesis::isolate(3, &[1, 2]);
+        let written = members[0]
+            .ingress()
+            .execute(Statement::new("CREATE (:Fresh {k: 1})"))
+            .await
+            .expect("the leader writes C");
+        let c = written.value.stats.commit_ts;
+        assert!(c > 0, "the write's commit timestamp");
+        wait_until("member 2 applies C", || count(&members[1], "Fresh") == 1).await;
+        assert_eq!(count(&members[2], "Fresh"), 0, "member 3 is held below C");
+
+        let read = |preference: ReadPreference, wait: Option<Duration>| Statement {
+            requested: Requested {
+                read_concern: Some(ReadConcernLevel::Majority),
+                after_ts: c,
+                causal_wait: wait,
+                read_preference: Some(preference),
+                ..Requested::default()
+            },
+            ..Statement::new("MATCH (n:Fresh) RETURN n.k AS k")
+        };
+        // The leader serves C at once from here on: a zero wait is then
+        // about member 3 alone.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while members[0]
+            .ingress()
+            .execute(read(ReadPreference::Primary, None))
+            .await
+            .is_err()
+        {
+            assert!(Instant::now() < deadline, "the leader serves C");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Anyone may serve it: the leader does, though the read allows no
+        // wait.
+        let nearest = members[2]
+            .ingress()
+            .execute(read(ReadPreference::Nearest, None))
+            .await
+            .expect("served after one hop");
+        assert_eq!(nearest.forwarded_to, Some(1));
+        assert_eq!(nearest.value.rows.len(), 1, "the read sees C");
+
+        // Only a follower may serve it: the other follower does.
+        let strict = members[2]
+            .ingress()
+            .execute(read(
+                ReadPreference::Secondary,
+                Some(Duration::from_secs(10)),
+            ))
+            .await
+            .expect("served by the other follower");
+        assert_eq!(strict.forwarded_to, Some(2), "never the leader");
+        assert_eq!(strict.value.rows.len(), 1);
+
+        nemesis::heal();
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    nemesis::heal();
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// A transaction belongs to the caller that opened it, whichever member a
 /// command comes through: a command acting for another subject, issuer or
 /// namespace under the same ID is refused as if no such transaction were
@@ -3732,16 +3812,25 @@ async fn a_read_continues_at_its_timestamp_on_a_replacement_replica() {
             .execute(Statement::new("CREATE (:Cont {k: 1}), (:Cont {k: 2})"))
             .await
             .expect("the first write");
-        let mut first = Statement::new(query);
-        first.requested = Requested {
-            read_concern: Some(ReadConcernLevel::Majority),
-            after_ts: written.value.stats.commit_ts,
-            causal_wait: Some(Duration::from_secs(10)),
-            read_preference: Some(ReadPreference::Nearest),
-            ..Requested::default()
+        // Read on the replica once its view meets the write: a replica still
+        // behind passes the read to the leader rather than wait.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let served = loop {
+            let mut first = Statement::new(query);
+            first.requested = Requested {
+                read_concern: Some(ReadConcernLevel::Majority),
+                after_ts: written.value.stats.commit_ts,
+                causal_wait: Some(Duration::from_secs(10)),
+                read_preference: Some(ReadPreference::Nearest),
+                ..Requested::default()
+            };
+            let served = members[1].execute(first).await.expect("a replica's read");
+            if served.forwarded_to.is_none() {
+                break served;
+            }
+            assert!(Instant::now() < deadline, "the replica meets the write");
+            tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        let served = members[1].execute(first).await.expect("a replica's read");
-        assert_eq!(served.forwarded_to, None, "the replica served it itself");
         assert_eq!(ks(&served.value.rows), vec![Value::Int(1), Value::Int(2)]);
         let at = served.value.stats.read_ts;
         assert!(at > 0, "the read names the timestamp it read at");

@@ -19,7 +19,8 @@ use coordinode_core::txn::command::{ActingContext, AdmissionSignal, TransactionI
 use coordinode_embed::replication::routing::{RoutedAnswer, RoutedStatement};
 
 use super::statement::{
-    Admission, Admitted, HOPS_HEADER, Requested, StatementExecutor, leader_hint, mismatch_metadata,
+    Admission, Admitted, HOPS_HEADER, ReadForward, Requested, StatementExecutor, leader_hint,
+    mismatch_metadata,
 };
 use crate::config::StatementDefaults;
 use crate::proto::{common, query, replication};
@@ -1241,6 +1242,32 @@ async fn run_at(
     Ok(routed_response(answer, start, executor.history()))
 }
 
+/// The statement of `req` as a read this member is behind for sends it to
+/// `forward.to`: with its preference and what is left of its wait and
+/// deadline, one budget through the hop.
+fn forwarded_read(
+    executor: &StatementExecutor,
+    req: &query::ExecuteCypherRequest,
+    requested: &Requested,
+    forward: &ReadForward,
+    source: Option<SourceContext>,
+) -> RoutedStatement {
+    RoutedStatement {
+        namespace: executor.namespace(),
+        actor: ActingContext::Trusted,
+        params: convert_params(&req.parameters),
+        query: req.query.clone(),
+        settings: coordinode_embed::replication::executor::forwarded_read_settings(
+            requested, forward,
+        ),
+        transaction: None,
+        operation: requested.operation,
+        deadline: time_left(requested.deadline),
+        source,
+        start: None,
+    }
+}
+
 /// What is left until `deadline`, zero once it passed; `None` without one.
 fn time_left(deadline: Option<std::time::Instant>) -> Option<Duration> {
     deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()))
@@ -1278,7 +1305,9 @@ fn routed_response(
             properties_set: stats.properties_set,
             execution_time_ms: start.elapsed().as_millis() as i64,
             receipt: Some(super::causal::receipt_to_proto(receipt)),
-            served_by_leader: true,
+            // As the executing member reports it: a read forwarded to a
+            // follower is not the leader's.
+            served_by_leader: stats.served_by_leader,
             commit_ts: stats.commit_ts,
             read_as_of_ts: stats.read_as_of_ts,
         }),
@@ -1404,10 +1433,40 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             .map_err(db_error_to_status)?;
         #[cfg(feature = "stage-timing")]
         coordinode_storage::stage_timing::record("grpc.admit", start);
-        let admitted = match admitted {
-            Admission::Run(admitted) => admitted,
+        let (admitted, requested) = match admitted {
+            Admission::Run(admitted) => (admitted, requested),
             Admission::Forward(leader_id) => {
                 return run_at(&executor, leader_id, req, &requested, source_ctx, start).await;
+            }
+            Admission::ForwardRead(forward) => {
+                let statement =
+                    forwarded_read(&executor, &req, &requested, &forward, source_ctx.clone());
+                match executor
+                    .route(forward.to, statement, &AdmissionSignal::new(|| {}))
+                    .await
+                {
+                    Ok(answer) => return Ok(routed_response(answer, start, executor.history())),
+                    // Proven not sent: served here after all, with what is
+                    // left of its wait, and never routed on.
+                    Err(DatabaseError::PeerUnreachable { .. }) => {
+                        let admitted = executor
+                            .admit_unsent(&req.query, &requested, &forward)
+                            .await
+                            .map_err(db_error_to_status)?;
+                        let mut requested = requested;
+                        requested.causal_wait = forward.wait;
+                        (admitted, requested)
+                    }
+                    // The target's refusal, as far as one hop took it.
+                    Err(e) => {
+                        let mut status = db_error_to_status(e);
+                        status.metadata_mut().insert(
+                            HOPS_HEADER,
+                            tonic::metadata::MetadataValue::from_static("1"),
+                        );
+                        return Err(status);
+                    }
+                }
             }
         };
 

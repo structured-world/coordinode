@@ -535,6 +535,7 @@ fn statement(transaction: Option<TransactionId>) -> RoutedStatement {
             vector_consistency: Some(VectorConsistencyMode::Exact),
             vector_build_wait: Some(Duration::from_millis(40)),
             query_memory_limit: Some(1 << 20),
+            read_preference: Some(coordinode_raft::read_fence::ReadPreference::Secondary),
         },
         transaction,
         operation: None,

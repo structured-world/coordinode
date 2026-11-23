@@ -46,7 +46,7 @@ use coordinode_embed::replication::routing::{
 use super::failure;
 use crate::services::cypher::{db_error_to_status, read_concern_level, read_preference};
 use crate::services::statement::{
-    Admission, Requested, StatementExecutor, columns_and_values, leader_hint,
+    Admission, ReadForward, Requested, StatementExecutor, columns_and_values, leader_hint,
 };
 use coordinode_embed::replication::executor::routed_settings;
 
@@ -183,6 +183,24 @@ impl DatabaseCursorEngine {
             deadline: None,
             source,
             start: None,
+        }
+    }
+
+    /// An autonomous session read this member is behind for, as sent to
+    /// `forward.to`: its preference and what is left of its wait go with it.
+    fn forwarded(
+        &self,
+        query: &str,
+        params: Option<HashMap<String, Value>>,
+        requested: &Requested,
+        forward: &ReadForward,
+        source: Option<SourceContext>,
+    ) -> RoutedStatement {
+        RoutedStatement {
+            settings: coordinode_embed::replication::executor::forwarded_read_settings(
+                requested, forward,
+            ),
+            ..self.autonomous(query, params, requested, source)
         }
     }
 }
@@ -397,11 +415,52 @@ impl CursorEngine for DatabaseCursorEngine {
                     .executor
                     .check(&call.query, &requested)
                     .map_err(engine_error)?;
-                let admission = engine
+                let mut admission = engine
                     .executor
                     .fence(checked, false)
                     .await
                     .map_err(engine_error)?;
+                let mut requested = requested;
+                // A read this member is behind for goes once to where its
+                // preference permits; proven not sent, it is served here
+                // with what is left of its wait.
+                if let Admission::ForwardRead(forward) = admission {
+                    let params = (!call.params.is_empty()).then(|| call.params.clone());
+                    let source = call.source.as_deref().and_then(source_context);
+                    let statement =
+                        engine.forwarded(&call.query, params, &requested, &forward, source);
+                    let signal = AdmissionSignal::new(|| {});
+                    let routed = tokio::select! {
+                        biased;
+                        () = call.cancel.thrown() => {
+                            return Err(engine_error(DatabaseError::Budget(
+                                coordinode_core::budget::BudgetStop::Cancelled,
+                            )));
+                        }
+                        routed = engine.executor.route_rows(forward.to, statement, &signal) => routed,
+                    };
+                    match routed {
+                        Ok(rows) => {
+                            return Ok(Box::new(Opened(Box::new(RoutedCursor {
+                                rows,
+                                cancel: call.cancel.clone(),
+                                led: true,
+                                history: engine.executor.history(),
+                            })))
+                                as Box<dyn PreparedStatement>);
+                        }
+                        Err(DatabaseError::PeerUnreachable { .. }) => {
+                            let admitted = engine
+                                .executor
+                                .admit_unsent(&call.query, &requested, &forward)
+                                .await
+                                .map_err(engine_error)?;
+                            requested.causal_wait = forward.wait;
+                            admission = Admission::Run(admitted);
+                        }
+                        Err(e) => return Err(engine_error(e)),
+                    }
+                }
                 // Named for the leader: it runs there, and this member only
                 // waits for its answer, holding no thread.
                 if let Admission::Forward(leader) = admission {
@@ -593,6 +652,40 @@ impl DatabaseCursorEngine {
             Admission::Forward(leader_id) => {
                 let statement = self.autonomous(query, params, requested, source);
                 return self.routed(leader_id, statement, &AdmissionSignal::new(|| {}), cancel);
+            }
+            // A read this member is behind for goes once to where its
+            // preference permits; proven not sent, it is served here with
+            // what is left of its wait.
+            Admission::ForwardRead(forward) => {
+                let statement =
+                    self.forwarded(query, params.clone(), requested, &forward, source.clone());
+                let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+                    EngineError::internal(format!("no runtime to reach another member on: {e}"))
+                })?;
+                let signal = AdmissionSignal::new(|| {});
+                let routed = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        () = cancel.thrown() => Err(DatabaseError::Budget(
+                            coordinode_core::budget::BudgetStop::Cancelled,
+                        )),
+                        routed = self.executor.route_rows(forward.to, statement, &signal) => routed,
+                    }
+                });
+                match routed {
+                    Ok(rows) => {
+                        return Ok(Box::new(RoutedCursor {
+                            rows,
+                            cancel: cancel.clone(),
+                            led: true,
+                            history: self.executor.history(),
+                        }));
+                    }
+                    Err(DatabaseError::PeerUnreachable { .. }) => runtime
+                        .block_on(self.executor.admit_unsent(query, requested, &forward))
+                        .map_err(engine_error)?,
+                    Err(e) => return Err(engine_error(e)),
+                }
             }
         };
         let fenced = SessionStats {
@@ -1096,7 +1189,9 @@ impl QueryCursor for RoutedCursor {
                 (stats.read_ts > 0).then_some(stats.read_ts),
                 self.history,
             ),
-            served_by_leader: self.led,
+            // As the executing member reports it, for a statement of its own:
+            // a read forwarded to a follower is not the leader's.
+            served_by_leader: self.led && stats.served_by_leader,
             commit_ts: stats.commit_ts,
             read_as_of_ts: stats.read_as_of_ts,
             ..SessionStats::default()
