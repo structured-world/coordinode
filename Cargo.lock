@@ -918,11 +918,13 @@ version = "0.10.1"
 dependencies = [
  "anyhow",
  "coordinode-core",
+ "coordinode-embed",
  "coordinode-modality",
  "coordinode-openraft",
  "coordinode-raft",
  "coordinode-storage",
  "coordinode-workspace-hack",
+ "crc32c",
  "rmp-serde",
  "rmpv",
  "serde",

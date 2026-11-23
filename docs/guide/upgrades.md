@@ -62,6 +62,32 @@ A data directory records the engine format that wrote it in an
 written by any other format is refused by name and left untouched. A member
 whose directory is refused is removed from its group and added back empty.
 
+## Bringing a directory from the previous release
+
+A directory the previous release wrote is brought to this one offline, with
+the server stopped, by `coordinode-migrate`, built from the same source tree:
+
+```bash
+cargo run --release -p coordinode-migrate -- --data /var/lib/coordinode        # report
+cargo run --release -p coordinode-migrate -- --data /var/lib/coordinode --apply # rewrite
+```
+
+Only the step from the release just before this one ships: a directory of an
+older release goes through each release in turn. From 0.10.1 the step:
+
+- moves each tree from the top of a store into the system set (`system/`) or
+  the store's namespace set (`ns/0000000000000001/`), checkpoints included;
+- puts the namespace marker in front of every unit of the journal and of the
+  group's Raft log;
+- moves the deployment's own records (its identity, node identifier leases,
+  level routing, version pairs, operation incarnations, the Raft state
+  machine's position, membership and snapshot) from the Schema tree to the
+  Deployment tree.
+
+A report changes nothing. Every journal segment `--apply` rewrites is kept as
+a hard link under `<dir>/migrate-backup/<run>/`; a moved tree is moved back by
+renaming its directory. A second run finds nothing to do.
+
 ## Watching a move
 
 `GET /version` on the operational port (`7084` by default) returns the

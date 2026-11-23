@@ -1,22 +1,26 @@
-//! Log entries and segments in the current and the old shapes, for tests.
+//! Journal records and segments as this build and as 0.10.1 wrote them, for
+//! tests.
 
 use std::path::Path;
 
+use coordinode_core::txn::frame::encode_unit;
 use coordinode_core::txn::proposal::{Mutation, PartitionId, ProposalId, RaftProposal};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::storage::{CommittedLeaderId, Entry, Request};
 use coordinode_storage::engine::config::SyncMethod;
 use coordinode_storage::oplog::{OplogEntry, OplogOp, SegmentWriter};
 use openraft::entry::RaftEntry as _;
-use rmpv::Value;
 
-/// A proposal writing one node at `commit_ts`.
+/// The namespace the store's data is in.
+pub(crate) const NAMESPACE: coordinode_core::namespace::NamespaceId =
+    coordinode_core::namespace::NamespaceId::from_raw(1);
+
+/// A proposal writing node `id` at `commit_ts`, in the store's namespace.
 pub(crate) fn proposal(id: u64, commit_ts: u64) -> RaftProposal {
     RaftProposal {
         id: ProposalId::from_raw(id),
-        // Any namespace: the migration carries units without reading them.
         mutations: coordinode_core::txn::proposal::in_namespace(
-            coordinode_core::namespace::NamespaceId::from_raw(1),
+            NAMESPACE,
             [Mutation::Put {
                 partition: PartitionId::Node,
                 key: format!("node:1:{id}").into_bytes(),
@@ -29,8 +33,55 @@ pub(crate) fn proposal(id: u64, commit_ts: u64) -> RaftProposal {
     }
 }
 
-/// A current Normal entry at `index` carrying `request`.
-pub(crate) fn current_entry(index: u64, request: Request) -> Entry {
+/// The unit frame of [`proposal`] as this build writes it.
+pub(crate) fn named_frame(id: u64, commit_ts: u64) -> Vec<u8> {
+    encode_unit(
+        &proposal(id, commit_ts).mutations,
+        Timestamp::from_raw(commit_ts),
+    )
+    .expect("encode")
+}
+
+/// `frame` as 0.10.1 wrote it: the same operations without the namespace
+/// marker in front of them.
+pub(crate) fn unnamed(frame: &[u8]) -> Vec<u8> {
+    let body = &frame[..frame.len() - 4];
+    let mut at = 1;
+    let varint = |at: &mut usize| {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = body[*at];
+            *at += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    };
+    for _ in 0..3 {
+        varint(&mut at);
+    }
+    at += 1;
+    let count_at = at;
+    let count = varint(&mut at);
+    // The marker: its tag and the namespace's one-byte number.
+    assert_eq!(&body[at..at + 2], &[4 | (1 << 3), 1], "a named frame");
+    let mut old = body[..count_at].to_vec();
+    assert!(
+        count - 1 < 0x80,
+        "a test unit counts its operations in one byte"
+    );
+    old.push(u8::try_from(count - 1).expect("one byte"));
+    old.extend_from_slice(&body[at + 2..]);
+    let crc = crc32c::crc32c(&old);
+    old.extend_from_slice(&crc.to_le_bytes());
+    old
+}
+
+/// A Normal entry at `index` carrying `request`.
+pub(crate) fn entry(index: u64, request: Request) -> Entry {
     Entry::new_normal(
         openraft::LogId::new(
             CommittedLeaderId {
@@ -43,34 +94,32 @@ pub(crate) fn current_entry(index: u64, request: Request) -> Entry {
     )
 }
 
-/// `entry` encoded as a build before the closed bound wrote it: the request
-/// array without its second field.
-pub(crate) fn old_bytes(entry: &Entry) -> Vec<u8> {
-    let current = rmp_serde::to_vec(entry).expect("encode");
-    let mut value = rmpv::decode::read_value(&mut &current[..]).expect("decode");
-    let Value::Array(fields) = &mut value else {
-        unreachable!("an entry encodes as an array")
-    };
-    let Some(Value::Map(payload)) = fields.get_mut(1) else {
-        unreachable!("a Normal payload encodes as a map")
-    };
-    let [(_, Value::Array(request))] = payload.as_mut_slice() else {
-        unreachable!("a request encodes as an array")
-    };
-    request.truncate(1);
-    let mut out = Vec::new();
-    rmpv::encode::write_value(&mut out, &value).expect("encode");
-    out
-}
-
-/// A journal record at `index` whose envelope is `data`.
-pub(crate) fn record(index: u64, data: Vec<u8>) -> OplogEntry {
+/// A record of the store's own journal at `index`: the unit `frame` alone.
+pub(crate) fn journal_record(index: u64, frame: Vec<u8>) -> OplogEntry {
     OplogEntry {
         ts: 1000 + index,
         term: 1,
         index,
         shard: 0,
-        ops: vec![OplogOp::RaftEntry { data }],
+        ops: vec![OplogOp::Unit { frame }],
+        is_migration: false,
+        pre_images: None,
+    }
+}
+
+/// A record of a group's Raft log at `index`: the entry's envelope, then the
+/// unit `frame`.
+pub(crate) fn raft_record(index: u64, frame: Vec<u8>) -> OplogEntry {
+    let envelope = rmp_serde::to_vec(&entry(index, Request::closing(0))).expect("encode");
+    OplogEntry {
+        ts: 1000 + index,
+        term: 1,
+        index,
+        shard: 0,
+        ops: vec![
+            OplogOp::RaftEntry { data: envelope },
+            OplogOp::Unit { frame },
+        ],
         is_migration: false,
         pre_images: None,
     }

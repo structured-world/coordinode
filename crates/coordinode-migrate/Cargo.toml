@@ -12,11 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 coordinode-storage = { workspace = true }
-coordinode-raft = { workspace = true }
 coordinode-modality = { workspace = true }
 coordinode-core = { workspace = true }
 serde = { workspace = true }
 anyhow = "1"
+# A unit frame rewritten in place carries the checksum its decoder checks.
+crc32c = "0.6"
 rmp-serde = { workspace = true }
 # Old encodings are rewritten as msgpack values, so no copy of a retired
 # type has to be kept to read them.
@@ -24,6 +25,10 @@ rmpv = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
+# The Raft log entries a group's log records, for its segments in tests.
+coordinode-raft = { workspace = true }
+# A store 0.10.1 wrote, migrated, is opened as an application opens it.
+coordinode-embed = { workspace = true }
 openraft = { workspace = true }
 tempfile = { workspace = true }
 

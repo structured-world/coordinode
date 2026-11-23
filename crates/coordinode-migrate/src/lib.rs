@@ -20,7 +20,7 @@ pub mod oplog;
 
 use std::path::{Path, PathBuf};
 
-pub use migrations::MIGRATIONS;
+pub use migrations::{RELEASE_STEPS, ReleaseStep, migrations};
 
 /// Directory, inside the data directory, that keeps the replaced files.
 pub const BACKUP_DIR: &str = "migrate-backup";
@@ -152,10 +152,7 @@ pub fn open_store(dir: &Path) -> anyhow::Result<coordinode_storage::engine::core
 ///
 /// A migration cannot read what it surveys; nothing is changed.
 pub fn survey(data: &Path) -> anyhow::Result<Vec<(&'static Migration, Vec<Finding>)>> {
-    MIGRATIONS
-        .iter()
-        .map(|m| Ok((m, (m.survey)(data)?)))
-        .collect()
+    migrations().map(|m| Ok((m, (m.survey)(data)?))).collect()
 }
 
 /// Survey `data` and rewrite every finding, keeping what is replaced under

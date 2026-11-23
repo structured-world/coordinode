@@ -1,12 +1,8 @@
 use super::{read, segment_files};
-use crate::test_support::{current_entry, record, write_segment};
-use coordinode_raft::storage::Request;
+use crate::test_support::{named_frame, raft_record, write_segment};
 
 fn current_record(index: u64) -> coordinode_storage::oplog::OplogEntry {
-    record(
-        index,
-        rmp_serde::to_vec(&current_entry(index, Request::closing(0))).expect("encode"),
-    )
+    raft_record(index, named_frame(index, 100 + index))
 }
 
 /// The store's journal on every endpoint and the copies inside checkpoints

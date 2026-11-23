@@ -21,7 +21,7 @@ pub const NAMESPACES_DIR: &str = "ns";
 /// The directory, within a namespace's set, holding its `STORAGE COLUMNAR`
 /// table trees. Part of the layout whether or not this build serves tables:
 /// a store's directories mean the same to every build.
-pub(crate) const TABLES_DIR: &str = "tables";
+pub const TABLES_DIR: &str = "tables";
 
 pub use coordinode_core::namespace::NamespaceId;
 
