@@ -1287,7 +1287,7 @@ fn stage_edge_type(
     // refuses this commit instead of passing under it.
     let version = txn.record_condition(Partition::Schema, &pointer)?;
     let current = store.load_edge_type(&name)?;
-    txn.expect_version(Partition::Schema, &pointer, version)?;
+    txn.expect_condition(Partition::Schema, &pointer, version)?;
     let object = |disposition, revision| PublishedObject {
         object: CatalogObject::EdgeType,
         name: name.clone(),

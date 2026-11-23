@@ -190,12 +190,21 @@ struct Catalog {
     /// certified: what every write asks before it judges its labels twice,
     /// answered without walking the indexes.
     proposed_btree: usize,
+    /// How many definitions are registered at a stored record whose commit
+    /// is not known here: what a member asks after every applied entry
+    /// before it looks for them, answered without walking the indexes.
+    unknown_revision: usize,
 }
 
 /// Whether `def` is a B-tree index with a change of what a type implies
 /// being certified for its label.
 fn proposes_btree(def: &IndexDefinition) -> bool {
     def.index_type == IndexType::BTree && def.has_proposed()
+}
+
+/// Whether `registered` was read at a record whose commit is not known.
+fn of_unknown_revision(registered: &Registered) -> bool {
+    registered.version == Some(coordinode_storage::engine::UNKNOWN_REVISION)
 }
 
 impl Catalog {
@@ -206,8 +215,10 @@ impl Catalog {
         }
         // Counted in before the old one is counted out: never below zero.
         self.proposed_btree += usize::from(proposes_btree(&registered.def));
+        self.unknown_revision += usize::from(of_unknown_revision(&registered));
         if let Some(old) = self.by_id.insert(id, registered) {
             self.proposed_btree -= usize::from(proposes_btree(&old.def));
+            self.unknown_revision -= usize::from(of_unknown_revision(&old));
             self.unbind(&old.def);
         }
         if let Some(name) = &self.by_id[&id].def.name {
@@ -219,6 +230,7 @@ impl Catalog {
         if let Some(old) = self.by_id.remove(&id) {
             // It was counted in when inserted.
             self.proposed_btree -= usize::from(proposes_btree(&old.def));
+            self.unknown_revision -= usize::from(of_unknown_revision(&old));
             self.unbind(&old.def);
         }
         if self.labels == Some(id) {
@@ -1308,13 +1320,22 @@ impl IndexRegistry {
     /// The active definitions whose commit is not known here: the ones a
     /// writer binding to them is refused for until they are written again.
     pub fn of_unknown_revision(&self) -> Vec<IndexDefinition> {
-        self.indexes
-            .read()
+        let catalog = self.indexes.read();
+        if catalog.unknown_revision == 0 {
+            return Vec::new();
+        }
+        catalog
             .by_id
             .values()
-            .filter(|r| r.version == Some(coordinode_storage::engine::UNKNOWN_REVISION))
+            .filter(|r| of_unknown_revision(r))
             .map(|r| IndexDefinition::clone(&r.def))
             .collect()
+    }
+
+    /// Whether any active definition's commit is not known here, answered
+    /// from a count kept as definitions are registered, without walking them.
+    pub fn has_unknown_revision(&self) -> bool {
+        self.indexes.read().unknown_revision > 0
     }
 
     /// Every active index (owned clones).

@@ -778,7 +778,7 @@ impl BlobCollector {
                 .record_condition(Partition::BlobRef, COMPACTION_PENDING_KEY)?
                 == Some(deleted_at)
             {
-                txn.expect_version(Partition::BlobRef, COMPACTION_PENDING_KEY, Some(deleted_at))?;
+                txn.expect_condition(Partition::BlobRef, COMPACTION_PENDING_KEY, Some(deleted_at))?;
                 txn.delete(Partition::BlobRef, COMPACTION_PENDING_KEY)?;
                 // Bounded by the bytes deleted, which fit an i64.
                 txn.push_counter_delta(UNCOMPACTED_BYTES_KEY, -(uncompacted as i64));

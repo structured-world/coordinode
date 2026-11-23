@@ -369,7 +369,7 @@ impl BlobStore {
             for content in &distinct {
                 let key = catalog_key(content);
                 let (entry, version) = store.catalog_entry(&key)?;
-                txn.expect_version(Partition::BlobRef, &key, version)?;
+                txn.expect_condition(Partition::BlobRef, &key, version)?;
                 let staged = match entry.map(|e| e.eligible) {
                     Some(eligible) => StagedContent {
                         content: *content,
@@ -389,7 +389,7 @@ impl BlobStore {
                 admitted_at_micros: (store.now_micros)(),
                 contents,
             };
-            txn.expect_version(Partition::BlobRef, &staging_key(staging_id), None)?;
+            txn.expect_condition(Partition::BlobRef, &staging_key(staging_id), None)?;
             txn.put(
                 Partition::BlobRef,
                 &staging_key(staging_id),
@@ -486,7 +486,7 @@ impl BlobStore {
         else {
             return Err(BlobError::Fenced);
         };
-        txn.expect_version(Partition::BlobRef, &stage_key, Some(stage_version))?;
+        txn.expect_condition(Partition::BlobRef, &stage_key, Some(stage_version))?;
         txn.delete(Partition::BlobRef, &stage_key)?;
 
         let mut shared = 0;
@@ -496,7 +496,7 @@ impl BlobStore {
             txn.push_counter_delta(&pins_counter_key(&item.content), -1);
             let key = catalog_key(&item.content);
             let (entry, version) = self.catalog_entry(&key)?;
-            txn.expect_version(Partition::BlobRef, &key, version)?;
+            txn.expect_condition(Partition::BlobRef, &key, version)?;
             match entry {
                 Some(entry) if entry.eligible.generation == item.generation => {
                     shared += 1;
@@ -536,7 +536,7 @@ impl BlobStore {
         if write == OwnerWrite::Create && old.is_some() {
             return Err(BlobError::OwnerExists);
         }
-        txn.expect_version(Partition::BlobRef, owner_key, owner_version)?;
+        txn.expect_condition(Partition::BlobRef, owner_key, owner_version)?;
         released += self.release_into(txn, owner_key, old.as_ref(), Some(&record.blob))?;
         self.acquire_into(txn, old.as_ref(), &record.blob);
         txn.put(
@@ -571,7 +571,7 @@ impl BlobStore {
             let staged: StagingRecord = decode(&stage_key, &bytes, StagingRecord::from_msgpack)?;
             let now = (store.now_micros)();
             let mut txn = store.begin();
-            txn.expect_version(Partition::BlobRef, &stage_key, Some(version))?;
+            txn.expect_condition(Partition::BlobRef, &stage_key, Some(version))?;
             txn.delete(Partition::BlobRef, &stage_key)?;
             for item in &staged.contents {
                 txn.push_counter_delta(&pins_counter_key(&item.content), -1);
@@ -586,7 +586,7 @@ impl BlobStore {
                 if entry.map(|e| e.eligible.generation) == Some(item.generation) {
                     continue;
                 }
-                txn.expect_version(Partition::BlobRef, &key, version)?;
+                txn.expect_condition(Partition::BlobRef, &key, version)?;
                 retire_into(&mut txn, &item.content, item.generation, now)?;
             }
             store.commit(txn)?;
@@ -636,7 +636,7 @@ impl BlobStore {
         let Some(old) = old else {
             return Ok(None);
         };
-        txn.expect_version(Partition::BlobRef, owner_key, version)?;
+        txn.expect_condition(Partition::BlobRef, owner_key, version)?;
         txn.delete(Partition::BlobRef, owner_key)?;
         self.release_into(txn, owner_key, Some(&old), None)?;
         Ok(Some(old))
@@ -760,7 +760,7 @@ impl BlobStore {
             // admissions already on their way, whose references it then
             // counts, and later ones queue behind it.
             let mut txn = store.begin();
-            txn.expect_version(Partition::BlobRef, &key, version)?;
+            txn.expect_condition(Partition::BlobRef, &key, version)?;
             let revision = txn.schema_generation();
             txn.claim(Claim::new(
                 ClaimScope::Record(key.clone()),
@@ -802,7 +802,7 @@ impl BlobStore {
                     decided.push(Retirement::NotEligible);
                     continue;
                 }
-                txn.expect_version(Partition::BlobRef, &key, version)?;
+                txn.expect_condition(Partition::BlobRef, &key, version)?;
                 txn.claim(Claim::new(
                     ClaimScope::Record(key.clone()),
                     ClaimPredicate::BlobRetired {
@@ -855,7 +855,7 @@ impl BlobStore {
                 else {
                     continue;
                 };
-                txn.expect_version(Partition::BlobRef, &record, Some(version))?;
+                txn.expect_condition(Partition::BlobRef, &record, Some(version))?;
                 let entry_key = catalog_key(content);
                 let (entry, entry_version) = store.catalog_entry(&entry_key)?;
                 if entry.map(|e| e.eligible.generation) == Some(*generation) {
@@ -867,7 +867,7 @@ impl BlobStore {
                 // The generation can never become eligible again, and the
                 // entry's version is checked so a retirement and its cleanup
                 // are never decided from two different catalog states.
-                txn.expect_version(Partition::BlobRef, &entry_key, entry_version)?;
+                txn.expect_condition(Partition::BlobRef, &entry_key, entry_version)?;
                 txn.delete(Partition::BlobRef, &record)?;
                 cleaned.representations += 1;
                 let payload = payload_key(content, *generation);

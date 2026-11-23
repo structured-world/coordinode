@@ -123,6 +123,8 @@ tempfile = { workspace = true }
 coordinode-search = { workspace = true, features = ["test-hooks"] }
 coordinode-client = { workspace = true }
 coordinode-modality = { workspace = true }
+# Loses a record's revision for the session tests that condition on one.
+coordinode-storage = { workspace = true, features = ["test-faults"] }
 coordinode-test-fixtures = { workspace = true }
 # Counts what a piece of work held at once (`alloc_peak`) in unit tests.
 tracking-allocator = { version = "0.4", default-features = false }

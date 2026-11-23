@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
+use coordinode_embed::db::{CommitOptions, ExpectedVersion};
 use coordinode_embed::{Database, DatabaseError};
 
 /// Copy the directory `from` to `to`, recursively.
@@ -213,19 +214,43 @@ fn a_settled_version_is_unknown() {
             Err(DatabaseError::RevisionUnavailable { .. })
         ));
     }
-    let tx = db.begin_transaction().expect("begin");
-    db.execute_in_transaction(tx, "MATCH (p:Probe {k: 'a'}) SET p.v = 10", None)
-        .expect("statement");
-    db.execute_in_transaction(tx, "CREATE (:SideEffect)", None)
-        .expect("statement");
-    db.expect_node_version(tx, a, Some(1))
-        .expect("state the condition");
-    assert!(matches!(
-        db.commit_transaction(tx),
-        Err(DatabaseError::RevisionUnavailable { .. })
-    ));
-    assert_eq!(int(&mut db, "MATCH (s:SideEffect) RETURN count(s) AS n"), 0);
-    assert_eq!(int(&mut db, "MATCH (p:Probe {k: 'a'}) RETURN p.v AS v"), 1);
+    // No version a caller names gets past the lost one: zero and absence
+    // included, stated on the transaction or carried by the commit.
+    for (expected, on_commit) in [
+        (Some(1), false),
+        (Some(0), false),
+        (None, false),
+        (Some(0), true),
+    ] {
+        let tx = db.begin_transaction().expect("begin");
+        db.execute_in_transaction(tx, "MATCH (p:Probe {k: 'a'}) SET p.v = 10", None)
+            .expect("statement");
+        db.execute_in_transaction(tx, "CREATE (:SideEffect)", None)
+            .expect("statement");
+        let condition = [ExpectedVersion {
+            node: a,
+            version: expected,
+        }];
+        let outcome = if on_commit {
+            db.commit_transaction_with(
+                tx,
+                &CommitOptions {
+                    expect: &condition,
+                    ..CommitOptions::default()
+                },
+            )
+        } else {
+            db.expect_node_version(tx, a, expected)
+                .expect("state the condition");
+            db.commit_transaction(tx)
+        };
+        assert!(
+            matches!(outcome, Err(DatabaseError::RevisionUnavailable { .. })),
+            "{expected:?} on the commit: {on_commit}"
+        );
+        assert_eq!(int(&mut db, "MATCH (s:SideEffect) RETURN count(s) AS n"), 0);
+        assert_eq!(int(&mut db, "MATCH (p:Probe {k: 'a'}) RETURN p.v AS v"), 1);
+    }
 
     db.execute_cypher("MATCH (p:Probe {k: 'a'}) SET p.v = 12")
         .expect("a write replaces the record");

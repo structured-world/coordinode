@@ -912,7 +912,7 @@ pub fn rebuild(
         }
     }
     let marker = descriptor.coverage_key();
-    txn.expect_version(Partition::Schema, &marker, None)?;
+    txn.expect_condition(Partition::Schema, &marker, None)?;
     txn.put(Partition::Schema, &marker, b"")?;
     Ok(rebuilt)
 }

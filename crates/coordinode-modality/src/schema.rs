@@ -1174,7 +1174,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
             Some(version) if implicit => {
                 txn.accept_written_at(Partition::Schema, &pointer_key, version)?;
             }
-            _ => txn.expect_version(Partition::Schema, &pointer_key, version)?,
+            _ => txn.expect_condition(Partition::Schema, &pointer_key, version)?,
         }
         Ok(current)
     }
@@ -1414,7 +1414,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
         label: &str,
     ) -> StoreResult<()> {
         let key = encode_constraint_name_key(name);
-        txn.expect_version(Partition::Schema, &key, None)?;
+        txn.expect_condition(Partition::Schema, &key, None)?;
         txn.put(Partition::Schema, &key, label.as_bytes())?;
         Ok(())
     }
@@ -1422,7 +1422,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
     fn release_constraint_name_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
         let key = encode_constraint_name_key(name);
         let version = self.engine.record_condition(Partition::Schema, &key)?;
-        txn.expect_version(Partition::Schema, &key, version)?;
+        txn.expect_condition(Partition::Schema, &key, version)?;
         txn.delete(Partition::Schema, &key)?;
         Ok(())
     }

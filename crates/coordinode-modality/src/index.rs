@@ -1339,7 +1339,7 @@ impl LocalIndexStore<'_> {
             Some((bytes, version)) => (decode("index identity allocator", &bytes)?, Some(version)),
             None => (IdentityAllocator::default(), None),
         };
-        txn.expect_version(Partition::Schema, key, version)?;
+        txn.expect_condition(Partition::Schema, key, version)?;
         Ok(allocator)
     }
 
@@ -1658,7 +1658,7 @@ impl IndexStore for LocalIndexStore<'_> {
             }
             // Bound only while it is free when the statement commits: two
             // publications of one name cannot both commit.
-            txn.expect_version(Partition::Schema, &key, None)?;
+            txn.expect_condition(Partition::Schema, &key, None)?;
         }
         let mut allocator = self.allocator_txn(txn)?;
         let id = allocator.allocate_index()?;
@@ -1691,7 +1691,7 @@ impl IndexStore for LocalIndexStore<'_> {
         if txn.get(Partition::Schema, LABEL_LOOKUP_KEY)?.is_some() {
             return Ok(None);
         }
-        txn.expect_version(Partition::Schema, LABEL_LOOKUP_KEY, None)?;
+        txn.expect_condition(Partition::Schema, LABEL_LOOKUP_KEY, None)?;
         let def = self.publish_definition_txn(txn, descriptor)?;
         txn.put(
             Partition::Schema,
@@ -1921,7 +1921,7 @@ impl IndexStore for LocalIndexStore<'_> {
         version: Option<u64>,
     ) -> StoreResult<()> {
         let value = encode("index policy", policy)?;
-        txn.expect_version(Partition::Schema, NamespaceIndexPolicy::KEY, version)?;
+        txn.expect_condition(Partition::Schema, NamespaceIndexPolicy::KEY, version)?;
         txn.put(Partition::Schema, NamespaceIndexPolicy::KEY, &value)?;
         Ok(())
     }
@@ -1956,7 +1956,7 @@ impl IndexStore for LocalIndexStore<'_> {
         id: IndexId,
         version: Option<u64>,
     ) -> StoreResult<()> {
-        Ok(txn.expect_version(
+        Ok(txn.expect_condition(
             Partition::Schema,
             &IndexDefinition::schema_key_of(id),
             version,
@@ -1975,7 +1975,7 @@ impl IndexStore for LocalIndexStore<'_> {
         name: &str,
         version: Option<u64>,
     ) -> StoreResult<()> {
-        Ok(txn.expect_version(
+        Ok(txn.expect_condition(
             Partition::Schema,
             &IndexDefinition::name_key_of(name),
             version,
@@ -2008,7 +2008,7 @@ impl IndexStore for LocalIndexStore<'_> {
         version: Option<u64>,
     ) -> StoreResult<()> {
         let key = IndexBuildRecord::key_of(record.generation);
-        txn.expect_version(Partition::Schema, &key, version)?;
+        txn.expect_condition(Partition::Schema, &key, version)?;
         txn.put(
             Partition::Schema,
             &key,
@@ -2049,7 +2049,7 @@ impl IndexStore for LocalIndexStore<'_> {
         version: Option<u64>,
     ) -> StoreResult<()> {
         let key = LabelCertificationRecord::key_of(record.generation);
-        txn.expect_version(Partition::Schema, &key, version)?;
+        txn.expect_condition(Partition::Schema, &key, version)?;
         txn.put(
             Partition::Schema,
             &key,
@@ -2103,7 +2103,7 @@ impl IndexStore for LocalIndexStore<'_> {
         version: u64,
     ) -> StoreResult<()> {
         let key = IndexBuildRecord::key_of(generation);
-        txn.expect_version(Partition::Schema, &key, Some(version))?;
+        txn.expect_condition(Partition::Schema, &key, Some(version))?;
         txn.delete(Partition::Schema, &key)?;
         self.delete_repairs_txn(txn, generation)
     }
@@ -2157,7 +2157,7 @@ impl IndexStore for LocalIndexStore<'_> {
         version: Option<u64>,
     ) -> StoreResult<()> {
         let key = IndexIntegrityRecord::key_of(record.generation);
-        txn.expect_version(Partition::Schema, &key, version)?;
+        txn.expect_condition(Partition::Schema, &key, version)?;
         txn.put(
             Partition::Schema,
             &key,
@@ -2172,7 +2172,7 @@ impl IndexStore for LocalIndexStore<'_> {
         generation: GenerationId,
         version: u64,
     ) -> StoreResult<()> {
-        txn.expect_version(
+        txn.expect_condition(
             Partition::Schema,
             &IndexIntegrityRecord::key_of(generation),
             Some(version),
@@ -2555,7 +2555,7 @@ impl IndexStore for LocalIndexStore<'_> {
         let (key, value) = entry(index.generation, tuple, owner);
         // The condition before the write it guards: a direct-mode engine
         // decides a condition when it is stated.
-        txn.expect_version(Partition::Idx, &key, version)?;
+        txn.expect_condition(Partition::Idx, &key, version)?;
         if present {
             txn.put(Partition::Idx, &key, &value)?;
         } else {

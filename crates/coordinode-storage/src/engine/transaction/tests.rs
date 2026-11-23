@@ -735,7 +735,7 @@ fn a_record_of_unknown_commit_is_given_one_version() {
 
     let rewrite = || {
         let mut txn = mvcc_txn(&engine, &oracle);
-        txn.expect_version(Partition::Node, KEY, Some(UNKNOWN_REVISION))
+        txn.expect_condition(Partition::Node, KEY, Some(UNKNOWN_REVISION))
             .expect("state the condition");
         txn.put(Partition::Node, KEY, b"as it stands")
             .expect("stage");
@@ -807,6 +807,64 @@ fn a_record_of_unknown_commit_is_given_one_version() {
         Err(CommitError::Storage(
             StorageError::RevisionUnavailable { .. }
         ))
+    ));
+}
+
+/// A caller's version condition on a record of unknown commit is refused
+/// whatever it names, zero and absence included, and nothing is written:
+/// the state the engine's own rewrite is conditioned on is not a version a
+/// caller can hold, so naming zero cannot write past a lost revision.
+#[test]
+fn a_callers_condition_on_a_record_of_unknown_commit_is_refused() {
+    const KEY: &[u8] = b"node:00:00000001";
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    let mut create = mvcc_txn(&engine, &oracle);
+    create
+        .put(Partition::Node, KEY, b"as it stands")
+        .expect("stage");
+    create.commit(&ctx()).expect("create");
+    assert!(
+        engine
+            .forget_revision(Partition::Node, KEY)
+            .expect("forget")
+    );
+
+    for expected in [Some(0), None] {
+        let mut txn = mvcc_txn(&engine, &oracle);
+        txn.expect_version(Partition::Node, KEY, expected)
+            .expect("state the condition");
+        txn.put(Partition::Node, KEY, b"past the lost revision")
+            .expect("stage");
+        txn.put(Partition::Node, b"node:00:00000002", b"side effect")
+            .expect("stage");
+        assert!(
+            matches!(
+                txn.commit(&ctx()),
+                Err(CommitError::Storage(
+                    StorageError::RevisionUnavailable { .. }
+                ))
+            ),
+            "{expected:?} is refused"
+        );
+    }
+    assert_eq!(
+        engine.get(Partition::Node, KEY).unwrap().as_deref(),
+        Some(&b"as it stands"[..])
+    );
+    assert_eq!(
+        engine.get(Partition::Node, b"node:00:00000002").unwrap(),
+        None,
+        "no side effect"
+    );
+    assert!(matches!(
+        engine.record_version(Partition::Node, KEY),
+        Err(StorageError::RevisionUnavailable { .. })
     ));
 }
 

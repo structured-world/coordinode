@@ -1285,3 +1285,31 @@ fn partial_filter_matches_function() {
         .matches(&props)
     );
 }
+
+/// Whether a definition of unknown commit is registered is kept as
+/// definitions come and go, and agrees with the definitions themselves: a
+/// member asks it after every applied entry without walking them.
+#[test]
+fn the_count_of_definitions_of_unknown_commit_follows_registration() {
+    use coordinode_storage::engine::UNKNOWN_REVISION;
+    let reg = IndexRegistry::new();
+    let email = btree("user_email", "email", 1);
+    let name = btree("user_name", "name", 2);
+    let agrees = |expected: usize| {
+        assert_eq!(reg.of_unknown_revision().len(), expected);
+        assert_eq!(reg.has_unknown_revision(), expected > 0);
+    };
+    agrees(0);
+    reg.insert(email.clone(), Some(UNKNOWN_REVISION));
+    reg.insert(name.clone(), Some(UNKNOWN_REVISION));
+    agrees(2);
+    // Written again: the same definition at a commit of its own.
+    reg.insert(email.clone(), Some(7));
+    agrees(1);
+    reg.insert(email, Some(UNKNOWN_REVISION));
+    agrees(2);
+    reg.unregister(name.id);
+    agrees(1);
+    reg.insert(name, None);
+    agrees(1);
+}

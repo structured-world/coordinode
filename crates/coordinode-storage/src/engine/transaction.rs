@@ -310,6 +310,20 @@ fn proposal_err_to_commit(err: ProposalError) -> CommitError {
     }
 }
 
+/// Who stated a version condition, which decides what a record whose commit
+/// is not known answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConditionOf {
+    /// A caller naming the version it read: such a record has none, so the
+    /// condition is refused whatever it names.
+    Caller,
+    /// The engine's own writer naming what
+    /// [`StorageEngine::record_condition`] read, where
+    /// [`crate::engine::UNKNOWN_REVISION`] matches a record still in that
+    /// state.
+    Engine,
+}
+
 /// Per-statement transaction context. See the module docs.
 pub struct Transaction<'a> {
     engine: &'a StorageEngine,
@@ -387,7 +401,7 @@ pub struct Transaction<'a> {
     /// Held apart from the write buffer because the condition is not a write:
     /// it is what makes the write admissible, and the two are checked at
     /// different points against different evidence.
-    expected_versions: Vec<(Partition, Vec<u8>, Option<u64>)>,
+    expected_versions: Vec<(Partition, Vec<u8>, Option<u64>, ConditionOf)>,
     /// Records written since the snapshot at a version this attempt read and
     /// builds on ([`Self::accept_written_at`]): their write-set check is the
     /// exact version condition stated for them in `expected_versions`, not
@@ -564,7 +578,7 @@ pub struct TransactionState {
     schema_reads: ClaimSet,
     /// Parked for the same reason as the claims: a condition stated by one
     /// statement of an interactive transaction binds the commit of the last.
-    expected_versions: Vec<(Partition, Vec<u8>, Option<u64>)>,
+    expected_versions: Vec<(Partition, Vec<u8>, Option<u64>, ConditionOf)>,
     /// Parked with the conditions they rest on.
     accepted_writes: Vec<(Partition, Vec<u8>)>,
     /// Parked with the claims it stamps: the generation belongs to the
@@ -676,7 +690,9 @@ impl TransactionState {
     /// An interactive transaction spends most of its life here rather than as
     /// a `Transaction`, and a caller that wants to condition its commit has
     /// nowhere else to say so. The condition binds the commit, not the
-    /// statement it was stated beside.
+    /// statement it was stated beside. The caller's form of
+    /// [`Transaction::expect_version`]: a record whose commit is not known
+    /// refuses it.
     pub fn expect_version(
         &mut self,
         part: Partition,
@@ -689,7 +705,8 @@ impl TransactionState {
                  operands, so a write cannot be conditioned on their version"
             )));
         }
-        self.expected_versions.push((part, key.to_vec(), expected));
+        self.expected_versions
+            .push((part, key.to_vec(), expected, ConditionOf::Caller));
         Ok(())
     }
 
@@ -2018,11 +2035,14 @@ impl<'a> Transaction<'a> {
     /// is no longer at the version named, carrying the version that is there.
     fn check_expected_versions(&self) -> Result<(), CommitError> {
         use crate::engine::UNKNOWN_REVISION;
-        for (part, key, expected) in &self.expected_versions {
+        for (part, key, expected, of) in &self.expected_versions {
             let current = self.engine.record_condition(*part, key)?;
-            // A version named of a record whose commit is not known: there
-            // is no version to compare it with.
-            if current == Some(UNKNOWN_REVISION) && *expected != Some(UNKNOWN_REVISION) {
+            // A record whose commit is not known has no version to compare
+            // a caller's condition with; only the engine's own condition
+            // names that state.
+            if current == Some(UNKNOWN_REVISION)
+                && (*of == ConditionOf::Caller || *expected != Some(UNKNOWN_REVISION))
+            {
                 return Err(StorageError::RevisionUnavailable {
                     partition: part.name(),
                 }
@@ -2059,11 +2079,9 @@ impl<'a> Transaction<'a> {
     /// gets from stating it is a refusal carrying the version that is there
     /// now, so a retry needs no second read.
     ///
-    /// [`crate::engine::UNKNOWN_REVISION`] names the state of a live record
-    /// whose commit is not known ([`StorageEngine::record_condition`]): the
-    /// write is admitted only while nothing has written the record, as every
-    /// write gives it a known version. A known version named of a record in
-    /// that state is refused as unanswerable.
+    /// This is the caller's form: a record whose commit is not known has no
+    /// version, so any condition on it, absence and zero included, refuses
+    /// the commit with [`StorageError::RevisionUnavailable`].
     ///
     /// # Errors
     ///
@@ -2074,6 +2092,39 @@ impl<'a> Transaction<'a> {
         key: &[u8],
         expected: Option<u64>,
     ) -> StorageResult<()> {
+        self.expect(part, key, expected, ConditionOf::Caller)
+    }
+
+    /// The engine's own writers' form of [`Self::expect_version`], naming the
+    /// condition [`StorageEngine::record_condition`] read:
+    /// [`crate::engine::UNKNOWN_REVISION`] names a live record whose commit
+    /// is not known, and the write is admitted only while nothing has written
+    /// it, as every write gives it a known version. A known version named of
+    /// a record in that state is refused as unanswerable.
+    ///
+    /// Never for a version a caller supplies: a caller holding no version of
+    /// such a record would write past its lost revision by naming zero.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::expect_version`].
+    pub fn expect_condition(
+        &mut self,
+        part: Partition,
+        key: &[u8],
+        condition: Option<u64>,
+    ) -> StorageResult<()> {
+        self.expect(part, key, condition, ConditionOf::Engine)
+    }
+
+    fn expect(
+        &mut self,
+        part: Partition,
+        key: &[u8],
+        expected: Option<u64>,
+        of: ConditionOf,
+    ) -> StorageResult<()> {
+        use crate::engine::UNKNOWN_REVISION;
         if part.is_commutative() {
             return Err(StorageError::InvalidConfig(format!(
                 "the {part:?} partition is merge-composed: its rows are folded from \
@@ -2084,10 +2135,16 @@ impl<'a> Transaction<'a> {
         // checked at the commit would see this attempt's own writes. It is
         // decided now, before them; one that fails now is kept and refuses
         // the commit as usual.
-        if self.oracle.is_none() && self.engine.record_condition(part, key)? == expected {
-            return Ok(());
+        if self.oracle.is_none() {
+            let current = self.engine.record_condition(part, key)?;
+            if current == expected
+                && (of == ConditionOf::Engine || current != Some(UNKNOWN_REVISION))
+            {
+                return Ok(());
+            }
         }
-        self.expected_versions.push((part, key.to_vec(), expected));
+        self.expected_versions
+            .push((part, key.to_vec(), expected, of));
         Ok(())
     }
 
@@ -2113,7 +2170,7 @@ impl<'a> Transaction<'a> {
         key: &[u8],
         version: u64,
     ) -> StorageResult<()> {
-        self.expect_version(part, key, Some(version))?;
+        self.expect_condition(part, key, Some(version))?;
         self.accepted_writes.push((part, key.to_vec()));
         Ok(())
     }
@@ -2128,7 +2185,7 @@ impl<'a> Transaction<'a> {
     /// The errors of [`Self::expect_version`].
     pub fn bind_index_definition(&mut self, key: &[u8], version: Option<u64>) -> StorageResult<()> {
         if self.derived.bind(key) {
-            self.expect_version(Partition::Schema, key, version)?;
+            self.expect_condition(Partition::Schema, key, version)?;
         }
         Ok(())
     }
@@ -2179,11 +2236,6 @@ impl<'a> Transaction<'a> {
     /// [`StorageEngine::record_condition`].
     pub fn record_condition(&self, part: Partition, key: &[u8]) -> StorageResult<Option<u64>> {
         self.engine.record_condition(part, key)
-    }
-
-    /// The conditions stated so far, for a caller that has to report them.
-    pub fn expected_versions(&self) -> &[(Partition, Vec<u8>, Option<u64>)] {
-        &self.expected_versions
     }
 
     /// The engine this attempt reads and commits to.
@@ -2673,8 +2725,8 @@ impl<'a> Transaction<'a> {
         let guards: Vec<(Partition, Vec<u8>)> = self
             .expected_versions
             .iter()
-            .filter(|(part, key, _)| !scope.iter().any(|(p, k)| p == part && k == key))
-            .map(|(part, key, _)| (*part, key.clone()))
+            .filter(|(part, key, _, _)| !scope.iter().any(|(p, k)| p == part && k == key))
+            .map(|(part, key, _, _)| (*part, key.clone()))
             .collect();
         let pending = self.engine.pending_commits();
         // A statement's commit waits no longer than the statement may.

@@ -1169,7 +1169,7 @@ impl NodeStore for LocalNodeStore {
             if seen_below.is_some_and(|s| version.is_some_and(|v| v >= s)) {
                 return Ok(false);
             }
-            txn.expect_version(Partition::Node, key, version)?;
+            txn.expect_condition(Partition::Node, key, version)?;
         }
         Ok(true)
     }
@@ -1541,7 +1541,7 @@ impl NodeStore for LocalNodeStore {
         owner: EntryOwner,
         version: Option<u64>,
     ) -> StoreResult<()> {
-        Ok(txn.expect_version(Partition::Node, &row_key(shard_id, owner), version)?)
+        Ok(txn.expect_condition(Partition::Node, &row_key(shard_id, owner), version)?)
     }
 }
 

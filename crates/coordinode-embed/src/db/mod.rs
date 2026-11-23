@@ -4166,7 +4166,7 @@ impl Database {
                 let Some(stored) = txn.get(Schema, &key)? else {
                     return Ok(());
                 };
-                txn.expect_version(
+                txn.expect_condition(
                     Schema,
                     &key,
                     Some(coordinode_storage::engine::UNKNOWN_REVISION),
@@ -4183,7 +4183,7 @@ impl Database {
         }
         self.refresh_btree_indexes()?;
         match refused {
-            Some(e) if !self.index_registry.of_unknown_revision().is_empty() => Err(e),
+            Some(e) if self.index_registry.has_unknown_revision() => Err(e),
             _ => Ok(written),
         }
     }
@@ -4191,8 +4191,10 @@ impl Database {
     /// Whether an index definition this member registered has a commit not
     /// known here: a member that does not lead then takes the group's copy
     /// of the catalog, which carries the commit where the leader knows it.
+    /// Kept by the registry as definitions are registered, so asking it after
+    /// every applied entry walks nothing.
     pub fn has_index_definitions_of_unknown_revision(&self) -> bool {
-        !self.index_registry.of_unknown_revision().is_empty()
+        self.index_registry.has_unknown_revision()
     }
 
     /// Reload the index definitions from the schema partition, so a member

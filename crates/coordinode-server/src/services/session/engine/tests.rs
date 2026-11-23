@@ -1078,6 +1078,81 @@ async fn a_begin_takes_its_timeout_outcome_from_the_session() {
     assert_eq!(rows.len(), 1, "committed at expiry, as the session said");
 }
 
+/// A session commit naming zero as the version of a node whose commit is not
+/// known is refused with REVISION_UNAVAILABLE, nothing of its transaction
+/// applied: zero is not a version a client can hold, so it cannot write past
+/// a lost revision.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_commit_naming_zero_on_a_lost_revision_is_refused() {
+    use coordinode_core::graph::node::{NodeId, encode_node_key};
+    use coordinode_core::txn::command::ExpectedVersion;
+    use coordinode_storage::engine::partition::Partition;
+
+    let database = seeded_db(0);
+    let node = {
+        let mut db = database.write();
+        let rows = db
+            .execute_cypher("CREATE (n:Probe {v: 1}) RETURN id(n) AS id")
+            .expect("create");
+        let Some(Value::Int(id)) = rows.first().and_then(|r| r.get("id")) else {
+            panic!("an id, got {rows:?}");
+        };
+        let node = NodeId::from_raw(u64::try_from(*id).expect("id"));
+        assert!(
+            db.engine()
+                // A store of its own is shard 1.
+                .forget_revision(Partition::Node, &encode_node_key(1, node))
+                .expect("forget"),
+            "the node's record"
+        );
+        assert!(matches!(
+            db.node_version(node),
+            Err(coordinode_embed::DatabaseError::RevisionUnavailable { .. })
+        ));
+        node
+    };
+    let mut session = Driver::open(DatabaseCursorEngine::new(Arc::clone(&database)));
+    let transaction = session.begin().await;
+    for statement in ["MATCH (n:Probe) SET n.v = 2", "CREATE (:SideEffect)"] {
+        let ran = session.execute(statement, Some(transaction), None).await;
+        assert!(
+            matches!(ran.last(), Some(SessionEvent::CursorEnd { .. })),
+            "{ran:?}"
+        );
+    }
+    let refused = session
+        .send(SessionOp::Commit {
+            transaction,
+            operation: None,
+            expect: vec![ExpectedVersion {
+                node,
+                version: Some(0),
+            }],
+        })
+        .await;
+    let (why, _) = settled_reason(&refused);
+    assert_eq!(why, "REVISION_UNAVAILABLE");
+
+    drop(session);
+    let mut db = database
+        .try_write_for(std::time::Duration::from_secs(30))
+        .expect("nothing holds the database once the session is idle");
+    assert!(
+        db.execute_cypher("MATCH (s:SideEffect) RETURN s")
+            .expect("read")
+            .is_empty(),
+        "no side effect"
+    );
+    let rows = db
+        .execute_cypher("MATCH (n:Probe) RETURN n.v AS v")
+        .expect("read");
+    assert_eq!(
+        rows.first().and_then(|r| r.get("v")),
+        Some(&Value::Int(1)),
+        "the node as it was"
+    );
+}
+
 /// The reason and metadata a session failure carries in its details.
 fn settled_reason(events: &[SessionEvent]) -> (String, std::collections::HashMap<String, String>) {
     use tonic_types::StatusExt;
