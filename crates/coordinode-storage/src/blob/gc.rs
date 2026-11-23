@@ -728,8 +728,9 @@ impl BlobCollector {
         use lsm_tree::AbstractTree as _;
 
         let engine = self.store.engine();
+        // A mark of unknown commit was made before any reader now open.
         let Some((oldest, deleted_at)) =
-            engine.get_versioned(Partition::BlobRef, COMPACTION_PENDING_KEY)?
+            engine.get_conditioned(Partition::BlobRef, COMPACTION_PENDING_KEY)?
         else {
             return Ok(());
         };
@@ -774,7 +775,7 @@ impl BlobCollector {
             // all the same, and a newer mark keeps its compaction to run.
             if store
                 .engine()
-                .record_version(Partition::BlobRef, COMPACTION_PENDING_KEY)?
+                .record_condition(Partition::BlobRef, COMPACTION_PENDING_KEY)?
                 == Some(deleted_at)
             {
                 txn.expect_version(Partition::BlobRef, COMPACTION_PENDING_KEY, Some(deleted_at))?;

@@ -1183,11 +1183,6 @@ impl Database {
         // unfit until checked, from before the registry serves anything.
         let index_registry = Arc::new(coordinode_query::index::IndexRegistry::new());
         index_registry.recover_local_guards(&engine)?;
-        // A store only this process writes gives a definition of unknown
-        // commit one, before it admits a write bound to it.
-        if opens_deployment && engine.has_journal() {
-            index_registry.reinstall_unknown_definitions(&engine)?;
-        }
         index_registry.load_all(&engine)?;
         // A capture of the store says what this member proved of its index
         // copies, and a transfer received says what the sender proved.
@@ -4086,6 +4081,9 @@ impl Database {
     /// The build records could not be read, or an executor could not start.
     pub fn resume_interrupted_index_builds(&self) -> Result<ResumedIndexBuilds, DatabaseError> {
         use coordinode_query::index::IndexBuildOutcome;
+        // The definitions the builds bind to first: one whose commit is not
+        // known is written again here, where the builds are taken up.
+        self.reinstall_unknown_index_definitions()?;
         // The namespace's label lookup is filled in the background: label
         // scans read the records until it is ready, so nobody waits for it.
         let provisioned = self
@@ -4135,6 +4133,66 @@ impl Database {
             .resume_checks()
             .map_err(DatabaseError::Other)?;
         Ok(out)
+    }
+
+    /// Give every index definition whose commit is not known (a store
+    /// brought from a release that kept none) a version, by writing it again
+    /// as it stands in one ordinary catalog commit each: admitted only while
+    /// its commit is still not known where it is decided, so a change of the
+    /// definition since (a DDL, a drop, a rewrite by an earlier pass whose
+    /// reply was lost) refuses it, and applied by every member as committed,
+    /// at one version. Run by a store's only writer before it admits writes,
+    /// and by a group's leader before it takes up the builds that depend on
+    /// the definitions. Returns how many were written.
+    ///
+    /// # Errors
+    ///
+    /// The catalog cannot be read, or a definition is still of unknown
+    /// commit after its write was refused (this member takes no writes now,
+    /// or the outcome was lost); the next pass takes up only those.
+    pub fn reinstall_unknown_index_definitions(&self) -> Result<usize, DatabaseError> {
+        use coordinode_storage::engine::partition::Partition::Schema;
+        use coordinode_storage::error::StorageError;
+        // The registry already knows which: no pass over the catalog.
+        let unknown = self.index_registry.of_unknown_revision();
+        if unknown.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        let mut refused = None;
+        for def in unknown {
+            let key = def.schema_key();
+            let outcome = self.commit_catalog(|txn| {
+                let Some(stored) = txn.get(Schema, &key)? else {
+                    return Ok(());
+                };
+                txn.expect_version(
+                    Schema,
+                    &key,
+                    Some(coordinode_storage::engine::UNKNOWN_REVISION),
+                )?;
+                txn.put(Schema, &key, &stored)?;
+                Ok::<(), StorageError>(())
+            });
+            match outcome {
+                Ok(()) => written += 1,
+                // Refused because it was changed meanwhile, or not taken: the
+                // catalog read below says which.
+                Err(e) => refused = Some(e),
+            }
+        }
+        self.refresh_btree_indexes()?;
+        match refused {
+            Some(e) if !self.index_registry.of_unknown_revision().is_empty() => Err(e),
+            _ => Ok(written),
+        }
+    }
+
+    /// Whether an index definition this member registered has a commit not
+    /// known here: a member that does not lead then takes the group's copy
+    /// of the catalog, which carries the commit where the leader knows it.
+    pub fn has_index_definitions_of_unknown_revision(&self) -> bool {
+        !self.index_registry.of_unknown_revision().is_empty()
     }
 
     /// Reload the index definitions from the schema partition, so a member

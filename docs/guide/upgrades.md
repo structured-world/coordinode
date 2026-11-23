@@ -95,9 +95,16 @@ rewrites is kept as a hard link under `<dir>/migrate-backup/<run>/`; a moved
 tree is moved back by renaming its directory. A second run finds nothing to
 do.
 
-On its first open after the step, a store the server alone writes gives each
-index definition of unknown version a version of its own, by writing the
-definition again as it stands, before it admits any write.
+An index definition of unknown version gets a version of its own once, by
+writing the definition again as it stands: a store the server alone writes
+does it when it opens, a group's leader does it before it takes up index
+builds, in one commit every member applies. The write is admitted only while
+the definition is still unchanged, so a definition dropped, recreated or
+altered meanwhile is never written over, and a repeated attempt writes
+nothing. A member that cannot prove a definition's version while the leader
+can takes the leader's copy of the catalog and keeps the leader's version.
+Until then writers of that index are admitted against the definition as it
+stands, and catalog changes (`DROP`, `ALTER`, new indexes) work as usual.
 
 ## Watching a move
 

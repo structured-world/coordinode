@@ -4077,3 +4077,285 @@ async fn a_member_rebuilds_a_counter_through_a_state_cut() {
     drop(cut);
     member.shutdown().await.unwrap();
 }
+
+/// The schema key of index `name` in `db`'s catalog.
+fn definition_key(db: &ReplicatedDatabase, name: &str) -> Vec<u8> {
+    let engine = db.database().read().engine_handle();
+    coordinode_query::index::ops::list_index_definitions(&engine)
+        .unwrap()
+        .into_iter()
+        .find(|def| def.name.as_deref() == Some(name))
+        .expect("the index is defined")
+        .schema_key()
+}
+
+/// The commit of the definition at `key` as `db` knows it: `None` when its
+/// commit is not known there. Panics when it is not there.
+fn definition_commit(db: &ReplicatedDatabase, key: &[u8]) -> Option<u64> {
+    let engine = db.database().read().engine_handle();
+    match engine.record_version(Partition::Schema, key) {
+        Ok(Some(commit)) => Some(commit),
+        Ok(None) => panic!("the definition is gone"),
+        Err(coordinode_storage::error::StorageError::RevisionUnavailable { .. }) => None,
+        Err(e) => panic!("reading the definition's version: {e}"),
+    }
+}
+
+/// Leave `db`'s copy of the definition at `key` with no known commit, as the
+/// step from a release that kept none leaves one its evidence does not prove,
+/// and register it so.
+fn forget_definition_commit(db: &ReplicatedDatabase, key: &[u8]) {
+    let database = db.database();
+    let database = database.read();
+    assert!(
+        database
+            .engine_handle()
+            .forget_revision(Partition::Schema, key)
+            .unwrap()
+    );
+    database.refresh_btree_indexes().unwrap();
+}
+
+/// A unique email: a held one is refused, a new one taken, through `db`.
+fn unique_email_holds(db: &ReplicatedDatabase, held: &str, new: &str) {
+    let mut database = db.database().write();
+    assert!(
+        matches!(
+            database.execute_cypher(&format!("CREATE (:U {{email: '{held}'}})")),
+            Err(DatabaseError::UniqueViolation { .. })
+        ),
+        "{held} is held"
+    );
+    database
+        .execute_cypher(&format!("CREATE (:U {{email: '{new}'}})"))
+        .unwrap();
+}
+
+/// A group with a unique index whose definition every member knows at one
+/// commit: the members, the definition's key and that commit.
+async fn group_with_unique_index(
+    dirs: &[tempfile::TempDir],
+) -> (Vec<ReplicatedDatabase>, Vec<u8>, u64) {
+    let (members, _ports) = group(dirs, None).await;
+    wait_until("every member knows the leader", || {
+        members.iter().all(|m| m.leader() == Some(1))
+    })
+    .await;
+    members[0]
+        .database()
+        .write()
+        .execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .unwrap();
+    members[0]
+        .database()
+        .write()
+        .execute_cypher("CREATE (:U {email: 'a@x'})")
+        .unwrap();
+    let key = definition_key(&members[0], "u_email");
+    let commit = definition_commit(&members[0], &key).expect("written here");
+    wait_until("every member holds the definition at its commit", || {
+        members.iter().all(|m| {
+            m.database()
+                .read()
+                .engine_handle()
+                .record_version(Partition::Schema, &key)
+                .ok()
+                == Some(Some(commit))
+        })
+    })
+    .await;
+    (members, key, commit)
+}
+
+/// Members whose evidence differs: the leader proves the definition's commit,
+/// its followers do not. Each follower takes the leader's catalog, so the
+/// group ends with the definition at its original commit on every member,
+/// none written again; after the lead moves the unique index holds and its
+/// writers are not refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_that_cannot_date_a_definition_takes_the_leaders_commit() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, key, commit) = group_with_unique_index(&dirs).await;
+        for follower in &members[1..] {
+            forget_definition_commit(follower, &key);
+            assert_eq!(definition_commit(follower, &key), None);
+        }
+        // An applied entry wakes the followers' work.
+        members[0]
+            .database()
+            .write()
+            .execute_cypher("CREATE (:Wake)")
+            .unwrap();
+        wait_until("every member holds the leader's commit", || {
+            members
+                .iter()
+                .all(|m| definition_commit(m, &key) == Some(commit))
+        })
+        .await;
+
+        members[0].transfer_leadership(2).await.unwrap();
+        wait_until("member 2 leads", || members[1].leader() == Some(2)).await;
+        unique_email_holds(&members[1], "a@x", "b@x");
+        wait_until("the write reaches every member", || {
+            members.iter().all(|m| count(m, "U") == 2)
+        })
+        .await;
+        for m in &members {
+            assert_eq!(
+                definition_commit(m, &key),
+                Some(commit),
+                "no member wrote the definition again"
+            );
+        }
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// No member proves the definition's commit. The member that leads next
+/// writes it again as it stands, once, and every member applies that one
+/// commit; moving the lead back writes nothing more. Until then a writer of
+/// the index is admitted against the definition as it stands, and the unique
+/// index holds throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_definition_no_member_can_date_gets_one_commit_across_leader_changes() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, key, commit) = group_with_unique_index(&dirs).await;
+        for member in &members {
+            forget_definition_commit(member, &key);
+        }
+        unique_email_holds(&members[0], "a@x", "b@x");
+
+        members[0].transfer_leadership(2).await.unwrap();
+        wait_until("member 2 leads", || members[1].leader() == Some(2)).await;
+        wait_until("every member holds one new commit", || {
+            let commits: Vec<_> = members.iter().map(|m| definition_commit(m, &key)).collect();
+            commits[0].is_some() && commits.iter().all(|c| *c == commits[0])
+        })
+        .await;
+        let given = definition_commit(&members[1], &key).unwrap();
+        assert!(
+            given > commit,
+            "the definition is written at a commit of its own"
+        );
+
+        members[1].transfer_leadership(1).await.unwrap();
+        wait_until("member 1 leads again", || members[0].leader() == Some(1)).await;
+        unique_email_holds(&members[0], "b@x", "c@x");
+        wait_until("the write reaches every member", || {
+            members.iter().all(|m| count(m, "U") == 3)
+        })
+        .await;
+        for m in &members {
+            assert_eq!(
+                definition_commit(m, &key),
+                Some(given),
+                "a later lead writes no second commit"
+            );
+        }
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// The leader cannot date the definition and a follower can: the leader,
+/// once another member leads, takes that member's catalog and holds the
+/// original commit, as every member does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_that_cannot_date_a_definition_takes_the_next_leaders_commit() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, key, commit) = group_with_unique_index(&dirs).await;
+        forget_definition_commit(&members[0], &key);
+
+        members[0].transfer_leadership(2).await.unwrap();
+        wait_until("member 2 leads", || members[1].leader() == Some(2)).await;
+        members[1]
+            .database()
+            .write()
+            .execute_cypher("CREATE (:Wake)")
+            .unwrap();
+        wait_until("member 1 holds the original commit", || {
+            definition_commit(&members[0], &key) == Some(commit)
+        })
+        .await;
+        for m in &members {
+            assert_eq!(definition_commit(m, &key), Some(commit));
+        }
+        unique_email_holds(&members[1], "a@x", "b@x");
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// A definition no member can date is dropped and created again before any
+/// member writes it: the new definition, which has its commit, is what every
+/// member holds, nothing writes the dropped one back, and the next leader
+/// writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_definition_changed_before_it_is_dated_is_not_written_over() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let (members, key, _commit) = group_with_unique_index(&dirs).await;
+        for member in &members {
+            forget_definition_commit(member, &key);
+        }
+        {
+            let mut leader = members[0].database().write();
+            leader.execute_cypher("DROP CONSTRAINT u_email").unwrap();
+            leader
+                .execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+                .unwrap();
+        }
+        let recreated = definition_key(&members[0], "u_email");
+        assert_ne!(recreated, key, "a new definition");
+        let created = definition_commit(&members[0], &recreated).expect("dated");
+        wait_until("every member holds the new definition", || {
+            members.iter().all(|m| {
+                m.database()
+                    .read()
+                    .engine_handle()
+                    .record_version(Partition::Schema, &recreated)
+                    .ok()
+                    == Some(Some(created))
+            })
+        })
+        .await;
+
+        members[0].transfer_leadership(3).await.unwrap();
+        wait_until("member 3 leads", || members[2].leader() == Some(3)).await;
+        unique_email_holds(&members[2], "a@x", "b@x");
+        wait_until("the write reaches every member", || {
+            members.iter().all(|m| count(m, "U") == 2)
+        })
+        .await;
+        for m in &members {
+            assert_eq!(definition_commit(m, &recreated), Some(created));
+            assert_eq!(
+                m.database()
+                    .read()
+                    .engine_handle()
+                    .record_version(Partition::Schema, &key)
+                    .unwrap(),
+                None,
+                "the dropped definition stays dropped"
+            );
+        }
+        for m in members.into_iter().rev() {
+            m.shutdown().await.unwrap();
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}

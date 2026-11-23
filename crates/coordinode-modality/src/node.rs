@@ -1161,10 +1161,11 @@ impl NodeStore for LocalNodeStore {
 
     fn condition_unchanged(&self, txn: &mut Transaction, keys: &[Vec<u8>]) -> StoreResult<bool> {
         // A snapshot at S sees the versions below S; a row whose latest
-        // version is at or above it changed after the rows were read.
+        // version is at or above it changed after the rows were read. A row
+        // of unknown commit was written before any snapshot.
         let seen_below = txn.snapshot();
         for key in keys {
-            let version = txn.record_version(Partition::Node, key)?;
+            let version = txn.record_condition(Partition::Node, key)?;
             if seen_below.is_some_and(|s| version.is_some_and(|v| v >= s)) {
                 return Ok(false);
             }
@@ -1528,7 +1529,7 @@ impl NodeStore for LocalNodeStore {
         owner: EntryOwner,
     ) -> StoreResult<Option<(NodeRecord, u64)>> {
         engine
-            .get_versioned(Partition::Node, &row_key(shard_id, owner))?
+            .get_conditioned(Partition::Node, &row_key(shard_id, owner))?
             .map(|(bytes, version)| Ok((Self::decode_record(&bytes)?, version)))
             .transpose()
     }

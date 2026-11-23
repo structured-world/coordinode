@@ -42,6 +42,7 @@ pub mod promise;
 pub mod rebuild;
 pub mod retention_stats;
 pub(crate) mod revision;
+pub use revision::UNKNOWN as UNKNOWN_REVISION;
 pub mod routing;
 pub mod scope;
 pub mod space;

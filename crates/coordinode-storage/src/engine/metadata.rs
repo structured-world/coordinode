@@ -906,7 +906,8 @@ pub fn label_binding_effects(
             continue;
         }
         let key = encode_label_current_revision_key(name);
-        if let Some((bytes, version)) = engine.get_versioned(Partition::Schema, &key)? {
+        // A binding of unknown commit was written before this one.
+        if let Some((bytes, version)) = engine.get_conditioned(Partition::Schema, &key)? {
             let binding = LabelBinding::decode(&bytes).ok_or_else(|| {
                 StorageError::Serialization(format!(
                     "the binding of label {name:?} does not decode"

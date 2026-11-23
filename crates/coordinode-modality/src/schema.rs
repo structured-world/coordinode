@@ -1160,7 +1160,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
         // Every change of a label's schema writes its pointer. The version is
         // read before the schema: a change landing between the two reads
         // refuses the commit instead of passing under the older schema.
-        let version = txn.record_version(Partition::Schema, &pointer_key)?;
+        let version = txn.record_condition(Partition::Schema, &pointer_key)?;
         let current = self.load_label(name)?;
         // A name bound implicitly (its first use, or the binding the caller
         // published before declaring it) carries no definition: the
@@ -1421,7 +1421,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
 
     fn release_constraint_name_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
         let key = encode_constraint_name_key(name);
-        let version = self.engine.record_version(Partition::Schema, &key)?;
+        let version = self.engine.record_condition(Partition::Schema, &key)?;
         txn.expect_version(Partition::Schema, &key, version)?;
         txn.delete(Partition::Schema, &key)?;
         Ok(())

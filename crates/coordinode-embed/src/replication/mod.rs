@@ -598,9 +598,16 @@ fn leader_work(
             stop.clone(),
         ));
     }
+    // A member with peers takes the leader's catalog where its own does not
+    // know when a definition was written.
+    let installer = node
+        .connections()
+        .is_some()
+        .then(|| Arc::new(SegmentInstaller::new(Arc::clone(&engine))));
     tasks.push(background::spawn_index_build_resumer(
         Arc::clone(database),
         Arc::clone(node),
+        installer,
         stop.clone(),
     ));
     (tasks, follower)

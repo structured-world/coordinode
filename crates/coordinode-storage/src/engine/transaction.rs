@@ -2017,8 +2017,17 @@ impl<'a> Transaction<'a> {
     /// Refuse the commit when a record stated with [`Self::expect_version`]
     /// is no longer at the version named, carrying the version that is there.
     fn check_expected_versions(&self) -> Result<(), CommitError> {
+        use crate::engine::UNKNOWN_REVISION;
         for (part, key, expected) in &self.expected_versions {
-            let current = self.engine.record_version(*part, key)?;
+            let current = self.engine.record_condition(*part, key)?;
+            // A version named of a record whose commit is not known: there
+            // is no version to compare it with.
+            if current == Some(UNKNOWN_REVISION) && *expected != Some(UNKNOWN_REVISION) {
+                return Err(StorageError::RevisionUnavailable {
+                    partition: part.name(),
+                }
+                .into());
+            }
             if current != *expected {
                 // An index definition the effects were bound to moved under
                 // them (a build published, a rebuild or a drop): the write
@@ -2049,6 +2058,16 @@ impl<'a> Transaction<'a> {
     /// would prove something about a moment that has passed. What the caller
     /// gets from stating it is a refusal carrying the version that is there
     /// now, so a retry needs no second read.
+    ///
+    /// [`crate::engine::UNKNOWN_REVISION`] names the state of a live record
+    /// whose commit is not known ([`StorageEngine::record_condition`]): the
+    /// write is admitted only while nothing has written the record, as every
+    /// write gives it a known version. A known version named of a record in
+    /// that state is refused as unanswerable.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a commutative partition.
     pub fn expect_version(
         &mut self,
         part: Partition,
@@ -2065,7 +2084,7 @@ impl<'a> Transaction<'a> {
         // checked at the commit would see this attempt's own writes. It is
         // decided now, before them; one that fails now is kept and refuses
         // the commit as usual.
-        if self.oracle.is_none() && self.engine.record_version(part, key)? == expected {
+        if self.oracle.is_none() && self.engine.record_condition(part, key)? == expected {
             return Ok(());
         }
         self.expected_versions.push((part, key.to_vec(), expected));
@@ -2154,6 +2173,12 @@ impl<'a> Transaction<'a> {
     /// [`StorageEngine::record_version`].
     pub fn record_version(&self, part: Partition, key: &[u8]) -> StorageResult<Option<u64>> {
         self.engine.record_version(part, key)
+    }
+
+    /// The condition a catalog write on the record names now. See
+    /// [`StorageEngine::record_condition`].
+    pub fn record_condition(&self, part: Partition, key: &[u8]) -> StorageResult<Option<u64>> {
+        self.engine.record_condition(part, key)
     }
 
     /// The conditions stated so far, for a caller that has to report them.

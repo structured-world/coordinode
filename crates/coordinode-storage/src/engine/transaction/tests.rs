@@ -701,6 +701,115 @@ fn an_installed_copy_keeps_each_records_revision() {
     );
 }
 
+/// A record of unknown commit written again as it stands, conditioned on its
+/// commit still being unknown, gets one version: the write's. A second such
+/// write (a pass whose reply was lost, run again) is refused and leaves that
+/// version; so is one staged before another write gave the record a version
+/// of its own, which keeps that write. A condition naming a real version of
+/// a record of unknown commit is refused as unanswerable.
+#[test]
+fn a_record_of_unknown_commit_is_given_one_version() {
+    use crate::engine::UNKNOWN_REVISION;
+    const KEY: &[u8] = b"node:00:00000001";
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    let mut create = mvcc_txn(&engine, &oracle);
+    create
+        .put(Partition::Node, KEY, b"as it stands")
+        .expect("stage");
+    create.commit(&ctx()).expect("create");
+    assert!(
+        engine
+            .forget_revision(Partition::Node, KEY)
+            .expect("forget")
+    );
+    assert!(matches!(
+        engine.record_version(Partition::Node, KEY),
+        Err(StorageError::RevisionUnavailable { .. })
+    ));
+
+    let rewrite = || {
+        let mut txn = mvcc_txn(&engine, &oracle);
+        txn.expect_version(Partition::Node, KEY, Some(UNKNOWN_REVISION))
+            .expect("state the condition");
+        txn.put(Partition::Node, KEY, b"as it stands")
+            .expect("stage");
+        txn
+    };
+    let mut lost_reply = rewrite();
+    rewrite().commit(&ctx()).expect("still unknown");
+    let given = engine
+        .record_version(Partition::Node, KEY)
+        .expect("version")
+        .expect("there");
+    assert!(
+        matches!(
+            lost_reply.commit(&ctx()),
+            Err(CommitError::RevisionMismatch { expected: Some(UNKNOWN_REVISION), current })
+                if current == Some(given)
+        ),
+        "a second pass gives no second version"
+    );
+    assert_eq!(
+        engine
+            .record_version(Partition::Node, KEY)
+            .expect("version"),
+        Some(given)
+    );
+
+    // Unknown again; a change lands between the pass's read and its commit.
+    assert!(
+        engine
+            .forget_revision(Partition::Node, KEY)
+            .expect("forget")
+    );
+    let mut pass = rewrite();
+    let mut change = mvcc_txn(&engine, &oracle);
+    change.put(Partition::Node, KEY, b"changed").expect("stage");
+    change.commit(&ctx()).expect("the change");
+    let changed = engine
+        .record_version(Partition::Node, KEY)
+        .expect("version")
+        .expect("there");
+    assert!(matches!(
+        pass.commit(&ctx()),
+        Err(CommitError::RevisionMismatch { current, .. }) if current == Some(changed)
+    ));
+    assert_eq!(
+        engine.get(Partition::Node, KEY).unwrap().as_deref(),
+        Some(&b"changed"[..]),
+        "the change is not written over"
+    );
+    assert_eq!(
+        engine
+            .record_version(Partition::Node, KEY)
+            .expect("version"),
+        Some(changed)
+    );
+
+    assert!(
+        engine
+            .forget_revision(Partition::Node, KEY)
+            .expect("forget")
+    );
+    let mut named = mvcc_txn(&engine, &oracle);
+    named
+        .expect_version(Partition::Node, KEY, Some(changed))
+        .expect("state the condition");
+    named.put(Partition::Node, KEY, b"named").expect("stage");
+    assert!(matches!(
+        named.commit(&ctx()),
+        Err(CommitError::Storage(
+            StorageError::RevisionUnavailable { .. }
+        ))
+    ));
+}
+
 /// Two claimers race for one record and exactly one wins. The loser is told
 /// which version is there, which is what makes its next attempt a decision
 /// rather than another guess.

@@ -273,8 +273,9 @@ impl<'a> Backfill<'a> {
             else {
                 continue;
             };
+            // A row of unknown commit was written before the build began.
             if txn
-                .record_version(coordinode_storage::engine::partition::Partition::Node, key)
+                .record_condition(coordinode_storage::engine::partition::Partition::Node, key)
                 .map_err(StoreError::from)?
                 .is_some_and(|version| version > maintained_after)
             {

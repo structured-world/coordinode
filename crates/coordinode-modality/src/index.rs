@@ -1335,7 +1335,7 @@ impl LocalIndexStore<'_> {
         // The value and the version of one write, read together: a version
         // newer than the value would let the condition pass on a stale
         // allocator and hand out a number twice.
-        let (allocator, version) = match self.engine.get_versioned(Partition::Schema, key)? {
+        let (allocator, version) = match self.engine.get_conditioned(Partition::Schema, key)? {
             Some((bytes, version)) => (decode("index identity allocator", &bytes)?, Some(version)),
             None => (IdentityAllocator::default(), None),
         };
@@ -1907,7 +1907,7 @@ impl IndexStore for LocalIndexStore<'_> {
         // change conditioned on the version builds on this value.
         match self
             .engine
-            .get_versioned(Partition::Schema, NamespaceIndexPolicy::KEY)?
+            .get_conditioned(Partition::Schema, NamespaceIndexPolicy::KEY)?
         {
             Some((bytes, version)) => Ok((decode("index policy", &bytes)?, Some(version))),
             None => Ok((NamespaceIndexPolicy::default(), None)),
@@ -1929,13 +1929,13 @@ impl IndexStore for LocalIndexStore<'_> {
     fn definition_version(&self, id: IndexId) -> StoreResult<Option<u64>> {
         Ok(self
             .engine
-            .record_version(Partition::Schema, &IndexDefinition::schema_key_of(id))?)
+            .record_condition(Partition::Schema, &IndexDefinition::schema_key_of(id))?)
     }
 
     fn definition_version_as(&self, def: &IndexDefinition) -> StoreResult<Option<u64>> {
         let Some((bytes, version)) = self
             .engine
-            .get_versioned(Partition::Schema, &IndexDefinition::schema_key_of(def.id))?
+            .get_conditioned(Partition::Schema, &IndexDefinition::schema_key_of(def.id))?
         else {
             return Ok(None);
         };
@@ -1945,7 +1945,7 @@ impl IndexStore for LocalIndexStore<'_> {
 
     fn definition_versioned(&self, id: IndexId) -> StoreResult<Option<(IndexDefinition, u64)>> {
         self.engine
-            .get_versioned(Partition::Schema, &IndexDefinition::schema_key_of(id))?
+            .get_conditioned(Partition::Schema, &IndexDefinition::schema_key_of(id))?
             .map(|(bytes, version)| Ok((decode("index definition", &bytes)?, version)))
             .transpose()
     }
@@ -1966,7 +1966,7 @@ impl IndexStore for LocalIndexStore<'_> {
     fn name_version(&self, name: &str) -> StoreResult<Option<u64>> {
         Ok(self
             .engine
-            .record_version(Partition::Schema, &IndexDefinition::name_key_of(name))?)
+            .record_condition(Partition::Schema, &IndexDefinition::name_key_of(name))?)
     }
 
     fn expect_name_txn(
@@ -1984,7 +1984,7 @@ impl IndexStore for LocalIndexStore<'_> {
 
     fn load_build(&self, generation: GenerationId) -> StoreResult<Option<(IndexBuildRecord, u64)>> {
         self.engine
-            .get_versioned(Partition::Schema, &IndexBuildRecord::key_of(generation))?
+            .get_conditioned(Partition::Schema, &IndexBuildRecord::key_of(generation))?
             .map(|(bytes, version)| Ok((decode("index build record", &bytes)?, version)))
             .transpose()
     }
@@ -2022,7 +2022,7 @@ impl IndexStore for LocalIndexStore<'_> {
         generation: GenerationId,
     ) -> StoreResult<Option<(LabelCertificationRecord, u64)>> {
         self.engine
-            .get_versioned(
+            .get_conditioned(
                 Partition::Schema,
                 &LabelCertificationRecord::key_of(generation),
             )?
@@ -2113,7 +2113,7 @@ impl IndexStore for LocalIndexStore<'_> {
         generation: GenerationId,
     ) -> StoreResult<Option<(IndexIntegrityRecord, u64)>> {
         self.engine
-            .get_versioned(Partition::Schema, &IndexIntegrityRecord::key_of(generation))?
+            .get_conditioned(Partition::Schema, &IndexIntegrityRecord::key_of(generation))?
             .map(|(bytes, version)| Ok((decode("index integrity record", &bytes)?, version)))
             .transpose()
     }
@@ -2529,8 +2529,8 @@ impl IndexStore for LocalIndexStore<'_> {
         let key = entry(index.generation, tuple, owner).0;
         Ok(self
             .engine
-            .get_versioned(Partition::Idx, &key)?
-            .map(|(_, version)| LatestEntry { version }))
+            .record_condition(Partition::Idx, &key)?
+            .map(|version| LatestEntry { version }))
     }
 
     fn repair_entry_txn(

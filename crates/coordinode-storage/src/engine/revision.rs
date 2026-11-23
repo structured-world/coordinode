@@ -20,8 +20,9 @@ use super::partition::Partition;
 pub(crate) const STAMP_LEN: usize = 8;
 
 /// The revision of a record whose original commit timestamp is not known:
-/// no commit is ever at timestamp zero, so it names none.
-pub(crate) const UNKNOWN: u64 = 0;
+/// no commit is ever at timestamp zero, so it names none. As a write
+/// condition it names that state of the record, which ends at its next write.
+pub const UNKNOWN: u64 = 0;
 
 /// Whether the value stored at `key` of `part` carries a stamp.
 #[inline]

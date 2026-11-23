@@ -8371,6 +8371,26 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Leave the live record at `key` here with its payload and no known
+    /// commit, as a store brought from a release that kept none holds a
+    /// record its evidence does not prove; nothing else changes. Whether a
+    /// record was there. For tests of stores whose members prove different
+    /// commits.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn forget_revision(&self, part: Partition, key: &[u8]) -> StorageResult<bool> {
+        let Some(payload) = self.get(part, key)? else {
+            return Ok(false);
+        };
+        let unknown =
+            crate::engine::revision::stored(part, key, &payload, crate::engine::revision::UNKNOWN);
+        self.put_stored(part, key, &unknown)?;
+        Ok(true)
+    }
+
     /// Apply one direct write, the batch `build` makes for the seqno it
     /// lands at (its key and a replacement's copy), at the next seqno.
     fn apply_single(
@@ -11114,6 +11134,54 @@ impl StorageEngine {
         };
         let (payload, revision) = Self::revision_of(part, &value)?;
         Ok(Some((bytes::Bytes::copy_from_slice(payload), revision)))
+    }
+
+    /// The condition a write on this record names, for the engine's own
+    /// catalog writers: its version, or zero for a live record whose commit
+    /// is not known, which a condition matches for as long as nothing writes
+    /// the record (every write gives it a known version). `None` when no live
+    /// row is there. Never a version to hand a caller as the record's.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] for a commutative partition; a read
+    /// failure.
+    pub fn record_condition(
+        &self,
+        part: Partition,
+        key: &[u8],
+    ) -> StorageResult<Option<lsm_tree::SeqNo>> {
+        let Some(value) = self.get_versioned_at_rest(part, key)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::condition_of(&value)?.1))
+    }
+
+    /// A record's latest value with its [`Self::record_condition`], both of
+    /// one stored value: what a catalog read-modify-write states.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::record_condition`].
+    pub fn get_conditioned(
+        &self,
+        part: Partition,
+        key: &[u8],
+    ) -> StorageResult<Option<(bytes::Bytes, lsm_tree::SeqNo)>> {
+        let Some(value) = self.get_versioned_at_rest(part, key)? else {
+            return Ok(None);
+        };
+        let (payload, condition) = Self::condition_of(&value)?;
+        Ok(Some((bytes::Bytes::copy_from_slice(payload), condition)))
+    }
+
+    /// A stored record's payload and its revision, zero when not known.
+    fn condition_of(value: &[u8]) -> StorageResult<(&[u8], lsm_tree::SeqNo)> {
+        Ok(
+            crate::engine::revision::split(value).ok_or(lsm_tree::Error::InvalidHeader(
+                "a stored record is shorter than its revision stamp",
+            ))?,
+        )
     }
 
     /// The latest stored value of a record, its revision stamp included. It

@@ -480,7 +480,9 @@ impl BlobStore {
             blob: upload.blob.clone(),
         };
         let stage_key = staging_key(upload.staging_id);
-        let Some(stage_version) = self.engine.record_version(Partition::BlobRef, &stage_key)?
+        let Some(stage_version) = self
+            .engine
+            .record_condition(Partition::BlobRef, &stage_key)?
         else {
             return Err(BlobError::Fenced);
         };
@@ -560,8 +562,9 @@ impl BlobStore {
     pub fn abandon(&self, staging_id: u64) -> BlobResult<bool> {
         let abandoned = self.retrying(|store| {
             let stage_key = staging_key(staging_id);
-            let Some((bytes, version)) =
-                store.engine.get_versioned(Partition::BlobRef, &stage_key)?
+            let Some((bytes, version)) = store
+                .engine
+                .get_conditioned(Partition::BlobRef, &stage_key)?
             else {
                 return Ok(false);
             };
@@ -848,7 +851,7 @@ impl BlobStore {
             let mut cleaned = CleanedUp::default();
             for (content, generation) in retired {
                 let record = retired_key(content, *generation);
-                let Some(version) = store.engine.record_version(Partition::BlobRef, &record)?
+                let Some(version) = store.engine.record_condition(Partition::BlobRef, &record)?
                 else {
                     continue;
                 };
@@ -953,7 +956,7 @@ impl BlobStore {
 
     /// The owner record at `owner_key` and its version, as committed now.
     fn owner(&self, owner_key: &[u8]) -> BlobResult<(Option<OwnerRecord>, Option<u64>)> {
-        match self.engine.get_versioned(Partition::BlobRef, owner_key)? {
+        match self.engine.get_conditioned(Partition::BlobRef, owner_key)? {
             Some((bytes, version)) => Ok((
                 Some(decode(owner_key, &bytes, OwnerRecord::from_msgpack)?),
                 Some(version),
@@ -964,7 +967,7 @@ impl BlobStore {
 
     /// The catalog entry at `key` and its version, as committed now.
     fn catalog_entry(&self, key: &[u8]) -> BlobResult<(Option<CatalogEntry>, Option<u64>)> {
-        match self.engine.get_versioned(Partition::BlobRef, key)? {
+        match self.engine.get_conditioned(Partition::BlobRef, key)? {
             Some((bytes, version)) => Ok((
                 Some(decode(key, &bytes, CatalogEntry::from_msgpack)?),
                 Some(version),

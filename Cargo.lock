@@ -919,6 +919,7 @@ dependencies = [
  "anyhow",
  "coordinode-core",
  "coordinode-embed",
+ "coordinode-lsm-tree",
  "coordinode-modality",
  "coordinode-openraft",
  "coordinode-raft",

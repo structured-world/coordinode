@@ -1285,7 +1285,7 @@ fn stage_edge_type(
     let pointer = encode_edge_type_current_revision_key(&name);
     // Version first, then the definition: a change landing between the two
     // refuses this commit instead of passing under it.
-    let version = txn.record_version(Partition::Schema, &pointer)?;
+    let version = txn.record_condition(Partition::Schema, &pointer)?;
     let current = store.load_edge_type(&name)?;
     txn.expect_version(Partition::Schema, &pointer, version)?;
     let object = |disposition, revision| PublishedObject {

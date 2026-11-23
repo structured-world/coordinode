@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coordinode_raft::cluster::RaftNode;
+use coordinode_replicate::SegmentInstaller;
 use parking_lot::RwLock;
 use tokio::sync::watch;
 
@@ -140,17 +141,24 @@ pub(super) fn spawn_idle_reaper(
 
 /// Watch `raft_node`'s leadership and, each time this member becomes the
 /// leader, finish the builds left unfinished: those a process left when it
-/// stopped, and those a former leader held when it lost the lead. Ends when
-/// the node is dropped or `stop` says so, never in the middle of a pass.
+/// stopped, and those a former leader held when it lost the lead. Under
+/// another leader, a member holding index definitions of unknown commit
+/// takes the leader's copy of its catalog through `installer`, once per
+/// leader: the copy carries each definition's commit where the leader knows
+/// it. Ends when the node is dropped or `stop` says so, never in the middle
+/// of a pass.
 pub(super) fn spawn_index_build_resumer(
     database: Arc<RwLock<Database>>,
     raft_node: Arc<RaftNode>,
+    installer: Option<Arc<SegmentInstaller>>,
     mut stop: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let mut applied = raft_node.subscribe_applied();
     tokio::spawn(async move {
         // Whether the work ran during this member's current lead.
         let mut done_this_lead = false;
+        // The leader whose catalog this member last took.
+        let mut catalog_from = None;
         let mut look_now = true;
         loop {
             // A new leader's first entry is among the applied ones, so
@@ -164,8 +172,23 @@ pub(super) fn spawn_index_build_resumer(
             if *stop.borrow() {
                 break;
             }
-            if raft_node.current_leader() != Some(raft_node.node_id()) {
+            let leader = raft_node.current_leader();
+            if leader != Some(raft_node.node_id()) {
                 done_this_lead = false;
+                if let (Some(leader), Some(installer)) = (leader, &installer)
+                    && catalog_from != Some(leader)
+                    && database.read().has_index_definitions_of_unknown_revision()
+                {
+                    if take_leader_catalog(&database, &raft_node, installer, leader).await {
+                        catalog_from = Some(leader);
+                    } else {
+                        tokio::select! {
+                            () = tokio::time::sleep(RETRY) => {}
+                            () = stopped(&mut stop) => break,
+                        }
+                        look_now = true;
+                    }
+                }
                 continue;
             }
             if done_this_lead {
@@ -220,6 +243,56 @@ pub(super) fn spawn_index_build_resumer(
         }
     })
 }
+
+/// Replace this member's catalog (the namespace's Schema tree) with
+/// `leader`'s copy, which keeps each record's commit as the leader stores
+/// it, and reload the index definitions from it. Whether the copy was taken:
+/// a failed pull leaves the local catalog as it was, to be pulled again. A
+/// definition the leader does not know either is written again by the
+/// leader, and this member applies that write.
+async fn take_leader_catalog(
+    database: &Arc<RwLock<Database>>,
+    raft_node: &RaftNode,
+    installer: &Arc<SegmentInstaller>,
+    leader: u64,
+) -> bool {
+    use coordinode_storage::engine::partition::Partition;
+    let (Some((links, _)), Some(target)) = (
+        super::index_copy::segment_peers(raft_node),
+        raft_node.member_target(leader),
+    ) else {
+        return false;
+    };
+    let tree = database.read().engine_handle().tree_id(Partition::Schema);
+    let pulled = installer
+        .repair_tree(
+            &links,
+            &[target],
+            tree,
+            CATALOG_PIECE_SIZE,
+            coordinode_replicate::PieceEncoding::None,
+        )
+        .await;
+    if let Err(e) = pulled {
+        tracing::debug!(%e, leader, "taking the leader's catalog failed; retrying");
+        return false;
+    }
+    let db = Arc::clone(database);
+    match tokio::task::spawn_blocking(move || db.read().refresh_btree_indexes()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::warn!(%e, "reloading the index definitions failed");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(%e, "reloading the index definitions failed");
+            false
+        }
+    }
+}
+
+/// The piece size a catalog copy is pulled in.
+const CATALOG_PIECE_SIZE: usize = 1 << 20;
 
 /// Drive AFTER COMMIT trigger dispatch on the leader.
 ///

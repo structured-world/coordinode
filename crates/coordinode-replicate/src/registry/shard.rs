@@ -413,7 +413,7 @@ impl RegistryCore {
         let key = encode_registry_key(consumer_id);
         let version = self
             .engine
-            .record_version(Partition::Registry, &key)
+            .record_condition(Partition::Registry, &key)
             .map_err(|e| RegistryError::Replication(e.to_string()))?;
         let Some(bytes) = self.read_raw(&key)? else {
             return Ok(None);
@@ -516,7 +516,7 @@ impl RegistryCore {
         let key = encode_heartbeat_key(consumer_id);
         let version = self
             .engine
-            .record_version(Partition::Registry, &key)
+            .record_condition(Partition::Registry, &key)
             .map_err(|e| RegistryError::Replication(e.to_string()))?;
         let raw = self
             .engine
