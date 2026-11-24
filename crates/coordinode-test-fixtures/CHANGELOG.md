@@ -2,6 +2,14 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(server)* bind every client session to a named namespace
+- *(storage)* scope the change feed and fixed cuts to a namespace
+- *(cluster)* a joining member brings no namespace and serves once caught up
+
 ## v0.10.1 - 2026-11-20
 
 ### Added

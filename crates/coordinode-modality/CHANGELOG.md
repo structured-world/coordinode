@@ -2,6 +2,33 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(embed)* fixed cut of nodes by label with a joined change cursor
+- *(query)* repair duplicates in the name of the build's issuer
+- *(storage)* scope the change feed and fixed cuts to a namespace
+- *(storage)* units name the namespace their data belongs to
+- *(storage)* keep the deployment's records in the system set
+
+### Documentation
+
+- *(storage)* resolve intra-doc links to their owning type
+- *(readme)* point the commercial licence contact at coordinode.com
+
+### Fixed
+
+- *(storage)* keep the published conditions to a caller's version
+- *(storage)* refuse a caller's condition on a lost revision
+- *(storage)* date a definition of unknown commit once per group
+- *(storage)* keep each record's revision through rewrites
+
+### Performance
+
+- *(cdc)* select each unit once for every reader of an interest
+- *(cdc)* decode each log entry once for every change-feed reader
+
 ## v0.10.0 - 2026-11-19
 
 ### Added

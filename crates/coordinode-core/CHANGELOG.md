@@ -2,6 +2,32 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(schema)* compare documents by content, declare unordered members
+- *(embed)* an issuer belongs to the principal that enrolled it
+- *(query)* native ACL statements
+- *(embed)* principal sessions and grant changes, decided at apply
+- *(storage)* grant-catalog changes decided in log order
+- *(storage)* check a unit's principal where the unit applies
+- *(core)* carry the acting principal in a log unit
+- *(namespace)* per-namespace data-block compression
+- *(cluster)* a joining member brings no namespace and serves once caught up
+- *(storage)* namespace catalog with create and drop
+- *(storage)* units name the namespace their data belongs to
+- *(storage)* keep the deployment's records in the system set
+
+### Documentation
+
+- *(readme)* point the commercial licence contact at coordinode.com
+
+### Fixed
+
+- *(schema)* judge writes below a declared list, numbers by value
+- *(query)* a MAP property takes a map and equals it
+
 ## v0.10.0 - 2026-11-19
 
 ### Added

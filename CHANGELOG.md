@@ -1,5 +1,122 @@
 # Changelog
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(schema)* compare documents by content, declare unordered members
+- *(client)* read from the nearest member of a group
+- *(replication)* forward a read its member is behind for, once
+- *(embed)* namespaces, principals and access control behind `tenancy`
+- *(embed)* an issuer belongs to the principal that enrolled it
+- *(embed)* admit a principal's statements only while it holds a right
+- *(namespace)* per-namespace data-block compression
+- *(embed)* reopen a store of several namespaces on its first
+- *(server)* back up and restore one namespace
+- *(server)* read change streams in the namespace a call names
+- *(query)* create, drop and list namespaces from Cypher and SQL
+- *(server)* bound open namespace sessions from the config file
+- *(server)* bind every typed call and pg connection to a namespace
+- *(server)* bind every client session to a named namespace
+- *(replicate)* repair a corrupt tree from the same namespace's copies
+- *(cluster)* a joining member brings no namespace and serves once caught up
+- *(storage)* units name the namespace their data belongs to
+- *(storage)* keep the deployment's records in the system set
+- *(storage)* lay trees out in a system set and namespace sets
+- *(query)* native ACL statements
+- *(embed)* principal sessions and grant changes, decided at apply
+- *(storage)* grant-catalog changes decided in log order
+- *(storage)* check a unit's principal where the unit applies
+- *(core)* carry the acting principal in a log unit
+- *(storage)* namespace catalog with create and drop
+- *(embed)* fixed cut of nodes by label with a joined change cursor
+- *(migrate)* give 0.10.1 records the version they can prove
+- *(query)* ACL statements commit with their transaction
+- *(query)* repair duplicates in the name of the build's issuer
+- *(embed)* deployment-catalog scope for a principal
+- *(embed)* read the grants that bear on a principal
+- *(storage)* close the trees of idle namespaces
+- *(storage)* scope the change feed and fixed cuts to a namespace
+- *(migrate)* bring a 0.10.1 data directory to this build
+- *(core)* carry the logical effect context in the unit frame
+- *(schema)* give labels a catalog identity records store
+- *(operation)* apply each client write once
+- *(storage)* store index generations under local installations
+- *(migrate)* add the node sizes report module
+- *(migrate)* catalog record migrations, check and journal stats
+- *(migrate)* offline tool to bring a data directory current
+
+### Documentation
+
+- *(readme)* point the commercial licence contact at coordinode.com
+- *(storage)* resolve intra-doc links to their owning type
+
+### Fixed
+
+- *(schema)* judge writes below a declared list, numbers by value
+- *(embed)* a group member reopens with its consumer registrations
+- *(storage)* refuse a caller's condition on a lost revision
+- *(storage)* keep each record's revision through rewrites
+- *(replication)* serve a read here when its target has no room
+- *(storage)* repair every namespace's trees by tree, not by partition
+- *(storage)* remove a dropped namespace's directories once its trees close
+- *(query)* a MAP property takes a map and equals it
+- *(storage)* date a definition of unknown commit once per group
+- *(embed)* refuse a readiness wait the clock cannot end
+- *(embed)* decide a catalog statement by its own right
+- *(query)* refuse AS OF times before the epoch or not yet reached
+- *(storage)* keep each namespace's cache, taps and feed apart
+- *(storage)* keep the published conditions to a caller's version
+- *(raft)* read the log and wait on the disk off the runtime workers
+- *(raft)* form a group around existing data however slow its snapshot
+- *(raft)* carry every namespace through applies and snapshots
+- *(raft)* end an append stream at a request it cannot read
+- *(storage)* a page of a cut charges only what it holds
+- *(ci)* public docs, bench lockfile, platform paths in a test
+- *(storage)* hold a caller's index binding after the engine bound it
+- *(migrate)* prove a version only by a write the apply took
+- *(migrate)* prove a version by its unit and refuse unstamped stores
+- *(vector)* keep a node reachable when its neighbours retire together
+- *(storage)* never copy a checkpoint over a file it holds
+- *(migrate)* find every marked store, Raft snapshot captures too
+
+### Performance
+
+- *(cdc)* select each unit once for every reader of an interest
+- *(cdc)* decode each log entry once for every change-feed reader
+- *(cdc)* read a change-stream page frame by frame
+- *(query)* bound property delta chains with whole writes
+
+### Refactored
+
+- *(storage)* split the deployment from a namespace's engine
+- *(storage)* find trees by set, listed afresh by the services
+
+### Testing
+
+- two checks that raced the engine's own background work
+- *(replication)* a read's one wait, held apply and cancel
+- *(server)* a forwarded read ends at its call deadline
+- *(server)* namespaces stay apart through typed reads and on every tier
+- *(version-moves)* report pauses besides the move's own
+- *(version-moves)* report what each member wrote in a write pause
+- release the held read before the purge, no raw key in a cut test
+- *(raft)* a stream closed inside a purged log read keeps the leader
+- *(embed)* a group member rebuilds nodes by label through a node cut
+- *(embed)* a repairing build stops when its issuer loses the grant
+- *(embed)* take fresh memtable segments before measuring writes
+- *(embed)* ownerless operations, a role's home and a role moved away
+- *(embed)* access control across a restart, a leader move and a race
+- *(embed)* let followers catch up before a full group's limit drops
+- *(embed)* namespaces survive failover and never conflict across transactions
+- *(embed)* each namespace keeps its own index maintenance default
+- *(raft)* judge the purge by the log's purge point
+- *(raft)* a follower behind a purge takes every write from its leader
+- *(storage)* allow a compaction between codec change and reopen
+- *(namespace)* check the installed tables survive a reopen unchanged
+- *(namespace)* check namespace codecs on installed tables
+- *(migrate)* track the data directories of the receipt fixtures
+
 ## v0.10.1 - 2026-11-20
 
 ### Added

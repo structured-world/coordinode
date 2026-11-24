@@ -2,6 +2,25 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(server)* bind every client session to a named namespace
+- *(replicate)* repair a corrupt tree from the same namespace's copies
+- *(storage)* units name the namespace their data belongs to
+- *(storage)* keep the deployment's records in the system set
+- *(storage)* lay trees out in a system set and namespace sets
+
+### Documentation
+
+- *(readme)* point the commercial licence contact at coordinode.com
+
+### Fixed
+
+- *(storage)* date a definition of unknown commit once per group
+- *(raft)* carry every namespace through applies and snapshots
+
 ## v0.10.0 - 2026-11-19
 
 ### Added

@@ -2,6 +2,13 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(client)* read from the nearest member of a group
+- *(server)* bind every client session to a named namespace
+
 ## v0.10.1 - 2026-11-20
 
 ### Added

@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Documentation
+
+- *(readme)* point the commercial licence contact at coordinode.com
+
+### Fixed
+
+- *(vector)* keep a node reachable when its neighbours retire together
+
 ## v0.10.1 - 2026-11-20
 
 ### Fixed

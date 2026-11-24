@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-auth"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-bench"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "clap",
  "serde",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-client"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "parking_lot 0.13.0",
  "prost",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-cluster"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-storage",
  "coordinode-workspace-hack",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-core"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-embed"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-core",
  "coordinode-embed",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-integration"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-client",
  "coordinode-test-fixtures",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-migrate"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "coordinode-core",
@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-modality"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-core",
  "coordinode-lsm-tree",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-query"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-cluster",
  "coordinode-core",
@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-raft"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bytes",
  "coordinode-core",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-replicate"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-core",
  "coordinode-query",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-s3"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bytes",
  "coordinode-core",
@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-search"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "coordinode-core",
@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-server"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-session"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-core",
  "parking_lot 0.13.0",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-storage"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "byteorder-lite",
  "bytes",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-swarm"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "lz4_flex",
  "structured-zstd",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-test-fixtures"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-lsm-tree",
  "coordinode-storage",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-timeseries"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-core",
  "coordinode-modality",
@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-vector"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "coordinode-core",
  "coordinode-storage",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-wire"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "arc-swap",
  "bytes",
