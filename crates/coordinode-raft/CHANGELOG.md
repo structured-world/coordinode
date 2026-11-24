@@ -2,6 +2,52 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(replication)* forward a read its member is behind for, once
+- *(embed)* principal sessions and grant changes, decided at apply
+- *(core)* carry the acting principal in a log unit
+- *(server)* bind every client session to a named namespace
+- *(replicate)* repair a corrupt tree from the same namespace's copies
+- *(storage)* scope the change feed and fixed cuts to a namespace
+- *(cluster)* a joining member brings no namespace and serves once caught up
+- *(storage)* namespace catalog with create and drop
+- *(storage)* units name the namespace their data belongs to
+- *(storage)* keep the deployment's records in the system set
+- *(storage)* lay trees out in a system set and namespace sets
+
+### Documentation
+
+- *(readme)* point the commercial licence contact at coordinode.com
+
+### Fixed
+
+- *(storage)* keep each record's revision through rewrites
+- *(raft)* read the log and wait on the disk off the runtime workers
+- *(embed)* refuse a readiness wait the clock cannot end
+- *(raft)* form a group around existing data however slow its snapshot
+- *(raft)* carry every namespace through applies and snapshots
+- *(storage)* repair every namespace's trees by tree, not by partition
+- *(raft)* end an append stream at a request it cannot read
+
+### Performance
+
+- *(cdc)* decode each log entry once for every change-feed reader
+
+### Refactored
+
+- *(storage)* split the deployment from a namespace's engine
+
+### Testing
+
+- *(raft)* judge the purge by the log's purge point
+- release the held read before the purge, no raw key in a cut test
+- *(raft)* a stream closed inside a purged log read keeps the leader
+- *(replication)* a read's one wait, held apply and cancel
+- *(raft)* a follower behind a purge takes every write from its leader
+
 ## v0.10.0 - 2026-11-19
 
 ### Added

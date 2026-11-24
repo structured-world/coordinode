@@ -2,6 +2,39 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(schema)* compare documents by content, declare unordered members
+- *(embed)* fixed cut of nodes by label with a joined change cursor
+- *(migrate)* give 0.10.1 records the version they can prove
+- *(query)* ACL statements commit with their transaction
+- *(query)* repair duplicates in the name of the build's issuer
+- *(query)* native ACL statements
+- *(embed)* principal sessions and grant changes, decided at apply
+- *(namespace)* per-namespace data-block compression
+- *(query)* create, drop and list namespaces from Cypher and SQL
+- *(server)* bind every client session to a named namespace
+- *(storage)* scope the change feed and fixed cuts to a namespace
+- *(storage)* units name the namespace their data belongs to
+
+### Documentation
+
+- *(readme)* point the commercial licence contact at coordinode.com
+
+### Fixed
+
+- *(schema)* judge writes below a declared list, numbers by value
+- *(query)* a MAP property takes a map and equals it
+- *(storage)* keep the published conditions to a caller's version
+- *(storage)* refuse a caller's condition on a lost revision
+- *(storage)* date a definition of unknown commit once per group
+- *(storage)* keep each record's revision through rewrites
+- *(embed)* refuse a readiness wait the clock cannot end
+- *(embed)* decide a catalog statement by its own right
+- *(query)* refuse AS OF times before the epoch or not yet reached
+
 ## v0.10.0 - 2026-11-19
 
 ### Added

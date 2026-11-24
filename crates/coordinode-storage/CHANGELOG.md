@@ -2,6 +2,77 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(embed)* fixed cut of nodes by label with a joined change cursor
+- *(migrate)* give 0.10.1 records the version they can prove
+- *(migrate)* bring a 0.10.1 data directory to this build
+- *(embed)* namespaces, principals and access control behind `tenancy`
+- *(query)* ACL statements commit with their transaction
+- *(embed)* an issuer belongs to the principal that enrolled it
+- *(embed)* read the grants that bear on a principal
+- *(query)* native ACL statements
+- *(embed)* admit a principal's statements only while it holds a right
+- *(embed)* principal sessions and grant changes, decided at apply
+- *(storage)* grant-catalog changes decided in log order
+- *(storage)* check a unit's principal where the unit applies
+- *(core)* carry the acting principal in a log unit
+- *(namespace)* per-namespace data-block compression
+- *(embed)* reopen a store of several namespaces on its first
+- *(storage)* close the trees of idle namespaces
+- *(server)* bind every typed call and pg connection to a namespace
+- *(server)* bind every client session to a named namespace
+- *(replicate)* repair a corrupt tree from the same namespace's copies
+- *(storage)* scope the change feed and fixed cuts to a namespace
+- *(cluster)* a joining member brings no namespace and serves once caught up
+- *(storage)* namespace catalog with create and drop
+- *(storage)* units name the namespace their data belongs to
+- *(storage)* keep the deployment's records in the system set
+- *(storage)* lay trees out in a system set and namespace sets
+
+### Documentation
+
+- *(storage)* resolve intra-doc links to their owning type
+- *(readme)* point the commercial licence contact at coordinode.com
+
+### Fixed
+
+- *(storage)* a page of a cut charges only what it holds
+- *(ci)* public docs, bench lockfile, platform paths in a test
+- *(storage)* hold a caller's index binding after the engine bound it
+- *(storage)* keep the published conditions to a caller's version
+- *(migrate)* prove a version only by a write the apply took
+- *(storage)* refuse a caller's condition on a lost revision
+- *(storage)* date a definition of unknown commit once per group
+- *(migrate)* prove a version by its unit and refuse unstamped stores
+- *(storage)* keep each record's revision through rewrites
+- *(raft)* read the log and wait on the disk off the runtime workers
+- *(storage)* remove a dropped namespace's directories once its trees close
+- *(raft)* carry every namespace through applies and snapshots
+- *(storage)* keep each namespace's cache, taps and feed apart
+- *(storage)* repair every namespace's trees by tree, not by partition
+
+### Performance
+
+- *(cdc)* select each unit once for every reader of an interest
+- *(cdc)* decode each log entry once for every change-feed reader
+- *(cdc)* read a change-stream page frame by frame
+
+### Refactored
+
+- *(storage)* split the deployment from a namespace's engine
+- *(storage)* find trees by set, listed afresh by the services
+
+### Testing
+
+- two checks that raced the engine's own background work
+- *(storage)* allow a compaction between codec change and reopen
+- *(namespace)* check the installed tables survive a reopen unchanged
+- *(namespace)* check namespace codecs on installed tables
+- *(server)* namespaces stay apart through typed reads and on every tier
+
 ## v0.10.1 - 2026-11-20
 
 ### Testing

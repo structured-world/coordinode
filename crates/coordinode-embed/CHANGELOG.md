@@ -2,6 +2,79 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(schema)* compare documents by content, declare unordered members
+- *(embed)* fixed cut of nodes by label with a joined change cursor
+- *(migrate)* give 0.10.1 records the version they can prove
+- *(replication)* forward a read its member is behind for, once
+- *(embed)* namespaces, principals and access control behind `tenancy`
+- *(query)* ACL statements commit with their transaction
+- *(query)* repair duplicates in the name of the build's issuer
+- *(embed)* an issuer belongs to the principal that enrolled it
+- *(embed)* deployment-catalog scope for a principal
+- *(embed)* read the grants that bear on a principal
+- *(query)* native ACL statements
+- *(embed)* admit a principal's statements only while it holds a right
+- *(embed)* principal sessions and grant changes, decided at apply
+- *(namespace)* per-namespace data-block compression
+- *(embed)* reopen a store of several namespaces on its first
+- *(server)* back up and restore one namespace
+- *(storage)* close the trees of idle namespaces
+- *(query)* create, drop and list namespaces from Cypher and SQL
+- *(server)* bound open namespace sessions from the config file
+- *(server)* bind every typed call and pg connection to a namespace
+- *(server)* bind every client session to a named namespace
+- *(storage)* scope the change feed and fixed cuts to a namespace
+- *(cluster)* a joining member brings no namespace and serves once caught up
+- *(storage)* units name the namespace their data belongs to
+- *(storage)* keep the deployment's records in the system set
+- *(storage)* lay trees out in a system set and namespace sets
+
+### Documentation
+
+- *(readme)* point the commercial licence contact at coordinode.com
+
+### Fixed
+
+- *(schema)* judge writes below a declared list, numbers by value
+- *(query)* a MAP property takes a map and equals it
+- *(embed)* a group member reopens with its consumer registrations
+- *(storage)* refuse a caller's condition on a lost revision
+- *(storage)* date a definition of unknown commit once per group
+- *(storage)* keep each record's revision through rewrites
+- *(replication)* serve a read here when its target has no room
+- *(embed)* refuse a readiness wait the clock cannot end
+- *(embed)* decide a catalog statement by its own right
+- *(query)* refuse AS OF times before the epoch or not yet reached
+- *(storage)* remove a dropped namespace's directories once its trees close
+- *(storage)* keep each namespace's cache, taps and feed apart
+- *(storage)* repair every namespace's trees by tree, not by partition
+
+### Performance
+
+- *(cdc)* select each unit once for every reader of an interest
+- *(cdc)* decode each log entry once for every change-feed reader
+
+### Refactored
+
+- *(storage)* split the deployment from a namespace's engine
+
+### Testing
+
+- release the held read before the purge, no raw key in a cut test
+- *(raft)* a stream closed inside a purged log read keeps the leader
+- *(embed)* a group member rebuilds nodes by label through a node cut
+- *(embed)* a repairing build stops when its issuer loses the grant
+- *(embed)* take fresh memtable segments before measuring writes
+- *(embed)* ownerless operations, a role's home and a role moved away
+- *(embed)* access control across a restart, a leader move and a race
+- *(embed)* let followers catch up before a full group's limit drops
+- *(embed)* namespaces survive failover and never conflict across transactions
+- *(embed)* each namespace keeps its own index maintenance default
+
 ## v0.10.1 - 2026-11-20
 
 ### Added

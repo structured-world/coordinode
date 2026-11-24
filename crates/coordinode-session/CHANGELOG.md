@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.11.0 - 2026-11-24
+
+### Added
+
+- *(server)* bind every client session to a named namespace
+
+### Documentation
+
+- *(readme)* point the commercial licence contact at coordinode.com
+
 ## v0.10.0 - 2026-11-19
 
 ### Added
