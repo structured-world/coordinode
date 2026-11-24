@@ -11065,8 +11065,8 @@ impl StorageEngine {
     /// what a conditional write is asking about, and inventing a second
     /// number would mean keeping two things in step for no gain.
     ///
-    /// The revision is the one the record's value carries
-    /// ([`crate::engine::revision`]), so it survives every rewrite of the
+    /// The revision is the stamp the record's value carries, so it survives
+    /// every rewrite of the
     /// record by storage: compaction, a copy of the partition installed
     /// elsewhere, a reopen.
     ///

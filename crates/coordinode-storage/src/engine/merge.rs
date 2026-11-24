@@ -170,7 +170,7 @@ impl MergeOperator for PostingListMerge {
 /// one as the new base, discarding older bases.
 ///
 /// The base and every operand end in the revision stamp of the write that
-/// made them ([`crate::engine::revision`]); the merged record carries the
+/// made them; the merged record carries the
 /// stamp of the last one applied, the record's latest write.
 pub struct DocumentMerge;
 

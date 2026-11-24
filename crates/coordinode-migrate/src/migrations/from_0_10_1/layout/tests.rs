@@ -27,23 +27,28 @@ fn each_tree_goes_to_its_set() {
     for name in ["raft", "registry", "node", "idx", "tables"] {
         std::fs::create_dir_all(store.join(name)).expect("tree");
     }
-    let mut got: Vec<(String, String)> = moves(store)
+    // Compared as paths, not strings: the separator is the platform's.
+    let mut got: Vec<(std::path::PathBuf, std::path::PathBuf)> = moves(store)
         .into_iter()
         .map(|(from, to)| {
-            let rel = |p: &Path| p.strip_prefix(store).expect("inside").display().to_string();
+            let rel = |p: &Path| p.strip_prefix(store).expect("inside").to_path_buf();
             (rel(&from), rel(&to))
         })
         .collect();
     got.sort();
-    let mut expected: Vec<(String, String)> = [
-        ("idx", "ns/0000000000000001/idx"),
-        ("node", "ns/0000000000000001/node"),
-        ("raft", "system/raft"),
-        ("registry", "system/registry"),
-        ("tables", "ns/0000000000000001/tables"),
+    let ns = ["ns", "0000000000000001"];
+    let mut expected: Vec<(std::path::PathBuf, std::path::PathBuf)> = [
+        ("idx", &ns[..]),
+        ("node", &ns[..]),
+        ("raft", &["system"][..]),
+        ("registry", &["system"][..]),
+        ("tables", &ns[..]),
     ]
     .into_iter()
-    .map(|(a, b)| (a.to_owned(), b.to_owned()))
+    .map(|(tree, set)| {
+        let to: std::path::PathBuf = set.iter().chain(std::iter::once(&tree)).collect();
+        (std::path::PathBuf::from(tree), to)
+    })
     .collect();
     expected.sort();
     assert_eq!(got, expected);

@@ -79,8 +79,7 @@ pub type StorageIter = Box<dyn DoubleEndedIterator<Item = StorageGuard> + Send +
 /// One key-value pair of a scan. A key of an index generation is read from
 /// this member's installation of it and given back with the generation in
 /// its place (see [`installation`]); every other key is given back as stored.
-/// A value is given back without the revision its record carries
-/// ([`revision`]).
+/// A value is given back without the revision stamp its record carries.
 pub struct StorageGuard {
     inner: lsm_tree::IterGuardImpl,
     /// The generation whose installation the key was read from.
