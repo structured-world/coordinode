@@ -4078,6 +4078,110 @@ async fn a_member_rebuilds_a_counter_through_a_state_cut() {
     member.shutdown().await.unwrap();
 }
 
+/// A member rebuilds a projection of :Person nodes through a node cut of its
+/// group's log: the view selects the :Person nodes below the group's closed
+/// bound, the continuation is the group's change feed under the labels the
+/// cut bound, and the projection after the join is the member's :Person
+/// nodes, a RETYPE out and a delete after the cut included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_rebuilds_nodes_by_label_through_a_node_cut() {
+    use coordinode_embed::changes::{Action, ChangeInterest, Delivery, OwnedTarget};
+    use std::collections::BTreeMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let member = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+        .await
+        .unwrap();
+    wait_until("the member leads", || member.leader() == Some(1)).await;
+    for query in [
+        "CREATE NODE TYPE Person WITH (name: STRING)",
+        "CREATE NODE TYPE Org WITH (name: STRING)",
+        "CREATE (:Person {name: 'a'}), (:Person {name: 'b'}), (:Org {name: 'o'})",
+    ] {
+        member.database().write().execute_cypher(query).unwrap();
+    }
+    let database = Arc::clone(member.database());
+    let mut cut = tokio::task::spawn_blocking(move || {
+        database
+            .read()
+            .node_cut(Some(&["Person".to_string()]), Duration::from_secs(10))
+    })
+    .await
+    .unwrap()
+    .expect("cut");
+    for query in [
+        "MATCH (n:Person {name: 'a'}) RETYPE NODE n TO Org",
+        "MATCH (n:Person {name: 'b'}) DETACH DELETE n",
+        "CREATE (:Person {name: 'c'})",
+    ] {
+        member.database().write().execute_cypher(query).unwrap();
+    }
+
+    // Read through and released before the member shuts down.
+    {
+        let db = member.database().read();
+        let budget = coordinode_core::budget::QueryBudget::new(1 << 24);
+        let mut nodes: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = db
+                .node_cut_scan(&cut, after.as_deref(), 1, &budget)
+                .expect("page");
+            let Some(next) = page.next_after() else { break };
+            after = Some(next.to_vec());
+            nodes.extend(page.rows().iter().map(|(k, v)| (k.to_vec(), v.to_vec())));
+        }
+        assert_eq!(nodes.len(), 2, "the two :Person nodes of the view");
+        let end = db
+            .change_cursor(&ChangeInterest::default())
+            .expect("end")
+            .position();
+        let joined = loop {
+            let batch = db.node_cut_tail(&mut cut, 4, &budget, None).expect("tail");
+            for event in batch.units().iter().flat_map(|u| u.events.iter()) {
+                let OwnedTarget::Node(key) = &event.target else {
+                    continue;
+                };
+                match (event.action, event.delivery) {
+                    (Action::Put, Delivery::Enter | Delivery::Apply) => {
+                        nodes.insert(key.clone(), event.payload.clone().expect("record"));
+                    }
+                    (_, Delivery::Leave) | (Action::Remove, _) => {
+                        nodes.remove(key);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            if let Some(joined) = batch.joined()
+                && joined.position() >= end
+            {
+                break joined.clone();
+            }
+        };
+        assert_eq!(
+            joined.history(),
+            cut.cursor().history(),
+            "the group's history"
+        );
+        let person = joined.interest().labels().expect("labels")[0];
+        let source: BTreeMap<Vec<u8>, Vec<u8>> = db
+            .engine()
+            .snapshot_prefix_scan(&db.engine().snapshot(), Partition::Node, b"node:")
+            .expect("scan")
+            .into_iter()
+            .filter(|(_, value)| {
+                coordinode_core::graph::node::NodeRecord::labels_from_msgpack(value)
+                    .expect("labels")
+                    .contains(&person)
+            })
+            .map(|(key, value)| (key, value.to_vec()))
+            .collect();
+        assert_eq!(nodes, source, "the member's :Person nodes");
+        assert_eq!(nodes.len(), 1, "only c is left");
+    }
+    member.shutdown().await.unwrap();
+}
+
 /// The schema key of index `name` in `db`'s catalog.
 fn definition_key(db: &ReplicatedDatabase, name: &str) -> Vec<u8> {
     let engine = db.database().read().engine_handle();
