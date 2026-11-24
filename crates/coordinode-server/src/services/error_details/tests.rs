@@ -96,6 +96,7 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::TransactionTooLarge,
         Reason::CapacityExhausted,
         Reason::SchemaViolation,
+        Reason::DuplicateMember,
         Reason::WriteBackpressure,
         Reason::NotLeader,
         Reason::OutsideRetention,

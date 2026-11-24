@@ -34,7 +34,19 @@ pub struct PropertyDef {
 
     /// Default value (if any). Applied when the property is missing on read.
     pub default: Option<Value>,
+
+    /// For a DOCUMENT property, the lists inside it whose members are
+    /// unordered: each a path of fields leading to the list, a list on the
+    /// way standing for every one of its elements, the empty path for the
+    /// value itself. Such a list holds each member once and is the same as
+    /// another holding the same members in any order.
+    #[serde(default)]
+    pub unordered: Vec<Vec<String>>,
 }
+
+/// The most unordered lists one property may declare, and the most fields
+/// one of their paths may name.
+pub const MAX_UNORDERED_PATHS: usize = 64;
 
 impl PropertyDef {
     /// Create a simple property definition with no constraints.
@@ -44,7 +56,68 @@ impl PropertyDef {
             property_type,
             not_null: false,
             default: None,
+            unordered: Vec::new(),
         }
+    }
+
+    /// Declare the list at `path` below this DOCUMENT property a list of
+    /// unordered members.
+    #[must_use]
+    pub fn with_unordered_members<S: Into<String>>(
+        mut self,
+        path: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.unordered
+            .push(path.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// The declared unordered lists, as the comparison and the check of
+    /// members read them.
+    pub fn unordered_paths(&self) -> Vec<Vec<&str>> {
+        self.unordered
+            .iter()
+            .map(|path| path.iter().map(String::as_str).collect())
+            .collect()
+    }
+
+    /// What is wrong with the unordered lists this property declares, if
+    /// anything: declared on another type than DOCUMENT, too many, a path
+    /// too long or naming an empty field, or one path declared twice.
+    pub fn unordered_error(&self) -> Option<String> {
+        if self.unordered.is_empty() {
+            return None;
+        }
+        if self.property_type != PropertyType::Document {
+            return Some(format!(
+                "property `{}` is {}: only a DOCUMENT property declares unordered members",
+                self.name, self.property_type
+            ));
+        }
+        if self.unordered.len() > MAX_UNORDERED_PATHS {
+            return Some(format!(
+                "property `{}` declares {} lists of unordered members, more than {MAX_UNORDERED_PATHS}",
+                self.name,
+                self.unordered.len()
+            ));
+        }
+        for (at, path) in self.unordered.iter().enumerate() {
+            if path.len() > MAX_UNORDERED_PATHS || path.iter().any(String::is_empty) {
+                return Some(format!(
+                    "property `{}` declares unordered members at a path naming an empty field \
+                     or more than {MAX_UNORDERED_PATHS} fields",
+                    self.name
+                ));
+            }
+            if self.unordered[..at].contains(path) {
+                return Some(format!(
+                    "property `{}` declares unordered members at `{}` twice",
+                    self.name,
+                    path.join(".")
+                ));
+            }
+        }
+        None
     }
 
     /// Set NOT NULL constraint.
@@ -73,6 +146,7 @@ impl PropertyDef {
             property_type: PropertyType::Computed(spec),
             not_null: false,
             default: None,
+            unordered: Vec::new(),
         }
     }
 }
@@ -681,7 +755,7 @@ impl LabelSchema {
             || self
                 .properties
                 .values()
-                .any(|p| p.not_null && p.default.is_none())
+                .any(|p| (p.not_null && p.default.is_none()) || !p.unordered.is_empty())
     }
 
     /// The type facts a declaration is compared with: the candidate's while

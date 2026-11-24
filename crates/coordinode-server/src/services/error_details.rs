@@ -143,6 +143,11 @@ pub enum Reason {
     /// A schema rule refused the write: an undeclared property on a strict
     /// label, or an attempt to set a computed one.
     SchemaViolation,
+    /// A write would give a list its document property declares as unordered
+    /// members one member twice. Nothing was written. Metadata carries
+    /// `property` and `path`, the fields leading from the property to the
+    /// list joined by a dot. Terminal: the same write is refused again.
+    DuplicateMember,
     /// Storage is over its compaction-debt stop threshold and is shedding
     /// new writes until compaction catches up. Nothing was applied; retry
     /// after the advised delay.
@@ -371,6 +376,7 @@ impl Reason {
             Reason::CapacityExhausted => "CAPACITY_EXHAUSTED",
             Reason::StorageFull => "STORAGE_FULL",
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
+            Reason::DuplicateMember => "DUPLICATE_MEMBER",
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
             Reason::MemberBusy => "MEMBER_BUSY",
             Reason::NamespaceRequired => "NAMESPACE_REQUIRED",

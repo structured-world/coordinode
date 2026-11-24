@@ -70,6 +70,7 @@ mod integration {
     mod text_index;
     mod tiered_cache;
     mod unique_admission;
+    mod unordered_members;
     mod validated_extra;
     mod vector_index_build_lifecycle;
     mod vector_index_ddl;

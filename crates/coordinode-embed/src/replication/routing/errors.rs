@@ -89,6 +89,7 @@ fn variant_name(err: &DatabaseError) -> &'static str {
         E::CascadeOverflow { .. } => "CascadeOverflow",
         E::CascadeFanoutOverflow { .. } => "CascadeFanoutOverflow",
         E::SchemaViolation(_) => "SchemaViolation",
+        E::DuplicateMember { .. } => "DuplicateMember",
         E::DuplicateKey { .. } => "DuplicateKey",
         E::UniqueViolation { .. } => "UniqueViolation",
         E::UniquenessUnresolved { .. } => "UniquenessUnresolved",
@@ -526,6 +527,9 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
             limit,
         }),
         E::SchemaViolation(message) => Kind::SchemaViolation(text(message)),
+        E::DuplicateMember { property, path } => {
+            Kind::DuplicateMember(wire::DuplicateMember { property, path })
+        }
         E::DuplicateKey {
             table,
             key,
@@ -978,6 +982,10 @@ fn from_wire(kind: Kind) -> Result<DatabaseError, String> {
             limit: c.limit,
         },
         Kind::SchemaViolation(t) => E::SchemaViolation(t.message),
+        Kind::DuplicateMember(d) => E::DuplicateMember {
+            property: d.property,
+            path: d.path,
+        },
         Kind::DuplicateKey(d) => E::DuplicateKey {
             table: d.table,
             key: d.key,

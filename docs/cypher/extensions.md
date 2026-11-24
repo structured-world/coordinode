@@ -489,6 +489,32 @@ MATCH (d:Device {name: 'Router-A'})
 REMOVE d.config.security.key_rotation
 ```
 
+### Document Equality ✅
+
+`=` and `<>` compare a document by what it holds:
+
+- the fields of a map by name, in whatever order either side holds them;
+- a list position by position;
+- a scalar by its type and value (an integer is not the float of the same
+  magnitude), a binary payload by its bytes.
+
+```cypher
+-- true whichever order $candidate lists its fields in
+MATCH (d:Device {name: 'Router-A'})
+RETURN d.config = $candidate
+```
+
+A label can declare a list inside a document property as *unordered
+members*: such a list equals another holding the same members in any order,
+and a member it would hold twice is refused. Both sides of a comparison with
+that property follow its declaration, so one parameter can compare by
+membership with one property and by position with another. The declaration
+is made with the label's definition (see
+[Declaring the Schema](../guide/embedded#unordered-members-of-a-document)).
+A comparison follows it where the statement reads the property of a matched
+node (`n.body = $x`, `n.body.ops = $x`, `(n {body: $x})`); a value carried
+on under another name (`WITH n.body AS b`) compares as any document.
+
 ### Array Mutation Functions ✅ 🔷
 
 Concurrent-safe array mutations using LSM merge operators. Multiple writers can append/remove simultaneously without conflicts.

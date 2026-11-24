@@ -2928,6 +2928,29 @@ fn a_duplicate_key_maps_to_already_exists_with_the_holder() {
     assert!(details.retry_info().is_none(), "terminal: no retry advice");
 }
 
+/// A member a list of unordered members would hold twice is
+/// FAILED_PRECONDITION / DUPLICATE_MEMBER, with the property and the path of
+/// the list in the metadata, and no retry advice: the same write is refused
+/// again.
+#[test]
+fn a_duplicate_member_maps_to_failed_precondition_with_its_path() {
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::from(ExecutionError::DuplicateMember {
+        property: "body".into(),
+        path: "ops".into(),
+    }));
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "DUPLICATE_MEMBER");
+    let meta = |k: &str| info.metadata.get(k).map(String::as_str);
+    assert_eq!(meta("property"), Some("body"));
+    assert_eq!(meta("path"), Some("ops"));
+    assert!(details.retry_info().is_none(), "terminal: no retry advice");
+}
+
 /// A spent statement budget answers with the class a caller acts on: memory
 /// is RESOURCE_EXHAUSTED / EXCEEDS_MEMORY_BUDGET with the three numbers and no
 /// retry advice, a deadline DEADLINE_EXCEEDED, a cancellation CANCELLED. None

@@ -280,26 +280,6 @@ fn hash_document<H: core::hash::Hasher>(doc: &rmpv::Value, state: &mut H) {
     }
 }
 
-/// Whether two document values hold the same content: maps by their fields
-/// in any order, lists position by position, everything else as `==` does.
-fn same_fields(a: &rmpv::Value, b: &rmpv::Value) -> bool {
-    match (a, b) {
-        (rmpv::Value::Map(left), rmpv::Value::Map(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, value)| {
-                    right
-                        .iter()
-                        .find(|(other, _)| other == key)
-                        .is_some_and(|(_, other)| same_fields(value, other))
-                })
-        }
-        (rmpv::Value::Array(left), rmpv::Value::Array(right)) => {
-            left.len() == right.len() && left.iter().zip(right).all(|(l, r)| same_fields(l, r))
-        }
-        _ => a == b,
-    }
-}
-
 impl Value {
     /// Feeds `state` so that values equal under `==` feed it the same bytes:
     /// the hash an exact deduplication buckets by before comparing. Zero
@@ -512,16 +492,34 @@ impl Value {
         }
     }
 
-    /// Whether two values are the same value. A map and a document of the
-    /// same fields are: a map is stored as a document, so a stored map
-    /// compares equal to the map it was written from, in whatever order the
-    /// document holds its fields. Every other pair compares as `==` does.
+    /// Whether two values are the same value. A document compares with a
+    /// document, a map or a list by content: the fields of a map by name,
+    /// in whatever order either side holds them, a list by position. Every
+    /// other pair compares as `==` does.
     pub fn same_value(&self, other: &Self) -> bool {
-        match (self, other) {
-            (map @ Self::Map(_), Self::Document(document))
-            | (Self::Document(document), map @ Self::Map(_)) => {
-                same_fields(&map.to_rmpv(), document)
+        self.same_value_under(other, &[])
+    }
+
+    /// [`Self::same_value`] for a document whose lists at `sets`, each a
+    /// path of fields below it, hold unordered members: such a list is the
+    /// same as another holding the same members in any order.
+    pub fn same_value_under(&self, other: &Self, sets: &[&[&str]]) -> bool {
+        use std::borrow::Cow;
+        let document = |v: &Self| matches!(v, Self::Document(_));
+        if !(document(self) || document(other) || !sets.is_empty()) {
+            return self == other;
+        }
+        // What a document compares with by content: another, or the map or
+        // list a document is made from.
+        fn content(v: &Value) -> Option<Cow<'_, rmpv::Value>> {
+            match v {
+                Value::Document(inner) => Some(Cow::Borrowed(inner)),
+                Value::Map(_) | Value::Array(_) => Some(Cow::Owned(v.to_rmpv())),
+                _ => None,
             }
+        }
+        match (content(self), content(other)) {
+            (Some(a), Some(b)) => crate::schema::members::same_document(&a, &b, sets),
             _ => self == other,
         }
     }

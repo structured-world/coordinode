@@ -407,6 +407,9 @@ pub(super) fn check_label_declaration(schema: &LabelSchema) -> Result<(), Databa
             p.name, schema.name
         )));
     }
+    if let Some(wrong) = schema.properties.values().find_map(|p| p.unordered_error()) {
+        return Err(refused(format!(":{}: {wrong}", schema.name)));
+    }
     check_property_nesting(&schema.name, &schema.properties)
 }
 
@@ -438,6 +441,13 @@ pub(super) fn check_property_nesting(
 /// [`EdgeTypeSchema::resolve_identity`] before handing the schema over.
 pub(super) fn resolve_edge_identity(schema: &mut EdgeTypeSchema) -> Result<(), DatabaseError> {
     check_property_nesting(&schema.name, &schema.properties)?;
+    if let Some(p) = schema.properties.values().find(|p| !p.unordered.is_empty()) {
+        return Err(refused(format!(
+            "property `{}` of edge type '{}' declares unordered members: only a property of a \
+             label does",
+            p.name, schema.name
+        )));
+    }
     if schema.discriminator().is_none() {
         schema.resolve_identity(None).map_err(refused)?;
     }

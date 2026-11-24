@@ -10,6 +10,7 @@ use crate::graph::types::Value;
 use crate::schema::definition::{
     ConstraintKind, LabelSchema, NodeConstraint, PropertyDef, PropertyType,
 };
+use crate::schema::members::MemberError;
 
 /// Validation error for property values.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +51,22 @@ pub enum ValidationError {
 
     /// Attempt to SET a COMPUTED (read-only) property.
     ComputedReadOnly { property: String },
+
+    /// A list the property declares as unordered members holds one twice.
+    DuplicateMember {
+        property: String,
+        /// The fields leading to the list below the property, joined by
+        /// `.`; empty when the property itself is the list.
+        path: String,
+    },
+
+    /// What stands where the property declares a list of unordered members
+    /// is neither a list nor absent.
+    MembersNotAList {
+        property: String,
+        /// As for [`Self::DuplicateMember`].
+        path: String,
+    },
 
     /// A node breaks a named constraint of its label.
     ConstraintViolation {
@@ -109,6 +126,16 @@ impl std::fmt::Display for ValidationError {
             Self::ComputedReadOnly { property } => {
                 write!(f, "cannot SET COMPUTED property '{property}' (read-only)")
             }
+            Self::DuplicateMember { property, path } => write!(
+                f,
+                "duplicate member in '{}': a list of unordered members holds each member once",
+                member_path(property, path)
+            ),
+            Self::MembersNotAList { property, path } => write!(
+                f,
+                "'{}' is declared a list of unordered members and holds another kind of value",
+                member_path(property, path)
+            ),
             Self::ConstraintViolation {
                 constraint,
                 kind: ConstraintKind::Type(expected),
@@ -130,6 +157,14 @@ impl std::fmt::Display for ValidationError {
 }
 
 impl std::error::Error for ValidationError {}
+
+/// The property and the path below it, as one dotted name.
+fn member_path(property: &str, path: &str) -> String {
+    match path {
+        "" => property.to_string(),
+        path => format!("{property}.{path}"),
+    }
+}
 
 /// Check if a `Value` matches a `PropertyType`.
 fn value_matches_type(value: &Value, expected: &PropertyType) -> bool {
@@ -166,6 +201,34 @@ pub fn validate_one(
     def: &PropertyDef,
 ) -> Result<(), ValidationError> {
     validate_property(prop_name, value, def)
+}
+
+/// Check a property value against the unordered members its definition
+/// declares, and nothing else of it: every declared list holds each member
+/// once. This holds in every schema mode, a FLEXIBLE one included, where
+/// the rest of a definition is not enforced.
+pub fn validate_members(
+    prop_name: &str,
+    value: &Value,
+    def: &PropertyDef,
+) -> Result<(), ValidationError> {
+    if def.unordered.is_empty() {
+        return Ok(());
+    }
+    let document = match value {
+        Value::Document(document) => std::borrow::Cow::Borrowed(document),
+        Value::Map(_) | Value::Array(_) => std::borrow::Cow::Owned(value.to_rmpv()),
+        _ => return Ok(()),
+    };
+    let paths = def.unordered_paths();
+    let paths: Vec<&[&str]> = paths.iter().map(Vec::as_slice).collect();
+    crate::schema::members::check_members(&document, &paths).map_err(|e| {
+        let property = prop_name.to_string();
+        match e {
+            MemberError::Repeated { path } => ValidationError::DuplicateMember { property, path },
+            MemberError::NotAList { path } => ValidationError::MembersNotAList { property, path },
+        }
+    })
 }
 
 /// Validate a single property value against its definition.
@@ -230,6 +293,8 @@ fn validate_property(
         }
     }
 
+    validate_members(prop_name, value, def)?;
+
     // Document size check (4MB default limit)
     if let Value::Document(_) = value
         && let Some(size) = value.document_serialized_size()
@@ -272,9 +337,12 @@ pub fn validate_properties(
 
         if let Some(def) = schema.get_property(prop_name) {
             // Declared property — validate type if mode supports it
-            if schema.mode.validates_declared()
-                && let Err(e) = validate_property(prop_name, value, def)
-            {
+            let checked = if schema.mode.validates_declared() {
+                validate_property(prop_name, value, def)
+            } else {
+                validate_members(prop_name, value, def)
+            };
+            if let Err(e) = checked {
                 errors.push(e);
             }
         } else if schema.mode.rejects_unknown() {

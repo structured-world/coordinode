@@ -502,6 +502,7 @@ fn idle_commit_end(
             | DatabaseError::Budget(_)
             | DatabaseError::UniqueViolation { .. }
             | DatabaseError::SchemaViolation(_)
+            | DatabaseError::DuplicateMember { .. }
             | DatabaseError::UniquenessUnresolved { .. },
         ) => TransactionEnd::IdleCommitRefused,
         Err(_) => TransactionEnd::IdleCommitUnknown,

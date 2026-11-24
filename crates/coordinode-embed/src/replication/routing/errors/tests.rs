@@ -154,6 +154,10 @@ fn every_variant() -> Vec<DatabaseError> {
             limit: 64,
         },
         E::SchemaViolation("undeclared property `x`".into()),
+        E::DuplicateMember {
+            property: "body".into(),
+            path: "ops".into(),
+        },
         E::DuplicateKey {
             table: "Account".into(),
             key: "7".into(),

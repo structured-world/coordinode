@@ -156,6 +156,19 @@ pub enum DatabaseError {
     #[error("schema violation: {0}")]
     SchemaViolation(String),
 
+    /// A write would give a list its document property declares as unordered
+    /// members one member twice. Nothing was written.
+    #[error(
+        "property `{property}` holds a member twice in its list of unordered members at          `{path}`"
+    )]
+    DuplicateMember {
+        /// The document property.
+        property: String,
+        /// The fields leading from the property to the list, joined by a
+        /// dot; empty when the property's own value is the list.
+        path: String,
+    },
+
     /// An insert named a key a row of the table already holds. Nothing was
     /// written.
     #[error(
@@ -986,6 +999,7 @@ impl From<ExecutionError> for DatabaseError {
                 ready_through,
             },
             E::SchemaViolation(detail) => Self::SchemaViolation(detail),
+            E::DuplicateMember { property, path } => Self::DuplicateMember { property, path },
             E::DuplicateKey {
                 table,
                 key,

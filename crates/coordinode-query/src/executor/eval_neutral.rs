@@ -17,7 +17,28 @@ use super::eval::{
     EvalError, dispatch_scalar_function, eval_binary_op, eval_unary_op, rmpv_to_value,
 };
 use super::row::Row;
-use crate::plan::expr::{Expr, MapProjItem, Quantifier, StrOp};
+use crate::plan::expr::{BinOp, Expr, MapProjItem, Quantifier, StrOp};
+
+/// `left = right` or `left <> right` where one side reads a document
+/// property declaring unordered members: both values compared under that
+/// declaration. `None` for any other operator or operand, a NULL included,
+/// which the ordinary evaluation answers.
+pub(crate) fn equality_under_declaration(
+    left: &Expr,
+    op: BinOp,
+    right: &Expr,
+    left_value: &Value,
+    right_value: &Value,
+    row: &Row,
+) -> Option<Value> {
+    let negated = match op {
+        BinOp::Eq => false,
+        BinOp::Neq => true,
+        _ => return None,
+    };
+    super::members::declared_equality(left, right, left_value, right_value, row)
+        .map(|same| Value::Bool(same != negated))
+}
 
 /// Evaluate a neutral expression against a row (pure, no storage access).
 ///
@@ -34,7 +55,10 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
         Expr::Binary { left, op, right } => {
             let lv = eval_neutral(left, row)?;
             let rv = eval_neutral(right, row)?;
-            eval_binary_op(&lv, *op, &rv)?
+            match equality_under_declaration(left, *op, right, &lv, &rv, row) {
+                Some(value) => value,
+                None => eval_binary_op(&lv, *op, &rv)?,
+            }
         }
         Expr::Unary { op, operand } => {
             let v = eval_neutral(operand, row)?;

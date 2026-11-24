@@ -342,6 +342,14 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
+        DatabaseError::DuplicateMember { property, path } => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::DuplicateMember,
+                [("property", property.clone()), ("path", path.clone())],
+            );
+        }
         DatabaseError::DuplicateKey {
             table,
             key,

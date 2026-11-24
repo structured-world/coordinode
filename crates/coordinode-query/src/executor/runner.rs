@@ -21,7 +21,7 @@ use coordinode_core::schema::label_id::LabelId;
 use coordinode_core::schema::labels::{
     LabelFacts, LabelKindError, Membership, NodeLabels, resolve_node_labels,
 };
-use coordinode_core::schema::validation::validate_one;
+use coordinode_core::schema::validation::{validate_members, validate_one};
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::core::StorageEngine;
@@ -287,6 +287,19 @@ pub enum ExecutionError {
     /// a write attempted to SET a COMPUTED (read-only) property.
     #[error("schema violation: {0}")]
     SchemaViolation(String),
+
+    /// A write would give a list its document property declares as unordered
+    /// members one member twice. Nothing was written.
+    #[error(
+        "property `{property}` holds a member twice in its list of unordered members at          `{path}`"
+    )]
+    DuplicateMember {
+        /// The document property.
+        property: String,
+        /// The fields leading from the property to the list, joined by a
+        /// dot; empty when the property's own value is the list.
+        path: String,
+    },
 
     /// An insert named a key that a row of the table already holds. Nothing
     /// was written; the existing row is unchanged.
@@ -2414,8 +2427,7 @@ impl<'a> ExecutionContext<'a> {
                         "property '{name}' is computed on :{label} and cannot be stored"
                     )));
                 }
-                (_, Some(def)) => validate_one(&name, &value, def)
-                    .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?,
+                (_, Some(def)) => validate_one(&name, &value, def).map_err(schema_refusal)?,
                 (_, None) => {}
             }
             let stored_by_name = stored_by_name(Some(&schema), &name);
@@ -9201,7 +9213,9 @@ fn judge_filter(
     use crate::executor::row::row_held_bytes;
     let actual = super::row::property(row, variable, prop_name).unwrap_or(&Value::Null);
     if let Some(expected) = named_value(filter_expr, row, outer) {
-        return Ok(actual == expected);
+        return Ok(super::members::holds(
+            row, variable, prop_name, actual, expected,
+        ));
     }
     let eval_row = match outer {
         None => row,
@@ -9217,7 +9231,10 @@ fn judge_filter(
             extended.as_ref().unwrap_or(row)
         }
     };
-    Ok(*actual == eval_neutral(filter_expr, eval_row)?)
+    let expected = eval_neutral(filter_expr, eval_row)?;
+    Ok(super::members::holds(
+        row, variable, prop_name, actual, &expected,
+    ))
 }
 
 /// The value a filter expression names without being evaluated, resolved in
@@ -15490,7 +15507,10 @@ fn eval_neutral_with_storage(
                 _ => {}
             }
             let rv = eval_neutral_with_storage(right, row, ctx)?;
-            Ok(eval_binary_op(&lv, *op, &rv)?)
+            match super::eval_neutral::equality_under_declaration(left, *op, right, &lv, &rv, row) {
+                Some(value) => Ok(value),
+                None => Ok(eval_binary_op(&lv, *op, &rv)?),
+            }
         }
         other => Ok(eval_neutral(other, row)?),
     }
@@ -16283,8 +16303,7 @@ fn execute_create_node(
                         }
                         Some(def) => {
                             // Declared non-computed property → validate type, then set.
-                            validate_one(prop_name, &val, def)
-                                .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
+                            validate_one(prop_name, &val, def).map_err(schema_refusal)?;
                             record.set(field_id, val);
                         }
                         None => {
@@ -16308,14 +16327,17 @@ fn execute_create_node(
                         }
                         Some(def) => {
                             // Declared non-computed property → validate type, then set.
-                            validate_one(prop_name, &val, def)
-                                .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
+                            validate_one(prop_name, &val, def).map_err(schema_refusal)?;
                             record.set(field_id, val);
                         }
                     }
                 }
                 SchemaMode::Flexible => {
-                    // No schema enforcement: set unconditionally.
+                    // No type enforcement; the unordered members a property
+                    // declares hold in every mode.
+                    if let Some(def) = schema.as_ref().and_then(|s| s.get_property(prop_name)) {
+                        validate_members(prop_name, &val, def).map_err(schema_refusal)?;
+                    }
                     record.set(field_id, val);
                 }
             }
@@ -18068,6 +18090,10 @@ fn execute_remove(
                             }
                             if path.len() == 1 {
                                 remove_node_property(&mut new_record, &path[0], ctx.interner);
+                            } else if let Err(refused) =
+                                refuse_write_below_members(remove_label_schema.as_ref(), path)
+                            {
+                                return Err(refused);
                             } else if let Some((target, sub_path)) =
                                 removal_target(remove_label_schema.as_ref(), path, ctx.interner)
                             {
@@ -18191,6 +18217,9 @@ fn execute_remove(
                         Some(label) => ctx.load_current_label_schema(&label)?,
                         None => None,
                     };
+                    if path.len() > 1 {
+                        refuse_write_below_members(label_schema.as_ref(), path)?;
+                    }
                     if let Some((target, sub_path)) =
                         removal_target(label_schema.as_ref(), path, ctx.interner)
                     {
@@ -18839,8 +18868,7 @@ fn execute_merge_nodes(
                             )));
                         }
                         Some(def) => {
-                            validate_one(&prop_name, val, def)
-                                .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
+                            validate_one(&prop_name, val, def).map_err(schema_refusal)?;
                         }
                     },
                     SchemaMode::Validated => {
@@ -18851,11 +18879,14 @@ fn execute_merge_nodes(
                                      on label '{target_label}'"
                                 )));
                             }
-                            validate_one(&prop_name, val, def)
-                                .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
+                            validate_one(&prop_name, val, def).map_err(schema_refusal)?;
                         }
                     }
-                    SchemaMode::Flexible => {}
+                    SchemaMode::Flexible => {
+                        if let Some(def) = schema.get_property(&prop_name) {
+                            validate_members(&prop_name, val, def).map_err(schema_refusal)?;
+                        }
+                    }
                 }
             }
             // The overflow `extra` map carries undeclared properties; under
@@ -20106,6 +20137,15 @@ fn execute_detach_document(
             )));
         };
 
+        // A document taken from below a property is a write below it.
+        if property_path.len() > 1
+            && let Some(Value::String(primary)) =
+                input_row.get(&format!("{source_variable}.__label__"))
+        {
+            let schema = ctx.load_current_label_schema(primary)?;
+            refuse_write_below_members(schema.as_ref(), property_path)?;
+        }
+
         // 2. Resolve the property value at `property_path`.
         let (field_id_opt, doc_value) =
             resolve_document_property(&record, property_path, ctx.interner)?;
@@ -20739,6 +20779,19 @@ fn execute_attach_document(
 
         // --- 3. Package source properties as a DOCUMENT ---
         let doc = source_record_to_document(&source_record, ctx.interner);
+        // A property declaring unordered members takes the document whole,
+        // checked against them, and no write below it.
+        if let Some(Value::String(primary)) = input_row.get(&format!("{target_variable}.__label__"))
+            && let Some(schema) = ctx.load_current_label_schema(primary)?
+            && let Some(def) = schema.get_property(&target_property_path[0])
+            && !def.unordered.is_empty()
+        {
+            if target_property_path.len() > 1 {
+                refuse_write_below_members(Some(&schema), target_property_path)?;
+            }
+            validate_one(&target_property_path[0], &Value::Document(doc.clone()), def)
+                .map_err(schema_refusal)?;
+        }
 
         // Write the document at `target_property_path` on the target.
         //
@@ -20855,7 +20908,14 @@ fn set_property_violation(
 ) -> Option<ExecutionError> {
     let schema = schema?;
     let def = match (&schema.mode, schema.get_property(property)) {
-        (SchemaMode::Flexible, _) | (SchemaMode::Validated, None) => return None,
+        // No type enforcement; the unordered members a property declares
+        // hold in every mode.
+        (SchemaMode::Flexible, Some(def)) => {
+            return value
+                .and_then(|v| validate_members(property, v, def).err())
+                .map(schema_refusal);
+        }
+        (SchemaMode::Flexible, None) | (SchemaMode::Validated, None) => return None,
         (SchemaMode::Strict, None) => {
             return Some(ExecutionError::SchemaViolation(format!(
                 "unknown property '{property}' for strict label '{label}'"
@@ -20870,7 +20930,19 @@ fn set_property_violation(
     }
     value
         .and_then(|v| validate_one(property, v, def).err())
-        .map(|e| ExecutionError::SchemaViolation(e.to_string()))
+        .map(schema_refusal)
+}
+
+/// The refusal of a write whose value its property's definition does not
+/// take.
+fn schema_refusal(e: coordinode_core::schema::validation::ValidationError) -> ExecutionError {
+    use coordinode_core::schema::validation::ValidationError;
+    match e {
+        ValidationError::DuplicateMember { property, path } => {
+            ExecutionError::DuplicateMember { property, path }
+        }
+        other => ExecutionError::SchemaViolation(other.to_string()),
+    }
 }
 
 /// Refuse a user write of a field the engine keeps in every version of a
@@ -21035,6 +21107,27 @@ fn remove_node_property(
     record.remove_extra(name).or(by_id)
 }
 
+/// Refuse a write below property `path[0]` of a node under `schema` when the
+/// property declares unordered members. Such a write is applied without
+/// reading the document it changes, so it cannot tell whether it would leave
+/// a list holding one member twice; the property is written whole instead.
+fn refuse_write_below_members(
+    schema: Option<&LabelSchema>,
+    path: &[String],
+) -> Result<(), ExecutionError> {
+    let declares = schema
+        .and_then(|s| s.get_property(&path[0]))
+        .is_some_and(|def| !def.unordered.is_empty());
+    if declares {
+        return Err(ExecutionError::Unsupported(format!(
+            "property `{}` declares unordered members: a write below it is not checked \
+             against them; set the whole property",
+            path[0]
+        )));
+    }
+    Ok(())
+}
+
 /// The merge target and in-target path of property path `path` of a node
 /// under `schema`: an overflow property is addressed by its full path inside
 /// the overflow map, any other by its id and the path below it.
@@ -21044,6 +21137,7 @@ fn document_target(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(coordinode_core::graph::doc_delta::PathTarget, Vec<String>), ExecutionError> {
     use coordinode_core::graph::doc_delta::PathTarget;
+    refuse_write_below_members(schema, path)?;
     if stored_by_name(schema, &path[0]) {
         Ok((PathTarget::Extra, path.to_vec()))
     } else {
@@ -21790,6 +21884,9 @@ fn inject_computed_from_schema(row: &mut Row, variable: &str, schema: &LabelSche
         let val = evaluate_computed_spec(spec, variable, row, now_us);
         row.insert(crate::executor::row::column_name(variable, prop_name), val);
     }
+    // What the type declares of its documents travels with the row, for a
+    // comparison of one of them to read.
+    super::members::insert_members_column(row, variable, schema);
 }
 
 /// What [`inject_computed_from_schema`] adds to a row under `variable`, known
@@ -21798,7 +21895,7 @@ fn inject_computed_from_schema(row: &mut Row, variable: &str, schema: &LabelSche
 /// counted too.
 fn computed_columns_bytes(variable: &str, schema: &LabelSchema) -> u64 {
     use coordinode_core::schema::definition::PropertyType;
-    schema
+    let computed: u64 = schema
         .properties
         .iter()
         .filter_map(|(name, def)| match &def.property_type {
@@ -21810,7 +21907,8 @@ fn computed_columns_bytes(variable: &str, schema: &LabelSchema) -> u64 {
                 + core::mem::size_of::<Value>() as u64
                 + crate::executor::row::column_lookup_bytes(variable, spec.anchor_field())
         })
-        .sum()
+        .sum();
+    computed + super::members::members_column_bytes(variable, schema)
 }
 
 /// Evaluate a single ComputedSpec to produce a Value.

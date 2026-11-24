@@ -1162,6 +1162,30 @@ fn declare_schema(db: &Database) -> Result<bool, DatabaseError> {
 
 `define_label`, `create_label_schema`, `define_edge_type` and `create_edge_type_schema` publish one object through the same core. A single-object call that publishes a candidate waits for its proof within the statement wait (`index_build_statement_wait_secs`), as `CREATE CONSTRAINT` waits for its build. Over gRPC the package is `SchemaService.PublishSchema`, awaited with `AwaitSchema`.
 
+### Unordered members of a document
+
+A DOCUMENT property can declare lists inside it whose members are unordered. The caller then passes such a list in any order; the engine compares it by its members and refuses a member held twice.
+
+```rust
+use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+
+let mut fact = LabelSchema::new_node_id("Fact");
+fact.add_property(PropertyDef::new("key", PropertyType::String));
+fact.add_property(
+    PropertyDef::new("body", PropertyType::Document)
+        // `body.ops` holds unordered members.
+        .with_unordered_members(["ops"]),
+);
+```
+
+- **Paths.** A path names the fields leading from the property to the list. A list on the way stands for each of its elements (`["steps", "inputs"]` is the `inputs` list of every step); the empty path is the property's own value. A property declares at most 64 lists.
+- **Equality.** `n.body = $candidate`, `n.body <> $candidate`, the inline form `(n:Fact {body: $candidate})` and a comparison of the list itself (`n.body.ops = $ops`) hold when both sides have the same members, whatever their order. A member is compared by all it holds: every field by name, a nested declared list by its members, any other list by position, a scalar by type and value, a field that is absent as absent. Fields of a document compare by name with or without a declaration.
+- **Repeats.** A write whose list holds one member twice is refused with `DatabaseError::DuplicateMember { property, path }` (`DUPLICATE_MEMBER` over gRPC), at the first write and at every later one; nothing is written and the stored version stays. What stands at a declared path must be a list, or be absent.
+- **Whole writes.** The property is written whole (`CREATE`, `SET n.body = $value`). A write below it (`SET n.body.ops = ...`, `doc_push`, `doc_add_to_set`, `REMOVE n.body.ops`) is applied without reading the document and so cannot be checked against the declaration: it is refused.
+- **Every mode.** The declaration holds in every schema mode, FLEXIBLE included. Declaring it over stored documents is proved like any definition that can refuse a stored node: a stored document holding a member twice fails the proof and the label keeps the definition it had.
+- **A retry in another order.** To apply the same immutable fact again, read it by its key and compare (`MATCH (n:Fact {key: $key}) RETURN n.body = $candidate`): an equal value needs no write. The engine does not reorder or rewrite what was stored, and reads return members in the order they were written.
+- **Not an index.** The declaration is not a uniqueness across nodes and creates no index. Ordinary lists keep their order, and a binary payload compares by its bytes.
+
 ## What Is and Isn't Available
 
 The embedded API exposes the full query engine (graph, vector, full-text, time-series) with the same Cypher dialect as the network server. Only network-facing features (gRPC server, REST transcoding, Prometheus scrape endpoint) are absent; replication between embedded members is available behind the `replication` feature (see below).

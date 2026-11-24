@@ -9,6 +9,7 @@ pub mod eval;
 pub mod eval_neutral;
 pub mod instant;
 pub mod label_kinds;
+pub(crate) mod members;
 pub mod namespaces;
 pub mod row;
 pub mod runner;

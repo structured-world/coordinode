@@ -209,6 +209,8 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
             "23514"
         }
         DatabaseError::ConstraintViolation { .. } => "23502",
+        // check_violation: the value breaks a rule of its column's definition.
+        DatabaseError::DuplicateMember { .. } => "23514",
         DatabaseError::KeyImmutable { .. } => "42P10",
         DatabaseError::TransactionConflict { .. } => "40001",
         // insufficient_resources: the server catching up, and the same
