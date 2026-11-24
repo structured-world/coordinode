@@ -280,6 +280,26 @@ fn hash_document<H: core::hash::Hasher>(doc: &rmpv::Value, state: &mut H) {
     }
 }
 
+/// Whether two document values hold the same content: maps by their fields
+/// in any order, lists position by position, everything else as `==` does.
+fn same_fields(a: &rmpv::Value, b: &rmpv::Value) -> bool {
+    match (a, b) {
+        (rmpv::Value::Map(left), rmpv::Value::Map(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .iter()
+                        .find(|(other, _)| other == key)
+                        .is_some_and(|(_, other)| same_fields(value, other))
+                })
+        }
+        (rmpv::Value::Array(left), rmpv::Value::Array(right)) => {
+            left.len() == right.len() && left.iter().zip(right).all(|(l, r)| same_fields(l, r))
+        }
+        _ => a == b,
+    }
+}
+
 impl Value {
     /// Feeds `state` so that values equal under `==` feed it the same bytes:
     /// the hash an exact deduplication buckets by before comparing. Zero
@@ -490,6 +510,29 @@ impl Value {
                 ])
             }
         }
+    }
+
+    /// Whether two values are the same value. A map and a document of the
+    /// same fields are: a map is stored as a document, so a stored map
+    /// compares equal to the map it was written from, in whatever order the
+    /// document holds its fields. Every other pair compares as `==` does.
+    pub fn same_value(&self, other: &Self) -> bool {
+        match (self, other) {
+            (map @ Self::Map(_), Self::Document(document))
+            | (Self::Document(document), map @ Self::Map(_)) => {
+                same_fields(&map.to_rmpv(), document)
+            }
+            _ => self == other,
+        }
+    }
+
+    /// Whether this is a document holding a map whose keys are all strings:
+    /// the stored form of a map.
+    pub fn is_map_document(&self) -> bool {
+        matches!(
+            self,
+            Self::Document(rmpv::Value::Map(fields)) if fields.iter().all(|(key, _)| key.is_str())
+        )
     }
 
     /// Convert `Value::Map` to `Value::Document` for storage as nested document.

@@ -42,6 +42,7 @@ mod integration {
     mod label_count;
     mod label_kinds;
     mod label_lookup;
+    mod map_property;
     mod merge_stress;
     mod multi_endpoint;
     mod multi_label;

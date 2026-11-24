@@ -564,3 +564,76 @@ fn validate_properties_reports_constraints_in_flexible_mode() {
     props.insert(2, Value::Int(1));
     assert!(validate_properties(&schema, &props, &field_names).is_ok());
 }
+
+/// A MAP property takes a map in either form it reaches a write in: the
+/// map itself, or the document a map is stored as. A document that holds
+/// no map, or a map under a key that is no string, is not a MAP.
+#[test]
+fn a_map_property_takes_a_map_in_its_stored_form() {
+    let def = PropertyDef::new("meta", PropertyType::Map);
+    let map = Value::Map(std::collections::BTreeMap::from([(
+        "a".to_string(),
+        Value::Int(1),
+    )]));
+    assert!(validate_one("meta", &map, &def).is_ok());
+    assert!(validate_one("meta", &map.clone().map_to_document(), &def).is_ok());
+
+    let list = Value::Document(rmpv::Value::Array(vec![rmpv::Value::from(1)]));
+    assert!(matches!(
+        validate_one("meta", &list, &def),
+        Err(ValidationError::TypeMismatch { .. })
+    ));
+    let keyed_by_number = Value::Document(rmpv::Value::Map(vec![(
+        rmpv::Value::from(1),
+        rmpv::Value::from(1),
+    )]));
+    assert!(matches!(
+        validate_one("meta", &keyed_by_number, &def),
+        Err(ValidationError::TypeMismatch { .. })
+    ));
+}
+
+/// A map equals the document it is stored as, whatever order the document
+/// holds its fields in, nested maps included; a different field, a missing
+/// one or a list in another order does not.
+#[test]
+fn a_map_equals_its_stored_document_in_any_field_order() {
+    use std::collections::BTreeMap;
+    let inner = Value::Map(BTreeMap::from([
+        ("x".to_string(), Value::Int(1)),
+        ("y".to_string(), Value::Int(2)),
+    ]));
+    let map = Value::Map(BTreeMap::from([
+        ("a".to_string(), inner),
+        (
+            "b".to_string(),
+            Value::Array(vec![Value::Int(1), Value::Int(2)]),
+        ),
+    ]));
+    let s = |text: &str| rmpv::Value::from(text);
+    let document = |list: Vec<rmpv::Value>, y: i64| {
+        Value::Document(rmpv::Value::Map(vec![
+            (s("b"), rmpv::Value::Array(list)),
+            (
+                s("a"),
+                rmpv::Value::Map(vec![
+                    (s("y"), rmpv::Value::from(y)),
+                    (s("x"), rmpv::Value::from(1)),
+                ]),
+            ),
+        ]))
+    };
+    let in_order = vec![rmpv::Value::from(1), rmpv::Value::from(2)];
+    let reversed = vec![rmpv::Value::from(2), rmpv::Value::from(1)];
+    assert!(map.same_value(&document(in_order.clone(), 2)));
+    assert!(document(in_order.clone(), 2).same_value(&map));
+    assert!(
+        !map.same_value(&document(in_order, 3)),
+        "another field value"
+    );
+    assert!(
+        !map.same_value(&document(reversed, 2)),
+        "a list keeps its order"
+    );
+    assert!(!map.same_value(&Value::Document(rmpv::Value::Map(Vec::new()))));
+}

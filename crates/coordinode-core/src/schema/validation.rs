@@ -144,6 +144,8 @@ fn value_matches_type(value: &Value, expected: &PropertyType) -> bool {
         (Value::Blob(_), PropertyType::Blob) => true,
         (Value::Array(_), PropertyType::Array(_)) => true, // homogeneity checked separately
         (Value::Map(_), PropertyType::Map) => true,
+        // A map is stored as a document: a write hands it over in that form.
+        (document @ Value::Document(_), PropertyType::Map) => document.is_map_document(),
         (Value::Geo(_), PropertyType::Geo) => true,
         (Value::Binary(_), PropertyType::Binary) => true,
         (Value::Document(_), PropertyType::Document) => true,

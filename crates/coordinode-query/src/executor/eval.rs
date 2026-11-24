@@ -273,11 +273,11 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<V
         // for absent values.
         BinOp::Eq => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
-            _ => Value::Bool(left == right),
+            _ => Value::Bool(left.same_value(right)),
         },
         BinOp::Neq => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
-            _ => Value::Bool(left != right),
+            _ => Value::Bool(!left.same_value(right)),
         },
         BinOp::Lt => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
