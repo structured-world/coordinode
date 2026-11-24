@@ -72,6 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // that only nodes are served.
                 format!("{proto_root_str}/coordinode/v1/replication/raft.proto"),
                 format!("{proto_root_str}/coordinode/v1/replication/transfer.proto"),
+                // Change streams, subscribed to as a consumer does.
+                format!("{proto_root_str}/coordinode/v1/replication/cdc.proto"),
                 format!("{proto_root_str}/coordinode/internode/handshake.proto"),
             ],
             &includes,

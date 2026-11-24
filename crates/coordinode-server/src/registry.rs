@@ -1,25 +1,16 @@
-//! Consumer-retention registry construction from operator config.
+//! The consumer-retention registry's operator config and metrics.
 //!
 //! `coordinode serve` exposes the registry's background cadences as config
-//! keys. This module is the single place that turns those parsed values into
-//! a live [`ShardConsumerRegistry`] plus its background service. `main.rs`
-//! and the server-level test both go through here, so the wiring production
-//! runs is the wiring that gets tested. The history the registry answers
-//! for, the Raft log and the MVCC store, is a
-//! [`LogRetentionSource`](coordinode_replicate::LogRetentionSource).
+//! keys. The registry itself is opened by the member's database over the
+//! group's log, which takes up the registrations of an earlier run; this
+//! module turns the parsed values into the tuning its background service
+//! starts with, and samples its gauges.
 //!
 //! The MVCC time-travel window is not a registry setting: the engine
 //! enforces it from `StorageConfig::retention_window_secs`, and the registry
 //! only ever lowers the GC watermark further for a lagging consumer.
 
-use std::sync::Arc;
-
-use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
-use coordinode_replicate::{
-    BackgroundConfig, RegistryBackground, RegistryError, RetentionSource, SeqnoConsumerRegistry,
-    ShardConsumerRegistry, SystemClock,
-};
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_replicate::{BackgroundConfig, SeqnoConsumerRegistry, ShardConsumerRegistry};
 
 /// Operator-supplied registry tuning, parsed from the config file.
 ///
@@ -32,41 +23,15 @@ pub(crate) struct RegistryTuning {
     pub heartbeat_window_ms: Option<u64>,
 }
 
-/// Build the per-shard consumer-retention registry and start its
-/// background service, applying any operator overrides from `tuning`.
-///
-/// Returns the live [`ShardConsumerRegistry`] (cheap to clone — `Arc`-backed —
-/// so producers like the change-stream service register through it) and its
-/// [`RegistryBackground`] handle, which must be held for the process lifetime:
-/// dropping it shuts the background service down (with a final heartbeat flush).
-///
-/// # Errors
-///
-/// A stored registration could not be recovered, or the background service's
-/// thread could not be started.
-pub(crate) fn build_consumer_registry(
-    engine: Arc<StorageEngine>,
-    pipeline: Arc<dyn ProposalPipeline>,
-    source: Arc<dyn RetentionSource>,
-    tuning: RegistryTuning,
-) -> Result<(ShardConsumerRegistry, RegistryBackground), RegistryError> {
-    let registry = ShardConsumerRegistry::new(
-        engine,
-        pipeline,
-        Arc::new(ProposalIdGenerator::with_base(
-            coordinode_core::txn::proposal::fresh_proposal_id_base(),
-        )),
-        Arc::new(SystemClock),
-        source,
-    )?;
-    let mut bg_cfg = BackgroundConfig::default();
+/// The tuning of the registry's background service, with the operator's
+/// overrides from `tuning`: the member's database starts the service with
+/// it when it opens the registry.
+pub(crate) fn background_config(tuning: RegistryTuning) -> BackgroundConfig {
+    let mut config = BackgroundConfig::default();
     if let Some(ms) = tuning.heartbeat_window_ms {
-        bg_cfg.heartbeat_window_ms = ms;
+        config.heartbeat_window_ms = ms;
     }
-    // start_background borrows &self, so the registry stays owned and is returned
-    // for producers to register through (the bg task holds its own Arc to core).
-    let background = registry.start_background(bg_cfg)?;
-    Ok((registry, background))
+    config
 }
 
 /// Set the per-consumer gauges (lag in positions, age of the work owed,

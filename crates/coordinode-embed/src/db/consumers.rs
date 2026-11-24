@@ -1,24 +1,23 @@
-//! Change-stream consumers of a database that is not a member of a
-//! replicated group: their registrations, and the history the store keeps
-//! for them.
+//! Change-stream consumers of a database: their registrations, and the
+//! history the store keeps for them, over its own journal or, for a member
+//! of a replicated group, over its group's log.
 //!
 //! Each consumer registers with an explicit retention policy. A STRICT one
 //! keeps what it needs until it is cancelled; an ordinary one records its
 //! position only, and learns of history the store no longer holds as
 //! `RetentionLost`. The store's journal (for log consumers) and its MVCC
 //! history (for the others) are kept from the lowest position a live STRICT
-//! registration needs. The registry is
-//! the one the server runs; here it runs over the store's own journal, with
-//! its background service on a thread of its own, so a database without an
-//! async runtime has it.
+//! registration needs. The registry is the one the server runs, with its
+//! background service on a thread of its own, so a database without an async
+//! runtime has it.
 
 use std::sync::Arc;
 
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_replicate::{
     BackgroundConfig, ConsumerRegistration, ConsumerSnapshot, LogRetentionSource, RegisteredHandle,
-    RegistryBackground, RetentionSummary, SeqnoConsumerRegistry, ShardConsumerRegistry,
-    SystemClock,
+    RegistryBackground, RetentionSource, RetentionSummary, SeqnoConsumerRegistry,
+    ShardConsumerRegistry, SystemClock,
 };
 use coordinode_storage::engine::core::StorageEngine;
 
@@ -40,32 +39,56 @@ impl Drop for Consumers {
     }
 }
 
+/// The history a member of a replicated group serves its consumers from:
+/// its group's log, and the background service's tuning.
+pub(crate) struct GroupConsumers {
+    /// The group's log and the MVCC history this member applied from it.
+    pub(crate) source: Arc<dyn RetentionSource>,
+    /// The background service's tuning.
+    pub(crate) background: BackgroundConfig,
+}
+
 impl Consumers {
-    /// The registry over `engine`'s own journal and MVCC history, writing
-    /// its records through `pipeline`. `None` for a store that keeps no
-    /// journal of its own (a member of a replicated group, an in-memory
-    /// store), which holds no history for consumers this way.
+    /// The registry of `engine`'s consumers, writing its records through
+    /// `pipeline`: over the store's own journal and MVCC history, or, for a
+    /// member of a replicated group (one voter alone included), over its
+    /// group's log as `group` gives it. The registrations recorded in an
+    /// earlier run are taken up again by this one registry, and their
+    /// history stays held until it publishes their floors. `None` for a
+    /// store with neither (an in-memory store), which holds no history for
+    /// consumers.
     ///
     /// # Errors
     ///
     /// The journal could not be inspected, a stored registration could not
-    /// be recovered, the store holds registrations it has no journal of its
-    /// own to serve, or the service's thread could not be started.
+    /// be recovered, the store holds registrations and has neither a journal
+    /// of its own nor a group's log to serve them, or the service's thread
+    /// could not be started.
     pub(crate) fn open(
         engine: &Arc<StorageEngine>,
         pipeline: &Arc<dyn ProposalPipeline>,
+        group: Option<GroupConsumers>,
     ) -> Result<Option<Self>, DatabaseError> {
-        let Some(source) = LogRetentionSource::over_own_journal(Arc::clone(engine))? else {
-            // The engine holds every version for these registrations until
-            // their floors are published, which nothing here would do.
-            if engine.consumer_protections_pending() {
-                return Err(DatabaseError::Unsupported(
-                    "the store holds consumer registrations, and this database keeps no \
-                     journal of its own to serve them; cancel them on a standalone open first"
-                        .into(),
-                ));
+        let (source, background): (Arc<dyn RetentionSource>, BackgroundConfig) = match (
+            LogRetentionSource::over_own_journal(Arc::clone(engine))?,
+            group,
+        ) {
+            (Some(own), _) => (Arc::new(own), BackgroundConfig::default()),
+            (None, Some(group)) => (group.source, group.background),
+            (None, None) => {
+                // The engine holds every version for these registrations
+                // until their floors are published, which nothing here
+                // would do.
+                if engine.consumer_protections_pending() {
+                    return Err(DatabaseError::Unsupported(
+                        "the store holds consumer registrations, and this database keeps \
+                             neither a journal of its own nor a group's log to serve them; \
+                             cancel them on a standalone open first"
+                            .into(),
+                    ));
+                }
+                return Ok(None);
             }
-            return Ok(None);
         };
         let registry = ShardConsumerRegistry::new(
             Arc::clone(engine),
@@ -74,9 +97,9 @@ impl Consumers {
                 coordinode_core::txn::proposal::fresh_proposal_id_base(),
             )),
             Arc::new(SystemClock),
-            Arc::new(source),
+            source,
         )?;
-        let service = registry.start_background(BackgroundConfig::default())?;
+        let service = registry.start_background(background)?;
         Ok(Some(Self {
             registry,
             service: Some(service),
@@ -85,11 +108,20 @@ impl Consumers {
 }
 
 impl Database {
+    /// The consumer registry of this database's deployment, shared with
+    /// every handle and session of it: the one a server's change streams
+    /// register through. `None` for a database with no history to serve
+    /// consumers from (an in-memory store).
+    #[must_use]
+    pub fn consumer_registry(&self) -> Option<ShardConsumerRegistry> {
+        self.consumers.as_ref().map(|c| c.registry.clone())
+    }
+
     /// The registry, or why this database has none.
     fn consumers(&self) -> Result<&ShardConsumerRegistry, DatabaseError> {
         self.consumers.as_ref().map(|c| &c.registry).ok_or_else(|| {
             DatabaseError::Unsupported(
-                "this database keeps no journal of its own to hold history for consumers".into(),
+                "this database keeps no history to hold for consumers".into(),
             )
         })
     }

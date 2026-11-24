@@ -477,6 +477,11 @@ pub(crate) async fn serve(
     };
     member_options.timing = election_timing;
     member_options.preference = election_preference;
+    // The member's database opens the one consumer registry over the
+    // group's log; the operator's cadence reaches its background service.
+    member_options.consumers = registry::background_config(registry::RegistryTuning {
+        heartbeat_window_ms: registry_heartbeat_ms,
+    });
     // A server is not embedded in an application with a format of its own:
     // its host epoch is zero.
     member_options.host_epoch = 0;
@@ -889,9 +894,6 @@ pub(crate) async fn serve(
         raft_node.set_join_timeout(std::time::Duration::from_secs(secs.get()));
     }
 
-    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
-        Arc::new(raft_node.pipeline());
-
     // A member that joins its group serves its peers before it serves data:
     // the group reaches it on the gRPC port to catch it up, and its clients
     // are served once its namespace has arrived. Until then the port answers
@@ -1084,31 +1086,14 @@ pub(crate) async fn serve(
 
     // Per-shard consumer-retention registry: every change-stream consumer is
     // registered here with its retention policy, over the history this node
-    // holds (the Raft log, the MVCC store). The background service flushes
-    // heartbeats and republishes the floors when a registration changes. Both
-    // standalone and cluster modes drive it through the same Raft pipeline.
-    // Held for the process lifetime. The heartbeat window arrives from the
-    // config file; `None` keeps the built-in 1 s.
-    let retention_source: Arc<dyn coordinode_replicate::RetentionSource> = {
-        let applied_node = Arc::clone(&raft_node);
-        Arc::new(coordinode_replicate::LogRetentionSource::new(
-            Arc::clone(&engine),
-            coordinode_raft::storage::raft_oplog_dirs(&engine, 0)
-                .map_err(|e| format!("oplog directories: {e}"))?
-                .all,
-            raft_node.retained_floor(),
-            Arc::new(move || applied_node.applied_through()),
-        ))
-    };
-    let (consumer_registry, _registry_bg) = registry::build_consumer_registry(
-        Arc::clone(&engine),
-        Arc::clone(&pipeline),
-        retention_source,
-        registry::RegistryTuning {
-            heartbeat_window_ms: registry_heartbeat_ms,
-        },
-    )
-    .map_err(|e| format!("consumer registry: {e}"))?;
+    // holds (the Raft log, the MVCC store). The member's database opened it
+    // over the group's log and took up the registrations an earlier run
+    // recorded; the server registers through that one registry, so a restart
+    // finds them again. Its background service lives with the database.
+    let consumer_registry = database
+        .read()
+        .consumer_registry()
+        .ok_or("the member's database opened no consumer registry")?;
 
     // Vector index observability: per-index serving state + freshness lag as
     // Prometheus gauges. The lag needs the engine's current committed HLC,

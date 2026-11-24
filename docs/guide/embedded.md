@@ -518,9 +518,13 @@ longer offers refuses to open its registry with an error naming the record,
 rather than reuse them under another meaning.
 
 The registry runs on a thread of the database and stops when it is dropped;
-no async runtime is needed. A database kept in memory, and a member of a
-replicated group (whose history is the group's log, not a journal of its
-own), refuse registrations as `Unsupported`.
+no async runtime is needed. A member of a replicated group (with the
+`replication` feature, a member alone included) serves its consumers from
+the group's log the same way: its database opens the one registry over that
+log, which takes up the registrations of an earlier run when it reopens and
+keeps their history held until it has published where each stands. A
+database kept in memory has no history to serve and refuses registrations as
+`Unsupported`.
 
 ### Reading changes as events
 

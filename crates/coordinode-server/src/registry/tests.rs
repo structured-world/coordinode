@@ -1,7 +1,11 @@
 use super::*;
+use std::sync::Arc;
+
+use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::TimestampOracle;
-use coordinode_replicate::LogRetentionSource;
+use coordinode_replicate::{LogRetentionSource, RegistryBackground, RetentionSource, SystemClock};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::local_pipeline::OwnedLocalProposalPipeline;
 use coordinode_storage::oplog::RetainedFloor;
 use coordinode_storage::oplog::manager::OplogManager;
@@ -52,6 +56,25 @@ fn empty_source(engine: &Arc<StorageEngine>) -> Arc<dyn RetentionSource> {
     ))
 }
 
+/// A registry over `engine` with an empty source and its background service
+/// started with the default tuning, as a member's database opens one.
+fn open_registry(engine: &Arc<StorageEngine>) -> (ShardConsumerRegistry, RegistryBackground) {
+    let registry = ShardConsumerRegistry::new(
+        Arc::clone(engine),
+        pipeline_for(engine),
+        Arc::new(ProposalIdGenerator::with_base(
+            coordinode_core::txn::proposal::fresh_proposal_id_base(),
+        )),
+        Arc::new(SystemClock),
+        empty_source(engine),
+    )
+    .expect("registry");
+    let background = registry
+        .start_background(background_config(RegistryTuning::default()))
+        .expect("background");
+    (registry, background)
+}
+
 /// The engine window survives registry construction: with no consumers the
 /// registry publishes no consumer floor, so the GC watermark stays exactly
 /// `snapshot - window` (the engine's own floor), never `u64::MAX` (which
@@ -61,15 +84,7 @@ fn empty_source(engine: &Arc<StorageEngine>) -> Arc<dyn RetentionSource> {
 async fn registry_leaves_the_engine_window_in_force() {
     let window_secs = 3_600u64; // 1 hour
     let (engine, _dir) = open_engine(Some(window_secs));
-    let pipeline = pipeline_for(&engine);
-
-    let _bg = build_consumer_registry(
-        Arc::clone(&engine),
-        pipeline,
-        empty_source(&engine),
-        RegistryTuning::default(),
-    )
-    .expect("registry");
+    let _registry = open_registry(&engine);
 
     let snap = engine.snapshot();
     let expected = snap.saturating_sub(window_secs * US_PER_SEC);
@@ -88,23 +103,11 @@ async fn registry_leaves_the_engine_window_in_force() {
 #[tokio::test]
 async fn short_window_keeps_higher_floor_than_default() {
     let (engine_short, _d1) = open_engine(Some(1)); // 1 second
-    let _bg_short = build_consumer_registry(
-        Arc::clone(&engine_short),
-        pipeline_for(&engine_short),
-        empty_source(&engine_short),
-        RegistryTuning::default(),
-    )
-    .expect("registry");
+    let _short = open_registry(&engine_short);
     let floor_short = engine_short.gc_watermark();
 
     let (engine_default, _d2) = open_engine(None); // 7-day default
-    let _bg_default = build_consumer_registry(
-        Arc::clone(&engine_default),
-        pipeline_for(&engine_default),
-        empty_source(&engine_default),
-        RegistryTuning::default(),
-    )
-    .expect("registry");
+    let _default = open_registry(&engine_default);
     let floor_default = engine_default.gc_watermark();
 
     assert!(
@@ -115,18 +118,16 @@ async fn short_window_keeps_higher_floor_than_default() {
 }
 
 /// Background cadence overrides are applied, not silently dropped: the
-/// registry service starts with the operator values.
-#[tokio::test]
-async fn cadence_overrides_reach_the_background_service() {
-    let (engine, _dir) = open_engine(None);
-    let (_registry, bg) = build_consumer_registry(
-        Arc::clone(&engine),
-        pipeline_for(&engine),
-        empty_source(&engine),
-        RegistryTuning {
-            heartbeat_window_ms: Some(250),
-        },
-    )
-    .expect("registry");
-    assert_eq!(bg.config().heartbeat_window_ms, 250);
+/// tuning the member's registry starts with carries the operator values, and
+/// none keeps the built-in default.
+#[test]
+fn cadence_overrides_reach_the_background_tuning() {
+    let config = background_config(RegistryTuning {
+        heartbeat_window_ms: Some(250),
+    });
+    assert_eq!(config.heartbeat_window_ms, 250);
+    assert_eq!(
+        background_config(RegistryTuning::default()).heartbeat_window_ms,
+        BackgroundConfig::default().heartbeat_window_ms
+    );
 }

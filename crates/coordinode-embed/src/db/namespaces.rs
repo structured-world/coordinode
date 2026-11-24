@@ -78,7 +78,7 @@ impl Database {
                     &engine,
                 ),
             );
-        Self::finish_open(&path, oracle, engine, pipeline, false, None)
+        Self::finish_open(&path, oracle, engine, pipeline, false, None, None)
     }
 
     /// Create the namespace `name` in the deployment's catalog. It holds no

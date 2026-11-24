@@ -877,7 +877,7 @@ impl Database {
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
         // Embedded: HNSW updated inline, no oplog-tailing worker.
-        Self::finish_open(&path, oracle, engine, pipeline, false, None)
+        Self::finish_open(&path, oracle, engine, pipeline, false, None, None)
     }
 
     /// Open an in-memory database backed by `lsm_tree::fs::MemFs`.
@@ -916,7 +916,7 @@ impl Database {
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
         // Embedded in-memory: HNSW updated inline, no oplog-tailing worker.
-        Self::finish_open(&virtual_path, oracle, engine, pipeline, false, None)
+        Self::finish_open(&virtual_path, oracle, engine, pipeline, false, None, None)
     }
 
     /// Initialize a database from pre-opened engine, oracle, and pipeline.
@@ -930,6 +930,30 @@ impl Database {
         engine: Arc<StorageEngine>,
         oracle: Arc<TimestampOracle>,
         pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
+    ) -> Result<Self, DatabaseError> {
+        Self::from_engine_with(path, engine, oracle, pipeline, None)
+    }
+
+    /// [`Self::from_engine`] for a member of a replicated group, whose
+    /// consumers are served from its group's log: the registrations an
+    /// earlier run recorded are taken up by the one registry over that log.
+    #[cfg(feature = "replication")]
+    pub(crate) fn from_member_engine(
+        path: impl AsRef<Path>,
+        engine: Arc<StorageEngine>,
+        oracle: Arc<TimestampOracle>,
+        pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
+        group_consumers: consumers::GroupConsumers,
+    ) -> Result<Self, DatabaseError> {
+        Self::from_engine_with(path, engine, oracle, pipeline, Some(group_consumers))
+    }
+
+    fn from_engine_with(
+        path: impl AsRef<Path>,
+        engine: Arc<StorageEngine>,
+        oracle: Arc<TimestampOracle>,
+        pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
+        group_consumers: Option<consumers::GroupConsumers>,
     ) -> Result<Self, DatabaseError> {
         // The engine stamps log entries with a bound read from its clock, and
         // the database takes commit timestamps from `oracle`: two clocks would
@@ -945,7 +969,15 @@ impl Database {
         }
         // Cluster mode (RaftProposalPipeline): the state machine applies writes,
         // so the oplog-tailing worker maintains HNSW (no inline index path).
-        Self::finish_open(path.as_ref(), oracle, engine, pipeline, true, None)
+        Self::finish_open(
+            path.as_ref(),
+            oracle,
+            engine,
+            pipeline,
+            true,
+            None,
+            group_consumers,
+        )
     }
 
     /// A session of this database's deployment working in the namespace
@@ -992,6 +1024,7 @@ impl Database {
                 consumers: self.consumers.clone(),
                 journal_reclaim: self.journal_reclaim.clone(),
             }),
+            None,
         )?;
         session.carry_settings_from(self);
         Ok(session)
@@ -1115,6 +1148,9 @@ impl Database {
         // The deployment's services when this opens a further namespace's
         // session of a deployment already open; `None` opens the deployment.
         shared: Option<DeploymentServices>,
+        // For a deployment a member of a replicated group opens: the group's
+        // log its consumers are served from. Unused for a session.
+        group_consumers: Option<consumers::GroupConsumers>,
     ) -> Result<Self, DatabaseError> {
         // What opening the database writes (repair, registries, schema) is
         // the store's own work: bounded, and allowed past a limit the
@@ -1365,7 +1401,8 @@ impl Database {
                 // Registrations recorded in an earlier run hold their history
                 // again from here, before anything this open starts purges the
                 // journal.
-                let consumers = consumers::Consumers::open(&engine, &pipeline)?.map(Arc::new);
+                let consumers =
+                    consumers::Consumers::open(&engine, &pipeline, group_consumers)?.map(Arc::new);
                 // After the registrations above hold their history again.
                 let journal_reclaim = engine.deployment().start_journal_reclaim()?.map(Arc::new);
                 (consumers, journal_reclaim)
@@ -4732,6 +4769,8 @@ pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use blob::{BlobId, GroupMembers, UploadedBlob};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
 pub use changes::{ChangeFollower, ChangeInterest, ChangePage};
+#[cfg(feature = "replication")]
+pub(crate) use consumers::GroupConsumers;
 pub use coordinode_core::access::{AccessRefusal, MissingRight, NamespaceRole, PrincipalId};
 pub use coordinode_core::txn::command::{
     ActingContext, AdmissionSignal, ExpectedVersion, Principal, TimeoutOutcome, TransactionId,

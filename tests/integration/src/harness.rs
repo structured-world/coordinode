@@ -763,6 +763,25 @@ impl CoordinodeProcess {
         CypherServiceClient::with_interceptor(channel, NameNamespace)
     }
 
+    /// Build a `ChangeStreamServiceClient` connected to this process, naming
+    /// its namespace on every call.
+    pub async fn change_stream_client(
+        &self,
+    ) -> crate::proto::replication::change_stream_service_client::ChangeStreamServiceClient<
+        NamedChannel,
+    > {
+        self.serving().await;
+        let channel = tonic::transport::Endpoint::from_shared(self.endpoint())
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("connect to the change stream service");
+        crate::proto::replication::change_stream_service_client::ChangeStreamServiceClient::with_interceptor(
+            channel,
+            NameNamespace,
+        )
+    }
+
     /// Build a `ClusterServiceClient` connected to this process.
     pub async fn cluster_client(&self) -> ClusterServiceClient<tonic::transport::Channel> {
         let channel = tonic::transport::Endpoint::from_shared(self.endpoint())

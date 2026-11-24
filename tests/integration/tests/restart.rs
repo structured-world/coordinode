@@ -903,3 +903,122 @@ async fn acknowledged_writes_survive_every_kind_of_stop() {
         );
     }
 }
+
+// ── Durable change-stream consumers across a restart ─────────────────────────
+
+use coordinode_integration::proto::replication::{
+    AcknowledgeSubscriptionRequest, ChangeBatch, ChangeInterest, ConsumerRetention, NameList,
+    StrictRetention, SubscribeRequest, consumer_retention, logical_change,
+};
+
+/// A subscription of consumer `id` following :Item nodes: registered anew
+/// with strict retention for incarnation 0, resumed otherwise.
+fn subscription(id: &str, incarnation: u64) -> SubscribeRequest {
+    SubscribeRequest {
+        cursor: Vec::new(),
+        interest: Some(ChangeInterest {
+            labels: Some(NameList {
+                names: vec!["Item".to_string()],
+            }),
+            edge_types: Some(NameList { names: Vec::new() }),
+            blobs: false,
+        }),
+        consumer_id: id.to_string(),
+        incarnation,
+        retention: Some(ConsumerRetention {
+            policy: Some(consumer_retention::Policy::Strict(StrictRetention {})),
+        }),
+    }
+}
+
+/// Read `stream` until a batch holds a node event; that batch.
+async fn batch_with_a_node(stream: &mut tonic::Streaming<ChangeBatch>) -> ChangeBatch {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let batch = tokio::time::timeout_at(deadline, stream.message())
+            .await
+            .expect("a node event in time")
+            .expect("the stream")
+            .expect("a batch");
+        let has_node = batch.units.iter().any(|u| {
+            u.events
+                .iter()
+                .any(|e| matches!(e.target, Some(logical_change::Target::Node(_))))
+        });
+        if has_node {
+            return batch;
+        }
+    }
+}
+
+/// The ids of the nodes `batch` writes.
+fn written_nodes(batch: &ChangeBatch) -> Vec<u64> {
+    batch
+        .units
+        .iter()
+        .flat_map(|u| u.events.iter())
+        .filter_map(|e| match &e.target {
+            Some(logical_change::Target::Node(node)) => Some(node.node_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A durable consumer registered with a server, its progress acknowledged,
+/// resumes the same registration after the server restarts over the same
+/// directory in the same mode, and receives the write made after the
+/// restart, not the one it acknowledged. The server opens as a group of one
+/// whose consumers are served from the group's log: the open takes the
+/// registration up again rather than refusing the store that holds it.
+#[tokio::test]
+async fn a_durable_consumer_resumes_its_registration_after_a_restart() {
+    let proc = CoordinodeProcess::start().await;
+    cypher_q(&proc, "CREATE NODE TYPE Item WITH (n: INT)")
+        .await
+        .expect("create the type");
+    let mut client = proc.change_stream_client().await;
+    let response = client
+        .subscribe(subscription("durable", 0))
+        .await
+        .expect("register");
+    let incarnation: u64 = response
+        .metadata()
+        .get("x-coordinode-consumer-incarnation")
+        .expect("the incarnation")
+        .to_str()
+        .expect("text")
+        .parse()
+        .expect("a number");
+    let mut stream = response.into_inner();
+    cypher_q(&proc, "CREATE (:Item {n: 1})")
+        .await
+        .expect("first write");
+    let first = batch_with_a_node(&mut stream).await;
+    let acknowledged = written_nodes(&first);
+    assert_eq!(acknowledged.len(), 1, "{first:?}");
+    client
+        .acknowledge_subscription(AcknowledgeSubscriptionRequest {
+            consumer_id: "durable".to_string(),
+            incarnation,
+            cursor: first.cursor.clone(),
+        })
+        .await
+        .expect("acknowledge");
+    drop(stream);
+    drop(client);
+
+    let proc = proc.restart().await;
+    cypher_q(&proc, "CREATE (:Item {n: 2})")
+        .await
+        .expect("the write after the restart");
+    let mut client = proc.change_stream_client().await;
+    let mut resumed = client
+        .subscribe(subscription("durable", incarnation))
+        .await
+        .expect("resume the same registration")
+        .into_inner();
+    let next = batch_with_a_node(&mut resumed).await;
+    let written = written_nodes(&next);
+    assert_eq!(written.len(), 1, "the next write only: {next:?}");
+    assert_ne!(written, acknowledged, "not the acknowledged one again");
+}

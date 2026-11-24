@@ -129,6 +129,10 @@ pub struct MemberOptions {
     pub snapshots: SnapshotTriggerConfig,
     /// What commands its peers route here may hold.
     pub routing: routing::RoutingLimits,
+    /// The tuning of the background service of the member's consumer
+    /// registry, which serves its change-stream consumers from the group's
+    /// log.
+    pub consumers: coordinode_replicate::BackgroundConfig,
 }
 
 impl MemberOptions {
@@ -142,6 +146,7 @@ impl MemberOptions {
             host_epoch: 0,
             snapshots: SnapshotTriggerConfig::default(),
             routing: routing::RoutingLimits::default(),
+            consumers: coordinode_replicate::BackgroundConfig::default(),
         }
     }
 }
@@ -511,6 +516,9 @@ pub struct Member {
     /// What the sessions of further namespaces run beside them, started as
     /// each session opens.
     sessions: SessionWork,
+    /// The tuning of the consumer registry the database opens over the
+    /// group's log.
+    consumers: coordinode_replicate::BackgroundConfig,
 }
 
 /// What the sessions of further namespaces start beside them.
@@ -665,6 +673,7 @@ impl Member {
             host_epoch,
             snapshots,
             routing: _,
+            consumers,
         } = options;
         let mut node_options = NodeOptions {
             snapshots,
@@ -729,6 +738,7 @@ impl Member {
             background: Vec::new(),
             stop: tokio::sync::watch::Sender::new(false),
             sessions: SessionWork::default(),
+            consumers,
         };
         // A member whose store holds its namespace serves from the open; one
         // that joins serves once its namespace arrives (`serve`).
@@ -775,11 +785,29 @@ impl Member {
         let node = &self.node;
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(node.pipeline());
-        let database = Database::from_engine(
+        // The member's consumers are served from its group's log: the one
+        // registry over it takes up the registrations an earlier run
+        // recorded, whose history stays held until it publishes their floors.
+        let source: Arc<dyn coordinode_replicate::RetentionSource> = {
+            let applied = Arc::clone(node);
+            Arc::new(coordinode_replicate::LogRetentionSource::new(
+                Arc::clone(&self.engine),
+                coordinode_raft::storage::raft_oplog_dirs(&self.engine, 0)
+                    .map_err(|e| DatabaseError::Other(format!("the group's log: {e}")))?
+                    .all,
+                node.retained_floor(),
+                Arc::new(move || applied.applied_through()),
+            ))
+        };
+        let database = Database::from_member_engine(
             &self.data_dir,
             Arc::clone(&self.engine),
             Arc::clone(&self.oracle),
             pipeline,
+            crate::db::GroupConsumers {
+                source,
+                background: self.consumers,
+            },
         )?;
         tracing::debug!(target: "coordinode::startup", "database open; awaiting leadership");
         // Before the database serves anything: a member that does not lead

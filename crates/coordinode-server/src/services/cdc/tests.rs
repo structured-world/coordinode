@@ -35,7 +35,30 @@ use crate::proto::replication::cdc::{
     ConsumerRetention, NameList, OrdinaryRetention, StrictRetention, SubscribeRequest,
     consumer_retention, logical_change,
 };
-use crate::registry::{RegistryTuning, build_consumer_registry};
+use crate::registry::{RegistryTuning, background_config};
+
+/// A registry over `source`, its background service started with
+/// `tuning`, as a member's database opens it over the group's log.
+fn build_consumer_registry(
+    engine: Arc<StorageEngine>,
+    pipeline: Arc<dyn ProposalPipeline>,
+    source: Arc<dyn coordinode_replicate::RetentionSource>,
+    tuning: RegistryTuning,
+) -> Result<(ShardConsumerRegistry, RegistryBackground), coordinode_replicate::RegistryError> {
+    let registry = ShardConsumerRegistry::new(
+        engine,
+        pipeline,
+        Arc::new(
+            coordinode_core::txn::proposal::ProposalIdGenerator::with_base(
+                coordinode_core::txn::proposal::fresh_proposal_id_base(),
+            ),
+        ),
+        Arc::new(coordinode_replicate::SystemClock),
+        source,
+    )?;
+    let background = registry.start_background(background_config(tuning))?;
+    Ok((registry, background))
+}
 use coordinode_replicate::LogRetentionSource;
 
 /// Open a fresh single-endpoint engine in a temp directory.

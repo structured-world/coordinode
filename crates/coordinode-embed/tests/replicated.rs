@@ -4182,6 +4182,64 @@ async fn a_member_rebuilds_nodes_by_label_through_a_node_cut() {
     member.shutdown().await.unwrap();
 }
 
+/// A member alone registers a strict consumer with its database, which
+/// serves it from the group's log, acknowledges progress, and reopens over
+/// the same directory: the registration is taken up again, not refused, and
+/// the same incarnation resumes at the acknowledged position.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_members_consumer_registration_survives_a_reopen() {
+    use coordinode_embed::consumer::{
+        ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, InitialSeqno, TopologyScope,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let (incarnation, acknowledged) = {
+        let member = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+            .await
+            .unwrap();
+        wait_until("the member leads", || member.leader() == Some(1)).await;
+        member
+            .database()
+            .write()
+            .execute_cypher("CREATE (:Item {n: 1})")
+            .unwrap();
+        let registered = {
+            let db = member.database().read();
+            let handle = db
+                .register_consumer(ConsumerRegistration {
+                    consumer_id: "durable".to_string(),
+                    kind: ConsumerKind::OplogEvents,
+                    scope: TopologyScope::Shard(0),
+                    initial_seqno: InitialSeqno::FromNow,
+                    retention: ConsumerRetentionPolicy::Strict,
+                })
+                .expect("a member's database serves consumers");
+            let position = db.consumer_position(&handle).expect("position");
+            db.acknowledge_consumer(&handle, position).expect("ack");
+            (handle.incarnation(), position)
+        };
+        member.shutdown().await.unwrap();
+        registered
+    };
+
+    let member = ReplicatedDatabase::open(&storage(dir.path()), MemberOptions::new(1), None)
+        .await
+        .expect("the reopen takes the registration up again");
+    wait_until("the member leads", || member.leader() == Some(1)).await;
+    {
+        let db = member.database().read();
+        let handle = db
+            .resume_consumer("durable", incarnation)
+            .expect("the same incarnation resumes");
+        assert_eq!(
+            db.consumer_position(&handle).expect("position"),
+            acknowledged,
+            "where it acknowledged"
+        );
+    }
+    member.shutdown().await.unwrap();
+}
+
 /// The schema key of index `name` in `db`'s catalog.
 fn definition_key(db: &ReplicatedDatabase, name: &str) -> Vec<u8> {
     let engine = db.database().read().engine_handle();
