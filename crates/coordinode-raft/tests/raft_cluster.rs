@@ -9746,6 +9746,16 @@ async fn a_stream_closed_inside_a_log_read_with_a_purge_asked_does_not_stop_the_
         let term = n1.current_term();
         let before = log_segments(dirs[0].path());
         assert!(before.len() > 2, "several sealed segments: {before:?}");
+        // Where the log is purged through before the purge is asked for;
+        // nothing is purged yet when there is no such index.
+        let purged_index = |n: &RaftNode| {
+            n.raft()
+                .metrics()
+                .borrow_watched()
+                .purged
+                .map(|log| log.index)
+        };
+        let purged_before = purged_index(&n1);
 
         // The leader reads its log for the new learner, and the read waits.
         gate.arm();
@@ -9774,8 +9784,7 @@ async fn a_stream_closed_inside_a_log_read_with_a_purge_asked_does_not_stop_the_
                 let applied = n1.applied_index();
                 n1.raft().trigger().purge_log(applied).await.expect("purge");
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                let metrics = n1.raft().metrics().borrow_watched().clone();
-                if metrics.purged.is_some() && log_segments(dirs[0].path()).len() < before.len() {
+                if purged_index(&n1) > purged_before {
                     return true;
                 }
             }
