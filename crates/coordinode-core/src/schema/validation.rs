@@ -220,8 +220,7 @@ pub fn validate_members(
         Value::Map(_) | Value::Array(_) => std::borrow::Cow::Owned(value.to_rmpv()),
         _ => return Ok(()),
     };
-    let paths = def.unordered_paths();
-    let paths: Vec<&[&str]> = paths.iter().map(Vec::as_slice).collect();
+    let paths: Vec<&[String]> = def.unordered.iter().map(Vec::as_slice).collect();
     crate::schema::members::check_members(&document, &paths).map_err(|e| {
         let property = prop_name.to_string();
         match e {

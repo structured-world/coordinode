@@ -449,6 +449,8 @@ fn to_wire(err: DatabaseError) -> wire::RoutedError {
                 }
                 // Taken by the arm above.
                 EvalError::VectorDomain(e) => return to_wire(E::VectorDomain(e)),
+                // A spent budget is its own case, wherever it was met.
+                EvalError::Budget(stop) => return to_wire(E::Budget(stop)),
             }),
         }),
         E::VectorRefused {

@@ -35,7 +35,7 @@ use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 
 use super::eval::{EvalError, eval_binary_op, eval_unary_op, is_truthy};
-use super::eval_neutral::eval_neutral;
+use super::eval_neutral::{eval_neutral, eval_neutral_in};
 use super::row::Row;
 use crate::index::{IndexDelta, IndexState, OnlineDuringBuild};
 use crate::plan::ViolationMode;
@@ -610,6 +610,7 @@ impl From<super::eval::EvalError> for ExecutionError {
     fn from(e: super::eval::EvalError) -> Self {
         match e {
             super::eval::EvalError::VectorDomain(e) => Self::VectorDomain(e),
+            super::eval::EvalError::Budget(stop) => Self::Budget(stop),
             other => Self::Arithmetic(other),
         }
     }
@@ -2219,6 +2220,30 @@ impl<'a> ExecutionContext<'a> {
 
     /// The current schema of `label`, read once per statement in its
     /// transaction; `None` for a label without a definition.
+    /// The definitions this statement has read, for comparisons of document
+    /// properties to follow, charged to its budget.
+    fn declared(&self) -> super::members::Declared<'_> {
+        super::members::Declared::new(&self.label_schema_cache, &self.budget)
+    }
+
+    /// Read the definition of the type of every node `row` binds under one
+    /// of `variables`, once per type: a comparison of a document property
+    /// of such a node follows what its type declares.
+    fn load_compared_definitions(
+        &mut self,
+        variables: &[String],
+        row: &Row,
+    ) -> Result<(), ExecutionError> {
+        for variable in variables {
+            if let Some(Value::String(label)) = super::row::property(row, variable, "__label__")
+                && !self.label_schema_cache.contains_key(label.as_str())
+            {
+                self.shared_label_schema(label)?;
+            }
+        }
+        Ok(())
+    }
+
     fn cached_label_schema(&mut self, label: &str) -> Result<Option<&LabelSchema>, ExecutionError> {
         Ok(self.shared_label_schema(label)?.map(|s| &**s))
     }
@@ -6417,11 +6442,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             let corr = ctx.correlated_row.clone();
             // The kept rows move over; only the list holding them is new.
             ctx.hold((rows.len() * core::mem::size_of::<Row>()) as u64)?;
+            let compared = super::members::compared_variables(predicate);
             if neutral_contains_subplan(predicate) {
                 // Storage-aware path: correlated subplans need edge lookups.
                 let mut result = Vec::new();
                 for row in rows {
                     ctx.budget.work(1)?;
+                    ctx.load_compared_definitions(&compared, &row)?;
                     let effective_row = if let Some(ref outer) = corr {
                         let mut merged = outer.clone();
                         merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -6441,15 +6468,17 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 let mut kept = Vec::with_capacity(rows.len());
                 for row in rows {
                     ctx.budget.work(1)?;
+                    ctx.load_compared_definitions(&compared, &row)?;
+                    let declared = ctx.declared();
                     let keep = if let Some(ref outer) = corr {
                         // Correlated OPTIONAL MATCH: merge outer-scope variables
                         // so predicates like `c.age > a.age` can resolve `a`.
                         // Current row takes precedence over outer scope.
                         let mut merged = outer.clone();
                         merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
-                        is_truthy(&eval_neutral(predicate, &merged)?)
+                        is_truthy(&eval_neutral_in(predicate, &merged, &declared)?)
                     } else {
-                        is_truthy(&eval_neutral(predicate, &row)?)
+                        is_truthy(&eval_neutral_in(predicate, &row, &declared)?)
                     };
                     if keep {
                         kept.push(row);
@@ -6525,8 +6554,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // `&mut ctx`-borrowing path and propagate errors with `?`.
             ctx.hold((rows.len() * core::mem::size_of::<Row>()) as u64)?;
             let mut result: Vec<Row> = Vec::with_capacity(rows.len());
+            let compared: Vec<String> = items
+                .iter()
+                .flat_map(|item| super::members::compared_variables(&item.expr))
+                .collect();
             for row in rows {
                 ctx.budget.work(1)?;
+                ctx.load_compared_definitions(&compared, &row)?;
                 let mut out = Row::new();
                 for item in items {
                     if item.expr == crate::plan::expr::Expr::Star {
@@ -6552,7 +6586,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                             None if neutral_contains_subplan(&item.expr) => {
                                 eval_neutral_with_storage(&item.expr, &row, ctx)?
                             }
-                            None => eval_neutral(&item.expr, &row)?,
+                            None => eval_neutral_in(&item.expr, &row, &ctx.declared())?,
                         };
                         let key = item
                             .alias
@@ -8978,6 +9012,8 @@ struct NodeRowEnv<'e> {
     valid_now: i64,
     correlated_row: Option<&'e Row>,
     columns: Option<&'e crate::executor::columns::NodeColumns>,
+    /// What the document properties of the scanned types declare.
+    declared: super::members::Declared<'e>,
 }
 
 impl<'e> NodeRowEnv<'e> {
@@ -8989,6 +9025,7 @@ impl<'e> NodeRowEnv<'e> {
             valid_now: ctx.valid_now,
             correlated_row: ctx.correlated_row.as_ref(),
             columns: ctx.node_columns.as_ref(),
+            declared: ctx.declared(),
         }
     }
 
@@ -9166,6 +9203,7 @@ fn build_node_row(
             &mut extended,
             &mut copies,
             charge,
+            &env.declared,
         );
         charge.shrink(lookups);
         match judged {
@@ -9209,13 +9247,12 @@ fn judge_filter(
     extended: &mut Option<Row>,
     copies: &mut u64,
     charge: &mut coordinode_core::budget::MemoryCharge<'_>,
+    declared: &super::members::Declared<'_>,
 ) -> Result<bool, ExecutionError> {
     use crate::executor::row::row_held_bytes;
     let actual = super::row::property(row, variable, prop_name).unwrap_or(&Value::Null);
     if let Some(expected) = named_value(filter_expr, row, outer) {
-        return Ok(super::members::holds(
-            row, variable, prop_name, actual, expected,
-        ));
+        return Ok(declared.holds(row, variable, prop_name, actual, expected)?);
     }
     let eval_row = match outer {
         None => row,
@@ -9231,10 +9268,8 @@ fn judge_filter(
             extended.as_ref().unwrap_or(row)
         }
     };
-    let expected = eval_neutral(filter_expr, eval_row)?;
-    Ok(super::members::holds(
-        row, variable, prop_name, actual, &expected,
-    ))
+    let expected = eval_neutral_in(filter_expr, eval_row, declared)?;
+    Ok(declared.holds(row, variable, prop_name, actual, &expected)?)
 }
 
 /// The value a filter expression names without being evaluated, resolved in
@@ -15507,12 +15542,15 @@ fn eval_neutral_with_storage(
                 _ => {}
             }
             let rv = eval_neutral_with_storage(right, row, ctx)?;
-            match super::eval_neutral::equality_under_declaration(left, *op, right, &lv, &rv, row) {
+            let declared = ctx.declared();
+            match super::eval_neutral::equality_under_declaration(
+                left, *op, right, &lv, &rv, row, &declared,
+            )? {
                 Some(value) => Ok(value),
                 None => Ok(eval_binary_op(&lv, *op, &rv)?),
             }
         }
-        other => Ok(eval_neutral(other, row)?),
+        other => Ok(eval_neutral_in(other, row, &ctx.declared())?),
     }
 }
 
@@ -16977,6 +17015,12 @@ fn execute_update(
                                 &mut new_record,
                                 &[delta],
                             );
+                            check_members_kept(
+                                label_schema.as_ref(),
+                                path,
+                                &new_record,
+                                ctx.interner,
+                            )?;
                             ctx.write_stats.properties_set += 1;
                             // Surface the leaf path in out_row for RETURN.
                             let path_str = path.join(".");
@@ -17051,6 +17095,12 @@ fn execute_update(
                                 &mut new_record,
                                 &[delta],
                             );
+                            check_members_kept(
+                                label_schema.as_ref(),
+                                full_path,
+                                &new_record,
+                                ctx.interner,
+                            )?;
                             ctx.write_stats.properties_set += 1;
                         }
                     }
@@ -17469,6 +17519,7 @@ fn execute_update(
                         path: sub_path,
                         value: val.to_rmpv(),
                     };
+                    check_delta_keeps_members(ctx, node_id, label_schema.as_ref(), path, &delta)?;
                     let operand = delta.encode().map_err(|e| {
                         ExecutionError::Serialization(format!("DocDelta encode: {e}"))
                     })?;
@@ -17566,6 +17617,13 @@ fn execute_update(
                         }
                     };
 
+                    check_delta_keeps_members(
+                        ctx,
+                        node_id,
+                        label_schema.as_ref(),
+                        full_path,
+                        &delta,
+                    )?;
                     let operand = delta.encode().map_err(|e| {
                         ExecutionError::Serialization(format!("DocDelta encode: {e}"))
                     })?;
@@ -18090,10 +18148,6 @@ fn execute_remove(
                             }
                             if path.len() == 1 {
                                 remove_node_property(&mut new_record, &path[0], ctx.interner);
-                            } else if let Err(refused) =
-                                refuse_write_below_members(remove_label_schema.as_ref(), path)
-                            {
-                                return Err(refused);
                             } else if let Some((target, sub_path)) =
                                 removal_target(remove_label_schema.as_ref(), path, ctx.interner)
                             {
@@ -18108,6 +18162,12 @@ fn execute_remove(
                                     &mut new_record,
                                     &[delta],
                                 );
+                                check_members_kept(
+                                    remove_label_schema.as_ref(),
+                                    path,
+                                    &new_record,
+                                    ctx.interner,
+                                )?;
                             }
                             ctx.write_stats.properties_removed += 1;
                         }
@@ -18217,9 +18277,6 @@ fn execute_remove(
                         Some(label) => ctx.load_current_label_schema(&label)?,
                         None => None,
                     };
-                    if path.len() > 1 {
-                        refuse_write_below_members(label_schema.as_ref(), path)?;
-                    }
                     if let Some((target, sub_path)) =
                         removal_target(label_schema.as_ref(), path, ctx.interner)
                     {
@@ -18227,6 +18284,15 @@ fn execute_remove(
                             target,
                             path: sub_path,
                         };
+                        if path.len() > 1 {
+                            check_delta_keeps_members(
+                                ctx,
+                                node_id,
+                                label_schema.as_ref(),
+                                path,
+                                &delta,
+                            )?;
+                        }
                         let operand = delta.encode().map_err(|e| {
                             ExecutionError::Serialization(format!("DocDelta encode: {e}"))
                         })?;
@@ -20137,13 +20203,28 @@ fn execute_detach_document(
             )));
         };
 
-        // A document taken from below a property is a write below it.
+        // A document taken from below a property changes what stays: the
+        // lists the property declares as unordered members are judged as
+        // the removal leaves them.
         if property_path.len() > 1
             && let Some(Value::String(primary)) =
                 input_row.get(&format!("{source_variable}.__label__"))
         {
             let schema = ctx.load_current_label_schema(primary)?;
-            refuse_write_below_members(schema.as_ref(), property_path)?;
+            if members_touched(schema.as_ref(), property_path).is_some()
+                && let Some((target, sub_path)) =
+                    removal_target(schema.as_ref(), property_path, ctx.interner)
+            {
+                let mut after = record.clone();
+                coordinode_storage::engine::merge::apply_doc_deltas_to_record(
+                    &mut after,
+                    &[coordinode_core::graph::doc_delta::DocDelta::DeletePath {
+                        target,
+                        path: sub_path,
+                    }],
+                );
+                check_members_kept(schema.as_ref(), property_path, &after, ctx.interner)?;
+            }
         }
 
         // 2. Resolve the property value at `property_path`.
@@ -20779,18 +20860,23 @@ fn execute_attach_document(
 
         // --- 3. Package source properties as a DOCUMENT ---
         let doc = source_record_to_document(&source_record, ctx.interner);
-        // A property declaring unordered members takes the document whole,
-        // checked against them, and no write below it.
+        // The lists the target property declares as unordered members are
+        // judged as the attached document leaves them.
         if let Some(Value::String(primary)) = input_row.get(&format!("{target_variable}.__label__"))
             && let Some(schema) = ctx.load_current_label_schema(primary)?
-            && let Some(def) = schema.get_property(&target_property_path[0])
-            && !def.unordered.is_empty()
+            && members_touched(Some(&schema), target_property_path).is_some()
         {
-            if target_property_path.len() > 1 {
-                refuse_write_below_members(Some(&schema), target_property_path)?;
-            }
-            validate_one(&target_property_path[0], &Value::Document(doc.clone()), def)
-                .map_err(schema_refusal)?;
+            let (target, sub_path) = document_target(Some(&schema), target_property_path, ctx)?;
+            let mut after = target_record.clone();
+            coordinode_storage::engine::merge::apply_doc_deltas_to_record(
+                &mut after,
+                &[coordinode_core::graph::doc_delta::DocDelta::SetPath {
+                    target,
+                    path: sub_path,
+                    value: doc.clone(),
+                }],
+            );
+            check_members_kept(Some(&schema), target_property_path, &after, ctx.interner)?;
         }
 
         // Write the document at `target_property_path` on the target.
@@ -21107,25 +21193,84 @@ fn remove_node_property(
     record.remove_extra(name).or(by_id)
 }
 
-/// Refuse a write below property `path[0]` of a node under `schema` when the
-/// property declares unordered members. Such a write is applied without
-/// reading the document it changes, so it cannot tell whether it would leave
-/// a list holding one member twice; the property is written whole instead.
-fn refuse_write_below_members(
+/// The definition of property `path[0]` under `schema` when a write at
+/// `path` can change a list the property declares as unordered members:
+/// the write names the list, something inside one of its members, or
+/// something the list lies inside. `None` for a write proved to leave every
+/// declared list as it is, which is then applied without reading the
+/// document.
+///
+/// A numeric field of the path may index a list or name a field of a map;
+/// the write is taken as touching a declared list under either reading.
+fn members_touched<'s>(
+    schema: Option<&'s LabelSchema>,
+    path: &[String],
+) -> Option<&'s coordinode_core::schema::definition::PropertyDef> {
+    let def = schema?.get_property(path.first()?)?;
+    let below = &path[1..];
+    // The path as a declaration reads it when its numeric fields index
+    // lists: a list on the way stands for its elements.
+    let through_lists: Vec<&String> = below
+        .iter()
+        .filter(|field| field.parse::<u64>().is_err())
+        .collect();
+    let overlaps = |declared: &[String], written: &mut dyn Iterator<Item = &String>| {
+        declared.iter().zip(written).all(|(a, b)| a == b)
+    };
+    def.unordered
+        .iter()
+        .any(|declared| {
+            overlaps(declared, &mut below.iter())
+                || overlaps(declared, &mut through_lists.iter().copied())
+        })
+        .then_some(def)
+}
+
+/// Refuse `record`, the state a write at `path` leaves its node in, when
+/// the write can change a list its property declares as unordered members
+/// and the list now holds one member twice. The other members of the list
+/// are judged with the one written.
+fn check_members_kept(
     schema: Option<&LabelSchema>,
     path: &[String],
+    record: &NodeRecord,
+    interner: &FieldInterner,
 ) -> Result<(), ExecutionError> {
-    let declares = schema
-        .and_then(|s| s.get_property(&path[0]))
-        .is_some_and(|def| !def.unordered.is_empty());
-    if declares {
-        return Err(ExecutionError::Unsupported(format!(
-            "property `{}` declares unordered members: a write below it is not checked \
-             against them; set the whole property",
-            path[0]
-        )));
+    let Some(def) = members_touched(schema, path) else {
+        return Ok(());
+    };
+    match crate::index::registry::record_lookup(record, interner)(&path[0]) {
+        Some(value) => validate_members(&path[0], &value, def).map_err(schema_refusal),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Refuse `delta`, a write at `path` of node `node_id` about to be staged
+/// without reading the document, when it can change a list the property
+/// declares as unordered members and would leave one holding a member
+/// twice. Such a write is judged against the node as this transaction
+/// leaves it, its own earlier changes included, read through the
+/// transaction: a concurrent change of the node then refuses the commit, so
+/// two writes each valid alone cannot land a repeated member together. A
+/// write that touches no declared list reads nothing.
+fn check_delta_keeps_members(
+    ctx: &mut ExecutionContext<'_>,
+    node_id: NodeId,
+    schema: Option<&LabelSchema>,
+    path: &[String],
+    delta: &coordinode_core::graph::doc_delta::DocDelta,
+) -> Result<(), ExecutionError> {
+    if members_touched(schema, path).is_none() {
+        return Ok(());
+    }
+    let Some(mut after) = ctx.mvcc_node_post_state(ctx.shard_id, node_id)? else {
+        return Ok(());
+    };
+    coordinode_storage::engine::merge::apply_doc_deltas_to_record(
+        &mut after,
+        core::slice::from_ref(delta),
+    );
+    check_members_kept(schema, path, &after, ctx.interner)
 }
 
 /// The merge target and in-target path of property path `path` of a node
@@ -21137,7 +21282,6 @@ fn document_target(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(coordinode_core::graph::doc_delta::PathTarget, Vec<String>), ExecutionError> {
     use coordinode_core::graph::doc_delta::PathTarget;
-    refuse_write_below_members(schema, path)?;
     if stored_by_name(schema, &path[0]) {
         Ok((PathTarget::Extra, path.to_vec()))
     } else {
@@ -21884,9 +22028,6 @@ fn inject_computed_from_schema(row: &mut Row, variable: &str, schema: &LabelSche
         let val = evaluate_computed_spec(spec, variable, row, now_us);
         row.insert(crate::executor::row::column_name(variable, prop_name), val);
     }
-    // What the type declares of its documents travels with the row, for a
-    // comparison of one of them to read.
-    super::members::insert_members_column(row, variable, schema);
 }
 
 /// What [`inject_computed_from_schema`] adds to a row under `variable`, known
@@ -21895,7 +22036,7 @@ fn inject_computed_from_schema(row: &mut Row, variable: &str, schema: &LabelSche
 /// counted too.
 fn computed_columns_bytes(variable: &str, schema: &LabelSchema) -> u64 {
     use coordinode_core::schema::definition::PropertyType;
-    let computed: u64 = schema
+    schema
         .properties
         .iter()
         .filter_map(|(name, def)| match &def.property_type {
@@ -21907,8 +22048,7 @@ fn computed_columns_bytes(variable: &str, schema: &LabelSchema) -> u64 {
                 + core::mem::size_of::<Value>() as u64
                 + crate::executor::row::column_lookup_bytes(variable, spec.anchor_field())
         })
-        .sum();
-    computed + super::members::members_column_bytes(variable, schema)
+        .sum()
 }
 
 /// Evaluate a single ComputedSpec to produce a Value.

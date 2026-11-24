@@ -16,6 +16,7 @@ use coordinode_core::graph::types::Value;
 use super::eval::{
     EvalError, dispatch_scalar_function, eval_binary_op, eval_unary_op, rmpv_to_value,
 };
+use super::members::Declared;
 use super::row::Row;
 use crate::plan::expr::{BinOp, Expr, MapProjItem, Quantifier, StrOp};
 
@@ -30,14 +31,16 @@ pub(crate) fn equality_under_declaration(
     left_value: &Value,
     right_value: &Value,
     row: &Row,
-) -> Option<Value> {
+    env: &Declared<'_>,
+) -> Result<Option<Value>, EvalError> {
     let negated = match op {
         BinOp::Eq => false,
         BinOp::Neq => true,
-        _ => return None,
+        _ => return Ok(None),
     };
-    super::members::declared_equality(left, right, left_value, right_value, row)
-        .map(|same| Value::Bool(same != negated))
+    Ok(env
+        .equality(left, right, left_value, right_value, row)?
+        .map(|same| Value::Bool(same != negated)))
 }
 
 /// Evaluate a neutral expression against a row (pure, no storage access).
@@ -46,28 +49,34 @@ pub(crate) fn equality_under_declaration(
 /// reaches it via lowering at the boundary, and once the plan carries neutral
 /// expressions this becomes the sole pure evaluator.
 pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
+    eval_neutral_in(expr, row, &Declared::none())
+}
+
+/// [`eval_neutral`] under the definitions `env` holds: a comparison of a
+/// document property follows what the property declares.
+pub fn eval_neutral_in(expr: &Expr, row: &Row, env: &Declared<'_>) -> Result<Value, EvalError> {
     Ok(match expr {
         Expr::Literal(v) => v.clone(),
         // Parameters are substituted before execution; unresolved → Null.
         Expr::Parameter(_) => Value::Null,
         Expr::Variable(name) => row.get(name).cloned().unwrap_or(Value::Null),
-        Expr::Property { base, key } => eval_property(base, key, row)?,
+        Expr::Property { base, key } => eval_property(base, key, row, env)?,
         Expr::Binary { left, op, right } => {
-            let lv = eval_neutral(left, row)?;
-            let rv = eval_neutral(right, row)?;
-            match equality_under_declaration(left, *op, right, &lv, &rv, row) {
+            let lv = eval_neutral_in(left, row, env)?;
+            let rv = eval_neutral_in(right, row, env)?;
+            match equality_under_declaration(left, *op, right, &lv, &rv, row, env)? {
                 Some(value) => value,
                 None => eval_binary_op(&lv, *op, &rv)?,
             }
         }
         Expr::Unary { op, operand } => {
-            let v = eval_neutral(operand, row)?;
+            let v = eval_neutral_in(operand, row, env)?;
             eval_unary_op(*op, &v)
         }
         Expr::Call { name, args, .. } => {
             let evaluated: Vec<Value> = args
                 .iter()
-                .map(|a| eval_neutral(a, row))
+                .map(|a| eval_neutral_in(a, row, env))
                 .collect::<Result<_, _>>()?;
             let first_arg_var = args.first().and_then(|a| match a {
                 Expr::Variable(v) => Some(v.as_str()),
@@ -78,13 +87,13 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
         Expr::List(items) => Value::Array(
             items
                 .iter()
-                .map(|e| eval_neutral(e, row))
+                .map(|e| eval_neutral_in(e, row, env))
                 .collect::<Result<_, _>>()?,
         ),
         Expr::Map(entries) => {
             let mut map = std::collections::BTreeMap::new();
             for (k, v) in entries {
-                map.insert(k.clone(), eval_neutral(v, row)?);
+                map.insert(k.clone(), eval_neutral_in(v, row, env)?);
             }
             Value::Map(map)
         }
@@ -93,18 +102,18 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
             for item in items {
                 match item {
                     MapProjItem::Property(prop) => {
-                        map.insert(prop.clone(), eval_property(base, prop, row)?);
+                        map.insert(prop.clone(), eval_property(base, prop, row, env)?);
                     }
                     MapProjItem::Computed(alias, value_expr) => {
-                        map.insert(alias.clone(), eval_neutral(value_expr, row)?);
+                        map.insert(alias.clone(), eval_neutral_in(value_expr, row, env)?);
                     }
                 }
             }
             Value::Map(map)
         }
         Expr::In { item, list } => {
-            let val = eval_neutral(item, row)?;
-            let list_val = eval_neutral(list, row)?;
+            let val = eval_neutral_in(item, row, env)?;
+            let list_val = eval_neutral_in(list, row, env)?;
             if let Value::Array(items) = list_val {
                 Value::Bool(items.contains(&val))
             } else {
@@ -112,7 +121,7 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
             }
         }
         Expr::IsNull { operand, negated } => {
-            let v = eval_neutral(operand, row)?;
+            let v = eval_neutral_in(operand, row, env)?;
             let is_null = v.is_null();
             Value::Bool(if *negated { !is_null } else { is_null })
         }
@@ -121,7 +130,7 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
             type_name,
             negated,
         } => {
-            let v = eval_neutral(operand, row)?;
+            let v = eval_neutral_in(operand, row, env)?;
             let matches = match type_name.to_ascii_uppercase().as_str() {
                 "INTEGER" | "INT" => matches!(v, Value::Int(_)),
                 "FLOAT" => matches!(v, Value::Float(_)),
@@ -136,8 +145,8 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
             Value::Bool(matches ^ *negated)
         }
         Expr::StringMatch { value, op, pattern } => {
-            let s = eval_neutral(value, row)?;
-            let p = eval_neutral(pattern, row)?;
+            let s = eval_neutral_in(value, row, env)?;
+            let p = eval_neutral_in(pattern, row, env)?;
             match (s.as_str(), p.as_str()) {
                 (Some(s), Some(p)) => {
                     let result = match op {
@@ -159,27 +168,27 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
             otherwise,
         } => {
             if let Some(op) = operand {
-                let op_val = eval_neutral(op, row)?;
+                let op_val = eval_neutral_in(op, row, env)?;
                 for (when, then) in branches {
-                    if op_val == eval_neutral(when, row)? {
-                        return eval_neutral(then, row);
+                    if op_val == eval_neutral_in(when, row, env)? {
+                        return eval_neutral_in(then, row, env);
                     }
                 }
             } else {
                 for (when, then) in branches {
-                    if eval_neutral(when, row)? == Value::Bool(true) {
-                        return eval_neutral(then, row);
+                    if eval_neutral_in(when, row, env)? == Value::Bool(true) {
+                        return eval_neutral_in(then, row, env);
                     }
                 }
             }
             match otherwise {
-                Some(el) => eval_neutral(el, row)?,
+                Some(el) => eval_neutral_in(el, row, env)?,
                 None => Value::Null,
             }
         }
         Expr::Subscript { base, index } => {
-            let b = eval_neutral(base, row)?;
-            let idx = eval_neutral(index, row)?;
+            let b = eval_neutral_in(base, row, env)?;
+            let idx = eval_neutral_in(index, row, env)?;
             match (b, idx) {
                 (Value::Array(arr), Value::Int(i)) => {
                     let len = arr.len() as i64;
@@ -196,12 +205,12 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
                 _ => Value::Null,
             }
         }
-        Expr::Slice { base, start, end } => match eval_neutral(base, row)? {
+        Expr::Slice { base, start, end } => match eval_neutral_in(base, row, env)? {
             Value::Array(arr) => {
                 let len = arr.len() as i64;
                 let resolve = |bound: &Option<Box<Expr>>, default: i64| -> Result<i64, EvalError> {
                     Ok(match bound {
-                        Some(e) => match eval_neutral(e, row)? {
+                        Some(e) => match eval_neutral_in(e, row, env)? {
                             Value::Int(i) => {
                                 let idx = if i < 0 { len + i } else { i };
                                 idx.clamp(0, len)
@@ -226,19 +235,19 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
             list,
             filter,
             map,
-        } => match eval_neutral(list, row)? {
+        } => match eval_neutral_in(list, row, env)? {
             Value::Array(items) => {
                 let mut scratch = row.clone();
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
                     scratch.insert(var.clone(), item.clone());
                     let keep = match filter {
-                        Some(p) => matches!(eval_neutral(p, &scratch)?, Value::Bool(true)),
+                        Some(p) => matches!(eval_neutral_in(p, &scratch, env)?, Value::Bool(true)),
                         None => true,
                     };
                     if keep {
                         out.push(match map {
-                            Some(m) => eval_neutral(m, &scratch)?,
+                            Some(m) => eval_neutral_in(m, &scratch, env)?,
                             None => item,
                         });
                     }
@@ -252,14 +261,17 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
             var,
             list,
             predicate,
-        } => match eval_neutral(list, row)? {
+        } => match eval_neutral_in(list, row, env)? {
             Value::Array(items) => {
                 let total = items.len();
                 let mut scratch = row.clone();
                 let mut true_count = 0usize;
                 for item in items {
                     scratch.insert(var.clone(), item);
-                    if matches!(eval_neutral(predicate, &scratch)?, Value::Bool(true)) {
+                    if matches!(
+                        eval_neutral_in(predicate, &scratch, env)?,
+                        Value::Bool(true)
+                    ) {
                         true_count += 1;
                     }
                 }
@@ -280,14 +292,14 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
             list,
             step,
         } => {
-            let mut acc_val = eval_neutral(init, row)?;
-            match eval_neutral(list, row)? {
+            let mut acc_val = eval_neutral_in(init, row, env)?;
+            match eval_neutral_in(list, row, env)? {
                 Value::Array(items) => {
                     let mut scratch = row.clone();
                     for item in items {
                         scratch.insert(acc.clone(), acc_val);
                         scratch.insert(var.clone(), item);
-                        acc_val = eval_neutral(step, &scratch)?;
+                        acc_val = eval_neutral_in(step, &scratch, env)?;
                     }
                     acc_val
                 }
@@ -308,7 +320,12 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
 /// Property access `base.key`, mirroring the cypher evaluator: collect the full
 /// dot-notation path and try progressively-longer row-key prefixes, extracting
 /// from a Document/Map for any remaining path.
-fn eval_property(base: &Expr, key: &str, row: &Row) -> Result<Value, EvalError> {
+fn eval_property(
+    base: &Expr,
+    key: &str,
+    row: &Row,
+    env: &Declared<'_>,
+) -> Result<Value, EvalError> {
     // `var.key`, the common read, without building the path: the column
     // `var.key` itself, or a map or document bound to `var` holding `key`.
     if let Expr::Variable(var_name) = base {
@@ -355,7 +372,7 @@ fn eval_property(base: &Expr, key: &str, row: &Row) -> Result<Value, EvalError> 
         Ok(Value::Null)
     } else {
         // Non-variable base (function result, etc.): evaluate then index.
-        Ok(match eval_neutral(base, row)? {
+        Ok(match eval_neutral_in(base, row, env)? {
             Value::Map(map) => map.get(key).cloned().unwrap_or(Value::Null),
             Value::Document(ref doc) => {
                 let extracted = coordinode_core::graph::document::extract_at_path(doc, &[key]);

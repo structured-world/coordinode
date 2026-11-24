@@ -2,54 +2,178 @@
 //! declared as unordered members is the same as another holding the same
 //! members in any order.
 //!
-//! A node's row carries what its type declares in one hidden column, so the
-//! comparison of `n.body = $value` reads the declaration of the property it
-//! names without reaching for the catalog: both operands are then compared
-//! under it.
+//! The declaration is read where it lives, in the definition of the node's
+//! type as the statement's snapshot holds it. A row names only the type of
+//! each node it binds, so rows of different types, a node bound under
+//! another name, and one parameter compared with properties of different
+//! types each resolve their own declaration, and no row carries a copy.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
 
+use coordinode_core::budget::{BudgetStop, QueryBudget};
 use coordinode_core::graph::types::Value;
 use coordinode_core::schema::definition::LabelSchema;
 
-use super::row::{Row, column_entry_bytes, column_name, property};
+use super::row::{Row, property};
 use crate::plan::expr::Expr;
 
-/// The hidden column of a node's row holding the unordered lists its type
-/// declares: a map from property to its paths, each a list of field names.
-pub(crate) const MEMBERS_COLUMN: &str = "__members__";
-
-/// What `schema` declares, as the hidden column holds it; `None` when it
-/// declares no unordered members, and the row then carries no column.
-fn declared(schema: &LabelSchema) -> Option<Value> {
-    let by_property: BTreeMap<String, Value> = schema
-        .properties
-        .iter()
-        .filter(|(_, def)| !def.unordered.is_empty())
-        .map(|(name, def)| {
-            let paths = def
-                .unordered
-                .iter()
-                .map(|path| Value::Array(path.iter().cloned().map(Value::String).collect()))
-                .collect();
-            (name.clone(), Value::Array(paths))
-        })
-        .collect();
-    (!by_property.is_empty()).then_some(Value::Map(by_property))
+/// The definitions a statement compares document properties under, and the
+/// budget the copies a comparison sorts are charged to.
+#[derive(Clone, Copy)]
+pub struct Declared<'e> {
+    /// The definitions the statement has read, by label name.
+    schemas: Option<&'e HashMap<String, Option<Arc<LabelSchema>>>>,
+    budget: Option<&'e QueryBudget>,
 }
 
-/// Put what `schema` declares into `row` under `variable`.
-pub(crate) fn insert_members_column(row: &mut Row, variable: &str, schema: &LabelSchema) {
-    if let Some(declared) = declared(schema) {
-        row.insert(column_name(variable, MEMBERS_COLUMN), declared);
+impl<'e> Declared<'e> {
+    /// No definitions: every document compares as one that declares
+    /// nothing.
+    pub const fn none() -> Self {
+        Self {
+            schemas: None,
+            budget: None,
+        }
+    }
+
+    /// The definitions in `schemas`, with comparisons charged to `budget`.
+    pub fn new(
+        schemas: &'e HashMap<String, Option<Arc<LabelSchema>>>,
+        budget: &'e QueryBudget,
+    ) -> Self {
+        Self {
+            schemas: Some(schemas),
+            budget: Some(budget),
+        }
+    }
+
+    /// The unordered lists declared at or below `fields` of the node bound
+    /// to `variable`, the property first, each path cut to start there;
+    /// empty when its type declares none.
+    fn below(&self, row: &Row, variable: &str, fields: &[&str]) -> Vec<&'e [String]> {
+        let Some(Value::String(label)) = property(row, variable, "__label__") else {
+            return Vec::new();
+        };
+        let Some(def) = self
+            .schemas
+            .and_then(|schemas| schemas.get(label.as_str()))
+            .and_then(Option::as_ref)
+            .and_then(|schema| schema.get_property(fields[0]))
+        else {
+            return Vec::new();
+        };
+        let above = &fields[1..];
+        def.unordered
+            .iter()
+            .filter(|path| {
+                path.len() >= above.len()
+                    && path.iter().zip(above).all(|(field, read)| field == read)
+            })
+            .map(|path| &path[above.len()..])
+            .collect()
+    }
+
+    /// Compare under `sets`, the copies the comparison may sort charged to
+    /// the statement while it runs: at most both values, twice over.
+    fn compare(&self, a: &Value, b: &Value, sets: &[&[String]]) -> Result<bool, BudgetStop> {
+        let mut held = self.budget.map(QueryBudget::empty_charge);
+        if let Some(held) = &mut held {
+            held.grow(2 * (a.held_bytes() + b.held_bytes()))?;
+        }
+        Ok(a.same_value_under(b, sets))
+    }
+
+    /// Whether the values `left` and `right` evaluated to are the same
+    /// value, when one of the expressions reads a property that declares
+    /// unordered members at or below what it reads: both values are then
+    /// compared under that declaration. `None` when neither does, and the
+    /// comparison is the ordinary one.
+    ///
+    /// # Errors
+    ///
+    /// The statement's budget does not cover the comparison.
+    pub(crate) fn equality(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        left_value: &Value,
+        right_value: &Value,
+        row: &Row,
+    ) -> Result<Option<bool>, BudgetStop> {
+        if self.schemas.is_none() || !(structured(left_value) && structured(right_value)) {
+            return Ok(None);
+        }
+        for side in [left, right] {
+            let Some((variable, fields)) = property_chain(side) else {
+                continue;
+            };
+            let sets = self.below(row, variable, &fields);
+            if !sets.is_empty() {
+                return self.compare(left_value, right_value, &sets).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether property `name` of `variable` in `row` holds `expected`,
+    /// under what the property declares: what an inline `{name: value}`
+    /// asks.
+    ///
+    /// # Errors
+    ///
+    /// The statement's budget does not cover the comparison.
+    pub(crate) fn holds(
+        &self,
+        row: &Row,
+        variable: &str,
+        name: &str,
+        actual: &Value,
+        expected: &Value,
+    ) -> Result<bool, BudgetStop> {
+        if !(structured(actual) && structured(expected)) {
+            return Ok(actual == expected);
+        }
+        let sets = self.below(row, variable, &[name]);
+        if sets.is_empty() {
+            return Ok(actual.same_value(expected));
+        }
+        self.compare(actual, expected, &sets)
     }
 }
 
-/// What [`insert_members_column`] adds to a row, known before it is added.
-pub(crate) fn members_column_bytes(variable: &str, schema: &LabelSchema) -> u64 {
-    declared(schema).map_or(0, |declared| {
-        column_entry_bytes(variable, MEMBERS_COLUMN) + declared.held_bytes()
-    })
+/// The node variables whose document properties `expr` compares: the roots
+/// of the property reads standing on either side of an `=` or `<>`, at any
+/// depth outside its subqueries. A statement loads the definitions of their
+/// types before it evaluates `expr` over a row.
+pub(crate) fn compared_variables(expr: &Expr) -> Vec<String> {
+    use crate::plan::expr::{BinOp, ExprChild};
+    fn walk(expr: &mut Expr, out: &mut Vec<String>) {
+        if let Expr::Binary {
+            left,
+            op: BinOp::Eq | BinOp::Neq,
+            right,
+        } = &*expr
+        {
+            for side in [left, right] {
+                if let Some((variable, _)) = property_chain(side)
+                    && !out.iter().any(|known| known == variable)
+                {
+                    out.push(variable.to_string());
+                }
+            }
+        }
+        expr.for_each_child_mut(&mut |child| {
+            if let ExprChild::Expr(child) = child {
+                walk(child, out);
+            }
+        });
+    }
+    // The walk over children takes them mutably; it changes nothing.
+    let mut copy = expr.clone();
+    let mut out = Vec::new();
+    walk(&mut copy, &mut out);
+    out
 }
 
 /// The variable a property expression reads and the fields it names below
@@ -72,80 +196,7 @@ fn property_chain(expr: &Expr) -> Option<(&str, Vec<&str>)> {
     }
 }
 
-/// The unordered lists declared at or below `fields` of `variable`, the
-/// property first, each path starting there; empty when the property
-/// declares none.
-fn declared_below<'r>(row: &'r Row, variable: &str, fields: &[&str]) -> Vec<Vec<&'r str>> {
-    let Some(Value::Map(by_property)) = property(row, variable, MEMBERS_COLUMN) else {
-        return Vec::new();
-    };
-    let Some(Value::Array(paths)) = by_property.get(fields[0]) else {
-        return Vec::new();
-    };
-    paths
-        .iter()
-        .filter_map(|path| {
-            let Value::Array(path) = path else {
-                return None;
-            };
-            let path: Vec<&str> = path
-                .iter()
-                .filter_map(|field| match field {
-                    Value::String(field) => Some(field.as_str()),
-                    _ => None,
-                })
-                .collect();
-            let above = &fields[1..];
-            let reaches = path.len() >= above.len()
-                && path.iter().zip(above).all(|(field, read)| field == read);
-            reaches.then(|| path[above.len()..].to_vec())
-        })
-        .collect()
-}
-
 /// Whether `value` is a document or what one is made from.
 fn structured(value: &Value) -> bool {
     matches!(value, Value::Document(_) | Value::Map(_) | Value::Array(_))
-}
-
-/// Whether the values `left` and `right` evaluated to are the same value,
-/// when one of the expressions reads a property that declares unordered
-/// members at or below what it reads: both values are then compared under
-/// that declaration. `None` when neither does, and the comparison is the
-/// ordinary one.
-pub(crate) fn declared_equality(
-    left: &Expr,
-    right: &Expr,
-    left_value: &Value,
-    right_value: &Value,
-    row: &Row,
-) -> Option<bool> {
-    if !(structured(left_value) && structured(right_value)) {
-        return None;
-    }
-    [left, right].into_iter().find_map(|side| {
-        let (variable, fields) = property_chain(side)?;
-        let sets = declared_below(row, variable, &fields);
-        (!sets.is_empty()).then(|| {
-            let sets: Vec<&[&str]> = sets.iter().map(Vec::as_slice).collect();
-            left_value.same_value_under(right_value, &sets)
-        })
-    })
-}
-
-/// Whether property `name` of `variable` in `row` holds `expected`, under
-/// what the property declares: what an inline `{name: value}` asks.
-pub(crate) fn holds(
-    row: &Row,
-    variable: &str,
-    name: &str,
-    actual: &Value,
-    expected: &Value,
-) -> bool {
-    if !(structured(actual) && structured(expected)) {
-        return actual == expected;
-    }
-    let sets = declared_below(row, variable, &[name]);
-    let sets: Vec<&[&str]> = sets.iter().map(Vec::as_slice).collect();
-    actual.same_value_under(expected, &sets)
 }

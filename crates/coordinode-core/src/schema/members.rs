@@ -30,40 +30,40 @@ pub enum MemberError {
 
 /// The declared paths still leading somewhere below the value in hand, each
 /// cut down to what remains of it.
-type Remaining<'p, 's> = Vec<&'p [&'s str]>;
+type Remaining<'p, S> = Vec<&'p [S]>;
 
 /// Whether the value in hand is itself declared: a path ends at it.
-fn ends_here(paths: &[&[&str]]) -> bool {
+fn ends_here<S>(paths: &[&[S]]) -> bool {
     paths.iter().any(|p| p.is_empty())
 }
 
 /// The paths that go on below the value in hand.
-fn below<'p, 's>(paths: &[&'p [&'s str]]) -> Remaining<'p, 's> {
+fn below<'p, S>(paths: &[&'p [S]]) -> Remaining<'p, S> {
     paths.iter().copied().filter(|p| !p.is_empty()).collect()
 }
 
 /// The paths that go on through field `key`, without it.
-fn through<'p, 's>(paths: &[&'p [&'s str]], key: &Value) -> Remaining<'p, 's> {
+fn through<'p, S: AsRef<str>>(paths: &[&'p [S]], key: &Value) -> Remaining<'p, S> {
     let Some(key) = key.as_str() else {
         return Vec::new();
     };
     paths
         .iter()
         .filter_map(|p| match p.split_first() {
-            Some((first, rest)) if *first == key => Some(rest),
+            Some((first, rest)) if first.as_ref() == key => Some(rest),
             _ => None,
         })
         .collect()
 }
 
-/// The kinds of value, in the order values of different kinds sort in.
+/// The kinds of value, in the order values of different kinds sort in. Every
+/// number is one kind, whatever holds it: a number is the value it
+/// represents.
 fn rank(value: &Value) -> u8 {
     match value {
         Value::Nil => 0,
         Value::Boolean(_) => 1,
-        Value::Integer(_) => 2,
-        Value::F32(_) => 3,
-        Value::F64(_) => 4,
+        Value::Integer(_) | Value::F32(_) | Value::F64(_) => 2,
         Value::String(_) => 5,
         Value::Binary(_) => 6,
         Value::Array(_) => 7,
@@ -72,12 +72,61 @@ fn rank(value: &Value) -> u8 {
     }
 }
 
-/// Floats as `==` has them, but for a NaN, which is the value it is.
-fn float_order(a: f64, b: f64) -> Ordering {
-    if a == b {
-        Ordering::Equal
-    } else {
-        a.total_cmp(&b)
+/// A number as it is compared: an integer whole, a float as the binary
+/// value it holds.
+#[derive(Clone, Copy)]
+enum Number {
+    Integer(i128),
+    Float(f64),
+}
+
+fn number(value: &Value) -> Option<Number> {
+    match value {
+        Value::Integer(i) => i
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| i.as_u64().map(i128::from))
+            .map(Number::Integer),
+        Value::F32(f) => Some(Number::Float(f64::from(*f))),
+        Value::F64(f) => Some(Number::Float(*f)),
+        _ => None,
+    }
+}
+
+/// An integer against a float, by the values they represent and without
+/// rounding either: the float's whole part is compared as an integer, and
+/// its fraction decides between equal whole parts. An infinity lies beyond
+/// every integer, and a NaN after everything.
+fn integer_to_float(integer: i128, float: f64) -> Ordering {
+    // Every integer a document holds lies within these, which a float
+    // represents exactly.
+    const BELOW: f64 = -9_223_372_036_854_775_808.0;
+    const ABOVE: f64 = 18_446_744_073_709_551_616.0;
+    if float.is_nan() || float >= ABOVE {
+        return Ordering::Less;
+    }
+    if float < BELOW {
+        return Ordering::Greater;
+    }
+    let whole = float.trunc();
+    // Exact: `whole` is an integer within the range above.
+    integer.cmp(&(whole as i128)).then_with(|| {
+        let fraction = float - whole;
+        0.0_f64.partial_cmp(&fraction).unwrap_or(Ordering::Equal)
+    })
+}
+
+/// Numbers by the values they represent: `1` and `1.0` are one number, as
+/// are the two zeros; a NaN is the value it is and sorts after the rest.
+fn number_order(a: Number, b: Number) -> Ordering {
+    match (a, b) {
+        (Number::Integer(a), Number::Integer(b)) => a.cmp(&b),
+        (Number::Integer(a), Number::Float(b)) => integer_to_float(a, b),
+        (Number::Float(a), Number::Integer(b)) => integer_to_float(b, a).reverse(),
+        (Number::Float(a), Number::Float(b)) => match a.partial_cmp(&b) {
+            Some(order) => order,
+            None => a.is_nan().cmp(&b.is_nan()).then_with(|| a.total_cmp(&b)),
+        },
     }
 }
 
@@ -86,18 +135,11 @@ fn float_order(a: f64, b: f64) -> Ordering {
 /// exactly when it calls them equal, once their maps and declared lists
 /// stand in this order ([`canonical`]).
 fn order(a: &Value, b: &Value) -> Ordering {
+    if let (Some(a), Some(b)) = (number(a), number(b)) {
+        return number_order(a, b);
+    }
     match (a, b) {
         (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
-        (Value::Integer(a), Value::Integer(b)) => {
-            let wide = |i: &rmpv::Integer| {
-                i.as_i64()
-                    .map(i128::from)
-                    .or_else(|| i.as_u64().map(i128::from))
-            };
-            wide(a).cmp(&wide(b))
-        }
-        (Value::F32(a), Value::F32(b)) => float_order(f64::from(*a), f64::from(*b)),
-        (Value::F64(a), Value::F64(b)) => float_order(*a, *b),
         (Value::String(a), Value::String(b)) => a.as_bytes().cmp(b.as_bytes()),
         (Value::Binary(a), Value::Binary(b)) => a.cmp(b),
         (Value::Array(a), Value::Array(b)) => a
@@ -119,7 +161,7 @@ fn order(a: &Value, b: &Value) -> Ordering {
 
 /// `value` with every map's fields and every declared list's members in
 /// [`order`]: the one form all values that are the same value share.
-fn canonical(value: &Value, paths: &[&[&str]]) -> Value {
+fn canonical<S: AsRef<str>>(value: &Value, paths: &[&[S]]) -> Value {
     match value {
         Value::Map(fields) => {
             let mut fields: Vec<(Value, Value)> = fields
@@ -144,11 +186,11 @@ fn canonical(value: &Value, paths: &[&[&str]]) -> Value {
 /// Whether `a` and `b` are the same document under the unordered members
 /// `sets` declares: the fields of a map by name, the members of a declared
 /// list as a whole whatever their order, any other list by position.
-pub fn same_document(a: &Value, b: &Value, sets: &[&[&str]]) -> bool {
+pub fn same_document<S: AsRef<str>>(a: &Value, b: &Value, sets: &[&[S]]) -> bool {
     same(a, b, sets)
 }
 
-fn same(a: &Value, b: &Value, paths: &[&[&str]]) -> bool {
+fn same<S: AsRef<str>>(a: &Value, b: &Value, paths: &[&[S]]) -> bool {
     match (a, b) {
         (Value::Map(left), Value::Map(right)) => {
             left.len() == right.len() && same_fields(left, right, paths)
@@ -181,7 +223,11 @@ fn same(a: &Value, b: &Value, paths: &[&[&str]]) -> bool {
 /// Whether two maps of one length hold the same fields. Fields standing in
 /// the same order are compared in place; from the first that does not, both
 /// maps are read in the order of their names.
-fn same_fields(left: &[(Value, Value)], right: &[(Value, Value)], paths: &[&[&str]]) -> bool {
+fn same_fields<S: AsRef<str>>(
+    left: &[(Value, Value)],
+    right: &[(Value, Value)],
+    paths: &[&[S]],
+) -> bool {
     let pair = |(lk, lv): &(Value, Value), (rk, rv): &(Value, Value)| {
         order(lk, rk).is_eq() && same(lv, rv, &through(paths, lk))
     };
@@ -220,14 +266,14 @@ fn by_name(fields: &[(Value, Value)]) -> Vec<&(Value, Value)> {
 ///
 /// The first list found holding a member twice, or the first declared path
 /// holding something else than a list, with the path to it.
-pub fn check_members(value: &Value, sets: &[&[&str]]) -> Result<(), MemberError> {
+pub fn check_members<S: AsRef<str>>(value: &Value, sets: &[&[S]]) -> Result<(), MemberError> {
     let mut at = Vec::new();
     check(value, sets, &mut at)
 }
 
-fn check<'v>(
+fn check<'v, S: AsRef<str>>(
     value: &'v Value,
-    paths: &[&[&str]],
+    paths: &[&[S]],
     at: &mut Vec<&'v str>,
 ) -> Result<(), MemberError> {
     let inner = below(paths);

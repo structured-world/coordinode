@@ -154,6 +154,10 @@ pub enum EvalError {
     /// NaN would pass for an answer.
     #[error(transparent)]
     VectorDomain(#[from] VectorDomainError),
+
+    /// The statement's budget does not cover a comparison of documents.
+    #[error(transparent)]
+    Budget(#[from] coordinode_core::budget::BudgetStop),
 }
 
 /// `None` from a `checked_*` integer operation means the exact result does not

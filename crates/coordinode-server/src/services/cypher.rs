@@ -253,6 +253,10 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 vector_problem(domain),
             );
         }
+        // A spent budget is its own class, wherever it was met.
+        DatabaseError::Arithmetic(EvalError::Budget(stop)) => {
+            return db_error_to_status(DatabaseError::Budget(*stop));
+        }
         DatabaseError::Arithmetic(eval) => {
             let (reason, metadata) = match eval {
                 EvalError::DivideByZero => (Reason::DivideByZero, Vec::new()),
@@ -267,6 +271,10 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 ),
                 // Taken by the arm above.
                 EvalError::VectorDomain(domain) => (Reason::VectorDomain, vector_problem(domain)),
+                // Taken by the arm above too.
+                EvalError::Budget(stop) => {
+                    return db_error_to_status(DatabaseError::Budget(*stop));
+                }
             };
             return status_with_reason(Code::InvalidArgument, eval.to_string(), reason, metadata);
         }

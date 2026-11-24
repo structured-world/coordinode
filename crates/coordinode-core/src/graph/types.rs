@@ -497,13 +497,13 @@ impl Value {
     /// in whatever order either side holds them, a list by position. Every
     /// other pair compares as `==` does.
     pub fn same_value(&self, other: &Self) -> bool {
-        self.same_value_under(other, &[])
+        self.same_value_under::<&str>(other, &[])
     }
 
     /// [`Self::same_value`] for a document whose lists at `sets`, each a
     /// path of fields below it, hold unordered members: such a list is the
     /// same as another holding the same members in any order.
-    pub fn same_value_under(&self, other: &Self, sets: &[&[&str]]) -> bool {
+    pub fn same_value_under<S: AsRef<str>>(&self, other: &Self, sets: &[&[S]]) -> bool {
         use std::borrow::Cow;
         let document = |v: &Self| matches!(v, Self::Document(_));
         if !(document(self) || document(other) || !sets.is_empty()) {

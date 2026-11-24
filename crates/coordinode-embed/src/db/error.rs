@@ -938,6 +938,7 @@ impl From<ExecutionError> for DatabaseError {
                 reason,
             },
             E::Arithmetic(EvalError::VectorDomain(e)) | E::VectorDomain(e) => Self::VectorDomain(e),
+            E::Arithmetic(EvalError::Budget(stop)) => Self::Budget(stop),
             E::Arithmetic(eval) => Self::Arithmetic(eval),
             E::VectorRefused {
                 label,

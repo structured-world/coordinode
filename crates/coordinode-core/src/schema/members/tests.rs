@@ -30,6 +30,9 @@ fn member(node: u64, revision: u64, kind: &str, result: Option<i64>) -> Value {
 
 const OPS: &[&[&str]] = &[&["ops"]];
 
+/// Nothing declared.
+const NONE: &[&[&str]] = &[];
+
 /// The fields of a map compare by name with nothing declared: a map with
 /// its pairs reversed, at the top and one level down, is the same document.
 #[test]
@@ -42,14 +45,14 @@ fn named_fields_compare_in_any_order() {
         ("y", map(vec![("q", s("b")), ("p", s("a"))])),
         ("x", Value::from(1)),
     ]);
-    assert!(same_document(&a, &b, &[]));
+    assert!(same_document(&a, &b, NONE));
     let other = map(vec![
         ("y", map(vec![("q", s("b")), ("p", s("c"))])),
         ("x", Value::from(1)),
     ]);
-    assert!(!same_document(&a, &other, &[]), "another field value");
+    assert!(!same_document(&a, &other, NONE), "another field value");
     let fewer = map(vec![("x", Value::from(1))]);
-    assert!(!same_document(&a, &fewer, &[]), "a missing field");
+    assert!(!same_document(&a, &fewer, NONE), "a missing field");
 }
 
 /// A declared list is the same in any order of its members; the same list
@@ -63,7 +66,10 @@ fn only_a_declared_list_ignores_the_order_of_its_members() {
     let a = doc(vec![m1.clone(), m2.clone()], tags());
     let b = doc(vec![m2.clone(), m1.clone()], tags());
     assert!(same_document(&a, &b, OPS));
-    assert!(!same_document(&a, &b, &[]), "nothing declared: by position");
+    assert!(
+        !same_document(&a, &b, NONE),
+        "nothing declared: by position"
+    );
     let swapped_tags = doc(vec![m1, m2], vec![s("b"), s("a")]);
     assert!(
         !same_document(&a, &swapped_tags, OPS),
@@ -103,14 +109,89 @@ fn a_member_differs_by_any_one_of_its_fields() {
     ));
 }
 
-/// A number is the value of its type: an integer is not the float of the
-/// same magnitude, and a binary payload compares by its bytes.
+/// A number is the value it represents, whatever holds it: an integer
+/// equals the float of the same value and so repeats it in a declared list,
+/// and an integer no float holds differs from the float beside it. A binary
+/// payload compares by its bytes.
 #[test]
-fn scalars_compare_by_type_and_bytes() {
+fn numbers_compare_by_value_and_binaries_by_bytes() {
     let of = |v: Value| map(vec![("ops", list(vec![v]))]);
-    assert!(!same_document(
+    assert!(same_document(
         &of(Value::from(1)),
         &of(Value::F64(1.0)),
+        OPS
+    ));
+    assert!(same_document(
+        &of(Value::F32(1.0)),
+        &of(Value::F64(1.0)),
+        OPS
+    ));
+    assert!(same_document(
+        &of(Value::F64(-0.0)),
+        &of(Value::from(0)),
+        OPS
+    ));
+    assert!(!same_document(
+        &of(Value::from(1)),
+        &of(Value::F64(1.5)),
+        OPS
+    ));
+    assert_eq!(
+        check_members(
+            &map(vec![("ops", list(vec![Value::from(1), Value::F64(1.0)]))]),
+            OPS
+        ),
+        Err(MemberError::Repeated {
+            path: "ops".to_string()
+        })
+    );
+    // 2^53 is a float; 2^53 + 1 is not, and is not rounded to it.
+    let exact = 1_i64 << 53;
+    assert!(same_document(
+        &of(Value::from(exact)),
+        &of(Value::F64(exact as f64)),
+        OPS
+    ));
+    assert!(!same_document(
+        &of(Value::from(exact + 1)),
+        &of(Value::F64(exact as f64)),
+        OPS
+    ));
+    assert_eq!(
+        check_members(
+            &map(vec![(
+                "ops",
+                list(vec![Value::from(exact + 1), Value::F64(exact as f64)])
+            )]),
+            OPS
+        ),
+        Ok(())
+    );
+    // The widest integers lie on their side of the floats around them.
+    assert!(!same_document(
+        &of(Value::from(u64::MAX)),
+        &of(Value::F64(18_446_744_073_709_551_616.0)),
+        OPS
+    ));
+    assert!(!same_document(
+        &of(Value::from(i64::MIN + 1)),
+        &of(Value::F64(i64::MIN as f64)),
+        OPS
+    ));
+    assert!(same_document(
+        &of(Value::from(i64::MIN)),
+        &of(Value::F64(i64::MIN as f64)),
+        OPS
+    ));
+    // A NaN is the value it is; an infinity is no integer.
+    assert!(same_document(
+        &of(Value::F64(f64::NAN)),
+        &of(Value::F64(f64::NAN)),
+        OPS
+    ));
+    assert!(!same_document(
+        &of(Value::F64(f64::INFINITY)),
+        &of(Value::from(u64::MAX)),
         OPS
     ));
     assert!(same_document(
@@ -191,7 +272,7 @@ fn a_repeated_member_is_refused_with_its_path() {
             path: "ops".to_string()
         })
     );
-    assert_eq!(check_members(&twice, &[]), Ok(()), "nothing declared");
+    assert_eq!(check_members(&twice, NONE), Ok(()), "nothing declared");
     let nested: &[&[&str]] = &[&["a", "b"]];
     let deep = map(vec![(
         "a",

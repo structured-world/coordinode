@@ -382,30 +382,141 @@ fn a_repeated_member_is_refused_and_the_stored_version_stays() {
     );
 }
 
-/// A write below a property declaring unordered members is not checked
-/// against them, so it is refused and changes nothing; the property is
-/// written whole.
+/// Whether `refused` is the refusal of a member repeated in `body.ops`.
+fn repeats_a_member<T: std::fmt::Debug>(refused: Result<T, DatabaseError>) {
+    match refused {
+        Err(DatabaseError::DuplicateMember { property, path }) => {
+            assert_eq!((property.as_str(), path.as_str()), ("body", "ops"));
+        }
+        other => panic!("expected a duplicate member refusal, got {other:?}"),
+    }
+}
+
+/// A small member, by its two fields.
+fn pair(node: i64, x: Option<i64>) -> Doc {
+    let mut fields = vec![("node", Doc::from(node))];
+    if let Some(x) = x {
+        fields.push(("x", Doc::from(x)));
+    }
+    map(fields)
+}
+
+/// A write below the property that touches no declared list goes through
+/// as it always did; one that touches a declared list is judged by the
+/// document it leaves: a valid one lands, one that would repeat a member is
+/// refused and changes nothing.
 #[test]
-fn a_write_below_the_property_is_refused() {
+fn a_write_below_the_property_is_judged_by_what_it_leaves() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = open_declared(dir.path());
-    create(&mut db, "k", body(members())).expect("write");
-    for statement in [
-        "MATCH (n:Fact) SET n.body.ops = []",
-        "MATCH (n:Fact) SET n.body.tags = ['z']",
-        "MATCH (n:Fact) SET doc_push(n.body.ops, 1)",
-        "MATCH (n:Fact) SET doc_add_to_set(n.body.ops, 1)",
-        "MATCH (n:Fact) REMOVE n.body.ops",
-    ] {
-        match db.execute_cypher(statement) {
-            Err(refused) => assert!(
-                refused.to_string().contains("declares unordered members"),
-                "{statement}: {refused}"
-            ),
-            Ok(rows) => panic!("{statement} was admitted: {rows:?}"),
-        }
-    }
-    assert_eq!(stored(&mut db, "k"), Value::Document(body(members())));
+    let ops = || vec![pair(1, Some(1)), pair(1, None), pair(2, None)];
+    create(&mut db, "k", body(ops())).expect("write");
+    let run = |db: &mut Database, statement: &str, value: Option<Doc>| {
+        db.execute_cypher_with_params(
+            statement,
+            value.map_or_else(HashMap::new, |v| params(vec![("v", Value::Document(v))])),
+        )
+    };
+
+    // Beside the declared list: nothing of it is read or judged.
+    run(&mut db, "MATCH (n:Fact) SET n.body.tags = ['z', 'z']", None).expect("an ordinary list");
+    run(
+        &mut db,
+        "MATCH (n:Fact) SET doc_push(n.body.tags, 'z')",
+        None,
+    )
+    .expect("push beside");
+    run(&mut db, "MATCH (n:Fact) REMOVE n.body.payload", None).expect("remove beside");
+
+    // The declared list itself: a new member lands, a held one does not.
+    run(
+        &mut db,
+        "MATCH (n:Fact) SET doc_push(n.body.ops, $v)",
+        Some(pair(3, None)),
+    )
+    .expect("a new member");
+    repeats_a_member(run(
+        &mut db,
+        "MATCH (n:Fact) SET doc_push(n.body.ops, $v)",
+        Some(reversed(&pair(1, Some(1)))),
+    ));
+    // The transaction's own earlier change is part of what is judged.
+    repeats_a_member(run(
+        &mut db,
+        "MATCH (n:Fact) SET doc_push(n.body.ops, $v), doc_push(n.body.ops, $v)",
+        Some(pair(4, None)),
+    ));
+    // A path cannot reach inside a member: a write through the list would
+    // put a map where the list stands, which the declaration refuses, and a
+    // removal through it finds nothing to remove.
+    let through = run(&mut db, "MATCH (n:Fact) SET n.body.ops.`2`.node = 3", None);
+    assert!(
+        matches!(through, Err(DatabaseError::SchemaViolation(_))),
+        "{through:?}"
+    );
+    run(&mut db, "MATCH (n:Fact) REMOVE n.body.ops.`0`.x", None).expect("nothing to remove");
+    // The list replaced whole, and the document above it.
+    repeats_a_member(run(
+        &mut db,
+        "MATCH (n:Fact) SET n.body.ops = $v",
+        Some(Doc::Array(vec![pair(5, None), pair(5, None)])),
+    ));
+
+    let expected = map(vec![
+        (
+            "ops",
+            Doc::Array(vec![
+                pair(1, Some(1)),
+                pair(1, None),
+                pair(2, None),
+                pair(3, None),
+            ]),
+        ),
+        ("tags", Doc::Array(vec![s("z"), s("z"), s("z")])),
+    ]);
+    assert!(holds(&mut db, "k", &expected), "{:?}", stored(&mut db, "k"));
+
+    run(
+        &mut db,
+        "MATCH (n:Fact) SET n.body.ops = $v",
+        Some(Doc::Array(vec![pair(6, None), pair(5, None)])),
+    )
+    .expect("a valid list");
+    let replaced = map(vec![
+        ("ops", Doc::Array(vec![pair(5, None), pair(6, None)])),
+        ("tags", Doc::Array(vec![s("z"), s("z"), s("z")])),
+    ]);
+    assert!(holds(&mut db, "k", &replaced), "{:?}", stored(&mut db, "k"));
+}
+
+/// Two transactions each add the same member, each valid alone: the one
+/// that commits second is refused, and the list holds the member once.
+#[test]
+fn two_writers_cannot_land_one_member_twice() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open_declared(dir.path());
+    create(&mut db, "k", body(vec![pair(1, None)])).expect("write");
+    let push = |db: &mut Database, tx| {
+        db.execute_in_transaction(
+            tx,
+            "MATCH (n:Fact) SET doc_push(n.body.ops, $v)",
+            Some(params(vec![("v", Value::Document(pair(2, None)))])),
+        )
+    };
+    let first = db.begin_transaction().expect("begin");
+    let second = db.begin_transaction().expect("begin");
+    push(&mut db, first).expect("valid alone");
+    push(&mut db, second).expect("valid alone");
+    db.commit_transaction(first).expect("the first commits");
+    let refused = db.commit_transaction(second);
+    assert!(refused.is_err(), "the second commit landed: {refused:?}");
+
+    let expected = map(vec![
+        ("ops", Doc::Array(vec![pair(1, None), pair(2, None)])),
+        ("tags", Doc::Array(vec![s("a"), s("b")])),
+        ("payload", Doc::Binary(vec![3, 1, 2])),
+    ]);
+    assert!(holds(&mut db, "k", &expected), "{:?}", stored(&mut db, "k"));
 }
 
 /// The declaration holds on a FLEXIBLE label, which enforces nothing else
@@ -524,4 +635,74 @@ fn a_merge_in_another_order_finds_the_same_node() {
         .len();
     assert_eq!(nodes, 1);
     assert_eq!(stored(&mut db, "k"), Value::Document(body(members())));
+}
+
+/// One parameter compares with each property under that property's own
+/// declaration: rows of a type that declares the list equal a permuted
+/// value, rows of a type that does not differ by order, in one statement;
+/// and a node bound under another name keeps its type's declaration.
+#[test]
+fn one_parameter_follows_the_declaration_of_each_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open_declared(dir.path());
+    let mut plain = LabelSchema::new_node_id("Loose");
+    plain.add_property(PropertyDef::new("key", PropertyType::String));
+    plain.add_property(PropertyDef::new("body", PropertyType::Document));
+    assert!(publish(&db, plain, Intent::Ensure).all_ready());
+    create(&mut db, "k", body(members())).expect("declared");
+    db.execute_cypher_with_params(
+        "CREATE (:Loose {key: 'k', body: $body})",
+        params(vec![("body", Value::Document(body(members())))]),
+    )
+    .expect("undeclared");
+
+    let mut permuted = members();
+    permuted.reverse();
+    let candidate = || params(vec![("c", Value::Document(body(permuted.clone())))]);
+    let mut matched: Vec<String> = db
+        .execute_cypher_with_params(
+            "MATCH (n) WHERE n.body = $c RETURN labels(n) AS labels",
+            candidate(),
+        )
+        .expect("both types")
+        .into_iter()
+        .map(|row| format!("{:?}", row.get("labels")))
+        .collect();
+    matched.sort();
+    assert_eq!(matched.len(), 1, "{matched:?}");
+    assert!(matched[0].contains("Fact"), "{matched:?}");
+
+    let renamed = db
+        .execute_cypher_with_params(
+            "MATCH (n:Fact) WITH n AS m WHERE m.body = $c RETURN m.body = $c AS same",
+            candidate(),
+        )
+        .expect("another name");
+    assert_eq!(renamed.len(), 1);
+    assert_eq!(renamed[0].get("same"), Some(&Value::Bool(true)));
+}
+
+/// A number in a member is the value it represents: an integer and the
+/// float of the same value are one member, in a comparison and as a repeat.
+#[test]
+fn a_number_in_a_member_is_its_value() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open_declared(dir.path());
+    let of = |values: Vec<Doc>| map(vec![("ops", Doc::Array(values))]);
+    create(&mut db, "k", of(vec![Doc::from(1), Doc::from(2)])).expect("write");
+    assert!(holds(&mut db, "k", &of(vec![Doc::F64(2.0), Doc::F64(1.0)])));
+    assert!(!holds(
+        &mut db,
+        "k",
+        &of(vec![Doc::F64(2.5), Doc::F64(1.0)])
+    ));
+    repeats_a_member(create(&mut db, "x", of(vec![Doc::from(1), Doc::F64(1.0)])));
+    // 2^53 + 1 is no float: it is not the float beside it.
+    let exact = 1_i64 << 53;
+    create(
+        &mut db,
+        "big",
+        of(vec![Doc::from(exact + 1), Doc::F64(exact as f64)]),
+    )
+    .expect("two numbers");
 }

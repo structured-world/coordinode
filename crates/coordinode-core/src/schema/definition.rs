@@ -72,15 +72,6 @@ impl PropertyDef {
         self
     }
 
-    /// The declared unordered lists, as the comparison and the check of
-    /// members read them.
-    pub fn unordered_paths(&self) -> Vec<Vec<&str>> {
-        self.unordered
-            .iter()
-            .map(|path| path.iter().map(String::as_str).collect())
-            .collect()
-    }
-
     /// What is wrong with the unordered lists this property declares, if
     /// anything: declared on another type than DOCUMENT, too many, a path
     /// too long or naming an empty field, or one path declared twice.

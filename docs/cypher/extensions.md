@@ -495,8 +495,9 @@ REMOVE d.config.security.key_rotation
 
 - the fields of a map by name, in whatever order either side holds them;
 - a list position by position;
-- a scalar by its type and value (an integer is not the float of the same
-  magnitude), a binary payload by its bytes.
+- a number by the value it represents (`1` and `1.0` are one number, compared
+  exactly), any other scalar by its type and value, a binary payload by its
+  bytes.
 
 ```cypher
 -- true whichever order $candidate lists its fields in
@@ -511,9 +512,10 @@ that property follow its declaration, so one parameter can compare by
 membership with one property and by position with another. The declaration
 is made with the label's definition (see
 [Declaring the Schema](../guide/embedded#unordered-members-of-a-document)).
-A comparison follows it where the statement reads the property of a matched
-node (`n.body = $x`, `n.body.ops = $x`, `(n {body: $x})`); a value carried
-on under another name (`WITH n.body AS b`) compares as any document.
+A comparison follows it where the statement reads the property of a node,
+under whatever name the node is bound (`n.body = $x`, `n.body.ops = $x`,
+`(n {body: $x})`, `WITH n AS m ... m.body = $x`); a value taken out of its
+node (`WITH n.body AS b`) compares as any document.
 
 ### Array Mutation Functions ✅ 🔷
 
