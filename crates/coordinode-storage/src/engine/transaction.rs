@@ -2234,7 +2234,18 @@ impl<'a> Transaction<'a> {
         version: Option<u64>,
         of: ConditionOf,
     ) -> StorageResult<()> {
-        if self.derived.bind(key) {
+        // The engine binds a definition once however many effects follow;
+        // a caller's binding is its own condition, stated even when the
+        // engine's path bound the definition first, since the engine's
+        // condition admits a definition of unknown commit and the caller's
+        // refuses it.
+        let first = self.derived.bind(key);
+        if first
+            || (of == ConditionOf::Caller
+                && !self.expected_versions.iter().any(|(part, k, _, o)| {
+                    *part == Partition::Schema && k == key && *o == ConditionOf::Caller
+                }))
+        {
             self.expect(Partition::Schema, key, version, of)?;
         }
         Ok(())

@@ -899,6 +899,85 @@ fn a_callers_condition_on_a_record_of_unknown_commit_is_refused() {
     ));
 }
 
+/// A caller's binding of an index definition holds after the engine's own
+/// path bound the same definition in the transaction: the engine's
+/// condition on a definition of unknown commit admits the write, the
+/// caller's refuses it, and the caller's is the one asked for. Bound the
+/// other way round, or by the engine alone, the outcome is as before.
+#[test]
+fn a_callers_binding_holds_after_the_engine_bound_the_definition() {
+    use crate::engine::UNKNOWN_REVISION;
+    const DEFINITION: &[u8] = b"idx:def:by_name";
+    const SIDE: &[u8] = b"node:00:00000002";
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+    };
+    let mut create = mvcc_txn(&engine, &oracle);
+    create
+        .put(Partition::Schema, DEFINITION, b"as it stands")
+        .expect("stage");
+    create.commit(&ctx()).expect("create");
+    assert!(
+        engine
+            .forget_revision(Partition::Schema, DEFINITION)
+            .expect("forget")
+    );
+
+    let bound = |engine_first: Option<bool>| {
+        let mut txn = mvcc_txn(&engine, &oracle);
+        match engine_first {
+            Some(true) => {
+                txn.bind_index_condition(DEFINITION, Some(UNKNOWN_REVISION))
+                    .expect("engine binds");
+                txn.bind_index_definition(DEFINITION, Some(0))
+                    .expect("caller binds");
+            }
+            Some(false) => {
+                txn.bind_index_definition(DEFINITION, Some(0))
+                    .expect("caller binds");
+                txn.bind_index_condition(DEFINITION, Some(UNKNOWN_REVISION))
+                    .expect("engine binds");
+            }
+            None => {
+                txn.bind_index_condition(DEFINITION, Some(UNKNOWN_REVISION))
+                    .expect("engine binds");
+                txn.bind_index_condition(DEFINITION, Some(UNKNOWN_REVISION))
+                    .expect("engine binds again");
+            }
+        }
+        txn.put(Partition::Node, SIDE, b"side effect")
+            .expect("stage");
+        txn
+    };
+    for engine_first in [true, false] {
+        assert!(
+            matches!(
+                bound(Some(engine_first)).commit(&ctx()),
+                Err(CommitError::Storage(
+                    StorageError::RevisionUnavailable { .. }
+                ))
+            ),
+            "the caller's binding refuses (engine first: {engine_first})"
+        );
+        assert_eq!(
+            engine.get(Partition::Node, SIDE).unwrap(),
+            None,
+            "no side effect"
+        );
+    }
+    bound(None)
+        .commit(&ctx())
+        .expect("the engine's own binding admits the write");
+    assert_eq!(
+        engine.get(Partition::Node, SIDE).unwrap().as_deref(),
+        Some(&b"side effect"[..])
+    );
+}
+
 /// Two claimers race for one record and exactly one wins. The loser is told
 /// which version is there, which is what makes its next attempt a decision
 /// rather than another guess.
