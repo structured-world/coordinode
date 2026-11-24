@@ -6269,8 +6269,12 @@ impl StorageEngine {
         crate::engine::fixed_cut::CutRows,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
-        let (rows, _, charge) =
+        let (rows, last, mut charge) =
             self.cut_page_where(cut, after, max_rows, budget, |_, _| Ok(true))?;
+        // Every row read is in the page: its last key is not kept beside it.
+        if let Some(last) = last {
+            charge.shrink(last.len() as u64);
+        }
         Ok((rows, charge))
     }
 

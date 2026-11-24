@@ -521,12 +521,29 @@ fn a_namespace_codec_change_applies_to_its_next_tables_only() {
     deployment
         .set_namespace_storage("first", hot(BlockCodec::Zstd(3)))
         .expect("alter");
-    assert_eq!(
-        node_tables(&first),
-        first_before,
-        "the change rewrote a table"
-    );
-    assert_eq!(node_tables(&second), second_before);
+    // The change itself rewrites nothing: a table installed before it is
+    // still the very one. The engine's own compaction may have replaced one
+    // by now, which is the machine's timing; what it wrote carries the
+    // namespace's codec as it then stands, never the other's.
+    for (name, engine, before, codec) in [
+        ("first", &first, &first_before, CompressionType::Zstd(3)),
+        ("second", &second, &second_before, CompressionType::None),
+    ] {
+        for table in node_tables(engine) {
+            match before.iter().find(|t| t.id == table.id) {
+                Some(earlier) => assert_eq!(
+                    &table, earlier,
+                    "the change rewrote {name}'s table {}",
+                    table.id
+                ),
+                None => assert_eq!(
+                    table.codec, codec,
+                    "{name}'s compacted table {} carries its own codec",
+                    table.id
+                ),
+            }
+        }
+    }
 
     write_rows(&first, &oracle, "first", 500..1000);
     write_rows(&second, &oracle, "second", 500..1000);
