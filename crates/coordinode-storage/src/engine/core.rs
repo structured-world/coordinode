@@ -6269,6 +6269,34 @@ impl StorageEngine {
         crate::engine::fixed_cut::CutRows,
         coordinode_core::budget::MemoryCharge<'b>,
     )> {
+        let (rows, _, charge) =
+            self.cut_page_where(cut, after, max_rows, budget, |_, _| Ok(true))?;
+        Ok((rows, charge))
+    }
+
+    /// [`Self::cut_page`] keeping only the rows `keep` takes: at most
+    /// `max_rows` rows of the view are read, the ones `keep` refuses are not
+    /// copied, and the last key read is handed back with them, where the
+    /// next page goes on from. A page that read rows and kept none of them
+    /// is not the end of the view: only a page that read none is. The last
+    /// key read is charged to `budget` with the rows.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::cut_page`]; an error `keep` returns.
+    #[allow(clippy::type_complexity)]
+    pub fn cut_page_where<'b>(
+        &self,
+        cut: &crate::engine::fixed_cut::FixedCut,
+        after: Option<&[u8]>,
+        max_rows: usize,
+        budget: &'b coordinode_core::budget::QueryBudget,
+        mut keep: impl FnMut(&[u8], &[u8]) -> StorageResult<bool>,
+    ) -> StorageResult<(
+        crate::engine::fixed_cut::CutRows,
+        Option<Vec<u8>>,
+        coordinode_core::budget::MemoryCharge<'b>,
+    )> {
         use std::ops::Bound;
         self.held_cut(cut)?;
         self.cut_of_namespace(cut)?;
@@ -6299,8 +6327,14 @@ impl StorageEngine {
             return Err(refused());
         };
         charge.grow(scan).map_err(StorageError::Budget)?;
-        for guard in self.scan_range_at(cut.scope.partition(), lo, hi, cut.bound)? {
-            if page.len() >= max_rows {
+        // The last row read, kept or not: shared with the block it was read
+        // from until it is handed back. `read` counts the rows before it.
+        let mut last = None;
+        for (read, guard) in self
+            .scan_range_at(cut.scope.partition(), lo, hi, cut.bound)?
+            .enumerate()
+        {
+            if read >= max_rows {
                 break;
             }
             // Shared with the block they were read from: nothing is copied
@@ -6310,25 +6344,38 @@ impl StorageEngine {
             let row = (key.len() + value.len()) as u64;
             // A row longer than the scan was given room for is not taken.
             if row > longest {
-                if page.is_empty() {
+                if read == 0 {
                     return Err(refused());
                 }
                 break;
             }
-            // Copied into the page's blocks; the budget is asked only when a
-            // block or the index has to grow.
-            if let Err(stop) = page.push(&key, &value, &mut charge, budget) {
-                if page.is_empty() {
-                    return Err(StorageError::Budget(stop));
+            if keep(&key, &value)? {
+                // Copied into the page's blocks; the budget is asked only
+                // when a block or the index has to grow.
+                if let Err(stop) = page.push(&key, &value, &mut charge, budget) {
+                    if read == 0 {
+                        return Err(StorageError::Budget(stop));
+                    }
+                    break;
                 }
-                break;
             }
+            last = Some(key);
         }
         charge.shrink(scan);
         // A repair that replaced the tree while the page was read leaves
         // rows of another copy in it: the page is not handed over.
         self.scope_view_intact(cut)?;
-        Ok((page, charge))
+        let last = match last {
+            Some(key) => {
+                // Slices of memory that exists: their lengths fit in u64.
+                charge
+                    .grow(key.len() as u64)
+                    .map_err(StorageError::Budget)?;
+                Some(key.to_vec())
+            }
+            None => None,
+        };
+        Ok((page, last, charge))
     }
 
     /// Refuse `cut` once its scope's tree no longer holds the view: a repair

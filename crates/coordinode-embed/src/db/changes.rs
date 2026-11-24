@@ -41,11 +41,16 @@ pub struct ChangePage<'b> {
     _charge: MemoryCharge<'b>,
 }
 
-impl ChangePage<'_> {
+impl<'b> ChangePage<'b> {
     /// The units read and the cursor to continue from.
     #[must_use]
     pub fn batch(&self) -> &ChangeBatch {
         &self.batch
+    }
+
+    /// The batch and the charge its events hold.
+    pub(super) fn into_parts(self) -> (ChangeBatch, MemoryCharge<'b>) {
+        (self.batch, self._charge)
     }
 }
 

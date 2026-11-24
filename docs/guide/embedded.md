@@ -780,6 +780,62 @@ A member of a replicated group (with the `replication` feature) takes its
 cut of the group's log the same way: the view is below the group's closed
 bound, and the continuation reads the log this member applied.
 
+### Rebuilding a projection of nodes by label
+
+A reader that follows nodes by label rebuilds from a cut of the nodes its
+labels select. `node_cut` takes the cut and binds each label name to the
+label in force at the cut's bound; a reader that already has a cursor uses
+`node_cut_for`, which keeps the labels its cursor is bound to, so a label
+dropped and created again under the same name is not picked up. The view
+holds the nodes that carry one of the labels in the cut's catalog: as their
+type, as one of their own labels, or implied by their type.
+
+`node_cut_scan` reads up to its count of node records and hands over those
+the labels select, with the key the next page goes on from
+(`next_after`). A page that selects no node is not the end of the view;
+only `next_after() == None` is. `node_cut_tail` reads the continuation as
+`read_changes` reads it, under the same bound labels, leaving out the units
+the view already holds: each unit comes with its events and how each reaches
+the labels (`Enter`, `Apply`, `Leave`), under the identities the feed gives
+them. A change of what a type implies arrives as a scope change, with no
+node written: reconcile the affected scope from a new cut, or report that
+it needs one, before publishing. Once `NodeCut::joined` returns a cursor,
+publish the new generation together with that cursor, and read on from it
+with `read_changes`. A cursor that follows relationships or blob objects is
+not rebuilt from a cut of nodes. Errors are those of `state_cut_*` and
+`read_changes`; a `RetentionLost` leaves the cut where it was, and the
+previous generation stays published until a new cut completes.
+
+```rust,no_run
+use std::time::Duration;
+use coordinode_core::budget::QueryBudget;
+use coordinode_embed::Database;
+
+# fn main() -> Result<(), coordinode_embed::DatabaseError> {
+let db = Database::open("/var/lib/myapp/graph")?;
+let labels = vec!["Person".to_string()];
+let mut cut = db.node_cut(Some(&labels), Duration::from_secs(10))?;
+let budget = QueryBudget::new(64 << 20);
+let mut after: Option<Vec<u8>> = None;
+loop {
+    let page = db.node_cut_scan(&cut, after.as_deref(), 1024, &budget)?;
+    let Some(next) = page.next_after() else { break };
+    after = Some(next.to_vec());
+    // ...write `page.rows()` into the destination's new generation.
+}
+let cursor = loop {
+    let batch = db.node_cut_tail(&mut cut, 256, &budget, None)?;
+    // ...apply each unit's events to the new generation.
+    if let Some(cursor) = batch.joined() {
+        break cursor.clone();
+    }
+};
+// ...publish the new generation and `cursor.to_bytes()` in one write.
+# let _ = cursor;
+# Ok(())
+# }
+```
+
 ## Blobs
 
 Large binary objects are stored by id beside the graph. Each upload is its own

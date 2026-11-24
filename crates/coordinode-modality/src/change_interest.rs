@@ -32,13 +32,46 @@ pub fn resolve_change_interest(
     labels: Option<&[String]>,
     edge_types: Option<&[String]>,
 ) -> StoreResult<Result<Interest, InterestRefusal>> {
+    resolve_with(engine, labels, edge_types, |store, name| {
+        store.label_id(name)
+    })
+}
+
+/// [`resolve_change_interest`] with each name bound to the label it named as
+/// `snapshot` reads the catalog: a reader starting from a cut at that
+/// snapshot follows the labels in force there. A name with no live binding
+/// there is bound as the catalog binds it now.
+///
+/// # Errors
+///
+/// As [`resolve_change_interest`].
+pub fn resolve_change_interest_at(
+    engine: &StorageEngine,
+    snapshot: coordinode_storage::engine::StorageSnapshot,
+    labels: Option<&[String]>,
+    edge_types: Option<&[String]>,
+) -> StoreResult<Result<Interest, InterestRefusal>> {
+    resolve_with(engine, labels, edge_types, |store, name| {
+        store.label_id_at(snapshot, name)
+    })
+}
+
+fn resolve_with(
+    engine: &StorageEngine,
+    labels: Option<&[String]>,
+    edge_types: Option<&[String]>,
+    mut bind: impl FnMut(
+        &LocalSchemaStore<'_>,
+        &str,
+    ) -> StoreResult<Option<coordinode_core::schema::label_id::LabelId>>,
+) -> StoreResult<Result<Interest, InterestRefusal>> {
     let store = LocalSchemaStore::new(engine);
     let labels = match labels {
         None => None,
         Some(names) => {
             let mut ids = Vec::with_capacity(names.len());
             for name in names {
-                match store.label_id(name)? {
+                match bind(&store, name)? {
                     Some(id) => ids.push(id),
                     None => return Ok(Err(InterestRefusal::Unbound(name.clone()))),
                 }

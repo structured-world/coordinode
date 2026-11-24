@@ -63,10 +63,25 @@ pub fn label_carriers_in(
     label: &str,
     cache: &mut CatalogMembership<'_>,
 ) -> Result<Option<LabelCarriers>, StoreError> {
-    let store = LocalSchemaStore::new(engine);
     let Some(label) = cache.label_id(label)? else {
         return Ok(None);
     };
+    label_carriers_of(engine, label, cache).map(Some)
+}
+
+/// The carriers of the label with identity `label` under the view of the
+/// catalog `cache` reads, whatever name is bound to it there: a reader
+/// bound to an identity keeps following it after its name is reused.
+///
+/// # Errors
+///
+/// As [`label_carriers`].
+pub fn label_carriers_of(
+    engine: &StorageEngine,
+    label: LabelId,
+    cache: &mut CatalogMembership<'_>,
+) -> Result<LabelCarriers, StoreError> {
+    let store = LocalSchemaStore::new(engine);
     // Every identity ever allocated, each judged by the view's own facts:
     // the latest catalog's types and implications are not the view's, which
     // may hold a type that implies nothing now, or a candidate's implication
@@ -80,7 +95,7 @@ pub fn label_carriers_in(
     }
     // In id order: two views holding the same interpretation compare equal.
     implying.sort_unstable();
-    Ok(Some(LabelCarriers { label, implying }))
+    Ok(LabelCarriers { label, implying })
 }
 
 /// Which state of the catalog a membership judges by.

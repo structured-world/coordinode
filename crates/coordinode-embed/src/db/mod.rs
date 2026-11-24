@@ -4719,6 +4719,7 @@ mod index_builds;
 mod index_maintenance;
 mod interactive;
 mod namespaces;
+mod node_cut;
 mod package;
 mod projection;
 #[cfg(test)]
@@ -4745,6 +4746,7 @@ pub use interactive::{
     CommitOptions, RollbackOptions, TransactionEnd, TransactionOptions, draw_transaction_id,
 };
 pub use namespaces::NamespaceInfo;
+pub use node_cut::{NodeCut, NodeCutBatch, NodeCutPage};
 pub use package::{
     Disposition, EdgeTypeDeclaration, Intent, LabelDeclaration, MAX_SCHEMA_PACKAGE_DECLARATIONS,
     PackageConstraint, PublishedObject, Readiness, SchemaPackage, SchemaPublication,
