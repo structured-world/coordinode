@@ -919,12 +919,15 @@ impl Database {
         Self::finish_open(&virtual_path, oracle, engine, pipeline, false, None, None)
     }
 
-    /// Initialize a database from pre-opened engine, oracle, and pipeline.
+    /// Initialize a database from a pre-opened engine, oracle and pipeline,
+    /// whose writes a Raft state machine applies: the TTL reaper submits its
+    /// mutations through the pipeline for replication.
     ///
-    /// Used by the server binary in cluster mode: the server creates
-    /// a shared `StorageEngine` + `TimestampOracle` for the `RaftNode`, then
-    /// passes the same engine + a `RaftProposalPipeline` here. The TTL reaper
-    /// submits mutations through Raft for replication.
+    /// It is given no group's log, so its consumers are served only from a
+    /// journal the engine keeps of its own, and a store holding consumer
+    /// registrations without one is refused. A member of a replicated group
+    /// (the server, a replicated embedded database) opens through its
+    /// member, which serves consumers from the group's log.
     pub fn from_engine(
         path: impl AsRef<Path>,
         engine: Arc<StorageEngine>,

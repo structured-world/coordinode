@@ -9480,3 +9480,326 @@ async fn a_causal_bound_is_met_after_its_leader_is_lost() {
         "TIMED OUT: a_causal_bound_is_met_after_its_leader_is_lost"
     );
 }
+
+/// Holds the first read of a log segment that arrives while it is armed,
+/// and lets every other read through: a disk that answers one read late.
+#[derive(Default)]
+struct OneHeldRead {
+    /// Armed, a read held now, reads held so far.
+    state: parking_lot::Mutex<(bool, bool, usize)>,
+    changed: parking_lot::Condvar,
+}
+
+impl OneHeldRead {
+    fn arm(&self) {
+        self.state.lock().0 = true;
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock();
+        state.0 = false;
+        state.1 = false;
+        self.changed.notify_all();
+    }
+
+    fn pass(&self) {
+        let mut state = self.state.lock();
+        if state.0 && !state.1 {
+            state.1 = true;
+            state.2 += 1;
+            self.changed.notify_all();
+            while state.1 {
+                self.changed.wait(&mut state);
+            }
+        }
+    }
+
+    /// Wait until a read is held, for at most `within`.
+    fn wait_held(&self, within: Duration) -> bool {
+        let mut state = self.state.lock();
+        let deadline = std::time::Instant::now() + within;
+        while state.2 == 0 {
+            if self.changed.wait_until(&mut state, deadline).timed_out() {
+                break;
+            }
+        }
+        state.2 > 0
+    }
+}
+
+/// The standard file system, with reads of a log segment opened for reading
+/// only passing `gate`.
+struct HeldSegmentReads {
+    gate: Arc<OneHeldRead>,
+}
+
+impl lsm_tree::fs::Fs for HeldSegmentReads {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        opts: &lsm_tree::fs::FsOpenOptions,
+    ) -> lsm_tree::io::Result<Box<dyn lsm_tree::fs::FsFile>> {
+        let file = lsm_tree::fs::StdFs.open(path, opts)?;
+        let segment = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("oplog-"));
+        if segment && opts.read && !opts.write {
+            return Ok(Box::new(HeldSegment {
+                inner: file,
+                gate: Arc::clone(&self.gate),
+            }));
+        }
+        Ok(file)
+    }
+
+    fn create_dir_all(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(
+        &self,
+        path: &std::path::Path,
+    ) -> lsm_tree::io::Result<Vec<lsm_tree::fs::FsDirEntry>> {
+        lsm_tree::fs::StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &std::path::Path) -> lsm_tree::io::Result<lsm_tree::fs::FsMetadata> {
+        lsm_tree::fs::StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &std::path::Path) -> lsm_tree::io::Result<bool> {
+        lsm_tree::fs::StdFs.exists(path)
+    }
+}
+
+/// A segment whose reads pass the gate.
+struct HeldSegment {
+    inner: Box<dyn lsm_tree::fs::FsFile>,
+    gate: Arc<OneHeldRead>,
+}
+
+impl std::io::Read for HeldSegment {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.gate.pass();
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for HeldSegment {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for HeldSegment {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl lsm_tree::fs::FsFile for HeldSegment {
+    fn sync_all(&self) -> lsm_tree::io::Result<()> {
+        self.inner.sync_all()
+    }
+
+    fn sync_data(&self) -> lsm_tree::io::Result<()> {
+        self.inner.sync_data()
+    }
+
+    fn metadata(&self) -> lsm_tree::io::Result<lsm_tree::fs::FsMetadata> {
+        self.inner.metadata()
+    }
+
+    fn set_len(&self, size: u64) -> lsm_tree::io::Result<()> {
+        self.inner.set_len(size)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> lsm_tree::io::Result<usize> {
+        self.gate.pass();
+        self.inner.read_at(buf, offset)
+    }
+
+    fn lock_exclusive(&self) -> lsm_tree::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+}
+
+/// The log segments in `dir`, by name.
+fn log_segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut segments: Vec<_> = std::fs::read_dir(dir.join("oplog").join("0"))
+        .expect("list the log")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+        .collect();
+    segments.sort();
+    segments
+}
+
+/// A replication stream closed while its read of the log is still waiting
+/// on the disk, with the segments it reads purged under it, does not stop
+/// the leader: the leader reads its log for a new learner, the learner is
+/// removed while that read is held, a snapshot lets the leader purge the
+/// segments the read opened, and the read then returns. The leader's
+/// consensus core keeps running, keeps its term and commits the next write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_closed_inside_a_log_read_purged_under_it_does_not_stop_the_leader() {
+    use openraft::async_runtime::watch::WatchReceiver;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=warn,coordinode_raft=warn")
+        .with_test_writer()
+        .try_init();
+    let gate = Arc::new(OneHeldRead::default());
+
+    let held = Arc::clone(&gate);
+    let result = tokio::time::timeout(Duration::from_secs(120), async move {
+        let gate = held;
+        let (p1, p2) = (alloc_port(), alloc_port());
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+        ];
+        // Small segments: the entries written below seal several, which a
+        // purge removes whole.
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dirs[0].path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )])
+        .with_fs(Arc::new(HeldSegmentReads {
+            gate: Arc::clone(&gate),
+        }));
+        config.oplog_segment_max_entries = 4;
+        let e1 = Arc::new(StorageEngine::open(&config).expect("open engine"));
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+            conn(1),
+        )
+        .await
+        .expect("n1");
+        await_leadership(&n1).await;
+
+        let key = |i: u64| format!("node:1:held-{i}").into_bytes();
+        let put = move |id, i: u64| RaftProposal {
+            id,
+            mutations: unit![Mutation::Put {
+                partition: PartitionId::Node,
+                key: key(i),
+                value: b"v".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(100 + i),
+            start_ts: Timestamp::from_raw(99 + i),
+            bypass_rate_limiter: false,
+        };
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        let pipeline = n1.pipeline();
+        for i in 1..=24u64 {
+            pipeline
+                .propose_and_wait(&put(id_gen.next(), i))
+                .expect("propose");
+        }
+        // Reopened, the leader holds none of its log in memory: what it
+        // sends a learner it reads from the segments.
+        drop(pipeline);
+        n1.shutdown().await.expect("stop the leader");
+        drop(n1);
+        drop(e1);
+        let e1 = Arc::new(StorageEngine::open(&config).expect("reopen engine"));
+        let n1 = reopen_member(1, &e1, p1).await;
+        await_leadership(&n1).await;
+        let pipeline = n1.pipeline();
+        let e2 = member_engine_at(dirs[1].path());
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+            conn(2),
+            enroll(&n1, format!("127.0.0.1:{p1}")),
+        )
+        .await
+        .expect("n2");
+        let term = n1.current_term();
+        let before = log_segments(dirs[0].path());
+        assert!(before.len() > 2, "several sealed segments: {before:?}");
+
+        // The leader reads its log for the new learner, and the read waits.
+        gate.arm();
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"), ident(2))
+            .await
+            .expect("add the learner");
+        let read_held = gate.wait_held(Duration::from_secs(20));
+
+        // The learner goes: its stream is closed inside the read.
+        let removed = tokio::time::timeout(Duration::from_secs(20), n1.remove_node(2)).await;
+
+        // The leader snapshots and purges the segments the read opened.
+        let purged = async {
+            n1.raft().trigger().snapshot().await.expect("snapshot");
+            for _ in 0..100 {
+                let applied = n1.applied_index();
+                n1.raft().trigger().purge_log(applied).await.expect("purge");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if log_segments(dirs[0].path()).first() != before.first() {
+                    return true;
+                }
+            }
+            false
+        }
+        .await;
+
+        // The disk answers: the read returns into a closed stream.
+        gate.release();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let running = n1.raft().metrics().borrow_watched().running_state.clone();
+        let next = pipeline.propose_and_wait(&put(id_gen.next(), 9_999));
+
+        assert!(read_held, "the leader read its segments for the learner");
+        assert!(
+            matches!(removed, Ok(Ok(()))),
+            "removing the learner waited on its held read: {removed:?}"
+        );
+        assert!(purged, "the purge removed a segment under the held read");
+        assert!(
+            running.is_ok(),
+            "the leader's consensus core stopped: {running:?}"
+        );
+        assert!(next.is_ok(), "the next write did not commit: {next:?}");
+        assert!(n1.is_leader().await, "member 1 still leads");
+        assert_eq!(n1.current_term(), term, "no election took place");
+
+        drop(pipeline);
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+    })
+    .await;
+    // A timeout leaves a read held: let it go so its thread ends.
+    gate.release();
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_stream_closed_inside_a_log_read_purged_under_it_does_not_stop_the_leader"
+    );
+}
