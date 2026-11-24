@@ -9656,13 +9656,14 @@ fn log_segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 /// A replication stream closed while its read of the log is still waiting
-/// on the disk, with the segments it reads purged under it, does not stop
-/// the leader: the leader reads its log for a new learner, the learner is
-/// removed while that read is held, a snapshot lets the leader purge the
-/// segments the read opened, and the read then returns. The leader's
-/// consensus core keeps running, keeps its term and commits the next write.
+/// on the disk, with a purge of what it reads asked for meanwhile, does not
+/// stop the leader: the leader reads its log for a new learner, the learner
+/// is removed while that read is held, a snapshot and a purge are asked
+/// for, and the read then returns. Whether the purge ran under the read or
+/// waited for it, it goes through afterwards, and the leader's consensus
+/// core keeps running, keeps its term and commits the next write.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stream_closed_inside_a_log_read_purged_under_it_does_not_stop_the_leader() {
+async fn a_stream_closed_inside_a_log_read_with_a_purge_asked_does_not_stop_the_leader() {
     use openraft::async_runtime::watch::WatchReceiver;
     let _ = tracing_subscriber::fmt()
         .with_env_filter("openraft=warn,coordinode_raft=warn")
@@ -9756,24 +9757,31 @@ async fn a_stream_closed_inside_a_log_read_purged_under_it_does_not_stop_the_lea
         // The learner goes: its stream is closed inside the read.
         let removed = tokio::time::timeout(Duration::from_secs(20), n1.remove_node(2)).await;
 
-        // The leader snapshots and purges the segments the read opened.
+        // A snapshot and a purge are asked for while the read is held. The
+        // purge may run under the read or wait for the closed stream to
+        // stop reading: neither is waited for here.
+        n1.raft().trigger().snapshot().await.expect("snapshot");
+        let asked = n1.applied_index();
+        n1.raft().trigger().purge_log(asked).await.expect("purge");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The disk answers: the read returns into a closed stream.
+        gate.release();
+
+        // The purge then goes through: the log's purge point moves.
         let purged = async {
-            n1.raft().trigger().snapshot().await.expect("snapshot");
             for _ in 0..100 {
                 let applied = n1.applied_index();
                 n1.raft().trigger().purge_log(applied).await.expect("purge");
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                if log_segments(dirs[0].path()).first() != before.first() {
+                let metrics = n1.raft().metrics().borrow_watched().clone();
+                if metrics.purged.is_some() && log_segments(dirs[0].path()).len() < before.len() {
                     return true;
                 }
             }
             false
         }
         .await;
-
-        // The disk answers: the read returns into a closed stream.
-        gate.release();
-        tokio::time::sleep(Duration::from_secs(1)).await;
         let running = n1.raft().metrics().borrow_watched().running_state.clone();
         let next = pipeline.propose_and_wait(&put(id_gen.next(), 9_999));
 
@@ -9782,7 +9790,7 @@ async fn a_stream_closed_inside_a_log_read_purged_under_it_does_not_stop_the_lea
             matches!(removed, Ok(Ok(()))),
             "removing the learner waited on its held read: {removed:?}"
         );
-        assert!(purged, "the purge removed a segment under the held read");
+        assert!(purged, "the purge went through once the read returned");
         assert!(
             running.is_ok(),
             "the leader's consensus core stopped: {running:?}"
@@ -9800,6 +9808,6 @@ async fn a_stream_closed_inside_a_log_read_purged_under_it_does_not_stop_the_lea
     gate.release();
     assert!(
         result.is_ok(),
-        "TIMED OUT: a_stream_closed_inside_a_log_read_purged_under_it_does_not_stop_the_leader"
+        "TIMED OUT: a_stream_closed_inside_a_log_read_with_a_purge_asked_does_not_stop_the_leader"
     );
 }

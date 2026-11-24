@@ -324,13 +324,13 @@ fn a_label_dropped_and_created_again_keeps_the_cut_identity() {
     assert_eq!(copy_view(&db, &fresh).0.len(), 1, "the new label's node");
 }
 
-/// A :Person node written inside the join, above the view's bound: the view
-/// lacks it, the continuation hands it over once as entering the scope, under
-/// the identity a continuous reader receives it by, and the projection is the
-/// source's.
+/// A :Person node written again inside the join, above the view's bound:
+/// the view holds its earlier record, the continuation hands the write over
+/// once as applying to the scope, under the identity a continuous reader
+/// receives it by, and the projection is the source's.
 #[test]
-fn a_write_inside_the_join_enters_once_under_its_feed_identity() {
-    use coordinode_core::graph::node::{NodeId, NodeRecord, encode_node_key};
+fn a_write_inside_the_join_applies_once_under_its_feed_identity() {
+    use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::txn::proposal::{
         Implication, Mutation, NodeBasis, PartitionId, UnitEffects,
     };
@@ -346,7 +346,11 @@ fn a_write_inside_the_join_enters_once_under_its_feed_identity() {
             blobs: false,
         })
         .expect("cursor");
-    let key = encode_node_key(0, NodeId::from_raw(1_000_000));
+    // The node just created, by the key the source holds it under.
+    let key = source_nodes(&db, |l| l.contains(&person))
+        .into_keys()
+        .next()
+        .expect("the node");
     let record = NodeRecord::with_labels(vec![person])
         .to_msgpack()
         .expect("record");
@@ -360,10 +364,10 @@ fn a_write_inside_the_join_enters_once_under_its_feed_identity() {
                 label: person,
                 implies: Vec::new(),
             }];
-            // A new node: it stored no labels before the unit.
+            // The labels it stored before the unit.
             effects.nodes = vec![NodeBasis {
                 key: hook_key.clone(),
-                labels: Vec::new(),
+                labels: vec![person],
             }];
             let unit = coordinode_storage::engine::scope::store_unit([
                 Mutation::Put {
@@ -390,7 +394,10 @@ fn a_write_inside_the_join_enters_once_under_its_feed_identity() {
         "the join holds it"
     );
     let (mut nodes, _) = copy_view(&db, &cut);
-    assert!(!nodes.contains_key(&key), "above the view's bound");
+    assert!(
+        nodes.get(&key).is_some_and(|held| *held != record),
+        "the view holds the record below its bound"
+    );
     let (_, events) = read_continuation(&db, &mut cut, &mut nodes);
     let mut followed = Nodes::new();
     let mut fed = Vec::new();
@@ -415,7 +422,7 @@ fn a_write_inside_the_join_enters_once_under_its_feed_identity() {
         .filter(|e| e.target == OwnedTarget::Node(key.clone()))
         .collect();
     assert_eq!(joined.len(), 1, "once: {events:?}");
-    assert_eq!(joined[0].delivery, Delivery::Enter);
+    assert_eq!(joined[0].delivery, Delivery::Apply);
     let in_feed = fed
         .iter()
         .find(|e| e.target == OwnedTarget::Node(key.clone()))
